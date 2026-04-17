@@ -288,18 +288,10 @@ fn f_n_plus_1_returns_43_when_n_is_42() {
 }
 
 #[test]
-fn f_returning_negative_literal_is_unsupported_in_m1() {
-    // `-7` parses as `UnaryExpression { op: "-", arg: NumericLiteral 7 }`,
-    // not a negative literal, so it must surface as `unary_expression`
-    // until M3/M4 introduce unary negation.
-    let err = compile("function g() { return -7; }").expect_err("unary minus later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "unary_expression",
-            ..
-        }
-    ));
+fn unary_minus_on_literal_returns_negated_int32() {
+    // `-7` parses as `UnaryExpression { op: "-", arg: NumericLiteral 7 }`.
+    // Post-M10 this lowers to `LdaSmi 7; Negate; Return`.
+    assert_eq!(run_int32_function("function g() { return -7; }", &[]), -7);
 }
 
 #[test]
@@ -2002,4 +1994,242 @@ fn new_expression_unsupported() {
             ..
         }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// M10: UnaryExpression + UpdateExpression
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unary_negation_on_parameter() {
+    // `-n` → `Ldar r0; Negate; Return`. Negate on int32 is
+    // wraparound negation, so `-(-7)` round-trips.
+    assert_eq!(run_int32_function("function f(n) { return -n; }", &[7]), -7);
+    assert_eq!(run_int32_function("function f(n) { return -n; }", &[-7]), 7);
+}
+
+#[test]
+fn unary_plus_is_identity_on_int32() {
+    // `+n` → `Ldar r0; ToNumber; Return`. ToNumber on int32 is a
+    // no-op, so the value round-trips unchanged.
+    assert_eq!(
+        run_int32_function("function f(n) { return +n; }", &[42]),
+        42
+    );
+}
+
+#[test]
+fn bitwise_not_on_parameter() {
+    // `~n` → `Ldar r0; BitwiseNot; Return`. Matches JS:
+    // `~0` = -1, `~-1` = 0, `~5` = -6.
+    assert_eq!(run_int32_function("function f(n) { return ~n; }", &[0]), -1);
+    assert_eq!(run_int32_function("function f(n) { return ~n; }", &[-1]), 0);
+    assert_eq!(run_int32_function("function f(n) { return ~n; }", &[5]), -6);
+}
+
+#[test]
+fn logical_not_on_truthy_int32_returns_false() {
+    // `!n` → `Ldar r0; LogicalNot; Return`. Non-zero int32 is
+    // truthy, so `!5` is false (0 when coerced back to i32).
+    let module = compile("function f(n) { return !n; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    registers[hidden] = RegisterValue::from_i32(5);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value().as_bool(), Some(false));
+}
+
+#[test]
+fn logical_not_on_zero_returns_true() {
+    let module = compile("function f(n) { return !n; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    registers[hidden] = RegisterValue::from_i32(0);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value().as_bool(), Some(true));
+}
+
+#[test]
+fn typeof_int32_returns_number_string() {
+    // `typeof n` → `Ldar r0; TypeOf; Return`. Returns the string
+    // "number" for int32 values.
+    let module = compile("function f(n) { return typeof n; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    registers[hidden] = RegisterValue::from_i32(7);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    let handle = result
+        .return_value()
+        .as_object_handle()
+        .expect("typeof returns a string object handle");
+    let text = runtime
+        .objects
+        .string_value(crate::object::ObjectHandle(handle))
+        .expect("typeof result readable")
+        .expect("typeof result has string value");
+    assert_eq!(text.to_rust_string(), "number");
+}
+
+#[test]
+fn void_expression_returns_undefined() {
+    // `void n` evaluates the argument for side effects, then
+    // returns `undefined`. We observe this end-to-end via the raw
+    // `RegisterValue::undefined()` comparison — `undefined` isn't
+    // in scope as an identifier at this milestone, so the test can't
+    // write `=== undefined` in source yet.
+    let module = compile("function f(n) { return void n; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    registers[hidden] = RegisterValue::from_i32(42);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value(), RegisterValue::undefined());
+}
+
+#[test]
+fn delete_unary_unsupported() {
+    // `delete x` depends on PropertyAccess / global-binding support
+    // that hasn't landed yet. Must surface a stable tag.
+    let err = compile("function f(n) { let x = n; return delete x; }").expect_err("delete at M10");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "delete_unary",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn prefix_increment_on_local_returns_new_value() {
+    // `++x` returns the incremented value and writes it back.
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; ++x; return x; }", &[]),
+        6,
+    );
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; return ++x; }", &[]),
+        6,
+    );
+}
+
+#[test]
+fn prefix_decrement_on_local_returns_new_value() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; --x; return x; }", &[]),
+        4,
+    );
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; return --x; }", &[]),
+        4,
+    );
+}
+
+#[test]
+fn postfix_increment_on_local_returns_old_value_writes_new() {
+    // Expression result is the pre-increment int32, but the
+    // binding holds the incremented value afterward.
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; return x++; }", &[]),
+        5,
+    );
+    // Readback test: after `x++`, `x` is 6.
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; x++; return x; }", &[]),
+        6,
+    );
+}
+
+#[test]
+fn postfix_decrement_on_local_returns_old_value_writes_new() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; return x--; }", &[]),
+        5,
+    );
+    assert_eq!(
+        run_int32_function("function f() { let x = 5; x--; return x; }", &[]),
+        4,
+    );
+}
+
+#[test]
+fn update_on_parameter_rejected() {
+    let err = compile("function f(n) { return n++; }").expect_err("++param at M10");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "update_on_param",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn update_on_const_rejected() {
+    let err = compile("function f() { const x = 5; return ++x; }").expect_err("++const at M10");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "const_update",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn update_loop_counter_in_while() {
+    // The canonical `while (i < 3) { ... i++; }` shape lets us
+    // exercise UpdateExpression as an ExpressionStatement inside a
+    // loop body (not just inside a return).
+    assert_eq!(
+        run_int32_function(
+            "function f() { let s = 0; let i = 0; while (i < 3) { s = s + i; i++; } return s; }",
+            &[]
+        ),
+        3, // 0 + 1 + 2
+    );
+}
+
+#[test]
+fn unary_composes_with_binary_rhs() {
+    // `return x + -y;` exercises the complex-RHS path that spills
+    // LHS, evaluates the unary into acc, then reapplies the op.
+    assert_eq!(
+        run_int32_function("function f(n) { let y = 2; return n + -y; }", &[10]),
+        8,
+    );
+}
+
+#[test]
+fn update_composes_with_binary_rhs() {
+    // `return n + x++;` — the RHS produces the OLD x, then writes
+    // x back. Exercises the complex-RHS path carrying a
+    // postfix-update.
+    assert_eq!(
+        run_int32_function("function f(n) { let x = 5; return n + x++; }", &[10]),
+        15,
+    );
 }

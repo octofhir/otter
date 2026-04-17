@@ -48,7 +48,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 
 | ID       | Scope                                                                                                                          | Status | Commit |
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
-| M10      | `UnaryExpression` (`!`, `-x`, `+x`, `typeof`, `void`) + `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals.              | [ ]    |        |
+| M10      | `UnaryExpression` (`!`, `-x`, `+x`, `typeof`, `void`, `~x`) + `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals.         | [x]    | _pending_ |
 | M11      | `break` / `continue` inside `while` / `for` (unlabelled).                                                                      | [ ]    |        |
 | M12      | Block scoping for `let` / `const` inside `if` / `while` / `for` bodies + nested blocks.                                         | [ ]    |        |
 | M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [ ]    |        |
@@ -97,6 +97,8 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `ForStatement`                    | yes       | M8        |
 | Multiple top-level functions      | yes       | M9        |
 | `CallExpression` (known function) | yes       | M9        |
+| `UnaryExpression` (`!`, `-x`, `+x`, `~x`, `typeof`, `void`) | yes | M10 |
+| `UpdateExpression` (`++x`, `x++`, `--x`, `x--`) on locals | yes | M10 |
 
 ## Benchmarks
 

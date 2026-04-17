@@ -121,7 +121,8 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
     BindingPattern, Expression, FormalParameter, FormalParameters, Function, FunctionBody,
-    NumericLiteral, Program, Statement, VariableDeclaration, VariableDeclarationKind,
+    NumericLiteral, Program, SimpleAssignmentTarget, Statement, UnaryExpression, UnaryOperator,
+    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
     VariableDeclarator,
 };
 use oxc_parser::Parser;
@@ -494,16 +495,20 @@ fn lower_nested_statement<'a>(
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => {
             // Statement-position expressions: `AssignmentExpression`
-            // (`x = …;`) and `CallExpression` (`f();` — result
-            // discarded; acc gets overwritten by the next stmt).
-            // Bare reads, member access, etc. surface their own tag
-            // so a future milestone can widen them one shape at a
-            // time.
+            // (`x = …;`), `CallExpression` (`f();`),
+            // `UpdateExpression` (`x++;` — writes x back, result
+            // value discarded). The last is the canonical
+            // loop-counter idiom. Bare reads, member access, etc.
+            // surface their own tag so a future milestone can widen
+            // them one shape at a time.
             match &expr_stmt.expression {
                 Expression::AssignmentExpression(assign) => {
                     lower_assignment_expression(builder, ctx, assign)
                 }
                 Expression::CallExpression(call) => lower_call_expression(builder, ctx, call),
+                Expression::UpdateExpression(update) => {
+                    lower_update_expression(builder, ctx, update)
+                }
                 other => Err(SourceLoweringError::unsupported(
                     expression_construct_tag(other),
                     other.span(),
@@ -745,15 +750,17 @@ fn lower_for_statement<'a>(
     lower_nested_statement(builder, ctx, &for_stmt.body)?;
 
     // 4) Update — runs after every iteration, before the back-jump.
+    //    M10 also accepts `UpdateExpression` (`i++` / `++i`),
+    //    matching the canonical `for (let i = 0; i < n; i++)` idiom.
+    //    The UpdateExpression's accumulator result is discarded.
     if let Some(update) = &for_stmt.update {
         match update {
             Expression::AssignmentExpression(assign) => {
                 lower_assignment_expression(builder, ctx, assign)?;
             }
-            // Other update expressions (calls, post-increment, …)
-            // would need to be lowered as expressions whose result
-            // is discarded. Reject for now; M5+ already restricts
-            // statement-position expressions to assignments.
+            Expression::UpdateExpression(update_expr) => {
+                lower_update_expression(builder, ctx, update_expr)?;
+            }
             other => {
                 return Err(SourceLoweringError::unsupported(
                     "for_update_expression",
@@ -1299,11 +1306,224 @@ fn lower_return_expression(
         Expression::ParenthesizedExpression(inner) => {
             lower_return_expression(builder, ctx, &inner.expression)
         }
+        Expression::UnaryExpression(unary) => lower_unary_expression(builder, ctx, unary),
+        Expression::UpdateExpression(update) => lower_update_expression(builder, ctx, update),
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
         )),
     }
+}
+
+/// Lowers `!x` / `-x` / `+x` / `~x` / `typeof x` / `void x` into the
+/// accumulator.
+///
+/// Each operator maps to a dedicated single-operand opcode on the
+/// accumulator:
+/// - `!` → [`Opcode::LogicalNot`] (returns a boolean; works on any
+///   value).
+/// - `-` → [`Opcode::Negate`] (int32 wraparound on the current
+///   source subset).
+/// - `+` → [`Opcode::ToNumber`] (identity for int32; coerces other
+///   types once the source surface grows).
+/// - `~` → [`Opcode::BitwiseNot`] (int32 bitwise NOT).
+/// - `typeof` → [`Opcode::TypeOf`].
+/// - `void` → evaluate the argument for its side effects, then
+///   overwrite acc with `undefined`.
+///
+/// `delete` is rejected with `unsupported("delete_unary")` — the
+/// semantics depend on PropertyAccess / global-binding support that
+/// the current source surface hasn't reached yet.
+fn lower_unary_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &UnaryExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    // Evaluate the argument into the accumulator first. The operand
+    // lowering already handles every shape
+    // `lower_return_expression` accepts, including nested unary /
+    // assignment / call expressions, so the operator step below
+    // composes cleanly with any int32-producing subexpression.
+    lower_return_expression(builder, ctx, &expr.argument)?;
+
+    match expr.operator {
+        UnaryOperator::LogicalNot => {
+            builder.emit(Opcode::LogicalNot, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LogicalNot: {err:?}"))
+            })?;
+        }
+        UnaryOperator::UnaryNegation => {
+            builder
+                .emit(Opcode::Negate, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode Negate: {err:?}")))?;
+        }
+        UnaryOperator::UnaryPlus => {
+            builder.emit(Opcode::ToNumber, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode ToNumber: {err:?}"))
+            })?;
+        }
+        UnaryOperator::BitwiseNot => {
+            builder.emit(Opcode::BitwiseNot, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode BitwiseNot: {err:?}"))
+            })?;
+        }
+        UnaryOperator::Typeof => {
+            builder
+                .emit(Opcode::TypeOf, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode TypeOf: {err:?}")))?;
+        }
+        UnaryOperator::Void => {
+            // `void x` — evaluate x for side effects (already done
+            // above), then discard and return undefined.
+            builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaUndefined: {err:?}"))
+            })?;
+        }
+        UnaryOperator::Delete => {
+            return Err(SourceLoweringError::unsupported("delete_unary", expr.span));
+        }
+    }
+    Ok(())
+}
+
+/// Lowers `++x` / `x++` / `--x` / `x--` onto a writable local
+/// binding.
+///
+/// Prefix form (`++x`) bytecode shape:
+///
+/// ```text
+///   Ldar r_x         ; acc = old x
+///   Inc              ; acc = old + 1
+///   Star r_x         ; x = new value (also in acc for composition)
+/// ```
+///
+/// Postfix form (`x++`) bytecode shape:
+///
+/// ```text
+///   Ldar r_x         ; acc = old x
+///   Star r_temp      ; temp = old (preserved for the expression's value)
+///   Inc              ; acc = old + 1
+///   Star r_x         ; x = new value
+///   Ldar r_temp      ; acc = old (the expression result)
+/// ```
+///
+/// The int32 envelope means `ToNumber` coercion is implicit: the
+/// operand is int32 throughout, so `Inc`/`Dec` produces int32 with
+/// wraparound semantics that match `x + 1 | 0` / `x - 1 | 0`. A
+/// future milestone that grows past int32 will need an explicit
+/// `ToNumber` step to preserve JS postfix semantics ("return the
+/// coerced number, write the incremented value").
+///
+/// Rejects:
+/// - non-identifier target → `non_identifier_update_target`;
+/// - unbound identifier → `unbound_identifier`;
+/// - parameter as target → `update_on_param`;
+/// - `const` binding as target → `const_update`;
+/// - in-TDZ binding → `tdz_self_reference`.
+fn lower_update_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &UpdateExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    // 1) Target must be a plain identifier; anything else (member,
+    //    computed, TS-only) is out of scope for M10.
+    let ident = match &expr.argument {
+        SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => ident.as_ref(),
+        _ => {
+            return Err(SourceLoweringError::unsupported(
+                "non_identifier_update_target",
+                expr.span,
+            ));
+        }
+    };
+    let binding = ctx
+        .resolve_identifier(ident.name.as_str())
+        .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", ident.span))?;
+    let target_reg = match binding {
+        BindingRef::Local {
+            reg,
+            initialized: true,
+            is_const: false,
+        } => reg,
+        BindingRef::Local { is_const: true, .. } => {
+            return Err(SourceLoweringError::unsupported("const_update", ident.span));
+        }
+        BindingRef::Local {
+            initialized: false, ..
+        } => {
+            return Err(SourceLoweringError::unsupported(
+                "tdz_self_reference",
+                ident.span,
+            ));
+        }
+        BindingRef::Param { .. } => {
+            return Err(SourceLoweringError::unsupported(
+                "update_on_param",
+                ident.span,
+            ));
+        }
+    };
+
+    let op_opcode = match expr.operator {
+        UpdateOperator::Increment => Opcode::Inc,
+        UpdateOperator::Decrement => Opcode::Dec,
+    };
+    let op_label = match expr.operator {
+        UpdateOperator::Increment => "Inc",
+        UpdateOperator::Decrement => "Dec",
+    };
+
+    // 2) Load old value into acc. Reuses `lower_identifier_read` so
+    //    the emitted `Ldar` also picks up a fresh arithmetic feedback
+    //    slot for M_JIT_C.2 / M_JIT_C.3 consumption.
+    lower_identifier_read(builder, ctx, binding, ident.span)?;
+
+    if expr.prefix {
+        // Prefix: Inc/Dec in place, Star back.
+        builder
+            .emit(op_opcode, &[])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode {op_label}: {err:?}")))?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (prefix update): {err:?}"))
+            })?;
+    } else {
+        // Postfix: spill old to a temp, Inc/Dec, Star back, reload
+        // the spilled old value into acc so the expression's value
+        // is the pre-increment int32. The temp is released once we
+        // reload, matching the LIFO contract callers rely on for
+        // nested calls.
+        let temp = ctx.acquire_temps(1)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Star (postfix old-value spill): {err:?}"
+                ))
+            })
+            .inspect_err(|_| ctx.release_temps(1))?;
+        builder
+            .emit(op_opcode, &[])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode {op_label}: {err:?}")))
+            .inspect_err(|_| ctx.release_temps(1))?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (postfix update): {err:?}"))
+            })
+            .inspect_err(|_| ctx.release_temps(1))?;
+        // Reload old value. No feedback slot attached — this is a
+        // purely mechanical temp reload, not a user-facing read.
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (postfix old reload): {err:?}"))
+            })
+            .inspect_err(|_| ctx.release_temps(1))?;
+        ctx.release_temps(1);
+    }
+    Ok(())
 }
 
 /// Per-operator opcode pair: the Reg-RHS form and the optional
@@ -1679,13 +1899,16 @@ fn apply_binary_op_with_acc_lhs(
             lower_identifier_as_reg_rhs(builder, ctx, encoding, binding, ident.span)
         }
         // Complex RHS shapes — a call, a nested binary, a
-        // parenthesised binary, an assignment expression, etc. The
-        // RHS lowering would clobber acc (which currently holds the
-        // LHS), so we spill LHS to a temp first, then re-stitch.
+        // parenthesised binary, an assignment expression, a unary /
+        // update expression, etc. The RHS lowering would clobber
+        // acc (which currently holds the LHS), so we spill LHS to a
+        // temp first, then re-stitch.
         Expression::CallExpression(_)
         | Expression::BinaryExpression(_)
         | Expression::ParenthesizedExpression(_)
-        | Expression::AssignmentExpression(_) => {
+        | Expression::AssignmentExpression(_)
+        | Expression::UnaryExpression(_)
+        | Expression::UpdateExpression(_) => {
             apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
         }
         other => Err(SourceLoweringError::unsupported(

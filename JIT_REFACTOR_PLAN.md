@@ -443,7 +443,7 @@ guarded emitter partially wired and the invocation smoke test
   cold stencil (572 → 356 B). `bench2_microbench` JIT latency holds
   at 2 ns/inner-iter (benchmark compiles cold, so M_JIT_C.2's shrink
   doesn't show up in that microbench; warm-compile savings live in
-  the unit test). Commit: `_pending_`.
+  the unit test). Commit: `ad3d137`.
 
 ---
 

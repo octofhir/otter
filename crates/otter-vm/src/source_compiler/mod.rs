@@ -532,12 +532,7 @@ fn lower_nested_statement<'a>(
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
             Ok(())
         }
-        Statement::BlockStatement(block) => {
-            for inner in &block.body {
-                lower_nested_statement(builder, ctx, inner)?;
-            }
-            Ok(())
-        }
+        Statement::BlockStatement(block) => lower_block_statement(builder, ctx, block),
         Statement::VariableDeclaration(decl) => Err(SourceLoweringError::unsupported(
             "nested_variable_declaration",
             decl.span,
@@ -547,6 +542,49 @@ fn lower_nested_statement<'a>(
             other.span(),
         )),
     }
+}
+
+/// Lowers a `BlockStatement` with its own lexical scope (M12).
+///
+/// A fresh scope snapshot brackets the block body so any `let` /
+/// `const` declared inside the block pops off the locals stack on
+/// exit. Slot reservations survive via
+/// [`LoweringContext::peak_local_count`], matching the `for`-init
+/// scoping model — bindings that came in between enter and exit
+/// keep their frame slots allocated, so a later sibling block can't
+/// reuse them (which would be visibly wrong if a closure snapshotted
+/// the old slot).
+///
+/// Nested blocks compose naturally: each block pushes its own
+/// snapshot, and the popped-but-reserved slots stack in LIFO order.
+/// `let`/`const` in an `if` / `while` / `for` body is accepted only
+/// through a `{ ... }` wrapper per the JS spec (lexical declarations
+/// in a bare Statement position are a SyntaxError the parser
+/// already rejects).
+///
+/// Non-declaration statements inside the block fall through to
+/// [`lower_nested_statement`] so the full nested-statement surface —
+/// `if` / `while` / `for` / `return` / `break` / `continue` / inner
+/// blocks / expression statements — keeps working unchanged.
+fn lower_block_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    block: &'a oxc_ast::ast::BlockStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    let scope = ctx.snapshot_scope();
+    let mut result = Ok(());
+    for inner in &block.body {
+        let step = match inner {
+            Statement::VariableDeclaration(decl) => lower_let_const_declaration(builder, ctx, decl),
+            _ => lower_nested_statement(builder, ctx, inner),
+        };
+        if let Err(err) = step {
+            result = Err(err);
+            break;
+        }
+    }
+    ctx.restore_scope(scope);
+    result
 }
 
 /// Lowers an `if (test) consequent` (with optional `else alternate`).
@@ -965,6 +1003,22 @@ struct LoweringContext<'a> {
     /// type itself isn't. `enter_loop` / `exit_loop` are the only
     /// mutators.
     loop_labels: RefCell<Vec<LoopLabels>>,
+    /// Stack of `locals.len()` snapshots marking the start of each
+    /// currently-open lexical scope (M12). Pushed by
+    /// [`snapshot_scope`](Self::snapshot_scope) and popped by
+    /// [`restore_scope`](Self::restore_scope).
+    ///
+    /// The innermost scope starts at
+    /// `scope_starts.last().unwrap_or(&0)`. `allocate_local` checks
+    /// for duplicates only within that window, so `let x` inside a
+    /// nested block can legally shadow an outer `let x`.
+    ///
+    /// Function top-scope has `scope_starts` empty (index 0 is
+    /// implicit). The parameter name still participates in the
+    /// top-scope duplicate check — function parameters and
+    /// function-scope `let`/`const` live in the same lexical
+    /// environment per the ES spec.
+    scope_starts: RefCell<Vec<usize>>,
 }
 
 /// `break` / `continue` jump targets for one loop frame. `break_label`
@@ -1011,6 +1065,7 @@ impl<'a> LoweringContext<'a> {
             function_names,
             next_feedback_slot: Cell::new(0),
             loop_labels: RefCell::new(Vec::new()),
+            scope_starts: RefCell::new(Vec::new()),
         }
     }
 
@@ -1147,12 +1202,17 @@ impl<'a> LoweringContext<'a> {
     /// Snapshots the current scope so a later [`restore_scope`] can
     /// pop bindings that came in between the two calls. Used by
     /// [`lower_for_statement`] to scope the for-init `let`/`const`
-    /// to the loop without leaking it to the surrounding function
-    /// scope.
+    /// to the loop, and by [`lower_block_statement`] (M12) to scope
+    /// `let`/`const` inside a nested `{ ... }` to the block.
+    ///
+    /// Also pushes the current `locals.len()` onto `scope_starts` so
+    /// [`allocate_local`](Self::allocate_local) can distinguish
+    /// duplicate bindings in the SAME scope (rejected) from legal
+    /// shadowing of outer-scope names.
     fn snapshot_scope(&self) -> ScopeSnapshot {
-        ScopeSnapshot {
-            len: self.locals.len(),
-        }
+        let len = self.locals.len();
+        self.scope_starts.borrow_mut().push(len);
+        ScopeSnapshot { len }
     }
 
     /// Pops every binding allocated since the matching
@@ -1160,10 +1220,19 @@ impl<'a> LoweringContext<'a> {
     /// [`peak_local_count`](Self::peak_local_count)) so bindings
     /// allocated later don't collide with the popped ones'
     /// addresses.
+    ///
+    /// Also pops the matching `scope_starts` entry so subsequent
+    /// `allocate_local` duplicate checks see the outer scope.
     fn restore_scope(&mut self, snapshot: ScopeSnapshot) {
         debug_assert!(
             snapshot.len <= self.locals.len(),
             "scope snapshot length must not grow",
+        );
+        let popped = self.scope_starts.borrow_mut().pop();
+        debug_assert_eq!(
+            popped,
+            Some(snapshot.len),
+            "scope_starts stack out of sync with scope snapshot",
         );
         self.locals.truncate(snapshot.len);
     }
@@ -1176,8 +1245,16 @@ impl<'a> LoweringContext<'a> {
     /// declaration kind so [`lower_assignment_expression`] can reject
     /// writes to const bindings.
     ///
+    /// The duplicate check (M12) operates on the innermost open
+    /// scope only — a nested `let x` legally shadows an outer
+    /// `let x` or an enclosing-function's `let x`. The function's
+    /// parameter name participates in the top-scope check because
+    /// parameters and function-scope `let`/`const` live in the same
+    /// lexical environment per ES spec.
+    ///
     /// Rejects:
-    /// - duplicate name (already a parameter or another local in scope) →
+    /// - duplicate name in the same scope (another local / the
+    ///   parameter at top scope) →
     ///   `Unsupported { construct: "duplicate_binding" }`;
     /// - register-space exhaustion → `Internal`.
     fn allocate_local(
@@ -1186,7 +1263,14 @@ impl<'a> LoweringContext<'a> {
         is_const: bool,
         span: Span,
     ) -> Result<u16, SourceLoweringError> {
-        if self.param_name == Some(name) || self.locals.iter().any(|l| l.name == name) {
+        let scope_start = self.scope_starts.borrow().last().copied().unwrap_or(0);
+        let same_scope_duplicate = self.locals[scope_start..].iter().any(|l| l.name == name);
+        // Parameters live in the function's outermost lexical scope,
+        // so they collide with a top-scope `let`/`const` of the same
+        // name but NOT with a same-named binding inside a nested
+        // block.
+        let param_collision = scope_start == 0 && self.param_name == Some(name);
+        if same_scope_duplicate || param_collision {
             return Err(SourceLoweringError::unsupported("duplicate_binding", span));
         }
         // The new slot lives at `param_count + locals.len()` (using the

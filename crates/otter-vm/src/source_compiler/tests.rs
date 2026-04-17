@@ -1232,20 +1232,27 @@ fn if_inside_compound_assignment_chain() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn nested_let_inside_if_unsupported() {
-    // M6 has no block scoping. `let x` inside an `if` would either
-    // need its own slot lifetime (block scope) or be hoisted (which
-    // changes observable semantics). Reject until block scoping
-    // lands.
-    let err = compile("function f(n) { if (n > 0) { let x = 1; } return n; }")
-        .expect_err("nested let at M6");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "nested_variable_declaration",
-            ..
-        }
-    ));
+fn let_inside_if_body_is_block_scoped() {
+    // M12: `let x = 1;` inside an `if` body (wrapped in `{}`) is
+    // block-scoped — the binding only exists within the block.
+    // Outside the block, the same name can be reused freely
+    // (FrameLayout reserves the peak slot count so the two
+    // reservations don't collide).
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let r = 0; if (n > 0) { let x = 7; r = x; } return r; }",
+            &[1],
+        ),
+        7,
+    );
+    // `n <= 0` skips the block entirely; `r` stays 0.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let r = 0; if (n > 0) { let x = 7; r = x; } return r; }",
+            &[-1],
+        ),
+        0,
+    );
 }
 
 #[test]
@@ -1452,19 +1459,18 @@ fn while_loop_with_early_return_in_body() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn nested_let_inside_while_unsupported() {
-    // Same rejection as `let` inside `if` — block scoping lands
-    // later. Confirms the `lower_nested_statement` path consistently
-    // refuses both.
-    let err = compile("function f(n) { while (n > 0) { let x = 1; n = n - 1; } return n; }")
-        .expect_err("nested let inside while at M7");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "nested_variable_declaration",
-            ..
-        }
-    ));
+fn let_inside_while_body_is_block_scoped() {
+    // M12: `let` inside a `while` body is block-scoped per iteration
+    // — each iteration starts with a freshly-declared `x`. Updates
+    // to an outer `let` from inside the block are observable.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let s = 0; let i = 0; while (i < n) { let x = i; s = s + x; i = i + 1; } return s; }",
+            &[4],
+        ),
+        // sum 0..3 = 6
+        6,
+    );
 }
 
 #[test]
@@ -1659,33 +1665,27 @@ fn nested_for_loops() {
 }
 
 #[test]
-fn nested_for_with_same_name_unsupported_until_block_scoping() {
-    // Documents the M8 limitation: nested for-init `let`s sharing a
-    // name need lexical-scope tracking (per-scope shadow lookup +
-    // proper `resolve_identifier` walk). Block scoping lands in a
-    // later milestone alongside `let`/`const` inside `if`/`while`
-    // bodies — at that point both this test and the
-    // `nested_let_inside_if_unsupported` neighbour will roll
-    // forward to positives.
-    let err = compile(
-        "function f(n) {
-            let total = 0;
-            for (let i = 0; i < n; i = i + 1) {
+fn nested_for_with_same_name_shadows() {
+    // M12: nested `for (let i = ...; ...)` loops where each init
+    // uses the same name `i` now works — per-for-scope snapshot
+    // gives each loop its own binding, shadowing the outer one
+    // inside the inner body.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) {
+                let total = 0;
                 for (let i = 0; i < n; i = i + 1) {
-                    total = total + 1;
+                    for (let i = 0; i < n; i = i + 1) {
+                        total = total + 1;
+                    }
                 }
-            }
-            return total;
-        }",
-    )
-    .expect_err("nested for-init shadowing at M8");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "duplicate_binding",
-            ..
-        }
-    ));
+                return total;
+            }",
+            &[3],
+        ),
+        // 3 outer × 3 inner = 9.
+        9,
+    );
 }
 
 #[test]
@@ -2436,5 +2436,151 @@ fn break_after_loop_still_rejected() {
             }
         ),
         "unexpected err: {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M12: Block scoping for let / const inside if / while / for / bare blocks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn let_inside_for_body_is_block_scoped() {
+    // M12: `for (let i = ...; ...) { let y = ...; ... }` — the
+    // `y` binding is declared per iteration. Slots don't collide
+    // with the for-init `i` because FrameLayout reserves the peak.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { \
+                 let s = 0; \
+                 for (let i = 0; i < n; i = i + 1) { \
+                     let y = i; \
+                     s = s + y; \
+                 } \
+                 return s; \
+             }",
+            &[4],
+        ),
+        // sum 0..3 = 6
+        6,
+    );
+}
+
+#[test]
+fn bare_block_statement_scopes_let() {
+    // M12: a `{ ... }` at function-body level creates a new scope
+    // for `let`. The binding is popped on block exit; reassigning
+    // the OUTER `x` after the block works fine.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let x = 1; \
+                 { let y = 2; x = x + y; } \
+                 x = x + 10; \
+                 return x; \
+             }",
+            &[],
+        ),
+        13,
+    );
+}
+
+#[test]
+fn nested_blocks_each_have_own_scope() {
+    // Two nested blocks each declare their own `let x`; the inner
+    // one shadows the middle one, which shadows the outer function
+    // `let x`. Each restore_scope pops only the innermost. The
+    // return reads the outer function-scope `x`, which stayed at
+    // its initial value.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let x = 1; \
+                 { \
+                     let x = 2; \
+                     { \
+                         let x = 3; \
+                     } \
+                 } \
+                 return x; \
+             }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn outer_let_assignable_from_inside_block() {
+    // The inner block can reassign an outer `let` (block scope
+    // doesn't block write-access; it just narrows NEW `let`
+    // lifetimes).
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let x = 0; \
+                 { x = 42; } \
+                 return x; \
+             }",
+            &[],
+        ),
+        42,
+    );
+}
+
+#[test]
+fn const_inside_block_rejects_reassignment() {
+    // Scoped `const` retains its const-ness: `const_assignment`
+    // fires on attempted writes inside the block.
+    let err = compile("function f() { { const c = 5; c = 6; } return 0; }")
+        .expect_err("const reassign in block at M12");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "const_assignment",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn let_in_block_not_visible_after_block() {
+    // Reading `y` after its containing block has closed must
+    // surface as an unbound identifier — bindings pop off the
+    // lexical environment on block exit.
+    let err =
+        compile("function f() { { let y = 1; } return y; }").expect_err("use after block at M12");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "unbound_identifier",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn sibling_blocks_reuse_the_same_reserved_slots() {
+    // Two sibling blocks each declare `let t` but don't overlap
+    // at runtime — the second block starts after the first has
+    // popped. The FrameLayout still reserves the slot once (the
+    // peak local count across blocks), so neither clobbers the
+    // outer `s`.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let s = 0; \
+                 { let t = 10; s = s + t; } \
+                 { let t = 20; s = s + t; } \
+                 return s; \
+             }",
+            &[],
+        ),
+        30,
     );
 }

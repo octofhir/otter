@@ -54,7 +54,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [x]    | 54e1339 |
 | M14      | Global reads — `undefined`, `null`, `Infinity`, `NaN`, `globalThis`, plus one anchor builtin namespace.                         | [x]    | 8ca80bd |
 | M15      | `StringLiteral` + string concatenation (`+` on mixed operands).                                                                 | [x]    | bca0df8 |
-| M16      | `ObjectExpression` + `ArrayExpression` literals with int/string values.                                                         | [x]    | _pending_ |
+| M16      | `ObjectExpression` + `ArrayExpression` literals with int/string values.                                                         | [x]    | 13dd2f8 |
 | M17      | Property access: `StaticMemberExpression` (`o.x`), `ComputedMemberExpression` (`o[k]`), read + write.                            | [ ]    |        |
 | M18      | Template literals (simple + interpolated).                                                                                       | [ ]    |        |
 | M19      | `console.log` + minimal console shim — first "hello world" gate.                                                                | [ ]    |        |

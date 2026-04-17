@@ -36,7 +36,7 @@ See [`JIT_REFACTOR_PLAN.md`](./JIT_REFACTOR_PLAN.md) for concrete task lists per
 
 | ID       | Scope                                                                                                                          | Status | Commit |
 |----------|--------------------------------------------------------------------------------------------------------------------------------|--------|--------|
-| M_JIT_A  | Finish aarch64 tag-guarded v2 baseline: `eor/tst/b.ne` on every int32 load, bailout prologue, invocation through `TierUpHook::execute_cached`, widen analyzer coverage. | [ ]    |        |
+| M_JIT_A  | Finish aarch64 tag-guarded v2 baseline: `eor/tst/b.ne` on every int32 load, bailout prologue, invocation through `TierUpHook::execute_cached`, widen analyzer coverage. | [x]    | _pending_ |
 | M_JIT_B  | x86_64 baseline backend — port the v2 template-baseline stencil (same op coverage, tag guards, bailout model).                   | [ ]    |        |
 | M_JIT_C  | (deferred) OSR into hot loops + speculative int32-trust elision from persistent arithmetic feedback.                             | [ ]    |        |
 
@@ -110,8 +110,8 @@ cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 | Scenario                          | Otter interp | Otter JIT | bun | node |
 |-----------------------------------|--------------|-----------|-----|------|
 | `f(42)` (10⁶ iter, aarch64)       | 496 ns/iter  | —         | —   | —    |
-| `bench2.ts sum(10⁶)` per-call (50× warmup-100, aarch64 interp) | 416 ms/call | — | — | — |
-| `bench2.ts sum(10⁶)` per-inner-iter (aarch64 interp) | 416 ns/iter | — | — | — |
+| `bench2.ts sum(10⁶)` per-call (50× warmup-100, aarch64) | 416 ms/call | 2.51 ms/call | — | — |
+| `bench2.ts sum(10⁶)` per-inner-iter (aarch64) | 416 ns/iter | 2 ns/iter | — | — |
 
 ## Notes
 

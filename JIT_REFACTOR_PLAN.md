@@ -1,11 +1,11 @@
 # Otter JIT Refactor Plan
 
-> Status (2026-04-17): M0–M9 of the v2 migration have shipped. The source
-> compiler, bytecode, dispatcher, and baseline JIT all live on a single
-> v2 pipeline — v1 was retired in M0 (`eeb84c8`). The aarch64 baseline
-> stencil exists but runs real JS only in trust-int32 mode; the next
-> JIT milestone (`M_JIT_A`) wires the tag-guarded variant through the
-> production `TierUpHook`.
+> Status (2026-04-17): M0–M9 of the v2 migration have shipped, and
+> `M_JIT_A` has now landed on top: the aarch64 baseline runs real
+> source-compiled JS through `TierUpHook::execute_cached`, uses per-load
+> int32 tag guards + bailout pads, and caches recursive `CallDirect`
+> bodies as deopt-friendly template stencils. The next JIT milestone is
+> `M_JIT_B` (x86_64 backend parity).
 >
 > Rule: this document tracks the **design direction** behind the JIT,
 > not the feature roadmap. Feature milestones live in `V2_MIGRATION.md`;
@@ -31,37 +31,32 @@
   `ThrowConstAssign`/`AssertConstructor`).
 - **v2 baseline JIT** ([`crates/otter-jit/src/baseline/mod.rs`](crates/otter-jit/src/baseline/mod.rs))
   — acc-aware `TemplateInstruction` IR + x21-pinned aarch64 emitter.
-  Sum-loop stencil at ≈280 bytes in trust-int32 mode (≈532 B with
-  partial tag guards); 3× shrink vs the retired v1 baseline. Fed by
-  [`crates/otter-jit/src/pipeline.rs`](crates/otter-jit/src/pipeline.rs)
-  which probes `analyze_template_candidate` + `emit_template_stencil`
-  before any fallback.
+  The shipped path now translates bytecode-visible registers through the
+  frame's hidden-slot base, tag-guards every int32 load, writes
+  `(bailout_pc, bailout_reason, accumulator_raw)` on side exits, and
+  treats `CallDirect` bodies as cacheable deopt boundaries so recursive
+  functions still get template stencils. `bench2.ts sum(10⁶)` measures
+  **2 ns/inner-iter** in the release microbench.
 - **Tier-up plumbing**: `DefaultTierUpHook` in
   [`crates/otter-jit/src/tier_up_hook.rs`](crates/otter-jit/src/tier_up_hook.rs)
   is installed into every `OtterRuntime`. Inner calls routed through
   `CallDirect` (as of M9) decrement the JSC hotness budget and compile
-  synchronously on exhaustion.
+  synchronously on exhaustion; the smoke path now runs through the real
+  `otter` CLI and observes JIT telemetry for the hot inner function.
 
 ### What's still latent
 
-The aarch64 baseline exists but doesn't serve real code yet:
+The remaining JIT work is now downstream of `M_JIT_A`:
 
-1. **No tag guards in the shipped v2 emitter path.** Trust-int32 code
-   would corrupt on first non-int32 input. A partially-guarded variant
-   is in the tree (`AccState::{Int32, Raw}` tracker + bailout pads) but
-   the `sum()` shape diverges once `LdaThis`/`LdaCurrentClosure`/
-   `ToNumber` enter the analyzer, so those arms are commented out.
-2. **Direct stencil invocation hangs the test harness on Apple Silicon**
-   (UE zombies — documented macOS `MAP_JIT` / `pthread_jit_write_protect_np`
-   hazard). Production invocation through `TierUpHook::execute_cached`
-   is fine, but the in-process smoke test is gated `#[ignore]` until
-   `M_JIT_A` re-enables it.
-3. **Analyzer coverage** today lands `Ldar` / `Star` / `Mov` / `LdaSmi`
-   / constant loads / `Add` / `Sub` / `Mul` / `BitwiseOr` / `*Smi`
-   variants / `Test{LessThan, GreaterThan, LessThanOrEqual,
-   GreaterThanOrEqual, EqualStrict}` / `Jump` / `JumpIfToBooleanFalse`
-   / `Return`. Missing for an M9-shape function: `Inc` / `Dec` /
-   `Negate` / `BitwiseNot` / the remaining Smi variants.
+1. **x86_64 backend parity is still missing.** `M_JIT_B` ports the same
+   template-baseline subset, guard model, and bailout contract to the
+   x86_64 assembler.
+2. **Direct in-process stencil calls from Rust tests on Apple Silicon
+   remain hostile.** The regression-safe smoke coverage therefore uses
+   the real `otter` subprocess rather than reintroducing raw harness
+   calls; production CLI/runtime execution is the canonical path.
+3. **OSR + speculative int32-trust remain deferred.** Back-edge entry
+   and feedback-driven guard elision are still the `M_JIT_C` work.
 
 ### Benchmarks (M2 + M7)
 
@@ -69,6 +64,9 @@ The aarch64 baseline exists but doesn't serve real code yet:
   iterations via `Interpreter::execute_with_runtime`.
 - **`bench2.ts sum(10⁶)` interpreter**: **416 ns/inner-iter** (≈ 416
   ms/call) on aarch64, 50 calls × 10⁶ inner iters with 100-call warmup.
+- **`bench2.ts sum(10⁶)` JIT**: **2 ns/inner-iter** (≈ 2.51 ms/call)
+  on aarch64 via `DefaultTierUpHook::execute_cached` after
+  `try_compile(sum)`.
 
 Both benchmarks live in
 [`crates/otter-jit/src/baseline/mod.rs::tests`](crates/otter-jit/src/baseline/mod.rs)
@@ -79,14 +77,15 @@ cargo test -p otter-jit --release -- --ignored m1_microbench     --nocapture
 cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 ```
 
-Matching JIT rows stay open until `M_JIT_A` lands.
+The aarch64 JIT rows above are the `M_JIT_A` completion marker; the next
+benchmark gap is x86_64 parity (`M_JIT_B`).
 
 ### Regression status (post-M9)
 
 | Command | Pass / Total |
 | --- | --- |
 | `cargo test -p otter-vm --lib` | **371 / 371** |
-| `cargo test -p otter-jit --lib` | **16 / 16** (3 ignored — `stencil_invocation_smoke` + `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib` | **21 / 21** (2 ignored — `m1_microbench` + `bench2_microbench`) |
 | `cargo build --workspace` | green |
 | `cargo clippy --workspace --all-targets -- -D warnings` | green |
 | `cargo fmt --all --check` | green |
@@ -303,6 +302,16 @@ guarded emitter partially wired and the invocation smoke test
   `apply_binary_op_with_complex_rhs` fallback for call/nested-binary RHS
   (`n * fact(n - 1)`). Tier-up now fires on inner calls via `CallDirect`.
   16 new unit tests. Commit: `f6ea6a5`.
+- 2026-04-17: **M_JIT_A landed** — the aarch64 template baseline now
+  translates bytecode-visible registers through the hidden-slot base,
+  guards every int32 load with `eor / tst / b.ne`, writes
+  `(bailout_pc, bailout_reason, accumulator_raw)` on every side exit,
+  and keeps recursive `CallDirect` bodies cacheable by lowering them to
+  deopt boundaries. `stencil_invocation_smoke` now exercises the real
+  `otter` CLI path, `fact(7)` caches as
+  `CompiledCodeOrigin::TemplateBaseline`, and `bench2_microbench`
+  reports **2 ns/inner-iter** (≈ 2.51 ms/call) on Apple Silicon.
+  Commit: `_pending_`.
 
 ---
 

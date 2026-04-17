@@ -20,7 +20,7 @@
 //! ```
 
 use otter_vm::bytecode::{InstructionIter, Opcode, Operand};
-use otter_vm::module::Function;
+use otter_vm::module::{Function, FunctionIndex};
 
 /// An operation in the v2 baseline IR. Each op reads / writes the
 /// accumulator (held in x21 by the Phase 4.2 emitter) and at most one
@@ -118,6 +118,14 @@ pub enum TemplateInstruction {
     /// accumulator is already a JS Number). On `Raw` state we bail out
     /// to the interpreter for the coercion-correct path.
     ToNumberAcc,
+    /// Direct-call boundary compiled as an unconditional deopt. This
+    /// keeps the surrounding hot prefix JIT-eligible while the
+    /// interpreter executes the actual call sequence.
+    CallDirect {
+        callee: FunctionIndex,
+        arg_base: u16,
+        arg_count: u16,
+    },
 }
 
 /// Comparison kind carried across `CompareAcc` → `JumpIfCompareFalse`.
@@ -136,6 +144,12 @@ pub enum CompareKind {
 pub struct TemplateProgram {
     /// Function name for diagnostics / telemetry.
     pub function_name: String,
+    /// Absolute frame-slot offset of bytecode-visible register `r0`.
+    /// Source-compiled functions reserve hidden slots (for `this`,
+    /// future closure metadata, etc.) ahead of the user-visible window,
+    /// so the emitter must translate bytecode registers through this
+    /// base before touching the shared register file.
+    pub user_visible_base: u16,
     /// Total register count in the frame layout — drives the `x0`
     /// (register_base) offset math in the emitter.
     pub register_count: u16,
@@ -183,7 +197,8 @@ pub enum TemplateCompileError {
 /// `Inc`/`Dec`/`Negate`/`BitwiseNot`,
 /// `TestLessThan`/`TestGreaterThan`/`TestLessThanOrEqual`/
 /// `TestGreaterThanOrEqual`/`TestEqualStrict`,
-/// `Jump`, `JumpIfToBooleanFalse`, `Return`.
+/// `Jump`, `JumpIfToBooleanFalse`, `CallDirect` (as a deopt boundary),
+/// `Return`.
 ///
 /// All other opcodes surface `UnsupportedOpcode` and prevent the
 /// function from entering the v2 baseline path.
@@ -245,6 +260,7 @@ pub fn analyze_template_candidate(
             .name()
             .map(str::to_string)
             .unwrap_or_else(|| "<anonymous>".to_string()),
+        user_visible_base: function.frame_layout().user_visible_start(),
         register_count: function.frame_layout().register_count(),
         instructions,
         byte_pcs,
@@ -413,6 +429,15 @@ fn lower_raw(
         Opcode::LdaThis => Ok(TemplateInstruction::LdaThis),
         Opcode::LdaCurrentClosure => Ok(TemplateInstruction::LdaCurrentClosure),
         Opcode::ToNumber => Ok(TemplateInstruction::ToNumberAcc),
+        Opcode::CallDirect => {
+            let callee = idx_u32(&r.operands, 0, bp)?;
+            let (arg_base, arg_count) = reg_list_u16(&r.operands, 1, bp)?;
+            Ok(TemplateInstruction::CallDirect {
+                callee: FunctionIndex(callee),
+                arg_base,
+                arg_count,
+            })
+        }
         other => Err(TemplateCompileError::UnsupportedOpcode {
             byte_pc: bp,
             opcode: other,
@@ -451,6 +476,42 @@ fn jump_off(ops: &[Operand], pos: usize, byte_pc: u32) -> Result<i32, TemplateCo
         _ => Err(TemplateCompileError::OperandKindMismatch {
             byte_pc,
             expected: "JumpOff",
+        }),
+    }
+}
+
+fn idx_u32(ops: &[Operand], pos: usize, byte_pc: u32) -> Result<u32, TemplateCompileError> {
+    match ops.get(pos) {
+        Some(Operand::Idx(v)) => Ok(*v),
+        _ => Err(TemplateCompileError::OperandKindMismatch {
+            byte_pc,
+            expected: "Idx",
+        }),
+    }
+}
+
+fn reg_list_u16(
+    ops: &[Operand],
+    pos: usize,
+    byte_pc: u32,
+) -> Result<(u16, u16), TemplateCompileError> {
+    match ops.get(pos) {
+        Some(Operand::RegList { base, count }) => {
+            let base =
+                u16::try_from(*base).map_err(|_| TemplateCompileError::OperandKindMismatch {
+                    byte_pc,
+                    expected: "RegList base fits in u16",
+                })?;
+            let count =
+                u16::try_from(*count).map_err(|_| TemplateCompileError::OperandKindMismatch {
+                    byte_pc,
+                    expected: "RegList count fits in u16",
+                })?;
+            Ok((base, count))
+        }
+        _ => Err(TemplateCompileError::OperandKindMismatch {
+            byte_pc,
+            expected: "RegList",
         }),
     }
 }
@@ -565,8 +626,12 @@ fn emit_template_stencil_aarch64(
     use crate::arch::CodeBuffer;
     use crate::arch::aarch64::{Assembler, Cond, Reg};
 
-    fn slot_offset(slot: u16) -> Result<u32, TemplateEmitError> {
-        let byte_offset = u32::from(slot) * 8;
+    fn slot_offset(program: &TemplateProgram, slot: u16) -> Result<u32, TemplateEmitError> {
+        let absolute_slot = program
+            .user_visible_base
+            .checked_add(slot)
+            .ok_or(TemplateEmitError::RegisterSlotOutOfRange { slot })?;
+        let byte_offset = u32::from(absolute_slot) * 8;
         if byte_offset > 4095 * 8 {
             return Err(TemplateEmitError::RegisterSlotOutOfRange { slot });
         }
@@ -703,7 +768,7 @@ fn emit_template_stencil_aarch64(
                 acc_state = AccState::Int32;
             }
             TemplateInstruction::Star { reg } => {
-                store_accumulator(&mut asm, acc_state, slot_offset(*reg)?);
+                store_accumulator(&mut asm, acc_state, slot_offset(program, *reg)?);
                 // Star doesn't touch x21.
             }
             TemplateInstruction::Ldar { reg } => {
@@ -713,7 +778,7 @@ fn emit_template_stencil_aarch64(
                 load_int32_guarded(
                     &mut asm,
                     Reg::X21,
-                    slot_offset(*reg)?,
+                    slot_offset(program, *reg)?,
                     byte_pc,
                     AccState::Raw,
                     &mut bailout_patches,
@@ -733,7 +798,7 @@ fn emit_template_stencil_aarch64(
                     load_int32_guarded(
                         &mut asm,
                         Reg::X10,
-                        slot_offset(*rhs)?,
+                        slot_offset(program, *rhs)?,
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
@@ -755,7 +820,7 @@ fn emit_template_stencil_aarch64(
                     load_int32_guarded(
                         &mut asm,
                         Reg::X10,
-                        slot_offset(*rhs)?,
+                        slot_offset(program, *rhs)?,
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
@@ -777,7 +842,7 @@ fn emit_template_stencil_aarch64(
                     load_int32_guarded(
                         &mut asm,
                         Reg::X10,
-                        slot_offset(*rhs)?,
+                        slot_offset(program, *rhs)?,
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
@@ -799,7 +864,7 @@ fn emit_template_stencil_aarch64(
                     load_int32_guarded(
                         &mut asm,
                         Reg::X10,
-                        slot_offset(*rhs)?,
+                        slot_offset(program, *rhs)?,
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
@@ -864,7 +929,7 @@ fn emit_template_stencil_aarch64(
                     load_int32_guarded(
                         &mut asm,
                         Reg::X10,
-                        slot_offset(*rhs)?,
+                        slot_offset(program, *rhs)?,
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
@@ -970,8 +1035,8 @@ fn emit_template_stencil_aarch64(
             }
             TemplateInstruction::Mov { dst, src } => {
                 // Raw register-to-register copy — doesn't touch x21.
-                asm.ldr_u64_imm(Reg::X10, Reg::X9, slot_offset(*src)?);
-                asm.str_u64_imm(Reg::X10, Reg::X9, slot_offset(*dst)?);
+                asm.ldr_u64_imm(Reg::X10, Reg::X9, slot_offset(program, *src)?);
+                asm.str_u64_imm(Reg::X10, Reg::X9, slot_offset(program, *dst)?);
             }
             TemplateInstruction::IncAcc => {
                 if acc_state != AccState::Int32 {
@@ -1121,6 +1186,19 @@ fn emit_template_stencil_aarch64(
                     );
                 }
                 // Int32: no-op (already a Number).
+            }
+            TemplateInstruction::CallDirect {
+                callee: _,
+                arg_base: _,
+                arg_count: _,
+            } => {
+                emit_unconditional_bailout(
+                    &mut asm,
+                    byte_pc,
+                    crate::BailoutReason::Unsupported as u32,
+                    acc_state,
+                    &mut bailout_patches,
+                );
             }
         }
         acc_states.push(acc_state);
@@ -1314,9 +1392,33 @@ fn emit_template_stencil_aarch64(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_cache;
+    use crate::code_memory::CompiledCodeOrigin;
+    use crate::tier_up_hook::DefaultTierUpHook;
     use otter_vm::bytecode::BytecodeBuilder;
     use otter_vm::frame::FrameLayout;
-    use otter_vm::module::Function;
+    use otter_vm::interpreter::{TierUpExecResult, TierUpHook};
+    use otter_vm::module::{Function, FunctionIndex};
+    use otter_vm::source_compiler::ModuleCompiler;
+    use otter_vm::value::RegisterValue;
+    use otter_vm::{Interpreter, RuntimeState};
+    use oxc_span::SourceType;
+
+    fn compile_source_module(source: &str, url: &str) -> otter_vm::module::Module {
+        ModuleCompiler::new()
+            .compile(source, url, SourceType::default())
+            .expect("source must compile")
+    }
+
+    fn register_window(function: &Function, args: &[i32]) -> Vec<RegisterValue> {
+        let mut registers =
+            vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+        let hidden = usize::from(function.frame_layout().hidden_count());
+        for (i, arg) in args.iter().enumerate() {
+            registers[hidden + i] = RegisterValue::from_i32(*arg);
+        }
+        registers
+    }
 
     /// Build a v2 function containing the sum-loop pattern and verify
     /// the analyzer lowers it to the expected sequence. Exercises all
@@ -1412,6 +1514,87 @@ mod tests {
             Err(TemplateCompileError::MissingBytecode) => {}
             other => panic!("expected MissingBytecode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn analyzer_accepts_unary_int32_ops() {
+        let mut b = BytecodeBuilder::new();
+        b.emit(Opcode::LdaSmi, &[Operand::Imm(7)]).unwrap();
+        b.emit(Opcode::Inc, &[]).unwrap();
+        b.emit(Opcode::Dec, &[]).unwrap();
+        b.emit(Opcode::Negate, &[]).unwrap();
+        b.emit(Opcode::BitwiseNot, &[]).unwrap();
+        b.emit(Opcode::Return, &[]).unwrap();
+        let v2 = b.finish().unwrap();
+        let layout = FrameLayout::new(0, 0, 0, 0).unwrap();
+        let function = Function::with_empty_tables(Some("unary"), layout, v2);
+
+        let program = analyze_template_candidate(&function).expect("analyze unary ops");
+        assert_eq!(
+            program.instructions,
+            vec![
+                TemplateInstruction::LdaI32 { imm: 7 },
+                TemplateInstruction::IncAcc,
+                TemplateInstruction::DecAcc,
+                TemplateInstruction::NegateAcc,
+                TemplateInstruction::BitNotAcc,
+                TemplateInstruction::ReturnAcc,
+            ]
+        );
+    }
+
+    #[test]
+    fn analyzer_accepts_smi_immediate_ops() {
+        let mut b = BytecodeBuilder::new();
+        b.emit(Opcode::LdaSmi, &[Operand::Imm(3)]).unwrap();
+        b.emit(Opcode::MulSmi, &[Operand::Imm(4)]).unwrap();
+        b.emit(Opcode::BitwiseAndSmi, &[Operand::Imm(15)]).unwrap();
+        b.emit(Opcode::ShlSmi, &[Operand::Imm(2)]).unwrap();
+        b.emit(Opcode::ShrSmi, &[Operand::Imm(1)]).unwrap();
+        b.emit(Opcode::Return, &[]).unwrap();
+        let v2 = b.finish().unwrap();
+        let layout = FrameLayout::new(0, 0, 0, 0).unwrap();
+        let function = Function::with_empty_tables(Some("smi_ops"), layout, v2);
+
+        let program = analyze_template_candidate(&function).expect("analyze smi ops");
+        assert_eq!(
+            program.instructions,
+            vec![
+                TemplateInstruction::LdaI32 { imm: 3 },
+                TemplateInstruction::MulAccI32 { imm: 4 },
+                TemplateInstruction::BitAndAccI32 { imm: 15 },
+                TemplateInstruction::ShlAccI32 { imm: 2 },
+                TemplateInstruction::ShrAccI32 { imm: 1 },
+                TemplateInstruction::ReturnAcc,
+            ]
+        );
+    }
+
+    #[test]
+    fn analyzer_accepts_call_direct_as_deopt_boundary() {
+        let mut b = BytecodeBuilder::new();
+        b.emit(
+            Opcode::CallDirect,
+            &[Operand::Idx(1), Operand::RegList { base: 2, count: 1 }],
+        )
+        .unwrap();
+        b.emit(Opcode::Return, &[]).unwrap();
+        let v2 = b.finish().unwrap();
+        let layout = FrameLayout::new(0, 0, 0, 0).unwrap();
+        let function = Function::with_empty_tables(Some("caller"), layout, v2);
+
+        let program = analyze_template_candidate(&function).expect("analyze call-direct");
+        assert_eq!(
+            program.instructions,
+            vec![
+                TemplateInstruction::CallDirect {
+                    callee: FunctionIndex(1),
+                    arg_base: 2,
+                    arg_count: 1,
+                },
+                TemplateInstruction::ReturnAcc,
+            ]
+        );
     }
 
     /// Emit a stencil for the sum-loop program and verify the byte
@@ -1519,28 +1702,98 @@ mod tests {
         );
     }
 
-    /// Phase 4.3 end-to-end invocation is deferred pending on-hardware
-    /// debugging. Even a trivial `LdaSmi 42; Return` stencil — whose
-    /// disassembly structurally mirrors the production v1 template
-    /// baseline epilogue — hangs the Rust test harness on the call,
-    /// leaving UE (uninterruptible-exiting) zombie processes behind.
-    /// Possible causes (needs lldb to narrow):
-    ///   * macOS MAP_JIT / `pthread_jit_write_protect_np` flip missing
-    ///     around the call site — the memory is mapped X but not in
-    ///     the thread's current-execute state.
-    ///   * Stack alignment drift from a prologue variant `push_x19_lr_32`
-    ///     was not designed for this call convention.
-    ///   * Signal-handler interaction specific to the test harness.
-    ///
-    /// The emitter + analyzer + disassembly coverage above already
-    /// pins the compiled bytes; Phase 4.4 (guarded variant + proper
-    /// tier-up-hook wiring) will thread the v2 stencil through the
-    /// production `TierUpHook::execute_cached` path which has the
-    /// MAP_JIT write-protect flips in place and has been proven by v1.
-    #[ignore = "Phase 4.3 end-to-end invocation deferred to Phase 4.4 with tier-up hook wiring"]
+    /// End-to-end smoke test that routes a source-compiled JS function
+    /// through the production `otter` CLI, which in turn executes the
+    /// hot inner function via `DefaultTierUpHook::execute_cached`.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn stencil_invocation_smoke() {}
+    fn stencil_invocation_smoke() {
+        use std::fs;
+        use std::process::Command;
+
+        let script_path = std::env::temp_dir().join("otter-stencil-invocation-smoke.js");
+        let script = "function sum(n) { \
+                          let s = 0; \
+                          let i = 0; \
+                          while (i < n) { \
+                              s = (s + i) | 0; \
+                              i = i + 1; \
+                          } \
+                          return s; \
+                      } \
+                      function main() { \
+                          let i = 0; \
+                          let out = 0; \
+                          while (i < 120) { \
+                              out = sum(1000); \
+                              i = i + 1; \
+                          } \
+                          return out; \
+                      }";
+        fs::write(&script_path, script).expect("write smoke script");
+
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "-p",
+                "otterjs",
+                "--",
+                "--dump-jit-stats",
+                "run",
+                script_path.to_str().expect("utf8 temp path"),
+            ])
+            .output()
+            .expect("run otter smoke script");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "otter smoke run failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr,
+        );
+        assert!(
+            stderr.contains("sum"),
+            "expected telemetry to mention compiled sum():\n{stderr}",
+        );
+        assert!(
+            stderr.contains("Native ratio"),
+            "expected telemetry execution summary:\n{stderr}",
+        );
+
+        let _ = fs::remove_file(&script_path);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn recursion_factorial_caches_template_baseline_entry() {
+        code_cache::clear();
+
+        let module = compile_source_module(
+            "function fact(n) { \
+                 if (n === 0) { return 1; } \
+                 return n * fact(n - 1); \
+             } \
+             function main() { return fact(7); }",
+            "fact.js",
+        );
+        let fact = module.function(FunctionIndex(0)).expect("fact function");
+        let fact_ptr = fact as *const Function;
+
+        let mut runtime = RuntimeState::new();
+        let hook = DefaultTierUpHook;
+        assert!(hook.try_compile(
+            &module,
+            FunctionIndex(0),
+            (&mut runtime as *mut RuntimeState).cast::<()>(),
+        ));
+        assert_eq!(
+            code_cache::origin_of(fact_ptr),
+            Some(CompiledCodeOrigin::TemplateBaseline),
+        );
+
+        code_cache::clear();
+    }
 
     // -------------------------------------------------------------------
     // M2: stencil disassembly sanity + interpreter microbenchmark.
@@ -1560,17 +1813,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn m2_stencil_disassembly_sanity() {
-        use otter_vm::module::FunctionIndex;
-        use otter_vm::source_compiler::ModuleCompiler;
-        use oxc_span::SourceType;
-
-        let module = ModuleCompiler::new()
-            .compile(
-                "function f(n) { return n + 1; }",
-                "f.js",
-                SourceType::default(),
-            )
-            .expect("M1 source must compile");
+        let module = compile_source_module("function f(n) { return n + 1; }", "f.js");
         let function = module
             .function(FunctionIndex(0))
             .expect("module has entry function");
@@ -1692,20 +1935,9 @@ mod tests {
     #[ignore = "M1 microbenchmark — run manually via `--ignored m1_microbench --nocapture`"]
     #[test]
     fn m1_microbench() {
-        use otter_vm::module::FunctionIndex;
-        use otter_vm::source_compiler::ModuleCompiler;
-        use otter_vm::value::RegisterValue;
-        use otter_vm::{Interpreter, RuntimeState};
-        use oxc_span::SourceType;
         use std::time::Instant;
 
-        let module = ModuleCompiler::new()
-            .compile(
-                "function f(n) { return n + 1; }",
-                "f.js",
-                SourceType::default(),
-            )
-            .expect("M1 source must compile");
+        let module = compile_source_module("function f(n) { return n + 1; }", "f.js");
         let function = module
             .function(FunctionIndex(0))
             .expect("module has entry function");
@@ -1757,31 +1989,28 @@ mod tests {
     /// Microbenchmark for the M7 bench2 sum-loop — the canonical
     /// int32 accumulator loop reserved for M7's full benchmark vs
     /// `bun` and `node` (see `V2_MIGRATION.md`). Measures the
-    /// per-call latency of `sum(1_000_000)` through the v2
-    /// interpreter on a persistent `RuntimeState` after a
-    /// 100-iteration warmup, and prints a `bench2 interp:` line for
-    /// the V2_MIGRATION.md tracker.
+    /// per-call latency of `sum(1_000_000)` first through the v2
+    /// interpreter, then through a cached `DefaultTierUpHook`
+    /// `execute_cached` entry, printing both `bench2 interp:` and
+    /// `bench2 jit:` rows for the V2_MIGRATION.md tracker.
     ///
     /// Invoke with:
     /// ```text
     /// cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
     /// ```
     ///
-    /// JIT-side measurement is intentionally skipped this session
-    /// for the same reason as `m1_microbench`: top-level
-    /// `execute_with_runtime` doesn't trigger the JSC tier-up hook
-    /// (which fires on inner `CallClosure` boundaries), and the v2
-    /// source compiler does not yet emit calls (lands at M9).
-    /// Direct stencil invocation remains the documented macOS hazard.
+    /// The JIT half compiles the source-compiled `sum()` helper via
+    /// `DefaultTierUpHook::try_compile`, then times
+    /// `DefaultTierUpHook::execute_cached` directly so the benchmark
+    /// measures the production entry path without reintroducing raw
+    /// stencil calls from the harness.
     #[cfg(target_arch = "aarch64")]
     #[ignore = "M7 bench2 microbench — run manually via `--ignored bench2_microbench --nocapture`"]
     #[test]
     fn bench2_microbench() {
         use otter_vm::module::FunctionIndex;
-        use otter_vm::source_compiler::ModuleCompiler;
         use otter_vm::value::RegisterValue;
         use otter_vm::{Interpreter, RuntimeState};
-        use oxc_span::SourceType;
         use std::time::Instant;
 
         // Canonical M7 source (see V2_MIGRATION.md), written with
@@ -1797,9 +2026,7 @@ mod tests {
                           } \
                           return s; \
                       }";
-        let module = ModuleCompiler::new()
-            .compile(source, "bench2.ts", SourceType::default())
-            .expect("M7 source must compile");
+        let module = compile_source_module(source, "bench2.ts");
         let function = module
             .function(FunctionIndex(0))
             .expect("module has entry function");
@@ -1857,5 +2084,67 @@ mod tests {
              {} ms total over {CALLS} calls × {N} iter, acc={acc})",
             elapsed.as_millis(),
         );
+
+        code_cache::clear();
+        let mut runtime = RuntimeState::new();
+        let hook = DefaultTierUpHook;
+        assert!(hook.try_compile(
+            &module,
+            FunctionIndex(0),
+            (&mut runtime as *mut RuntimeState).cast::<()>(),
+        ));
+
+        let mut jit_registers = register_window(function, &[N]);
+        for _ in 0..WARMUP_CALLS {
+            match hook.execute_cached(
+                &module,
+                FunctionIndex(0),
+                jit_registers.as_mut_ptr(),
+                jit_registers.len(),
+                RegisterValue::undefined().raw_bits(),
+                (&mut runtime as *mut RuntimeState).cast::<()>(),
+                std::ptr::null(),
+            ) {
+                TierUpExecResult::Return(_) => {}
+                other => panic!("warmup JIT execute failed: {other:?}"),
+            }
+        }
+
+        let jit_started = Instant::now();
+        let mut jit_acc: i64 = 0;
+        for _ in 0..CALLS {
+            jit_registers[hidden] = RegisterValue::from_i32(N);
+            match hook.execute_cached(
+                &module,
+                FunctionIndex(0),
+                jit_registers.as_mut_ptr(),
+                jit_registers.len(),
+                RegisterValue::undefined().raw_bits(),
+                (&mut runtime as *mut RuntimeState).cast::<()>(),
+                std::ptr::null(),
+            ) {
+                TierUpExecResult::Return(value) => {
+                    jit_acc = jit_acc.wrapping_add(i64::from(value.as_i32().unwrap_or(0)));
+                }
+                other => panic!("measured JIT execute failed: {other:?}"),
+            }
+        }
+        let jit_elapsed = jit_started.elapsed();
+        assert_ne!(jit_acc, 0, "JIT sum returned zero unexpectedly");
+
+        let jit_total_ns = jit_elapsed.as_nanos();
+        let jit_per_call_ns = jit_total_ns / u128::from(CALLS);
+        let jit_per_inner_iter_ns = jit_total_ns / total_inner_iters;
+        println!(
+            "bench2 jit: {jit_per_call_ns} ns/call ({jit_per_inner_iter_ns} ns/inner-iter, \
+             {} ms total over {CALLS} calls × {N} iter, acc={jit_acc})",
+            jit_elapsed.as_millis(),
+        );
+        assert!(
+            jit_per_inner_iter_ns < per_inner_iter_ns,
+            "JIT bench2 should beat interpreter: jit={jit_per_inner_iter_ns} ns/iter, interp={per_inner_iter_ns} ns/iter",
+        );
+
+        code_cache::clear();
     }
 }

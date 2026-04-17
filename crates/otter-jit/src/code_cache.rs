@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::Tier;
-use crate::code_memory::CompiledFunction;
+use crate::code_memory::{CompiledCodeOrigin, CompiledFunction};
 use crate::telemetry::CodeCacheStats;
 
 /// Key for the code cache: raw pointer to the bytecode Function.
@@ -135,6 +135,18 @@ pub fn tier_of(func_ptr: *const otter_vm::Function) -> Option<Tier> {
             .entries
             .get(&(func_ptr as usize))
             .map(|e| e.tier)
+    })
+}
+
+/// Get the code origin of a cached function.
+#[must_use]
+pub fn origin_of(func_ptr: *const otter_vm::Function) -> Option<CompiledCodeOrigin> {
+    CACHE.with(|cache| {
+        cache
+            .borrow()
+            .entries
+            .get(&(func_ptr as usize))
+            .map(|e| e.compiled.origin)
     })
 }
 

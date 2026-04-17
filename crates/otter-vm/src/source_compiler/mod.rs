@@ -6,13 +6,16 @@
 //! current compilation and drives the staged lowering: parse → AST
 //! shape check → bytecode emit → `Module`.
 //!
-//! # Current state (M7)
+//! # Current state (M9)
 //!
-//! The compiler accepts a **single** top-level `FunctionDeclaration`
-//! and lowers a narrow slice of its body. Supported surface:
+//! The compiler accepts one or more top-level `FunctionDeclaration`s
+//! and lowers a narrow slice of each body. Supported surface:
 //!
-//! - Program with exactly one statement, and that statement is a
-//!   `FunctionDeclaration`.
+//! - Program is one or more `FunctionDeclaration`s. The **last**
+//!   declaration becomes `Module::entry` (conventional `main` at the
+//!   bottom). Functions can call each other in any order — names are
+//!   collected before any body is lowered, so forward references
+//!   work like JS function-declaration hoisting.
 //! - Function: named (Identifier), not async, not a generator, 0 or 1
 //!   parameters. The parameter must be a plain identifier — no
 //!   destructuring, no default, no rest, no type annotation.
@@ -60,6 +63,14 @@
 //!     register without a scratch slot.
 //!   - `AssignmentExpression` (so `return x = 5;` works the same as
 //!     the statement form).
+//!   - `CallExpression` whose callee is the name of a top-level
+//!     `FunctionDeclaration` in the same module. Args are
+//!     materialized into a contiguous user-visible register window
+//!     allocated via [`LoweringContext::acquire_temps`] (and freed
+//!     on call return); the call lowers as `CallDirect(func_idx,
+//!     RegList { base, count })`. `f();` is also accepted as an
+//!     `ExpressionStatement` — the result lands in the accumulator
+//!     and is overwritten by the next statement.
 //!
 //! ## TDZ at M4
 //!
@@ -103,6 +114,8 @@ mod error;
 mod tests;
 
 pub use error::SourceLoweringError;
+
+use std::cell::Cell;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -183,40 +196,69 @@ impl ModuleCompiler {
 // ---------------------------------------------------------------------------
 
 fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
-    // M1 accepts exactly one top-level statement, and it must be a
-    // `FunctionDeclaration`. Everything else — empty bodies, multiple
-    // statements, `class`/`var`/`import`/bare expressions — surfaces as
-    // an `Unsupported` pointing at the offending (or missing) node so
-    // later milestones can widen coverage one construct at a time.
-    let only = match program.body.as_slice() {
-        [single] => single,
-        [] => return Err(SourceLoweringError::unsupported("program", program.span)),
-        [_first, second, ..] => {
-            return Err(SourceLoweringError::unsupported(
-                "multiple_top_level_statements",
-                second.span(),
-            ));
-        }
-    };
+    // The program is one or more top-level `FunctionDeclaration`s.
+    // Anything else — `class`, `var`, top-level expressions or
+    // statements, imports/exports — surfaces as an `Unsupported`
+    // pointing at the offending node so later milestones can widen
+    // coverage one construct at a time. The conventional `main`
+    // pattern (helpers first, entry last) makes the **last**
+    // function the module's entry.
+    if program.body.is_empty() {
+        return Err(SourceLoweringError::unsupported("program", program.span));
+    }
 
-    let function = match only {
-        Statement::FunctionDeclaration(func) => func.as_ref(),
-        Statement::ClassDeclaration(class) => {
+    // First pass: collect each declaration's name. Names must be
+    // available before any body is lowered so cross-function calls
+    // (including forward references and recursion) resolve.
+    let mut declarations: Vec<&Function<'_>> = Vec::with_capacity(program.body.len());
+    let mut names: Vec<&str> = Vec::with_capacity(program.body.len());
+    for stmt in &program.body {
+        let func = match stmt {
+            Statement::FunctionDeclaration(func) => func.as_ref(),
+            Statement::ClassDeclaration(class) => {
+                return Err(SourceLoweringError::unsupported(
+                    "class_declaration",
+                    class.span,
+                ));
+            }
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    statement_construct_tag(other),
+                    other.span(),
+                ));
+            }
+        };
+        let name = func
+            .id
+            .as_ref()
+            .map(|ident| ident.name.as_str())
+            .ok_or_else(|| SourceLoweringError::unsupported("anonymous_function", func.span))?;
+        if names.contains(&name) {
             return Err(SourceLoweringError::unsupported(
-                "class_declaration",
-                class.span,
+                "duplicate_function_declaration",
+                func.span,
             ));
         }
-        other => {
-            return Err(SourceLoweringError::unsupported(
-                statement_construct_tag(other),
-                other.span(),
-            ));
-        }
-    };
+        names.push(name);
+        declarations.push(func);
+    }
 
-    let lowered = lower_function_declaration(function)?;
-    let module = Module::new(None::<&str>, vec![lowered], FunctionIndex(0)).map_err(|err| {
+    // Second pass: lower each function with the shared name table
+    // available so `f(args)` inside one body can resolve `f` to its
+    // `FunctionIndex`.
+    let mut functions: Vec<VmFunction> = Vec::with_capacity(declarations.len());
+    for func in &declarations {
+        functions.push(lower_function_declaration(func, &names)?);
+    }
+
+    // Entry = last declared function (conventional `main` lives at
+    // the bottom of the file). Safe: `declarations` is non-empty
+    // (we returned early above) and `functions.len() ==
+    // declarations.len()`.
+    let entry_idx = u32::try_from(functions.len() - 1)
+        .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?;
+
+    let module = Module::new(None::<&str>, functions, FunctionIndex(entry_idx)).map_err(|err| {
         SourceLoweringError::Internal(format!("module construction failed: {err}"))
     })?;
     Ok(module)
@@ -245,7 +287,10 @@ fn statement_construct_tag(stmt: &Statement<'_>) -> &'static str {
     }
 }
 
-fn lower_function_declaration(func: &Function<'_>) -> Result<VmFunction, SourceLoweringError> {
+fn lower_function_declaration<'a>(
+    func: &'a Function<'a>,
+    function_names: &'a [&'a str],
+) -> Result<VmFunction, SourceLoweringError> {
     if func.r#async {
         return Err(SourceLoweringError::unsupported(
             "async_function",
@@ -269,18 +314,20 @@ fn lower_function_declaration(func: &Function<'_>) -> Result<VmFunction, SourceL
         .as_ref()
         .ok_or_else(|| SourceLoweringError::unsupported("declared_only_function", func.span))?;
 
-    // Lower the body first so we know the final `let`/`const` count;
-    // FrameLayout needs that up front because slot indices are stable
-    // across the function's lifetime.
-    let (bytecode, local_count) = lower_function_body(body, &func.params, param_count)?;
+    // Lower the body first so we know the final `let`/`const` and
+    // call-temp counts; FrameLayout needs that up front because slot
+    // indices are stable across the function's lifetime.
+    let (bytecode, local_count, temp_count) =
+        lower_function_body(body, &func.params, param_count, function_names)?;
 
     // FrameLayout: 1 hidden slot for `this`, then `param_count`
-    // parameter slots, then `local_count` `let`/`const` slots, then 0
-    // temporaries (M5+ owns scratch). The v2 interpreter maps
+    // parameter slots, then `local_count` `let`/`const` slots, then
+    // `temp_count` call-arg scratch slots. The v2 interpreter maps
     // `Ldar r0` through `FrameLayout::resolve_user_visible(0)`, which
     // points at the first parameter (absolute index 1), so parameter
-    // and local access stays symmetric with v1's register semantics.
-    let layout = FrameLayout::new(1, param_count, local_count, 0)
+    // / local / temp access stays symmetric with v1's register
+    // semantics.
+    let layout = FrameLayout::new(1, param_count, local_count, temp_count)
         .map_err(|err| SourceLoweringError::Internal(format!("frame layout invalid: {err:?}")))?;
 
     Ok(VmFunction::with_empty_tables(Some(name), layout, bytecode).with_strict(func.id.is_some()))
@@ -328,7 +375,8 @@ fn lower_function_body<'a>(
     body: &'a FunctionBody<'a>,
     params: &'a FormalParameters<'a>,
     param_count: RegisterIndex,
-) -> Result<(Bytecode, RegisterIndex), SourceLoweringError> {
+    function_names: &'a [&'a str],
+) -> Result<(Bytecode, RegisterIndex, RegisterIndex), SourceLoweringError> {
     if !body.directives.is_empty() {
         return Err(SourceLoweringError::unsupported(
             "directive_prologue",
@@ -344,7 +392,7 @@ fn lower_function_body<'a>(
     // (which accepts top-level `let`/`const` plus everything
     // `lower_nested_statement` accepts).
     let mut builder = BytecodeBuilder::new();
-    let mut ctx = LoweringContext::new(params, param_count);
+    let mut ctx = LoweringContext::new(params, param_count, function_names);
 
     let Some((last, rest)) = body.statements.split_last() else {
         return Err(SourceLoweringError::unsupported("empty_body", body.span));
@@ -373,7 +421,7 @@ fn lower_function_body<'a>(
         .finish()
         .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
 
-    Ok((bytecode, ctx.local_count()))
+    Ok((bytecode, ctx.local_count(), ctx.temp_count()))
 }
 
 /// Lowers a single statement at function-body top level. Accepts the
@@ -412,13 +460,17 @@ fn lower_nested_statement<'a>(
 ) -> Result<(), SourceLoweringError> {
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => {
-            // Only AssignmentExpression at statement position. Bare
-            // expression reads, calls, etc. surface their own tag so
-            // a future milestone can widen them one shape at a time.
+            // Statement-position expressions: `AssignmentExpression`
+            // (`x = …;`) and `CallExpression` (`f();` — result
+            // discarded; acc gets overwritten by the next stmt).
+            // Bare reads, member access, etc. surface their own tag
+            // so a future milestone can widen them one shape at a
+            // time.
             match &expr_stmt.expression {
                 Expression::AssignmentExpression(assign) => {
                     lower_assignment_expression(builder, ctx, assign)
                 }
+                Expression::CallExpression(call) => lower_call_expression(builder, ctx, call),
                 other => Err(SourceLoweringError::unsupported(
                     expression_construct_tag(other),
                     other.span(),
@@ -726,8 +778,10 @@ struct LocalBinding<'a> {
 }
 
 /// Per-function lowering context: tracks the sole parameter (if any)
-/// plus every `let`/`const` declared so far, with their assigned
-/// register slots and TDZ state. Scoped declarations (currently only
+/// plus every `let`/`const` declared so far (with their assigned
+/// register slots and TDZ state), the call-arg temp pool, and the
+/// shared module-level function name table for resolving
+/// `CallExpression` targets. Scoped declarations (currently only
 /// `for` init `let`s) push onto `locals` and pop on scope exit while
 /// `peak_local_count` retains the high-water mark so the
 /// [`FrameLayout`] reserves enough slots for the whole function.
@@ -743,6 +797,25 @@ struct LoweringContext<'a> {
     /// [`restore_scope`](Self::restore_scope) still has its slot
     /// reserved for the duration of the function.
     peak_local_count: RegisterIndex,
+    /// Temps currently in use (acquired but not yet released). Temps
+    /// live in the user-visible register window after the local
+    /// region; their indices start at `param_count + peak_local_count`
+    /// and grow upward. `Cell` so `lower_call_expression` can
+    /// acquire/release through a shared `&LoweringContext` borrow
+    /// (every other expression-lowering helper takes `&` too).
+    current_temp_count: Cell<RegisterIndex>,
+    /// High-water mark of `current_temp_count`. Drives the
+    /// `temporary_count` field on the `FrameLayout` so the frame
+    /// reserves enough room for the deepest call-argument window
+    /// the function reaches. `Cell` for the same reason as
+    /// `current_temp_count`.
+    peak_temp_count: Cell<RegisterIndex>,
+    /// Names of every top-level `FunctionDeclaration` in the module,
+    /// indexed by `FunctionIndex`. Used by `lower_call_expression`
+    /// to translate a callee identifier into a `CallDirect` opcode.
+    /// Ordered the same way the functions appear in
+    /// `Module::functions`.
+    function_names: &'a [&'a str],
 }
 
 /// Snapshot of [`LoweringContext::locals`] length, returned by
@@ -756,7 +829,11 @@ struct ScopeSnapshot {
 }
 
 impl<'a> LoweringContext<'a> {
-    fn new(params: &'a FormalParameters<'a>, param_count: RegisterIndex) -> Self {
+    fn new(
+        params: &'a FormalParameters<'a>,
+        param_count: RegisterIndex,
+        function_names: &'a [&'a str],
+    ) -> Self {
         let param_name = match params.items.as_slice() {
             [single] => match &single.pattern {
                 BindingPattern::BindingIdentifier(ident) => Some(ident.name.as_str()),
@@ -769,6 +846,9 @@ impl<'a> LoweringContext<'a> {
             param_count,
             locals: Vec::new(),
             peak_local_count: 0,
+            current_temp_count: Cell::new(0),
+            peak_temp_count: Cell::new(0),
+            function_names,
         }
     }
 
@@ -779,6 +859,70 @@ impl<'a> LoweringContext<'a> {
     /// must size for the peak.
     fn local_count(&self) -> RegisterIndex {
         self.peak_local_count
+    }
+
+    /// Number of `temporary` slots reserved by the frame layout —
+    /// the high-water mark of `current_temp_count`. Temps live in
+    /// the user-visible register window after the local region and
+    /// are used by `lower_call_expression` to materialize a
+    /// contiguous arg buffer for `CallDirect`.
+    fn temp_count(&self) -> RegisterIndex {
+        self.peak_temp_count.get()
+    }
+
+    /// Acquires `count` consecutive temp slots and returns the
+    /// user-visible register index of the first one. Caller must
+    /// call [`release_temps`](Self::release_temps) with the same
+    /// `count` once it's done with the slots — typically in a
+    /// LIFO pattern, mirroring nested call expressions. Takes
+    /// `&self` so it can be called from the `&LoweringContext`
+    /// expression-lowering paths; mutation lives behind `Cell` for
+    /// the temp counters.
+    fn acquire_temps(&self, count: RegisterIndex) -> Result<u16, SourceLoweringError> {
+        let local_room = self
+            .param_count
+            .checked_add(self.peak_local_count)
+            .ok_or_else(|| {
+                SourceLoweringError::Internal("temp base overflow (params + locals)".into())
+            })?;
+        let in_use = self.current_temp_count.get();
+        let base = local_room.checked_add(in_use).ok_or_else(|| {
+            SourceLoweringError::Internal("temp base overflow (in-use temps)".into())
+        })?;
+        let new_used = in_use
+            .checked_add(count)
+            .ok_or_else(|| SourceLoweringError::Internal("temp count overflow".into()))?;
+        if new_used > self.peak_temp_count.get() {
+            self.peak_temp_count.set(new_used);
+        }
+        self.current_temp_count.set(new_used);
+        Ok(base)
+    }
+
+    /// Releases `count` temp slots — the matching pair of
+    /// [`acquire_temps`](Self::acquire_temps). Slots are reusable by
+    /// later calls but stay reserved by the frame layout's
+    /// `temporary_count` (which tracks the peak, not the live count).
+    fn release_temps(&self, count: RegisterIndex) {
+        let in_use = self.current_temp_count.get();
+        debug_assert!(
+            in_use >= count,
+            "release_temps under-flow: have {in_use}, releasing {count}",
+        );
+        self.current_temp_count.set(in_use.saturating_sub(count));
+    }
+
+    /// Resolves a top-level function name to its `FunctionIndex`.
+    /// Used by [`lower_call_expression`] to translate `f(args)` into
+    /// `CallDirect(f_idx, …)`. Returns `None` for unknown names —
+    /// the caller surfaces a `SourceLoweringError::Unsupported`
+    /// (typically with the `unbound_function` tag).
+    fn resolve_function(&self, name: &str) -> Option<FunctionIndex> {
+        self.function_names
+            .iter()
+            .position(|&n| n == name)
+            .and_then(|idx| u32::try_from(idx).ok())
+            .map(FunctionIndex)
     }
 
     /// Snapshots the current scope so a later [`restore_scope`] can
@@ -1060,6 +1204,12 @@ fn lower_return_expression(
             // composes as a normal accumulator-producing expression.
             lower_assignment_expression(builder, ctx, assign)
         }
+        Expression::CallExpression(call) => {
+            // `return f(args)`, `let x = f(args)`, `if (f(args))`,
+            // any acc-producing position. Result lands in the
+            // accumulator after `CallDirect`.
+            lower_call_expression(builder, ctx, call)
+        }
         Expression::ParenthesizedExpression(inner) => {
             lower_return_expression(builder, ctx, &inner.expression)
         }
@@ -1073,11 +1223,14 @@ fn lower_return_expression(
 /// Per-operator opcode pair: the Reg-RHS form and the optional
 /// `*Smi imm` fast path. `Some(smi)` means the bytecode ISA carries a
 /// dedicated immediate opcode for this operator; `None` means a
-/// literal RHS would have to be materialised into a scratch slot the
-/// M3 frame layout doesn't yet allocate (e.g. `^`, `>>>`).
+/// literal RHS would have to be materialised into a scratch slot.
 struct BinaryOpEncoding {
     reg_opcode: Opcode,
     smi_opcode: Option<Opcode>,
+    /// `true` when `a OP b == b OP a` (Add/Mul/BitOr/BitAnd/BitXor).
+    /// Non-commutative ops (Sub/Shl/Shr/UShr) need a second temp slot
+    /// in the complex-RHS fallback to preserve operand order.
+    commutative: bool,
     /// Short label used in `SourceLoweringError::Internal` messages so
     /// encoder failures point at the right opcode without resorting to
     /// `format!("{:?}", op)`.
@@ -1094,46 +1247,55 @@ fn binary_op_encoding(op: BinaryOperator) -> Option<BinaryOpEncoding> {
         Addition => BinaryOpEncoding {
             reg_opcode: Opcode::Add,
             smi_opcode: Some(Opcode::AddSmi),
+            commutative: true,
             label: "Add",
         },
         Subtraction => BinaryOpEncoding {
             reg_opcode: Opcode::Sub,
             smi_opcode: Some(Opcode::SubSmi),
+            commutative: false,
             label: "Sub",
         },
         Multiplication => BinaryOpEncoding {
             reg_opcode: Opcode::Mul,
             smi_opcode: Some(Opcode::MulSmi),
+            commutative: true,
             label: "Mul",
         },
         BitwiseOR => BinaryOpEncoding {
             reg_opcode: Opcode::BitwiseOr,
             smi_opcode: Some(Opcode::BitwiseOrSmi),
+            commutative: true,
             label: "BitwiseOr",
         },
         BitwiseAnd => BinaryOpEncoding {
             reg_opcode: Opcode::BitwiseAnd,
             smi_opcode: Some(Opcode::BitwiseAndSmi),
+            commutative: true,
             label: "BitwiseAnd",
         },
         BitwiseXOR => BinaryOpEncoding {
             reg_opcode: Opcode::BitwiseXor,
             smi_opcode: None,
+            commutative: true,
             label: "BitwiseXor",
         },
         ShiftLeft => BinaryOpEncoding {
             reg_opcode: Opcode::Shl,
             smi_opcode: Some(Opcode::ShlSmi),
+            commutative: false,
             label: "Shl",
         },
         ShiftRight => BinaryOpEncoding {
             reg_opcode: Opcode::Shr,
             smi_opcode: Some(Opcode::ShrSmi),
+            commutative: false,
             label: "Shr",
         },
         ShiftRightZeroFill => BinaryOpEncoding {
             reg_opcode: Opcode::UShr,
             smi_opcode: None,
+            commutative: false,
             label: "UShr",
         },
         _ => return None,
@@ -1368,9 +1530,17 @@ fn emit_identifier_as_reg_operand(
 /// Applies a binary operation whose LHS is already in the accumulator.
 /// Picks `*Smi imm` for int32-safe literal RHS that fits `i8` (when
 /// the operator carries a Smi opcode), or the Reg form for an
-/// in-scope identifier RHS. Used by both [`lower_binary_expression`]
-/// and the compound-assignment path in [`lower_assignment_expression`]
-/// — the bytecode shape `<load lhs into acc>; <op> <rhs>` is identical.
+/// in-scope identifier RHS. Falls back to a temp-spill path for
+/// "complex" RHS shapes (call, nested binary, parenthesised binary,
+/// assignment) — the LHS gets spilled to a temp, the RHS is lowered
+/// into acc through the standard expression path, and the result is
+/// stitched back together as `acc = LHS op RHS` (commutative ops
+/// reuse one temp; non-commutative ops grab a second temp to
+/// preserve operand order).
+///
+/// Used by both [`lower_binary_expression`] and the compound-
+/// assignment path in [`lower_assignment_expression`] — the
+/// bytecode shape `<load lhs into acc>; <op> <rhs>` is identical.
 fn apply_binary_op_with_acc_lhs(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'_>,
@@ -1407,14 +1577,104 @@ fn apply_binary_op_with_acc_lhs(
             })?;
             lower_identifier_as_reg_rhs(builder, encoding, binding, ident.span)
         }
-        Expression::ParenthesizedExpression(inner) => Err(SourceLoweringError::unsupported(
-            "parenthesised_rhs",
-            inner.span,
-        )),
+        // Complex RHS shapes — a call, a nested binary, a
+        // parenthesised binary, an assignment expression, etc. The
+        // RHS lowering would clobber acc (which currently holds the
+        // LHS), so we spill LHS to a temp first, then re-stitch.
+        Expression::CallExpression(_)
+        | Expression::BinaryExpression(_)
+        | Expression::ParenthesizedExpression(_)
+        | Expression::AssignmentExpression(_) => {
+            apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
+        }
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
         )),
+    }
+}
+
+/// Fallback path for binary expressions whose RHS doesn't fit the
+/// fast `*Smi imm` / `Op reg` shapes — typically because the RHS
+/// itself contains a call, a nested binary, or an assignment.
+///
+/// Bytecode shape (commutative op, single temp):
+///
+/// ```text
+///   ; LHS already in acc (lowered by caller)
+///   Star r_lhs_temp      ; spill LHS so RHS can clobber acc
+///   <lower RHS>          ; acc = RHS
+///   Op r_lhs_temp        ; acc = RHS op LHS = LHS op RHS  (commutative)
+/// ```
+///
+/// For non-commutative ops we need a second temp to preserve
+/// operand order:
+///
+/// ```text
+///   Star r_lhs_temp
+///   <lower RHS>
+///   Star r_rhs_temp
+///   Ldar r_lhs_temp      ; acc = LHS
+///   Op r_rhs_temp        ; acc = LHS op RHS
+/// ```
+fn apply_binary_op_with_complex_rhs(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    encoding: &BinaryOpEncoding,
+    rhs: &Expression<'_>,
+) -> Result<(), SourceLoweringError> {
+    let lhs_temp = ctx.acquire_temps(1)?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(lhs_temp))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (LHS spill): {err:?}"))
+        })?;
+
+    let lower_result = lower_return_expression(builder, ctx, rhs);
+    if let Err(err) = lower_result {
+        ctx.release_temps(1);
+        return Err(err);
+    }
+
+    if encoding.commutative {
+        // acc = RHS, lhs_temp = LHS. `Op r_lhs_temp` ⇒ acc = RHS
+        // op LHS, which equals LHS op RHS for commutative ops.
+        builder
+            .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(lhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode {} (commutative complex RHS): {err:?}",
+                    encoding.label
+                ))
+            })?;
+        ctx.release_temps(1);
+        Ok(())
+    } else {
+        // Non-commutative: order matters. Spill RHS to a second
+        // temp, reload LHS into acc, then apply op against RHS.
+        let rhs_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(rhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (RHS spill): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(lhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (LHS reload): {err:?}"))
+            })?;
+        builder
+            .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(rhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode {} (non-commutative complex RHS): {err:?}",
+                    encoding.label
+                ))
+            })?;
+        // Release in LIFO order — rhs_temp was acquired last.
+        ctx.release_temps(1); // rhs_temp
+        ctx.release_temps(1); // lhs_temp
+        Ok(())
     }
 }
 
@@ -1616,6 +1876,119 @@ fn lower_accumulator_operand(
     expr: &Expression<'_>,
 ) -> Result<(), SourceLoweringError> {
     lower_return_expression(builder, ctx, expr)
+}
+
+/// Lowers a `CallExpression` whose callee is the name of a
+/// top-level `FunctionDeclaration` in the same module. Bytecode
+/// shape:
+///
+/// ```text
+///   <lower arg 0> ; Star r_temp0
+///   <lower arg 1> ; Star r_temp1
+///   …
+///   CallDirect func_idx, RegList { base: temp0, count: argc }
+/// ```
+///
+/// The call result lands in the accumulator. Temps are acquired
+/// from the function-level pool ([`LoweringContext::acquire_temps`])
+/// so nested calls (e.g. `f(g(1, 2), h(3))`) get their own
+/// non-overlapping windows; the pool is released LIFO when the call
+/// completes.
+///
+/// Rejects:
+/// - non-identifier callee (member, computed, …) →
+///   `non_identifier_callee`;
+/// - identifier callee that doesn't name a top-level function →
+///   `unbound_function` (parameters and locals can't be called yet —
+///   closure values land later);
+/// - spread args (`f(...arr)`) → `spread_call_arg`;
+/// - `new f()` is a separate AST node (`NewExpression`) and falls
+///   through to `expression_construct_tag`.
+fn lower_call_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    call: &oxc_ast::ast::CallExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+
+    // 1) Resolve callee.
+    let callee_ident = match &call.callee {
+        Expression::Identifier(ident) => ident,
+        Expression::ParenthesizedExpression(inner) => match &inner.expression {
+            Expression::Identifier(ident) => ident,
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    "non_identifier_callee",
+                    other.span(),
+                ));
+            }
+        },
+        other => {
+            return Err(SourceLoweringError::unsupported(
+                "non_identifier_callee",
+                other.span(),
+            ));
+        }
+    };
+    let func_idx = ctx
+        .resolve_function(callee_ident.name.as_str())
+        .ok_or_else(|| SourceLoweringError::unsupported("unbound_function", callee_ident.span))?;
+
+    // 2) Acquire temp slots for the argument window.
+    let argc = RegisterIndex::try_from(call.arguments.len())
+        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+    let base = ctx.acquire_temps(argc)?;
+
+    // 3) Lower each arg into its temp slot. Spread args are
+    //    rejected — they need iterator protocol + dynamic argc.
+    for (offset, arg) in call.arguments.iter().enumerate() {
+        let expr = match arg {
+            Argument::SpreadElement(spread) => {
+                ctx.release_temps(argc);
+                return Err(SourceLoweringError::unsupported(
+                    "spread_call_arg",
+                    spread.span,
+                ));
+            }
+            // Non-spread argument: the `Argument` enum inlines all
+            // `Expression` variants, so we can downcast to `&Expression`
+            // and reuse the standard expression-lowering path.
+            other => other.to_expression(),
+        };
+        lower_return_expression(builder, ctx, expr)?;
+        let slot = base
+            .checked_add(RegisterIndex::try_from(offset).map_err(|_| {
+                SourceLoweringError::Internal("call argument offset overflow".into())
+            })?)
+            .ok_or_else(|| SourceLoweringError::Internal("call argument slot overflow".into()))?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (call arg): {err:?}"))
+            })?;
+    }
+
+    // 4) Emit CallDirect — function index + the contiguous arg window.
+    builder
+        .emit(
+            Opcode::CallDirect,
+            &[
+                Operand::Idx(func_idx.0),
+                Operand::RegList {
+                    base: u32::from(base),
+                    count: u32::from(argc),
+                },
+            ],
+        )
+        .map_err(|err| SourceLoweringError::Internal(format!("encode CallDirect: {err:?}")))?;
+
+    // 5) Release the temp slots (LIFO with respect to nested
+    //    calls). The slots stay reserved by the FrameLayout's
+    //    `temporary_count` (which tracks the peak, not the live
+    //    count) so a later call at the same depth reuses them.
+    ctx.release_temps(argc);
+
+    Ok(())
 }
 
 /// Convert a parsed `NumericLiteral` into an int32. Rejects fractional

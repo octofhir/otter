@@ -28,7 +28,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | M6       | `IfStatement` + relational ops (`<`, `>`, `<=`, `>=`, `===`, `!==`) for int32.                                                  | [x]    | 991b282 |
 | M7       | `WhileStatement`. Closes `bench2.ts`: int32 accumulator loop + full microbench vs bun/node.                                     | [x]    | d02fce5 |
 | M8       | `ForStatement` (desugar to while).                                                                                             | [x]    | 5ad7cfe |
-| M9       | Multiple functions + `CallExpression` without `this`/closures.                                                                  | [ ]    |        |
+| M9       | Multiple functions + `CallExpression` without `this`/closures.                                                                  | [x]    | _pending_ |
 | M_JIT_x86_64 | Cranelift / hand-rolled x86_64 backend for the JIT baseline.                                                               | [ ]    |        |
 | M10+     | Closures, globals, `console.log`, classes, async, generators, destructuring, property access, exceptions, exports/imports.       | [ ]    |        |
 
@@ -49,7 +49,8 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | `WhileStatement`                  | yes       | M7        |
 | `VariableDeclaration` multi-declarator | yes  | M7        |
 | `ForStatement`                    | yes       | M8        |
-| `CallExpression`                  | no        | M9        |
+| Multiple top-level functions      | yes       | M9        |
+| `CallExpression` (known function) | yes       | M9        |
 
 ## Benchmarks
 

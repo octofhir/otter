@@ -395,7 +395,7 @@ guarded emitter partially wired and the invocation smoke test
   regression vs M_JIT_B), and the new `osr_smoke` integration test
   confirms a single-function 100k-iter loop tiers up mid-loop through
   the real `otter` CLI with `--dump-jit-stats` showing `1 JIT / 0
-  interpreter entries` for `main`. Commit: `_pending_`.
+  interpreter entries` for `main`. Commit: `5251b41`.
 
 ---
 

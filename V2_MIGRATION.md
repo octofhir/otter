@@ -52,7 +52,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M11      | `break` / `continue` inside `while` / `for` (unlabelled).                                                                      | [x]    | 2bdb704 |
 | M12      | Block scoping for `let` / `const` inside `if` / `while` / `for` bodies + nested blocks.                                         | [x]    | f0df9b2 |
 | M13      | `ConditionalExpression` (`a ? b : c`) + logical `&&` / `\|\|` / `??` short-circuit.                                              | [x]    | 54e1339 |
-| M14      | Global reads — `undefined`, `null`, `Infinity`, `NaN`, `globalThis`, plus one anchor builtin namespace.                         | [ ]    |        |
+| M14      | Global reads — `undefined`, `null`, `Infinity`, `NaN`, `globalThis`, plus one anchor builtin namespace.                         | [x]    | _pending_ |
 | M15      | `StringLiteral` + string concatenation (`+` on mixed operands).                                                                 | [ ]    |        |
 | M16      | `ObjectExpression` + `ArrayExpression` literals with int/string values.                                                         | [ ]    |        |
 | M17      | Property access: `StaticMemberExpression` (`o.x`), `ComputedMemberExpression` (`o[k]`), read + write.                            | [ ]    |        |
@@ -103,6 +103,8 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | Block scoping for `let` / `const` in `{ }` / `if` / `while` / `for` bodies | yes | M12 |
 | `ConditionalExpression` (`a ? b : c`) | yes | M13 |
 | `LogicalExpression` (`&&`, `\|\|`, `??`) | yes | M13 |
+| `NullLiteral` / `BooleanLiteral` | yes | M14 |
+| Well-known globals: `undefined`, `NaN`, `Infinity`, `globalThis`, `Math` | yes | M14 |
 
 ## Benchmarks
 

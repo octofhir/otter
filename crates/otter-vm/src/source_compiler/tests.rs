@@ -2787,3 +2787,184 @@ fn logical_or_composes_with_ternary() {
         1,
     );
 }
+
+// ---------------------------------------------------------------------------
+// M14: Null / Boolean literals + well-known globals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn null_literal_returns_null() {
+    let module = compile("function f() { return null; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value(), RegisterValue::null());
+}
+
+#[test]
+fn true_literal_returns_true() {
+    let module = compile("function f() { return true; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value().as_bool(), Some(true));
+}
+
+#[test]
+fn false_literal_returns_false() {
+    let module = compile("function f() { return false; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value().as_bool(), Some(false));
+}
+
+#[test]
+fn undefined_identifier_maps_to_lda_undefined() {
+    let module = compile("function f() { return undefined; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value(), RegisterValue::undefined());
+}
+
+#[test]
+fn nan_identifier_maps_to_lda_nan() {
+    // `NaN` returns the NaN-boxed NaN — `as_i32` is None because
+    // the value isn't an int32. We check via IEEE bits.
+    let module = compile("function f() { return NaN; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    let raw = result.return_value().raw_bits();
+    assert_eq!(raw, crate::value::TAG_NAN);
+}
+
+#[test]
+fn infinity_identifier_maps_to_lda_const_f64() {
+    let module = compile("function f() { return Infinity; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    // The function's float-constant side table must include INFINITY.
+    assert_eq!(function.float_constants().len(), 1);
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    let as_f64 = f64::from_bits(result.return_value().raw_bits());
+    assert!(as_f64.is_infinite() && as_f64.is_sign_positive());
+}
+
+#[test]
+fn global_this_resolves_via_lda_global() {
+    // `globalThis` must map through the property-name side table
+    // and emit `LdaGlobal`. The interpreter walks the runtime's
+    // global object and returns a handle.
+    let module = compile("function f() { return globalThis; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    assert_eq!(function.property_names().len(), 1);
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    // globalThis must be an object handle (the global itself).
+    assert!(result.return_value().as_object_handle().is_some());
+}
+
+#[test]
+fn math_identifier_resolves_via_lda_global() {
+    // Anchor-builtin check: `Math` is a global bound to the
+    // intrinsic Math object. LdaGlobal with "Math" interned into
+    // the property-name table should resolve.
+    let module = compile("function f() { return Math; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    assert_eq!(function.property_names().len(), 1);
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert!(result.return_value().as_object_handle().is_some());
+}
+
+#[test]
+fn null_composes_with_nullish_coalesce() {
+    // `return null ?? 42` — the null path of `??` fires.
+    assert_eq!(
+        run_int32_function("function f() { return null ?? 42; }", &[]),
+        42,
+    );
+}
+
+#[test]
+fn ternary_with_boolean_literal_test() {
+    assert_eq!(
+        run_int32_function("function f() { return true ? 1 : 2; }", &[]),
+        1,
+    );
+    assert_eq!(
+        run_int32_function("function f() { return false ? 1 : 2; }", &[]),
+        2,
+    );
+}
+
+#[test]
+fn undefined_property_name_interner_dedups() {
+    // Two `globalThis` references should intern to the same slot
+    // — property_names must stay at length 1.
+    let module = compile("function f() { let a = globalThis; let b = globalThis; return a; }")
+        .expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    assert_eq!(function.property_names().len(), 1);
+}
+
+#[test]
+fn unknown_global_identifier_still_rejected() {
+    // Anything outside the current whitelist still surfaces as
+    // `unbound_identifier` at compile time — the generic
+    // LdaGlobal fallback only activates for the whitelisted names.
+    let err = compile("function f() { return Reflect; }").expect_err("unknown global at M14");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "unbound_identifier",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}

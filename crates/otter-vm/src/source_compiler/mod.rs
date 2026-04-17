@@ -121,7 +121,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
     BindingPattern, ConditionalExpression, Expression, FormalParameter, FormalParameters, Function,
-    FunctionBody, LogicalExpression, LogicalOperator, NumericLiteral, Program,
+    FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral, Program,
     SimpleAssignmentTarget, Statement, UnaryExpression, UnaryOperator, UpdateExpression,
     UpdateOperator, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
@@ -317,12 +317,13 @@ fn lower_function_declaration<'a>(
         .ok_or_else(|| SourceLoweringError::unsupported("declared_only_function", func.span))?;
 
     // Lower the body first so we know the final `let`/`const`,
-    // call-temp, and feedback-slot counts; FrameLayout needs the
-    // first two up front, and the feedback slot count seeds the
-    // function's `FeedbackTableLayout` for the JIT's int32-trust
-    // consumer (see `analyze_template_candidate_with_feedback`).
-    let (bytecode, local_count, temp_count, feedback_slot_count) =
-        lower_function_body(body, &func.params, param_count, function_names)?;
+    // call-temp, feedback-slot counts, and the interned
+    // property-name / float-constant tables (M14). FrameLayout
+    // needs the first two up front, and the feedback slot count
+    // seeds the function's `FeedbackTableLayout` for the JIT's
+    // int32-trust consumer (see
+    // `analyze_template_candidate_with_feedback`).
+    let body_out = lower_function_body(body, &func.params, param_count, function_names)?;
 
     // FrameLayout: 1 hidden slot for `this`, then `param_count`
     // parameter slots, then `local_count` `let`/`const` slots, then
@@ -331,7 +332,7 @@ fn lower_function_declaration<'a>(
     // points at the first parameter (absolute index 1), so parameter
     // / local / temp access stays symmetric with v1's register
     // semantics.
-    let layout = FrameLayout::new(1, param_count, local_count, temp_count)
+    let layout = FrameLayout::new(1, param_count, body_out.local_count, body_out.temp_count)
         .map_err(|err| SourceLoweringError::Internal(format!("frame layout invalid: {err:?}")))?;
 
     // M_JIT_C.2: every arithmetic op emitted above allocated a fresh
@@ -339,16 +340,45 @@ fn lower_function_declaration<'a>(
     // the matching side-table layout so the interpreter and JIT can
     // resolve `bytecode.feedback().get(pc) -> FeedbackSlot` against a
     // well-shaped `FeedbackVector`.
-    let feedback_layout = arithmetic_only_feedback_layout(feedback_slot_count);
+    let feedback_layout = arithmetic_only_feedback_layout(body_out.feedback_slot_count);
+    // M14: wire the accumulated property-name and float-constant
+    // interners into the function's side tables so `LdaGlobal` /
+    // `LdaConstF64` can resolve their `Idx` operands at runtime.
+    // Other tables (strings, bigints, closures, calls, regexps)
+    // stay default-empty until later milestones exercise them.
+    let side_tables = crate::module::FunctionSideTables::new(
+        body_out.property_names,
+        Default::default(),
+        body_out.float_constants,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
     let tables = FunctionTables::new(
-        crate::module::FunctionSideTables::default(),
+        side_tables,
         feedback_layout,
         Default::default(),
         Default::default(),
         Default::default(),
     );
 
-    Ok(VmFunction::new(Some(name), layout, bytecode, tables).with_strict(func.id.is_some()))
+    Ok(
+        VmFunction::new(Some(name), layout, body_out.bytecode, tables)
+            .with_strict(func.id.is_some()),
+    )
+}
+
+/// Output of [`lower_function_body`]. Groups the bytecode with the
+/// per-function side-table counts the caller wires into the
+/// `Function`.
+struct FunctionBodyOutput {
+    bytecode: Bytecode,
+    local_count: RegisterIndex,
+    temp_count: RegisterIndex,
+    feedback_slot_count: u16,
+    property_names: crate::property::PropertyNameTable,
+    float_constants: crate::float::FloatTable,
 }
 
 /// Build a `FeedbackTableLayout` with `count` [`FeedbackKind::Arithmetic`]
@@ -405,7 +435,7 @@ fn lower_function_body<'a>(
     params: &'a FormalParameters<'a>,
     param_count: RegisterIndex,
     function_names: &'a [&'a str],
-) -> Result<(Bytecode, RegisterIndex, RegisterIndex, u16), SourceLoweringError> {
+) -> Result<FunctionBodyOutput, SourceLoweringError> {
     if !body.directives.is_empty() {
         return Err(SourceLoweringError::unsupported(
             "directive_prologue",
@@ -450,12 +480,14 @@ fn lower_function_body<'a>(
         .finish()
         .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
 
-    Ok((
+    Ok(FunctionBodyOutput {
         bytecode,
-        ctx.local_count(),
-        ctx.temp_count(),
-        ctx.feedback_slot_count(),
-    ))
+        local_count: ctx.local_count(),
+        temp_count: ctx.temp_count(),
+        feedback_slot_count: ctx.feedback_slot_count(),
+        property_names: ctx.take_property_names(),
+        float_constants: ctx.take_float_constants(),
+    })
 }
 
 /// Lowers a single statement at function-body top level. Accepts the
@@ -1019,6 +1051,19 @@ struct LoweringContext<'a> {
     /// function-scope `let`/`const` live in the same lexical
     /// environment per the ES spec.
     scope_starts: RefCell<Vec<usize>>,
+    /// Deduplicated property-name interner (M14). Grows when the
+    /// compiler emits `LdaGlobal` / `StaGlobal` for a previously-
+    /// unseen identifier, with the interned index used as the
+    /// `Idx` operand. Handed to [`PropertyNameTable::new`] at
+    /// function finalisation so the dispatcher can resolve the name
+    /// back to a string at runtime.
+    property_names: RefCell<Vec<String>>,
+    /// Deduplicated float-constant interner (M14). Currently only
+    /// used for materialising `Infinity` / `-Infinity` (int32
+    /// literals still flow through `LdaSmi`). Handed to
+    /// [`FloatTable::new`](crate::float::FloatTable::new) at
+    /// function finalisation.
+    float_constants: RefCell<Vec<f64>>,
 }
 
 /// `break` / `continue` jump targets for one loop frame. `break_label`
@@ -1066,7 +1111,49 @@ impl<'a> LoweringContext<'a> {
             next_feedback_slot: Cell::new(0),
             loop_labels: RefCell::new(Vec::new()),
             scope_starts: RefCell::new(Vec::new()),
+            property_names: RefCell::new(Vec::new()),
+            float_constants: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Intern a property name into the function's side table,
+    /// returning its index for use as an `Idx` operand (e.g., on
+    /// `LdaGlobal`). Dedup is O(N) on an already-small table.
+    fn intern_property_name(&self, name: &str) -> Result<u32, SourceLoweringError> {
+        let mut tbl = self.property_names.borrow_mut();
+        if let Some(pos) = tbl.iter().position(|n| n == name) {
+            return Ok(pos as u32);
+        }
+        let idx = u32::try_from(tbl.len())
+            .map_err(|_| SourceLoweringError::Internal("property name table overflow".into()))?;
+        tbl.push(name.to_owned());
+        Ok(idx)
+    }
+
+    /// Intern a float constant into the function's side table,
+    /// returning its index. Uses `to_bits` for equality so
+    /// `Infinity` and `NaN` dedup correctly despite NaN's pathological
+    /// `==` behaviour.
+    fn intern_float_constant(&self, value: f64) -> Result<u32, SourceLoweringError> {
+        let mut tbl = self.float_constants.borrow_mut();
+        let bits = value.to_bits();
+        if let Some(pos) = tbl.iter().position(|v| v.to_bits() == bits) {
+            return Ok(pos as u32);
+        }
+        let idx = u32::try_from(tbl.len())
+            .map_err(|_| SourceLoweringError::Internal("float constant table overflow".into()))?;
+        tbl.push(value);
+        Ok(idx)
+    }
+
+    /// Finalise the property-name interner into an immutable table.
+    fn take_property_names(&self) -> crate::property::PropertyNameTable {
+        crate::property::PropertyNameTable::new(self.property_names.borrow().clone())
+    }
+
+    /// Finalise the float-constant interner into an immutable table.
+    fn take_float_constants(&self) -> crate::float::FloatTable {
+        crate::float::FloatTable::new(self.float_constants.borrow().clone())
     }
 
     /// Push a fresh [`LoopLabels`] frame onto the stack. Paired 1:1
@@ -1432,6 +1519,71 @@ fn lower_single_declarator<'a>(
     ctx.mark_initialized(name)
 }
 
+/// Lower an `Expression::Identifier` reading the named binding into
+/// the accumulator.
+///
+/// Resolution order:
+/// 1. Local / parameter binding — routes through
+///    [`lower_identifier_read`], which also primes a feedback slot
+///    for M_JIT_C.2 consumption.
+/// 2. Well-known global constant (M14) — emits a dedicated opcode:
+///    `undefined` → `LdaUndefined`, `NaN` → `LdaNaN`, `Infinity` →
+///    `LdaConstF64` against an interned `f64::INFINITY`.
+/// 3. Well-known global property (M14) — `globalThis`, `Math`, and
+///    any other recognised name emit `LdaGlobal` with the name
+///    interned into the function's `PropertyNameTable`.
+/// 4. Otherwise — surface the pre-existing `unbound_identifier`
+///    compile-time rejection. Generalising this to "always emit
+///    `LdaGlobal`" would match the ES spec's dynamic-lookup model,
+///    but keeping the reject lets later milestones extend the
+///    whitelist intentionally.
+fn lower_identifier_reference(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    ident: &IdentifierReference<'_>,
+) -> Result<(), SourceLoweringError> {
+    let name = ident.name.as_str();
+    if let Some(binding) = ctx.resolve_identifier(name) {
+        return lower_identifier_read(builder, ctx, binding, ident.span);
+    }
+    match name {
+        "undefined" => {
+            builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaUndefined: {err:?}"))
+            })?;
+            Ok(())
+        }
+        "NaN" => {
+            builder
+                .emit(Opcode::LdaNaN, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode LdaNaN: {err:?}")))?;
+            Ok(())
+        }
+        "Infinity" => {
+            let idx = ctx.intern_float_constant(f64::INFINITY)?;
+            builder
+                .emit(Opcode::LdaConstF64, &[Operand::Idx(idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaConstF64: {err:?}"))
+                })?;
+            Ok(())
+        }
+        "globalThis" | "Math" => {
+            let idx = ctx.intern_property_name(name)?;
+            builder
+                .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaGlobal: {err:?}"))
+                })?;
+            Ok(())
+        }
+        _ => Err(SourceLoweringError::unsupported(
+            "unbound_identifier",
+            ident.span,
+        )),
+    }
+}
+
 /// Emits `Ldar reg` for an in-scope identifier read. Rejects
 /// uninitialized locals (TDZ self-reference) at compile time so the
 /// runtime never sees a hole on this path.
@@ -1501,17 +1653,29 @@ fn lower_return_expression(
     expr: &Expression<'_>,
 ) -> Result<(), SourceLoweringError> {
     match expr {
-        Expression::Identifier(ident) => {
-            let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
-                SourceLoweringError::unsupported("unbound_identifier", ident.span)
-            })?;
-            lower_identifier_read(builder, ctx, binding, ident.span)
-        }
+        Expression::Identifier(ident) => lower_identifier_reference(builder, ctx, ident),
         Expression::NumericLiteral(literal) => {
             let value = int32_from_literal(literal)?;
             builder
                 .emit(Opcode::LdaSmi, &[Operand::Imm(value)])
                 .map_err(|err| SourceLoweringError::Internal(format!("encode LdaSmi: {err:?}")))?;
+            Ok(())
+        }
+        Expression::NullLiteral(_) => {
+            builder
+                .emit(Opcode::LdaNull, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode LdaNull: {err:?}")))?;
+            Ok(())
+        }
+        Expression::BooleanLiteral(lit) => {
+            let opcode = if lit.value {
+                Opcode::LdaTrue
+            } else {
+                Opcode::LdaFalse
+            };
+            builder
+                .emit(opcode, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode LdaBool: {err:?}")))?;
             Ok(())
         }
         Expression::BinaryExpression(binary) => lower_binary_expression(builder, ctx, binary),

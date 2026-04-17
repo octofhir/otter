@@ -17,7 +17,9 @@ use std::time::Instant;
 use otter_vm as vm;
 use otter_vm::feedback::FeedbackVector;
 
-use crate::baseline::{analyze_template_candidate, emit_template_stencil};
+use crate::baseline::{
+    analyze_template_candidate, analyze_template_candidate_with_feedback, emit_template_stencil,
+};
 use crate::code_memory::{CompiledCodeOrigin, CompiledFunction, compile_code_buffer};
 use crate::telemetry;
 use crate::{BailoutReason, JitError};
@@ -114,12 +116,16 @@ pub fn compile_function_with_feedback(
 
 fn compile_template_baseline(
     function: &vm::Function,
-    _feedback: Option<&FeedbackVector>,
+    feedback: Option<&FeedbackVector>,
 ) -> Result<CompiledFunction, JitError> {
     let started = Instant::now();
 
-    let program = analyze_template_candidate(function)
-        .map_err(|err| JitError::UnsupportedInstruction(format!("{err:?}")))?;
+    let program = match feedback {
+        Some(fv) => analyze_template_candidate_with_feedback(function, Some(fv))
+            .map_err(|err| JitError::UnsupportedInstruction(format!("{err:?}")))?,
+        None => analyze_template_candidate(function)
+            .map_err(|err| JitError::UnsupportedInstruction(format!("{err:?}")))?,
+    };
 
     let stencil = emit_template_stencil(&program)
         .map_err(|err| JitError::UnsupportedInstruction(format!("{err:?}")))?;

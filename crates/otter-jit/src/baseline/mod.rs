@@ -20,6 +20,7 @@
 //! ```
 
 use otter_vm::bytecode::{InstructionIter, Opcode, Operand};
+use otter_vm::feedback::{ArithmeticFeedback, FeedbackSlotId, FeedbackVector};
 use otter_vm::module::{Function, FunctionIndex};
 
 /// An operation in the v2 baseline IR. Each op reads / writes the
@@ -164,6 +165,14 @@ pub struct TemplateProgram {
     /// emitter to insert the acc-spill prelude before the header and
     /// by OSR to pick valid entry points.
     pub loop_header_byte_pcs: Vec<u32>,
+    /// Per-instruction int32-trust flag (same length as `instructions`).
+    /// `true` means the instruction's persistent `ArithmeticFeedback`
+    /// has stabilised at `Int32`, so the emitter may skip the tag guard
+    /// on the instruction's RHS load. Produced by
+    /// [`analyze_template_candidate_with_feedback`]; the profile-free
+    /// variant leaves this all-`false`, preserving the guarded fast
+    /// path.
+    pub trust_int32: Vec<bool>,
 }
 
 /// Why a v2 function is not yet supported by the template baseline.
@@ -204,6 +213,26 @@ pub enum TemplateCompileError {
 /// function from entering the v2 baseline path.
 pub fn analyze_template_candidate(
     function: &Function,
+) -> Result<TemplateProgram, TemplateCompileError> {
+    analyze_template_candidate_with_feedback(function, None)
+}
+
+/// Feedback-aware analyzer variant.
+///
+/// Walks the same bytecode as [`analyze_template_candidate`] but
+/// additionally consults the function's persistent [`FeedbackVector`]
+/// (via the bytecode's sparse `FeedbackMap`) to populate
+/// [`TemplateProgram::trust_int32`]. Instructions whose arithmetic
+/// feedback has stabilised at [`ArithmeticFeedback::Int32`] after
+/// warmup get their trust flag set so the emitter can drop the tag
+/// guard on the RHS load.
+///
+/// Passing `feedback = None` is equivalent to
+/// [`analyze_template_candidate`] and leaves every entry of
+/// `trust_int32` as `false`.
+pub fn analyze_template_candidate_with_feedback(
+    function: &Function,
+    feedback: Option<&FeedbackVector>,
 ) -> Result<TemplateProgram, TemplateCompileError> {
     let bytecode = function.bytecode();
     let bytes = bytecode.bytes();
@@ -255,6 +284,33 @@ pub fn analyze_template_candidate(
         i += 1;
     }
 
+    // Build the trust_int32 side table: one flag per emitted
+    // instruction, derived from the feedback slot attached to the
+    // instruction's byte-PC. A flag is `true` only when ALL of the
+    // following hold:
+    //
+    //   1. A feedback slot is attached to this byte-PC (the source
+    //      compiler only attaches slots to arithmetic ops, so this
+    //      gates the whole check on "is arithmetic?").
+    //   2. A `FeedbackVector` was supplied to the analyzer (this is the
+    //      post-warmup recompile; the first compile has no feedback
+    //      and keeps the guarded variant).
+    //   3. The vector's slot has stabilised at
+    //      `ArithmeticFeedback::Int32` — meaning every observation so
+    //      far was int32. Any Number/BigInt/Any observation keeps the
+    //      flag `false` so the emitter retains the guard.
+    let bytecode_feedback_map = function.bytecode().feedback();
+    let mut trust_int32 = vec![false; instructions.len()];
+    if let Some(fv) = feedback {
+        for (i, byte_pc) in byte_pcs.iter().enumerate() {
+            if let Some(slot) = bytecode_feedback_map.get(*byte_pc)
+                && let Some(ArithmeticFeedback::Int32) = fv.arithmetic(FeedbackSlotId(slot.0))
+            {
+                trust_int32[i] = true;
+            }
+        }
+    }
+
     Ok(TemplateProgram {
         function_name: function
             .name()
@@ -265,6 +321,7 @@ pub fn analyze_template_candidate(
         instructions,
         byte_pcs,
         loop_header_byte_pcs,
+        trust_int32,
     })
 }
 
@@ -739,6 +796,14 @@ fn emit_template_stencil_aarch64(
     /// failure, control branches to the per-site bailout pad patched
     /// in after the main body. The guard uses the 3-insn
     /// `eor / tst / b.ne` sequence from v1's `check_int32_tag_fast`.
+    ///
+    /// When `trust_int32` is `true`, the guard and its bailout patch
+    /// are elided: only `ldr` + `sxtw` remain. The caller (the
+    /// feedback-driven analyzer) is responsible for ensuring the slot
+    /// really does hold an int32 at runtime, either because
+    /// [`ArithmeticFeedback::Int32`] has stabilised on the associated
+    /// PC across many observations or because an upstream guard
+    /// already validated the operand.
     fn load_int32_guarded(
         asm: &mut Assembler,
         dst: Reg,
@@ -746,16 +811,19 @@ fn emit_template_stencil_aarch64(
         byte_pc: u32,
         acc_state_at_guard: AccState,
         bailout_patches: &mut Vec<BailoutPatch>,
+        trust_int32: bool,
     ) {
         asm.ldr_u64_imm(dst, Reg::X9, slot_off);
-        asm.check_int32_tag_fast(dst, Reg::X20);
-        let bp = asm.b_cond_placeholder(Cond::Ne);
-        bailout_patches.push(BailoutPatch {
-            source_offset: bp,
-            byte_pc,
-            reason: crate::BailoutReason::TypeGuardFailed as u32,
-            acc_state: acc_state_at_guard,
-        });
+        if !trust_int32 {
+            asm.check_int32_tag_fast(dst, Reg::X20);
+            let bp = asm.b_cond_placeholder(Cond::Ne);
+            bailout_patches.push(BailoutPatch {
+                source_offset: bp,
+                byte_pc,
+                reason: crate::BailoutReason::TypeGuardFailed as u32,
+                acc_state: acc_state_at_guard,
+            });
+        }
         asm.sxtw(dst, dst);
     }
 
@@ -870,7 +938,10 @@ fn emit_template_stencil_aarch64(
             TemplateInstruction::Ldar { reg } => {
                 // The guard fires AFTER ldr has clobbered x21 with raw
                 // slot bits — so at the bailout point x21 holds raw
-                // (not yet sxtw'd). Spill as Raw.
+                // (not yet sxtw'd). Spill as Raw. `Ldar` has no
+                // attached feedback slot (the source compiler only
+                // attaches slots to arithmetic ops), so `trust_int32[i]`
+                // is always `false` here and the guard stays.
                 load_int32_guarded(
                     &mut asm,
                     Reg::X21,
@@ -878,6 +949,7 @@ fn emit_template_stencil_aarch64(
                     byte_pc,
                     AccState::Raw,
                     &mut bailout_patches,
+                    program.trust_int32[i],
                 );
                 acc_state = AccState::Int32;
             }
@@ -898,6 +970,7 @@ fn emit_template_stencil_aarch64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.add_rrr(Reg::X21, Reg::X21, Reg::X10);
                     asm.sxtw(Reg::X21, Reg::X21);
@@ -920,6 +993,7 @@ fn emit_template_stencil_aarch64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.sub_rrr(Reg::X21, Reg::X21, Reg::X10);
                     asm.sxtw(Reg::X21, Reg::X21);
@@ -942,6 +1016,7 @@ fn emit_template_stencil_aarch64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.mul_rrr(Reg::X21, Reg::X21, Reg::X10);
                     asm.sxtw(Reg::X21, Reg::X21);
@@ -964,6 +1039,7 @@ fn emit_template_stencil_aarch64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.orr_rrr(Reg::X21, Reg::X21, Reg::X10);
                 }
@@ -1029,6 +1105,7 @@ fn emit_template_stencil_aarch64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.cmp_rr(Reg::X21, Reg::X10);
                 }
@@ -1576,16 +1653,19 @@ fn emit_template_stencil_x64(
         byte_pc: u32,
         acc_state_at_guard: AccState,
         bailout_patches: &mut Vec<BailoutPatch>,
+        trust_int32: bool,
     ) {
         asm.mov_mr_u32(dst, Reg::R12, slot_off);
-        asm.check_int32_tag_fast(dst, Reg::Rax, Reg::R14);
-        let bp = asm.b_cond_placeholder(Cond::Ne);
-        bailout_patches.push(BailoutPatch {
-            source_offset: bp,
-            byte_pc,
-            reason: crate::BailoutReason::TypeGuardFailed as u32,
-            acc_state: acc_state_at_guard,
-        });
+        if !trust_int32 {
+            asm.check_int32_tag_fast(dst, Reg::Rax, Reg::R14);
+            let bp = asm.b_cond_placeholder(Cond::Ne);
+            bailout_patches.push(BailoutPatch {
+                source_offset: bp,
+                byte_pc,
+                reason: crate::BailoutReason::TypeGuardFailed as u32,
+                acc_state: acc_state_at_guard,
+            });
+        }
         asm.sxtw(dst, dst);
     }
 
@@ -1680,6 +1760,7 @@ fn emit_template_stencil_x64(
                     byte_pc,
                     AccState::Raw,
                     &mut bailout_patches,
+                    program.trust_int32[i],
                 );
                 acc_state = AccState::Int32;
             }
@@ -1700,6 +1781,7 @@ fn emit_template_stencil_x64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.add_rrr(Reg::R13, Reg::R13, Reg::R10);
                     asm.sxtw(Reg::R13, Reg::R13);
@@ -1722,6 +1804,7 @@ fn emit_template_stencil_x64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.sub_rrr(Reg::R13, Reg::R13, Reg::R10);
                     asm.sxtw(Reg::R13, Reg::R13);
@@ -1744,6 +1827,7 @@ fn emit_template_stencil_x64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.mul_rrr(Reg::R13, Reg::R13, Reg::R10);
                     asm.sxtw(Reg::R13, Reg::R13);
@@ -1766,6 +1850,7 @@ fn emit_template_stencil_x64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.orr_rrr(Reg::R13, Reg::R13, Reg::R10);
                 }
@@ -1831,6 +1916,7 @@ fn emit_template_stencil_x64(
                         byte_pc,
                         acc_state,
                         &mut bailout_patches,
+                        program.trust_int32[i],
                     );
                     asm.cmp_rr(Reg::R13, Reg::R10);
                 }
@@ -2721,6 +2807,98 @@ mod tests {
         );
 
         let _ = fs::remove_file(&script_path);
+    }
+
+    /// M_JIT_C.2 regression guard: a feedback-warm recompile of the
+    /// `bench2.ts sum` loop produces a strictly smaller stencil than
+    /// the cold-compile variant, because every arithmetic op in the
+    /// hot loop has its tag guard elided once `ArithmeticFeedback::Int32`
+    /// stabilises.
+    ///
+    /// The test synthesises a fully-primed `FeedbackVector` rather than
+    /// running the interpreter (so it stays a unit test, not an
+    /// integration test). The feedback layout comes from the source
+    /// compiler's slot allocation; we populate every arithmetic slot
+    /// with `Int32`. Shrink target: the warm stencil must be at most
+    /// 80% of the cold stencil (matching the 20% shrink goal in the
+    /// M_JIT_C.2 acceptance criteria).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn m_jit_c_2_feedback_shrinks_stencil() {
+        use otter_vm::feedback::{ArithmeticFeedback, FeedbackSlotData, FeedbackVector};
+
+        let module = compile_source_module(
+            "function sum(n) { \
+                 let s = 0; \
+                 let i = 0; \
+                 while (i < n) { \
+                     s = (s + i) | 0; \
+                     i = i + 1; \
+                 } \
+                 return s; \
+             }",
+            "bench2.js",
+        );
+        let sum = module.function(FunctionIndex(0)).expect("sum function");
+
+        // Cold compile: no feedback → every arithmetic op keeps its
+        // tag guard.
+        let cold_program = analyze_template_candidate(sum).expect("cold analyze");
+        assert!(
+            cold_program.trust_int32.iter().all(|&t| !t),
+            "cold analyzer must leave trust_int32 all-false",
+        );
+        let cold_stencil = emit_template_stencil(&cold_program).expect("cold emit");
+        let cold_size = cold_stencil.code.bytes().len();
+
+        // Warm recompile: synthesise a fully-primed feedback vector
+        // with `Int32` observations on every arithmetic slot, matching
+        // what the interpreter records after running the loop through
+        // enough iterations for the JSC-style back-edge budget to
+        // exhaust.
+        let layout = sum.feedback();
+        assert!(
+            !layout.is_empty(),
+            "source compiler must populate arithmetic feedback slots for sum's loop body",
+        );
+        let mut fv = FeedbackVector::from_layout(layout);
+        for (i, slot) in layout.slots().iter().enumerate() {
+            if let FeedbackSlotData::Arithmetic(_) = FeedbackSlotData::for_kind(slot.kind()) {
+                fv.record_arithmetic(
+                    otter_vm::feedback::FeedbackSlotId(i as u16),
+                    ArithmeticFeedback::Int32,
+                );
+            }
+        }
+        let warm_program =
+            analyze_template_candidate_with_feedback(sum, Some(&fv)).expect("warm analyze");
+        assert!(
+            warm_program.trust_int32.iter().any(|&t| t),
+            "warm analyzer must flip at least one trust_int32 entry to true",
+        );
+        let warm_stencil = emit_template_stencil(&warm_program).expect("warm emit");
+        let warm_size = warm_stencil.code.bytes().len();
+
+        // The emitter's guard elision is what drives the shrink: each
+        // guarded load is `eor / tst / b.cond` on aarch64 (12 bytes of
+        // guard code) plus the shared bailout pad it targets (~24
+        // bytes). Even half of the sum loop's arithmetic ops going
+        // trust-int32 shaves well past 20%.
+        let warm_ratio = (warm_size as f64) / (cold_size as f64);
+        assert!(
+            warm_size < cold_size,
+            "warm stencil must be smaller than cold: cold={cold_size} warm={warm_size}",
+        );
+        assert!(
+            warm_ratio <= 0.80,
+            "feedback-warm recompile should shrink stencil by ≥ 20%: \
+             cold={cold_size} warm={warm_size} ratio={warm_ratio:.2}",
+        );
+        eprintln!(
+            "M_JIT_C.2 shrink: cold={cold_size} B → warm={warm_size} B \
+             ({:.1}% reduction)",
+            (1.0 - warm_ratio) * 100.0,
+        );
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]

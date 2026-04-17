@@ -4,10 +4,17 @@
 > v2 baseline now runs on both supported native backends:
 > `M_JIT_A` landed the guarded aarch64 path and `M_JIT_B` lands x86_64
 > parity. `M_JIT_C.1` then added mid-loop OSR on top of the existing
-> tier-up hook, so a hot loop in the entry function now enters compiled
+> tier-up hook, so a hot loop in the entry function enters compiled
 > code at its back-edge instead of waiting for the next function call.
-> Feedback-driven int32-trust elision (`M_JIT_C.2`) and the loop-local
-> register allocator (`M_JIT_C.3`) are the remaining JIT milestones.
+> `M_JIT_C.2` wired speculative int32-trust elision end-to-end: the
+> source compiler attaches feedback slots to every `Ldar`, arithmetic,
+> and int32 compare op; the interpreter records `Int32` observations;
+> the JIT analyzer consumes the persistent `FeedbackVector` and flips a
+> per-instruction `trust_int32` flag; and the emitters drop the
+> `eor/tst/b.cond` tag guards on trusted loads. On `bench2.ts sum`, a
+> feedback-warm recompile shrinks the stencil by ~38% (572 B → 356 B).
+> The loop-local register allocator (`M_JIT_C.3`) is the remaining JIT
+> milestone.
 >
 > Rule: this document tracks the **design direction** behind the JIT,
 > not the feature roadmap. Feature milestones live in `V2_MIGRATION.md`;
@@ -49,7 +56,7 @@
 
 ### What's still latent
 
-The remaining JIT work is now downstream of `M_JIT_C.1`:
+The remaining JIT work is now downstream of `M_JIT_C.2`:
 
 1. **Direct in-process stencil calls from Rust tests on Apple Silicon
    remain hostile.** The regression-safe smoke coverage therefore uses
@@ -59,15 +66,18 @@ The remaining JIT work is now downstream of `M_JIT_C.1`:
    Apple Silicon.** The backend itself runs and the Rosetta local sample
    proves a large JIT win, but the default 50-call `bench2_microbench`
    exceeds the fixed 180-second timeout under Rosetta.
-3. **Speculative int32-trust elision (`M_JIT_C.2`) is still deferred.**
-   The `analyze_template_candidate_with_feedback` + `trust_int32` side
-   table is sketched but inactive; feedback-slot allocation on the
-   source compiler side is the wiring that remains.
+3. **Trust-int32 has no function-entry safety net.** Feedback-warm
+   elision correctly emits a guarded variant on bailout (the deopt
+   path demotes the bailout PC's slot and invalidates the cached
+   stencil), but there is no up-front parameter tag check, so a
+   post-warmup call with a non-int32 param produces silently wrong
+   results until a downstream op that still carries a guard triggers
+   the deopt demotion. Parameter-entry guards are a future refinement.
 4. **Loop-local register allocator (`M_JIT_C.3`) is still deferred.**
    Hot int32 loop-carried slots still round-trip through memory on
    every iteration — the biggest single remaining throughput win.
 
-### Benchmarks (M2 + M7 + M_JIT_B + M_JIT_C.1)
+### Benchmarks (M2 + M7 + M_JIT_B + M_JIT_C.1 + M_JIT_C.2)
 
 - **`f(42)` interpreter** (M1 shape): **496 ns/iter** on aarch64, 10⁶
   iterations via `Interpreter::execute_with_runtime`.
@@ -99,15 +109,21 @@ Silicon host. `M_JIT_C.1` keeps these steady-state numbers untouched
 adds back-edge OSR for the cold-loop shape: a one-shot 100k-iter
 `main` loop that previously ran in the interpreter end-to-end now tiers
 up mid-loop after ≈1500 back-edges and finishes execution in the JIT,
-as verified by `osr_smoke`.
+as verified by `osr_smoke`. `M_JIT_C.2` then shrinks the feedback-warm
+stencil: on the same `bench2.ts sum` loop, a recompile with all
+arithmetic slots primed at `Int32` drops the stencil from 572 B to
+356 B (−37.8%), as verified by `m_jit_c_2_feedback_shrinks_stencil`.
+Steady-state `bench2_microbench` JIT latency stays at 2 ns/inner-iter
+because that benchmark compiles cold (no prior interpreter runs to
+build feedback); warm-compile throughput lives in the shrink test.
 
-### Regression status (post-M_JIT_C.1)
+### Regression status (post-M_JIT_C.2)
 
 | Command | Pass / Total |
 | --- | --- |
 | `cargo test -p otter-vm --lib` | **371 / 371** |
-| `cargo test -p otter-jit --lib` | **22 / 22** (2 ignored — `m1_microbench` + `bench2_microbench`) |
-| `cargo test -p otter-jit --lib --target x86_64-apple-darwin` | **25 / 25** (2 ignored — `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib` | **23 / 23** (2 ignored — `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib --target x86_64-apple-darwin` | **26 / 26** (2 ignored — `m1_microbench` + `bench2_microbench`) |
 | `cargo build --workspace` | green |
 | `cargo build --workspace --target x86_64-apple-darwin` | green |
 | `cargo clippy --workspace --all-targets -- -D warnings` | green |
@@ -215,29 +231,44 @@ calls [`TierUpHook::execute_cached_at_pc`](crates/otter-vm/src/interpreter/tier_
 once the back-edge budget exhausts; bailouts restore the frame and
 resume interpretation in-place.
 
-### M_JIT_C.2 — speculative int32-trust elision (deferred)
+### M_JIT_C.2 — speculative int32-trust elision
 
-1. **Feedback-slot allocation in the source compiler.** For every
-   arithmetic opcode emitted on the hot path (`Add`, `Sub`, `Mul`,
-   `BitwiseOr`/`And`/`Xor`, `Shl`, `Shr`, `UShr`, and their `*Smi`
-   variants), allocate a slot in the function's `FeedbackTableLayout`
-   so the interpreter has somewhere to persist `ArithmeticFeedback`.
-2. **Feedback recording in the interpreter.** Write `Int32` when both
-   operands were int32; write `NotInt32`/`Any` otherwise.
-3. **Activate `analyze_template_candidate_with_feedback`.** Wire
-   [`compile_function_with_feedback`](crates/otter-jit/src/pipeline.rs)
-   to pass the function's current `FeedbackVector` through; on recompile,
-   PCs with stable `Int32` feedback get `trust_int32[i] = true`.
-4. **Emitter elision.** When `trust_int32[i]` is true, skip
-   `check_int32_tag_fast` + the conditional bailout branch on the
-   instruction's loads. Apply on both aarch64 and x86_64.
-5. **Deopt demotes feedback.** If a guard elsewhere still fires on a
-   trust-int32 PC, demote the feedback slot and invalidate the cached
-   stencil so the next tier-up recompile goes back to the guarded
-   variant.
-6. **Stencil-size regression test.** Warm up feedback at Int32, force a
-   recompile, assert the new stencil is strictly smaller than the cold
-   stencil.
+**Shipped.** The source compiler attaches an `Arithmetic`-kind
+[`FeedbackSlot`](crates/otter-vm/src/bytecode/feedback_map.rs) to every
+`Ldar`, binary-arithmetic, `*Smi`, and int32-compare op via
+[`BytecodeBuilder::attach_feedback`](crates/otter-vm/src/bytecode/encoding.rs)
+and populates a matching `FeedbackTableLayout` on the function. The
+interpreter's dispatch records
+[`ArithmeticFeedback::Int32`](crates/otter-vm/src/feedback.rs) after
+every successful op (`Ldar` additionally promotes to `Any` on a
+non-int32 load so the monotonic lattice demotes speculation when the
+slot turns out to be polymorphic). `run_completion_with_runtime`'s
+existing `persist_feedback` call merges the per-frame observations
+into the runtime's persistent vector on Return, and
+[`DefaultTierUpHook::try_compile`](crates/otter-jit/src/tier_up_hook.rs)
+passes that persistent vector through to
+[`compile_function_with_feedback`](crates/otter-jit/src/pipeline.rs) ⇒
+[`analyze_template_candidate_with_feedback`](crates/otter-jit/src/baseline/mod.rs).
+The analyzer walks `byte_pcs[i] → FeedbackMap::get(pc) → FeedbackSlotId`
+and flips `trust_int32[i] = true` for every instruction whose slot
+stabilised at `Int32`. Both emitters thread the flag into
+`load_int32_guarded`, which elides the `eor/tst/b.cond` guard and the
+associated bailout pad when the flag is set.
+
+Deopt path (both `execute_cached` and `execute_cached_at_pc`):
+`demote_and_invalidate_on_bailout` drops the bailout PC's feedback
+slot to `Any` via [`FeedbackVector::demote_arithmetic_to_any`](crates/otter-vm/src/feedback.rs)
+and calls [`code_cache::invalidate`](crates/otter-jit/src/code_cache.rs)
+so the next tier-up call recompiles against the demoted feedback and
+re-emits the guarded variant. The existing
+`max_deopts_before_blacklist` mechanism remains the termination
+guarantee if repeated bailouts still produce trust-int32 stencils for
+a pathological program.
+
+Regression test: [`m_jit_c_2_feedback_shrinks_stencil`](crates/otter-jit/src/baseline/mod.rs)
+compiles `bench2.ts sum` cold, synthesises a fully-primed feedback
+vector, recompiles warm, and asserts the warm stencil is ≤ 80% of the
+cold stencil (measured: 572 → 356 B, 37.8% shrink).
 
 ### M_JIT_C.3 — loop-local register allocator (deferred)
 
@@ -396,6 +427,23 @@ guarded emitter partially wired and the invocation smoke test
   confirms a single-function 100k-iter loop tiers up mid-loop through
   the real `otter` CLI with `--dump-jit-stats` showing `1 JIT / 0
   interpreter entries` for `main`. Commit: `5251b41`.
+- 2026-04-17: **M_JIT_C.2 landed** — the source compiler now attaches
+  an arithmetic-kind `FeedbackSlot` to every `Ldar`, binary-arithmetic,
+  `*Smi`, and int32-compare op; the interpreter records
+  `ArithmeticFeedback::Int32` on success (and `Any` on non-int32 `Ldar`
+  loads); `DefaultTierUpHook::try_compile` threads the persistent
+  `FeedbackVector` into `analyze_template_candidate_with_feedback`,
+  which populates `TemplateProgram::trust_int32` per-instruction; both
+  emitters (aarch64 + x86_64) elide the `eor/tst/b.cond` guard and its
+  bailout pad on trusted loads. Deopt path demotes the bailout PC's
+  slot to `Any` via `FeedbackVector::demote_arithmetic_to_any` and
+  invalidates the cached stencil so the next recompile falls back to
+  the guarded variant. `m_jit_c_2_feedback_shrinks_stencil` confirms a
+  feedback-warm `bench2.ts sum` recompile is 37.8% smaller than the
+  cold stencil (572 → 356 B). `bench2_microbench` JIT latency holds
+  at 2 ns/inner-iter (benchmark compiles cold, so M_JIT_C.2's shrink
+  doesn't show up in that microbench; warm-compile savings live in
+  the unit test). Commit: `_pending_`.
 
 ---
 

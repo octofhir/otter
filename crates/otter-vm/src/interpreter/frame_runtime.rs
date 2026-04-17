@@ -121,13 +121,18 @@ impl FrameRuntimeState {
     }
 
     /// Get the feedback slot ID for a given PC if it matches the expected kind.
-    #[allow(dead_code)]
+    ///
+    /// Resolves through the sparse
+    /// [`FeedbackMap`](crate::bytecode::FeedbackMap) attached to the
+    /// bytecode by the source compiler: only instructions that were
+    /// explicitly annotated at compile time carry a slot.
     fn feedback_slot_of_kind(
         function: &Function,
         pc: ProgramCounter,
         expected_kind: FeedbackKind,
     ) -> Option<FeedbackSlotId> {
-        let slot = FeedbackSlotId(u16::try_from(pc).ok()?);
+        let bytecode_slot = function.bytecode().feedback().get(pc)?;
+        let slot = FeedbackSlotId(bytecode_slot.0);
         let layout = function.feedback().get(slot)?;
         (layout.kind() == expected_kind).then_some(slot)
     }

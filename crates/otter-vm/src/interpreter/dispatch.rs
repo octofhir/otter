@@ -20,6 +20,7 @@
 //!   from the byte *after* the jump operand.
 
 use crate::bytecode::{InstructionIter, Opcode, Operand};
+use crate::feedback::ArithmeticFeedback;
 use crate::frame::RegisterIndex;
 use crate::module::{Function, Module};
 use crate::value::RegisterValue;
@@ -37,7 +38,7 @@ impl Interpreter {
         _module: &Module,
         activation: &mut Activation,
         runtime: &mut RuntimeState,
-        _frame_runtime: &mut FrameRuntimeState,
+        frame_runtime: &mut FrameRuntimeState,
     ) -> Result<StepOutcome, InterpreterError> {
         let bytecode = function.bytecode();
         let bytes = bytecode.bytes();
@@ -56,7 +57,19 @@ impl Interpreter {
             // ---- Accumulator load / store / move ----
             Opcode::Ldar => {
                 let r = reg(&instr.operands, 0)?;
-                activation.set_accumulator(read_reg(activation, function, r)?);
+                let v = read_reg(activation, function, r)?;
+                activation.set_accumulator(v);
+                // M_JIT_C.2: track whether this PC's slot has only ever
+                // been observed as int32. The JIT consumer drops the
+                // `Ldar` tag guard once the feedback stabilises at
+                // `Int32`; observing any non-int32 value promotes the
+                // lattice to `Any`, which keeps the guard in place.
+                let observation = if v.as_i32().is_some() {
+                    ArithmeticFeedback::Int32
+                } else {
+                    ArithmeticFeedback::Any
+                };
+                frame_runtime.record_arithmetic(function, pc, observation);
             }
             Opcode::Star => {
                 let r = reg(&instr.operands, 0)?;
@@ -133,6 +146,13 @@ impl Interpreter {
             }
 
             // ---- Binary arithmetic (int32 fast path; generic bail later) ----
+            //
+            // Every successful int32 op records an
+            // [`ArithmeticFeedback::Int32`] observation at this PC so
+            // the JIT baseline can drop tag guards once the feedback
+            // stabilises (M_JIT_C.2 trust-int32 elision). Slots are
+            // attached sparsely by the source compiler, so recording a
+            // non-existent slot is a no-op.
             Opcode::Add => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 activation.set_accumulator(
@@ -141,6 +161,7 @@ impl Interpreter {
                         .add_i32(rhs)
                         .map_err(|_| InterpreterError::TypeError(Box::from("expected int32")))?,
                 );
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::Sub => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
@@ -150,6 +171,7 @@ impl Interpreter {
                         .sub_i32(rhs)
                         .map_err(|_| InterpreterError::TypeError(Box::from("expected int32")))?,
                 );
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::Mul => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
@@ -159,24 +181,28 @@ impl Interpreter {
                         .mul_i32(rhs)
                         .map_err(|_| InterpreterError::TypeError(Box::from("expected int32")))?,
                 );
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::BitwiseOr => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_i32(l | r));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::BitwiseAnd => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_i32(l & r));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::BitwiseXor => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_i32(l ^ r));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::Shl => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
@@ -185,6 +211,7 @@ impl Interpreter {
                 // §13.9.2 — shift amount masked to low 5 bits.
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shl((r as u32) & 0x1F)));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::Shr => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
@@ -192,6 +219,7 @@ impl Interpreter {
                 let r = i32_of(rhs)?;
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shr((r as u32) & 0x1F)));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::UShr => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
@@ -199,6 +227,7 @@ impl Interpreter {
                 let r = i32_of(rhs)? as u32;
                 activation
                     .set_accumulator(RegisterValue::from_i32((l.wrapping_shr(r & 0x1F)) as i32));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::Div => {
                 // Int-only div: bail on non-i32 or division-by-zero
@@ -227,42 +256,53 @@ impl Interpreter {
             }
 
             // ---- Smi immediate variants ----
+            //
+            // Feedback recording mirrors the reg-form arithmetic above:
+            // a successful Smi op necessarily saw an int32 acc, so we
+            // record `ArithmeticFeedback::Int32` at each op's PC.
             Opcode::AddSmi => {
                 let v = imm(&instr.operands, 0)?;
                 let l = i32_of(activation.accumulator())?;
                 activation.set_accumulator(RegisterValue::from_i32(l.wrapping_add(v)));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::SubSmi => {
                 let v = imm(&instr.operands, 0)?;
                 let l = i32_of(activation.accumulator())?;
                 activation.set_accumulator(RegisterValue::from_i32(l.wrapping_sub(v)));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::MulSmi => {
                 let v = imm(&instr.operands, 0)?;
                 let l = i32_of(activation.accumulator())?;
                 activation.set_accumulator(RegisterValue::from_i32(l.wrapping_mul(v)));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::BitwiseOrSmi => {
                 let v = imm(&instr.operands, 0)?;
                 let l = i32_of(activation.accumulator())?;
                 activation.set_accumulator(RegisterValue::from_i32(l | v));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::BitwiseAndSmi => {
                 let v = imm(&instr.operands, 0)?;
                 let l = i32_of(activation.accumulator())?;
                 activation.set_accumulator(RegisterValue::from_i32(l & v));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::ShlSmi => {
                 let v = imm(&instr.operands, 0)?;
                 let l = i32_of(activation.accumulator())?;
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shl((v as u32) & 0x1F)));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::ShrSmi => {
                 let v = imm(&instr.operands, 0)?;
                 let l = i32_of(activation.accumulator())?;
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shr((v as u32) & 0x1F)));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
 
             // ---- Unary ops on accumulator ----
@@ -296,34 +336,51 @@ impl Interpreter {
             }
 
             // ---- Comparisons (int32 ordered) ----
+            //
+            // A successful int32 ordered compare saw int32 on both
+            // sides; record Int32 so the JIT can elide the RHS tag
+            // guard on trust-int32 recompile. `TestEqualStrict` is
+            // polymorphic at the ISA level — we observe per-call and
+            // let the monotonic lattice record whatever we actually
+            // saw.
             Opcode::TestLessThan => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l < r));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::TestGreaterThan => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l > r));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::TestLessThanOrEqual => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l <= r));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::TestGreaterThanOrEqual => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l >= r));
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::TestEqualStrict => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                activation
-                    .set_accumulator(RegisterValue::from_bool(activation.accumulator() == rhs));
+                let lhs = activation.accumulator();
+                activation.set_accumulator(RegisterValue::from_bool(lhs == rhs));
+                let observation = if lhs.as_i32().is_some() && rhs.as_i32().is_some() {
+                    ArithmeticFeedback::Int32
+                } else {
+                    ArithmeticFeedback::Any
+                };
+                frame_runtime.record_arithmetic(function, pc, observation);
             }
             Opcode::TestEqual => {
                 // Loose equality (§7.2.14). Phase 3b.6: for int32/null/

@@ -23,6 +23,7 @@
 use std::ptr::null_mut;
 use std::sync::Arc;
 
+use otter_vm::feedback::FeedbackSlotId;
 use otter_vm::interpreter::{TierUpExecResult, TierUpHook};
 use otter_vm::module::{FunctionIndex, Module};
 use otter_vm::value::RegisterValue;
@@ -50,6 +51,48 @@ impl DefaultTierUpHook {
     pub fn new_arc() -> Arc<dyn TierUpHook> {
         Arc::new(Self)
     }
+}
+
+/// On a JIT bailout, demote the arithmetic feedback slot (if any)
+/// attached to the bailout PC to [`ArithmeticFeedback::Any`] and
+/// invalidate the cached stencil.
+///
+/// The stencil invalidation is what breaks the "trust-int32
+/// bailout loop": without it, the next tier-up call would re-issue
+/// the same cached code and bail at the same PC forever. With it,
+/// the next tier-up call runs `try_compile` against the demoted
+/// feedback and emits the guarded variant for the offending op.
+///
+/// The function also demotes the arithmetic slot even when the
+/// bailout PC isn't an arithmetic op — the `feedback_map.get()`
+/// lookup returns `None` in that case and the demote is a no-op. The
+/// invalidation still runs, covering deopts from `Ldar` or
+/// `CompareAcc` paths where the next recompile with unchanged
+/// feedback might still pick the same shape.
+fn demote_and_invalidate_on_bailout(
+    module: &Module,
+    function_index: FunctionIndex,
+    function_ptr: *const Function,
+    bailout_pc: u32,
+    runtime_ptr: *mut (),
+) {
+    if runtime_ptr.is_null() {
+        return;
+    }
+    // SAFETY: runtime_ptr is a live `*mut RuntimeState` held by the
+    // interpreter for the duration of the hook call.
+    let runtime = unsafe { &mut *(runtime_ptr as *mut RuntimeState) };
+    if let Some(function) = module.function(function_index)
+        && let Some(bytecode_slot) = function.bytecode().feedback().get(bailout_pc)
+        && let Some(fv) = runtime.feedback_vector_mut(function_index)
+    {
+        fv.demote_arithmetic_to_any(FeedbackSlotId(bytecode_slot.0));
+    }
+    // Invalidate the cached stencil regardless of whether we found a
+    // feedback slot to demote — on recompile, `try_compile` will
+    // consult the (possibly demoted) feedback and emit a guarded
+    // stencil for the offending PCs.
+    code_cache::invalidate(function_ptr);
 }
 
 impl TierUpHook for DefaultTierUpHook {
@@ -127,6 +170,17 @@ impl TierUpHook for DefaultTierUpHook {
 
         if raw_result == BAILOUT_SENTINEL {
             code_cache::record_deopt(function_ptr);
+            // M_JIT_C.2.5: demote the bailout PC's arithmetic feedback
+            // slot so the next recompile falls back to the guarded
+            // variant. Also invalidates the cached stencil so the next
+            // tier-up call actually recompiles.
+            demote_and_invalidate_on_bailout(
+                module,
+                function_index,
+                function_ptr,
+                ctx.bailout_pc,
+                runtime_ptr,
+            );
 
             // Anti-thrash: after too many deopts, drop the compiled code and
             // blacklist the function so the interpreter stops asking us to
@@ -242,6 +296,17 @@ impl TierUpHook for DefaultTierUpHook {
 
         if raw_result == BAILOUT_SENTINEL {
             code_cache::record_deopt(function_ptr);
+            // Mirror the function-entry bailout path: demote the
+            // bailout PC's arithmetic feedback slot and invalidate the
+            // cached stencil so a trust-int32 mid-loop bailout can't
+            // loop on the same stencil.
+            demote_and_invalidate_on_bailout(
+                module,
+                function_index,
+                function_ptr,
+                ctx.bailout_pc,
+                runtime_ptr,
+            );
             return TierUpExecResult::Bailout {
                 resume_pc: ctx.bailout_pc,
                 reason: ctx.bailout_reason,

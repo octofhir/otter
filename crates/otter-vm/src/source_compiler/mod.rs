@@ -127,9 +127,10 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 
-use crate::bytecode::{Bytecode, BytecodeBuilder, Opcode, Operand};
+use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Opcode, Operand};
+use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
 use crate::frame::{FrameLayout, RegisterIndex};
-use crate::module::{Function as VmFunction, FunctionIndex, Module};
+use crate::module::{Function as VmFunction, FunctionIndex, FunctionTables, Module};
 
 /// Staged AST-to-bytecode compiler for a single source file.
 ///
@@ -314,10 +315,12 @@ fn lower_function_declaration<'a>(
         .as_ref()
         .ok_or_else(|| SourceLoweringError::unsupported("declared_only_function", func.span))?;
 
-    // Lower the body first so we know the final `let`/`const` and
-    // call-temp counts; FrameLayout needs that up front because slot
-    // indices are stable across the function's lifetime.
-    let (bytecode, local_count, temp_count) =
+    // Lower the body first so we know the final `let`/`const`,
+    // call-temp, and feedback-slot counts; FrameLayout needs the
+    // first two up front, and the feedback slot count seeds the
+    // function's `FeedbackTableLayout` for the JIT's int32-trust
+    // consumer (see `analyze_template_candidate_with_feedback`).
+    let (bytecode, local_count, temp_count, feedback_slot_count) =
         lower_function_body(body, &func.params, param_count, function_names)?;
 
     // FrameLayout: 1 hidden slot for `this`, then `param_count`
@@ -330,7 +333,32 @@ fn lower_function_declaration<'a>(
     let layout = FrameLayout::new(1, param_count, local_count, temp_count)
         .map_err(|err| SourceLoweringError::Internal(format!("frame layout invalid: {err:?}")))?;
 
-    Ok(VmFunction::with_empty_tables(Some(name), layout, bytecode).with_strict(func.id.is_some()))
+    // M_JIT_C.2: every arithmetic op emitted above allocated a fresh
+    // `Arithmetic`-kind slot via `allocate_arithmetic_feedback`. Build
+    // the matching side-table layout so the interpreter and JIT can
+    // resolve `bytecode.feedback().get(pc) -> FeedbackSlot` against a
+    // well-shaped `FeedbackVector`.
+    let feedback_layout = arithmetic_only_feedback_layout(feedback_slot_count);
+    let tables = FunctionTables::new(
+        crate::module::FunctionSideTables::default(),
+        feedback_layout,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+    );
+
+    Ok(VmFunction::new(Some(name), layout, bytecode, tables).with_strict(func.id.is_some()))
+}
+
+/// Build a `FeedbackTableLayout` with `count` [`FeedbackKind::Arithmetic`]
+/// slots (ids `0..count`). Source-compiled functions allocate slots in
+/// monotonically increasing order, so this direct construction matches
+/// the slot ids produced by `LoweringContext::allocate_arithmetic_feedback`.
+fn arithmetic_only_feedback_layout(count: u16) -> FeedbackTableLayout {
+    let slots: Vec<FeedbackSlotLayout> = (0..count)
+        .map(|i| FeedbackSlotLayout::new(FeedbackSlotId(i), FeedbackKind::Arithmetic))
+        .collect();
+    FeedbackTableLayout::new(slots)
 }
 
 fn count_simple_params(
@@ -376,7 +404,7 @@ fn lower_function_body<'a>(
     params: &'a FormalParameters<'a>,
     param_count: RegisterIndex,
     function_names: &'a [&'a str],
-) -> Result<(Bytecode, RegisterIndex, RegisterIndex), SourceLoweringError> {
+) -> Result<(Bytecode, RegisterIndex, RegisterIndex, u16), SourceLoweringError> {
     if !body.directives.is_empty() {
         return Err(SourceLoweringError::unsupported(
             "directive_prologue",
@@ -421,7 +449,12 @@ fn lower_function_body<'a>(
         .finish()
         .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
 
-    Ok((bytecode, ctx.local_count(), ctx.temp_count()))
+    Ok((
+        bytecode,
+        ctx.local_count(),
+        ctx.temp_count(),
+        ctx.feedback_slot_count(),
+    ))
 }
 
 /// Lowers a single statement at function-body top level. Accepts the
@@ -816,6 +849,12 @@ struct LoweringContext<'a> {
     /// Ordered the same way the functions appear in
     /// `Module::functions`.
     function_names: &'a [&'a str],
+    /// Next [`FeedbackSlot`] id to hand out. Incremented every time an
+    /// arithmetic op is emitted with an attached feedback slot. The
+    /// final count seeds the function's [`FeedbackTableLayout`].
+    /// `Cell` so the expression-lowering helpers that take `&self`
+    /// can still allocate a slot.
+    next_feedback_slot: Cell<u16>,
 }
 
 /// Snapshot of [`LoweringContext::locals`] length, returned by
@@ -849,7 +888,40 @@ impl<'a> LoweringContext<'a> {
             current_temp_count: Cell::new(0),
             peak_temp_count: Cell::new(0),
             function_names,
+            next_feedback_slot: Cell::new(0),
         }
+    }
+
+    /// Allocates a fresh arithmetic-feedback slot id, returning the
+    /// [`FeedbackSlot`] the caller should attach to its freshly-emitted
+    /// instruction via
+    /// [`BytecodeBuilder::attach_feedback`](crate::bytecode::BytecodeBuilder::attach_feedback).
+    ///
+    /// Slot ids are sequential (`0`, `1`, …); the final count drives the
+    /// size of the function's [`FeedbackTableLayout`]. Every allocated
+    /// slot is assumed [`FeedbackKind::Arithmetic`] — the M_JIT_C.2 side
+    /// table only tracks int32-trust feedback and intentionally does not
+    /// populate Comparison/Branch/Property/Call slots.
+    ///
+    /// Panics in `debug_assertions` when the counter overflows `u16`;
+    /// release builds saturate and the surplus ops simply share the
+    /// last slot (correctness-preserving: the analyzer's trust map
+    /// still reflects the worst of the overlapping observations).
+    fn allocate_arithmetic_feedback(&self) -> FeedbackSlot {
+        let id = self.next_feedback_slot.get();
+        debug_assert!(
+            id < u16::MAX,
+            "feedback slot counter overflow — pathological function > 65 535 arithmetic ops",
+        );
+        self.next_feedback_slot.set(id.saturating_add(1));
+        FeedbackSlot(id)
+    }
+
+    /// Current count of allocated arithmetic-feedback slots. Consumed
+    /// by [`lower_function_body`] to build the function's
+    /// [`FeedbackTableLayout`].
+    fn feedback_slot_count(&self) -> u16 {
+        self.next_feedback_slot.get()
     }
 
     /// Number of `let`/`const` slots reserved by the frame layout —
@@ -1132,8 +1204,15 @@ fn lower_single_declarator<'a>(
 /// Emits `Ldar reg` for an in-scope identifier read. Rejects
 /// uninitialized locals (TDZ self-reference) at compile time so the
 /// runtime never sees a hole on this path.
+///
+/// Allocates an arithmetic feedback slot and attaches it to the
+/// emitted `Ldar` so the interpreter can record Int32 when the slot
+/// holds an int32 value, and the JIT baseline can drop the `Ldar`
+/// tag guard once the feedback stabilises (M_JIT_C.2 int32-trust
+/// elision).
 fn lower_identifier_read(
     builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
     binding: BindingRef,
     ident_span: Span,
 ) -> Result<(), SourceLoweringError> {
@@ -1153,29 +1232,36 @@ fn lower_identifier_read(
             ));
         }
     };
-    builder
+    let pc = builder
         .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
         .map_err(|err| SourceLoweringError::Internal(format!("encode Ldar: {err:?}")))?;
+    let slot = ctx.allocate_arithmetic_feedback();
+    builder.attach_feedback(pc, slot);
     Ok(())
 }
 
 /// Emits a Reg-form binary opcode (`Add`/`Sub`/...) reading the given
 /// in-scope identifier as the RHS. Thin wrapper over
-/// [`emit_identifier_as_reg_operand`] so the arithmetic and relational
-/// paths share the TDZ check + error-tag plumbing.
+/// [`emit_identifier_as_reg_operand`], which allocates the feedback
+/// slot so the interpreter can record Int32 / NotInt32 observations
+/// and the JIT baseline can consume them via
+/// [`analyze_template_candidate_with_feedback`].
 fn lower_identifier_as_reg_rhs(
     builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
     encoding: &BinaryOpEncoding,
     binding: BindingRef,
     ident_span: Span,
 ) -> Result<(), SourceLoweringError> {
     emit_identifier_as_reg_operand(
         builder,
+        ctx,
         encoding.reg_opcode,
         encoding.label,
         binding,
         ident_span,
-    )
+    )?;
+    Ok(())
 }
 
 fn lower_return_expression(
@@ -1188,7 +1274,7 @@ fn lower_return_expression(
             let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
-            lower_identifier_read(builder, binding, ident.span)
+            lower_identifier_read(builder, ctx, binding, ident.span)
         }
         Expression::NumericLiteral(literal) => {
             let value = int32_from_literal(literal)?;
@@ -1455,6 +1541,7 @@ fn lower_relational_expression(
                 })?;
             emit_identifier_as_reg_operand(
                 builder,
+                ctx,
                 encoding.forward_op,
                 encoding.label,
                 binding,
@@ -1476,6 +1563,7 @@ fn lower_relational_expression(
                 })?;
             emit_identifier_as_reg_operand(
                 builder,
+                ctx,
                 encoding.swapped_op,
                 encoding.label,
                 binding,
@@ -1498,13 +1586,22 @@ fn lower_relational_expression(
 /// shared TDZ check on the binding so callers don't have to repeat
 /// the match. Used by [`lower_identifier_as_reg_rhs`] (arithmetic
 /// RHS) and [`lower_relational_expression`] (relational comparand).
+///
+/// Allocates an arithmetic feedback slot and attaches it to the
+/// emitted instruction. Both arithmetic RHS loads and relational
+/// RHS loads benefit from the int32-trust elision in the JIT
+/// baseline, so the attachment is unconditional — the feedback
+/// lattice's monotonic semantics (observe_int32 only ever records
+/// Int32 when both operands were int32) preserves correctness across
+/// the two call kinds.
 fn emit_identifier_as_reg_operand(
     builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
     opcode: Opcode,
     label: &'static str,
     binding: BindingRef,
     ident_span: Span,
-) -> Result<(), SourceLoweringError> {
+) -> Result<u32, SourceLoweringError> {
     let reg = match binding {
         BindingRef::Param { reg } => reg,
         BindingRef::Local {
@@ -1521,10 +1618,12 @@ fn emit_identifier_as_reg_operand(
             ));
         }
     };
-    builder
+    let pc = builder
         .emit(opcode, &[Operand::Reg(u32::from(reg))])
         .map_err(|err| SourceLoweringError::Internal(format!("encode {label}: {err:?}")))?;
-    Ok(())
+    let slot = ctx.allocate_arithmetic_feedback();
+    builder.attach_feedback(pc, slot);
+    Ok(pc)
 }
 
 /// Applies a binary operation whose LHS is already in the accumulator.
@@ -1553,7 +1652,7 @@ fn apply_binary_op_with_acc_lhs(
             let fits_i8 = (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&value);
             match (encoding.smi_opcode, fits_i8) {
                 (Some(smi_op), true) => {
-                    builder
+                    let pc = builder
                         .emit(smi_op, &[Operand::Imm(value)])
                         .map_err(|err| {
                             SourceLoweringError::Internal(format!(
@@ -1561,6 +1660,8 @@ fn apply_binary_op_with_acc_lhs(
                                 encoding.label
                             ))
                         })?;
+                    let slot = ctx.allocate_arithmetic_feedback();
+                    builder.attach_feedback(pc, slot);
                 }
                 _ => {
                     return Err(SourceLoweringError::unsupported(
@@ -1575,7 +1676,7 @@ fn apply_binary_op_with_acc_lhs(
             let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
-            lower_identifier_as_reg_rhs(builder, encoding, binding, ident.span)
+            lower_identifier_as_reg_rhs(builder, ctx, encoding, binding, ident.span)
         }
         // Complex RHS shapes — a call, a nested binary, a
         // parenthesised binary, an assignment expression, etc. The
@@ -1639,7 +1740,7 @@ fn apply_binary_op_with_complex_rhs(
     if encoding.commutative {
         // acc = RHS, lhs_temp = LHS. `Op r_lhs_temp` ⇒ acc = RHS
         // op LHS, which equals LHS op RHS for commutative ops.
-        builder
+        let pc = builder
             .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(lhs_temp))])
             .map_err(|err| {
                 SourceLoweringError::Internal(format!(
@@ -1647,6 +1748,8 @@ fn apply_binary_op_with_complex_rhs(
                     encoding.label
                 ))
             })?;
+        let slot = ctx.allocate_arithmetic_feedback();
+        builder.attach_feedback(pc, slot);
         ctx.release_temps(1);
         Ok(())
     } else {
@@ -1658,12 +1761,14 @@ fn apply_binary_op_with_complex_rhs(
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Star (RHS spill): {err:?}"))
             })?;
-        builder
+        let ldar_pc = builder
             .emit(Opcode::Ldar, &[Operand::Reg(u32::from(lhs_temp))])
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Ldar (LHS reload): {err:?}"))
             })?;
-        builder
+        let ldar_slot = ctx.allocate_arithmetic_feedback();
+        builder.attach_feedback(ldar_pc, ldar_slot);
+        let pc = builder
             .emit(encoding.reg_opcode, &[Operand::Reg(u32::from(rhs_temp))])
             .map_err(|err| {
                 SourceLoweringError::Internal(format!(
@@ -1671,6 +1776,8 @@ fn apply_binary_op_with_complex_rhs(
                     encoding.label
                 ))
             })?;
+        let slot = ctx.allocate_arithmetic_feedback();
+        builder.attach_feedback(pc, slot);
         // Release in LIFO order — rhs_temp was acquired last.
         ctx.release_temps(1); // rhs_temp
         ctx.release_temps(1); // lhs_temp
@@ -1800,11 +1907,13 @@ fn lower_assignment_expression(
                 "compound assignment {bin_op:?} has no binary opcode encoding"
             ))
         })?;
-        builder
+        let ldar_pc = builder
             .emit(Opcode::Ldar, &[Operand::Reg(u32::from(target_reg))])
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Ldar (compound lhs): {err:?}"))
             })?;
+        let ldar_slot = ctx.allocate_arithmetic_feedback();
+        builder.attach_feedback(ldar_pc, ldar_slot);
         apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
     }
 

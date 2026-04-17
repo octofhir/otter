@@ -438,6 +438,23 @@ impl FeedbackVector {
         }
     }
 
+    /// Force-set an arithmetic slot to [`ArithmeticFeedback::Any`].
+    ///
+    /// The monotonic lattice used by [`Self::record_arithmetic`] only
+    /// moves feedback upward as new observations arrive; it has no way
+    /// to back out a stale `Int32` verdict after a JIT bailout reveals
+    /// the slot was in fact polymorphic. This method exists so the
+    /// tier-up hook can demote the slot on deopt, ensuring the next
+    /// recompile falls back to the guarded variant instead of
+    /// re-issuing the same trust-int32 stencil that just bailed.
+    ///
+    /// No-op if the slot doesn't exist or isn't an arithmetic slot.
+    pub fn demote_arithmetic_to_any(&mut self, id: FeedbackSlotId) {
+        if let Some(FeedbackSlotData::Arithmetic(fb)) = self.get_mut(id) {
+            *fb = ArithmeticFeedback::Any;
+        }
+    }
+
     /// Record comparison feedback for a slot.
     pub fn record_comparison(&mut self, id: FeedbackSlotId, observed: ComparisonFeedback) {
         if let Some(FeedbackSlotData::Comparison(fb)) = self.get_mut(id) {

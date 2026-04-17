@@ -134,6 +134,17 @@ impl RuntimeState {
         self.feedback_vectors.get(&function_index)
     }
 
+    /// Mutable accessor for the persistent FeedbackVector. Used by the
+    /// tier-up hook's deopt path to demote a slot that produced a
+    /// bailout, so the next recompile picks a guarded variant instead
+    /// of re-issuing the same trust-int32 stencil.
+    pub fn feedback_vector_mut(
+        &mut self,
+        function_index: crate::FunctionIndex,
+    ) -> Option<&mut crate::feedback::FeedbackVector> {
+        self.feedback_vectors.get_mut(&function_index)
+    }
+
     /// Stash an uncaught-throw value so the outer host layer can later lift
     /// it back into a structured diagnostic. Called by the module-loader
     /// glue right before it converts an interpreter error to a string for

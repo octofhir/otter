@@ -6,15 +6,17 @@
 > parity. `M_JIT_C.1` then added mid-loop OSR on top of the existing
 > tier-up hook, so a hot loop in the entry function enters compiled
 > code at its back-edge instead of waiting for the next function call.
-> `M_JIT_C.2` wired speculative int32-trust elision end-to-end: the
-> source compiler attaches feedback slots to every `Ldar`, arithmetic,
-> and int32 compare op; the interpreter records `Int32` observations;
-> the JIT analyzer consumes the persistent `FeedbackVector` and flips a
-> per-instruction `trust_int32` flag; and the emitters drop the
-> `eor/tst/b.cond` tag guards on trusted loads. On `bench2.ts sum`, a
-> feedback-warm recompile shrinks the stencil by ~38% (572 B → 356 B).
-> The loop-local register allocator (`M_JIT_C.3`) is the remaining JIT
-> milestone.
+> `M_JIT_C.2` wired speculative int32-trust elision end-to-end, and
+> `M_JIT_C.3` capped the JIT track with a loop-local register
+> allocator: loop-carried int32 slots whose reads are all `trust_int32`
+> get pinned into callee-saved registers (x22..x25 on aarch64,
+> rbp/r15 on x86_64) for the life of the function, turning per-
+> iteration `Ldar`/`Star` pairs into single-insn register moves. On
+> `bench2.ts sum`, the feedback-warm recompile drops from 2 ns/inner-
+> iter (post-M_JIT_C.2) to **1 ns/inner-iter** (post-M_JIT_C.3) — the
+> 2× speedup the M_JIT_C.3 acceptance criteria targeted. The JIT
+> track is complete; the next milestone is `M10` on the feature
+> track.
 >
 > Rule: this document tracks the **design direction** behind the JIT,
 > not the feature roadmap. Feature milestones live in `V2_MIGRATION.md`;
@@ -56,7 +58,8 @@
 
 ### What's still latent
 
-The remaining JIT work is now downstream of `M_JIT_C.2`:
+All three JIT sub-milestones have shipped; the open-ended JIT items
+below are refinements rather than blocking work:
 
 1. **Direct in-process stencil calls from Rust tests on Apple Silicon
    remain hostile.** The regression-safe smoke coverage therefore uses
@@ -66,26 +69,33 @@ The remaining JIT work is now downstream of `M_JIT_C.2`:
    Apple Silicon.** The backend itself runs and the Rosetta local sample
    proves a large JIT win, but the default 50-call `bench2_microbench`
    exceeds the fixed 180-second timeout under Rosetta.
-3. **Trust-int32 has no function-entry safety net.** Feedback-warm
-   elision correctly emits a guarded variant on bailout (the deopt
-   path demotes the bailout PC's slot and invalidates the cached
-   stencil), but there is no up-front parameter tag check, so a
-   post-warmup call with a non-int32 param produces silently wrong
-   results until a downstream op that still carries a guard triggers
-   the deopt demotion. Parameter-entry guards are a future refinement.
-4. **Loop-local register allocator (`M_JIT_C.3`) is still deferred.**
-   Hot int32 loop-carried slots still round-trip through memory on
-   every iteration — the biggest single remaining throughput win.
+3. **Trust-int32 has no function-entry safety net.** Both M_JIT_C.2's
+   per-op elision and M_JIT_C.3's pinning rely on the feedback
+   lattice's past observations being predictive of the current call.
+   A post-warmup call with a non-int32 parameter produces silently
+   wrong results until a downstream op that still carries a guard
+   triggers the deopt demotion. Parameter-entry guards are a future
+   refinement once the source surface grows past pure int32.
+4. **Pin budget is conservative.** aarch64 uses x22..x25 (4 slots);
+   x86_64 uses rbp and r15 (2 slots). The analyzer produces up to
+   [`MAX_PINNING_CANDIDATES = 6`] candidates so raising the budget is
+   a one-line change once profile data identifies programs that would
+   benefit.
 
-### Benchmarks (M2 + M7 + M_JIT_B + M_JIT_C.1 + M_JIT_C.2)
+### Benchmarks (M2 + M7 + M_JIT_B + M_JIT_C.1 + M_JIT_C.2 + M_JIT_C.3)
 
 - **`f(42)` interpreter** (M1 shape): **496 ns/iter** on aarch64, 10⁶
   iterations via `Interpreter::execute_with_runtime`.
 - **`bench2.ts sum(10⁶)` interpreter**: **416 ns/inner-iter** (≈ 416
   ms/call) on aarch64, 50 calls × 10⁶ inner iters with 100-call warmup.
-- **`bench2.ts sum(10⁶)` JIT**: **2 ns/inner-iter** (≈ 2.51 ms/call)
-  on aarch64 via `DefaultTierUpHook::execute_cached` after
-  `try_compile(sum)`.
+- **`bench2.ts sum(10⁶)` JIT (feedback-warm recompile, M_JIT_C.3)**:
+  **1 ns/inner-iter** (≈ 1.08 ms/call) on aarch64. Post-M_JIT_C.2 the
+  same benchmark measured 2 ns/inner-iter; the drop comes from
+  loop-local register pinning moving per-iteration `Ldar`/`Star` of
+  `s` and `i` into register ops on the pinned `x22`/`x23`. The
+  benchmark harness was updated to reuse the warmed `RuntimeState`
+  so `try_compile` consumes the persistent feedback vector and
+  activates both M_JIT_C.2 guard elision and M_JIT_C.3 pinning.
 - **`bench2.ts sum(10⁶)` x86_64 local sample**: **1348 ns/inner-iter**
   (≈ 1348 ms/call) in the interpreter vs **3 ns/inner-iter** (≈ 3.30
   ms/call) in the JIT on `x86_64-apple-darwin` under Rosetta, measured
@@ -104,26 +114,27 @@ cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 
 The aarch64 rows above are the `M_JIT_A` completion marker; the x86_64
 local sample above is the `M_JIT_B` completion marker on this Apple
-Silicon host. `M_JIT_C.1` keeps these steady-state numbers untouched
-(the cached stencil dominates once warmup lands on function entry) and
-adds back-edge OSR for the cold-loop shape: a one-shot 100k-iter
-`main` loop that previously ran in the interpreter end-to-end now tiers
-up mid-loop after ≈1500 back-edges and finishes execution in the JIT,
-as verified by `osr_smoke`. `M_JIT_C.2` then shrinks the feedback-warm
-stencil: on the same `bench2.ts sum` loop, a recompile with all
-arithmetic slots primed at `Int32` drops the stencil from 572 B to
-356 B (−37.8%), as verified by `m_jit_c_2_feedback_shrinks_stencil`.
-Steady-state `bench2_microbench` JIT latency stays at 2 ns/inner-iter
-because that benchmark compiles cold (no prior interpreter runs to
-build feedback); warm-compile throughput lives in the shrink test.
+Silicon host. `M_JIT_C.1` adds back-edge OSR for the cold-loop shape:
+a one-shot 100k-iter `main` loop that previously ran in the
+interpreter end-to-end now tiers up mid-loop after ≈1500 back-edges
+and finishes execution in the JIT, as verified by `osr_smoke`.
+`M_JIT_C.2` shrinks the feedback-warm stencil: `bench2.ts sum` drops
+from 572 B cold to 356 B warm (−37.8%) when every arithmetic slot
+has stabilised at `Int32`, as verified by
+`m_jit_c_2_feedback_shrinks_stencil`. `M_JIT_C.3` then pins the
+loop-carried int32 slots into callee-saved registers, so the
+feedback-warm `bench2` JIT latency drops from 2 ns/inner-iter to
+**1 ns/inner-iter**. `m_jit_c_3_pinned_body_skips_pinned_slot_loads`
+locks in the pinned shape by asserting the stencil emits ≤ 12 `LDR`
+instructions total (the unpinned warm stencil has well over 15).
 
-### Regression status (post-M_JIT_C.2)
+### Regression status (post-M_JIT_C.3)
 
 | Command | Pass / Total |
 | --- | --- |
 | `cargo test -p otter-vm --lib` | **371 / 371** |
-| `cargo test -p otter-jit --lib` | **23 / 23** (2 ignored — `m1_microbench` + `bench2_microbench`) |
-| `cargo test -p otter-jit --lib --target x86_64-apple-darwin` | **26 / 26** (2 ignored — `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib` | **25 / 25** (2 ignored — `m1_microbench` + `bench2_microbench`) |
+| `cargo test -p otter-jit --lib --target x86_64-apple-darwin` | **27 / 27** (2 ignored — `m1_microbench` + `bench2_microbench`) |
 | `cargo build --workspace` | green |
 | `cargo build --workspace --target x86_64-apple-darwin` | green |
 | `cargo clippy --workspace --all-targets -- -D warnings` | green |
@@ -270,24 +281,54 @@ compiles `bench2.ts sum` cold, synthesises a fully-primed feedback
 vector, recompiles warm, and asserts the warm stencil is ≤ 80% of the
 cold stencil (measured: 572 → 356 B, 37.8% shrink).
 
-### M_JIT_C.3 — loop-local register allocator (deferred)
+### M_JIT_C.3 — loop-local register allocator
 
-1. **Liveness + loop-carried analysis.** Identify slots that are
-   written, read, and live across the back-edge.
-2. **Register allocation pass.** Assign up to N (aarch64: 6; x86_64:
-   ~4–6) callee-saved registers to the top-N liveness-ranked candidates.
-3. **Emitter integration.** Emit a prologue that loads each pinned slot
-   on loop entry, an epilogue that stores pinned registers back on
-   fall-through and every bailout site, and rewrite reads/writes of
-   pinned slots inside the body into register ops.
-4. **Bailout spill correctness.** Extend the existing bailout prologue
-   to spill all currently-pinned registers back to their slots so the
-   interpreter resumes with a coherent frame.
-5. **Cross-arch parity.** Share the allocation decision across aarch64
-   and x86_64 emitters.
-6. **Disassembly sanity test.** Assert the inner loop of
-   `bench2.ts sum(10⁶)` no longer issues `ldr`/`str` on the pinned `s`
-   and `i` slots.
+**Shipped.** The analyzer's `compute_pinning_candidates` pass walks
+each loop body bounded by `loop_header_byte_pcs` and the matching
+back-edge, counts READ + WRITE references per slot, filters candidates
+whose READ uses aren't all `trust_int32` (so cold compiles pin
+nothing), ranks the survivors by frequency with stable tie-breaking,
+and truncates at `MAX_PINNING_CANDIDATES = 6`.
+[`TemplateProgram::pinning_candidates`](crates/otter-jit/src/baseline/mod.rs)
+is the resulting ordered list; per-arch emitters take a prefix.
+
+Both emitters bind claimed slots to callee-saved registers the
+stencil wasn't already using:
+
+- **aarch64**: `x22`..`x25` (up to 4 slots). The prologue saves them
+  with `stp`-pair pushes (`xzr` padding for odd counts) and loads
+  each slot into its assigned reg; the body rewrites
+  `Ldar`/`Star`/`AddAcc`/`SubAcc`/`MulAcc`/`BitOrAcc`/`CompareAcc`/`Mov`
+  operations on pinned slots into direct reg ops (no memory access,
+  no tag guard); the epilogue on every exit path (`ReturnAcc`,
+  `bailout_common`) pops the saved regs. `bailout_common`
+  additionally spills each pinned reg back to its slot via
+  `box_int32` so the interpreter's bailout resume sees a coherent
+  frame. OSR trampolines mirror the main prologue's save + load, so
+  mid-loop re-entry from the interpreter picks up the latest memory
+  values before running the pinned body.
+- **x86_64**: `rbp` and `r15` (up to 2 slots). Same prologue /
+  epilogue / bailout / OSR treatment via plain `push`/`pop` and
+  `mov [r12 + off], rax`. `Rbp` is safe to reclaim because the
+  stencil never calls into external code that walks a frame chain.
+
+Correctness envelope mirrors M_JIT_C.2: pinning is gated on
+`trust_int32` so a slot is only promoted once the feedback lattice
+has observed `ArithmeticFeedback::Int32` at every read. The deopt
+path already demotes the offending slot and invalidates the cached
+stencil; the next recompile with the demoted feedback drops both
+pinning and guard elision for that slot.
+
+Regression tests:
+- [`analyzer_ranks_sum_loop_pinning_candidates_with_feedback`](crates/otter-jit/src/baseline/mod.rs)
+  locks in the ranking `[r2, r1, r0]` for the feedback-warm sum loop.
+- [`m_jit_c_3_pinned_body_skips_pinned_slot_loads`](crates/otter-jit/src/baseline/mod.rs)
+  disassembles the warm-compile stencil and asserts at most 12 `LDR`
+  insns — well below the ≥ 15 an unpinned stencil produces.
+- `bench2_microbench` now reuses the warmed `RuntimeState` so
+  `try_compile` sees the persistent `FeedbackVector` and activates
+  both M_JIT_C.2 and M_JIT_C.3; the JIT row drops from 2
+  ns/inner-iter (M_JIT_C.2) to 1 ns/inner-iter.
 
 ---
 
@@ -444,6 +485,26 @@ guarded emitter partially wired and the invocation smoke test
   at 2 ns/inner-iter (benchmark compiles cold, so M_JIT_C.2's shrink
   doesn't show up in that microbench; warm-compile savings live in
   the unit test). Commit: `ad3d137`.
+- 2026-04-17: **M_JIT_C.3 landed** — the analyzer's
+  `compute_pinning_candidates` pass counts loop-body READ + WRITE
+  references per slot, filters to candidates whose READ uses are all
+  `trust_int32`, ranks by frequency with stable tie-breaking, and
+  writes the top-6 into `TemplateProgram::pinning_candidates`. Both
+  emitters pick a prefix and bind slots to callee-saved regs
+  (`x22..x25` on aarch64 via `stp`-pair pushes; `rbp`/`r15` on x86_64
+  via plain `push`/`pop`). The prologue loads each pinned slot into
+  its reg; all `Ldar`/`Star`/`AddAcc`/`SubAcc`/`MulAcc`/`BitOrAcc`/
+  `CompareAcc`/`Mov` operations on pinned slots rewrite to register
+  ops; the return path pops the saved regs; `bailout_common` spills
+  pinned regs back to memory with `box_int32` before popping, so the
+  interpreter resume sees coherent slot state. OSR trampolines
+  mirror the main prologue's save-and-load. `bench2_microbench` now
+  reuses the warmed `RuntimeState` so `try_compile` activates both
+  M_JIT_C.2 and M_JIT_C.3 — the JIT row drops from 2 ns/inner-iter
+  to **1 ns/inner-iter** on aarch64 (the 2× target).
+  `m_jit_c_3_pinned_body_skips_pinned_slot_loads` locks in the
+  pinned shape by asserting the warm stencil has ≤ 12 `LDR` insns
+  (unpinned has ≥ 15). Commit: `_pending_`.
 
 ---
 

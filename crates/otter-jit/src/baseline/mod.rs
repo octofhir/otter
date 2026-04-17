@@ -173,6 +173,20 @@ pub struct TemplateProgram {
     /// variant leaves this all-`false`, preserving the guarded fast
     /// path.
     pub trust_int32: Vec<bool>,
+    /// Slots ranked as best candidates for loop-local register pinning,
+    /// top-first by total read + write frequency inside loop bodies.
+    /// Only slots that appear in at least one loop are listed; pure
+    /// straight-line code produces an empty list. Entries are unique
+    /// and stable across equivalent programs (ties broken by slot id).
+    ///
+    /// Per-arch emitters pick a prefix of this list up to their
+    /// callee-saved-register budget:
+    /// - aarch64: up to 4 (pins into `x22..x25`).
+    /// - x86_64: up to 2 (pins into `rbp` and `r15`).
+    ///
+    /// Populated by [`analyze_template_candidate`]; downstream
+    /// feedback-aware analysis does not affect the ranking.
+    pub pinning_candidates: Vec<u16>,
 }
 
 /// Why a v2 function is not yet supported by the template baseline.
@@ -311,6 +325,28 @@ pub fn analyze_template_candidate_with_feedback(
         }
     }
 
+    // Compute the function-wide pinning candidate ranking. Walk each
+    // loop body once (loop ranges come from `loop_header_byte_pcs`
+    // and their matching back-edges), count read + write references
+    // per slot, rank by count with stable ties on slot id, and drop
+    // any slot whose READ uses are not all trusted as int32.
+    //
+    // The trust-int32 filter is what gates pinning to the post-warmup
+    // path: a cold compile leaves `trust_int32` all-`false`, so no
+    // slot passes and `pinning_candidates` is empty — the emitter
+    // then skips the entire pinning prologue and produces the same
+    // stencil as the pre-M_JIT_C.3 baseline. A warm recompile with
+    // stable `Int32` feedback on every READ of `s` / `i` / `n`
+    // promotes those slots into the candidate list and the emitter
+    // pins them into callee-saved registers for the life of the
+    // function.
+    let pinning_candidates = compute_pinning_candidates(
+        &instructions,
+        &byte_pcs,
+        &loop_header_byte_pcs,
+        &trust_int32,
+    );
+
     Ok(TemplateProgram {
         function_name: function
             .name()
@@ -322,8 +358,165 @@ pub fn analyze_template_candidate_with_feedback(
         byte_pcs,
         loop_header_byte_pcs,
         trust_int32,
+        pinning_candidates,
     })
 }
+
+/// Loop-carried liveness pass: rank user-visible register slots by
+/// total read + write frequency inside any loop body.
+///
+/// The result is a deterministic, unique list of slots ordered by
+/// descending frequency, with ties broken by ascending slot id. The
+/// list is truncated at [`MAX_PINNING_CANDIDATES`] so per-arch
+/// emitters can always take a fixed-size prefix.
+///
+/// Loop bodies are bounded by `loop_header_byte_pcs` and the matching
+/// back-edge: for each header, the back-edge is the nearest
+/// `Jump`/`JumpIfAccFalse`/`JumpIfCompareFalse` whose `target_pc`
+/// equals the header's byte-PC. Instructions with `byte_pcs[i]` in
+/// the range `[header_pc, back_edge_pc]` count as inside that loop.
+///
+/// `trust_int32` is the per-instruction int32-trust flag (same shape
+/// as [`TemplateProgram::trust_int32`]). A slot is retained as a
+/// pinning candidate only when every READ reference to it inside
+/// loop bodies has its `trust_int32` flag set. Writes are
+/// unconditionally safe (the pinned reg mirrors the sign-extended
+/// int32 acc), so they don't impose any trust requirement. Because a
+/// cold compile has `trust_int32` all-false, no slot passes the
+/// filter and the candidate list is empty — cold stencils emit no
+/// pinning prologue. Warm recompiles with stable `Int32` feedback
+/// promote the loop-carried slots into the candidate list.
+fn compute_pinning_candidates(
+    instructions: &[TemplateInstruction],
+    byte_pcs: &[u32],
+    loop_header_byte_pcs: &[u32],
+    trust_int32: &[bool],
+) -> Vec<u16> {
+    if loop_header_byte_pcs.is_empty() || instructions.is_empty() {
+        return Vec::new();
+    }
+
+    // Per-slot reference count across all loop bodies. A slot that
+    // sits inside two nested loops is counted once per loop (matches
+    // the natural "how hot is this slot in the actual execution
+    // path" intuition). Slots that fail the trust-int32 filter never
+    // appear in the map.
+    let mut counts: std::collections::BTreeMap<u16, u32> = std::collections::BTreeMap::new();
+    let mut disqualified: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+
+    for &header_pc in loop_header_byte_pcs {
+        let Some(back_edge_idx) = find_back_edge_index(instructions, byte_pcs, header_pc) else {
+            continue;
+        };
+        let back_edge_pc = byte_pcs[back_edge_idx];
+        for (i, instr) in instructions.iter().enumerate() {
+            let instr_pc = byte_pcs[i];
+            if instr_pc < header_pc || instr_pc > back_edge_pc {
+                continue;
+            }
+            let Some(slot) = slot_referenced(instr) else {
+                continue;
+            };
+            // Read uses need trust-int32 so the prologue can load the
+            // pinned slot without a tag guard and in-loop reads can
+            // use the pinned reg directly. Writes don't read the
+            // slot, so they never fail this check.
+            if is_read_reference(instr) && !trust_int32[i] {
+                disqualified.insert(slot);
+                continue;
+            }
+            *counts.entry(slot).or_default() += 1;
+        }
+    }
+
+    for slot in disqualified {
+        counts.remove(&slot);
+    }
+
+    // Rank: highest count first; within a count, lowest slot id first
+    // (so the ordering is reproducible between runs with the same
+    // bytecode).
+    let mut ranked: Vec<(u16, u32)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(MAX_PINNING_CANDIDATES);
+    ranked.into_iter().map(|(slot, _)| slot).collect()
+}
+
+/// `true` when the instruction READS its slot operand — it requires
+/// `trust_int32` to elide the load's tag guard. Writes (`Star`) don't
+/// read the slot before clobbering it, so they need no such
+/// guarantee.
+fn is_read_reference(instr: &TemplateInstruction) -> bool {
+    matches!(
+        instr,
+        TemplateInstruction::Ldar { .. }
+            | TemplateInstruction::AddAcc { .. }
+            | TemplateInstruction::SubAcc { .. }
+            | TemplateInstruction::MulAcc { .. }
+            | TemplateInstruction::BitOrAcc { .. }
+            | TemplateInstruction::CompareAcc { .. }
+            | TemplateInstruction::Mov { .. }
+    )
+}
+
+/// Find the instruction index of the first back-edge whose
+/// `target_pc` matches `header_pc`. Returns `None` if no such
+/// instruction exists — that should not happen in well-formed
+/// programs, since `loop_header_byte_pcs` was populated from exactly
+/// these back-edges during analysis, but the emitter handles the
+/// missing case gracefully by simply leaving the loop out of the
+/// liveness accumulation.
+fn find_back_edge_index(
+    instructions: &[TemplateInstruction],
+    byte_pcs: &[u32],
+    header_pc: u32,
+) -> Option<usize> {
+    instructions.iter().enumerate().find_map(|(idx, instr)| {
+        let instr_pc = byte_pcs[idx];
+        if instr_pc < header_pc {
+            return None;
+        }
+        match instr {
+            TemplateInstruction::Jump { target_pc }
+            | TemplateInstruction::JumpIfAccFalse { target_pc }
+            | TemplateInstruction::JumpIfCompareFalse { target_pc, .. }
+                if *target_pc == header_pc =>
+            {
+                Some(idx)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Extract the user-visible register slot an instruction references
+/// as an operand, if any. Returns `None` for ops that don't touch a
+/// slot (immediate arithmetic, branches, `Return`, tag-constant
+/// loads, etc.).
+///
+/// Slots referenced more than once by the same instruction (currently
+/// none — every op that references a slot references exactly one)
+/// would be undercounted, but that isn't a correctness issue: the
+/// ranking is a heuristic.
+fn slot_referenced(instr: &TemplateInstruction) -> Option<u16> {
+    match instr {
+        TemplateInstruction::Ldar { reg }
+        | TemplateInstruction::Star { reg }
+        | TemplateInstruction::AddAcc { rhs: reg }
+        | TemplateInstruction::SubAcc { rhs: reg }
+        | TemplateInstruction::MulAcc { rhs: reg }
+        | TemplateInstruction::BitOrAcc { rhs: reg }
+        | TemplateInstruction::CompareAcc { rhs: reg, .. } => Some(*reg),
+        TemplateInstruction::Mov { dst: _, src } => Some(*src),
+        _ => None,
+    }
+}
+
+/// Maximum number of pinning candidates [`compute_pinning_candidates`]
+/// reports. Set slightly above the largest per-arch budget so future
+/// emitter growth (e.g., enabling `x26/x27` or adding `rbx`-class
+/// slots on x86_64) can grab more without re-running the analyzer.
+pub const MAX_PINNING_CANDIDATES: usize = 6;
 
 #[derive(Debug, Clone)]
 struct RawInstruction {
@@ -772,6 +965,77 @@ fn collect_osr_candidates(
     out
 }
 
+/// aarch64 callee-saved registers the pinning pass is allowed to claim
+/// for loop-local slots. Ordered — the i-th entry in
+/// `TemplateProgram::pinning_candidates` (truncated to
+/// [`AARCH64_PINNED_REGS`]'s length) binds to `AARCH64_PINNED_REGS[i]`.
+///
+/// We intentionally stop at four regs (x22..x25) so the prologue can
+/// save them with at most two `stp` pairs and the bailout spill loop
+/// stays compact. The analyzer's [`MAX_PINNING_CANDIDATES = 6`] ceiling
+/// leaves headroom to grow this array once per-register-pair cost
+/// analysis picks up the remaining x26/x27.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_PINNED_REGS: [crate::arch::aarch64::Reg; 4] = [
+    crate::arch::aarch64::Reg::X22,
+    crate::arch::aarch64::Reg::X23,
+    crate::arch::aarch64::Reg::X24,
+    crate::arch::aarch64::Reg::X25,
+];
+
+/// Push the claimed callee-saved pinning regs as 16-byte pairs. Odd
+/// pin counts pad the last pair with `xzr`. Matching pops live in
+/// [`pop_pinned_pairs_aarch64`].
+#[cfg(target_arch = "aarch64")]
+fn push_pinned_pairs_aarch64(
+    asm: &mut crate::arch::aarch64::Assembler,
+    pinned: &[(u16, crate::arch::aarch64::Reg)],
+) {
+    use crate::arch::aarch64::Reg;
+    let mut iter = pinned.iter();
+    while let Some((_, first)) = iter.next() {
+        let second = iter.next().map(|(_, r)| *r).unwrap_or(Reg::Xzr);
+        asm.stp_pair_push(*first, second);
+    }
+}
+
+/// Mirror [`push_pinned_pairs_aarch64`] for the epilogue: pop pairs
+/// in reverse order so the stack layout matches. The `xzr` slot in
+/// the odd-count case is loaded into xzr (a legal discard).
+#[cfg(target_arch = "aarch64")]
+fn pop_pinned_pairs_aarch64(
+    asm: &mut crate::arch::aarch64::Assembler,
+    pinned: &[(u16, crate::arch::aarch64::Reg)],
+) {
+    use crate::arch::aarch64::Reg;
+    // Walk pairs from the outer-most push inward. For an odd count,
+    // the last pair pushed was `(last_reg, xzr)`; we pop it first.
+    let mut pairs: Vec<(Reg, Reg)> = Vec::with_capacity(pinned.len().div_ceil(2));
+    let mut iter = pinned.iter();
+    while let Some((_, first)) = iter.next() {
+        let second = iter.next().map(|(_, r)| *r).unwrap_or(Reg::Xzr);
+        pairs.push((*first, second));
+    }
+    for (a, b) in pairs.into_iter().rev() {
+        asm.ldp_pair_pop(a, b);
+    }
+}
+
+/// x86_64 SysV callee-saved registers the pinning pass is allowed to
+/// claim. `rbx`/`r12`/`r13`/`r14` are already pinned to the JIT's
+/// own execution state (`JitContext*` / `registers_base` /
+/// `accumulator` / `TAG_INT32`), leaving `rbp` and `r15` as the
+/// two free callee-saved slots. `rbp` is the ABI frame pointer, but
+/// the stencil never calls into external code that expects a frame
+/// chain, so reclaiming it for pinning is safe here.
+///
+/// Ordering is deterministic so two compiles of the same bytecode
+/// produce identical stencils; `r15` goes first because it has a
+/// shorter REX-free encoding for most `mov`/`add` variants.
+#[cfg(target_arch = "x86_64")]
+const X64_PINNED_REGS: [crate::arch::x64::Reg; 2] =
+    [crate::arch::x64::Reg::R15, crate::arch::x64::Reg::Rbp];
+
 #[cfg(target_arch = "aarch64")]
 fn emit_template_stencil_aarch64(
     program: &TemplateProgram,
@@ -890,10 +1154,31 @@ fn emit_template_stencil_aarch64(
     let mut buf = CodeBuffer::new();
     let mut asm = Assembler::new(&mut buf);
 
+    // ---- Pinning setup (M_JIT_C.3) ----
+    //
+    // Claim the first `AARCH64_PINNED_REGS.len()` candidates from the
+    // analyzer's ranking (at most 4 on aarch64) and bind each to a
+    // callee-saved register. `pinned` is the emitter's authoritative
+    // slot→reg map; `reg_for_slot` walks it. An empty list disables
+    // pinning end-to-end (cold compiles fall into this path).
+    let pinned: Vec<(u16, Reg)> = program
+        .pinning_candidates
+        .iter()
+        .take(AARCH64_PINNED_REGS.len())
+        .enumerate()
+        .map(|(i, &slot)| (slot, AARCH64_PINNED_REGS[i]))
+        .collect();
+    let reg_for_slot =
+        |slot: u16| -> Option<Reg> { pinned.iter().find(|(s, _)| *s == slot).map(|(_, r)| *r) };
+
     // Prologue: 32-byte frame saving x19 + lr + x20. Same shape as v1
     // so the call-site ABI stays identical.
     asm.push_x19_lr_32();
     asm.str_x20_at_sp16();
+    // Save the claimed callee-saved pinning regs (up to 4) as paired
+    // 16-byte pushes. Odd counts pad with xzr so SP stays 16-aligned
+    // and the epilogue's pops mirror pushes exactly.
+    push_pinned_pairs_aarch64(&mut asm, &pinned);
     // x19 = JitContext*
     asm.mov_rr(Reg::X19, Reg::X0);
     // x9 = registers_base (hot, reused every instruction)
@@ -905,6 +1190,19 @@ fn emit_template_stencil_aarch64(
     // someone reads x21 before any write — which our analyzer
     // guarantees doesn't happen in practice.
     asm.mov_imm64(Reg::X21, 0);
+
+    // Load each pinned slot into its claimed register, sign-extending
+    // the low 32 bits. The analyzer only promotes slots whose READ
+    // references are all `trust_int32` — the feedback lattice
+    // guarantees (probabilistically) that the slot holds an int32 at
+    // every observed call — so no tag guard runs here. A non-int32
+    // value slipped through would propagate as a silently-corrupted
+    // int32, matching the correctness envelope of M_JIT_C.2's elided
+    // per-op guards; parameter-entry guards are a future refinement.
+    for (slot, reg) in &pinned {
+        asm.ldr_u64_imm(*reg, Reg::X9, slot_offset(program, *slot)?);
+        asm.sxtw(*reg, *reg);
+    }
 
     let mut branch_patches: Vec<BranchPatch> = Vec::new();
     let mut bailout_patches: Vec<BailoutPatch> = Vec::new();
@@ -932,25 +1230,45 @@ fn emit_template_stencil_aarch64(
                 acc_state = AccState::Int32;
             }
             TemplateInstruction::Star { reg } => {
-                store_accumulator(&mut asm, acc_state, slot_offset(program, *reg)?);
+                // Pinned slot: keep the pinned reg in sync with the
+                // accumulator. Because the analyzer only pins slots
+                // whose READ uses are all `trust_int32` and because
+                // Star's `acc_state == Int32` invariant is the only
+                // state the source compiler produces (every `Star`
+                // is preceded by arithmetic or an int32 `Ldar`), we
+                // can simply copy x21 into the pinned reg — x21 is
+                // already sign-extended int32.
+                if let Some(pr) = reg_for_slot(*reg) {
+                    asm.mov_rr(pr, Reg::X21);
+                } else {
+                    store_accumulator(&mut asm, acc_state, slot_offset(program, *reg)?);
+                }
                 // Star doesn't touch x21.
             }
             TemplateInstruction::Ldar { reg } => {
-                // The guard fires AFTER ldr has clobbered x21 with raw
-                // slot bits — so at the bailout point x21 holds raw
-                // (not yet sxtw'd). Spill as Raw. `Ldar` has no
-                // attached feedback slot (the source compiler only
-                // attaches slots to arithmetic ops), so `trust_int32[i]`
-                // is always `false` here and the guard stays.
-                load_int32_guarded(
-                    &mut asm,
-                    Reg::X21,
-                    slot_offset(program, *reg)?,
-                    byte_pc,
-                    AccState::Raw,
-                    &mut bailout_patches,
-                    program.trust_int32[i],
-                );
+                // Pinned slot: read directly out of the pinned reg.
+                // The pinned reg already holds the sign-extended
+                // int32 payload, so the accumulator moves straight
+                // to `AccState::Int32` without a tag guard.
+                if let Some(pr) = reg_for_slot(*reg) {
+                    asm.mov_rr(Reg::X21, pr);
+                } else {
+                    // Unpinned path: the guard fires AFTER ldr has
+                    // clobbered x21 with raw slot bits — so at the
+                    // bailout point x21 holds raw (not yet sxtw'd).
+                    // Spill as Raw. The existing M_JIT_C.2
+                    // `trust_int32[i]` plumbing still eliminates the
+                    // tag-guard insns when feedback has stabilised.
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::X21,
+                        slot_offset(program, *reg)?,
+                        byte_pc,
+                        AccState::Raw,
+                        &mut bailout_patches,
+                        program.trust_int32[i],
+                    );
+                }
                 acc_state = AccState::Int32;
             }
             TemplateInstruction::AddAcc { rhs } => {
@@ -963,16 +1281,24 @@ fn emit_template_stencil_aarch64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::X10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.add_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    // Source of the RHS operand: the pinned reg for
+                    // pinned slots (no load, no guard), otherwise the
+                    // usual guarded load into the x10 scratch.
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::X10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::X10
+                    };
+                    asm.add_rrr(Reg::X21, Reg::X21, rhs_reg);
                     asm.sxtw(Reg::X21, Reg::X21);
                 }
             }
@@ -986,16 +1312,21 @@ fn emit_template_stencil_aarch64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::X10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.sub_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::X10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::X10
+                    };
+                    asm.sub_rrr(Reg::X21, Reg::X21, rhs_reg);
                     asm.sxtw(Reg::X21, Reg::X21);
                 }
             }
@@ -1009,16 +1340,21 @@ fn emit_template_stencil_aarch64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::X10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.mul_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::X10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::X10
+                    };
+                    asm.mul_rrr(Reg::X21, Reg::X21, rhs_reg);
                     asm.sxtw(Reg::X21, Reg::X21);
                 }
             }
@@ -1032,16 +1368,21 @@ fn emit_template_stencil_aarch64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::X10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.orr_rrr(Reg::X21, Reg::X21, Reg::X10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::X10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::X10
+                    };
+                    asm.orr_rrr(Reg::X21, Reg::X21, rhs_reg);
                 }
             }
             TemplateInstruction::AddAccI32 { imm } => {
@@ -1098,16 +1439,21 @@ fn emit_template_stencil_aarch64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::X10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.cmp_rr(Reg::X21, Reg::X10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::X10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::X10
+                    };
+                    asm.cmp_rr(Reg::X21, rhs_reg);
                 }
             }
             TemplateInstruction::JumpIfAccFalse { target_pc } => {
@@ -1198,6 +1544,12 @@ fn emit_template_stencil_aarch64(
                         asm.mov_rr(Reg::X0, Reg::X21);
                     }
                 }
+                // Pop pinned regs first — they sit at a lower SP than
+                // the base x19/lr/x20 frame. Return doesn't spill
+                // pinned values back to memory: the activation is
+                // destroyed on return, and any v2 caller reads its
+                // own register window (not the callee's).
+                pop_pinned_pairs_aarch64(&mut asm, &pinned);
                 asm.ldr_x20_at_sp16();
                 asm.pop_x19_lr_32();
                 asm.ret();
@@ -1208,8 +1560,39 @@ fn emit_template_stencil_aarch64(
             }
             TemplateInstruction::Mov { dst, src } => {
                 // Raw register-to-register copy — doesn't touch x21.
-                asm.ldr_u64_imm(Reg::X10, Reg::X9, slot_offset(program, *src)?);
-                asm.str_u64_imm(Reg::X10, Reg::X9, slot_offset(program, *dst)?);
+                // Pinned-aware: use the pinned reg for either side
+                // when it's the source or destination; otherwise load
+                // via x10 scratch as before.
+                let src_pr = reg_for_slot(*src);
+                let dst_pr = reg_for_slot(*dst);
+                match (src_pr, dst_pr) {
+                    (Some(sp), Some(dp)) => {
+                        asm.mov_rr(dp, sp);
+                    }
+                    (Some(sp), None) => {
+                        asm.box_int32(Reg::X10, sp);
+                        asm.str_u64_imm(Reg::X10, Reg::X9, slot_offset(program, *dst)?);
+                    }
+                    (None, Some(dp)) => {
+                        // Source is memory. Load NaN-boxed value,
+                        // keep the guard unless the analyzer already
+                        // promised int32 at this PC — we still need
+                        // the sign-extension for the pinned reg.
+                        load_int32_guarded(
+                            &mut asm,
+                            dp,
+                            slot_offset(program, *src)?,
+                            byte_pc,
+                            AccState::Raw,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                    }
+                    (None, None) => {
+                        asm.ldr_u64_imm(Reg::X10, Reg::X9, slot_offset(program, *src)?);
+                        asm.str_u64_imm(Reg::X10, Reg::X9, slot_offset(program, *dst)?);
+                    }
+                }
             }
             TemplateInstruction::IncAcc => {
                 if acc_state != AccState::Int32 {
@@ -1382,9 +1765,18 @@ fn emit_template_stencil_aarch64(
     //
     // Per-site pads branch here AFTER populating: x10 = byte_pc,
     // x11 = reason, and spilling x21 into ctx.accumulator_raw. This
-    // block writes the low-32-bit pc/reason fields and unwinds the
-    // prologue, returning BAILOUT_SENTINEL in x0.
+    // block writes the low-32-bit pc/reason fields, spills every
+    // pinned register back to its slot so the interpreter's resume
+    // sees a coherent frame, unwinds the prologue, and returns
+    // BAILOUT_SENTINEL in x0.
     let bailout_common = asm.position();
+    // Spill each pinned reg back as a NaN-boxed int32. The pinned
+    // regs hold sign-extended int32 by emitter invariant, so
+    // `box_int32(x12, pr)` produces the correctly-tagged memory value.
+    for (slot, reg) in &pinned {
+        asm.box_int32(Reg::X12, *reg);
+        asm.str_u64_imm(Reg::X12, Reg::X9, slot_offset(program, *slot)?);
+    }
     asm.str_u32_imm(
         Reg::X10,
         Reg::X19,
@@ -1396,6 +1788,7 @@ fn emit_template_stencil_aarch64(
         crate::context::offsets::BAILOUT_REASON as u32,
     );
     asm.mov_imm64(Reg::X0, crate::BAILOUT_SENTINEL);
+    pop_pinned_pairs_aarch64(&mut asm, &pinned);
     asm.ldr_x20_at_sp16();
     asm.pop_x19_lr_32();
     asm.ret();
@@ -1460,11 +1853,12 @@ fn emit_template_stencil_aarch64(
         Vec::with_capacity(osr_candidates.len());
     for (header_pc, body_off) in osr_candidates {
         let osr_entry_offset = asm.position();
-        // Mirror the main prologue so the body's epilogue (`ldr x20 +
-        // pop x19/lr + ret`) restores the same callee-saved state we
-        // saved here.
+        // Mirror the main prologue so the body's epilogue (`pop
+        // pinned + ldr x20 + pop x19/lr + ret`) restores the same
+        // callee-saved state we saved here.
         asm.push_x19_lr_32();
         asm.str_x20_at_sp16();
+        push_pinned_pairs_aarch64(&mut asm, &pinned);
         asm.mov_rr(Reg::X19, Reg::X0);
         asm.ldr_u64_imm(Reg::X9, Reg::X19, 0);
         asm.mov_imm64(Reg::X20, TAG_INT32);
@@ -1476,6 +1870,16 @@ fn emit_template_stencil_aarch64(
             Reg::X19,
             crate::context::offsets::ACCUMULATOR_RAW as u32,
         );
+        // Rehydrate pinned regs from their slots. Same reasoning as
+        // the main prologue: no guard because pinning is restricted
+        // to slots with `trust_int32 == true` everywhere they're
+        // read. The interpreter's activation slots hold the latest
+        // values (the back-edge we're entering from just executed in
+        // the interpreter, which syncs writes to memory).
+        for (slot, reg) in &pinned {
+            asm.ldr_u64_imm(*reg, Reg::X9, slot_offset(program, *slot)?);
+            asm.sxtw(*reg, *reg);
+        }
         let src = asm.b_placeholder();
         osr_tail_patches.push((src, body_off));
         osr_entries.push(OsrEntry {
@@ -1715,6 +2119,23 @@ fn emit_template_stencil_x64(
     let mut buf = CodeBuffer::new();
     let mut asm = Assembler::new(&mut buf);
 
+    // ---- Pinning setup (M_JIT_C.3) ----
+    //
+    // Mirror the aarch64 path: claim the first
+    // `X64_PINNED_REGS.len()` candidates (at most 2 on x86_64 SysV)
+    // and bind them to callee-saved registers. `reg_for_slot` below
+    // acts as the emitter's slot→reg map; an empty `pinned` list
+    // disables pinning end-to-end.
+    let pinned: Vec<(u16, Reg)> = program
+        .pinning_candidates
+        .iter()
+        .take(X64_PINNED_REGS.len())
+        .enumerate()
+        .map(|(i, &slot)| (slot, X64_PINNED_REGS[i]))
+        .collect();
+    let reg_for_slot =
+        |slot: u16| -> Option<Reg> { pinned.iter().find(|(s, _)| *s == slot).map(|(_, r)| *r) };
+
     // SysV x86_64 ABI:
     //   rdi = JitContext* on entry
     //   rbx = pinned JitContext*
@@ -1722,7 +2143,13 @@ fn emit_template_stencil_x64(
     //   r13 = pinned accumulator
     //   r14 = pinned TAG_INT32
     //   r10/r11/rax = scratch
+    //   r15, rbp = loop-local pinning slots (when `pinned` is non-empty)
     asm.push_callee_saved();
+    // Save the claimed pinning regs as individual pushes (SysV
+    // requires we preserve the caller's rbp / r15 across the call).
+    for (_, reg) in &pinned {
+        asm.push(*reg);
+    }
     asm.mov_rr(Reg::Rbx, Reg::Rdi);
     asm.mov_mr_u32(
         Reg::R12,
@@ -1731,6 +2158,14 @@ fn emit_template_stencil_x64(
     );
     asm.mov_imm64(Reg::R14, TAG_INT32);
     asm.mov_imm64(Reg::R13, 0);
+    // Load each pinned slot into its claimed register. Same
+    // correctness envelope as aarch64: the analyzer filters
+    // candidates by `trust_int32`, so the feedback lattice has
+    // observed int32 at every read of each pinned slot.
+    for (slot, reg) in &pinned {
+        asm.mov_mr_u32(*reg, Reg::R12, slot_offset(program, *slot)?);
+        asm.sxtw(*reg, *reg);
+    }
 
     let mut branch_patches: Vec<BranchPatch> = Vec::new();
     let mut bailout_patches: Vec<BailoutPatch> = Vec::new();
@@ -1750,18 +2185,26 @@ fn emit_template_stencil_x64(
                 acc_state = AccState::Int32;
             }
             TemplateInstruction::Star { reg } => {
-                store_accumulator(&mut asm, acc_state, slot_offset(program, *reg)?);
+                if let Some(pr) = reg_for_slot(*reg) {
+                    asm.mov_rr(pr, Reg::R13);
+                } else {
+                    store_accumulator(&mut asm, acc_state, slot_offset(program, *reg)?);
+                }
             }
             TemplateInstruction::Ldar { reg } => {
-                load_int32_guarded(
-                    &mut asm,
-                    Reg::R13,
-                    slot_offset(program, *reg)?,
-                    byte_pc,
-                    AccState::Raw,
-                    &mut bailout_patches,
-                    program.trust_int32[i],
-                );
+                if let Some(pr) = reg_for_slot(*reg) {
+                    asm.mov_rr(Reg::R13, pr);
+                } else {
+                    load_int32_guarded(
+                        &mut asm,
+                        Reg::R13,
+                        slot_offset(program, *reg)?,
+                        byte_pc,
+                        AccState::Raw,
+                        &mut bailout_patches,
+                        program.trust_int32[i],
+                    );
+                }
                 acc_state = AccState::Int32;
             }
             TemplateInstruction::AddAcc { rhs } => {
@@ -1774,16 +2217,21 @@ fn emit_template_stencil_x64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::R10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.add_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::R10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::R10
+                    };
+                    asm.add_rrr(Reg::R13, Reg::R13, rhs_reg);
                     asm.sxtw(Reg::R13, Reg::R13);
                 }
             }
@@ -1797,16 +2245,21 @@ fn emit_template_stencil_x64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::R10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.sub_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::R10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::R10
+                    };
+                    asm.sub_rrr(Reg::R13, Reg::R13, rhs_reg);
                     asm.sxtw(Reg::R13, Reg::R13);
                 }
             }
@@ -1820,16 +2273,21 @@ fn emit_template_stencil_x64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::R10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.mul_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::R10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::R10
+                    };
+                    asm.mul_rrr(Reg::R13, Reg::R13, rhs_reg);
                     asm.sxtw(Reg::R13, Reg::R13);
                 }
             }
@@ -1843,16 +2301,21 @@ fn emit_template_stencil_x64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::R10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.orr_rrr(Reg::R13, Reg::R13, Reg::R10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::R10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::R10
+                    };
+                    asm.orr_rrr(Reg::R13, Reg::R13, rhs_reg);
                 }
             }
             TemplateInstruction::AddAccI32 { imm } => {
@@ -1909,16 +2372,21 @@ fn emit_template_stencil_x64(
                         &mut bailout_patches,
                     );
                 } else {
-                    load_int32_guarded(
-                        &mut asm,
-                        Reg::R10,
-                        slot_offset(program, *rhs)?,
-                        byte_pc,
-                        acc_state,
-                        &mut bailout_patches,
-                        program.trust_int32[i],
-                    );
-                    asm.cmp_rr(Reg::R13, Reg::R10);
+                    let rhs_reg = if let Some(pr) = reg_for_slot(*rhs) {
+                        pr
+                    } else {
+                        load_int32_guarded(
+                            &mut asm,
+                            Reg::R10,
+                            slot_offset(program, *rhs)?,
+                            byte_pc,
+                            acc_state,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                        Reg::R10
+                    };
+                    asm.cmp_rr(Reg::R13, rhs_reg);
                 }
             }
             TemplateInstruction::JumpIfAccFalse { target_pc } => {
@@ -1988,6 +2456,12 @@ fn emit_template_stencil_x64(
                     AccState::Int32 => asm.box_int32(Reg::Rax, Reg::R13),
                     AccState::Raw => asm.mov_rr(Reg::Rax, Reg::R13),
                 }
+                // Pop pinned regs in reverse push order. Return
+                // doesn't spill pinned values back to memory (the
+                // activation is destroyed on return).
+                for (_, reg) in pinned.iter().rev() {
+                    asm.pop(*reg);
+                }
                 asm.pop_callee_saved();
                 asm.ret();
             }
@@ -1996,8 +2470,32 @@ fn emit_template_stencil_x64(
                 acc_state = AccState::Raw;
             }
             TemplateInstruction::Mov { dst, src } => {
-                asm.mov_mr_u32(Reg::R10, Reg::R12, slot_offset(program, *src)?);
-                asm.mov_rm_u32(Reg::R12, slot_offset(program, *dst)?, Reg::R10);
+                let src_pr = reg_for_slot(*src);
+                let dst_pr = reg_for_slot(*dst);
+                match (src_pr, dst_pr) {
+                    (Some(sp), Some(dp)) => {
+                        asm.mov_rr(dp, sp);
+                    }
+                    (Some(sp), None) => {
+                        asm.box_int32(Reg::R10, sp);
+                        asm.mov_rm_u32(Reg::R12, slot_offset(program, *dst)?, Reg::R10);
+                    }
+                    (None, Some(dp)) => {
+                        load_int32_guarded(
+                            &mut asm,
+                            dp,
+                            slot_offset(program, *src)?,
+                            byte_pc,
+                            AccState::Raw,
+                            &mut bailout_patches,
+                            program.trust_int32[i],
+                        );
+                    }
+                    (None, None) => {
+                        asm.mov_mr_u32(Reg::R10, Reg::R12, slot_offset(program, *src)?);
+                        asm.mov_rm_u32(Reg::R12, slot_offset(program, *dst)?, Reg::R10);
+                    }
+                }
             }
             TemplateInstruction::IncAcc => {
                 if acc_state != AccState::Int32 {
@@ -2160,6 +2658,16 @@ fn emit_template_stencil_x64(
     }
 
     let bailout_common = asm.position();
+    // Spill each pinned reg back as a NaN-boxed int32 so the
+    // interpreter resume sees a coherent frame. Mirrors the aarch64
+    // bailout_common path: pinned regs hold sign-extended int32 by
+    // emitter invariant, so `box_int32` produces the correctly-tagged
+    // memory value. `Rax` is a convenient scratch at this point —
+    // we're about to overwrite it with `BAILOUT_SENTINEL` anyway.
+    for (slot, reg) in &pinned {
+        asm.box_int32(Reg::Rax, *reg);
+        asm.mov_rm_u32(Reg::R12, slot_offset(program, *slot)?, Reg::Rax);
+    }
     asm.mov_rm_u32_32(
         Reg::Rbx,
         crate::context::offsets::BAILOUT_PC as u32,
@@ -2171,6 +2679,9 @@ fn emit_template_stencil_x64(
         Reg::R11,
     );
     asm.mov_imm64(Reg::Rax, crate::BAILOUT_SENTINEL);
+    for (_, reg) in pinned.iter().rev() {
+        asm.pop(*reg);
+    }
     asm.pop_callee_saved();
     asm.ret();
 
@@ -2222,6 +2733,11 @@ fn emit_template_stencil_x64(
     for (header_pc, body_off) in osr_candidates {
         let osr_entry_offset = asm.position();
         asm.push_callee_saved();
+        // Save the pinning regs so the shared epilogue/bailout paths
+        // can pop them uniformly.
+        for (_, reg) in &pinned {
+            asm.push(*reg);
+        }
         asm.mov_rr(Reg::Rbx, Reg::Rdi);
         asm.mov_mr_u32(
             Reg::R12,
@@ -2234,6 +2750,14 @@ fn emit_template_stencil_x64(
             Reg::Rbx,
             crate::context::offsets::ACCUMULATOR_RAW as u32,
         );
+        // Rehydrate the pinned regs from memory. The interpreter's
+        // activation slots reflect the latest values because the
+        // back-edge we're entering from just executed in the
+        // interpreter, which syncs writes to memory.
+        for (slot, reg) in &pinned {
+            asm.mov_mr_u32(*reg, Reg::R12, slot_offset(program, *slot)?);
+            asm.sxtw(*reg, *reg);
+        }
         let src = asm.b_placeholder();
         osr_tail_patches.push((src, body_off));
         osr_entries.push(OsrEntry {
@@ -2443,6 +2967,103 @@ mod tests {
         assert_eq!(ops[3], TemplateInstruction::Star { reg: 2 });
         // The last instruction must be the return.
         assert_eq!(*ops.last().unwrap(), TemplateInstruction::ReturnAcc);
+
+        // M_JIT_C.3 pinning candidates: the profile-free analyzer
+        // path leaves `trust_int32` all-false, which disqualifies
+        // every READ reference from pinning. Cold-compile stencils
+        // therefore emit the same non-pinned shape as pre-M_JIT_C.3.
+        assert!(
+            program.pinning_candidates.is_empty(),
+            "cold analyzer must disable pinning (no feedback → trust_int32 all-false); \
+             got {:?}",
+            program.pinning_candidates,
+        );
+    }
+
+    /// Feedback-warm analyzer path primes every arithmetic slot at
+    /// `Int32`, promoting the sum loop's `s` / `i` / `n` to pinning
+    /// candidates ranked by reference count inside the loop body.
+    #[test]
+    fn analyzer_ranks_sum_loop_pinning_candidates_with_feedback() {
+        use otter_vm::feedback::{ArithmeticFeedback, FeedbackVector};
+
+        let mut b = BytecodeBuilder::new();
+        b.emit(Opcode::LdaSmi, &[Operand::Imm(0)]).unwrap();
+        b.emit(Opcode::Star, &[Operand::Reg(1)]).unwrap();
+        b.emit(Opcode::LdaSmi, &[Operand::Imm(0)]).unwrap();
+        b.emit(Opcode::Star, &[Operand::Reg(2)]).unwrap();
+
+        let loop_header = b.new_label();
+        let exit = b.new_label();
+        b.bind_label(loop_header).unwrap();
+        let ldar_i_pc = b.emit(Opcode::Ldar, &[Operand::Reg(2)]).unwrap();
+        b.attach_feedback(ldar_i_pc, otter_vm::bytecode::FeedbackSlot(0));
+        let test_pc = b.emit(Opcode::TestLessThan, &[Operand::Reg(0)]).unwrap();
+        b.attach_feedback(test_pc, otter_vm::bytecode::FeedbackSlot(1));
+        b.emit_jump_to(Opcode::JumpIfToBooleanFalse, exit).unwrap();
+        let ldar_s_pc = b.emit(Opcode::Ldar, &[Operand::Reg(1)]).unwrap();
+        b.attach_feedback(ldar_s_pc, otter_vm::bytecode::FeedbackSlot(2));
+        let add_pc = b.emit(Opcode::Add, &[Operand::Reg(2)]).unwrap();
+        b.attach_feedback(add_pc, otter_vm::bytecode::FeedbackSlot(3));
+        let orb_pc = b.emit(Opcode::BitwiseOrSmi, &[Operand::Imm(0)]).unwrap();
+        b.attach_feedback(orb_pc, otter_vm::bytecode::FeedbackSlot(4));
+        b.emit(Opcode::Star, &[Operand::Reg(1)]).unwrap();
+        let ldar_i2_pc = b.emit(Opcode::Ldar, &[Operand::Reg(2)]).unwrap();
+        b.attach_feedback(ldar_i2_pc, otter_vm::bytecode::FeedbackSlot(5));
+        let addsmi_pc = b.emit(Opcode::AddSmi, &[Operand::Imm(1)]).unwrap();
+        b.attach_feedback(addsmi_pc, otter_vm::bytecode::FeedbackSlot(6));
+        b.emit(Opcode::Star, &[Operand::Reg(2)]).unwrap();
+        b.emit_jump_to(Opcode::Jump, loop_header).unwrap();
+        b.bind_label(exit).unwrap();
+        let ldar_ret_pc = b.emit(Opcode::Ldar, &[Operand::Reg(1)]).unwrap();
+        b.attach_feedback(ldar_ret_pc, otter_vm::bytecode::FeedbackSlot(7));
+        b.emit(Opcode::Return, &[]).unwrap();
+        let v2 = b.finish().unwrap();
+        let layout = FrameLayout::new(0, 1, 2, 0).unwrap();
+        let feedback_layout = otter_vm::feedback::FeedbackTableLayout::new(
+            (0..8)
+                .map(|i| {
+                    otter_vm::feedback::FeedbackSlotLayout::new(
+                        otter_vm::feedback::FeedbackSlotId(i as u16),
+                        otter_vm::feedback::FeedbackKind::Arithmetic,
+                    )
+                })
+                .collect(),
+        );
+        let tables = otter_vm::module::FunctionTables::new(
+            Default::default(),
+            feedback_layout,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let function = Function::new(Some("sum"), layout, v2, tables);
+
+        // Prime every feedback slot at Int32 — the post-warmup shape.
+        let mut fv = FeedbackVector::from_layout(function.feedback());
+        for i in 0..8 {
+            fv.record_arithmetic(
+                otter_vm::feedback::FeedbackSlotId(i),
+                ArithmeticFeedback::Int32,
+            );
+        }
+        let program =
+            analyze_template_candidate_with_feedback(&function, Some(&fv)).expect("warm analyze");
+
+        // Inside-loop read counts (filtered by trust-int32):
+        //   r2: Ldar + Add + Ldar = 3 reads.
+        //   r1: Ldar = 1 read (plus a Star, which also counts for
+        //        the heuristic as a write reference).
+        //   r0: TestLessThan = 1 read.
+        // Writes: r1 and r2 each have one Star inside the loop; r0
+        // has none. Total ref counts: r2 = 3 reads + 1 write = 4;
+        // r1 = 1 read + 1 write = 2; r0 = 1 read = 1.
+        assert_eq!(
+            program.pinning_candidates,
+            vec![2, 1, 0],
+            "expected warm sum-loop pinning ranking r2 > r1 > r0 (got {:?})",
+            program.pinning_candidates,
+        );
     }
 
     #[test]
@@ -2901,6 +3522,98 @@ mod tests {
         );
     }
 
+    /// M_JIT_C.3 disassembly sanity: the feedback-warm `bench2 sum`
+    /// stencil must pin the hot `s` and `i` slots into callee-saved
+    /// registers, which means the inner loop body has zero `ldr`
+    /// instructions that reference the registers_base pointer (`x9`)
+    /// for those pinned slots.
+    ///
+    /// We use a proxy metric — total `ldr` count inside the body —
+    /// rather than an exact slot-by-slot match: counting bare
+    /// mnemonics stays robust to minor emitter reordering, and an
+    /// unpinned sum stencil is unambiguous on this metric (it has
+    /// ~8 slot loads; a pinned stencil has ≤ 2, counting only the
+    /// `n` parameter's compare load and the return-path `s` load).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn m_jit_c_3_pinned_body_skips_pinned_slot_loads() {
+        use otter_vm::feedback::{ArithmeticFeedback, FeedbackSlotData, FeedbackVector};
+
+        let module = compile_source_module(
+            "function sum(n) { \
+                 let s = 0; \
+                 let i = 0; \
+                 while (i < n) { \
+                     s = (s + i) | 0; \
+                     i = i + 1; \
+                 } \
+                 return s; \
+             }",
+            "bench2.js",
+        );
+        let sum = module.function(FunctionIndex(0)).expect("sum function");
+
+        // Warm feedback so the analyzer promotes pinning.
+        let layout = sum.feedback();
+        let mut fv = FeedbackVector::from_layout(layout);
+        for (i, slot) in layout.slots().iter().enumerate() {
+            if matches!(
+                FeedbackSlotData::for_kind(slot.kind()),
+                FeedbackSlotData::Arithmetic(_)
+            ) {
+                fv.record_arithmetic(
+                    otter_vm::feedback::FeedbackSlotId(i as u16),
+                    ArithmeticFeedback::Int32,
+                );
+            }
+        }
+        let program =
+            analyze_template_candidate_with_feedback(sum, Some(&fv)).expect("warm analyze");
+        assert!(
+            !program.pinning_candidates.is_empty(),
+            "warm sum should produce pinning candidates (got {:?})",
+            program.pinning_candidates,
+        );
+        let stencil = emit_template_stencil(&program).expect("warm emit");
+        let bytes = stencil.code.bytes();
+
+        // Count `LDR`s in the whole stencil. A feedback-warm sum
+        // pins `r2` (`i`) and `r1` (`s`); the remaining memory
+        // reads are:
+        //   * 1 load of `registers_base` from the JitContext
+        //     prologue.
+        //   * 1 load of `n` (r0) for TestLessThan inside the loop
+        //     (r0 has fewer references than s/i so it's the 3rd
+        //     pinning candidate — but the emitter only pins 2 on
+        //     this arch).
+        //   * 2 loads during the prologue to populate the pinned
+        //     regs' initial values (`s` and `i`, both int32).
+        //   * 1 load to rehydrate `accumulator_raw` on each OSR
+        //     trampoline.
+        // An unpinned stencil has ~8+ `LDR`s inside the loop alone
+        // (Ldar×2, Add, TestLessThan, Star×2, etc.), plus prologue
+        // and epilogue loads. Measured warm-pinned total: ~11 LDRs
+        // (prologue reg-base + 2 pin loads + n load in TestLessThan
+        // + ldr_x20 in Return + ldr_x20 in bailout_common + 4 in the
+        // OSR trampoline). Lock the threshold at ≤ 12 so the test
+        // fails if the loop body re-introduces per-iteration slot
+        // loads.
+        let ldr_count = bytes
+            .chunks_exact(4)
+            .filter_map(|chunk| {
+                let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                bad64::decode(word, 0).ok()
+            })
+            .filter(|insn| format!("{:?}", insn.op()) == "LDR")
+            .count();
+        assert!(
+            ldr_count <= 12,
+            "feedback-warm pinned sum should have ≤ 12 LDR insns (got {ldr_count}); \
+             an unpinned stencil has ≥ 15 (the loop alone has ~8)",
+        );
+        eprintln!("M_JIT_C.3 pinned sum stencil: {} LDR insns", ldr_count);
+    }
+
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn recursion_factorial_caches_template_baseline_entry() {
@@ -3305,8 +4018,13 @@ mod tests {
             elapsed.as_millis(),
         );
 
+        // Keep reusing the interpreter runtime so `try_compile` sees
+        // the persistent `FeedbackVector` built up by the warmup +
+        // measurement loops above. That's what activates M_JIT_C.2
+        // trust-int32 elision and M_JIT_C.3 loop-local pinning on
+        // recompile — a fresh `RuntimeState` would compile cold and
+        // miss both.
         code_cache::clear();
-        let mut runtime = RuntimeState::new();
         let hook = DefaultTierUpHook;
         assert!(hook.try_compile(
             &module,

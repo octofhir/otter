@@ -153,6 +153,31 @@ impl<'a> Assembler<'a> {
         self.emit_insn(0xA8C27BF3);
     }
 
+    /// `stp a, b, [sp, #-16]!` — pre-indexed pair push, SP -= 16.
+    /// Used by the M_JIT_C.3 pinning prologue to save extra
+    /// callee-saved registers (x22/x23, x24/x25) before loading
+    /// loop-local slots into them. Pass `Reg::Xzr` for `b` when the
+    /// caller only needs one slot of the pair (odd pin counts).
+    ///
+    /// Encoding: pre-indexed STP with imm7 = -2 (scaled by 8 = -16).
+    /// imm7 is a 7-bit signed immediate; -2 mod 128 = 0x7E.
+    pub fn stp_pair_push(&mut self, a: Reg, b: Reg) {
+        let imm7 = 0x7Eu32;
+        let insn = 0xA980_0000 | (imm7 << 15) | (b.encoding() << 10) | (31u32 << 5) | a.encoding();
+        self.emit_insn(insn);
+    }
+
+    /// `ldp a, b, [sp], #16` — post-indexed pair pop, SP += 16.
+    /// Matches [`stp_pair_push`] in the epilogue. `Reg::Xzr` as `b`
+    /// discards the loaded value (permitted by the ISA).
+    ///
+    /// Encoding: post-indexed LDP with imm7 = +2 (scaled by 8 = +16).
+    pub fn ldp_pair_pop(&mut self, a: Reg, b: Reg) {
+        let imm7 = 0x02u32;
+        let insn = 0xA8C0_0000 | (imm7 << 15) | (b.encoding() << 10) | (31u32 << 5) | a.encoding();
+        self.emit_insn(insn);
+    }
+
     /// `b offset` (placeholder for 26-bit immediate branch)
     pub fn b_placeholder(&mut self) -> u32 {
         let pos = self.position();

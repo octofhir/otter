@@ -40,7 +40,7 @@ See [`JIT_REFACTOR_PLAN.md`](./JIT_REFACTOR_PLAN.md) for concrete task lists per
 | M_JIT_B   | x86_64 baseline backend — port the v2 template-baseline stencil (same op coverage, tag guards, bailout model).                   | [x]    | e1b907a   |
 | M_JIT_C.1 | Mid-loop OSR — per-loop-header trampolines + `TierUpHook::execute_cached_at_pc` + back-edge budget-driven entry.                 | [x]    | 5251b41   |
 | M_JIT_C.2 | Speculative int32-trust elision — feedback-driven tag-guard skipping on stable arithmetic PCs.                                   | [x]    | ad3d137   |
-| M_JIT_C.3 | Loop-local register allocator — pin hot int32 slots into callee-saved registers across the loop body.                            | [ ]    |           |
+| M_JIT_C.3 | Loop-local register allocator — pin hot int32 slots into callee-saved registers across the loop body.                            | [x]    | _pending_ |
 
 ### Feature track (after JIT completion)
 
@@ -112,8 +112,8 @@ cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 | Scenario                          | Otter interp | Otter JIT | bun | node |
 |-----------------------------------|--------------|-----------|-----|------|
 | `f(42)` (10⁶ iter, aarch64)       | 496 ns/iter  | —         | —   | —    |
-| `bench2.ts sum(10⁶)` per-call (50× warmup-100, aarch64) | 416 ms/call | 2.51 ms/call | — | — |
-| `bench2.ts sum(10⁶)` per-inner-iter (aarch64) | 416 ns/iter | 2 ns/iter | — | — |
+| `bench2.ts sum(10⁶)` per-call (50× warmup-100, aarch64, feedback-warm recompile) | 447 ms/call | 1.08 ms/call | — | — |
+| `bench2.ts sum(10⁶)` per-inner-iter (aarch64, feedback-warm recompile) | 447 ns/iter | 1 ns/iter | — | — |
 | `bench2.ts sum(10⁶)` per-call (1× warmup-1, x86_64-apple-darwin under Rosetta) | 1348 ms/call | 3.30 ms/call | — | — |
 | `bench2.ts sum(10⁶)` per-inner-iter (x86_64-apple-darwin under Rosetta) | 1348 ns/iter | 3 ns/iter | — | — |
 

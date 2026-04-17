@@ -27,7 +27,7 @@ Cross-target sanity (`cargo build --target`) is run for `aarch64-apple-darwin`, 
 | M5       | `AssignmentExpression` (`=`, `+=`, `-=`, `*=`, `|=`) onto a local `let`.                                                        | [x]    | 53c24a2 |
 | M6       | `IfStatement` + relational ops (`<`, `>`, `<=`, `>=`, `===`, `!==`) for int32.                                                  | [x]    | 991b282 |
 | M7       | `WhileStatement`. Closes `bench2.ts`: int32 accumulator loop + full microbench vs bun/node.                                     | [x]    | d02fce5 |
-| M8       | `ForStatement` (desugar to while).                                                                                             | [x]    | _pending_ |
+| M8       | `ForStatement` (desugar to while).                                                                                             | [x]    | 5ad7cfe |
 | M9       | Multiple functions + `CallExpression` without `this`/closures.                                                                  | [ ]    |        |
 | M_JIT_x86_64 | Cranelift / hand-rolled x86_64 backend for the JIT baseline.                                                               | [ ]    |        |
 | M10+     | Closures, globals, `console.log`, classes, async, generators, destructuring, property access, exceptions, exports/imports.       | [ ]    |        |

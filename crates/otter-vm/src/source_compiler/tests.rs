@@ -875,18 +875,9 @@ fn assignment_to_undeclared_unsupported() {
     ));
 }
 
-#[test]
-fn member_assignment_target_unsupported() {
-    let err =
-        compile("function f(n) { n.x = 5; return 1; }").expect_err("member assign target at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "member_assignment_target",
-            ..
-        }
-    ));
-}
+// Removed: member_assignment_target is supported as of M17 —
+// `n.x = 5` now compiles. Coverage for member writes lives in the
+// M17 test block below.
 
 #[test]
 fn destructuring_assignment_target_unsupported() {
@@ -3452,6 +3443,211 @@ fn array_hole_rejected() {
                 construct: "elision_array_element",
                 ..
             }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M17: Property access — StaticMemberExpression + ComputedMemberExpression
+// ---------------------------------------------------------------------------
+
+#[test]
+fn static_member_read_on_identifier_base() {
+    // `{ a: 7 }.a` would need member-on-literal; simpler: build
+    // the object in a local, then read via `.a`.
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let o = { a: 7 }; return o.a; }");
+    assert_eq!(ret.as_i32(), Some(7));
+}
+
+#[test]
+fn static_member_read_on_complex_base_uses_temp() {
+    // Base is itself an object literal — not an identifier. Falls
+    // through `materialize_member_base`'s complex-path (lower + Star
+    // into a temp) rather than the identifier fast path.
+    let (_module, ret, _runtime) = compile_and_run("function f() { return ({ a: 99 }).a; }");
+    assert_eq!(ret.as_i32(), Some(99));
+}
+
+#[test]
+fn static_member_chain_reads_successive_properties() {
+    // `a.b.c`: two member reads chained.
+    let (_module, ret, _runtime) = compile_and_run(
+        "function f() { let o = { inner: { value: 123 } }; return o.inner.value; }",
+    );
+    assert_eq!(ret.as_i32(), Some(123));
+}
+
+#[test]
+fn computed_member_read_with_string_key() {
+    let (_module, ret, mut runtime) =
+        compile_and_run("function f() { let o = { hello: \"world\" }; return o[\"hello\"]; }");
+    assert_eq!(runtime.js_to_string_infallible(ret).as_ref(), "world",);
+}
+
+#[test]
+fn computed_member_read_with_int_index() {
+    // Array indexing: `a[2]` reads element at index 2. Int keys
+    // coerce to strings in the generic object-property path.
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let a = [10, 20, 30, 40]; return a[2]; }");
+    assert_eq!(ret.as_i32(), Some(30));
+}
+
+#[test]
+fn computed_member_read_with_identifier_key() {
+    // Key expression is an identifier bound to a local.
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let o = { x: 5, y: 6 }; let k = \"y\"; return o[k]; }");
+    assert_eq!(ret.as_i32(), Some(6));
+}
+
+#[test]
+fn static_member_read_returns_undefined_for_missing_property() {
+    // §13.3.2 — missing property returns `undefined`, not a throw.
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let o = { a: 1 }; return o.missing; }");
+    assert_eq!(ret, RegisterValue::undefined());
+}
+
+#[test]
+fn static_member_plain_assignment_sets_and_returns_value() {
+    // `o.x = 5` — statement position; acc holds 5 afterwards so
+    // the expression composes (`return o.x = 5` returns 5).
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let o = { x: 1 }; o.x = 42; return o.x; }");
+    assert_eq!(ret.as_i32(), Some(42));
+    // Also verify the plain composed form.
+    let (_m2, ret2, _r2) = compile_and_run("function f() { let o = {}; return o.x = 5; }");
+    assert_eq!(ret2.as_i32(), Some(5));
+}
+
+#[test]
+fn static_member_defines_new_property_when_absent() {
+    // Writing to a previously-absent property installs it per spec;
+    // subsequent reads find it.
+    let (_module, ret, mut runtime) =
+        compile_and_run("function f() { let o = {}; o.created = \"yes\"; return o.created; }");
+    assert_eq!(runtime.js_to_string_infallible(ret).as_ref(), "yes",);
+}
+
+#[test]
+fn static_member_compound_plus_assign_on_string() {
+    // Compound `+=` on a member — exercises the
+    // Lda/apply/Sta pattern for static member compound assign.
+    let (_module, ret, mut runtime) = compile_and_run(
+        "function f() { let o = { label: \"hi\" }; o.label += \", otter\"; return o.label; }",
+    );
+    assert_eq!(runtime.js_to_string_infallible(ret).as_ref(), "hi, otter",);
+}
+
+#[test]
+fn static_member_compound_plus_assign_on_int() {
+    // `o.count += 1` — int32 arithmetic on a member slot. Uses
+    // the AddSmi fast path inside `apply_binary_op_with_acc_lhs`.
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let o = { count: 41 }; o.count += 1; return o.count; }");
+    assert_eq!(ret.as_i32(), Some(42));
+}
+
+#[test]
+fn computed_member_assignment_with_string_key() {
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let o = {}; o[\"k\"] = 123; return o[\"k\"]; }");
+    assert_eq!(ret.as_i32(), Some(123));
+}
+
+#[test]
+fn computed_member_assignment_with_identifier_key() {
+    let (_module, ret, mut runtime) = compile_and_run(
+        "function f() { let o = {}; let k = \"dynamic\"; o[k] = \"present\"; return o[k]; }",
+    );
+    assert_eq!(runtime.js_to_string_infallible(ret).as_ref(), "present",);
+}
+
+#[test]
+fn computed_member_compound_assign_preserves_key_evaluation_order() {
+    // `a[k] += 1` — key is an identifier. The lowering spills the
+    // key into a temp exactly once and reuses it for both the read
+    // and the write, so the key expression evaluates just once per
+    // spec.
+    let (_module, ret, _runtime) = compile_and_run(
+        "function f() { let o = { n: 10 }; let k = \"n\"; o[k] += 5; return o[k]; }",
+    );
+    assert_eq!(ret.as_i32(), Some(15));
+}
+
+#[test]
+fn array_index_assignment_overwrites_element() {
+    // Indexed array write: `a[0] = 99`. Exercises
+    // StaKeyedProperty with an int-literal key that coerces to "0".
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let a = [1, 2, 3]; a[0] = 99; return a[0]; }");
+    assert_eq!(ret.as_i32(), Some(99));
+}
+
+#[test]
+fn member_read_composes_in_binary_expression() {
+    // `s + o.label` — the identifier-plus-member Add. The member
+    // lowering feeds through `apply_binary_op_with_complex_rhs`.
+    let (_module, ret, mut runtime) = compile_and_run(
+        "function f() { let o = { label: \"world\" }; return \"hello, \" + o.label; }",
+    );
+    assert_eq!(
+        runtime.js_to_string_infallible(ret).as_ref(),
+        "hello, world",
+    );
+}
+
+#[test]
+fn member_read_composes_inside_return_arithmetic() {
+    // `o.a + o.b` — two member reads, int32 add.
+    let (_module, ret, _runtime) =
+        compile_and_run("function f() { let o = { a: 3, b: 4 }; return o.a + o.b; }");
+    assert_eq!(ret.as_i32(), Some(7));
+}
+
+#[test]
+fn optional_chain_member_rejected() {
+    // oxc wraps `o?.a` in a `ChainExpression` node rather than
+    // setting `optional: true` on the member — so we surface the
+    // generic `expression` tag rather than a dedicated
+    // `optional_member_expression` tag. Optional chaining lands in
+    // a later milestone; any stable rejection is acceptable here.
+    let err =
+        compile("function f() { let o = { a: 1 }; return o?.a; }").expect_err("optional member");
+    assert!(
+        matches!(err, SourceLoweringError::Unsupported { .. }),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn optional_computed_member_rejected() {
+    let err = compile("function f() { let o = { a: 1 }; return o?.[\"a\"]; }")
+        .expect_err("optional computed member");
+    assert!(
+        matches!(err, SourceLoweringError::Unsupported { .. }),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn private_field_assignment_still_rejected() {
+    // Private fields remain rejected — class lowering arrives later.
+    let err = compile("function f() { let o = { a: 1 }; o.#priv = 2; return 1; }")
+        .expect_err("private field target");
+    // oxc parses `#priv` outside a class body as a parse error —
+    // either way it surfaces before we reach the lowering stage.
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Parse { .. }
+                | SourceLoweringError::Unsupported {
+                    construct: "private_field_assignment_target",
+                    ..
+                }
         ),
         "unexpected err: {err:?}",
     );

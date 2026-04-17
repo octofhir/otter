@@ -120,12 +120,12 @@ use std::cell::{Cell, RefCell};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentOperator,
-    AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, ConditionalExpression,
-    Expression, FormalParameter, FormalParameters, Function, FunctionBody, IdentifierReference,
-    LogicalExpression, LogicalOperator, NumericLiteral, ObjectExpression, ObjectPropertyKind,
-    Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement, UnaryExpression,
-    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, ComputedMemberExpression,
+    ConditionalExpression, Expression, FormalParameter, FormalParameters, Function, FunctionBody,
+    IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral, ObjectExpression,
+    ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
+    StaticMemberExpression, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -1744,6 +1744,12 @@ fn lower_return_expression(
         Expression::LogicalExpression(logical) => lower_logical_expression(builder, ctx, logical),
         Expression::ObjectExpression(obj) => lower_object_expression(builder, ctx, obj),
         Expression::ArrayExpression(arr) => lower_array_expression(builder, ctx, arr),
+        Expression::StaticMemberExpression(member) => {
+            lower_static_member_read(builder, ctx, member)
+        }
+        Expression::ComputedMemberExpression(member) => {
+            lower_computed_member_read(builder, ctx, member)
+        }
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -2329,6 +2335,139 @@ fn lower_array_expression(
     lower
 }
 
+/// Materialises the base object of a member expression into a
+/// register that the caller can feed to `Lda*Property` /
+/// `Sta*Property`. Fast path: if the base is an in-scope identifier
+/// bound to a parameter or initialised local, its slot is returned
+/// directly and no temp is acquired. Otherwise the base is lowered
+/// into the accumulator and spilled into a freshly-acquired temp
+/// slot; the caller must call `release_temps(temp_count)` in LIFO
+/// order once the emitted opcode consuming the base has run.
+///
+/// `temp_count` is always 0 or 1 and tells the caller whether to
+/// release a slot.
+struct MemberBase {
+    reg: RegisterIndex,
+    temp_count: RegisterIndex,
+}
+
+fn materialize_member_base<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    base: &'a Expression<'a>,
+) -> Result<MemberBase, SourceLoweringError> {
+    if let Expression::Identifier(ident) = base
+        && let Some(binding) = ctx.resolve_identifier(ident.name.as_str())
+    {
+        let reg = match binding {
+            BindingRef::Param { reg } => reg,
+            BindingRef::Local {
+                reg,
+                initialized: true,
+                ..
+            } => reg,
+            BindingRef::Local {
+                initialized: false, ..
+            } => {
+                return Err(SourceLoweringError::unsupported(
+                    "tdz_self_reference",
+                    ident.span,
+                ));
+            }
+        };
+        return Ok(MemberBase { reg, temp_count: 0 });
+    }
+
+    // Complex / non-local base — lower into acc and spill to a temp.
+    lower_return_expression(builder, ctx, base)?;
+    let temp = ctx.acquire_temps(1)?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(temp))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (member base spill): {err:?}"))
+        })?;
+    Ok(MemberBase {
+        reg: temp,
+        temp_count: 1,
+    })
+}
+
+/// Lowers `o.x` into the accumulator. Base goes through
+/// [`materialize_member_base`] (direct-reg fast path for identifier
+/// bases, temp-spill for everything else); the property name is
+/// interned into the function's `PropertyNameTable` with dedup.
+///
+/// Optional chaining (`o?.x`) is rejected — it requires the nullish
+/// short-circuit wiring that lands in a later milestone.
+///
+/// §13.3.2 Property Accessors
+/// <https://tc39.es/ecma262/#sec-property-accessors>
+fn lower_static_member_read(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &StaticMemberExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    if expr.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            expr.span,
+        ));
+    }
+    let base = materialize_member_base(builder, ctx, &expr.object)?;
+    let idx = ctx.intern_property_name(expr.property.name.as_str())?;
+    builder
+        .emit(
+            Opcode::LdaNamedProperty,
+            &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+        )
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaNamedProperty: {err:?}"))
+        })?;
+    if base.temp_count != 0 {
+        ctx.release_temps(base.temp_count);
+    }
+    Ok(())
+}
+
+/// Lowers `o[k]` into the accumulator. Shape:
+///
+/// ```text
+///   <materialize base into r_base>
+///   <lower key into acc>
+///   LdaKeyedProperty r_base     ; acc = r_base[acc]
+/// ```
+///
+/// Optional chaining rejected.
+///
+/// §13.3.2 Property Accessors
+/// <https://tc39.es/ecma262/#sec-property-accessors>
+fn lower_computed_member_read(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &ComputedMemberExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    if expr.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            expr.span,
+        ));
+    }
+    let base = materialize_member_base(builder, ctx, &expr.object)?;
+    lower_return_expression(builder, ctx, &expr.expression)?;
+    builder
+        .emit(
+            Opcode::LdaKeyedProperty,
+            &[Operand::Reg(u32::from(base.reg))],
+        )
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaKeyedProperty: {err:?}"))
+        })?;
+    if base.temp_count != 0 {
+        ctx.release_temps(base.temp_count);
+    }
+    Ok(())
+}
+
 /// Stable tag for unsupported `PropertyKey` shapes — surfaces in
 /// `SourceLoweringError::Unsupported { construct }`.
 fn property_key_tag(key: &PropertyKey<'_>) -> &'static str {
@@ -2743,7 +2882,11 @@ fn apply_binary_op_with_acc_lhs(
         | Expression::LogicalExpression(_)
         | Expression::StringLiteral(_)
         | Expression::NullLiteral(_)
-        | Expression::BooleanLiteral(_) => {
+        | Expression::BooleanLiteral(_)
+        | Expression::ObjectExpression(_)
+        | Expression::ArrayExpression(_)
+        | Expression::StaticMemberExpression(_)
+        | Expression::ComputedMemberExpression(_) => {
             apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
         }
         other => Err(SourceLoweringError::unsupported(
@@ -2867,54 +3010,58 @@ fn lower_assignment_expression(
     ctx: &LoweringContext<'_>,
     expr: &AssignmentExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    // 1) Resolve the assignment target. M5 only accepts a plain
-    //    identifier whose binding is a writable local `let`.
-    let (target_ident, target_span) = match &expr.left {
-        AssignmentTarget::AssignmentTargetIdentifier(ident) => (ident.name.as_str(), ident.span),
-        AssignmentTarget::ComputedMemberExpression(member) => {
-            return Err(SourceLoweringError::unsupported(
-                "member_assignment_target",
-                member.span,
-            ));
+    // Dispatch on target shape. Identifier + static/computed member
+    // are the three supported write targets as of M17. Everything
+    // else (private fields, destructuring, TS-only) stays rejected
+    // with a stable per-shape tag so future widenings don't have to
+    // unify the error-surface story retroactively.
+    match &expr.left {
+        AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+            lower_identifier_assignment(builder, ctx, expr, ident)
         }
         AssignmentTarget::StaticMemberExpression(member) => {
-            return Err(SourceLoweringError::unsupported(
-                "member_assignment_target",
-                member.span,
-            ));
+            lower_static_member_assignment(builder, ctx, expr, member)
         }
-        AssignmentTarget::PrivateFieldExpression(member) => {
-            return Err(SourceLoweringError::unsupported(
-                "private_field_assignment_target",
-                member.span,
-            ));
+        AssignmentTarget::ComputedMemberExpression(member) => {
+            lower_computed_member_assignment(builder, ctx, expr, member)
         }
-        AssignmentTarget::ArrayAssignmentTarget(pattern) => {
-            return Err(SourceLoweringError::unsupported(
-                "destructuring_assignment_target",
-                pattern.span,
-            ));
-        }
-        AssignmentTarget::ObjectAssignmentTarget(pattern) => {
-            return Err(SourceLoweringError::unsupported(
-                "destructuring_assignment_target",
-                pattern.span,
-            ));
-        }
+        AssignmentTarget::PrivateFieldExpression(member) => Err(SourceLoweringError::unsupported(
+            "private_field_assignment_target",
+            member.span,
+        )),
+        AssignmentTarget::ArrayAssignmentTarget(pattern) => Err(SourceLoweringError::unsupported(
+            "destructuring_assignment_target",
+            pattern.span,
+        )),
+        AssignmentTarget::ObjectAssignmentTarget(pattern) => Err(SourceLoweringError::unsupported(
+            "destructuring_assignment_target",
+            pattern.span,
+        )),
         // TS-only assignment targets (`x as T = ...`, `x! = ...`,
         // etc.). Treated as one bucket — all are out of scope until
         // the source compiler grows TS-specific handling.
         AssignmentTarget::TSAsExpression(_)
         | AssignmentTarget::TSSatisfiesExpression(_)
         | AssignmentTarget::TSNonNullExpression(_)
-        | AssignmentTarget::TSTypeAssertion(_) => {
-            return Err(SourceLoweringError::unsupported(
-                "ts_assignment_target",
-                expr.span,
-            ));
-        }
-    };
+        | AssignmentTarget::TSTypeAssertion(_) => Err(SourceLoweringError::unsupported(
+            "ts_assignment_target",
+            expr.span,
+        )),
+    }
+}
 
+/// Identifier-target path for `lower_assignment_expression`. Preserves
+/// the original M5 semantics: local `let` only, rejects `const`, TDZ,
+/// and param writes; compound `<op>=` emits `Ldar r_x; <apply op>;
+/// Star r_x`.
+fn lower_identifier_assignment<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &AssignmentExpression<'a>,
+    ident: &IdentifierReference<'a>,
+) -> Result<(), SourceLoweringError> {
+    let target_ident = ident.name.as_str();
+    let target_span = ident.span;
     let binding = ctx
         .resolve_identifier(target_ident)
         .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", target_span))?;
@@ -2946,21 +3093,13 @@ fn lower_assignment_expression(
         }
     };
 
-    // 2) Compute the assignment value into the accumulator.
     if expr.operator == AssignmentOperator::Assign {
-        // Plain `=`: just lower the RHS into acc.
         lower_return_expression(builder, ctx, &expr.right)?;
     } else {
-        // Compound `<op>=`: load the current value of the target into
-        // acc, then apply the binary op against the RHS.
         let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
             SourceLoweringError::unsupported(assignment_operator_tag(expr.operator), expr.span)
         })?;
         let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
-            // Unreachable in practice — every operator
-            // `compound_assign_to_binary_operator` returns has a
-            // `binary_op_encoding`. Surface as Internal so a future
-            // mismatch is visible.
             SourceLoweringError::Internal(format!(
                 "compound assignment {bin_op:?} has no binary opcode encoding"
             ))
@@ -2975,14 +3114,184 @@ fn lower_assignment_expression(
         apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
     }
 
-    // 3) Persist acc to the target slot. acc is left holding the
-    //    assigned value so this expression composes inside a larger
-    //    expression (e.g. `let y = x = 5;` or `return x = 5;`).
     builder
         .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
         .map_err(|err| SourceLoweringError::Internal(format!("encode Star: {err:?}")))?;
-
     Ok(())
+}
+
+/// Lowers `o.x = v` (or `o.x <op>= v`). Shape for plain `=`:
+///
+/// ```text
+///   <materialize base into r_base>
+///   <lower v into acc>
+///   StaNamedProperty r_base, name_idx
+/// ```
+///
+/// Compound `<op>=` (`+=`, `-=`, `*=`, `|=`):
+///
+/// ```text
+///   <materialize base into r_base>
+///   LdaNamedProperty r_base, name_idx   ; acc = o.x
+///   <apply_binary_op_with_acc_lhs>       ; acc = o.x <op> v
+///   StaNamedProperty r_base, name_idx    ; o.x = acc
+/// ```
+///
+/// The accumulator holds the assigned value on exit, so composed
+/// forms (`let y = o.x = 5;`) work without extra traffic.
+fn lower_static_member_assignment<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &AssignmentExpression<'a>,
+    member: &StaticMemberExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    if member.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            member.span,
+        ));
+    }
+    let base = materialize_member_base(builder, ctx, &member.object)?;
+    let idx = ctx.intern_property_name(member.property.name.as_str())?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        if expr.operator == AssignmentOperator::Assign {
+            lower_return_expression(builder, ctx, &expr.right)?;
+        } else {
+            let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+                SourceLoweringError::unsupported(assignment_operator_tag(expr.operator), expr.span)
+            })?;
+            let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+                SourceLoweringError::Internal(format!(
+                    "compound assignment {bin_op:?} has no binary opcode encoding"
+                ))
+            })?;
+            builder
+                .emit(
+                    Opcode::LdaNamedProperty,
+                    &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaNamedProperty (compound): {err:?}"
+                    ))
+                })?;
+            apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
+        }
+        builder
+            .emit(
+                Opcode::StaNamedProperty,
+                &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode StaNamedProperty: {err:?}"))
+            })?;
+        Ok(())
+    })();
+    if base.temp_count != 0 {
+        ctx.release_temps(base.temp_count);
+    }
+    lower
+}
+
+/// Lowers `o[k] = v` (or `o[k] <op>= v`). Shape for plain `=`:
+///
+/// ```text
+///   <materialize base into r_base>
+///   <lower key into acc>; Star r_key
+///   <lower v into acc>
+///   StaKeyedProperty r_base, r_key
+/// ```
+///
+/// Compound `<op>=`:
+///
+/// ```text
+///   <materialize base into r_base>
+///   <lower key into acc>; Star r_key
+///   Ldar r_key                       ; acc = key
+///   LdaKeyedProperty r_base          ; acc = r_base[key]
+///   <apply_binary_op_with_acc_lhs>   ; acc = old <op> v
+///   StaKeyedProperty r_base, r_key
+/// ```
+///
+/// The key always spills into a dedicated temp so both the read
+/// path (which needs key in acc) and the store path (which needs
+/// key in a register via `StaKeyedProperty`'s second operand) can
+/// reach it.
+fn lower_computed_member_assignment<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &AssignmentExpression<'a>,
+    member: &ComputedMemberExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    if member.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            member.span,
+        ));
+    }
+    let base = materialize_member_base(builder, ctx, &member.object)?;
+    let key_temp = ctx.acquire_temps(1)?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // Evaluate the key into its own temp — JS spec §13.15.2
+        // specifies left-to-right evaluation for `o[k] = v`.
+        lower_return_expression(builder, ctx, &member.expression)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (computed key spill): {err:?}"))
+            })?;
+
+        if expr.operator == AssignmentOperator::Assign {
+            lower_return_expression(builder, ctx, &expr.right)?;
+        } else {
+            let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+                SourceLoweringError::unsupported(assignment_operator_tag(expr.operator), expr.span)
+            })?;
+            let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+                SourceLoweringError::Internal(format!(
+                    "compound assignment {bin_op:?} has no binary opcode encoding"
+                ))
+            })?;
+            // Reload key into acc for LdaKeyedProperty.
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(key_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Ldar (computed compound key): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(
+                    Opcode::LdaKeyedProperty,
+                    &[Operand::Reg(u32::from(base.reg))],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaKeyedProperty (compound): {err:?}"
+                    ))
+                })?;
+            apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
+        }
+        builder
+            .emit(
+                Opcode::StaKeyedProperty,
+                &[
+                    Operand::Reg(u32::from(base.reg)),
+                    Operand::Reg(u32::from(key_temp)),
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode StaKeyedProperty: {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(1); // key_temp
+    if base.temp_count != 0 {
+        ctx.release_temps(base.temp_count);
+    }
+    lower
 }
 
 /// Maps a compound assignment operator to the binary operator whose

@@ -597,6 +597,17 @@ impl Interpreter {
             }
 
             // ---- Named property access ----
+            //
+            // All four property opcodes (named + keyed, read + write)
+            // go through the runtime-level helpers rather than
+            // `ObjectHeap::{get,set}_property` directly. The helpers
+            // thread the live `PropertyNameRegistry` into the heap
+            // lookup, which is necessary for Array / TypedArray /
+            // String exotic paths that must materialise the
+            // `PropertyNameId → name → canonical_array_index`
+            // resolution — `get_property`/`set_property` use a default
+            // (empty) registry and would silently miss array indices
+            // and the array `length` property.
             Opcode::LdaNamedProperty => {
                 let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let prop_id = idx_operand(&instr.operands, 1)?;
@@ -607,8 +618,7 @@ impl Interpreter {
                     )));
                 };
                 let result = match runtime
-                    .objects
-                    .get_property(crate::object::ObjectHandle(handle), property)?
+                    .property_lookup(crate::object::ObjectHandle(handle), property)?
                 {
                     Some(lookup) => match lookup.value() {
                         crate::object::PropertyValue::Data { value: v, .. } => v,
@@ -628,11 +638,7 @@ impl Interpreter {
                     )));
                 };
                 let value = activation.accumulator();
-                runtime.objects.set_property(
-                    crate::object::ObjectHandle(handle),
-                    property,
-                    value,
-                )?;
+                runtime.set_named_property(crate::object::ObjectHandle(handle), property, value)?;
             }
 
             // ---- Keyed property access ----
@@ -640,17 +646,12 @@ impl Interpreter {
             // v2 convention: `LdaKeyedProperty r` reads the key from the
             // accumulator and the base object from register `r`, writing
             // the fetched value back into the accumulator.
-            //
-            // For Phase 3b.6 we handle the common object path via
-            // `runtime.property_base_object_handle` + a key → name
-            // coercion through `runtime.intern_register_value_as_name`.
-            // Typed-array numeric fast paths land with Phase 3b.7.
             Opcode::LdaKeyedProperty => {
                 let base = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let key = activation.accumulator();
                 let handle = runtime.property_base_object_handle(base)?;
                 let prop = key_to_property_name(runtime, key)?;
-                let value = match runtime.objects.get_property(handle, prop)? {
+                let value = match runtime.property_lookup(handle, prop)? {
                     Some(lookup) => match lookup.value() {
                         crate::object::PropertyValue::Data { value: v, .. } => v,
                         crate::object::PropertyValue::Accessor { .. } => RegisterValue::undefined(),
@@ -666,7 +667,7 @@ impl Interpreter {
                 let value = activation.accumulator();
                 let handle = runtime.property_set_target_handle(base)?;
                 let prop = key_to_property_name(runtime, key)?;
-                runtime.objects.set_property(handle, prop, value)?;
+                runtime.set_named_property(handle, prop, value)?;
             }
 
             // ---- Object / array allocation ----

@@ -3158,3 +3158,301 @@ fn int32_add_regression_after_noncommutative_marker() {
         42
     );
 }
+
+// ---------------------------------------------------------------------------
+// M16: `ObjectExpression` + `ArrayExpression` literals
+// ---------------------------------------------------------------------------
+
+/// Compile `source` and run the entry function; returns the raw
+/// `RegisterValue` + a live `RuntimeState` so individual tests can
+/// inspect heap state (property values, array lengths, …).
+fn compile_and_run(
+    source: &str,
+) -> (
+    crate::module::Module,
+    RegisterValue,
+    crate::interpreter::RuntimeState,
+) {
+    let module = compile(source).expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).expect("entry fn");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    (module, result.return_value(), runtime)
+}
+
+#[test]
+fn empty_object_literal_returns_object() {
+    let (_module, ret, _runtime) = compile_and_run("function f() { return {}; }");
+    assert!(
+        ret.as_object_handle().is_some(),
+        "empty object literal must return an object handle",
+    );
+}
+
+#[test]
+fn empty_array_literal_returns_array() {
+    let (_module, ret, runtime) = compile_and_run("function f() { return []; }");
+    let handle = crate::object::ObjectHandle(
+        ret.as_object_handle()
+            .expect("array literal must return a handle"),
+    );
+    assert_eq!(
+        runtime
+            .heap()
+            .array_length(handle)
+            .expect("array kind")
+            .expect("array length"),
+        0,
+    );
+}
+
+#[test]
+fn object_literal_with_int_values_sets_properties() {
+    // `{ a: 1, b: 2 }` — static identifiers mapped to int32 values.
+    let (_module, ret, mut runtime) = compile_and_run("function f() { return { a: 1, b: 2 }; }");
+    let handle = crate::object::ObjectHandle(ret.as_object_handle().expect("object handle"));
+    let key_a = runtime.intern_property_name("a");
+    let key_b = runtime.intern_property_name("b");
+    let a = runtime
+        .own_property_value(handle, key_a)
+        .expect("property a");
+    let b = runtime
+        .own_property_value(handle, key_b)
+        .expect("property b");
+    assert_eq!(a.as_i32(), Some(1));
+    assert_eq!(b.as_i32(), Some(2));
+}
+
+#[test]
+fn object_literal_with_string_keys() {
+    // `{ "hello": 1 }` — string-literal key maps through the
+    // property-name interner the same as a static identifier.
+    let (_module, ret, mut runtime) = compile_and_run("function f() { return { \"hello\": 1 }; }");
+    let handle = crate::object::ObjectHandle(ret.as_object_handle().expect("object handle"));
+    let key = runtime.intern_property_name("hello");
+    let v = runtime
+        .own_property_value(handle, key)
+        .expect("property hello");
+    assert_eq!(v.as_i32(), Some(1));
+}
+
+#[test]
+fn object_literal_with_string_values() {
+    // `{ name: "otter" }` — value is a StringLiteral threading
+    // through the M15 string-literal lowering.
+    let (_module, ret, mut runtime) =
+        compile_and_run("function f() { return { name: \"otter\" }; }");
+    let handle = crate::object::ObjectHandle(ret.as_object_handle().expect("object handle"));
+    let key = runtime.intern_property_name("name");
+    let v = runtime
+        .own_property_value(handle, key)
+        .expect("property name");
+    assert_eq!(runtime.js_to_string_infallible(v).as_ref(), "otter",);
+}
+
+#[test]
+fn object_literal_with_mixed_values() {
+    // `{ a: 1, b: "two", c: true, d: null }` — all the M14/M15
+    // primitives flow through `lower_return_expression` as
+    // property values.
+    let (_module, ret, mut runtime) =
+        compile_and_run("function f() { return { a: 1, b: \"two\", c: true, d: null }; }");
+    let handle = crate::object::ObjectHandle(ret.as_object_handle().expect("object handle"));
+    let a = runtime.intern_property_name("a");
+    let b = runtime.intern_property_name("b");
+    let c = runtime.intern_property_name("c");
+    let d = runtime.intern_property_name("d");
+    let av = runtime.own_property_value(handle, a).unwrap();
+    let bv = runtime.own_property_value(handle, b).unwrap();
+    let cv = runtime.own_property_value(handle, c).unwrap();
+    let dv = runtime.own_property_value(handle, d).unwrap();
+    assert_eq!(av.as_i32(), Some(1));
+    assert_eq!(runtime.js_to_string_infallible(bv).as_ref(), "two");
+    assert_eq!(cv.as_bool(), Some(true));
+    assert_eq!(dv, RegisterValue::null());
+}
+
+#[test]
+fn array_literal_with_int_elements() {
+    let (_module, ret, mut runtime) = compile_and_run("function f() { return [10, 20, 30]; }");
+    let handle = crate::object::ObjectHandle(ret.as_object_handle().expect("array handle"));
+    assert_eq!(runtime.heap().array_length(handle).unwrap().unwrap(), 3,);
+    for (i, expected) in [(0usize, 10i32), (1, 20), (2, 30)] {
+        let v = runtime
+            .objects_mut()
+            .get_index(handle, i)
+            .unwrap()
+            .expect("element");
+        assert_eq!(v.as_i32(), Some(expected));
+    }
+}
+
+#[test]
+fn array_literal_with_mixed_primitives() {
+    // `[1, "two", true, null]` — values reuse `lower_return_expression`
+    // so every M14/M15 primitive composes inside an array.
+    let (_module, ret, mut runtime) =
+        compile_and_run("function f() { return [1, \"two\", true, null]; }");
+    let handle = crate::object::ObjectHandle(ret.as_object_handle().expect("array handle"));
+    assert_eq!(runtime.heap().array_length(handle).unwrap().unwrap(), 4,);
+    let e0 = runtime.objects_mut().get_index(handle, 0).unwrap().unwrap();
+    let e1 = runtime.objects_mut().get_index(handle, 1).unwrap().unwrap();
+    let e2 = runtime.objects_mut().get_index(handle, 2).unwrap().unwrap();
+    let e3 = runtime.objects_mut().get_index(handle, 3).unwrap().unwrap();
+    assert_eq!(e0.as_i32(), Some(1));
+    assert_eq!(runtime.js_to_string_infallible(e1).as_ref(), "two");
+    assert_eq!(e2.as_bool(), Some(true));
+    assert_eq!(e3, RegisterValue::null());
+}
+
+#[test]
+fn nested_array_in_object_property() {
+    // `{ nums: [1, 2, 3] }` — nested composition: the property
+    // value is an ArrayExpression. Both temps are acquired in LIFO
+    // order (object's temp first, array's temp nested inside).
+    let (_module, ret, mut runtime) =
+        compile_and_run("function f() { return { nums: [1, 2, 3] }; }");
+    let obj = crate::object::ObjectHandle(ret.as_object_handle().expect("object handle"));
+    let key = runtime.intern_property_name("nums");
+    let arr_val = runtime.own_property_value(obj, key).unwrap();
+    let arr = crate::object::ObjectHandle(arr_val.as_object_handle().expect("nested array handle"));
+    assert_eq!(runtime.heap().array_length(arr).unwrap().unwrap(), 3);
+    assert_eq!(
+        runtime
+            .objects_mut()
+            .get_index(arr, 2)
+            .unwrap()
+            .unwrap()
+            .as_i32(),
+        Some(3),
+    );
+}
+
+#[test]
+fn nested_object_in_array_element() {
+    // `[{ name: "a" }, { name: "b" }]` — array of object literals.
+    let (_module, ret, mut runtime) =
+        compile_and_run("function f() { return [{ name: \"a\" }, { name: \"b\" }]; }");
+    let arr = crate::object::ObjectHandle(ret.as_object_handle().expect("array handle"));
+    assert_eq!(runtime.heap().array_length(arr).unwrap().unwrap(), 2);
+    let key = runtime.intern_property_name("name");
+    for (i, expected) in [(0usize, "a"), (1, "b")] {
+        let elem = runtime.objects_mut().get_index(arr, i).unwrap().unwrap();
+        let obj = crate::object::ObjectHandle(elem.as_object_handle().unwrap());
+        let v = runtime.own_property_value(obj, key).unwrap();
+        assert_eq!(runtime.js_to_string_infallible(v).as_ref(), expected,);
+    }
+}
+
+#[test]
+fn object_property_name_interner_dedups() {
+    // `{ k: 1, k: 2 }` — duplicate-key literal is legal JS
+    // (later assignment wins). Both write through the same
+    // interned name, so `property_names` stays at 1.
+    let module = compile("function f() { return { k: 1, k: 2 }; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    assert_eq!(function.property_names().len(), 1);
+}
+
+#[test]
+fn spread_in_object_rejected() {
+    let err = compile("function f() { return { ...rest }; }").expect_err("spread");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "object_spread_property",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn computed_key_rejected() {
+    // Key is a Numeric/String expression computed at runtime.
+    // Rejected until a future milestone threads ToPropertyKey.
+    let err = compile("function f() { let k = 0; return { [k]: 1 }; }").expect_err("computed");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "computed_property_key",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn shorthand_property_rejected() {
+    let err = compile("function f(x) { return { x }; }").expect_err("shorthand");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "shorthand_property",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn getter_property_rejected() {
+    let err = compile("function f() { return { get x() { return 1; } }; }").expect_err("getter");
+    // oxc sets `.method = true` for accessor shorthand; we surface
+    // it as `method_property` since both are the same rejection
+    // surface for now.
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "method_property" | "accessor_property",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn spread_array_element_rejected() {
+    let err = compile("function f(a) { return [...a]; }").expect_err("array_spread");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "spread_array_element",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn array_hole_rejected() {
+    // `[1, , 3]` — the middle hole is an Elision node. Until we
+    // support sparse arrays, reject at compile time.
+    let err = compile("function f() { return [1, , 3]; }").expect_err("hole");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "elision_array_element",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}

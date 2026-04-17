@@ -119,11 +119,13 @@ use std::cell::{Cell, RefCell};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
-    BindingPattern, ConditionalExpression, Expression, FormalParameter, FormalParameters, Function,
-    FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral, Program,
-    SimpleAssignmentTarget, Statement, UnaryExpression, UnaryOperator, UpdateExpression,
-    UpdateOperator, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentOperator,
+    AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, ConditionalExpression,
+    Expression, FormalParameter, FormalParameters, Function, FunctionBody, IdentifierReference,
+    LogicalExpression, LogicalOperator, NumericLiteral, ObjectExpression, ObjectPropertyKind,
+    Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement, UnaryExpression,
+    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -1740,6 +1742,8 @@ fn lower_return_expression(
         Expression::UpdateExpression(update) => lower_update_expression(builder, ctx, update),
         Expression::ConditionalExpression(cond) => lower_conditional_expression(builder, ctx, cond),
         Expression::LogicalExpression(logical) => lower_logical_expression(builder, ctx, logical),
+        Expression::ObjectExpression(obj) => lower_object_expression(builder, ctx, obj),
+        Expression::ArrayExpression(arr) => lower_array_expression(builder, ctx, arr),
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -2123,6 +2127,224 @@ fn lower_logical_expression(
         }
     }
     Ok(())
+}
+
+/// Lowers an `ObjectExpression` literal with static-identifier or
+/// string-literal keys. Computed keys, methods, shorthand, spread,
+/// getters, and setters are rejected with a stable per-shape tag —
+/// later milestones widen the surface.
+///
+/// Bytecode shape:
+///
+/// ```text
+///   CreateObject               ; acc = {}
+///   Star r_obj                 ; spill object handle to a temp
+///   <lower value_0>            ; acc = value_0
+///   StaNamedProperty r_obj, k0 ; obj[k0] = value_0
+///   <lower value_1>            ; acc = value_1
+///   StaNamedProperty r_obj, k1 ; obj[k1] = value_1
+///   …
+///   Ldar r_obj                 ; acc = obj (result of the expression)
+/// ```
+///
+/// The empty-object case `{}` collapses to a single `CreateObject`
+/// with no temp-slot traffic — neither the spill nor the reload are
+/// emitted.
+///
+/// §13.2.5 Object Initializer
+/// <https://tc39.es/ecma262/#sec-object-initializer>
+fn lower_object_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &ObjectExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    builder
+        .emit(Opcode::CreateObject, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode CreateObject: {err:?}")))?;
+
+    if expr.properties.is_empty() {
+        return Ok(());
+    }
+
+    // Acquire a temp to hold the object handle across the property
+    // initialisers — each value lowering clobbers acc.
+    let obj_temp = ctx.acquire_temps(1)?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(obj_temp))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (object temp): {err:?}"))
+        })?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        for prop_kind in &expr.properties {
+            let prop = match prop_kind {
+                ObjectPropertyKind::ObjectProperty(p) => p,
+                ObjectPropertyKind::SpreadProperty(s) => {
+                    return Err(SourceLoweringError::unsupported(
+                        "object_spread_property",
+                        s.span,
+                    ));
+                }
+            };
+            if prop.computed {
+                return Err(SourceLoweringError::unsupported(
+                    "computed_property_key",
+                    prop.span,
+                ));
+            }
+            if prop.method {
+                return Err(SourceLoweringError::unsupported(
+                    "method_property",
+                    prop.span,
+                ));
+            }
+            if prop.shorthand {
+                return Err(SourceLoweringError::unsupported(
+                    "shorthand_property",
+                    prop.span,
+                ));
+            }
+            if !matches!(prop.kind, PropertyKind::Init) {
+                return Err(SourceLoweringError::unsupported(
+                    "accessor_property",
+                    prop.span,
+                ));
+            }
+            let key_name = match &prop.key {
+                PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
+                PropertyKey::StringLiteral(lit) => lit.value.as_str().to_owned(),
+                other => {
+                    return Err(SourceLoweringError::unsupported(
+                        property_key_tag(other),
+                        other.span(),
+                    ));
+                }
+            };
+            // Lower the value into acc; the object handle is
+            // safely spilled.
+            lower_return_expression(builder, ctx, &prop.value)?;
+            let idx = ctx.intern_property_name(&key_name)?;
+            builder
+                .emit(
+                    Opcode::StaNamedProperty,
+                    &[Operand::Reg(u32::from(obj_temp)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode StaNamedProperty: {err:?}"))
+                })?;
+        }
+        // Reload the object handle so the expression's value is in
+        // acc for the caller.
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(obj_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (object reload): {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(1);
+    lower
+}
+
+/// Lowers an `ArrayExpression` literal. Elements are emitted in
+/// source order via `ArrayPush` — the runtime's array helper bumps
+/// `length` and writes into the dense elements slot. Spread elements
+/// and holes (`[1, , 2]`) are rejected with a stable tag so future
+/// milestones can widen the surface without silently changing
+/// semantics.
+///
+/// Bytecode shape:
+///
+/// ```text
+///   CreateArray                ; acc = []
+///   Star r_arr
+///   <lower element_0>          ; acc = element_0
+///   ArrayPush r_arr            ; arr.push(element_0)
+///   <lower element_1>
+///   ArrayPush r_arr
+///   …
+///   Ldar r_arr                 ; acc = arr
+/// ```
+///
+/// The empty-array case `[]` collapses to a single `CreateArray`
+/// with no temp traffic.
+///
+/// §13.2.4 Array Initializer
+/// <https://tc39.es/ecma262/#sec-array-initializer>
+fn lower_array_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &ArrayExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    builder
+        .emit(Opcode::CreateArray, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode CreateArray: {err:?}")))?;
+
+    if expr.elements.is_empty() {
+        return Ok(());
+    }
+
+    let arr_temp = ctx.acquire_temps(1)?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(arr_temp))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (array temp): {err:?}"))
+        })?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        for element in &expr.elements {
+            let element_expr = match element {
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    return Err(SourceLoweringError::unsupported(
+                        "spread_array_element",
+                        spread.span,
+                    ));
+                }
+                ArrayExpressionElement::Elision(elision) => {
+                    return Err(SourceLoweringError::unsupported(
+                        "elision_array_element",
+                        elision.span,
+                    ));
+                }
+                // Non-spread, non-hole element. `to_expression`
+                // downcasts the `Expression` variants inlined by
+                // `ArrayExpressionElement` back to `&Expression`.
+                other => other.to_expression(),
+            };
+            lower_return_expression(builder, ctx, element_expr)?;
+            builder
+                .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(arr_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode ArrayPush: {err:?}"))
+                })?;
+        }
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(arr_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (array reload): {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(1);
+    lower
+}
+
+/// Stable tag for unsupported `PropertyKey` shapes — surfaces in
+/// `SourceLoweringError::Unsupported { construct }`.
+fn property_key_tag(key: &PropertyKey<'_>) -> &'static str {
+    match key {
+        PropertyKey::StaticIdentifier(_) => "static_identifier_key",
+        PropertyKey::PrivateIdentifier(_) => "private_identifier_key",
+        PropertyKey::StringLiteral(_) => "string_literal_key",
+        PropertyKey::NumericLiteral(_) => "numeric_literal_key",
+        PropertyKey::BigIntLiteral(_) => "bigint_literal_key",
+        PropertyKey::TemplateLiteral(_) => "template_literal_key",
+        // All other expression-inherited variants surface as a
+        // generic computed-key tag. Reached only when the AST builds
+        // something like `{[expr]: v}` slipping past the `computed`
+        // guard — the front wall rejects first.
+        _ => "computed_property_key",
+    }
 }
 
 /// Per-operator opcode pair: the Reg-RHS form and the optional

@@ -40,7 +40,7 @@ See [`JIT_REFACTOR_PLAN.md`](./JIT_REFACTOR_PLAN.md) for concrete task lists per
 | M_JIT_B   | x86_64 baseline backend — port the v2 template-baseline stencil (same op coverage, tag guards, bailout model).                   | [x]    | e1b907a   |
 | M_JIT_C.1 | Mid-loop OSR — per-loop-header trampolines + `TierUpHook::execute_cached_at_pc` + back-edge budget-driven entry.                 | [x]    | 5251b41   |
 | M_JIT_C.2 | Speculative int32-trust elision — feedback-driven tag-guard skipping on stable arithmetic PCs.                                   | [x]    | ad3d137   |
-| M_JIT_C.3 | Loop-local register allocator — pin hot int32 slots into callee-saved registers across the loop body.                            | [x]    | _pending_ |
+| M_JIT_C.3 | Loop-local register allocator — pin hot int32 slots into callee-saved registers across the loop body.                            | [x]    | 5fe7c1e   |
 
 ### Feature track (after JIT completion)
 

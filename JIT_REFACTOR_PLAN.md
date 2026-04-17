@@ -504,7 +504,7 @@ guarded emitter partially wired and the invocation smoke test
   to **1 ns/inner-iter** on aarch64 (the 2× target).
   `m_jit_c_3_pinned_body_skips_pinned_slot_loads` locks in the
   pinned shape by asserting the warm stencil has ≤ 12 `LDR` insns
-  (unpinned has ≥ 15). Commit: `_pending_`.
+  (unpinned has ≥ 15). Commit: `5fe7c1e`.
 
 ---
 

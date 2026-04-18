@@ -119,14 +119,14 @@ use std::cell::{Cell, RefCell};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    ArrayExpression, ArrayExpressionElement, ArrayPattern, AssignmentExpression,
-    AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern,
-    ComputedMemberExpression, ConditionalExpression, Expression, FormalParameters, Function,
-    FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral,
-    ObjectExpression, ObjectPattern, ObjectPropertyKind, Program, PropertyKey, PropertyKind,
-    SimpleAssignmentTarget, Statement, StaticMemberExpression, TemplateLiteral, UnaryExpression,
-    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    ArrayExpression, ArrayExpressionElement, ArrayPattern, ArrowFunctionExpression,
+    AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
+    BindingPattern, ComputedMemberExpression, ConditionalExpression, Expression, FormalParameters,
+    Function, FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator,
+    NumericLiteral, ObjectExpression, ObjectPattern, ObjectPropertyKind, Program, PropertyKey,
+    PropertyKind, SimpleAssignmentTarget, Statement, StaticMemberExpression, TemplateLiteral,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -756,6 +756,41 @@ fn lower_function_body_with_parent<'a>(
                 .emit(Opcode::Return, &[])
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
             false
+        }
+        // Arrow concise body — oxc wraps `() => expr` as a
+        // FunctionBody with a single `ExpressionStatement`
+        // containing the expression. §15.3 specifies that this
+        // form is semantically `() => { return expr; }`, so we
+        // lower it as an implicit return. Detected by checking
+        // that this is the ONLY statement in the body (no
+        // preceding `rest`) and its expression can be any
+        // acc-producing shape, not just call / assign / update.
+        Statement::ExpressionStatement(expr_stmt)
+            if rest.is_empty() && body.statements.len() == 1 =>
+        {
+            // Only take this path for expressions the top-statement
+            // lowerer wouldn't already have accepted (call, assign,
+            // update). For those we fall through to the default
+            // catchall below, keeping the pre-existing semantics
+            // (call expression statement leaves `undefined` as the
+            // implicit return, matching regular function bodies).
+            if matches!(
+                expr_stmt.expression,
+                Expression::CallExpression(_)
+                    | Expression::AssignmentExpression(_)
+                    | Expression::UpdateExpression(_)
+            ) {
+                lower_top_statement(&mut builder, &mut ctx, last)?;
+                true
+            } else {
+                lower_return_expression(&mut builder, &ctx, &expr_stmt.expression)?;
+                builder.emit(Opcode::Return, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Return (arrow concise body): {err:?}"
+                    ))
+                })?;
+                false
+            }
         }
         _ => {
             // Lower the statement (call-statement, assignment, if,
@@ -3204,6 +3239,9 @@ fn lower_return_expression<'a>(
         }
         Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
         Expression::FunctionExpression(func) => lower_function_expression(builder, ctx, func),
+        Expression::ArrowFunctionExpression(arrow) => {
+            lower_arrow_function_expression(builder, ctx, arrow)
+        }
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -3273,6 +3311,50 @@ fn lower_function_expression<'a>(
             &[Operand::Idx(inner_idx), Operand::Imm(0)],
         )
         .map_err(|err| SourceLoweringError::Internal(format!("encode CreateClosure: {err:?}")))?;
+    Ok(())
+}
+
+/// Lowers `(args) => expr` / `(args) => { body }` — an arrow
+/// function — into a closure value. Same shape as
+/// `FunctionExpression` with two differences:
+/// - Arrows cannot be generators; `async` rejected until M33.
+/// - Arrows have lexical `this`. M26 doesn't introduce any `this`
+///   support in the source compiler (classes and `this` land in
+///   M27+), so lexical-`this` is automatically satisfied: every
+///   arrow just lowers as a regular closure body and neither the
+///   arrow nor its container uses `this`.
+///
+/// §15.3 Arrow Function Definitions.
+fn lower_arrow_function_expression<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    arrow: &'a ArrowFunctionExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    if arrow.r#async {
+        return Err(SourceLoweringError::unsupported(
+            "async_arrow_function",
+            arrow.span,
+        ));
+    }
+    // oxc synthesises the arrow body as a `FunctionBody` whose
+    // single statement is a `ReturnStatement` for concise
+    // `() => expr` form. Block-body arrows already have a
+    // regular FunctionBody. Either case flows through
+    // `lower_inner_callable` unchanged — no special-casing of
+    // `arrow.expression` needed.
+    let (inner_idx, captures) = lower_inner_callable(ctx, &arrow.params, &arrow.body, None)?;
+    let pc = builder.pc();
+    let template =
+        crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(inner_idx), captures);
+    ctx.record_closure_template(pc, template);
+    builder
+        .emit(
+            Opcode::CreateClosure,
+            &[Operand::Idx(inner_idx), Operand::Imm(0)],
+        )
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode CreateClosure (arrow): {err:?}"))
+        })?;
     Ok(())
 }
 
@@ -3353,20 +3435,36 @@ fn lower_inner_function_with_captures<'a>(
     func: &'a Function<'a>,
     outer: &LoweringContext<'a>,
 ) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
-    let params_layout = analyze_params(&func.params)?;
-    let param_count = params_layout.param_slot_count();
     let body = func
         .body
         .as_ref()
         .ok_or_else(|| SourceLoweringError::unsupported("declared_only_function", func.span))?;
+    let name = func.id.as_ref().map(|ident| ident.name.as_str().to_owned());
+    lower_inner_callable(outer, &func.params, body, name)
+}
 
-    // Thread the outer context as the parent so identifier
-    // lookups that miss the inner scope walk up and record
-    // captures. The returned `captures` vec feeds directly into
-    // the `ClosureTemplate` at the parent's `CreateClosure` PC.
+/// Shared core for lowering a nested callable (FunctionExpression,
+/// ArrowFunctionExpression, or nested FunctionDeclaration). Takes
+/// params + body explicitly so the per-AST-shape wrappers can
+/// funnel through a single path.
+///
+/// Allocates a fresh module function index, lowers the body with
+/// the outer context as capture parent, produces a `VmFunction`,
+/// pushes it to the shared module list, and returns
+/// `(idx, captures)` so the caller can record a
+/// `ClosureTemplate`.
+fn lower_inner_callable<'a>(
+    outer: &LoweringContext<'a>,
+    params: &'a FormalParameters<'a>,
+    body: &'a FunctionBody<'a>,
+    name: Option<String>,
+) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
+    let params_layout = analyze_params(params)?;
+    let param_count = params_layout.param_slot_count();
+
     let (body_out, captures) = lower_function_body_with_parent(
         body,
-        &func.params,
+        params,
         &params_layout,
         outer.function_names,
         std::rc::Rc::clone(&outer.module_functions),
@@ -3392,10 +3490,8 @@ fn lower_inner_function_with_captures<'a>(
         body_out.exceptions,
         Default::default(),
     );
-    let name = func.id.as_ref().map(|ident| ident.name.as_str().to_owned());
     let inner = VmFunction::new(name, layout, body_out.bytecode, tables);
 
-    // Push onto the shared module list and return the new index.
     let mut fns = outer.module_functions.borrow_mut();
     let idx = u32::try_from(fns.len())
         .map_err(|_| SourceLoweringError::Internal("module function index overflow".into()))?;

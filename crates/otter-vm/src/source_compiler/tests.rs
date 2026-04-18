@@ -5207,3 +5207,99 @@ fn nested_function_declaration_binding_is_const() {
         "unexpected err: {err:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// M26: Arrow functions (concise + block body, lexical `this`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn arrow_concise_body_returns_expression() {
+    let src = "function main() { let sq = (n) => n * n; return sq(7); }";
+    assert_eq!(run_int32_function(src, &[]), 49);
+}
+
+#[test]
+fn arrow_block_body_with_explicit_return() {
+    let src = "function main() { \
+        let f = (a, b) => { let s = a + b; return s * 2; }; \
+        return f(3, 4); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 14);
+}
+
+#[test]
+fn arrow_zero_args_concise() {
+    let src = "function main() { let five = () => 5; return five() + five(); }";
+    assert_eq!(run_int32_function(src, &[]), 10);
+}
+
+#[test]
+fn arrow_single_arg_without_parens() {
+    // `n => n + 1` — oxc parses the bare-identifier form.
+    let src = "function main() { let inc = n => n + 1; return inc(41); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn arrow_captures_outer_parameter() {
+    // Classic add-N closure via arrow.
+    let src = "function makeAdder(n) { return (x) => x + n; } \
+               function main() { let add10 = makeAdder(10); return add10(5); }";
+    assert_eq!(run_int32_function(src, &[]), 15);
+}
+
+#[test]
+fn arrow_captures_outer_local() {
+    let src = "function make() { let base = 100; return () => base; } \
+               function main() { let f = make(); return f(); }";
+    assert_eq!(run_int32_function(src, &[]), 100);
+}
+
+#[test]
+fn arrow_returning_template_literal() {
+    let src = "function main() { \
+        let greet = (name) => `hello, ${name}!`; \
+        return greet(\"otter\"); \
+    }";
+    assert_eq!(run_string_function(src, &[]), "hello, otter!");
+}
+
+#[test]
+fn arrow_chain_returns_callable() {
+    // `x => y => x + y` — curried adder. Inner arrow captures
+    // outer arrow's parameter via the same closure chain.
+    let src = "function main() { \
+        let add = x => y => x + y; \
+        let add3 = add(3); \
+        return add3(4); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn arrow_as_call_argument() {
+    // Passing an arrow as a callback-style value. `console.log`
+    // won't call back into it, so we just verify the arrow
+    // itself produces the value when invoked separately.
+    let src = "function apply(f, v) { return f(v); } \
+               function main() { return apply(n => n * 10, 5); }";
+    assert_eq!(run_int32_function(src, &[]), 50);
+}
+
+#[test]
+fn arrow_async_rejected() {
+    // `async n => n` — async arrows land with M33; stays
+    // rejected with a stable tag until then.
+    let err =
+        compile("function main() { let f = async (n) => n; return 0; }").expect_err("async arrow");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "async_arrow_function",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}

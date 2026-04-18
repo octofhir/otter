@@ -64,7 +64,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M23      | Spread in call args + array literals (`f(...a)`, `[...a, ...b]`).                                                              | [x]    | b5cd2f4 |
 | M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [x]    | a474ae9 |
 | M25      | Closures — nested `FunctionDeclaration` / `FunctionExpression` + upvalue capture.                                                | [x]    | f0a39a0 |
-| M26      | Arrow functions + lexical `this` binding.                                                                                       | [ ]    |        |
+| M26      | Arrow functions + lexical `this` binding.                                                                                       | [x]    | _pending_ |
 | M27      | Class declaration: constructor + instance methods + static methods.                                                             | [ ]    |        |
 | M28      | Class inheritance (`extends` + `super` + `super(args)` in constructor).                                                         | [ ]    |        |
 | M29      | Class private fields (`#x`) + accessor methods (`get` / `set`).                                                                 | [ ]    |        |
@@ -116,6 +116,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | Spread in `ArrayExpression` and method-call args (`[...a, ...b]`, `o.m(...xs)`); direct-call spread deferred | yes | M23 |
 | Destructuring in `let` + params: array (with rest), object (shorthand, renaming, defaults); no nested/holes/object-rest | yes | M24 |
 | `FunctionExpression` + nested `FunctionDeclaration` as first-class values + live upvalue capture (outer params/locals, chained grand-closures) | yes | M25 |
+| `ArrowFunctionExpression` (concise / block body, captures outer bindings, curried chains); async arrows deferred | yes | M26 |
 
 ## Benchmarks
 

@@ -1922,21 +1922,8 @@ fn _calling_a_param_suppressed_placeholder() {
     ));
 }
 
-#[test]
-fn new_expression_unsupported() {
-    // `new f()` is a NewExpression, not a CallExpression — falls
-    // through to the catch-all `expression_construct_tag` →
-    // `new_expression`.
-    let err = compile("function f() { return 1; } function main() { return new f(); }")
-        .expect_err("new at M9");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "new_expression",
-            ..
-        }
-    ));
-}
+// Removed: new_expression_unsupported — `new` is supported as of
+// M27. Positive coverage lives in the M27 test block below.
 
 // ---------------------------------------------------------------------------
 // M10: UnaryExpression + UpdateExpression
@@ -5297,6 +5284,182 @@ fn arrow_async_rejected() {
             err,
             SourceLoweringError::Unsupported {
                 construct: "async_arrow_function",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M27: Class declarations (constructor + instance/static methods)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn class_with_constructor_and_instance_method() {
+    let src = "function main() { \
+        class Point { \
+            constructor(x, y) { this.x = x; this.y = y; } \
+            sum() { return this.x + this.y; } \
+        } \
+        let p = new Point(3, 4); \
+        return p.sum(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn class_without_explicit_constructor() {
+    // No `constructor` → synthesised empty ctor. `new Foo()`
+    // must still return the allocated receiver (not undefined).
+    let src = "function main() { \
+        class Box { answer() { return 42; } } \
+        let b = new Box(); \
+        return b.answer(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn class_static_method_returns_instance() {
+    // `Point.zero()` constructs a Point internally — the static
+    // method body closes over the class binding through the
+    // pre-allocated class-name local.
+    let src = "function main() { \
+        class Point { \
+            constructor(x, y) { this.x = x; this.y = y; } \
+            static zero() { return new Point(0, 0); } \
+        } \
+        let z = Point.zero(); \
+        return z.x + z.y; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn class_constructor_return_object_override() {
+    // §9.2.2.1 — an explicit Object return from a constructor
+    // wins over the allocated receiver.
+    let src = "function main() { \
+        class Trick { \
+            constructor() { this.x = 1; return { x: 99 }; } \
+        } \
+        let t = new Trick(); \
+        return t.x; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 99);
+}
+
+#[test]
+fn class_constructor_return_primitive_ignored() {
+    // §9.2.2.1 — a primitive return is dropped; the allocated
+    // receiver wins.
+    let src = "function main() { \
+        class Keep { \
+            constructor() { this.x = 7; return 123; } \
+        } \
+        let k = new Keep(); \
+        return k.x; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn class_instance_method_uses_this() {
+    let src = "function main() { \
+        class Counter { \
+            constructor() { this.n = 10; } \
+            bump() { this.n = this.n + 1; return this.n; } \
+        } \
+        let c = new Counter(); \
+        c.bump(); \
+        c.bump(); \
+        return c.bump(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 13);
+}
+
+#[test]
+fn class_static_method_is_on_constructor() {
+    // Static method installed on the constructor, not the
+    // prototype — so instances can't see it.
+    let src = "function main() { \
+        class C { \
+            static tag() { return 99; } \
+        } \
+        return C.tag(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 99);
+}
+
+#[test]
+fn class_new_with_zero_args() {
+    let src = "function main() { \
+        class E { \
+            constructor() { this.v = 55; } \
+        } \
+        return new E().v; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 55);
+}
+
+#[test]
+fn class_extends_still_unsupported() {
+    // `extends` lands with M28.
+    let err = compile("function main() { class A {} class B extends A {} }").expect_err("extends");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "class_extends",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn class_field_still_unsupported() {
+    let err = compile("function main() { class A { x = 1; } }").expect_err("class field");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "class_field",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn class_getter_still_unsupported() {
+    let err = compile("function main() { class A { get x() { return 1; } } }").expect_err("getter");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "accessor_class_method",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn spread_in_new_expression_unsupported() {
+    let err = compile(
+        "function main() { class C { tag() { return 1; } } let a = [1]; return new C(...a); }",
+    )
+    .expect_err("spread in new");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "spread_in_new_expression",
                 ..
             }
         ),

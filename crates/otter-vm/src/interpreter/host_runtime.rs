@@ -72,16 +72,35 @@ impl Interpreter {
         Self::invoke_host_function_handle(runtime, callable, receiver, arguments)
     }
 
-    /// §9.1.12 `OrdinaryCreateFromConstructor` default receiver
-    /// allocation for construct calls.
+    /// §9.1.12 `OrdinaryCreateFromConstructor` — creates a new
+    /// object whose `[[Prototype]]` is `new_target.prototype`
+    /// (falling back to the intrinsic default's prototype when
+    /// `new_target.prototype` isn't an Object). Called by
+    /// `construct_callable` when the constructor is a plain
+    /// class-constructor closure and needs a receiver.
     ///
-    /// Placeholder in M0.
+    /// M27: real implementation. Reads the new_target's
+    /// `prototype` property via the runtime's property-lookup
+    /// path, falls through to `IntrinsicKey::ObjectPrototype`
+    /// when the read doesn't produce an object.
     pub(super) fn allocate_construct_receiver(
-        _runtime: &mut RuntimeState,
-        _new_target: ObjectHandle,
-        _intrinsic_default: IntrinsicKey,
+        runtime: &mut RuntimeState,
+        new_target: ObjectHandle,
+        intrinsic_default: IntrinsicKey,
     ) -> Result<ObjectHandle, InterpreterError> {
-        Err(InterpreterError::NativeCall(M0_UNSUPPORTED.into()))
+        let prototype_prop = runtime.intern_property_name("prototype");
+        let proto_value = match runtime.property_lookup(new_target, prototype_prop)? {
+            Some(lookup) => match lookup.value() {
+                crate::object::PropertyValue::Data { value, .. } => value,
+                crate::object::PropertyValue::Accessor { .. } => RegisterValue::undefined(),
+            },
+            None => RegisterValue::undefined(),
+        };
+        let proto = proto_value
+            .as_object_handle()
+            .map(ObjectHandle)
+            .unwrap_or_else(|| runtime.intrinsics().get(intrinsic_default));
+        Ok(runtime.alloc_object_with_prototype(Some(proto)))
     }
 
     /// Resolve which intrinsic a native constructor uses as the default
@@ -96,16 +115,33 @@ impl Interpreter {
         IntrinsicKey::ObjectPrototype
     }
 
-    /// §9.2.1.16 — Apply the ES2024 rule that a `Construct` call returns
-    /// the explicit object produced by the body, else the default
-    /// `this` receiver.
-    ///
-    /// Placeholder in M0: returns whatever the completion already holds.
+    /// §9.2.1.16 — `Construct` return rule: if the body returned
+    /// an Object, keep it; otherwise use the default receiver
+    /// (the freshly-allocated `this`). M27 implements the real
+    /// rule; pre-M27 builds had a stub that returned the body's
+    /// value verbatim, which wrongly surfaced `undefined` from
+    /// empty constructors instead of the new object.
     pub(super) fn apply_construct_return_override(
         completion: Completion,
-        _default_receiver: RegisterValue,
+        default_receiver: RegisterValue,
     ) -> Completion {
-        completion
+        match completion {
+            Completion::Return(value) => {
+                // Keep explicit Object returns; replace
+                // primitives / undefined with the allocated
+                // receiver. The object-handle check covers
+                // plain Objects, Arrays, closures, etc.; the
+                // NaN-boxed non-object values (int32, bool,
+                // null, undefined, symbol, bigint-handle,
+                // f64) all fall through to the else arm.
+                if value.as_object_handle().is_some() {
+                    Completion::Return(value)
+                } else {
+                    Completion::Return(default_receiver)
+                }
+            }
+            other => other,
+        }
     }
 
     /// Resume a suspended generator. Placeholder in M0.

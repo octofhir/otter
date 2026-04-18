@@ -121,12 +121,13 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, ArrayPattern, ArrowFunctionExpression,
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
-    BindingPattern, ComputedMemberExpression, ConditionalExpression, Expression, FormalParameters,
-    Function, FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator,
-    NumericLiteral, ObjectExpression, ObjectPattern, ObjectPropertyKind, Program, PropertyKey,
-    PropertyKind, SimpleAssignmentTarget, Statement, StaticMemberExpression, TemplateLiteral,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    BindingPattern, Class, ClassElement, ComputedMemberExpression, ConditionalExpression,
+    Expression, FormalParameters, Function, FunctionBody, IdentifierReference, LogicalExpression,
+    LogicalOperator, MethodDefinitionKind, NewExpression, NumericLiteral, ObjectExpression,
+    ObjectPattern, ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget,
+    Statement, StaticMemberExpression, TemplateLiteral, UnaryExpression, UnaryOperator,
+    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -900,6 +901,7 @@ fn lower_nested_statement<'a>(
         Statement::FunctionDeclaration(func) => {
             lower_nested_function_declaration(builder, ctx, func)
         }
+        Statement::ClassDeclaration(class) => lower_nested_class_declaration(builder, ctx, class),
         Statement::ThrowStatement(throw) => lower_throw_statement(builder, ctx, throw),
         Statement::TryStatement(try_stmt) => lower_try_statement(builder, ctx, try_stmt),
         Statement::BreakStatement(break_stmt) => lower_break_statement(builder, ctx, break_stmt),
@@ -3242,6 +3244,22 @@ fn lower_return_expression<'a>(
         Expression::ArrowFunctionExpression(arrow) => {
             lower_arrow_function_expression(builder, ctx, arrow)
         }
+        // M27: `this` reads the function's receiver slot. Only
+        // meaningful inside constructors and methods — in plain
+        // function bodies `CallUndefinedReceiver` sets `this =
+        // undefined` (non-strict mode).
+        Expression::ThisExpression(_) => {
+            builder
+                .emit(Opcode::LdaThis, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode LdaThis: {err:?}")))?;
+            Ok(())
+        }
+        // M27: `new Foo(args)`. Flows through the `Construct`
+        // opcode which allocates the receiver from
+        // `Foo.prototype`, invokes the constructor with
+        // `this = receiver`, and applies §9.2.2.1's return
+        // override.
+        Expression::NewExpression(new_expr) => lower_new_expression(builder, ctx, new_expr),
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -3415,6 +3433,396 @@ fn lower_nested_function_declaration<'a>(
         })?;
     ctx.mark_initialized(name)?;
     Ok(())
+}
+
+/// Lowers a nested `class Foo { … }` declaration into a const
+/// binding of a constructor closure with methods installed on
+/// its prototype / static properties. M27 surface:
+/// - Explicit `constructor(args) { body }` or synthesised empty
+///   constructor if absent.
+/// - Instance methods (installed on `Foo.prototype`).
+/// - Static methods (installed on `Foo` itself).
+/// - Computed keys, getters / setters, class fields, `extends`,
+///   decorators all rejected with stable per-shape tags.
+///
+/// Bytecode shape:
+///
+/// ```text
+///   CreateClosure <ctor_idx>, flags=class_constructor
+///   Star r_class
+///   LdaNamedProperty r_class, "prototype"
+///   Star r_proto
+///   ; for each instance method:
+///     CreateClosure <m_idx>, 0
+///     StaNamedProperty r_proto, "<name>"
+///   ; for each static method:
+///     CreateClosure <m_idx>, 0
+///     StaNamedProperty r_class, "<name>"
+///   Ldar r_class           ; acc = Foo (value of the declaration)
+///   Star r_<name>          ; bind Foo as a const local
+/// ```
+fn lower_nested_class_declaration<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    class: &'a Class<'a>,
+) -> Result<(), SourceLoweringError> {
+    if !class.decorators.is_empty() {
+        return Err(SourceLoweringError::unsupported(
+            "class_decorator",
+            class.decorators[0].span,
+        ));
+    }
+    if class.super_class.is_some() {
+        return Err(SourceLoweringError::unsupported(
+            "class_extends",
+            class.span,
+        ));
+    }
+    let class_ident = class
+        .id
+        .as_ref()
+        .ok_or_else(|| SourceLoweringError::unsupported("anonymous_class", class.span))?;
+    let class_name = class_ident.name.as_str();
+
+    // 1) Locate the constructor (if any) + collect methods.
+    let mut constructor_fn: Option<&'a Function<'a>> = None;
+    let mut methods: Vec<(&'a str, bool, &'a Function<'a>)> = Vec::new(); // (name, is_static, fn)
+    for element in class.body.body.iter() {
+        match element {
+            ClassElement::MethodDefinition(method) => {
+                if method.computed {
+                    return Err(SourceLoweringError::unsupported(
+                        "computed_class_method_key",
+                        method.span,
+                    ));
+                }
+                if !matches!(
+                    method.kind,
+                    MethodDefinitionKind::Constructor | MethodDefinitionKind::Method
+                ) {
+                    return Err(SourceLoweringError::unsupported(
+                        "accessor_class_method",
+                        method.span,
+                    ));
+                }
+                let key_name = match &method.key {
+                    PropertyKey::StaticIdentifier(ident) => ident.name.as_str(),
+                    PropertyKey::StringLiteral(lit) => lit.value.as_str(),
+                    other => {
+                        return Err(SourceLoweringError::unsupported(
+                            property_key_tag(other),
+                            other.span(),
+                        ));
+                    }
+                };
+                match method.kind {
+                    MethodDefinitionKind::Constructor => {
+                        constructor_fn = Some(&method.value);
+                    }
+                    MethodDefinitionKind::Method => {
+                        methods.push((key_name, method.r#static, &method.value));
+                    }
+                    _ => unreachable!("kinds filtered above"),
+                }
+            }
+            ClassElement::PropertyDefinition(prop) => {
+                return Err(SourceLoweringError::unsupported("class_field", prop.span));
+            }
+            ClassElement::StaticBlock(block) => {
+                return Err(SourceLoweringError::unsupported(
+                    "class_static_block",
+                    block.span,
+                ));
+            }
+            ClassElement::AccessorProperty(prop) => {
+                return Err(SourceLoweringError::unsupported(
+                    "accessor_property",
+                    prop.span,
+                ));
+            }
+            ClassElement::TSIndexSignature(sig) => {
+                return Err(SourceLoweringError::unsupported(
+                    "ts_index_signature",
+                    sig.span,
+                ));
+            }
+        }
+    }
+
+    // Allocate the class-name local BEFORE lowering methods, so
+    // method bodies can resolve a self-reference (e.g. a `static
+    // zero() { return new Point(); }`) through the capture path.
+    // The binding starts uninitialized; it's flipped to
+    // `initialized` after the final `Star r_class_local` below,
+    // and stays `const`.
+    let class_slot = ctx.allocate_local(class_name, true, class_ident.span)?;
+
+    // 2) Lower the constructor — if none present, lowering the
+    //    empty-body synthetic Function would be complex; instead
+    //    emit an empty constructor inline through a minimal
+    //    bytecode function so `new Foo()` works even without an
+    //    explicit constructor.
+    let ctor_idx = match constructor_fn {
+        Some(func) => {
+            let (idx, captures) = lower_inner_callable(
+                ctx,
+                &func.params,
+                func.body.as_ref().ok_or_else(|| {
+                    SourceLoweringError::unsupported("declared_only_function", func.span)
+                })?,
+                Some(class_name.to_owned()),
+            )?;
+            let pc = builder.pc();
+            // Constructor closure gets the class_constructor flag
+            // so plain `Foo()` (without `new`) throws TypeError.
+            let template = crate::closure::ClosureTemplate::with_flags(
+                crate::module::FunctionIndex(idx),
+                captures,
+                crate::object::ClosureFlags::class_constructor(),
+            );
+            ctx.record_closure_template(pc, template);
+            builder
+                .emit(Opcode::CreateClosure, &[Operand::Idx(idx), Operand::Imm(0)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CreateClosure (class ctor): {err:?}"
+                    ))
+                })?;
+            idx
+        }
+        None => {
+            // Synthesise an empty constructor function.
+            let synthetic = synthesise_empty_constructor(ctx, class_name)?;
+            let pc = builder.pc();
+            let template = crate::closure::ClosureTemplate::with_flags(
+                crate::module::FunctionIndex(synthetic),
+                Vec::new(),
+                crate::object::ClosureFlags::class_constructor(),
+            );
+            ctx.record_closure_template(pc, template);
+            builder
+                .emit(
+                    Opcode::CreateClosure,
+                    &[Operand::Idx(synthetic), Operand::Imm(0)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CreateClosure (empty ctor): {err:?}"
+                    ))
+                })?;
+            synthetic
+        }
+    };
+    let _ = ctor_idx;
+
+    // 3) Spill constructor + prototype into temps for method
+    //    installation. The constructor also becomes the final
+    //    class binding in acc before the declarator `Star`.
+    let class_temp = ctx.acquire_temps(1)?;
+    let proto_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // acc = constructor (left over from CreateClosure above)
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(class_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (class ctor spill): {err:?}"))
+            })?;
+        let prototype_idx = ctx.intern_property_name("prototype")?;
+        builder
+            .emit(
+                Opcode::LdaNamedProperty,
+                &[
+                    Operand::Reg(u32::from(class_temp)),
+                    Operand::Idx(prototype_idx),
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaNamedProperty (class prototype): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(proto_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Star (class prototype spill): {err:?}"
+                ))
+            })?;
+
+        for (name, is_static, func) in methods.iter().copied() {
+            let (idx, captures) = lower_inner_callable(
+                ctx,
+                &func.params,
+                func.body.as_ref().ok_or_else(|| {
+                    SourceLoweringError::unsupported("declared_only_function", func.span)
+                })?,
+                Some(name.to_owned()),
+            )?;
+            let pc = builder.pc();
+            let template =
+                crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(idx), captures);
+            ctx.record_closure_template(pc, template);
+            builder
+                .emit(Opcode::CreateClosure, &[Operand::Idx(idx), Operand::Imm(0)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CreateClosure (class method): {err:?}"
+                    ))
+                })?;
+            let name_idx = ctx.intern_property_name(name)?;
+            let target_reg = if is_static { class_temp } else { proto_temp };
+            builder
+                .emit(
+                    Opcode::StaNamedProperty,
+                    &[Operand::Reg(u32::from(target_reg)), Operand::Idx(name_idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode StaNamedProperty (class method install): {err:?}"
+                    ))
+                })?;
+        }
+
+        // 4) Bind the constructor as a const local with the
+        //    class's name. Acc = constructor after the final Ldar.
+        //    The local was pre-allocated above so method bodies
+        //    could capture a forward reference; flip it to
+        //    initialized here.
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(class_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (class binding): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(class_slot))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (class name binding): {err:?}"))
+            })?;
+        ctx.mark_initialized(class_name)?;
+        Ok(())
+    })();
+    ctx.release_temps(2);
+    lower
+}
+
+/// Synthesises an empty class constructor function
+/// (`function() {}`) as a fresh `VmFunction` and appends it to
+/// the shared module list. Returns the new index. Used when a
+/// `class` declaration omits an explicit `constructor`.
+fn synthesise_empty_constructor<'a>(
+    outer: &LoweringContext<'a>,
+    class_name: &str,
+) -> Result<u32, SourceLoweringError> {
+    let layout = FrameLayout::new(1, 0, 0, 0)
+        .map_err(|err| SourceLoweringError::Internal(format!("empty ctor layout: {err:?}")))?;
+    let mut builder = BytecodeBuilder::new();
+    builder
+        .emit(Opcode::LdaUndefined, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode LdaUndefined: {err:?}")))?;
+    builder
+        .emit(Opcode::Return, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
+    let bytecode = builder
+        .finish()
+        .map_err(|err| SourceLoweringError::Internal(format!("finish empty ctor: {err:?}")))?;
+    let func = VmFunction::with_empty_tables(Some(class_name.to_owned()), layout, bytecode);
+    let mut fns = outer.module_functions.borrow_mut();
+    let idx = u32::try_from(fns.len())
+        .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?;
+    fns.push(func);
+    Ok(idx)
+}
+
+/// Lowers `new Foo(args)` — allocates the receiver from
+/// `Foo.prototype`, invokes the constructor with
+/// `this = receiver` + `new.target = Foo`, and applies the
+/// §9.2.2.1 return override (keep explicit object return, fall
+/// back to the allocated receiver otherwise).
+///
+/// Bytecode shape:
+///
+/// ```text
+///   <lower callee>; Star r_callee
+///   <lower arg_0>;  Star r_arg0
+///   …
+///   Construct r_callee, r_callee, RegList{base=r_arg0, count=argc}
+/// ```
+///
+/// `new.target` uses the same register as the target — callers
+/// that need a distinct `new.target` would have to be written
+/// through class inheritance, which lands with `extends` (M28).
+fn lower_new_expression<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &'a NewExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+    // Reject spread-in-`new` for M27 — same rationale as
+    // `spread_in_direct_call`.
+    if expr
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, Argument::SpreadElement(_)))
+    {
+        return Err(SourceLoweringError::unsupported(
+            "spread_in_new_expression",
+            expr.span,
+        ));
+    }
+    let argc = RegisterIndex::try_from(expr.arguments.len())
+        .map_err(|_| SourceLoweringError::Internal("new argument count exceeds u16".into()))?;
+    let callee_temp = ctx.acquire_temps(1)?;
+    let args_base = if argc == 0 {
+        0
+    } else {
+        ctx.acquire_temps(argc)
+            .inspect_err(|_| ctx.release_temps(1))?
+    };
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, &expr.callee)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (new callee): {err:?}"))
+            })?;
+        for (offset, arg) in expr.arguments.iter().enumerate() {
+            let arg_expr = match arg {
+                Argument::SpreadElement(_) => unreachable!("rejected above"),
+                other => other.to_expression(),
+            };
+            lower_return_expression(builder, ctx, arg_expr)?;
+            let slot = args_base
+                .checked_add(RegisterIndex::try_from(offset).map_err(|_| {
+                    SourceLoweringError::Internal("new argument offset overflow".into())
+                })?)
+                .ok_or_else(|| SourceLoweringError::Internal("new arg slot overflow".into()))?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Star (new arg): {err:?}"))
+                })?;
+        }
+        builder
+            .emit(
+                Opcode::Construct,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: u32::from(argc),
+                    },
+                ],
+            )
+            .map_err(|err| SourceLoweringError::Internal(format!("encode Construct: {err:?}")))?;
+        Ok(())
+    })();
+    if argc > 0 {
+        ctx.release_temps(argc);
+    }
+    ctx.release_temps(1);
+    lower
 }
 
 /// Recursively lowers a nested `Function` (the body of a

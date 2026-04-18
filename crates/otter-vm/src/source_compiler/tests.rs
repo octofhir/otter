@@ -5803,6 +5803,160 @@ fn m29_field_initializer_can_reference_this_and_outer_scope() {
     assert_eq!(run_int32_function(src, &[]), 42);
 }
 
+// ---------------------------------------------------------------------------
+// M29.5: Private methods + accessors + static blocks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m29p5_private_method_invoked_via_this() {
+    // `this.#m()` reads the method off the instance's
+    // `[[PrivateElements]]` (copied at construction time) and
+    // invokes it with `this = instance`.
+    let src = "function main() { \
+        class C { \
+            constructor() { this.base = 10; } \
+            #double() { return this.base + this.base; } \
+            get() { return this.#double(); } \
+        } \
+        return new C().get(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 20);
+}
+
+#[test]
+fn m29p5_private_method_forwarded_through_public_api() {
+    // Private methods are called from other methods — outside
+    // the class they're inaccessible. We don't test the negative
+    // path here because there's no `instanceof` yet; the
+    // compile-time `undeclared_private_name` check already
+    // covers cross-class access.
+    let src = "function main() { \
+        class Calc { \
+            #inc(n) { return n + 1; } \
+            apply(v) { return this.#inc(v); } \
+        } \
+        return new Calc().apply(5); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m29p5_private_getter_accessor() {
+    // `get #h()` installs a private accessor. Reading
+    // `this.#h` invokes the getter with `this = instance`.
+    let src = "function main() { \
+        class C { \
+            constructor() { this.raw = 7; } \
+            get #half() { return this.raw; } \
+            expose() { return this.#half + 1; } \
+        } \
+        return new C().expose(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 8);
+}
+
+#[test]
+fn m29p5_private_setter_accessor() {
+    // `set #h(v)` installs a private setter. `this.#h = v`
+    // invokes the setter with `this = instance` and `v` as the
+    // argument; the setter mutates a public field so we can
+    // observe the effect.
+    let src = "function main() { \
+        class C { \
+            constructor() { this.raw = 0; } \
+            set #slot(v) { this.raw = v + 3; } \
+            store(v) { this.#slot = v; } \
+        } \
+        let c = new C(); \
+        c.store(10); \
+        return c.raw; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 13);
+}
+
+#[test]
+fn m29p5_private_accessor_getter_and_setter_merge() {
+    // `get #p()` + `set #p(v)` declared together merge into a
+    // single accessor element. Same-name duplication in the
+    // private-name list needs a dedicated guard: for now we
+    // allow get/set pairs to share a name, since they declare
+    // complementary halves of one element.
+    let src = "function main() { \
+        class C { \
+            constructor() { this.backing = 0; } \
+            get #v() { return this.backing; } \
+            set #v(n) { this.backing = n; } \
+            round_trip(n) { this.#v = n; return this.#v + 1; } \
+        } \
+        return new C().round_trip(40); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 41);
+}
+
+#[test]
+fn m29p5_static_private_method() {
+    // `static #m()` lives directly on the class constructor's
+    // `[[PrivateElements]]` (via `DefinePrivateMethod`). Access
+    // from inside any method of the same class works.
+    let src = "function main() { \
+        class C { \
+            static #triple(n) { return n + n + n; } \
+            static run(n) { return C.#triple(n); } \
+        } \
+        return C.run(4); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 12);
+}
+
+#[test]
+fn m29p5_static_block_runs_at_class_definition() {
+    // `static { … }` runs once with `this = class`. The block
+    // mutates a static public field we can inspect after the
+    // class is defined.
+    let src = "function main() { \
+        class C { \
+            static counter = 0; \
+            static { this.counter = this.counter + 100; } \
+        } \
+        return C.counter; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 100);
+}
+
+#[test]
+fn m29p5_static_block_local_scope() {
+    // Static blocks can declare their own `let`/`const` (shared
+    // statement surface with function bodies).
+    let src = "function main() { \
+        class C { \
+            static total = 0; \
+            static { \
+                let step = 7; \
+                this.total = this.total + step; \
+                this.total = this.total + step; \
+            } \
+        } \
+        return C.total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 14);
+}
+
+#[test]
+fn m29p5_multiple_static_blocks_run_in_order() {
+    // Declaration order matters for static blocks: each block
+    // sees the side effects of the previous ones.
+    let src = "function main() { \
+        class C { \
+            static seq = 0; \
+            static { this.seq = 1; } \
+            static { this.seq = this.seq + 10; } \
+            static { this.seq = this.seq + 100; } \
+        } \
+        return C.seq; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 111);
+}
+
 #[test]
 fn spread_in_new_expression_unsupported() {
     let err = compile(

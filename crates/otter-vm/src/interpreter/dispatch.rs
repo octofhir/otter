@@ -1809,9 +1809,9 @@ impl Interpreter {
                 }
             }
             // §7.3.32 PrivateGet — read a private field / method
-            // / accessor from `r_obj`. Private accessors are
-            // returned as their getter closure; callers invoke
-            // through the usual call path.
+            // / accessor from `r_obj`. Fields return the stored
+            // value; methods return the callable handle; accessor
+            // gets invoke the getter with `r_obj` as receiver.
             Opcode::GetPrivateField => {
                 let obj_reg = reg(&instr.operands, 0)?;
                 let prop_id = idx_operand(&instr.operands, 1)?;
@@ -1823,9 +1823,40 @@ impl Interpreter {
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                 };
                 let key = active_private_name_key(activation, function, runtime, prop_id)?;
-                match runtime.objects.private_get(obj_handle, &key) {
-                    Ok(value) => activation.set_accumulator(value),
-                    Err(err) => return throw_object_error(runtime, err),
+                // Cloning is necessary because the borrow on
+                // `runtime.objects` conflicts with the `&mut self`
+                // we need below for the accessor invocation path.
+                let element = runtime
+                    .objects
+                    .private_elements_ref(obj_handle, &key)
+                    .cloned();
+                match element {
+                    Some(crate::object::PrivateElement::Field(v)) => {
+                        activation.set_accumulator(v);
+                    }
+                    Some(crate::object::PrivateElement::Method(m)) => {
+                        activation.set_accumulator(RegisterValue::from_object_handle(m.0));
+                    }
+                    Some(crate::object::PrivateElement::Accessor {
+                        getter: Some(g), ..
+                    }) => match self.call_callable_bytecode(runtime, g, obj_val, &[]) {
+                        Ok(v) => {
+                            activation.refresh_open_upvalues_from_cells(runtime)?;
+                            activation.set_accumulator(v);
+                        }
+                        Err(StepOutcome::Throw(v)) => return Ok(StepOutcome::Throw(v)),
+                        Err(other) => return Ok(other),
+                    },
+                    Some(crate::object::PrivateElement::Accessor { getter: None, .. }) => {
+                        let err = runtime.alloc_type_error("private accessor has no getter")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                    None => {
+                        let err = runtime.alloc_type_error(
+                            "cannot access private field or method: object does not have the private member",
+                        )?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
                 }
             }
             // §7.3.33 PrivateSet — write a private field value
@@ -1979,6 +2010,205 @@ impl Interpreter {
                     AccessorHalf::Set,
                     setter,
                 )?;
+            }
+
+            // M29.5: §15.7.14 step 28 / §7.3.33 — store a private
+            // method or accessor on the class constructor's
+            // `[[PrivateMethods]]` slot. `construct_callable` /
+            // `super_call_dispatch` later copy the list to each
+            // fresh instance's `[[PrivateElements]]`.
+            Opcode::PushPrivateMethod => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "PushPrivateMethod: target is not a closure",
+                    )));
+                };
+                let key = class_def_private_key(activation, function, prop_id)?;
+                let method = activation.accumulator();
+                let Some(method_handle) =
+                    method.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "PushPrivateMethod: method is not a closure",
+                    )));
+                };
+                if let Err(err) = runtime.objects.push_private_method(
+                    target_handle,
+                    key,
+                    crate::object::PrivateElement::Method(method_handle),
+                ) {
+                    return throw_object_error(runtime, err);
+                }
+            }
+            Opcode::PushPrivateGetter => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "PushPrivateGetter: target is not a closure",
+                    )));
+                };
+                let key = class_def_private_key(activation, function, prop_id)?;
+                let getter = activation.accumulator();
+                let Some(getter_handle) =
+                    getter.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "PushPrivateGetter: getter is not a closure",
+                    )));
+                };
+                if let Err(err) = runtime.objects.push_private_method(
+                    target_handle,
+                    key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: Some(getter_handle),
+                        setter: None,
+                    },
+                ) {
+                    return throw_object_error(runtime, err);
+                }
+            }
+            Opcode::PushPrivateSetter => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "PushPrivateSetter: target is not a closure",
+                    )));
+                };
+                let key = class_def_private_key(activation, function, prop_id)?;
+                let setter = activation.accumulator();
+                let Some(setter_handle) =
+                    setter.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "PushPrivateSetter: setter is not a closure",
+                    )));
+                };
+                if let Err(err) = runtime.objects.push_private_method(
+                    target_handle,
+                    key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: None,
+                        setter: Some(setter_handle),
+                    },
+                ) {
+                    return throw_object_error(runtime, err);
+                }
+            }
+
+            // M29.5: §7.3.33 `PrivateMethodOrAccessorAdd` —
+            // directly install a private method/accessor onto
+            // `r_target`'s own `[[PrivateElements]]`. Emitted by
+            // the compiler for `static #m() {}` / `static get #p()`
+            // so the element lives on the class constructor
+            // itself (no instance-copy step).
+            Opcode::DefinePrivateMethod => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefinePrivateMethod: target is not an object",
+                    )));
+                };
+                let key = class_def_private_key(activation, function, prop_id)?;
+                let method = activation.accumulator();
+                let Some(method_handle) =
+                    method.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "DefinePrivateMethod: method is not a closure",
+                    )));
+                };
+                if let Err(err) = runtime.objects.private_method_or_accessor_add(
+                    target_handle,
+                    key,
+                    crate::object::PrivateElement::Method(method_handle),
+                ) {
+                    return throw_object_error(runtime, err);
+                }
+            }
+            Opcode::DefinePrivateGetter => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefinePrivateGetter: target is not an object",
+                    )));
+                };
+                let key = class_def_private_key(activation, function, prop_id)?;
+                let getter = activation.accumulator();
+                let Some(getter_handle) =
+                    getter.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "DefinePrivateGetter: getter is not a closure",
+                    )));
+                };
+                if let Err(err) = runtime.objects.private_method_or_accessor_add(
+                    target_handle,
+                    key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: Some(getter_handle),
+                        setter: None,
+                    },
+                ) {
+                    return throw_object_error(runtime, err);
+                }
+            }
+            Opcode::DefinePrivateSetter => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefinePrivateSetter: target is not an object",
+                    )));
+                };
+                let key = class_def_private_key(activation, function, prop_id)?;
+                let setter = activation.accumulator();
+                let Some(setter_handle) =
+                    setter.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "DefinePrivateSetter: setter is not a closure",
+                    )));
+                };
+                if let Err(err) = runtime.objects.private_method_or_accessor_add(
+                    target_handle,
+                    key,
+                    crate::object::PrivateElement::Accessor {
+                        getter: None,
+                        setter: Some(setter_handle),
+                    },
+                ) {
+                    return throw_object_error(runtime, err);
+                }
             }
 
             Opcode::Nop => {}
@@ -2266,6 +2496,24 @@ fn super_call_dispatch(
     }
     activation.set_accumulator(receiver);
 
+    // §7.3.33 InitializeInstanceElements — copy the derived
+    // class's own private methods + accessors onto the instance.
+    // Parent's private methods were already installed when
+    // parent's constructor ran (either nested via super-chain
+    // `construct_callable` or at the top of this same helper
+    // for the parent's frame).
+    if let Some(receiver_handle) = receiver.as_object_handle().map(crate::object::ObjectHandle) {
+        match runtime.install_class_private_methods(active_closure, receiver_handle) {
+            Ok(()) => {}
+            Err(crate::VmNativeCallError::Thrown(v)) => {
+                return Ok(SuperCallOutcome::Throw(v));
+            }
+            Err(crate::VmNativeCallError::Internal(msg)) => {
+                return Err(InterpreterError::NativeCall(msg));
+            }
+        }
+    }
+
     // §15.7.14 step 28 — run the derived class's own field
     // initializer now that `this` is live. Mirrors the
     // base-class path in `construct_callable`; the two together
@@ -2338,6 +2586,39 @@ fn install_class_accessor(
             "class accessor install: {err:?}"
         )))),
     }
+}
+
+/// M29.5: `PrivateNameKey` used during class-definition
+/// emission. Reads the `class_id` from the frame's
+/// `current_class_id` scratch slot (populated by `AllocClassId`)
+/// rather than from the active closure — during class evaluation
+/// the active closure is the enclosing function, which has a
+/// different (usually zero) class_id. Private method/accessor
+/// installers (`PushPrivate*` / `DefinePrivate*`) all go through
+/// this path so they consistently use the class-being-defined's
+/// id.
+fn class_def_private_key(
+    activation: &Activation,
+    function: &Function,
+    prop_id: u32,
+) -> Result<crate::object::PrivateNameKey, InterpreterError> {
+    let class_id = activation.current_class_id;
+    if class_id == 0 {
+        return Err(InterpreterError::NativeCall(Box::from(
+            "private element install: class_id not allocated",
+        )));
+    }
+    let id = crate::property::PropertyNameId(prop_id as u16);
+    let description = function
+        .property_names()
+        .get(id)
+        .ok_or(InterpreterError::UnknownPropertyName)?
+        .to_owned()
+        .into_boxed_str();
+    Ok(crate::object::PrivateNameKey {
+        class_id,
+        description,
+    })
 }
 
 /// Construct a `PrivateNameKey` from the active closure's

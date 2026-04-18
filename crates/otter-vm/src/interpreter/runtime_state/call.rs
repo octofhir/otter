@@ -228,6 +228,47 @@ impl RuntimeState {
         crate::intrinsics::create_iter_result_object(value, done, self)
     }
 
+    /// §7.3.33 InitializeInstanceElements — copy the constructor's
+    /// private methods + accessors (populated at class-definition
+    /// time via `PushPrivateMethod` / `PushPrivateGetter` /
+    /// `PushPrivateSetter`) onto a freshly-allocated instance's
+    /// `[[PrivateElements]]` slot. Called by both the base-class
+    /// path in `construct_callable` and the derived-class path
+    /// in `super_call_dispatch`.
+    pub(crate) fn install_class_private_methods(
+        &mut self,
+        class: ObjectHandle,
+        instance: ObjectHandle,
+    ) -> Result<(), VmNativeCallError> {
+        let methods = match self.objects.closure_private_methods(class) {
+            Ok(methods) => methods,
+            Err(_) => return Ok(()),
+        };
+        for (key, element) in methods {
+            if let Err(err) = self
+                .objects
+                .private_method_or_accessor_add(instance, key, element)
+            {
+                match err {
+                    crate::object::ObjectError::TypeError(msg) => {
+                        let handle = self.alloc_type_error(&msg).map_err(|error| {
+                            VmNativeCallError::Internal(format!("{error}").into())
+                        })?;
+                        return Err(VmNativeCallError::Thrown(
+                            RegisterValue::from_object_handle(handle.0),
+                        ));
+                    }
+                    other => {
+                        return Err(VmNativeCallError::Internal(
+                            format!("install_class_private_methods: {other:?}").into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn call_callable(
         &mut self,
         callable: ObjectHandle,
@@ -411,6 +452,20 @@ impl RuntimeState {
                 }
                 if arguments.len() > param_count as usize {
                     activation.overflow_args = arguments[param_count as usize..].to_vec();
+                }
+
+                // §7.3.33 InitializeInstanceElements — for base
+                // classes we install private methods + accessors
+                // on the fresh receiver BEFORE any user code
+                // runs. (Derived classes get their own private
+                // methods copied over after `super()` returns in
+                // `super_call_dispatch`.)
+                if !is_derived_constructor
+                    && callee_function.frame_layout().receiver_slot().is_some()
+                    && let Some(receiver_handle) =
+                        default_receiver.as_object_handle().map(ObjectHandle)
+                {
+                    self.install_class_private_methods(target, receiver_handle)?;
                 }
 
                 // §15.7.14 step 28 — run the class field initializer

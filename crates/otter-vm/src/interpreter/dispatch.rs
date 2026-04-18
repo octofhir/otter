@@ -724,6 +724,61 @@ impl Interpreter {
                 activation.set_accumulator(RegisterValue::from_object_handle(arr.0));
             }
 
+            // `CreateClosure idx, flags` — M25. Builds a fresh
+            // closure object bound to the `ClosureTemplate`
+            // registered at this PC in the current function's
+            // `ClosureTable`. Each capture descriptor resolves to
+            // an upvalue handle:
+            // - `CaptureDescriptor::Register(reg)` promotes the
+            //   current frame's register into an open upvalue
+            //   cell — so later writes to the same slot sync
+            //   through the cell and the inner closure observes
+            //   live values.
+            // - `CaptureDescriptor::Upvalue(id)` re-captures an
+            //   existing upvalue the current closure already
+            //   holds, letting grand-closures reach past one
+            //   level of nesting.
+            //
+            // The `Idx` operand is the callee's function index in
+            // the current module; the `Imm` carries flags that
+            // future milestones (generator, async) will use. For
+            // M25 we ignore the operand flags and rely on
+            // `ClosureTemplate::flags()` so the metadata stays in
+            // one place.
+            Opcode::CreateClosure => {
+                use crate::closure::CaptureDescriptor;
+                let callee_idx_raw = idx_operand(&instr.operands, 0)?;
+                let _flags_imm = imm(&instr.operands, 1)?;
+                let template = function.closures().get(pc).ok_or_else(|| {
+                    InterpreterError::NativeCall(Box::from(
+                        "CreateClosure: no ClosureTemplate for this PC",
+                    ))
+                })?;
+                if template.callee().0 != callee_idx_raw {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "CreateClosure: template callee mismatches opcode operand",
+                    )));
+                }
+                let mut upvalues: Vec<crate::object::ObjectHandle> =
+                    Vec::with_capacity(template.captures().len());
+                for cap in template.captures() {
+                    let handle = match cap {
+                        CaptureDescriptor::Register(reg) => {
+                            activation.capture_bytecode_register_upvalue(function, runtime, *reg)?
+                        }
+                        CaptureDescriptor::Upvalue(id) => {
+                            let parent = activation
+                                .closure_handle()
+                                .ok_or(InterpreterError::MissingClosureContext)?;
+                            runtime.objects.closure_upvalue(parent, id.0 as usize)?
+                        }
+                    };
+                    upvalues.push(handle);
+                }
+                let handle = runtime.alloc_closure(template.callee(), upvalues, template.flags());
+                activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
+            }
+
             // ---- Coercions reusing runtime helpers ----
             Opcode::ToNumber => {
                 let v = activation.accumulator();

@@ -1902,14 +1902,17 @@ fn duplicate_top_level_function_unsupported() {
     ));
 }
 
+// Removed: calling_a_param_unsupported — M25 wires the
+// local/param-holds-callable fallback in `lower_direct_call`,
+// so `function caller(g) { return g(); }` now compiles
+// (runtime dispatches through `CallUndefinedReceiver` against
+// whatever value `g` holds).
+
 #[test]
-fn calling_a_param_unsupported() {
-    // `f(g)` passes `g` as an argument; calling that param value
-    // would need closure values. Until then, params are not
-    // callable — confirms the function-name lookup doesn't
-    // accidentally succeed on a parameter.
-    let err = compile("function caller(g) { return g(); } function main() { return caller(1); }")
-        .expect_err("call-of-param at M9");
+fn _calling_a_param_suppressed_placeholder() {
+    // Deleted companion assertion — M25 positive coverage lives
+    // in the M25 test block below.
+    let err = compile("function f() { return bogus(); }").expect_err("unbound still");
     assert!(matches!(
         err,
         SourceLoweringError::Unsupported {
@@ -5016,4 +5019,142 @@ fn array_destructure_default_rejected() {
         ),
         "unexpected err: {err:?}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// M25: FunctionExpression + closures (upvalue capture)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn function_expression_without_captures_returns_value() {
+    let src = "function main() { let f = function() { return 42; }; return f(); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn function_expression_with_param_returns_result() {
+    let src = "function main() { let dbl = function(n) { return n + n; }; return dbl(21); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn closure_captures_outer_parameter() {
+    let src = "function makeAdder(n) { return function(x) { return x + n; }; } \
+               function main() { let add10 = makeAdder(10); return add10(5); }";
+    assert_eq!(run_int32_function(src, &[]), 15);
+}
+
+#[test]
+fn closure_captures_outer_local() {
+    let src = "function make() { let base = 100; return function() { return base; }; } \
+               function main() { let f = make(); return f(); }";
+    assert_eq!(run_int32_function(src, &[]), 100);
+}
+
+#[test]
+fn closure_live_capture_outer_mutation_visible_from_inner() {
+    // §10.2.1 — closures see live outer mutations.
+    let src = "function make() { \
+        let v = 1; \
+        let f = function() { return v; }; \
+        v = 99; \
+        return f(); \
+    } \
+    function main() { return make(); }";
+    assert_eq!(run_int32_function(src, &[]), 99);
+}
+
+#[test]
+fn closure_inner_mutation_visible_to_outer() {
+    // Inner closure writes captured binding; outer observes
+    // via the open-upvalue cell sync.
+    let src = "function make() { \
+        let v = 0; \
+        let setter = function() { v = 42; }; \
+        setter(); \
+        return v; \
+    } \
+    function main() { return make(); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn counter_closure_maintains_state_across_calls() {
+    let src = "function makeCounter() { \
+        let n = 0; \
+        return function() { n = n + 1; return n; }; \
+    } \
+    function main() { \
+        let inc = makeCounter(); \
+        inc(); \
+        inc(); \
+        return inc(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 3);
+}
+
+#[test]
+fn independent_closures_have_independent_state() {
+    // Each `makeCounter` call allocates separate upvalue cells.
+    let src = "function makeCounter() { \
+        let n = 0; \
+        return function() { n = n + 1; return n; }; \
+    } \
+    function main() { \
+        let a = makeCounter(); \
+        let b = makeCounter(); \
+        a(); a(); a(); \
+        b(); \
+        return a() * 10 + b(); \
+    }";
+    // a called 4 times (=4); b called 2 times (=2). 4*10 + 2 = 42.
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn closure_calls_top_level_function() {
+    let src = "function helper(n) { return n + 1; } \
+               function main() { \
+                   let f = function(x) { return helper(x); }; \
+                   return f(41); \
+               }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn compound_assign_on_captured_binding() {
+    let src = "function make() { \
+        let total = 0; \
+        let add = function(n) { total += n; }; \
+        add(3); add(4); add(5); \
+        return total; \
+    } \
+    function main() { return make(); }";
+    assert_eq!(run_int32_function(src, &[]), 12);
+}
+
+#[test]
+fn closure_with_template_literal_over_captured_name() {
+    let src = "function greeter(name) { \
+        return function() { return `hello, ${name}!`; }; \
+    } \
+    function main() { let g = greeter(\"otter\"); return g(); }";
+    assert_eq!(run_string_function(src, &[]), "hello, otter!");
+}
+
+#[test]
+fn nested_closure_captures_grandparent_scope() {
+    // Three-level nesting — innermost captures `x` from the
+    // outermost via chained `CaptureDescriptor::Upvalue`.
+    let src = "function outer(x) { \
+        return function() { \
+            return function() { return x; }; \
+        }; \
+    } \
+    function main() { \
+        let mk = outer(7); \
+        let inner = mk(); \
+        return inner(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
 }

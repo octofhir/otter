@@ -250,19 +250,36 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
 
     // Second pass: lower each function with the shared name table
     // available so `f(args)` inside one body can resolve `f` to its
-    // `FunctionIndex`.
-    let mut functions: Vec<VmFunction> = Vec::with_capacity(declarations.len());
-    for func in &declarations {
-        functions.push(lower_function_declaration(func, &names)?);
+    // `FunctionIndex`. Top-level functions land at indices
+    // `0..declarations.len()`; any inner `FunctionExpression`
+    // encountered during body lowering appends beyond that.
+    let module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>> = std::rc::Rc::new(
+        std::cell::RefCell::new(Vec::with_capacity(declarations.len())),
+    );
+    // M25: top-level declaration indices need to be stable before
+    // any body lowering runs (so nested `f()` inside one body can
+    // resolve to the shared `function_names` table). We push
+    // placeholder `VmFunction::empty` entries and then overwrite
+    // each slot with the real lowered function. Inner functions
+    // (landing after the top-level slots) use `Vec::push` to grow
+    // the shared list.
+    for _ in 0..declarations.len() {
+        module_functions.borrow_mut().push(placeholder_function());
+    }
+    for (top_idx, func) in declarations.iter().enumerate() {
+        let lowered =
+            lower_function_declaration(func, &names, std::rc::Rc::clone(&module_functions))?;
+        module_functions.borrow_mut()[top_idx] = lowered;
     }
 
-    // Entry = last declared function (conventional `main` lives at
-    // the bottom of the file). Safe: `declarations` is non-empty
-    // (we returned early above) and `functions.len() ==
-    // declarations.len()`.
-    let entry_idx = u32::try_from(functions.len() - 1)
+    // Entry = last top-level declaration. Safe: `declarations` is
+    // non-empty (we returned early above).
+    let entry_idx = u32::try_from(declarations.len() - 1)
         .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?;
 
+    let functions = std::rc::Rc::try_unwrap(module_functions)
+        .map_err(|_| SourceLoweringError::Internal("module functions still shared".into()))?
+        .into_inner();
     let module = Module::new(None::<&str>, functions, FunctionIndex(entry_idx)).map_err(|err| {
         SourceLoweringError::Internal(format!("module construction failed: {err}"))
     })?;
@@ -292,9 +309,23 @@ fn statement_construct_tag(stmt: &Statement<'_>) -> &'static str {
     }
 }
 
+/// Placeholder `Function` used to reserve top-level module slots
+/// before bodies are lowered. Each slot is overwritten with the
+/// real lowered function at the end of
+/// `lower_program`; any nested `FunctionExpression` pushes beyond
+/// the top-level prefix without shifting reserved indices.
+fn placeholder_function() -> VmFunction {
+    let layout = FrameLayout::new(0, 0, 0, 0).expect("empty frame layout");
+    let empty_bytecode = BytecodeBuilder::new()
+        .finish()
+        .expect("empty BytecodeBuilder finishes");
+    VmFunction::with_empty_tables(None::<&'static str>, layout, empty_bytecode)
+}
+
 fn lower_function_declaration<'a>(
     func: &'a Function<'a>,
     function_names: &'a [&'a str],
+    module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
 ) -> Result<VmFunction, SourceLoweringError> {
     if func.r#async {
         return Err(SourceLoweringError::unsupported(
@@ -327,7 +358,13 @@ fn lower_function_declaration<'a>(
     // seeds the function's `FeedbackTableLayout` for the JIT's
     // int32-trust consumer (see
     // `analyze_template_candidate_with_feedback`).
-    let body_out = lower_function_body(body, &func.params, &params_layout, function_names)?;
+    let body_out = lower_function_body(
+        body,
+        &func.params,
+        &params_layout,
+        function_names,
+        module_functions,
+    )?;
 
     // FrameLayout: 1 hidden slot for `this`, then `param_count`
     // parameter slots (non-rest params only; rest lands in a local),
@@ -346,18 +383,18 @@ fn lower_function_declaration<'a>(
     // resolve `bytecode.feedback().get(pc) -> FeedbackSlot` against a
     // well-shaped `FeedbackVector`.
     let feedback_layout = arithmetic_only_feedback_layout(body_out.feedback_slot_count);
-    // M14/M15: wire the accumulated property-name, float-constant,
-    // and string-literal interners into the function's side tables
-    // so `LdaGlobal` / `LdaConstF64` / `LdaConstStr` can resolve
-    // their `Idx` operands at runtime. Other tables (bigints,
-    // closures, calls, regexps) stay default-empty until later
-    // milestones exercise them.
+    // M14 / M15 / M25: wire the accumulated side tables so the
+    // dispatcher can resolve `Idx` operands at runtime
+    // (property names, string literals, float constants) and
+    // materialise closures at CreateClosure PCs (closure
+    // templates). Other tables (bigints, calls, regexps) stay
+    // default-empty until later milestones exercise them.
     let side_tables = crate::module::FunctionSideTables::new(
         body_out.property_names,
         body_out.string_literals,
         body_out.float_constants,
         Default::default(),
-        Default::default(),
+        body_out.closures,
         Default::default(),
         Default::default(),
     );
@@ -387,6 +424,7 @@ struct FunctionBodyOutput {
     float_constants: crate::float::FloatTable,
     string_literals: crate::string::StringTable,
     exceptions: crate::exception::ExceptionTable,
+    closures: crate::closure::ClosureTable,
 }
 
 /// Build a `FeedbackTableLayout` with `count` [`FeedbackKind::Arithmetic`]
@@ -645,10 +683,23 @@ fn emit_rest_parameter<'a>(
 
 fn lower_function_body<'a>(
     body: &'a FunctionBody<'a>,
+    params: &'a FormalParameters<'a>,
+    layout: &ParamsLayout<'a>,
+    function_names: &'a [&'a str],
+    module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+) -> Result<FunctionBodyOutput, SourceLoweringError> {
+    lower_function_body_with_parent(body, params, layout, function_names, module_functions, None)
+        .map(|(out, _captures)| out)
+}
+
+fn lower_function_body_with_parent<'a>(
+    body: &'a FunctionBody<'a>,
     _params: &'a FormalParameters<'a>,
     layout: &ParamsLayout<'a>,
     function_names: &'a [&'a str],
-) -> Result<FunctionBodyOutput, SourceLoweringError> {
+    module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+    parent: Option<&'a LoweringContext<'a>>,
+) -> Result<(FunctionBodyOutput, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
     if !body.directives.is_empty() {
         return Err(SourceLoweringError::unsupported(
             "directive_prologue",
@@ -657,7 +708,7 @@ fn lower_function_body<'a>(
     }
 
     let mut builder = BytecodeBuilder::new();
-    let mut ctx = LoweringContext::new(layout, function_names);
+    let mut ctx = LoweringContext::with_parent(layout, function_names, module_functions, parent);
 
     // §14.1.21 FunctionDeclarationInstantiation — evaluate default
     // initializers for any param whose caller-supplied value is
@@ -726,21 +777,28 @@ fn lower_function_body<'a>(
     // Resolve pending exception handlers to concrete PCs before
     // `finish()` drops the builder's label state.
     let exception_handlers = ctx.take_exception_handlers(&builder)?;
+    let bytecode_len = builder.pc();
+    let closure_table = ctx.take_closure_table(bytecode_len);
 
     let bytecode = builder
         .finish()
         .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
 
-    Ok(FunctionBodyOutput {
-        bytecode,
-        local_count: ctx.local_count(),
-        temp_count: ctx.temp_count(),
-        feedback_slot_count: ctx.feedback_slot_count(),
-        property_names: ctx.take_property_names(),
-        float_constants: ctx.take_float_constants(),
-        string_literals: ctx.take_string_literals(),
-        exceptions: crate::exception::ExceptionTable::new(exception_handlers),
-    })
+    let captures = ctx.take_captures();
+    Ok((
+        FunctionBodyOutput {
+            bytecode,
+            local_count: ctx.local_count(),
+            temp_count: ctx.temp_count(),
+            feedback_slot_count: ctx.feedback_slot_count(),
+            property_names: ctx.take_property_names(),
+            float_constants: ctx.take_float_constants(),
+            string_literals: ctx.take_string_literals(),
+            exceptions: crate::exception::ExceptionTable::new(exception_handlers),
+            closures: closure_table,
+        },
+        captures,
+    ))
 }
 
 /// Lowers a single statement at function-body top level. Accepts the
@@ -1657,6 +1715,13 @@ enum BindingRef {
         initialized: bool,
         is_const: bool,
     },
+    /// M25: binding resolved in an enclosing scope — accessed
+    /// through the inner closure's upvalue list. `idx` is the
+    /// `LdaUpvalue`/`StaUpvalue` operand (0-based in capture
+    /// order).
+    Upvalue {
+        idx: u16,
+    },
 }
 
 /// In-scope `let`/`const` binding. The slot is assigned at allocation
@@ -1778,6 +1843,41 @@ struct LoweringContext<'a> {
     /// `ExceptionTable` is constructed in
     /// [`lower_function_body`].
     pending_handlers: RefCell<Vec<PendingExceptionHandler>>,
+    /// Pending ClosureTemplate entries (M25). Each
+    /// `CreateClosure <idx>, <flags>` site produces one entry
+    /// keyed by its byte PC. At function finalisation the entries
+    /// are materialised into a sparse `ClosureTable` indexed by
+    /// PC (empty slots between closure-creation sites stay `None`).
+    pending_closure_templates: RefCell<Vec<PendingClosureTemplate>>,
+    /// Shared, growing module-level function list. Inner
+    /// `FunctionExpression`s lowered during this context's body
+    /// emission push their produced `VmFunction` here and learn
+    /// their `FunctionIndex` from the post-push length. Every
+    /// context created during a single `compile()` call shares
+    /// the same `Rc<RefCell<…>>`.
+    module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+    /// Enclosing function's context for closure capture lookups.
+    /// `None` on top-level functions. Stored as a raw-pointer
+    /// reference via `Option<&'a LoweringContext<'a>>` — the
+    /// parent outlives every descendant because children are
+    /// constructed inside the parent's body-lowering call.
+    parent: Option<&'a LoweringContext<'a>>,
+    /// Captured outer bindings, in upvalue-index order. Each
+    /// entry corresponds to one `LdaUpvalue` / `StaUpvalue`
+    /// operand inside this function and one `CaptureDescriptor`
+    /// the parent's `ClosureTemplate` carries. Name is owned
+    /// (`String`) instead of `&'a str` so the field doesn't
+    /// contribute to `LoweringContext<'a>`'s invariance —
+    /// `Option<&'a LoweringContext<'a>>` for the `parent` field
+    /// would otherwise propagate invariance through every
+    /// function signature that touches `ctx`.
+    captures: RefCell<Vec<CaptureEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureEntry {
+    name: String,
+    descriptor: crate::closure::CaptureDescriptor,
 }
 
 /// Pre-resolution form of an `ExceptionHandler`. All three fields
@@ -1788,6 +1888,15 @@ struct PendingExceptionHandler {
     try_start: Label,
     try_end: Label,
     handler: Label,
+}
+
+/// Pre-resolution form of a `ClosureTemplate`. Stores the PC at
+/// which the `CreateClosure` opcode will be emitted so the
+/// finaliser can build a PC-indexed sparse `ClosureTable`.
+#[derive(Debug, Clone)]
+struct PendingClosureTemplate {
+    pc: u32,
+    template: crate::closure::ClosureTemplate,
 }
 
 /// `break` / `continue` jump targets for one enclosing control
@@ -1815,7 +1924,20 @@ struct ScopeSnapshot {
 }
 
 impl<'a> LoweringContext<'a> {
-    fn new(layout: &ParamsLayout<'a>, function_names: &'a [&'a str]) -> Self {
+    fn new(
+        layout: &ParamsLayout<'a>,
+        function_names: &'a [&'a str],
+        module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+    ) -> Self {
+        Self::with_parent(layout, function_names, module_functions, None)
+    }
+
+    fn with_parent(
+        layout: &ParamsLayout<'a>,
+        function_names: &'a [&'a str],
+        module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+        parent: Option<&'a LoweringContext<'a>>,
+    ) -> Self {
         let param_names = layout.names.clone();
         let param_count = RegisterIndex::try_from(param_names.len()).unwrap_or(u16::MAX);
         Self {
@@ -1833,7 +1955,42 @@ impl<'a> LoweringContext<'a> {
             float_constants: RefCell::new(Vec::new()),
             string_literals: RefCell::new(Vec::new()),
             pending_handlers: RefCell::new(Vec::new()),
+            pending_closure_templates: RefCell::new(Vec::new()),
+            module_functions,
+            parent,
+            captures: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Register a ClosureTemplate at the given `pc`. The PC is the
+    /// byte offset of a `CreateClosure` opcode just emitted by the
+    /// body lowerer; the finaliser builds a sparse
+    /// `ClosureTable` indexed by PC so the dispatcher can look up
+    /// the template per opcode.
+    fn record_closure_template(&self, pc: u32, template: crate::closure::ClosureTemplate) {
+        self.pending_closure_templates
+            .borrow_mut()
+            .push(PendingClosureTemplate { pc, template });
+    }
+
+    /// Finalise pending closure templates into a sparse
+    /// `ClosureTable` sized to the function's total bytecode
+    /// length. Empty PC slots stay `None`; closure-creation sites
+    /// get their registered `ClosureTemplate`.
+    fn take_closure_table(&self, bytecode_len: u32) -> crate::closure::ClosureTable {
+        let drained = std::mem::take(&mut *self.pending_closure_templates.borrow_mut());
+        if drained.is_empty() {
+            return crate::closure::ClosureTable::empty();
+        }
+        let mut templates: Vec<Option<crate::closure::ClosureTemplate>> =
+            vec![None; bytecode_len as usize];
+        for entry in drained {
+            let idx = entry.pc as usize;
+            if idx < templates.len() {
+                templates[idx] = Some(entry.template);
+            }
+        }
+        crate::closure::ClosureTable::new(templates)
     }
 
     /// Register a `try { … } catch/finally { … }` protected range
@@ -2241,11 +2398,21 @@ impl<'a> LoweringContext<'a> {
         Ok(())
     }
 
-    /// Resolves a JS identifier reference into a [`BindingRef`].
-    /// Locals shadow the parameter (only matters once shadowing is
-    /// allowed in later milestones; at M5 `allocate_local` rejects
-    /// duplicates so the lookup is unambiguous).
+    /// Resolves a JS identifier into a [`BindingRef`]. Locals +
+    /// params + already-captured upvalues are checked first;
+    /// misses trigger a parent-chain walk that records a new
+    /// capture entry (so the function ends up with a fresh
+    /// upvalue slot and a matching `CaptureDescriptor` in the
+    /// parent's `ClosureTemplate`).
     fn resolve_identifier(&self, name: &str) -> Option<BindingRef> {
+        if let Some(binding) = self.resolve_own(name) {
+            return Some(binding);
+        }
+        self.resolve_capture(name)
+    }
+
+    /// Like `resolve_identifier` but without parent-chain walk.
+    fn resolve_own(&self, name: &str) -> Option<BindingRef> {
         if let Some(local) = self.locals.iter().rev().find(|l| l.name == name) {
             return Some(BindingRef::Local {
                 reg: local.slot,
@@ -2253,10 +2420,6 @@ impl<'a> LoweringContext<'a> {
                 is_const: local.is_const,
             });
         }
-        // Walk params in declaration order; the i-th param lives at
-        // user-visible register `i`. Rest-param lookups fall through
-        // to the locals search above — rest is a local, not a
-        // parameter slot.
         for (i, param) in self.param_names.iter().enumerate() {
             if *param == name {
                 let reg = u16::try_from(i)
@@ -2264,7 +2427,63 @@ impl<'a> LoweringContext<'a> {
                 return Some(BindingRef::Param { reg });
             }
         }
+        for (idx, entry) in self.captures.borrow().iter().enumerate() {
+            if entry.name == name {
+                let idx = u16::try_from(idx).expect("capture idx fits in u16");
+                return Some(BindingRef::Upvalue { idx });
+            }
+        }
         None
+    }
+
+    fn resolve_capture(&self, name: &str) -> Option<BindingRef> {
+        let parent = self.parent?;
+        // Probe parent's own scope first.
+        let desc = match parent.resolve_own(name) {
+            Some(BindingRef::Local { reg, .. }) | Some(BindingRef::Param { reg }) => {
+                Some(crate::closure::CaptureDescriptor::Register(
+                    crate::bytecode::BytecodeRegister::new(reg),
+                ))
+            }
+            Some(BindingRef::Upvalue { idx }) => Some(crate::closure::CaptureDescriptor::Upvalue(
+                crate::closure::UpvalueId(idx),
+            )),
+            None => None,
+        };
+        if let Some(descriptor) = desc {
+            return Some(self.record_capture(name, descriptor));
+        }
+        // Parent didn't have it directly — recurse into parent's
+        // parent. Parent grows its own captures list as part of
+        // the recursive resolution, giving us a `parent_idx` to
+        // chain through.
+        let Some(BindingRef::Upvalue { idx: parent_idx }) = parent.resolve_capture(name) else {
+            return None;
+        };
+        let desc =
+            crate::closure::CaptureDescriptor::Upvalue(crate::closure::UpvalueId(parent_idx));
+        Some(self.record_capture(name, desc))
+    }
+
+    fn record_capture(
+        &self,
+        name: &str,
+        descriptor: crate::closure::CaptureDescriptor,
+    ) -> BindingRef {
+        let mut captures = self.captures.borrow_mut();
+        let idx = u16::try_from(captures.len()).expect("capture count fits in u16");
+        captures.push(CaptureEntry {
+            name: name.to_owned(),
+            descriptor,
+        });
+        BindingRef::Upvalue { idx }
+    }
+
+    fn take_captures(&self) -> Vec<crate::closure::CaptureDescriptor> {
+        std::mem::take(&mut *self.captures.borrow_mut())
+            .into_iter()
+            .map(|entry| entry.descriptor)
+            .collect()
     }
 }
 
@@ -2863,6 +3082,18 @@ fn lower_identifier_read(
                 ident_span,
             ));
         }
+        BindingRef::Upvalue { idx } => {
+            // M25: captured outer binding. `LdaUpvalue idx` reads
+            // the cell into acc; the dispatcher pulls the current
+            // value through the shared UpvalueCell so outer
+            // mutations are live-visible.
+            builder
+                .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaUpvalue: {err:?}"))
+                })?;
+            return Ok(());
+        }
     };
     let pc = builder
         .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
@@ -2896,10 +3127,10 @@ fn lower_identifier_as_reg_rhs(
     Ok(())
 }
 
-fn lower_return_expression(
+fn lower_return_expression<'a>(
     builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'_>,
-    expr: &Expression<'_>,
+    ctx: &LoweringContext<'a>,
+    expr: &'a Expression<'a>,
 ) -> Result<(), SourceLoweringError> {
     match expr {
         Expression::Identifier(ident) => lower_identifier_reference(builder, ctx, ident),
@@ -2969,11 +3200,145 @@ fn lower_return_expression(
             lower_computed_member_read(builder, ctx, member)
         }
         Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
+        Expression::FunctionExpression(func) => lower_function_expression(builder, ctx, func),
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
         )),
     }
+}
+
+/// Lowers `function(args) { body }` (a FunctionExpression in
+/// expression position) into a fresh closure value with live
+/// upvalue capture of outer-scope bindings.
+///
+/// Capture analysis: the inner function's body is lowered through
+/// a recursive `lower_inner_function` call that passes the outer
+/// context as the "lookup parent". Any identifier inside the inner
+/// function that can't be resolved to a local/param/global is
+/// looked up in the outer's bindings:
+/// - Outer local / param → `CaptureDescriptor::Register(reg)` —
+///   the outer frame promotes that slot into an open upvalue
+///   cell at `CreateClosure` time (via
+///   `capture_bytecode_register_upvalue`), and the inner closure
+///   uses `LdaUpvalue <idx>` to read / `StaUpvalue <idx>` to write.
+/// - Outer-outer capture → a nested closure references an
+///   already-captured binding; emitted as
+///   `CaptureDescriptor::Upvalue(UpvalueId)` so the dispatcher
+///   re-captures the parent closure's upvalue cell.
+///
+/// Bytecode shape:
+///
+/// ```text
+///   CreateClosure <inner_idx>, 0
+/// ```
+///
+/// The `ClosureTable` entry at this PC carries the callee's
+/// `FunctionIndex` plus the list of `CaptureDescriptor`s in
+/// upvalue-index order.
+fn lower_function_expression<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    func: &'a Function<'a>,
+) -> Result<(), SourceLoweringError> {
+    if func.r#async {
+        return Err(SourceLoweringError::unsupported(
+            "async_function",
+            func.span,
+        ));
+    }
+    if func.generator {
+        return Err(SourceLoweringError::unsupported("generator", func.span));
+    }
+    // Lower the inner function first — the recursive lowering
+    // collects the list of outer bindings it captured. The
+    // captures come back as a `Vec<CaptureDescriptor>`; each
+    // element's slot index matches the inner function's
+    // `LdaUpvalue <idx>` operands.
+    let (inner_idx, captures) = lower_inner_function_with_captures(func, ctx)?;
+
+    let pc = builder.pc();
+    let template =
+        crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(inner_idx), captures);
+    ctx.record_closure_template(pc, template);
+
+    // Emit `CreateClosure <idx>, 0`. The second operand carries
+    // closure flags — all zero for M25 (not generator, not async).
+    builder
+        .emit(
+            Opcode::CreateClosure,
+            &[Operand::Idx(inner_idx), Operand::Imm(0)],
+        )
+        .map_err(|err| SourceLoweringError::Internal(format!("encode CreateClosure: {err:?}")))?;
+    Ok(())
+}
+
+/// Recursively lowers a nested `Function` (the body of a
+/// `FunctionExpression` or a nested `FunctionDeclaration`) and
+/// appends its `VmFunction` to the shared module function list.
+/// Returns the assigned `FunctionIndex` as a raw `u32`.
+///
+/// M25 Phase A: inner functions see an empty outer scope — no
+/// captures allowed. Any reference to a name that isn't a
+/// local / param / whitelisted global surfaces as
+/// `unbound_identifier` from the regular identifier-resolution
+/// path. Phase B rewires that branch to synthesise captures.
+/// Lowers a nested function and returns `(function_index,
+/// captures)`. Captures list drives the parent's
+/// `ClosureTemplate` — each entry matches a `LdaUpvalue idx` /
+/// `StaUpvalue idx` inside the inner body.
+fn lower_inner_function_with_captures<'a>(
+    func: &'a Function<'a>,
+    outer: &LoweringContext<'a>,
+) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
+    let params_layout = analyze_params(&func.params)?;
+    let param_count = params_layout.param_slot_count();
+    let body = func
+        .body
+        .as_ref()
+        .ok_or_else(|| SourceLoweringError::unsupported("declared_only_function", func.span))?;
+
+    // Thread the outer context as the parent so identifier
+    // lookups that miss the inner scope walk up and record
+    // captures. The returned `captures` vec feeds directly into
+    // the `ClosureTemplate` at the parent's `CreateClosure` PC.
+    let (body_out, captures) = lower_function_body_with_parent(
+        body,
+        &func.params,
+        &params_layout,
+        outer.function_names,
+        std::rc::Rc::clone(&outer.module_functions),
+        Some(outer),
+    )?;
+
+    let layout = FrameLayout::new(1, param_count, body_out.local_count, body_out.temp_count)
+        .map_err(|err| SourceLoweringError::Internal(format!("frame layout invalid: {err:?}")))?;
+    let feedback_layout = arithmetic_only_feedback_layout(body_out.feedback_slot_count);
+    let side_tables = crate::module::FunctionSideTables::new(
+        body_out.property_names,
+        body_out.string_literals,
+        body_out.float_constants,
+        Default::default(),
+        body_out.closures,
+        Default::default(),
+        Default::default(),
+    );
+    let tables = FunctionTables::new(
+        side_tables,
+        feedback_layout,
+        Default::default(),
+        body_out.exceptions,
+        Default::default(),
+    );
+    let name = func.id.as_ref().map(|ident| ident.name.as_str().to_owned());
+    let inner = VmFunction::new(name, layout, body_out.bytecode, tables);
+
+    // Push onto the shared module list and return the new index.
+    let mut fns = outer.module_functions.borrow_mut();
+    let idx = u32::try_from(fns.len())
+        .map_err(|_| SourceLoweringError::Internal("module function index overflow".into()))?;
+    fns.push(inner);
+    Ok((idx, captures))
 }
 
 /// Lowers `!x` / `-x` / `+x` / `~x` / `typeof x` / `void x` into the
@@ -3120,6 +3485,12 @@ fn lower_update_expression(
         BindingRef::Param { .. } => {
             return Err(SourceLoweringError::unsupported(
                 "update_on_param",
+                ident.span,
+            ));
+        }
+        BindingRef::Upvalue { .. } => {
+            return Err(SourceLoweringError::unsupported(
+                "update_on_upvalue",
                 ident.span,
             ));
         }
@@ -3593,13 +3964,13 @@ fn materialize_member_base<'a>(
     if let Expression::Identifier(ident) = base
         && let Some(binding) = ctx.resolve_identifier(ident.name.as_str())
     {
-        let reg = match binding {
-            BindingRef::Param { reg } => reg,
+        match binding {
+            BindingRef::Param { reg } => return Ok(MemberBase { reg, temp_count: 0 }),
             BindingRef::Local {
                 reg,
                 initialized: true,
                 ..
-            } => reg,
+            } => return Ok(MemberBase { reg, temp_count: 0 }),
             BindingRef::Local {
                 initialized: false, ..
             } => {
@@ -3608,8 +3979,11 @@ fn materialize_member_base<'a>(
                     ident.span,
                 ));
             }
-        };
-        return Ok(MemberBase { reg, temp_count: 0 });
+            // Upvalue base: no dedicated register, so fall
+            // through to the complex-path below (lower into acc,
+            // spill to a temp).
+            BindingRef::Upvalue { .. } => {}
+        }
     }
 
     // Complex / non-local base — lower into acc and spill to a temp.
@@ -4235,6 +4609,16 @@ fn emit_identifier_as_reg_operand(
                 ident_span,
             ));
         }
+        // Upvalue bindings have no direct register — callers
+        // that reach here should route through the
+        // complex-RHS path instead. We surface a tagged
+        // internal error so accidental plumbing mismatches are
+        // loud.
+        BindingRef::Upvalue { .. } => {
+            return Err(SourceLoweringError::Internal(
+                "upvalue binding reached emit_identifier_as_reg_operand".into(),
+            ));
+        }
     };
     let pc = builder
         .emit(opcode, &[Operand::Reg(u32::from(reg))])
@@ -4294,7 +4678,15 @@ fn apply_binary_op_with_acc_lhs(
             let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
                 SourceLoweringError::unsupported("unbound_identifier", ident.span)
             })?;
-            lower_identifier_as_reg_rhs(builder, ctx, encoding, binding, ident.span)
+            // Upvalue bindings don't live in a register — route
+            // through the complex-RHS spill path so the RHS is
+            // read via `LdaUpvalue` into acc, then stitched back
+            // against the spilled LHS.
+            if matches!(binding, BindingRef::Upvalue { .. }) {
+                apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
+            } else {
+                lower_identifier_as_reg_rhs(builder, ctx, encoding, binding, ident.span)
+            }
         }
         // Complex RHS shapes — a call, a nested binary, a
         // parenthesised binary, an assignment expression, a unary /
@@ -4494,6 +4886,38 @@ fn lower_identifier_assignment<'a>(
     let binding = ctx
         .resolve_identifier(target_ident)
         .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", target_span))?;
+
+    // M25: assignment to an upvalue target goes through
+    // `StaUpvalue` — a different shape from the register-based
+    // path, so handle it separately.
+    if let BindingRef::Upvalue { idx } = binding {
+        if expr.operator == AssignmentOperator::Assign {
+            lower_return_expression(builder, ctx, &expr.right)?;
+        } else {
+            let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+                SourceLoweringError::unsupported(assignment_operator_tag(expr.operator), expr.span)
+            })?;
+            let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+                SourceLoweringError::Internal(format!(
+                    "compound assignment {bin_op:?} has no binary opcode encoding"
+                ))
+            })?;
+            // Read current upvalue value into acc.
+            builder
+                .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaUpvalue (compound upvalue lhs): {err:?}"
+                    ))
+                })?;
+            apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
+        }
+        builder
+            .emit(Opcode::StaUpvalue, &[Operand::Idx(u32::from(idx))])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode StaUpvalue: {err:?}")))?;
+        return Ok(());
+    }
+
     let target_reg = match binding {
         BindingRef::Local {
             reg,
@@ -4520,6 +4944,7 @@ fn lower_identifier_assignment<'a>(
         // `mutable: true`). Assignment writes back into the
         // parameter slot.
         BindingRef::Param { reg } => reg,
+        BindingRef::Upvalue { .. } => unreachable!("handled above"),
     };
 
     if expr.operator == AssignmentOperator::Assign {
@@ -4880,32 +5305,116 @@ fn lower_direct_call<'a>(
     call: &oxc_ast::ast::CallExpression<'a>,
     callee_ident: &IdentifierReference<'a>,
 ) -> Result<(), SourceLoweringError> {
-    let func_idx = ctx
-        .resolve_function(callee_ident.name.as_str())
-        .ok_or_else(|| SourceLoweringError::unsupported("unbound_function", callee_ident.span))?;
-
-    let argc = RegisterIndex::try_from(call.arguments.len())
-        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
-    let base = ctx.acquire_temps(argc)?;
-
-    let lower = (|| -> Result<(), SourceLoweringError> {
-        lower_call_arguments_into_temps(builder, ctx, call, base)?;
-        builder
-            .emit(
-                Opcode::CallDirect,
-                &[
-                    Operand::Idx(func_idx.0),
-                    Operand::RegList {
-                        base: u32::from(base),
-                        count: u32::from(argc),
-                    },
-                ],
-            )
-            .map_err(|err| SourceLoweringError::Internal(format!("encode CallDirect: {err:?}")))?;
-        Ok(())
-    })();
-    ctx.release_temps(argc);
-    lower
+    let name = callee_ident.name.as_str();
+    // Preferred: the name resolves to a top-level
+    // `FunctionDeclaration`. Emit `CallDirect <idx>, args`.
+    if let Some(func_idx) = ctx.resolve_function(name) {
+        let argc = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+        let base = ctx.acquire_temps(argc)?;
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            lower_call_arguments_into_temps(builder, ctx, call, base)?;
+            builder
+                .emit(
+                    Opcode::CallDirect,
+                    &[
+                        Operand::Idx(func_idx.0),
+                        Operand::RegList {
+                            base: u32::from(base),
+                            count: u32::from(argc),
+                        },
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode CallDirect: {err:?}"))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(argc);
+        return lower;
+    }
+    // Fallback: the name binds a local / param holding a
+    // callable value (a closure from a FunctionExpression, for
+    // instance). Load the value into a reg, then dispatch via
+    // `CallUndefinedReceiver` — same path a plain-function
+    // reference takes.
+    if let Some(binding) = ctx.resolve_identifier(name) {
+        // Acquire a callee temp + argc arg temps. The callee temp
+        // holds the callable value (either loaded from a reg via
+        // `Ldar` or from an upvalue via `LdaUpvalue`).
+        let argc = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+        let callee_temp = ctx.acquire_temps(1)?;
+        let args_base = ctx
+            .acquire_temps(argc)
+            .inspect_err(|_| ctx.release_temps(1))?;
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            match binding {
+                BindingRef::Param { reg }
+                | BindingRef::Local {
+                    reg,
+                    initialized: true,
+                    ..
+                } => {
+                    // Load the local/param into the callee temp.
+                    builder
+                        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Ldar (callable local): {err:?}"
+                            ))
+                        })?;
+                }
+                BindingRef::Local {
+                    initialized: false, ..
+                } => {
+                    return Err(SourceLoweringError::unsupported(
+                        "tdz_self_reference",
+                        callee_ident.span,
+                    ));
+                }
+                BindingRef::Upvalue { idx } => {
+                    builder
+                        .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode LdaUpvalue (callable upvalue): {err:?}"
+                            ))
+                        })?;
+                }
+            }
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Star (callable temp): {err:?}"))
+                })?;
+            lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+            builder
+                .emit(
+                    Opcode::CallUndefinedReceiver,
+                    &[
+                        Operand::Reg(u32::from(callee_temp)),
+                        Operand::RegList {
+                            base: u32::from(args_base),
+                            count: u32::from(argc),
+                        },
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CallUndefinedReceiver (local callable): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(argc);
+        ctx.release_temps(1);
+        return lower;
+    }
+    Err(SourceLoweringError::unsupported(
+        "unbound_function",
+        callee_ident.span,
+    ))
 }
 
 /// Method-call path for `o.method(args)`. Receiver, callee, and

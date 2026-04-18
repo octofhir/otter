@@ -4068,3 +4068,231 @@ fn direct_call_still_uses_call_direct() {
         42,
     );
 }
+
+// ---------------------------------------------------------------------------
+// M20: SwitchStatement with case / default + break exits
+// ---------------------------------------------------------------------------
+
+#[test]
+fn switch_matches_int_case_with_break() {
+    let program = "function f(n) { \
+        let r = -1; \
+        switch (n) { case 1: r = 10; break; case 2: r = 20; break; default: r = 0; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 10);
+    assert_eq!(run_int32_function(program, &[2]), 20);
+    assert_eq!(run_int32_function(program, &[99]), 0);
+}
+
+#[test]
+fn switch_falls_through_without_break() {
+    // Spec §14.11.9 — SwitchStatement evaluation doesn't
+    // synthesize an implicit break; a case without `break` runs
+    // into the next case's body.
+    let program = "function f(n) { \
+        let r = 0; \
+        switch (n) { case 1: r += 1; case 2: r += 2; break; case 3: r += 100; break; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 3); // 1 + 2
+    assert_eq!(run_int32_function(program, &[2]), 2);
+    assert_eq!(run_int32_function(program, &[3]), 100);
+}
+
+#[test]
+fn switch_with_default_at_end() {
+    let program = "function f(n) { \
+        let r = 0; \
+        switch (n) { case 1: r = 10; break; default: r = 99; break; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 10);
+    assert_eq!(run_int32_function(program, &[5]), 99);
+}
+
+#[test]
+fn switch_with_default_in_middle() {
+    // Default isn't always last — it can appear anywhere. The
+    // compare phase skips it and the no-match fallback jumps to
+    // the default label regardless of source position.
+    let program = "function f(n) { \
+        let r = 0; \
+        switch (n) { case 1: r = 1; break; default: r = 99; break; case 2: r = 2; break; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 1);
+    assert_eq!(run_int32_function(program, &[2]), 2);
+    assert_eq!(run_int32_function(program, &[3]), 99);
+}
+
+#[test]
+fn switch_without_default_leaves_result_alone() {
+    // When no case matches and there's no default, the switch
+    // body is skipped entirely — `r` keeps its initial value.
+    let program = "function f(n) { \
+        let r = -1; \
+        switch (n) { case 1: r = 10; break; case 2: r = 20; break; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 10);
+    assert_eq!(run_int32_function(program, &[5]), -1);
+}
+
+#[test]
+fn switch_uses_strict_equality() {
+    // `case "1"` does *not* match discriminant `1` — the compare
+    // is `TestEqualStrict` (§7.2.16 IsStrictlyEqual).
+    let program = "function f() { \
+        let r = 0; \
+        let n = 1; \
+        switch (n) { case \"1\": r = 10; break; default: r = 99; break; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 99);
+}
+
+#[test]
+fn switch_on_string_discriminant() {
+    let program = "function f() { \
+        let r = \"none\"; \
+        let k = \"b\"; \
+        switch (k) { case \"a\": r = \"A\"; break; case \"b\": r = \"B\"; break; default: r = \"D\"; } \
+        return r; \
+    }";
+    assert_eq!(run_string_function(program, &[]), "B");
+}
+
+#[test]
+fn switch_empty_case_bodies_fall_through_to_following() {
+    // `case 1: case 2: r = 12; break;` — both `1` and `2` land at
+    // the same body because empty cases fall through naturally.
+    let program = "function f(n) { \
+        let r = 0; \
+        switch (n) { case 1: case 2: r = 12; break; case 3: r = 3; break; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 12);
+    assert_eq!(run_int32_function(program, &[2]), 12);
+    assert_eq!(run_int32_function(program, &[3]), 3);
+}
+
+#[test]
+fn break_inside_switch_does_not_escape_outer_loop() {
+    // `break` inside a case targets the innermost break-frame —
+    // the switch, not the enclosing while.
+    let program = "function f(n) { \
+        let sum = 0; \
+        let i = 0; \
+        while (i < n) { \
+            switch (i) { case 0: break; case 1: break; default: sum += i; } \
+            i += 1; \
+        } \
+        return sum; \
+    }";
+    // i=0,1 → break (sum unchanged); i=2,3,4 → default → sum = 2+3+4 = 9.
+    assert_eq!(run_int32_function(program, &[5]), 9);
+}
+
+#[test]
+fn continue_inside_switch_targets_enclosing_loop() {
+    // §14.11 — `continue` inside a switch binds to the innermost
+    // *iteration* statement, not the switch. The switch frame's
+    // `continue_label` is `None` so it's skipped during
+    // traversal.
+    let program = "function f(n) { \
+        let sum = 0; \
+        let i = 0; \
+        while (i < n) { \
+            i += 1; \
+            switch (i) { case 3: continue; default: sum += i; } \
+        } \
+        return sum; \
+    }";
+    // i runs 1..=5. i=3 → continue → skip `sum += i`.
+    // sum = 1 + 2 + 4 + 5 = 12.
+    assert_eq!(run_int32_function(program, &[5]), 12);
+}
+
+#[test]
+fn switch_nested_inside_switch() {
+    // Inner switch's `break` stays local to the inner switch.
+    let program = "function f(n) { \
+        let r = 0; \
+        switch (n) { \
+            case 1: \
+                switch (n) { case 1: r = 11; break; default: r = 10; } \
+                break; \
+            default: r = 0; \
+        } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 11);
+    assert_eq!(run_int32_function(program, &[2]), 0);
+}
+
+#[test]
+fn switch_discriminant_evaluated_once() {
+    // Discriminant is a call expression — lowered once into a
+    // temp and reloaded from that temp for every compare.
+    let program = "function side(n) { return n + 1; } function main() { \
+        let n = 0; \
+        let r = 0; \
+        switch (side(n)) { case 1: r = 10; break; case 2: r = 20; break; } \
+        return r; \
+    }";
+    // side(0) = 1 → case 1 matches.
+    assert_eq!(run_int32_function(program, &[]), 10);
+}
+
+#[test]
+fn switch_with_return_in_case() {
+    // `return` inside a case exits the function — no break
+    // needed, no fall-through.
+    let program = "function f(n) { \
+        switch (n) { case 1: return 10; case 2: return 20; } \
+        return -1; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 10);
+    assert_eq!(run_int32_function(program, &[2]), 20);
+    assert_eq!(run_int32_function(program, &[7]), -1);
+}
+
+#[test]
+fn switch_empty_cases() {
+    // `switch (n) {}` — no cases. Legal JS, no-op.
+    let program = "function f(n) { let r = 42; switch (n) {} return r; }";
+    assert_eq!(run_int32_function(program, &[1]), 42);
+}
+
+#[test]
+fn switch_preserves_locals_after_exit() {
+    // `r` is live before and after the switch; a case that
+    // assigns must persist past `switch_exit`.
+    let program = "function f(n) { \
+        let r = 0; \
+        switch (n) { case 1: r = 100; break; } \
+        r += 1; \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 101);
+    assert_eq!(run_int32_function(program, &[9]), 1);
+}
+
+#[test]
+fn break_outside_switch_and_loop_rejected() {
+    // Bare `break` outside any break-frame still rejects —
+    // switch participates in the same stack as loops, so pushing
+    // switch didn't accidentally lift this requirement.
+    let err = compile("function f() { break; }").expect_err("break outside loop/switch");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "break_outside_loop",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}

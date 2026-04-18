@@ -400,9 +400,33 @@ impl Interpreter {
                 frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::TestEqualStrict => {
+                // §7.2.16 IsStrictlyEqual. Raw bit comparison covers
+                // the primitive cases (undefined/null/bool/int32/NaN
+                // distinction is carried in the NaN-box tag), but
+                // strings are heap objects and two distinct
+                // `JsString` allocations with the same code-unit
+                // sequence must compare equal. When both operands
+                // are string handles, fall back to content compare
+                // via `ObjectHeap::string_value`.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let lhs = activation.accumulator();
-                activation.set_accumulator(RegisterValue::from_bool(lhs == rhs));
+                let result = if lhs == rhs {
+                    true
+                } else if let (Some(lh), Some(rh)) =
+                    (lhs.as_object_handle(), rhs.as_object_handle())
+                {
+                    let lh = crate::object::ObjectHandle(lh);
+                    let rh = crate::object::ObjectHandle(rh);
+                    let lstr = runtime.objects.string_value(lh).ok().flatten();
+                    let rstr = runtime.objects.string_value(rh).ok().flatten();
+                    match (lstr, rstr) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                activation.set_accumulator(RegisterValue::from_bool(result));
                 let observation = if lhs.as_i32().is_some() && rhs.as_i32().is_some() {
                     ArithmeticFeedback::Int32
                 } else {

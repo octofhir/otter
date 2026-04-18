@@ -586,6 +586,7 @@ fn lower_nested_statement<'a>(
         Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
         Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
+        Statement::SwitchStatement(sw) => lower_switch_statement(builder, ctx, sw),
         Statement::BreakStatement(break_stmt) => lower_break_statement(builder, ctx, break_stmt),
         Statement::ContinueStatement(cont_stmt) => {
             lower_continue_statement(builder, ctx, cont_stmt)
@@ -779,7 +780,7 @@ fn lower_while_statement<'a>(
     // semantics.
     ctx.enter_loop(LoopLabels {
         break_label: loop_exit,
-        continue_label: loop_header,
+        continue_label: Some(loop_header),
     });
     let body_result = lower_nested_statement(builder, ctx, &while_stmt.body);
     ctx.exit_loop();
@@ -890,7 +891,7 @@ fn lower_for_statement<'a>(
     //    body lowering completes.
     ctx.enter_loop(LoopLabels {
         break_label: loop_exit,
-        continue_label: loop_continue,
+        continue_label: Some(loop_continue),
     });
     let body_result = lower_nested_statement(builder, ctx, &for_stmt.body);
     ctx.exit_loop();
@@ -933,6 +934,213 @@ fn lower_for_statement<'a>(
 
     ctx.restore_scope(scope);
     Ok(())
+}
+
+/// Lowers `switch (e) { case v: …; default: …; }`. Bytecode shape:
+///
+/// ```text
+///   <lower discriminant into acc>
+///   Star r_disc                        ; r_disc = discriminant
+///   ; Compare phase — one dispatch per case, in source order.
+///   Ldar r_disc                        ; acc = discriminant
+///   TestEqualStrict r_v0               ; acc = (discriminant === v0)
+///   JumpIfToBooleanTrue case_0
+///   Ldar r_disc
+///   TestEqualStrict r_v1
+///   JumpIfToBooleanTrue case_1
+///   …
+///   Jump default_label                 ; or `switch_exit` if no default
+///   ; Body phase — labels sit above each case's statements, in source
+///   ; order, so fall-through between cases works naturally. `break`
+///   ; inside a case targets `switch_exit`.
+/// case_0:
+///   <lower case 0 consequent>
+/// case_1:
+///   <lower case 1 consequent>
+///   …
+/// default_label:
+///   <lower default consequent>
+/// switch_exit:
+/// ```
+///
+/// Each case-value expression is lowered into acc and spilled into
+/// its own temp before the compare phase — this keeps the
+/// discriminant fresh in `r_disc` across comparisons and lets the
+/// `TestEqualStrict` opcode read `acc = discriminant` and
+/// `r_value` directly without extra reloads.
+///
+/// §14.11 SwitchStatement — `break` exits the switch; `continue`
+/// walks past the switch to the enclosing loop.
+///
+/// Intentionally simple: no jump-table optimisation for dense
+/// int32 cases, no deduplication of duplicate case values. Those
+/// are JIT-level tricks that land when the bytecode surface
+/// stabilises.
+fn lower_switch_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    sw: &'a oxc_ast::ast::SwitchStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    // 1) Evaluate discriminant into a temp. The compare phase
+    //    reloads it before each `TestEqualStrict` so the acc is
+    //    predictable when entering the comparison opcode.
+    let disc_temp = ctx.acquire_temps(1)?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, &sw.discriminant)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(disc_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (switch discriminant): {err:?}"))
+            })?;
+
+        // 2) Lower each `case <v>:` value into its own temp. We
+        //    do this eagerly so the comparisons below can just
+        //    `TestEqualStrict r_vN` without any re-evaluation.
+        //    `default:` (test == None) doesn't consume a temp.
+        let case_count = sw.cases.len();
+        // Per-case labels — bound later above each case's body.
+        let case_labels: Vec<Label> = (0..case_count).map(|_| builder.new_label()).collect();
+        let switch_exit = builder.new_label();
+
+        // Compute how many non-default cases we have so we can
+        // acquire exactly that many value-temps.
+        let value_case_count: u16 = sw
+            .cases
+            .iter()
+            .filter(|c| c.test.is_some())
+            .count()
+            .try_into()
+            .map_err(|_| SourceLoweringError::Internal("switch case count exceeds u16".into()))?;
+        let value_base = if value_case_count == 0 {
+            0
+        } else {
+            ctx.acquire_temps(value_case_count)?
+        };
+
+        let body_result = (|| -> Result<(), SourceLoweringError> {
+            // Lower case values into consecutive temps. Index into
+            // `value_base` advances only for non-default cases.
+            let mut value_slot: u16 = 0;
+            for case in sw.cases.iter() {
+                let Some(test) = case.test.as_ref() else {
+                    continue; // default — no value to evaluate.
+                };
+                lower_return_expression(builder, ctx, test)?;
+                let slot = value_base.checked_add(value_slot).ok_or_else(|| {
+                    SourceLoweringError::Internal("switch case value slot overflow".into())
+                })?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (switch case value): {err:?}"
+                        ))
+                    })?;
+                value_slot = value_slot
+                    .checked_add(1)
+                    .ok_or_else(|| SourceLoweringError::Internal("value_slot overflow".into()))?;
+            }
+
+            // 3) Compare phase. For each case with a test, emit
+            //    `Ldar r_disc; TestEqualStrict r_vN;
+            //    JumpIfToBooleanTrue case_label`. Default cases
+            //    are skipped here and covered by the "no-match"
+            //    fallback jump below.
+            let mut value_slot: u16 = 0;
+            let mut default_index: Option<usize> = None;
+            for (case_idx, case) in sw.cases.iter().enumerate() {
+                let Some(_test) = case.test.as_ref() else {
+                    default_index = Some(case_idx);
+                    continue;
+                };
+                builder
+                    .emit(Opcode::Ldar, &[Operand::Reg(u32::from(disc_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Ldar (switch disc reload): {err:?}"
+                        ))
+                    })?;
+                let value_reg = value_base.checked_add(value_slot).ok_or_else(|| {
+                    SourceLoweringError::Internal("switch value reg overflow".into())
+                })?;
+                builder
+                    .emit(
+                        Opcode::TestEqualStrict,
+                        &[Operand::Reg(u32::from(value_reg))],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode TestEqualStrict (switch): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit_jump_to(Opcode::JumpIfToBooleanTrue, case_labels[case_idx])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode JumpIfToBooleanTrue (switch): {err:?}"
+                        ))
+                    })?;
+                value_slot = value_slot
+                    .checked_add(1)
+                    .ok_or_else(|| SourceLoweringError::Internal("value_slot overflow".into()))?;
+            }
+
+            // 4) No case matched — jump to `default` if present,
+            //    otherwise skip the entire body to `switch_exit`.
+            let fallback = match default_index {
+                Some(idx) => case_labels[idx],
+                None => switch_exit,
+            };
+            builder
+                .emit_jump_to(Opcode::Jump, fallback)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Jump (switch fallback): {err:?}"))
+                })?;
+
+            // 5) Body phase. `enter_loop` pushes the break-only
+            //    frame so any nested `break` in a case jumps to
+            //    `switch_exit`; `continue` walks past this frame
+            //    because `continue_label` is `None`.
+            ctx.enter_loop(LoopLabels {
+                break_label: switch_exit,
+                continue_label: None,
+            });
+
+            let lower_cases = (|| -> Result<(), SourceLoweringError> {
+                for (case_idx, case) in sw.cases.iter().enumerate() {
+                    builder.bind_label(case_labels[case_idx]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "bind switch case {case_idx}: {err:?}"
+                        ))
+                    })?;
+                    for stmt in case.consequent.iter() {
+                        // Case bodies reject `let`/`const` (no
+                        // block scoping inside a case yet — the
+                        // M12 scoping work treated switch cases
+                        // as outside its surface).
+                        lower_nested_statement(builder, ctx, stmt)?;
+                    }
+                }
+                Ok(())
+            })();
+            ctx.exit_loop();
+            lower_cases?;
+
+            // 6) Exit label — bound after all case bodies so fall
+            //    through to the bottom is a natural next instruction.
+            builder.bind_label(switch_exit).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind switch exit: {err:?}"))
+            })?;
+            Ok(())
+        })();
+        if value_case_count > 0 {
+            ctx.release_temps(value_case_count);
+        }
+        body_result
+    })();
+    ctx.release_temps(1); // disc_temp
+    lower
 }
 
 /// Lowers `break;` → `Jump loop_exit` for the innermost enclosing
@@ -982,11 +1190,16 @@ fn lower_continue_statement<'a>(
             cont_stmt.span,
         ));
     }
-    let labels = ctx
-        .innermost_loop_labels()
+    // `continue` walks past any enclosing `switch` frames (which
+    // push break-only labels with `continue_label: None`) to find
+    // the innermost frame that actually has a continue target.
+    // Spec §14.11 IterationStatement: `continue` binds to the
+    // innermost *iteration* statement, not just any break-frame.
+    let target = ctx
+        .innermost_continue_label()
         .ok_or_else(|| SourceLoweringError::unsupported("continue_outside_loop", cont_stmt.span))?;
     builder
-        .emit_jump_to(Opcode::Jump, labels.continue_label)
+        .emit_jump_to(Opcode::Jump, target)
         .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (continue): {err:?}")))?;
     Ok(())
 }
@@ -1120,15 +1333,18 @@ struct LoweringContext<'a> {
     string_literals: RefCell<Vec<String>>,
 }
 
-/// `break` / `continue` jump targets for one loop frame. `break_label`
-/// is bound to the instruction immediately after the loop; `continue_label`
-/// is the re-entry point — for `while`, the loop header (which re-
-/// evaluates the condition); for `for`, the update clause (which
-/// evaluates the update, then jumps back to the header).
+/// `break` / `continue` jump targets for one enclosing control
+/// frame. `break_label` is bound to the instruction immediately
+/// after the loop or switch; `continue_label` is the re-entry
+/// point — for `while`, the loop header (re-evaluates the
+/// condition); for `for`, the update clause (evaluates the update,
+/// then jumps back to the header); for `switch`, `None` since
+/// `continue` inside a switch body walks past the switch to the
+/// enclosing loop (§14.11).
 #[derive(Debug, Clone, Copy)]
 struct LoopLabels {
     break_label: Label,
-    continue_label: Label,
+    continue_label: Option<Label>,
 }
 
 /// Snapshot of [`LoweringContext::locals`] length, returned by
@@ -1253,6 +1469,19 @@ impl<'a> LoweringContext<'a> {
     /// `continue_outside_loop` errors.
     fn innermost_loop_labels(&self) -> Option<LoopLabels> {
         self.loop_labels.borrow().last().copied()
+    }
+
+    /// Returns the innermost enclosing `continue`-capable frame's
+    /// jump target. Walks past switch frames (whose
+    /// `continue_label` is `None`) to find a real loop —
+    /// `continue` inside `switch` targets the enclosing loop per
+    /// §14.11, not the switch itself.
+    fn innermost_continue_label(&self) -> Option<Label> {
+        self.loop_labels
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|f| f.continue_label)
     }
 
     /// Allocates a fresh arithmetic-feedback slot id, returning the

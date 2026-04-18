@@ -65,7 +65,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [x]    | a474ae9 |
 | M25      | Closures — nested `FunctionDeclaration` / `FunctionExpression` + upvalue capture.                                                | [x]    | f0a39a0 |
 | M26      | Arrow functions + lexical `this` binding.                                                                                       | [x]    | 6ecd547 |
-| M27      | Class declaration: constructor + instance methods + static methods.                                                             | [x]    |        |
+| M27      | Class declaration: constructor + instance methods + static methods.                                                             | [x]    | 0911c9d |
 | M28      | Class inheritance (`extends` + `super` + `super(args)` in constructor).                                                         | [ ]    |        |
 | M29      | Class private fields (`#x`) + accessor methods (`get` / `set`).                                                                 | [ ]    |        |
 | M30      | `for (x of arr)` + iterator protocol (`Symbol.iterator`, `next()`).                                                             | [ ]    |        |

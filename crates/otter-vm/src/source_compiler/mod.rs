@@ -862,6 +862,9 @@ fn lower_nested_statement<'a>(
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
         Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
         Statement::SwitchStatement(sw) => lower_switch_statement(builder, ctx, sw),
+        Statement::FunctionDeclaration(func) => {
+            lower_nested_function_declaration(builder, ctx, func)
+        }
         Statement::ThrowStatement(throw) => lower_throw_statement(builder, ctx, throw),
         Statement::TryStatement(try_stmt) => lower_try_statement(builder, ctx, try_stmt),
         Statement::BreakStatement(break_stmt) => lower_break_statement(builder, ctx, break_stmt),
@@ -3270,6 +3273,65 @@ fn lower_function_expression<'a>(
             &[Operand::Idx(inner_idx), Operand::Imm(0)],
         )
         .map_err(|err| SourceLoweringError::Internal(format!("encode CreateClosure: {err:?}")))?;
+    Ok(())
+}
+
+/// Lowers `function foo() { … }` inside another function body.
+/// Treated as hoisting-free shorthand for `let foo = function() {
+/// … };` — the name is bound as a `const` local so accidental
+/// reassignment rejects, and the closure's captures follow the
+/// same parent-chain resolution the FunctionExpression path uses.
+///
+/// M25 simplification: spec-accurate hoisting (§14.1.11) isn't
+/// implemented — forward references to a nested
+/// FunctionDeclaration before its lexical position would surface
+/// as `unbound_identifier`. Real code typically declares before
+/// use, so this is a narrow corner.
+fn lower_nested_function_declaration<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    func: &'a Function<'a>,
+) -> Result<(), SourceLoweringError> {
+    if func.r#async {
+        return Err(SourceLoweringError::unsupported(
+            "async_function",
+            func.span,
+        ));
+    }
+    if func.generator {
+        return Err(SourceLoweringError::unsupported("generator", func.span));
+    }
+    let name_ident = func
+        .id
+        .as_ref()
+        .ok_or_else(|| SourceLoweringError::unsupported("anonymous_function", func.span))?;
+    let name = name_ident.name.as_str();
+
+    // Lower the inner function + record captures against the
+    // enclosing context, same as FunctionExpression.
+    let (inner_idx, captures) = lower_inner_function_with_captures(func, ctx)?;
+    let pc = builder.pc();
+    let template =
+        crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(inner_idx), captures);
+    ctx.record_closure_template(pc, template);
+    builder
+        .emit(
+            Opcode::CreateClosure,
+            &[Operand::Idx(inner_idx), Operand::Imm(0)],
+        )
+        .map_err(|err| SourceLoweringError::Internal(format!("encode CreateClosure: {err:?}")))?;
+
+    // Bind the produced closure to a local with the function's
+    // name (`const`-like — reassigning would rebind the name to
+    // a different value which the spec disallows for a
+    // declaration binding).
+    let slot = ctx.allocate_local(name, true, name_ident.span)?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (nested function binding): {err:?}"))
+        })?;
+    ctx.mark_initialized(name)?;
     Ok(())
 }
 

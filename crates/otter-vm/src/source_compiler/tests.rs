@@ -5158,3 +5158,52 @@ fn nested_closure_captures_grandparent_scope() {
     }";
     assert_eq!(run_int32_function(src, &[]), 7);
 }
+
+#[test]
+fn nested_function_declaration_binds_local() {
+    // `function f(){…}` inside a body binds `f` as a const
+    // local — callable from the same scope as a regular
+    // closure. Not hoisted (M25 simplification), so callers
+    // must declare before use.
+    let src = "function outer() { \
+        function inner(x) { return x + 1; } \
+        return inner(41); \
+    } \
+    function main() { return outer(); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn nested_function_declaration_captures_outer_local() {
+    // The nested FunctionDeclaration path runs through the
+    // same `lower_inner_function_with_captures` as
+    // FunctionExpression, so captures work identically.
+    let src = "function outer() { \
+        let base = 100; \
+        function add(x) { return base + x; } \
+        return add(42); \
+    } \
+    function main() { return outer(); }";
+    assert_eq!(run_int32_function(src, &[]), 142);
+}
+
+#[test]
+fn nested_function_declaration_binding_is_const() {
+    // `function f(){…}` inside a body binds as const — the
+    // declaration's name can't be reassigned.
+    let err = compile(
+        "function outer() { function f() { return 1; } f = 2; return f; } \
+         function main() { return outer(); }",
+    )
+    .expect_err("reassign nested fn binding");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "const_assignment",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}

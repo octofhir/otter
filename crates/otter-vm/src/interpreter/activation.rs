@@ -47,6 +47,13 @@ pub struct Activation {
     /// Defaults to `undefined` on frame creation. Mirrors the
     /// `secondary_result` field already present on `JitContext`.
     pub(super) secondary_result: RegisterValue,
+    /// M29: scratch slot for the `AllocClassId` / `CopyClassId`
+    /// opcode pair. `AllocClassId` writes a freshly-minted class
+    /// identifier here; subsequent `CopyClassId r_target` reads
+    /// it and stamps the value onto the closure in `r_target`.
+    /// Cleared (set to 0) when the class-definition sequence ends
+    /// so stale ids can't leak into sibling class blocks.
+    pub(super) current_class_id: u64,
 }
 
 impl Activation {
@@ -88,6 +95,7 @@ impl Activation {
             overflow_args: Vec::new(),
             accumulator: RegisterValue::undefined(),
             secondary_result: RegisterValue::undefined(),
+            current_class_id: 0,
         }
     }
 

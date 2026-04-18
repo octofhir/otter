@@ -641,16 +641,18 @@ impl Interpreter {
                         "v2 LdaNamedProperty: receiver is not an object",
                     )));
                 };
-                let result = match runtime
-                    .property_lookup(crate::object::ObjectHandle(handle), property)?
-                {
-                    Some(lookup) => match lookup.value() {
-                        crate::object::PropertyValue::Data { value: v, .. } => v,
-                        crate::object::PropertyValue::Accessor { .. } => RegisterValue::undefined(),
-                    },
-                    None => RegisterValue::undefined(),
-                };
-                activation.set_accumulator(result);
+                // M29: use `ordinary_get` so accessor getters are
+                // invoked with the target as receiver. Data and
+                // "not found" cases fall through unchanged.
+                let value = runtime
+                    .ordinary_get(crate::object::ObjectHandle(handle), property, target)
+                    .map_err(|err| match err {
+                        crate::VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                        crate::VmNativeCallError::Internal(msg) => {
+                            InterpreterError::NativeCall(msg)
+                        }
+                    })?;
+                activation.set_accumulator(value);
             }
             Opcode::StaNamedProperty => {
                 let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
@@ -662,7 +664,19 @@ impl Interpreter {
                     )));
                 };
                 let value = activation.accumulator();
-                runtime.set_named_property(crate::object::ObjectHandle(handle), property, value)?;
+                // M29: use `ordinary_set` so accessor setters fire
+                // when the target is part of an accessor chain.
+                // Data-property paths still share
+                // `set_named_property`'s cache-aware storage via
+                // `ordinary_set`'s `ordinary_set_on_receiver`.
+                runtime
+                    .ordinary_set(crate::object::ObjectHandle(handle), property, target, value)
+                    .map_err(|err| match err {
+                        crate::VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                        crate::VmNativeCallError::Internal(msg) => {
+                            InterpreterError::NativeCall(msg)
+                        }
+                    })?;
             }
 
             // ---- Keyed property access ----
@@ -675,17 +689,28 @@ impl Interpreter {
                 let key = activation.accumulator();
                 let handle = runtime.property_base_object_handle(base)?;
                 let prop = key_to_property_name(runtime, key)?;
-                let value = match runtime.property_lookup(handle, prop)? {
-                    Some(lookup) => match lookup.value() {
-                        crate::object::PropertyValue::Data { value: v, .. } => v,
-                        crate::object::PropertyValue::Accessor { .. } => RegisterValue::undefined(),
-                    },
-                    None => RegisterValue::undefined(),
-                };
+                let receiver = RegisterValue::from_object_handle(handle.0);
+                let value =
+                    runtime
+                        .ordinary_get(handle, prop, receiver)
+                        .map_err(|err| match err {
+                            crate::VmNativeCallError::Thrown(v) => {
+                                InterpreterError::UncaughtThrow(v)
+                            }
+                            crate::VmNativeCallError::Internal(msg) => {
+                                InterpreterError::NativeCall(msg)
+                            }
+                        })?;
                 activation.set_accumulator(value);
             }
             Opcode::StaKeyedProperty => {
                 // v2: `StaKeyedProperty r0 r1`: r0[r1] = acc.
+                // Uses `set_named_property` (not `ordinary_set`) so
+                // array indexed-storage + `length` stay on the
+                // registry-aware path. Accessor setters inherited
+                // via the prototype chain are rare for keyed
+                // access; M29 handles them via `StaNamedProperty`
+                // instead.
                 let base = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let key = read_reg(activation, function, reg(&instr.operands, 1)?)?;
                 let value = activation.accumulator();
@@ -1584,6 +1609,378 @@ impl Interpreter {
                 }
             }
 
+            // M29: Class field / accessor / private-name opcodes
+            //
+            // §6.2.12 / §15.7.14 infrastructure — the compiler
+            // emits `AllocClassId` once per class-definition
+            // block, which writes a fresh class id into the
+            // frame's `current_class_id` scratch slot. Subsequent
+            // `CopyClassId r_target` reads the slot and stamps
+            // it onto `r_target` (a closure). All private-name
+            // opcodes then pull the class_id from the active
+            // closure at runtime.
+            Opcode::AllocClassId => {
+                activation.current_class_id = runtime.alloc_class_id();
+            }
+            Opcode::CopyClassId => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "CopyClassId: target is not an object",
+                    )));
+                };
+                runtime
+                    .objects
+                    .set_closure_class_id(target_handle, activation.current_class_id)
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!(
+                            "CopyClassId: set_closure_class_id failed: {err:?}"
+                        )))
+                    })?;
+            }
+
+            // §15.7.14 step 28 — DefineField. Installs the
+            // accumulator value as an enumerable, writable,
+            // configurable data property on `r_target` under the
+            // name interned at `name_idx`. Used by class field
+            // initializer closures for `class C { x = expr; }`.
+            Opcode::DefineField => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineField: target is not an object",
+                    )));
+                };
+                let property = resolve_property(function, runtime, prop_id)?;
+                let value = activation.accumulator();
+                runtime
+                    .objects
+                    .define_own_property(
+                        target_handle,
+                        property,
+                        crate::object::PropertyValue::data_with_attrs(
+                            value,
+                            crate::object::PropertyAttributes::data(),
+                        ),
+                    )
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!(
+                            "DefineField: define_own_property failed: {err:?}"
+                        )))
+                    })?;
+            }
+            // §15.7.14 — DefineComputedField. Like `DefineField`
+            // but the key comes from a runtime register (the
+            // evaluated computed-key expression, already coerced
+            // via `ToPropertyKey` by the compiler).
+            Opcode::DefineComputedField => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let key_reg = reg(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let key = read_reg(activation, function, key_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineComputedField: target is not an object",
+                    )));
+                };
+                let property = key_to_property_name(runtime, key)?;
+                let value = activation.accumulator();
+                runtime
+                    .objects
+                    .define_own_property(
+                        target_handle,
+                        property,
+                        crate::object::PropertyValue::data_with_attrs(
+                            value,
+                            crate::object::PropertyAttributes::data(),
+                        ),
+                    )
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!(
+                            "DefineComputedField: define_own_property failed: {err:?}"
+                        )))
+                    })?;
+            }
+
+            // §15.7.14 step 34 — install the compiled field
+            // initializer closure onto the class constructor's
+            // `[[Fields]]` slot (we collapse the array into a
+            // single closure that walks all fields in order).
+            // Called once per class body right after the
+            // initializer is synthesized; later `RunClassFieldInitializer`
+            // invokes it per instance.
+            Opcode::SetClassFieldInitializer => {
+                let class_reg = reg(&instr.operands, 0)?;
+                let class_val = read_reg(activation, function, class_reg)?;
+                let Some(class_handle) = class_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "SetClassFieldInitializer: target is not a closure",
+                    )));
+                };
+                let initializer = activation.accumulator();
+                let Some(init_handle) = initializer
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "SetClassFieldInitializer: initializer is not a closure",
+                    )));
+                };
+                runtime
+                    .objects
+                    .set_closure_field_initializer(class_handle, init_handle)
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!(
+                            "SetClassFieldInitializer: {err:?}"
+                        )))
+                    })?;
+            }
+
+            // §15.7.14 / §10.2.1.3 — invoke the active function's
+            // class field initializer with `r_this` as receiver.
+            // Base ctors emit this at body entry; derived ctors
+            // emit it after every `CallSuper` so field init runs
+            // once the derived `this` binding is live. The
+            // initializer's return value is discarded.
+            Opcode::RunClassFieldInitializer => {
+                let this_reg = reg(&instr.operands, 0)?;
+                let this_val = read_reg(activation, function, this_reg)?;
+                let Some(active_closure) = activation.closure_handle() else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "RunClassFieldInitializer: no active closure",
+                    )));
+                };
+                let initializer = runtime
+                    .objects
+                    .closure_field_initializer(active_closure)
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!(
+                            "RunClassFieldInitializer: lookup failed: {err:?}"
+                        )))
+                    })?;
+                if let Some(init_handle) = initializer {
+                    match self.call_callable_bytecode(runtime, init_handle, this_val, &[]) {
+                        Ok(_) => {
+                            activation.refresh_open_upvalues_from_cells(runtime)?;
+                        }
+                        Err(StepOutcome::Throw(v)) => return Ok(StepOutcome::Throw(v)),
+                        Err(other) => return Ok(other),
+                    }
+                }
+            }
+
+            // §7.3.31 PrivateFieldAdd — append a private field
+            // to `r_target`'s `[[PrivateElements]]` using
+            // `{ class_id: activeClosure.class_id, description:
+            // name }` as the key. Value comes from the
+            // accumulator. Throws if the field already exists
+            // on the target (§7.3.31 step 3).
+            Opcode::DefinePrivateField => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefinePrivateField: target is not an object",
+                    )));
+                };
+                let key = active_private_name_key(activation, function, runtime, prop_id)?;
+                let value = activation.accumulator();
+                if let Err(err) = runtime.objects.private_field_add(target_handle, key, value) {
+                    return throw_object_error(runtime, err);
+                }
+            }
+            // §7.3.32 PrivateGet — read a private field / method
+            // / accessor from `r_obj`. Private accessors are
+            // returned as their getter closure; callers invoke
+            // through the usual call path.
+            Opcode::GetPrivateField => {
+                let obj_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let obj_val = read_reg(activation, function, obj_reg)?;
+                let Some(obj_handle) = obj_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err = runtime
+                        .alloc_type_error("Cannot read private field on a non-object value")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let key = active_private_name_key(activation, function, runtime, prop_id)?;
+                match runtime.objects.private_get(obj_handle, &key) {
+                    Ok(value) => activation.set_accumulator(value),
+                    Err(err) => return throw_object_error(runtime, err),
+                }
+            }
+            // §7.3.33 PrivateSet — write a private field value
+            // (or forward through an accessor's setter). The
+            // accumulator carries the value; if an accessor
+            // setter is selected `private_set` returns its
+            // handle, which we then invoke.
+            Opcode::SetPrivateField => {
+                let obj_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let obj_val = read_reg(activation, function, obj_reg)?;
+                let Some(obj_handle) = obj_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err = runtime
+                        .alloc_type_error("Cannot set private field on a non-object value")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let key = active_private_name_key(activation, function, runtime, prop_id)?;
+                let value = activation.accumulator();
+                match runtime.objects.private_set(obj_handle, &key, value) {
+                    Ok(None) => {}
+                    Ok(Some(setter)) => {
+                        match self.call_callable_bytecode(runtime, setter, obj_val, &[value]) {
+                            Ok(_) => {
+                                activation.refresh_open_upvalues_from_cells(runtime)?;
+                            }
+                            Err(StepOutcome::Throw(v)) => return Ok(StepOutcome::Throw(v)),
+                            Err(other) => return Ok(other),
+                        }
+                    }
+                    Err(err) => return throw_object_error(runtime, err),
+                }
+                // Assignment expression result is the RHS value.
+                activation.set_accumulator(value);
+            }
+
+            // §13.10.1 `#x in obj` — returns `true` iff `obj`
+            // has an own private element with this active
+            // closure's class_id + name. Throws TypeError when
+            // `obj` is a primitive per the spec's step 5.
+            Opcode::InPrivate => {
+                let obj_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let obj_val = read_reg(activation, function, obj_reg)?;
+                let Some(obj_handle) = obj_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err = runtime.alloc_type_error("Cannot use 'in' on a non-object value")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let key = active_private_name_key(activation, function, runtime, prop_id)?;
+                match runtime.objects.private_element_find(obj_handle, &key) {
+                    Ok(found) => {
+                        activation.set_accumulator(RegisterValue::from_bool(found));
+                    }
+                    Err(err) => return throw_object_error(runtime, err),
+                }
+            }
+
+            // §10.4.1.4 / §15.7.11 — install an accessor on
+            // `r_target` with class semantics (non-enumerable,
+            // configurable). Getter half comes from the
+            // accumulator; existing setter half is preserved
+            // when the named slot already holds an accessor.
+            Opcode::DefineClassGetter => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineClassGetter: target is not an object",
+                    )));
+                };
+                let property = resolve_property(function, runtime, prop_id)?;
+                let getter = activation.accumulator();
+                install_class_accessor(
+                    runtime,
+                    target_handle,
+                    property,
+                    AccessorHalf::Get,
+                    getter,
+                )?;
+            }
+            Opcode::DefineClassSetter => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineClassSetter: target is not an object",
+                    )));
+                };
+                let property = resolve_property(function, runtime, prop_id)?;
+                let setter = activation.accumulator();
+                install_class_accessor(
+                    runtime,
+                    target_handle,
+                    property,
+                    AccessorHalf::Set,
+                    setter,
+                )?;
+            }
+            // Computed-key variants — key lives in a register.
+            Opcode::DefineClassGetterComputed => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let key_reg = reg(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let key = read_reg(activation, function, key_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineClassGetterComputed: target is not an object",
+                    )));
+                };
+                let property = key_to_property_name(runtime, key)?;
+                let getter = activation.accumulator();
+                install_class_accessor(
+                    runtime,
+                    target_handle,
+                    property,
+                    AccessorHalf::Get,
+                    getter,
+                )?;
+            }
+            Opcode::DefineClassSetterComputed => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let key_reg = reg(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let key = read_reg(activation, function, key_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineClassSetterComputed: target is not an object",
+                    )));
+                };
+                let property = key_to_property_name(runtime, key)?;
+                let setter = activation.accumulator();
+                install_class_accessor(
+                    runtime,
+                    target_handle,
+                    property,
+                    AccessorHalf::Set,
+                    setter,
+                )?;
+            }
+
             Opcode::Nop => {}
 
             // Any other opcode is unsupported by this Phase 3b.1
@@ -1868,7 +2265,143 @@ fn super_call_dispatch(
         activation.set_register(slot, receiver)?;
     }
     activation.set_accumulator(receiver);
+
+    // §15.7.14 step 28 — run the derived class's own field
+    // initializer now that `this` is live. Mirrors the
+    // base-class path in `construct_callable`; the two together
+    // guarantee field init happens exactly once per instance.
+    if let Ok(Some(init)) = runtime.objects.closure_field_initializer(active_closure) {
+        match runtime.call_callable(init, receiver, &[]) {
+            Ok(_) => {}
+            Err(crate::VmNativeCallError::Thrown(v)) => {
+                return Ok(SuperCallOutcome::Throw(v));
+            }
+            Err(crate::VmNativeCallError::Internal(msg)) => {
+                return Err(InterpreterError::NativeCall(msg));
+            }
+        }
+    }
     Ok(SuperCallOutcome::Continue)
+}
+
+/// Which side of an accessor pair a `Define*Getter/Setter` opcode
+/// is currently installing. Used by [`install_class_accessor`] to
+/// preserve the other half of an existing accessor when a class
+/// declaration binds a getter+setter under the same key.
+#[derive(Clone, Copy)]
+enum AccessorHalf {
+    Get,
+    Set,
+}
+
+/// §15.7.11 PropertyDefinitionEvaluation (class body) — installs
+/// the accumulator-carried closure as one half of an accessor pair
+/// on `target`. Class accessors are non-enumerable + configurable
+/// (vs. enumerable for object-literal accessors), which is why
+/// this is a dedicated helper rather than sharing the
+/// object-literal path.
+fn install_class_accessor(
+    runtime: &mut RuntimeState,
+    target: crate::object::ObjectHandle,
+    property: crate::property::PropertyNameId,
+    half: AccessorHalf,
+    closure_value: RegisterValue,
+) -> Result<(), InterpreterError> {
+    let Some(closure_handle) = closure_value
+        .as_object_handle()
+        .map(crate::object::ObjectHandle)
+    else {
+        return Err(InterpreterError::TypeError(Box::from(
+            "class accessor install: value is not a closure",
+        )));
+    };
+    let desc = match half {
+        AccessorHalf::Get => crate::object::PropertyDescriptor::accessor(
+            Some(Some(closure_handle)),
+            None,
+            Some(false),
+            Some(true),
+        ),
+        AccessorHalf::Set => crate::object::PropertyDescriptor::accessor(
+            None,
+            Some(Some(closure_handle)),
+            Some(false),
+            Some(true),
+        ),
+    };
+    match runtime
+        .objects
+        .define_own_property_from_descriptor(target, property, desc)
+    {
+        Ok(_) => Ok(()),
+        Err(err) => Err(InterpreterError::NativeCall(Box::from(format!(
+            "class accessor install: {err:?}"
+        )))),
+    }
+}
+
+/// Construct a `PrivateNameKey` from the active closure's
+/// `class_id` plus the name interned at `prop_id`. Used by every
+/// private-field opcode to resolve to the right `[[PrivateElements]]`
+/// bucket per §6.2.12. A zero `class_id` means the compiler failed
+/// to emit `AllocClassId` / `CopyClassId` — surfaced as an internal
+/// error rather than silently producing lookup misses.
+fn active_private_name_key(
+    activation: &Activation,
+    function: &Function,
+    runtime: &mut RuntimeState,
+    prop_id: u32,
+) -> Result<crate::object::PrivateNameKey, InterpreterError> {
+    let Some(active_closure) = activation.closure_handle() else {
+        return Err(InterpreterError::NativeCall(Box::from(
+            "private name access: no active closure",
+        )));
+    };
+    let class_id = runtime
+        .objects
+        .closure_class_id(active_closure)
+        .map_err(|err| {
+            InterpreterError::NativeCall(Box::from(format!(
+                "private name access: class_id lookup failed: {err:?}"
+            )))
+        })?;
+    if class_id == 0 {
+        return Err(InterpreterError::NativeCall(Box::from(
+            "private name access: active closure has no class_id",
+        )));
+    }
+    let id = crate::property::PropertyNameId(prop_id as u16);
+    let description = function
+        .property_names()
+        .get(id)
+        .ok_or(InterpreterError::UnknownPropertyName)?
+        .to_owned()
+        .into_boxed_str();
+    Ok(crate::object::PrivateNameKey {
+        class_id,
+        description,
+    })
+}
+
+/// Convert an `ObjectError::TypeError` into a JS-level
+/// `StepOutcome::Throw` carrying a fresh `TypeError` instance.
+/// Other object errors fall back to an internal `NativeCall`
+/// error so bugs surface loudly.
+fn throw_object_error(
+    runtime: &mut RuntimeState,
+    err: crate::object::ObjectError,
+) -> Result<StepOutcome, InterpreterError> {
+    match err {
+        crate::object::ObjectError::TypeError(msg) => {
+            let handle = runtime.alloc_type_error(&msg)?;
+            Ok(StepOutcome::Throw(RegisterValue::from_object_handle(
+                handle.0,
+            )))
+        }
+        other => Err(InterpreterError::NativeCall(Box::from(format!(
+            "{other:?}"
+        )))),
+    }
 }
 
 /// §13.3.7 SuperReference base lookup — resolves

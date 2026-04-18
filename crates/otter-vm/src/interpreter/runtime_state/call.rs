@@ -413,6 +413,19 @@ impl RuntimeState {
                     activation.overflow_args = arguments[param_count as usize..].to_vec();
                 }
 
+                // §15.7.14 step 28 — run the class field initializer
+                // on the fresh receiver BEFORE the constructor body.
+                // Only applies to base classes: derived classes do
+                // not have `this` yet, so their initializer runs
+                // after `super()` inside `super_call_dispatch`
+                // instead.
+                if !is_derived_constructor
+                    && let Ok(Some(init)) = self.objects.closure_field_initializer(target)
+                    && callee_function.frame_layout().receiver_slot().is_some()
+                {
+                    self.call_callable(init, default_receiver, &[])?;
+                }
+
                 let completion = Interpreter::for_runtime(self)
                     .run_completion_with_runtime(&module, &mut activation, self)
                     .map_err(|error| match error {

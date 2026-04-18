@@ -3550,18 +3550,19 @@ fn optional_computed_member_rejected() {
 }
 
 #[test]
-fn private_field_assignment_still_rejected() {
-    // Private fields remain rejected — class lowering arrives later.
+fn private_field_assignment_outside_class_is_parse_error() {
+    // Private fields with a `#` prefix outside a class body are
+    // rejected at parse time by oxc; the lowering stage never
+    // sees the node. (M29 handles the in-class case via
+    // `SetPrivateField`.)
     let err = compile("function f() { let o = { a: 1 }; o.#priv = 2; return 1; }")
-        .expect_err("private field target");
-    // oxc parses `#priv` outside a class body as a parse error —
-    // either way it surfaces before we reach the lowering stage.
+        .expect_err("private field outside class");
     assert!(
         matches!(
             err,
             SourceLoweringError::Parse { .. }
                 | SourceLoweringError::Unsupported {
-                    construct: "private_field_assignment_target",
+                    construct: "undeclared_private_name",
                     ..
                 }
         ),
@@ -5613,14 +5614,95 @@ fn m28_super_call_in_base_class_is_unsupported() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// M29: Class fields (public + private) + accessors (get / set)
+// ---------------------------------------------------------------------------
+
 #[test]
-fn class_field_still_unsupported() {
-    let err = compile("function main() { class A { x = 1; } }").expect_err("class field");
+fn m29_public_field_with_initializer() {
+    // §15.7.14 step 28 — `x = 1;` installs a data property via
+    // `DefineField` inside the field-initializer closure.
+    let src = "function main() { \
+        class C { x = 7; } \
+        return new C().x; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn m29_public_field_without_initializer_defaults_to_undefined() {
+    // `y;` without an initializer installs the property with
+    // `undefined`. `typeof` returns the "undefined" string, so
+    // we compare its length (9) against the "number" alternative
+    // (6) — a cheap way to distinguish without wiring full
+    // string-literal `===` here.
+    let src = "function main() { \
+        class C { y; } \
+        let c = new C(); \
+        let t = typeof c.y; \
+        return t.length; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 9);
+}
+
+#[test]
+fn m29_private_field_with_this_access() {
+    // §6.2.12 — `this.#x` inside a method of class C resolves
+    // against C's private-name bucket on the instance.
+    let src = "function main() { \
+        class C { \
+            #x = 11; \
+            get() { return this.#x; } \
+        } \
+        return new C().get(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 11);
+}
+
+#[test]
+fn m29_private_field_write_through_method() {
+    // Setting `this.#x` via a mutator method and reading it back
+    // in another method exercises the full `SetPrivateField` /
+    // `GetPrivateField` round-trip.
+    let src = "function main() { \
+        class Counter { \
+            #n = 0; \
+            bump() { this.#n = this.#n + 1; return this.#n; } \
+        } \
+        let c = new Counter(); \
+        c.bump(); \
+        return c.bump(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 2);
+}
+
+#[test]
+fn m29_private_in_operator_checks_brand() {
+    // §13.10.1 — `#x in obj` returns true iff the object has the
+    // private element in the current class's bucket.
+    let src = "function main() { \
+        class C { \
+            #brand = 0; \
+            static isC(obj) { return (#brand in obj) ? 1 : 0; } \
+        } \
+        return C.isC(new C()) + C.isC({}); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn m29_undeclared_private_name_rejected() {
+    // Inside class C, `this.#missing` where `#missing` was never
+    // declared is a compile-time error.
+    let err = compile(
+        "function main() { class C { method() { return this.#missing; } } new C().method(); }",
+    )
+    .expect_err("undeclared private name must reject");
     assert!(
         matches!(
             err,
             SourceLoweringError::Unsupported {
-                construct: "class_field",
+                construct: "undeclared_private_name",
                 ..
             }
         ),
@@ -5629,18 +5711,96 @@ fn class_field_still_unsupported() {
 }
 
 #[test]
-fn class_getter_still_unsupported() {
-    let err = compile("function main() { class A { get x() { return 1; } } }").expect_err("getter");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "accessor_class_method",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn m29_getter_accessor_runs() {
+    // `get doubled()` installs a getter via `DefineClassGetter`.
+    // Access returns via the getter call path.
+    let src = "function main() { \
+        class C { \
+            constructor() { this.n = 21; } \
+            get doubled() { return this.n + this.n; } \
+        } \
+        return new C().doubled; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn m29_setter_accessor_stores_via_mutation() {
+    // `set value(v)` installs a setter; `c.value = 5` invokes it.
+    let src = "function main() { \
+        class C { \
+            constructor() { this.n = 0; } \
+            set value(v) { this.n = v + 1; } \
+        } \
+        let c = new C(); \
+        c.value = 10; \
+        return c.n; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 11);
+}
+
+#[test]
+fn m29_getter_and_setter_on_same_property() {
+    // §10.4.1 — `get`/`set` under the same key merge into one
+    // accessor property. Both halves must survive installation
+    // (the runtime's `apply_accessor_property_descriptor` merges
+    // getter/setter halves).
+    let src = "function main() { \
+        class C { \
+            constructor() { this.storage = 0; } \
+            get v() { return this.storage + 1; } \
+            set v(x) { this.storage = x; } \
+        } \
+        let c = new C(); \
+        c.v = 40; \
+        return c.v; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 41);
+}
+
+#[test]
+fn m29_static_public_field_installed_on_constructor() {
+    // Static fields run their initializer at class-definition
+    // time and install on the constructor itself (not the
+    // prototype). `DefineField r_class, name` is the emission.
+    let src = "function main() { \
+        class C { static tag = 99; } \
+        return C.tag; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 99);
+}
+
+#[test]
+fn m29_derived_class_field_runs_after_super() {
+    // §15.7.14 — derived-class field initializers run AFTER
+    // `super()` returns. Without that ordering the `this.x` in
+    // the field initializer would observe an uninitialised
+    // `this` and throw. The test relies on the runtime
+    // auto-invocation inside `super_call_dispatch`.
+    let src = "function main() { \
+        class Parent { constructor() { this.parentVal = 10; } } \
+        class Child extends Parent { \
+            offset = 5; \
+            sum() { return this.parentVal + this.offset; } \
+        } \
+        return new Child().sum(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 15);
+}
+
+#[test]
+fn m29_field_initializer_can_reference_this_and_outer_scope() {
+    // Field initializers capture outer bindings via the usual
+    // closure path and see `this` for per-instance state.
+    let src = "function main() { \
+        let base = 40; \
+        class C { \
+            offset = base + 2; \
+            get v() { return this.offset; } \
+        } \
+        return new C().v; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
 }
 
 #[test]

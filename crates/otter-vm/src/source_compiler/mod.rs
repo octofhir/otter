@@ -697,10 +697,12 @@ fn lower_function_body<'a>(
         module_functions,
         None,
         None,
+        None,
     )
     .map(|(out, _captures)| out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_function_body_with_parent<'a>(
     body: &'a FunctionBody<'a>,
     _params: &'a FormalParameters<'a>,
@@ -709,6 +711,7 @@ fn lower_function_body_with_parent<'a>(
     module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
     parent: Option<&'a LoweringContext<'a>>,
     class_super_binding: Option<ClassSuperBinding>,
+    class_private_names: Option<std::rc::Rc<[String]>>,
 ) -> Result<(FunctionBodyOutput, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
     if !body.directives.is_empty() {
         return Err(SourceLoweringError::unsupported(
@@ -724,6 +727,7 @@ fn lower_function_body_with_parent<'a>(
         module_functions,
         parent,
         class_super_binding,
+        class_private_names,
     );
 
     // §14.1.21 FunctionDeclarationInstantiation — evaluate default
@@ -1939,6 +1943,16 @@ struct LoweringContext<'a> {
     /// the runtime side, but without the compile-time gating the
     /// compiler cannot validate out-of-class `super` uses.
     class_super_binding: Option<ClassSuperBinding>,
+    /// M29: names declared in the immediately enclosing class
+    /// body's private-name scope (without the leading `#`). Shared
+    /// by reference across all methods / accessors / field
+    /// initializers of one class body so a single `#x in obj`
+    /// check inside any of them can validate the name.
+    ///
+    /// Empty for non-class contexts. For M29 scope: private-name
+    /// resolution does NOT walk parent classes, so nested-class
+    /// access to outer `#x` is rejected (`undeclared_private_name`).
+    class_private_names: std::rc::Rc<[String]>,
 }
 
 /// §13.3.7 / §15.7.14 — per-function metadata describing which
@@ -1952,6 +1966,35 @@ struct ClassSuperBinding {
     allow_super_property: bool,
     /// `super(args)` — allowed only in derived-class constructors.
     allow_super_call: bool,
+}
+
+/// M29: one `MethodDefinition` (method or accessor) from a
+/// `ClassBody`. Accessors (`get`/`set`) land in the same bucket
+/// as regular methods — the installer branches on `kind` when
+/// choosing between `StaNamedProperty` and the accessor opcodes.
+/// Private methods are rejected earlier with
+/// `private_class_method`, so `name` is always a public identifier.
+struct ClassMethod<'a> {
+    name: &'a str,
+    is_static: bool,
+    kind: MethodDefinitionKind,
+    func: &'a Function<'a>,
+}
+
+/// M29: one class field declaration. Represents both public
+/// (`x = expr;`) and private (`#x = expr;`) fields, instance and
+/// static. The initializer lives on the AST and is lowered inside
+/// the class body's field-initializer closure (or inline for
+/// statics).
+struct ClassField<'a> {
+    /// Field name without the leading `#` prefix for private fields.
+    name: String,
+    /// `true` when the declaration used `#` (private element).
+    is_private: bool,
+    /// Optional initializer expression. Absent initializers
+    /// default to `undefined` per §15.7.14.
+    initializer: Option<&'a Expression<'a>>,
+    span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -2009,7 +2052,7 @@ impl<'a> LoweringContext<'a> {
         function_names: &'a [&'a str],
         module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
     ) -> Self {
-        Self::with_parent(layout, function_names, module_functions, None, None)
+        Self::with_parent(layout, function_names, module_functions, None, None, None)
     }
 
     fn with_parent(
@@ -2018,6 +2061,7 @@ impl<'a> LoweringContext<'a> {
         module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
         parent: Option<&'a LoweringContext<'a>>,
         class_super_binding: Option<ClassSuperBinding>,
+        class_private_names: Option<std::rc::Rc<[String]>>,
     ) -> Self {
         let param_names = layout.names.clone();
         let param_count = RegisterIndex::try_from(param_names.len()).unwrap_or(u16::MAX);
@@ -2041,6 +2085,8 @@ impl<'a> LoweringContext<'a> {
             parent,
             captures: RefCell::new(Vec::new()),
             class_super_binding,
+            class_private_names: class_private_names
+                .unwrap_or_else(|| std::rc::Rc::<[String]>::from([])),
         }
     }
 
@@ -3281,6 +3327,17 @@ fn lower_return_expression<'a>(
         Expression::ComputedMemberExpression(member) => {
             lower_computed_member_read(builder, ctx, member)
         }
+        // M29: `obj.#x` — §13.3.2 PrivateFieldExpression read.
+        // Private-name resolution checks the enclosing class
+        // body's declaration list at compile time; the runtime
+        // walks `[[PrivateElements]]` using the active closure's
+        // `class_id`.
+        Expression::PrivateFieldExpression(expr) => lower_private_field_read(builder, ctx, expr),
+        // M29: `#name in obj` — §13.10.1 PrivateInExpression.
+        // Evaluates the RHS into a temp, then `InPrivate` checks
+        // the runtime's `[[PrivateElements]]` table against the
+        // active class_id.
+        Expression::PrivateInExpression(expr) => lower_private_in_expression(builder, ctx, expr),
         Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
         Expression::FunctionExpression(func) => lower_function_expression(builder, ctx, func),
         Expression::ArrowFunctionExpression(arrow) => {
@@ -3588,9 +3645,17 @@ fn lower_class_body_core<'a>(
     // enables `super(args)` inside the constructor.
     let is_derived = class.super_class.is_some();
 
-    // 1) Locate the constructor (if any) + collect methods.
+    // 1) Classify class elements. M29 splits the M27 methods list
+    //    into four buckets: constructor, real methods + accessors
+    //    (instance or static), and field declarations
+    //    (public or private, instance or static). Private
+    //    methods/accessors are deferred — they need
+    //    `PushPrivateMethod`/`Getter`/`Setter` wiring (M29.5).
     let mut constructor_fn: Option<&'a Function<'a>> = None;
-    let mut methods: Vec<(&'a str, bool, &'a Function<'a>)> = Vec::new(); // (name, is_static, fn)
+    let mut methods: Vec<ClassMethod<'a>> = Vec::new();
+    let mut instance_fields: Vec<ClassField<'a>> = Vec::new();
+    let mut static_fields: Vec<ClassField<'a>> = Vec::new();
+    let mut private_names: Vec<String> = Vec::new();
     for element in class.body.body.iter() {
         match element {
             ClassElement::MethodDefinition(method) => {
@@ -3600,12 +3665,11 @@ fn lower_class_body_core<'a>(
                         method.span,
                     ));
                 }
-                if !matches!(
-                    method.kind,
-                    MethodDefinitionKind::Constructor | MethodDefinitionKind::Method
-                ) {
+                // Private methods / accessors go through
+                // PushPrivateMethod etc. — deferred past M29.
+                if matches!(&method.key, PropertyKey::PrivateIdentifier(_)) {
                     return Err(SourceLoweringError::unsupported(
-                        "accessor_class_method",
+                        "private_class_method",
                         method.span,
                     ));
                 }
@@ -3623,14 +3687,86 @@ fn lower_class_body_core<'a>(
                     MethodDefinitionKind::Constructor => {
                         constructor_fn = Some(&method.value);
                     }
-                    MethodDefinitionKind::Method => {
-                        methods.push((key_name, method.r#static, &method.value));
+                    MethodDefinitionKind::Method
+                    | MethodDefinitionKind::Get
+                    | MethodDefinitionKind::Set => {
+                        methods.push(ClassMethod {
+                            name: key_name,
+                            is_static: method.r#static,
+                            kind: method.kind,
+                            func: &method.value,
+                        });
                     }
-                    _ => unreachable!("kinds filtered above"),
                 }
             }
             ClassElement::PropertyDefinition(prop) => {
-                return Err(SourceLoweringError::unsupported("class_field", prop.span));
+                if prop.computed {
+                    return Err(SourceLoweringError::unsupported(
+                        "computed_class_field",
+                        prop.span,
+                    ));
+                }
+                if !prop.decorators.is_empty() {
+                    return Err(SourceLoweringError::unsupported(
+                        "class_decorator",
+                        prop.decorators[0].span,
+                    ));
+                }
+                match &prop.key {
+                    PropertyKey::StaticIdentifier(ident) => {
+                        let field = ClassField {
+                            name: ident.name.to_string(),
+                            is_private: false,
+                            initializer: prop.value.as_ref(),
+                            span: prop.span,
+                        };
+                        if prop.r#static {
+                            static_fields.push(field);
+                        } else {
+                            instance_fields.push(field);
+                        }
+                    }
+                    PropertyKey::StringLiteral(lit) => {
+                        let field = ClassField {
+                            name: lit.value.to_string(),
+                            is_private: false,
+                            initializer: prop.value.as_ref(),
+                            span: prop.span,
+                        };
+                        if prop.r#static {
+                            static_fields.push(field);
+                        } else {
+                            instance_fields.push(field);
+                        }
+                    }
+                    PropertyKey::PrivateIdentifier(ident) => {
+                        let name = ident.name.to_string();
+                        if private_names.contains(&name) {
+                            return Err(SourceLoweringError::unsupported(
+                                "duplicate_private_name",
+                                prop.span,
+                            ));
+                        }
+                        private_names.push(name.clone());
+                        let field = ClassField {
+                            name,
+                            is_private: true,
+                            initializer: prop.value.as_ref(),
+                            span: prop.span,
+                        };
+                        if prop.r#static {
+                            static_fields.push(field);
+                        } else {
+                            instance_fields.push(field);
+                        }
+                    }
+                    other => {
+                        return Err(SourceLoweringError::unsupported(
+                            property_key_tag(other),
+                            other.span(),
+                        ));
+                    }
+                }
             }
             ClassElement::StaticBlock(block) => {
                 return Err(SourceLoweringError::unsupported(
@@ -3652,6 +3788,13 @@ fn lower_class_body_core<'a>(
             }
         }
     }
+
+    let has_instance_fields = !instance_fields.is_empty();
+    let class_private_names: std::rc::Rc<[String]> = if private_names.is_empty() {
+        std::rc::Rc::from([])
+    } else {
+        std::rc::Rc::from(private_names.clone().into_boxed_slice())
+    };
 
     // 2) Super-class eligibility flags for methods + constructor.
     //    Methods (including static) allow `super.x`; derived
@@ -3709,6 +3852,17 @@ fn lower_class_body_core<'a>(
                 })?;
         }
 
+        // M29: §6.2.12 — allocate a fresh class_id BEFORE we
+        // create any closure belonging to the class. Subsequent
+        // `CopyClassId r_target` stamps it on the ctor, each
+        // method/accessor, and the field initializer. The
+        // allocation is a no-op for classes without private
+        // names, but emitting it unconditionally keeps the shape
+        // predictable and lets tests rely on a non-zero id.
+        builder.emit(Opcode::AllocClassId, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode AllocClassId: {err:?}"))
+        })?;
+
         // 4) Lower the constructor — if none present, synthesise
         //    one. Derived classes with no explicit constructor get
         //    `constructor(...args) { super(...args); }` per
@@ -3724,6 +3878,7 @@ fn lower_class_body_core<'a>(
                     })?,
                     Some(class_name.to_owned()),
                     Some(ctor_super),
+                    Some(std::rc::Rc::clone(&class_private_names)),
                 )?;
                 if is_derived {
                     let mut fns = ctx.module_functions.borrow_mut();
@@ -3786,6 +3941,13 @@ fn lower_class_body_core<'a>(
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Star (class ctor spill): {err:?}"))
             })?;
+        // M29: stamp the class_id onto the ctor closure now that
+        // it lives in a register.
+        builder
+            .emit(Opcode::CopyClassId, &[Operand::Reg(u32::from(class_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode CopyClassId (class ctor): {err:?}"))
+            })?;
         let prototype_idx = ctx.intern_property_name("prototype")?;
         builder
             .emit(
@@ -3846,19 +4008,19 @@ fn lower_class_body_core<'a>(
                 SourceLoweringError::Internal(format!("encode SetHomeObject (class ctor): {err:?}"))
             })?;
 
-        // 7) Instance + static method installation. Each method
-        //    gets its own home object — instance methods use
-        //    `proto_temp`, static methods use `class_temp`. Both are
-        //    installed as plain data properties on the target.
-        for (name, is_static, func) in methods.iter().copied() {
+        // 7) Instance + static method / accessor installation.
+        //    Each closure gets a home object, a class_id stamp,
+        //    and an install opcode chosen per `kind`.
+        for method in methods.iter() {
             let (idx, captures) = lower_inner_callable_with_super(
                 ctx,
-                &func.params,
-                func.body.as_ref().ok_or_else(|| {
-                    SourceLoweringError::unsupported("declared_only_function", func.span)
+                &method.func.params,
+                method.func.body.as_ref().ok_or_else(|| {
+                    SourceLoweringError::unsupported("declared_only_function", method.func.span)
                 })?,
-                Some(name.to_owned()),
+                Some(method.name.to_owned()),
                 Some(method_super),
+                Some(std::rc::Rc::clone(&class_private_names)),
             )?;
             let pc = builder.pc();
             let template = crate::closure::ClosureTemplate::with_flags(
@@ -3875,8 +4037,9 @@ fn lower_class_body_core<'a>(
                     ))
                 })?;
             // Spill into `method_temp` so we can stamp HomeObject
-            // without disturbing the accumulator's closure value;
-            // StaNamedProperty will still read it back from acc.
+            // / class_id without disturbing the accumulator's
+            // closure value; the install opcode still reads it
+            // back from acc.
             builder
                 .emit(Opcode::Star, &[Operand::Reg(u32::from(method_temp))])
                 .map_err(|err| {
@@ -3884,7 +4047,11 @@ fn lower_class_body_core<'a>(
                         "encode Star (class method spill): {err:?}"
                     ))
                 })?;
-            let home_reg = if is_static { class_temp } else { proto_temp };
+            let home_reg = if method.is_static {
+                class_temp
+            } else {
+                proto_temp
+            };
             builder
                 .emit(
                     Opcode::SetHomeObject,
@@ -3898,22 +4065,150 @@ fn lower_class_body_core<'a>(
                         "encode SetHomeObject (class method): {err:?}"
                     ))
                 })?;
-            let name_idx = ctx.intern_property_name(name)?;
-            let target_reg = if is_static { class_temp } else { proto_temp };
+            // M29: stamp class_id so private-name lookups inside
+            // the method body resolve to this class's bucket.
+            builder
+                .emit(Opcode::CopyClassId, &[Operand::Reg(u32::from(method_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CopyClassId (class method): {err:?}"
+                    ))
+                })?;
+            let name_idx = ctx.intern_property_name(method.name)?;
+            let target_reg = if method.is_static {
+                class_temp
+            } else {
+                proto_temp
+            };
+            let install_op = match method.kind {
+                MethodDefinitionKind::Method => Opcode::StaNamedProperty,
+                MethodDefinitionKind::Get => Opcode::DefineClassGetter,
+                MethodDefinitionKind::Set => Opcode::DefineClassSetter,
+                MethodDefinitionKind::Constructor => unreachable!("filtered above"),
+            };
             builder
                 .emit(
-                    Opcode::StaNamedProperty,
+                    install_op,
                     &[Operand::Reg(u32::from(target_reg)), Operand::Idx(name_idx)],
                 )
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!(
-                        "encode StaNamedProperty (class method install): {err:?}"
+                        "encode {install_op:?} (class method install): {err:?}"
                     ))
                 })?;
         }
 
-        // 8) Leave the constructor in acc — the caller (declaration
-        //    or expression path) decides whether to bind it anywhere.
+        // 8) §15.7.14 step 28 — if the class body declares any
+        //    instance fields (public or private), synthesise a
+        //    field-initializer closure and attach it to the
+        //    constructor via `SetClassFieldInitializer`. The
+        //    runtime auto-invokes it on fresh receivers (base
+        //    ctors run it in `construct_callable`; derived ctors
+        //    run it after `super()` in `super_call_dispatch`).
+        if has_instance_fields {
+            let (init_idx, init_captures) = synthesise_field_initializer(
+                ctx,
+                &instance_fields,
+                class_name,
+                std::rc::Rc::clone(&class_private_names),
+            )?;
+            let pc = builder.pc();
+            let template = crate::closure::ClosureTemplate::with_flags(
+                crate::module::FunctionIndex(init_idx),
+                init_captures,
+                crate::object::ClosureFlags::method(),
+            );
+            ctx.record_closure_template(pc, template);
+            builder
+                .emit(
+                    Opcode::CreateClosure,
+                    &[Operand::Idx(init_idx), Operand::Imm(0)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CreateClosure (field initializer): {err:?}"
+                    ))
+                })?;
+            // Spill, stamp home + class_id, then install onto
+            // the ctor. acc keeps the closure for
+            // `SetClassFieldInitializer` to consume.
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(method_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (field init spill): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(
+                    Opcode::SetHomeObject,
+                    &[
+                        Operand::Reg(u32::from(method_temp)),
+                        Operand::Reg(u32::from(proto_temp)),
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode SetHomeObject (field init): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(Opcode::CopyClassId, &[Operand::Reg(u32::from(method_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CopyClassId (field init): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(
+                    Opcode::SetClassFieldInitializer,
+                    &[Operand::Reg(u32::from(class_temp))],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode SetClassFieldInitializer: {err:?}"
+                    ))
+                })?;
+        }
+
+        // 9) Static fields — evaluate each initializer inline and
+        //    install directly on the class constructor. Runs at
+        //    class-definition time (not instance creation), so
+        //    the expression sees the outer lexical scope. Real
+        //    engines bind `this = class` for these expressions;
+        //    M29 keeps that as a known limitation and will
+        //    revisit once a dedicated per-field evaluator lands.
+        for field in static_fields.iter() {
+            if let Some(init) = field.initializer {
+                lower_return_expression(builder, ctx, init)?;
+            } else {
+                builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaUndefined (static field default): {err:?}"
+                    ))
+                })?;
+            }
+            let name_idx = ctx.intern_property_name(&field.name)?;
+            let opcode = if field.is_private {
+                Opcode::DefinePrivateField
+            } else {
+                Opcode::DefineField
+            };
+            builder
+                .emit(
+                    opcode,
+                    &[Operand::Reg(u32::from(class_temp)), Operand::Idx(name_idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode {opcode:?} (static field): {err:?}"
+                    ))
+                })?;
+        }
+
+        // 10) Leave the constructor in acc — the caller
+        //     (declaration or expression path) decides whether
+        //     to bind it anywhere.
         builder
             .emit(Opcode::Ldar, &[Operand::Reg(u32::from(class_temp))])
             .map_err(|err| {
@@ -3926,6 +4221,142 @@ fn lower_class_body_core<'a>(
         ctx.release_temps(1);
     }
     lower
+}
+
+/// §15.7.14 step 28 — synthesises the class field initializer
+/// closure. Each instance field (public or private) becomes one
+/// `DefineField` / `DefinePrivateField` pair in the body:
+///
+/// ```text
+///   LdaThis                             ; once at entry
+///   Star r_this
+///   ; for each field:
+///     <initializer>  (or LdaUndefined)
+///     DefineField r_this, name_idx      ; public
+///     ; or DefinePrivateField r_this, name_idx
+///   LdaUndefined
+///   Return
+/// ```
+///
+/// The closure is installed on the class constructor via
+/// `SetClassFieldInitializer`; the runtime invokes it once per
+/// instance (see `construct_callable` / `super_call_dispatch`).
+/// Captures are resolved via the normal parent-chain walk so
+/// initializers can reference outer-scope bindings.
+fn synthesise_field_initializer<'a>(
+    outer: &LoweringContext<'a>,
+    fields: &[ClassField<'a>],
+    class_name: &str,
+    class_private_names: std::rc::Rc<[String]>,
+) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
+    let params_layout = ParamsLayout {
+        names: Vec::new(),
+        defaults: Vec::new(),
+        patterns: Vec::new(),
+        rest_name: None,
+    };
+    let mut builder = BytecodeBuilder::new();
+    let ctx = LoweringContext::with_parent(
+        &params_layout,
+        outer.function_names,
+        std::rc::Rc::clone(&outer.module_functions),
+        Some(outer),
+        Some(ClassSuperBinding {
+            allow_super_property: true,
+            allow_super_call: false,
+        }),
+        Some(class_private_names),
+    );
+
+    let this_reg = ctx.acquire_temps(1)?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        builder
+            .emit(Opcode::LdaThis, &[])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode LdaThis: {err:?}")))?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(this_reg))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (field init this): {err:?}"))
+            })?;
+        for field in fields {
+            if let Some(init) = field.initializer {
+                lower_return_expression(&mut builder, &ctx, init)?;
+            } else {
+                builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaUndefined (field default): {err:?}"
+                    ))
+                })?;
+            }
+            let name_idx = ctx.intern_property_name(&field.name)?;
+            let opcode = if field.is_private {
+                Opcode::DefinePrivateField
+            } else {
+                Opcode::DefineField
+            };
+            builder
+                .emit(
+                    opcode,
+                    &[Operand::Reg(u32::from(this_reg)), Operand::Idx(name_idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode {opcode:?} (field init): {err:?}"
+                    ))
+                })?;
+        }
+        builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaUndefined: {err:?}"))
+        })?;
+        builder
+            .emit(Opcode::Return, &[])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
+        Ok(())
+    })();
+    ctx.release_temps(1);
+    lower?;
+
+    let bytecode = builder.finish().map_err(|err| {
+        SourceLoweringError::Internal(format!("finish field initializer: {err:?}"))
+    })?;
+    let bytecode_len = bytecode.bytes().len() as u32;
+
+    let layout = FrameLayout::new(1, 0, ctx.local_count(), ctx.temp_count())
+        .map_err(|err| SourceLoweringError::Internal(format!("field init layout: {err:?}")))?;
+    let feedback_layout = arithmetic_only_feedback_layout(ctx.feedback_slot_count());
+    let side_tables = crate::module::FunctionSideTables::new(
+        ctx.take_property_names(),
+        ctx.take_string_literals(),
+        ctx.take_float_constants(),
+        Default::default(),
+        ctx.take_closure_table(bytecode_len),
+        Default::default(),
+        Default::default(),
+    );
+    // The field-initializer body can't emit `try`/`catch` — it's
+    // compiled from individual expressions, not statements — so
+    // the exception handler list is always empty.
+    let exception_table = crate::exception::ExceptionTable::new(Vec::new());
+    let tables = FunctionTables::new(
+        side_tables,
+        feedback_layout,
+        Default::default(),
+        exception_table,
+        Default::default(),
+    );
+    let init_name = format!("{class_name}#init");
+    let func = VmFunction::new(Some(init_name), layout, bytecode, tables);
+    let captures: Vec<crate::closure::CaptureDescriptor> = ctx
+        .captures
+        .borrow()
+        .iter()
+        .map(|entry| entry.descriptor)
+        .collect();
+    let mut fns = outer.module_functions.borrow_mut();
+    let idx = u32::try_from(fns.len())
+        .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?;
+    fns.push(func);
+    Ok((idx, captures))
 }
 
 /// §15.7.14 step 10.b — synthesises the default constructor for a
@@ -4163,20 +4594,22 @@ fn lower_inner_callable<'a>(
     body: &'a FunctionBody<'a>,
     name: Option<String>,
 ) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
-    lower_inner_callable_with_super(outer, params, body, name, None)
+    lower_inner_callable_with_super(outer, params, body, name, None, None)
 }
 
-/// M28 variant of [`lower_inner_callable`] that threads an explicit
-/// `class_super_binding` into the inner function's `LoweringContext`
-/// so class methods and constructors can validate `super.x` /
-/// `super(args)` uses against the surrounding class's heritage state.
-/// Callers outside `lower_class_body_core` always pass `None`.
+/// M28/M29 variant of [`lower_inner_callable`] that threads
+/// class-scope metadata into the inner function's `LoweringContext`
+/// so class methods and constructors can (1) validate `super.x` /
+/// `super(args)` uses and (2) resolve `this.#x` / `obj.#x` against
+/// the surrounding class's private-name list. Callers outside
+/// `lower_class_body_core` always pass `None` for both.
 fn lower_inner_callable_with_super<'a>(
     outer: &LoweringContext<'a>,
     params: &'a FormalParameters<'a>,
     body: &'a FunctionBody<'a>,
     name: Option<String>,
     class_super_binding: Option<ClassSuperBinding>,
+    class_private_names: Option<std::rc::Rc<[String]>>,
 ) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
     let params_layout = analyze_params(params)?;
     let param_count = params_layout.param_slot_count();
@@ -4189,6 +4622,7 @@ fn lower_inner_callable_with_super<'a>(
         std::rc::Rc::clone(&outer.module_functions),
         Some(outer),
         class_super_binding,
+        class_private_names,
     )?;
 
     let layout = FrameLayout::new(1, param_count, body_out.local_count, body_out.temp_count)
@@ -5798,10 +6232,9 @@ fn lower_assignment_expression(
         AssignmentTarget::ComputedMemberExpression(member) => {
             lower_computed_member_assignment(builder, ctx, expr, member)
         }
-        AssignmentTarget::PrivateFieldExpression(member) => Err(SourceLoweringError::unsupported(
-            "private_field_assignment_target",
-            member.span,
-        )),
+        AssignmentTarget::PrivateFieldExpression(member) => {
+            lower_private_field_assignment(builder, ctx, expr, member)
+        }
         AssignmentTarget::ArrayAssignmentTarget(pattern) => Err(SourceLoweringError::unsupported(
             "destructuring_assignment_target",
             pattern.span,
@@ -6226,6 +6659,67 @@ fn lower_computed_member_assignment<'a>(
         Ok(())
     })();
     ctx.release_temps(1); // key_temp
+    if base.temp_count != 0 {
+        ctx.release_temps(base.temp_count);
+    }
+    lower
+}
+
+/// M29: lowers `obj.#name = v` / `obj.#name <op>= v` onto
+/// `SetPrivateField`. Accumulator holds the value on exit (JS
+/// assignment value is the RHS), so compound assignments compose
+/// cleanly via `apply_binary_op_with_acc_lhs`.
+fn lower_private_field_assignment<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &'a AssignmentExpression<'a>,
+    member: &'a oxc_ast::ast::PrivateFieldExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    if member.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            member.span,
+        ));
+    }
+    let name = member.field.name.as_str();
+    enforce_private_name_declared(ctx, name, member.span)?;
+    let base = materialize_member_base(builder, ctx, &member.object)?;
+    let idx = ctx.intern_property_name(name)?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        if expr.operator == AssignmentOperator::Assign {
+            lower_return_expression(builder, ctx, &expr.right)?;
+        } else {
+            let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+                SourceLoweringError::unsupported(assignment_operator_tag(expr.operator), expr.span)
+            })?;
+            let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+                SourceLoweringError::Internal(format!(
+                    "compound assignment {bin_op:?} has no binary opcode encoding"
+                ))
+            })?;
+            builder
+                .emit(
+                    Opcode::GetPrivateField,
+                    &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode GetPrivateField (compound): {err:?}"
+                    ))
+                })?;
+            apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
+        }
+        builder
+            .emit(
+                Opcode::SetPrivateField,
+                &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode SetPrivateField: {err:?}"))
+            })?;
+        Ok(())
+    })();
     if base.temp_count != 0 {
         ctx.release_temps(base.temp_count);
     }
@@ -6894,6 +7388,88 @@ fn lower_computed_method_call<'a>(
     ctx.release_temps(args_temp_count);
     ctx.release_temps(2);
     lower
+}
+
+/// M29: compile-time guard for `this.#x` / `obj.#x` references.
+/// The private name must be declared in the immediately enclosing
+/// class body (no walking of parent classes in M29 — nested-class
+/// access is deferred to a future milestone).
+fn enforce_private_name_declared<'a>(
+    ctx: &LoweringContext<'a>,
+    name: &str,
+    span: Span,
+) -> Result<(), SourceLoweringError> {
+    if ctx.class_private_names.iter().any(|n| n == name) {
+        Ok(())
+    } else {
+        Err(SourceLoweringError::unsupported(
+            "undeclared_private_name",
+            span,
+        ))
+    }
+}
+
+/// §13.10.1 PrivateInExpression — lowers `#name in obj` into
+/// `InPrivate r_obj, name_idx`, writing a boolean to acc. The
+/// RHS is evaluated into a temp first so the operand register is
+/// stable across sub-expression lowering.
+fn lower_private_in_expression<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &'a oxc_ast::ast::PrivateInExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    let name = expr.left.name.as_str();
+    enforce_private_name_declared(ctx, name, expr.span)?;
+    let obj_temp = ctx.acquire_temps(1)?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, &expr.right)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(obj_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (PrivateIn obj): {err:?}"))
+            })?;
+        let idx = ctx.intern_property_name(name)?;
+        builder
+            .emit(
+                Opcode::InPrivate,
+                &[Operand::Reg(u32::from(obj_temp)), Operand::Idx(idx)],
+            )
+            .map_err(|err| SourceLoweringError::Internal(format!("encode InPrivate: {err:?}")))?;
+        Ok(())
+    })();
+    ctx.release_temps(1);
+    lower
+}
+
+/// §13.3.2 PrivateFieldExpression read — lowers `obj.#name` into
+/// `GetPrivateField r_obj, name_idx`. The runtime resolves the
+/// private key against `activeClosure.class_id` + the interned
+/// name and throws TypeError if the target lacks the element.
+fn lower_private_field_read<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &'a oxc_ast::ast::PrivateFieldExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    if expr.optional {
+        return Err(SourceLoweringError::unsupported(
+            "optional_member_expression",
+            expr.span,
+        ));
+    }
+    let name = expr.field.name.as_str();
+    enforce_private_name_declared(ctx, name, expr.span)?;
+    let base = materialize_member_base(builder, ctx, &expr.object)?;
+    let idx = ctx.intern_property_name(name)?;
+    builder
+        .emit(
+            Opcode::GetPrivateField,
+            &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+        )
+        .map_err(|err| SourceLoweringError::Internal(format!("encode GetPrivateField: {err:?}")))?;
+    if base.temp_count != 0 {
+        ctx.release_temps(base.temp_count);
+    }
+    Ok(())
 }
 
 /// M28: compile-time guard for `super.x` / `super[k]` references.

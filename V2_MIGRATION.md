@@ -68,7 +68,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M27      | Class declaration: constructor + instance methods + static methods.                                                             | [x]    | 0911c9d |
 | M28      | Class inheritance (`extends` + `super` + `super(args)` in constructor).                                                         | [x]    | 0981ec9 |
 | M29      | Class private fields (`#x`) + accessor methods (`get` / `set`).                                                                 | [x]    | c9398fe |
-| M30      | `for (x of arr)` + iterator protocol (`Symbol.iterator`, `next()`).                                                             | [ ]    |        |
+| M30      | `for (x of arr)` + iterator protocol (`Symbol.iterator`, `next()`).                                                             | [x]    | cf63969 |
 | M31      | `for (k in obj)` + property iteration.                                                                                         | [ ]    |        |
 | M32      | Promise runtime + microtask queue.                                                                                             | [ ]    |        |
 | M33      | `async` functions + `await` expression.                                                                                         | [ ]    |        |
@@ -121,6 +121,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | Class `extends` heritage + `super.x` / `super[k]` / `super.m(args)` / `super(args)` in derived constructors; default derived ctor synthesis `constructor(...args) { super(...args); }`; home-object wiring for methods + constructor | yes | M28 |
 | Class public + private instance fields (`x = …`, `#x = …`), static fields, `get` / `set` accessor methods (instance + static), `this.#x` / `obj.#x` read+write + compound `<op>=`, `#name in obj`; private methods/accessors deferred | yes | M29 |
 | Private methods + private get/set accessors (`#m()`, `get #p()`, `set #p(v)`; instance + static), `obj.#m(args)` invocation, and `static { … }` blocks evaluated at class-definition time with `this = class` | yes | M29.5 |
+| `for (<let\|const\|ident> of <iterable>) body` over built-in iterables (Array/String/TypedArray) via `GetIterator` + new `IteratorStep` opcode; `break` / `continue` wired through the loop-label stack; `for await`, destructuring LHS, `var` LHS, custom Symbol.iterator iterables deferred | yes | M30 |
 
 ## Benchmarks
 

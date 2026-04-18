@@ -457,28 +457,59 @@ fn lower_function_body<'a>(
     let mut builder = BytecodeBuilder::new();
     let mut ctx = LoweringContext::new(params, param_count, function_names);
 
+    // Split-off for the tail statement. Empty bodies stay rejected
+    // since the frame layout still needs some instruction to exit
+    // through; a caller could fall through to the synthesized
+    // `LdaUndefined; Return` below but callers that pass `{}`
+    // typically expect a stronger signal.
     let Some((last, rest)) = body.statements.split_last() else {
         return Err(SourceLoweringError::unsupported("empty_body", body.span));
     };
 
+    // Two tail shapes are accepted:
+    //   1. Explicit `return <expr>;` — lower the expression into
+    //      acc, then `Return`. Matches the historical M6 contract.
+    //   2. Any other statement — lower it as usual, then synthesize
+    //      `LdaUndefined; Return` so the function exits with the
+    //      undefined completion per §15.2.1 (FunctionBody evaluation
+    //      falls through to `return undefined` when no explicit
+    //      return is taken). This unlocks the natural
+    //      `function main() { console.log("hi"); }` shape — prior
+    //      to M19 the lowering required a spurious trailing
+    //      `return` which is not how real JS is written.
+    //
+    // Bare `return;` with no argument is lowered by the second arm
+    // because oxc represents it as a `ReturnStatement` with
+    // `argument == None`, which `lower_nested_statement` handles as
+    // `LdaUndefined; Return` directly.
     for stmt in rest {
         lower_top_statement(&mut builder, &mut ctx, stmt)?;
     }
-
-    let Statement::ReturnStatement(ret) = last else {
-        return Err(SourceLoweringError::unsupported(
-            "missing_return",
-            last.span(),
-        ));
+    let needs_synthetic_return = match last {
+        Statement::ReturnStatement(ret) if ret.argument.is_some() => {
+            let argument = ret.argument.as_ref().expect("checked Some above");
+            lower_return_expression(&mut builder, &ctx, argument)?;
+            builder
+                .emit(Opcode::Return, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
+            false
+        }
+        _ => {
+            // Lower the statement (call-statement, assignment, if,
+            // while, block, bare `return;`, …) — it must be a
+            // shape `lower_top_statement` already accepts.
+            lower_top_statement(&mut builder, &mut ctx, last)?;
+            true
+        }
     };
-    let argument = ret
-        .argument
-        .as_ref()
-        .ok_or_else(|| SourceLoweringError::unsupported("return_without_value", ret.span))?;
-    lower_return_expression(&mut builder, &ctx, argument)?;
-    builder
-        .emit(Opcode::Return, &[])
-        .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
+    if needs_synthetic_return {
+        builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaUndefined (synth return): {err:?}"))
+        })?;
+        builder.emit(Opcode::Return, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Return (synth): {err:?}"))
+        })?;
+    }
 
     let bytecode = builder
         .finish()
@@ -560,10 +591,22 @@ fn lower_nested_statement<'a>(
             lower_continue_statement(builder, ctx, cont_stmt)
         }
         Statement::ReturnStatement(ret) => {
-            let argument = ret.argument.as_ref().ok_or_else(|| {
-                SourceLoweringError::unsupported("return_without_value", ret.span)
-            })?;
-            lower_return_expression(builder, ctx, argument)?;
+            // §14.9 — `return;` returns `undefined`. Bare `return`
+            // without an argument lowers to `LdaUndefined; Return`;
+            // `return <expr>;` evaluates the expression into acc
+            // and exits.
+            match ret.argument.as_ref() {
+                Some(argument) => {
+                    lower_return_expression(builder, ctx, argument)?;
+                }
+                None => {
+                    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaUndefined (bare return): {err:?}"
+                        ))
+                    })?;
+                }
+            }
             builder
                 .emit(Opcode::Return, &[])
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;

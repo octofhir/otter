@@ -218,50 +218,39 @@ fn unbound_identifier_unsupported() {
 }
 
 #[test]
-fn missing_trailing_return_after_dead_code_unsupported() {
-    // The compiler always requires the *last* statement to be a
-    // `ReturnStatement`. Putting a non-return statement after a
-    // return therefore fails the trailing-return check rather than
-    // being flagged as dead code (M6 has no reachability analysis;
-    // the same tag will fire whether the earlier statements covered
-    // every path or not).
-    let err =
-        compile("function f() { return 1; let x = 2; }").expect_err("non-return as last statement");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "missing_return",
-            ..
-        }
-    ));
+fn missing_trailing_return_returns_undefined() {
+    // M19 follow-up: the source compiler used to require the
+    // last statement to be `return <expr>;`. Real JS doesn't —
+    // `function f() { let x = 2; }` returns `undefined`. The
+    // lowering now synthesizes `LdaUndefined; Return` after any
+    // non-return tail statement. (§15.2.1 FunctionBody evaluation.)
+    let module = compile("function f() { let x = 1; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value(), RegisterValue::undefined());
 }
 
 #[test]
-fn missing_return_unsupported() {
-    // M4 keeps M1's "exactly one return required" invariant — the v2
-    // dispatcher relies on every function path ending at a `Return`
-    // for the tier-up call exit. Falling off the end of the body is
-    // valid JS (returns undefined) but not yet wired here.
-    let err = compile("function f() { let x = 1; }").expect_err("body without return");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "missing_return",
-            ..
-        }
-    ));
-}
-
-#[test]
-fn return_without_value_unsupported() {
-    let err = compile("function f() { return; }").expect_err("bare return at M4+");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "return_without_value",
-            ..
-        }
-    ));
+fn bare_return_returns_undefined() {
+    // §14.9 — `return;` exits with `undefined`. The lowering used
+    // to reject this with `return_without_value`; M19 follow-up
+    // emits `LdaUndefined; Return` instead.
+    let module = compile("function f() { return; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value(), RegisterValue::undefined());
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,20 +1269,31 @@ fn comparison_with_unsupported_operator_falls_through_to_binary() {
 }
 
 #[test]
-fn if_with_return_only_branch_still_requires_trailing_return() {
-    // `if (n > 0) return n;` has a return inside the if branch —
-    // but the function still falls through if n <= 0. M6 doesn't
-    // synthesize a fall-through return, so the body must still end
-    // with one.
-    let err = compile("function f(n) { if (n > 0) return n; }")
-        .expect_err("missing trailing return at M6");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "missing_return",
-            ..
-        }
-    ));
+fn if_with_return_only_branch_falls_through_to_undefined() {
+    // `if (n > 0) return n;` returns `n` when taken, and
+    // `undefined` when the `if` branch isn't taken. M19 follow-up
+    // synthesizes the `LdaUndefined; Return` tail so the
+    // not-taken path exits correctly without the programmer
+    // writing a second explicit `return`.
+    let module = compile("function f(n) { if (n > 0) return n; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    // n = 0 → fall through → undefined.
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    registers[hidden] = RegisterValue::from_i32(0);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value(), RegisterValue::undefined());
+    // n = 5 → if branch taken → 5.
+    registers[hidden] = RegisterValue::from_i32(5);
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    assert_eq!(result.return_value().as_i32(), Some(5));
 }
 
 // ---------------------------------------------------------------------------
@@ -4025,6 +4025,33 @@ fn method_call_with_nested_member_receiver() {
         "function main() { let w = { c: console }; return w.c.log(\"nested\"); }",
     );
     assert_eq!(capture.lines()[0].message, "nested");
+}
+
+#[test]
+fn natural_hello_world_without_return() {
+    // The canonical "hello world" shape: bare `console.log` at
+    // statement position, no trailing `return`. Real JS code looks
+    // like this — M19 follow-up synthesizes the trailing
+    // `LdaUndefined; Return` so programmers don't have to.
+    let (capture, ret) =
+        compile_and_run_with_capture("function main() { console.log(\"hello world\"); }");
+    assert_eq!(ret, RegisterValue::undefined());
+    assert_eq!(capture.lines().len(), 1);
+    assert_eq!(capture.lines()[0].message, "hello world");
+}
+
+#[test]
+fn statement_position_call_followed_by_other_statement() {
+    // Two statement-position calls in sequence, no explicit
+    // return. The synthesized tail return still runs after the
+    // second call, and both messages reach the capture backend
+    // in source order.
+    let (capture, _ret) =
+        compile_and_run_with_capture("function main() { console.log(\"a\"); console.log(\"b\"); }");
+    let lines = capture.lines();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].message, "a");
+    assert_eq!(lines[1].message, "b");
 }
 
 #[test]

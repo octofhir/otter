@@ -61,7 +61,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M20      | `SwitchStatement` with `case` / `default` + `break` exits.                                                                     | [x]    | 5bd4a2d |
 | M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [x]    | fe76e4b |
 | M22      | Default params (`function f(n = 0)`) + rest params (`...rest`).                                                                 | [x]    | 03cb16f |
-| M23      | Spread in call args + array literals (`f(...a)`, `[...a, ...b]`).                                                              | [ ]    |        |
+| M23      | Spread in call args + array literals (`f(...a)`, `[...a, ...b]`).                                                              | [x]    | _pending_ |
 | M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [ ]    |        |
 | M25      | Closures — nested `FunctionDeclaration` / `FunctionExpression` + upvalue capture.                                                | [ ]    |        |
 | M26      | Arrow functions + lexical `this` binding.                                                                                       | [ ]    |        |
@@ -113,6 +113,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `SwitchStatement` with `case` / `default` + `break` exits (fall-through, mid-switch default, nested, string/content compare) | yes | M20 |
 | `ThrowStatement` + `TryStatement` with `catch` / `finally` (nested, rethrow, bindingless catch; normal + exception paths only) | yes | M21 |
 | Multi-param signatures + default initializers + rest params + writable param bindings | yes | M22 |
+| Spread in `ArrayExpression` and method-call args (`[...a, ...b]`, `o.m(...xs)`); direct-call spread deferred | yes | M23 |
 
 ## Benchmarks
 

@@ -3019,12 +3019,25 @@ fn lower_array_expression(
 
     let lower = (|| -> Result<(), SourceLoweringError> {
         for element in &expr.elements {
-            let element_expr = match element {
+            match element {
                 ArrayExpressionElement::SpreadElement(spread) => {
-                    return Err(SourceLoweringError::unsupported(
-                        "spread_array_element",
-                        spread.span,
-                    ));
+                    // M23: `[...iter]` — iterate the spread
+                    // source and push each value. The
+                    // `SpreadIntoArray r_arr` opcode handles the
+                    // iterator protocol + push loop in the
+                    // dispatcher; here we just lower the source
+                    // into acc and emit the opcode.
+                    lower_return_expression(builder, ctx, &spread.argument)?;
+                    builder
+                        .emit(
+                            Opcode::SpreadIntoArray,
+                            &[Operand::Reg(u32::from(arr_temp))],
+                        )
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode SpreadIntoArray (array literal): {err:?}"
+                            ))
+                        })?;
                 }
                 ArrayExpressionElement::Elision(elision) => {
                     return Err(SourceLoweringError::unsupported(
@@ -3035,14 +3048,16 @@ fn lower_array_expression(
                 // Non-spread, non-hole element. `to_expression`
                 // downcasts the `Expression` variants inlined by
                 // `ArrayExpressionElement` back to `&Expression`.
-                other => other.to_expression(),
-            };
-            lower_return_expression(builder, ctx, element_expr)?;
-            builder
-                .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(arr_temp))])
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!("encode ArrayPush: {err:?}"))
-                })?;
+                other => {
+                    let element_expr = other.to_expression();
+                    lower_return_expression(builder, ctx, element_expr)?;
+                    builder
+                        .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(arr_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!("encode ArrayPush: {err:?}"))
+                        })?;
+                }
+            }
         }
         builder
             .emit(Opcode::Ldar, &[Operand::Reg(u32::from(arr_temp))])
@@ -4312,6 +4327,8 @@ fn lower_call_expression(
     ctx: &LoweringContext<'_>,
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+
     // Callee classification — strip a single layer of parens so
     // `(f)()` still works, then match on the inner shape. Member
     // callees go through the method-call path so `this` binds
@@ -4321,13 +4338,31 @@ fn lower_call_expression(
         Expression::ParenthesizedExpression(paren) => &paren.expression,
         other => other,
     };
+
+    // M23: any `...expr` argument forces the CallSpread path.
+    // `CallSpread` expects a receiver (direct calls don't have
+    // one), so direct-call-with-spread is rejected until a future
+    // milestone exposes top-level function handles as values.
+    let has_spread = call
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+
     match inner_callee {
-        Expression::Identifier(ident) => lower_direct_call(builder, ctx, call, ident),
+        Expression::Identifier(ident) => {
+            if has_spread {
+                return Err(SourceLoweringError::unsupported(
+                    "spread_in_direct_call",
+                    call.span,
+                ));
+            }
+            lower_direct_call(builder, ctx, call, ident)
+        }
         Expression::StaticMemberExpression(member) => {
-            lower_static_method_call(builder, ctx, call, member)
+            lower_static_method_call(builder, ctx, call, member, has_spread)
         }
         Expression::ComputedMemberExpression(member) => {
-            lower_computed_method_call(builder, ctx, call, member)
+            lower_computed_method_call(builder, ctx, call, member, has_spread)
         }
         other => Err(SourceLoweringError::unsupported(
             "non_identifier_callee",
@@ -4380,11 +4415,17 @@ fn lower_direct_call<'a>(
 /// Method name is interned into the function's
 /// `PropertyNameTable`, matching the M17 `LdaNamedProperty`
 /// lowering.
+///
+/// When `has_spread` is `true` the caller observed at least one
+/// `...expr` argument; the args are collected into a single Array
+/// via `ArrayPush` / `SpreadIntoArray`, and the call is dispatched
+/// via `CallSpread` instead of `CallProperty`.
 fn lower_static_method_call<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
     call: &oxc_ast::ast::CallExpression<'a>,
     member: &StaticMemberExpression<'a>,
+    has_spread: bool,
 ) -> Result<(), SourceLoweringError> {
     if member.optional {
         return Err(SourceLoweringError::unsupported(
@@ -4392,13 +4433,23 @@ fn lower_static_method_call<'a>(
             member.span,
         ));
     }
-    let argc = RegisterIndex::try_from(call.arguments.len())
-        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
     let receiver_temp = ctx.acquire_temps(1)?;
     let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
-    let args_base = ctx
-        .acquire_temps(argc)
-        .inspect_err(|_| ctx.release_temps(2))?;
+    let (args_base, argc) = if has_spread {
+        // One temp — holds the args-array handle.
+        (
+            ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?,
+            1u16,
+        )
+    } else {
+        let n = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+        (
+            ctx.acquire_temps(n).inspect_err(|_| ctx.release_temps(2))?,
+            n,
+        )
+    };
+    let args_temp_count = argc;
 
     let lower = (|| -> Result<(), SourceLoweringError> {
         // Receiver → r_receiver.
@@ -4425,30 +4476,21 @@ fn lower_static_method_call<'a>(
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Star (method callee): {err:?}"))
             })?;
-        // Args → r_args[…].
-        lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
-        // CallProperty r_callee, r_receiver, args.
-        builder
-            .emit(
-                Opcode::CallProperty,
-                &[
-                    Operand::Reg(u32::from(callee_temp)),
-                    Operand::Reg(u32::from(receiver_temp)),
-                    Operand::RegList {
-                        base: u32::from(args_base),
-                        count: u32::from(argc),
-                    },
-                ],
-            )
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode CallProperty: {err:?}"))
-            })?;
+        emit_call_args_and_invoke(
+            builder,
+            ctx,
+            call,
+            callee_temp,
+            receiver_temp,
+            args_base,
+            has_spread,
+        )?;
         Ok(())
     })();
     // Release in LIFO order — args first, then (callee + receiver)
     // collapsed into a single release since the pool is just a
     // counter.
-    ctx.release_temps(argc);
+    ctx.release_temps(args_temp_count);
     ctx.release_temps(2);
     lower
 }
@@ -4458,12 +4500,14 @@ fn lower_static_method_call<'a>(
 /// the `CallProperty` emission mirrors the static-method path.
 /// Receiver, key, callee, and args each occupy their own temp so
 /// the evaluation order stays spec-compliant
-/// (receiver → key → arguments → call).
+/// (receiver → key → arguments → call). `has_spread` flips the
+/// args emission + call opcode to the `CallSpread` path.
 fn lower_computed_method_call<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
     call: &oxc_ast::ast::CallExpression<'a>,
     member: &ComputedMemberExpression<'a>,
+    has_spread: bool,
 ) -> Result<(), SourceLoweringError> {
     if member.optional {
         return Err(SourceLoweringError::unsupported(
@@ -4471,13 +4515,22 @@ fn lower_computed_method_call<'a>(
             member.span,
         ));
     }
-    let argc = RegisterIndex::try_from(call.arguments.len())
-        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
     let receiver_temp = ctx.acquire_temps(1)?;
     let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
-    let args_base = ctx
-        .acquire_temps(argc)
-        .inspect_err(|_| ctx.release_temps(2))?;
+    let (args_base, argc) = if has_spread {
+        (
+            ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?,
+            1u16,
+        )
+    } else {
+        let n = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+        (
+            ctx.acquire_temps(n).inspect_err(|_| ctx.release_temps(2))?,
+            n,
+        )
+    };
+    let args_temp_count = argc;
 
     let lower = (|| -> Result<(), SourceLoweringError> {
         // Receiver.
@@ -4506,6 +4559,47 @@ fn lower_computed_method_call<'a>(
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Star (computed callee): {err:?}"))
             })?;
+        emit_call_args_and_invoke(
+            builder,
+            ctx,
+            call,
+            callee_temp,
+            receiver_temp,
+            args_base,
+            has_spread,
+        )?;
+        Ok(())
+    })();
+    ctx.release_temps(args_temp_count);
+    ctx.release_temps(2);
+    lower
+}
+
+/// Shared emission helper for the "args + call opcode" tail of a
+/// method call. Branches on `has_spread`:
+///
+/// - Non-spread: lowers each arg into consecutive temps starting
+///   at `args_base` (via `lower_call_arguments_into_temps`) and
+///   emits `CallProperty r_callee, r_receiver, RegList{args_base,
+///   argc}`.
+/// - Spread: treats `args_base` as a single temp holding an
+///   Array. Emits `CreateArray; Star r_args; <push/spread per
+///   arg>; CallSpread r_callee, r_receiver, RegList{args_base,
+///   1}`. The `CallSpread` dispatch unpacks the array into
+///   individual args before invoking the callable.
+fn emit_call_args_and_invoke<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    callee_temp: RegisterIndex,
+    receiver_temp: RegisterIndex,
+    args_base: RegisterIndex,
+    has_spread: bool,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+    if !has_spread {
+        let argc = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
         lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
         builder
             .emit(
@@ -4520,13 +4614,61 @@ fn lower_computed_method_call<'a>(
                 ],
             )
             .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode CallProperty (computed): {err:?}"))
+                SourceLoweringError::Internal(format!("encode CallProperty: {err:?}"))
             })?;
-        Ok(())
-    })();
-    ctx.release_temps(argc);
-    ctx.release_temps(2);
-    lower
+        return Ok(());
+    }
+
+    // Spread path — build an Array of args, then CallSpread.
+    builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("encode CreateArray (spread args): {err:?}"))
+    })?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(args_base))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (spread args): {err:?}"))
+        })?;
+    for arg in call.arguments.iter() {
+        match arg {
+            Argument::SpreadElement(spread) => {
+                lower_return_expression(builder, ctx, &spread.argument)?;
+                builder
+                    .emit(
+                        Opcode::SpreadIntoArray,
+                        &[Operand::Reg(u32::from(args_base))],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode SpreadIntoArray (spread arg): {err:?}"
+                        ))
+                    })?;
+            }
+            other => {
+                lower_return_expression(builder, ctx, other.to_expression())?;
+                builder
+                    .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(args_base))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode ArrayPush (spread arg slot): {err:?}"
+                        ))
+                    })?;
+            }
+        }
+    }
+    builder
+        .emit(
+            Opcode::CallSpread,
+            &[
+                Operand::Reg(u32::from(callee_temp)),
+                Operand::Reg(u32::from(receiver_temp)),
+                Operand::RegList {
+                    base: u32::from(args_base),
+                    count: 1,
+                },
+            ],
+        )
+        .map_err(|err| SourceLoweringError::Internal(format!("encode CallSpread: {err:?}")))?;
+    Ok(())
 }
 
 /// Lowers each `CallExpression` argument into the accumulator and

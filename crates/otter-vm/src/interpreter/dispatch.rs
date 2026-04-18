@@ -835,6 +835,72 @@ impl Interpreter {
                     Err(other) => return Ok(other),
                 }
             }
+            // `CallSpread r_callee, r_receiver, RegList { base: r_args, count: 1 }`
+            // — method-style call whose argument list is a single
+            // Array held in the register pointed to by the RegList.
+            // The interpreter unpacks the array's elements into
+            // individual arguments before dispatching through
+            // `call_callable_bytecode`. The compiler builds the
+            // args array inline (see `lower_call_with_spread`)
+            // using `ArrayPush` + `SpreadIntoArray`, so every
+            // spread is flattened by the time the Array reaches
+            // this opcode.
+            Opcode::CallSpread => {
+                let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let receiver = read_reg(activation, function, reg(&instr.operands, 1)?)?;
+                let (base, count) = reg_list(&instr.operands, 2)?;
+                if count != 1 {
+                    let err = runtime
+                        .alloc_type_error("CallSpread expects a single args-array operand")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                }
+                let base_idx = RegisterIndex::try_from(base).map_err(|_| {
+                    InterpreterError::NativeCall("CallSpread args register overflow".into())
+                })?;
+                let args_val = read_reg(activation, function, base_idx)?;
+                let Some(args_handle) =
+                    args_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err =
+                        runtime.alloc_type_error("CallSpread args must be an Array object")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let len = match runtime.objects.array_length(args_handle) {
+                    Ok(Some(n)) => n,
+                    _ => {
+                        let err =
+                            runtime.alloc_type_error("CallSpread args must be an Array object")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                };
+                let mut args: Vec<RegisterValue> = Vec::with_capacity(len);
+                for i in 0..len {
+                    let v = runtime
+                        .objects
+                        .get_index(args_handle, i)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(RegisterValue::undefined);
+                    args.push(v);
+                }
+                let Some(callable) = target.as_object_handle() else {
+                    let err = runtime.alloc_type_error("Value is not callable")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                match self.call_callable_bytecode(
+                    runtime,
+                    crate::object::ObjectHandle(callable),
+                    receiver,
+                    &args,
+                ) {
+                    Ok(value) => {
+                        activation.refresh_open_upvalues_from_cells(runtime)?;
+                        activation.set_accumulator(value);
+                    }
+                    Err(StepOutcome::Throw(v)) => return Ok(StepOutcome::Throw(v)),
+                    Err(other) => return Ok(other),
+                }
+            }
             // §14.6 Tail-position calls: replace the current activation
             // with the callee's frame instead of nesting. The outer loop
             // at `run_completion_with_runtime` handles
@@ -1080,6 +1146,47 @@ impl Interpreter {
                     let err = runtime.alloc_type_error("ArrayPush target is not an array")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                 }
+            }
+
+            // `SpreadIntoArray r_arr` — iterates the value in acc
+            // via the iterator protocol and pushes each produced
+            // value into `r_arr` (an Array). Used by the compiler
+            // to expand `...iterable` inside an array literal or
+            // while building a CallSpread argument array.
+            //
+            // §13.2.4 ArrayAccumulation — spread element case.
+            Opcode::SpreadIntoArray => {
+                let arr_val = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let Some(arr) = arr_val.as_object_handle().map(crate::object::ObjectHandle) else {
+                    let err = runtime.alloc_type_error("SpreadIntoArray target is not an array")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let source = activation.accumulator();
+                let Some(source_handle) =
+                    source.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err = runtime.alloc_type_error("Spread argument is not iterable")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let iter = match runtime.objects.alloc_iterator(source_handle) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        let err = runtime.alloc_type_error("Spread argument is not iterable")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                };
+                loop {
+                    let step = runtime.iterator_next(iter)?;
+                    if step.is_done() {
+                        break;
+                    }
+                    if runtime.objects.push_element(arr, step.value()).is_err() {
+                        let err = runtime.alloc_type_error("SpreadIntoArray push failed")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+                // Leave acc untouched — callers that need the array
+                // read it from the register.
             }
 
             // ---- Control ----

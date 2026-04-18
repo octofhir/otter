@@ -208,6 +208,13 @@ pub enum Opcode {
     // §5.12 Modules
     DynamicImport = 0x98,
     ImportMeta = 0x99,
+
+    // §15.7.14 Class heritage — wires `Sub.__proto__ = Super` and
+    // `Sub.prototype.__proto__ = Super.prototype` per
+    // ClassDefinitionEvaluation steps 6-7. Added in M28 so the
+    // compiler can set up derived-class prototype chains without
+    // depending on the `Object.setPrototypeOf` intrinsic.
+    SetClassHeritage = 0x9A,
     // 0xFE, 0xFF are reserved for Wide / ExtraWide prefixes. Max legal
     // opcode discriminant is 0xFD.
 }
@@ -402,6 +409,7 @@ impl Opcode {
             0x97 => ThrowConstAssign,
             0x98 => DynamicImport,
             0x99 => ImportMeta,
+            0x9A => SetClassHeritage,
             _ => return None,
         })
     }
@@ -521,6 +529,9 @@ impl Opcode {
             // §5.12
             DynamicImport => OperandShape::of(&[Reg]),
             ImportMeta => OperandShape::of(&[]),
+
+            // §15.7.14 ClassDefinitionEvaluation — heritage wiring.
+            SetClassHeritage => OperandShape::of(&[Reg, Reg]),
         }
     }
 
@@ -689,6 +700,7 @@ impl Opcode {
             ThrowConstAssign => "ThrowConstAssign",
             DynamicImport => "DynamicImport",
             ImportMeta => "ImportMeta",
+            SetClassHeritage => "SetClassHeritage",
         }
     }
 

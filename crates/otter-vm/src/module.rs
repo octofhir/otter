@@ -274,6 +274,18 @@ impl Function {
         self
     }
 
+    /// Sets the derived-class-constructor flag in place.
+    ///
+    /// Mutator companion to [`Self::with_derived_constructor`] — used
+    /// by the source compiler after a function has already been
+    /// pushed onto the shared module list (M28: derived constructors
+    /// are identified only after `lower_inner_callable` returns, so
+    /// the flag is applied post-hoc rather than threaded through the
+    /// helper's signature).
+    pub fn set_derived_constructor(&mut self, derived_constructor: bool) {
+        self.derived_constructor = derived_constructor;
+    }
+
     /// Returns whether this function is a derived class constructor.
     #[must_use]
     pub const fn is_derived_constructor(&self) -> bool {

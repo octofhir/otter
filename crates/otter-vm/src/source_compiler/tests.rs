@@ -5452,15 +5452,160 @@ fn class_expression_static_method() {
     assert_eq!(run_int32_function(src, &[]), 5);
 }
 
+// ---------------------------------------------------------------------------
+// M28: Class inheritance (extends + super + super() in constructor)
+// ---------------------------------------------------------------------------
+
 #[test]
-fn class_extends_still_unsupported() {
-    // `extends` lands with M28.
-    let err = compile("function main() { class A {} class B extends A {} }").expect_err("extends");
+fn m28_extends_preserves_prototype_chain() {
+    // §15.7.14 step 7 — `Sub.prototype.__proto__ = Super.prototype`.
+    // We can't call `instanceof` yet (that's a later milestone),
+    // so exercise the inheritance via a parent instance method
+    // being reachable from a Sub instance through the
+    // prototype chain.
+    let src = "function main() { \
+        class Animal { hello() { return 77; } } \
+        class Dog extends Animal {} \
+        let d = new Dog(); \
+        return d.hello(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 77);
+}
+
+#[test]
+fn m28_super_method_called_from_instance_method() {
+    // `super.greet()` resolves against `Parent.prototype` but
+    // invokes with `this = child instance`, so `this.tag` reads
+    // the child's own property.
+    let src = "function main() { \
+        class Parent { greet() { return this.tag + 10; } } \
+        class Child extends Parent { \
+            constructor() { super(); this.tag = 5; } \
+            call() { return super.greet(); } \
+        } \
+        let c = new Child(); \
+        return c.call(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 15);
+}
+
+#[test]
+fn m28_super_call_initializes_this_in_derived_ctor() {
+    // `super(args)` must run before `this.x` in a derived ctor
+    // (§10.2.1.3 derived-path step 12). `x` below is forwarded to
+    // the parent and then read back through `this`.
+    let src = "function main() { \
+        class Base { constructor(x) { this.x = x; } } \
+        class Sub extends Base { \
+            constructor(x, y) { super(x); this.y = y; } \
+            sum() { return this.x + this.y; } \
+        } \
+        let s = new Sub(3, 4); \
+        return s.sum(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn m28_derived_class_without_explicit_constructor() {
+    // §15.7.14 step 10.b — the synthesised default ctor forwards
+    // all args to `super(...args)`. Parent's constructor stores
+    // `x`, which the child inherits transparently.
+    let src = "function main() { \
+        class Parent { constructor(x) { this.x = x; } } \
+        class Child extends Parent {} \
+        let c = new Child(21); \
+        return c.x + c.x; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn m28_static_chain_walks_via_extends() {
+    // §15.7.14 step 6 — `Sub.__proto__ = Super`. Accessing
+    // `Sub.parentStatic` walks up the constructor chain to
+    // `Super.parentStatic`.
+    let src = "function main() { \
+        class Base { static tag() { return 99; } } \
+        class Sub extends Base {} \
+        return Sub.tag(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 99);
+}
+
+#[test]
+fn m28_super_static_method_from_static_method() {
+    // `super.tag()` inside a static method of `Sub` resolves to
+    // `Base.tag` via the static-chain HomeObject.
+    let src = "function main() { \
+        class Base { static tag() { return 7; } } \
+        class Sub extends Base { \
+            static doubled() { return super.tag() * 2; } \
+        } \
+        return Sub.doubled(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 14);
+}
+
+#[test]
+fn m28_super_property_read() {
+    // `super.x` in a method — data property lookup on
+    // `Parent.prototype`. The parent's prototype has `answer: 42`.
+    let src = "function main() { \
+        class Parent {} \
+        Parent.prototype.answer = 42; \
+        class Child extends Parent { \
+            ask() { return super.answer; } \
+        } \
+        return new Child().ask(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn m28_super_property_assignment_writes_to_this() {
+    // §13.3.7 — `super.x = v` writes to `this` (not to the
+    // super prototype), using `this` as the `[[Set]]` receiver.
+    let src = "function main() { \
+        class Parent {} \
+        class Child extends Parent { \
+            constructor() { super(); super.slot = 9; } \
+        } \
+        return new Child().slot; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 9);
+}
+
+#[test]
+fn m28_super_outside_class_is_unsupported() {
+    // `super` used in a regular function body has no enclosing
+    // `ClassSuperBinding` — the compiler surfaces
+    // `super_outside_class` at lowering time.
+    let err = compile("function main() { super.x; }").expect_err("super outside class must reject");
     assert!(
         matches!(
             err,
             SourceLoweringError::Unsupported {
-                construct: "class_extends",
+                construct: "super_outside_class",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn m28_super_call_in_base_class_is_unsupported() {
+    // Base-class constructor — `ClassSuperBinding` exists but
+    // `allow_super_call` is false. Reject with the dedicated
+    // tag so future tests can grep for it.
+    let err = compile("function main() { class Base { constructor() { super(); } } new Base(); }")
+        .expect_err("super() outside derived class must reject");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "super_call_in_non_derived_class",
                 ..
             }
         ),

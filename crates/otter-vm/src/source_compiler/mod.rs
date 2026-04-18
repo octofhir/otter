@@ -689,8 +689,16 @@ fn lower_function_body<'a>(
     function_names: &'a [&'a str],
     module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
 ) -> Result<FunctionBodyOutput, SourceLoweringError> {
-    lower_function_body_with_parent(body, params, layout, function_names, module_functions, None)
-        .map(|(out, _captures)| out)
+    lower_function_body_with_parent(
+        body,
+        params,
+        layout,
+        function_names,
+        module_functions,
+        None,
+        None,
+    )
+    .map(|(out, _captures)| out)
 }
 
 fn lower_function_body_with_parent<'a>(
@@ -700,6 +708,7 @@ fn lower_function_body_with_parent<'a>(
     function_names: &'a [&'a str],
     module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
     parent: Option<&'a LoweringContext<'a>>,
+    class_super_binding: Option<ClassSuperBinding>,
 ) -> Result<(FunctionBodyOutput, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
     if !body.directives.is_empty() {
         return Err(SourceLoweringError::unsupported(
@@ -709,7 +718,13 @@ fn lower_function_body_with_parent<'a>(
     }
 
     let mut builder = BytecodeBuilder::new();
-    let mut ctx = LoweringContext::with_parent(layout, function_names, module_functions, parent);
+    let mut ctx = LoweringContext::with_parent(
+        layout,
+        function_names,
+        module_functions,
+        parent,
+        class_super_binding,
+    );
 
     // §14.1.21 FunctionDeclarationInstantiation — evaluate default
     // initializers for any param whose caller-supplied value is
@@ -1912,6 +1927,31 @@ struct LoweringContext<'a> {
     /// would otherwise propagate invariance through every
     /// function signature that touches `ctx`.
     captures: RefCell<Vec<CaptureEntry>>,
+    /// M28: super-expression eligibility for the current function.
+    /// `None` for ordinary functions; `Some` only when this
+    /// `LoweringContext` is compiling a class method, getter,
+    /// setter, or constructor.
+    ///
+    /// Arrow functions inside a class method do NOT inherit this
+    /// flag in M28 — the source compiler rejects `super` inside
+    /// arrows with `super_in_arrow`. The runtime's
+    /// `[[HomeObject]]` inheritance on arrow closures would cover
+    /// the runtime side, but without the compile-time gating the
+    /// compiler cannot validate out-of-class `super` uses.
+    class_super_binding: Option<ClassSuperBinding>,
+}
+
+/// §13.3.7 / §15.7.14 — per-function metadata describing which
+/// forms of `super` are syntactically valid inside the function's
+/// body.
+#[derive(Debug, Clone, Copy)]
+struct ClassSuperBinding {
+    /// `super.x` / `super[k]` / `super.m(args)` — allowed for any
+    /// class method / getter / setter / constructor. Gated by the
+    /// presence of `[[HomeObject]]` on the active closure.
+    allow_super_property: bool,
+    /// `super(args)` — allowed only in derived-class constructors.
+    allow_super_call: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1969,7 +2009,7 @@ impl<'a> LoweringContext<'a> {
         function_names: &'a [&'a str],
         module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
     ) -> Self {
-        Self::with_parent(layout, function_names, module_functions, None)
+        Self::with_parent(layout, function_names, module_functions, None, None)
     }
 
     fn with_parent(
@@ -1977,6 +2017,7 @@ impl<'a> LoweringContext<'a> {
         function_names: &'a [&'a str],
         module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
         parent: Option<&'a LoweringContext<'a>>,
+        class_super_binding: Option<ClassSuperBinding>,
     ) -> Self {
         let param_names = layout.names.clone();
         let param_count = RegisterIndex::try_from(param_names.len()).unwrap_or(u16::MAX);
@@ -1999,6 +2040,7 @@ impl<'a> LoweringContext<'a> {
             module_functions,
             parent,
             captures: RefCell::new(Vec::new()),
+            class_super_binding,
         }
     }
 
@@ -3512,13 +3554,19 @@ fn lower_class_expression<'a>(
     lower_class_body_core(builder, ctx, class, hint)
 }
 
-/// Shared core for `ClassDeclaration` + `ClassExpression`: validates
-/// class elements, lowers the constructor (real or synthesised)
-/// with the `class_constructor` flag, lowers instance methods onto
+/// Shared core for `ClassDeclaration` + `ClassExpression`. Validates
+/// class elements, optionally evaluates the `extends` expression,
+/// lowers the constructor (real or synthesised) with the
+/// `class_constructor` flag, lowers instance methods onto
 /// `Constructor.prototype` and static methods onto the Constructor
-/// itself, and leaves the Constructor in acc. `name_hint` is the
-/// display name used for the synthesised empty constructor and
-/// passed through to `lower_inner_callable`.
+/// itself, wires `[[HomeObject]]` via `SetHomeObject` for every
+/// method + the constructor, and — for derived classes — emits
+/// `SetClassHeritage` so the runtime can link
+/// `Sub.__proto__ = Super` and `Sub.prototype.__proto__ =
+/// Super.prototype` (§15.7.14 ClassDefinitionEvaluation).
+///
+/// `name_hint` is the display name used for the synthesised empty
+/// constructor and passed through to `lower_inner_callable`.
 fn lower_class_body_core<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
@@ -3531,14 +3579,14 @@ fn lower_class_body_core<'a>(
             class.decorators[0].span,
         ));
     }
-    if class.super_class.is_some() {
-        return Err(SourceLoweringError::unsupported(
-            "class_extends",
-            class.span,
-        ));
-    }
     let class_name_owned: String = name_hint.map(str::to_owned).unwrap_or_default();
     let class_name: &str = &class_name_owned;
+    // §15.7.14 step 3 — the presence of `extends` puts us in a
+    // derived class, which changes constructor synthesis
+    // (`constructor(...args) { super(...args); }`), the
+    // default-receiver handling in `construct_callable`, and
+    // enables `super(args)` inside the constructor.
+    let is_derived = class.super_class.is_some();
 
     // 1) Locate the constructor (if any) + collect methods.
     let mut constructor_fn: Option<&'a Function<'a>> = None;
@@ -3605,70 +3653,134 @@ fn lower_class_body_core<'a>(
         }
     }
 
-    // 2) Lower the constructor — if none present, synthesise an
-    //    empty one so `new Foo()` still returns the allocated
-    //    receiver.
-    let ctor_idx = match constructor_fn {
-        Some(func) => {
-            let (idx, captures) = lower_inner_callable(
-                ctx,
-                &func.params,
-                func.body.as_ref().ok_or_else(|| {
-                    SourceLoweringError::unsupported("declared_only_function", func.span)
-                })?,
-                Some(class_name.to_owned()),
-            )?;
-            let pc = builder.pc();
-            // Constructor closure gets the class_constructor flag
-            // so plain `Foo()` (without `new`) throws TypeError.
-            let template = crate::closure::ClosureTemplate::with_flags(
-                crate::module::FunctionIndex(idx),
-                captures,
-                crate::object::ClosureFlags::class_constructor(),
-            );
-            ctx.record_closure_template(pc, template);
-            builder
-                .emit(Opcode::CreateClosure, &[Operand::Idx(idx), Operand::Imm(0)])
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode CreateClosure (class ctor): {err:?}"
-                    ))
-                })?;
-            idx
-        }
-        None => {
-            // Synthesise an empty constructor function.
-            let synthetic = synthesise_empty_constructor(ctx, class_name)?;
-            let pc = builder.pc();
-            let template = crate::closure::ClosureTemplate::with_flags(
-                crate::module::FunctionIndex(synthetic),
-                Vec::new(),
-                crate::object::ClosureFlags::class_constructor(),
-            );
-            ctx.record_closure_template(pc, template);
-            builder
-                .emit(
-                    Opcode::CreateClosure,
-                    &[Operand::Idx(synthetic), Operand::Imm(0)],
-                )
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode CreateClosure (empty ctor): {err:?}"
-                    ))
-                })?;
-            synthetic
-        }
+    // 2) Super-class eligibility flags for methods + constructor.
+    //    Methods (including static) allow `super.x`; derived
+    //    constructors additionally allow `super(args)`.
+    let method_super = ClassSuperBinding {
+        allow_super_property: true,
+        allow_super_call: false,
     };
-    let _ = ctor_idx;
+    let ctor_super = ClassSuperBinding {
+        allow_super_property: true,
+        allow_super_call: is_derived,
+    };
 
-    // 3) Spill constructor + prototype into temps for method
-    //    installation. The constructor also becomes the final
-    //    class binding in acc before the declarator `Star`.
-    let class_temp = ctx.acquire_temps(1)?;
-    let proto_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    // 3) Acquire heritage + spill temps. Ordering mirrors §15.7.14:
+    //    evaluate `superclass` first, then build the constructor
+    //    closure. Heritage temp is only allocated when `extends`
+    //    is present so non-derived classes keep their previous
+    //    two-slot temp footprint.
+    let heritage_temp: Option<RegisterIndex> = if is_derived {
+        Some(ctx.acquire_temps(1)?)
+    } else {
+        None
+    };
+    let class_temp = ctx.acquire_temps(1).inspect_err(|_| {
+        if is_derived {
+            ctx.release_temps(1);
+        }
+    })?;
+    let proto_temp = ctx.acquire_temps(1).inspect_err(|_| {
+        ctx.release_temps(1);
+        if is_derived {
+            ctx.release_temps(1);
+        }
+    })?;
+    let method_temp = ctx.acquire_temps(1).inspect_err(|_| {
+        ctx.release_temps(2);
+        if is_derived {
+            ctx.release_temps(1);
+        }
+    })?;
 
     let lower = (|| -> Result<(), SourceLoweringError> {
-        // acc = constructor (left over from CreateClosure above)
+        // §15.7.14 step 5 — evaluate the superclass expression
+        // before anything else, while the outer lexical context is
+        // still active. The runtime's `SetClassHeritage` opcode
+        // validates "null or constructor" after we've built the
+        // class constructor.
+        if let Some(super_expr) = class.super_class.as_ref() {
+            lower_return_expression(builder, ctx, super_expr)?;
+            let heritage = heritage_temp.expect("heritage_temp allocated when derived");
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(heritage))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Star (class heritage): {err:?}"))
+                })?;
+        }
+
+        // 4) Lower the constructor — if none present, synthesise
+        //    one. Derived classes with no explicit constructor get
+        //    `constructor(...args) { super(...args); }` per
+        //    §15.7.14 step 10.b; base classes stay with the
+        //    `function() {}` synthesis inherited from M27.
+        let ctor_idx = match constructor_fn {
+            Some(func) => {
+                let (idx, captures) = lower_inner_callable_with_super(
+                    ctx,
+                    &func.params,
+                    func.body.as_ref().ok_or_else(|| {
+                        SourceLoweringError::unsupported("declared_only_function", func.span)
+                    })?,
+                    Some(class_name.to_owned()),
+                    Some(ctor_super),
+                )?;
+                if is_derived {
+                    let mut fns = ctx.module_functions.borrow_mut();
+                    fns[idx as usize].set_derived_constructor(true);
+                }
+                let pc = builder.pc();
+                // Constructor closure gets the class_constructor
+                // flag so plain `Foo()` (without `new`) throws
+                // TypeError.
+                let template = crate::closure::ClosureTemplate::with_flags(
+                    crate::module::FunctionIndex(idx),
+                    captures,
+                    crate::object::ClosureFlags::class_constructor(),
+                );
+                ctx.record_closure_template(pc, template);
+                builder
+                    .emit(Opcode::CreateClosure, &[Operand::Idx(idx), Operand::Imm(0)])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode CreateClosure (class ctor): {err:?}"
+                        ))
+                    })?;
+                idx
+            }
+            None => {
+                let synthetic = if is_derived {
+                    let idx = synthesise_derived_default_constructor(ctx, class_name)?;
+                    let mut fns = ctx.module_functions.borrow_mut();
+                    fns[idx as usize].set_derived_constructor(true);
+                    idx
+                } else {
+                    synthesise_empty_constructor(ctx, class_name)?
+                };
+                let pc = builder.pc();
+                let template = crate::closure::ClosureTemplate::with_flags(
+                    crate::module::FunctionIndex(synthetic),
+                    Vec::new(),
+                    crate::object::ClosureFlags::class_constructor(),
+                );
+                ctx.record_closure_template(pc, template);
+                builder
+                    .emit(
+                        Opcode::CreateClosure,
+                        &[Operand::Idx(synthetic), Operand::Imm(0)],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode CreateClosure (class default ctor): {err:?}"
+                        ))
+                    })?;
+                synthetic
+            }
+        };
+        let _ = ctor_idx;
+
+        // acc = constructor — spill to r_class so we can install
+        // methods and statics against a stable register.
         builder
             .emit(Opcode::Star, &[Operand::Reg(u32::from(class_temp))])
             .map_err(|err| {
@@ -3696,24 +3808,94 @@ fn lower_class_body_core<'a>(
                 ))
             })?;
 
+        // 5) §15.7.14 steps 6-7 — wire the heritage. Must happen
+        //    BEFORE method installation so methods that capture the
+        //    class (e.g. `static zero() { return new Point(); }`)
+        //    observe a fully-initialized prototype chain. Any
+        //    subsequent `Get`/`Set` on `Super.prototype` from method
+        //    bodies relies on this link being in place.
+        if let Some(heritage) = heritage_temp {
+            builder
+                .emit(
+                    Opcode::SetClassHeritage,
+                    &[
+                        Operand::Reg(u32::from(class_temp)),
+                        Operand::Reg(u32::from(heritage)),
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode SetClassHeritage: {err:?}"))
+                })?;
+        }
+
+        // 6) §10.2.5 MakeMethod on the constructor — sets its
+        //    `[[HomeObject]]` to `Sub.prototype` so `super.foo` from
+        //    inside the constructor body walks the prototype chain
+        //    rather than the static chain. The acc still holds the
+        //    constructor after the earlier `Star`; we refresh it
+        //    through `class_temp` for SetHomeObject's target.
+        builder
+            .emit(
+                Opcode::SetHomeObject,
+                &[
+                    Operand::Reg(u32::from(class_temp)),
+                    Operand::Reg(u32::from(proto_temp)),
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode SetHomeObject (class ctor): {err:?}"))
+            })?;
+
+        // 7) Instance + static method installation. Each method
+        //    gets its own home object — instance methods use
+        //    `proto_temp`, static methods use `class_temp`. Both are
+        //    installed as plain data properties on the target.
         for (name, is_static, func) in methods.iter().copied() {
-            let (idx, captures) = lower_inner_callable(
+            let (idx, captures) = lower_inner_callable_with_super(
                 ctx,
                 &func.params,
                 func.body.as_ref().ok_or_else(|| {
                     SourceLoweringError::unsupported("declared_only_function", func.span)
                 })?,
                 Some(name.to_owned()),
+                Some(method_super),
             )?;
             let pc = builder.pc();
-            let template =
-                crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(idx), captures);
+            let template = crate::closure::ClosureTemplate::with_flags(
+                crate::module::FunctionIndex(idx),
+                captures,
+                crate::object::ClosureFlags::method(),
+            );
             ctx.record_closure_template(pc, template);
             builder
                 .emit(Opcode::CreateClosure, &[Operand::Idx(idx), Operand::Imm(0)])
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!(
                         "encode CreateClosure (class method): {err:?}"
+                    ))
+                })?;
+            // Spill into `method_temp` so we can stamp HomeObject
+            // without disturbing the accumulator's closure value;
+            // StaNamedProperty will still read it back from acc.
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(method_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (class method spill): {err:?}"
+                    ))
+                })?;
+            let home_reg = if is_static { class_temp } else { proto_temp };
+            builder
+                .emit(
+                    Opcode::SetHomeObject,
+                    &[
+                        Operand::Reg(u32::from(method_temp)),
+                        Operand::Reg(u32::from(home_reg)),
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode SetHomeObject (class method): {err:?}"
                     ))
                 })?;
             let name_idx = ctx.intern_property_name(name)?;
@@ -3730,7 +3912,7 @@ fn lower_class_body_core<'a>(
                 })?;
         }
 
-        // 4) Leave the constructor in acc — the caller (declaration
+        // 8) Leave the constructor in acc — the caller (declaration
         //    or expression path) decides whether to bind it anywhere.
         builder
             .emit(Opcode::Ldar, &[Operand::Reg(u32::from(class_temp))])
@@ -3739,8 +3921,85 @@ fn lower_class_body_core<'a>(
             })?;
         Ok(())
     })();
-    ctx.release_temps(2);
+    ctx.release_temps(3);
+    if is_derived {
+        ctx.release_temps(1);
+    }
     lower
+}
+
+/// §15.7.14 step 10.b — synthesises the default constructor for a
+/// derived class: `constructor(...args) { super(...args); }`.
+/// Builds the bytecode directly (no AST round-trip) so the
+/// synthesised function stays independent of the outer
+/// `LoweringContext`'s parameter layout.
+///
+/// Frame shape: 1 hidden (receiver) + 0 params + 1 local
+/// (`r_args` — the rest-args Array) + 1 temp. Bytecode:
+///
+/// ```text
+///   CreateRestParameters                 ; acc = Array(...args)
+///   Star r_args                          ; r_args = acc
+///   CallSuperSpread RegList{r_args, 1}   ; super(...args), acc = receiver
+///   LdaUndefined                         ; §10.2.1.3 derived ctors return
+///   Return                               ; undefined → use `this`
+/// ```
+///
+/// The derived-constructor flag is applied by the caller via
+/// [`VmFunction::set_derived_constructor`].
+fn synthesise_derived_default_constructor<'a>(
+    outer: &LoweringContext<'a>,
+    class_name: &str,
+) -> Result<u32, SourceLoweringError> {
+    // 1 hidden + 0 params + 1 local (rest array) + 0 temp. The
+    // RegList for CallSuperSpread operates on the local slot
+    // directly, so no extra scratch temp is needed.
+    let layout = FrameLayout::new(1, 0, 1, 0)
+        .map_err(|err| SourceLoweringError::Internal(format!("derived ctor layout: {err:?}")))?;
+    // The rest-args array lives at user-visible slot 0. Register
+    // operands carry user-visible indices; `read_bytecode_register`
+    // adds `hidden_count` at dispatch time, so we must not
+    // pre-resolve here.
+    let args_reg: RegisterIndex = 0;
+    let mut builder = BytecodeBuilder::new();
+    builder
+        .emit(Opcode::CreateRestParameters, &[])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!(
+                "encode CreateRestParameters (derived ctor): {err:?}"
+            ))
+        })?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(args_reg))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (derived ctor args): {err:?}"))
+        })?;
+    builder
+        .emit(
+            Opcode::CallSuperSpread,
+            &[Operand::RegList {
+                base: u32::from(args_reg),
+                count: 1,
+            }],
+        )
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode CallSuperSpread (derived ctor): {err:?}"))
+        })?;
+    builder
+        .emit(Opcode::LdaUndefined, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode LdaUndefined: {err:?}")))?;
+    builder
+        .emit(Opcode::Return, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
+    let bytecode = builder.finish().map_err(|err| {
+        SourceLoweringError::Internal(format!("finish derived default ctor: {err:?}"))
+    })?;
+    let func = VmFunction::with_empty_tables(Some(class_name.to_owned()), layout, bytecode);
+    let mut fns = outer.module_functions.borrow_mut();
+    let idx = u32::try_from(fns.len())
+        .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?;
+    fns.push(func);
+    Ok(idx)
 }
 
 /// Synthesises an empty class constructor function
@@ -3904,6 +4163,21 @@ fn lower_inner_callable<'a>(
     body: &'a FunctionBody<'a>,
     name: Option<String>,
 ) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
+    lower_inner_callable_with_super(outer, params, body, name, None)
+}
+
+/// M28 variant of [`lower_inner_callable`] that threads an explicit
+/// `class_super_binding` into the inner function's `LoweringContext`
+/// so class methods and constructors can validate `super.x` /
+/// `super(args)` uses against the surrounding class's heritage state.
+/// Callers outside `lower_class_body_core` always pass `None`.
+fn lower_inner_callable_with_super<'a>(
+    outer: &LoweringContext<'a>,
+    params: &'a FormalParameters<'a>,
+    body: &'a FunctionBody<'a>,
+    name: Option<String>,
+    class_super_binding: Option<ClassSuperBinding>,
+) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
     let params_layout = analyze_params(params)?;
     let param_count = params_layout.param_slot_count();
 
@@ -3914,6 +4188,7 @@ fn lower_inner_callable<'a>(
         outer.function_names,
         std::rc::Rc::clone(&outer.module_functions),
         Some(outer),
+        class_super_binding,
     )?;
 
     let layout = FrameLayout::new(1, param_count, body_out.local_count, body_out.temp_count)
@@ -4624,6 +4899,38 @@ fn lower_static_member_read(
             expr.span,
         ));
     }
+    // M28: `super.x` — §13.3.7 SuperReference. Uses the enclosing
+    // method's `[[HomeObject]]` (resolved at runtime inside the
+    // `GetSuperProperty` opcode) as the lookup base, and the
+    // current frame's `this` as the `[[Get]]` receiver.
+    if matches!(&expr.object, Expression::Super(_)) {
+        enforce_super_property_binding(ctx, &expr.object)?;
+        let receiver_temp = ctx.acquire_temps(1)?;
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            builder.emit(Opcode::LdaThis, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaThis (super.x): {err:?}"))
+            })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (super.x receiver): {err:?}"
+                    ))
+                })?;
+            let idx = ctx.intern_property_name(expr.property.name.as_str())?;
+            builder
+                .emit(
+                    Opcode::GetSuperProperty,
+                    &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode GetSuperProperty: {err:?}"))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(1);
+        return lower;
+    }
     let base = materialize_member_base(builder, ctx, &expr.object)?;
     let idx = ctx.intern_property_name(expr.property.name.as_str())?;
     builder
@@ -4662,6 +4969,48 @@ fn lower_computed_member_read(
             "optional_member_expression",
             expr.span,
         ));
+    }
+    // M28: `super[k]` — dynamic-key super property read. Receiver
+    // is `this`; key is evaluated into a dedicated temp so the
+    // `GetSuperPropertyComputed` operand shape `(Reg, Reg)` matches.
+    if matches!(&expr.object, Expression::Super(_)) {
+        enforce_super_property_binding(ctx, &expr.object)?;
+        let receiver_temp = ctx.acquire_temps(1)?;
+        let key_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            builder.emit(Opcode::LdaThis, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaThis (super[k]): {err:?}"))
+            })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (super[k] receiver): {err:?}"
+                    ))
+                })?;
+            lower_return_expression(builder, ctx, &expr.expression)?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Star (super[k] key): {err:?}"))
+                })?;
+            builder
+                .emit(
+                    Opcode::GetSuperPropertyComputed,
+                    &[
+                        Operand::Reg(u32::from(receiver_temp)),
+                        Operand::Reg(u32::from(key_temp)),
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode GetSuperPropertyComputed: {err:?}"
+                    ))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(2);
+        return lower;
     }
     let base = materialize_member_base(builder, ctx, &expr.object)?;
     lower_return_expression(builder, ctx, &expr.expression)?;
@@ -5608,6 +5957,66 @@ fn lower_static_member_assignment<'a>(
             member.span,
         ));
     }
+    // M28: `super.x = v` / `super.x <op>= v`. The super base is not
+    // materialised into a regular register; instead the LHS read
+    // goes through `GetSuperProperty` and the store through
+    // `SetSuperProperty`. Receiver register holds the current
+    // frame's `this`.
+    if matches!(&member.object, Expression::Super(_)) {
+        enforce_super_property_binding(ctx, &member.object)?;
+        let receiver_temp = ctx.acquire_temps(1)?;
+        let idx = ctx.intern_property_name(member.property.name.as_str())?;
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            builder.emit(Opcode::LdaThis, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaThis (super.x write): {err:?}"))
+            })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (super.x receiver): {err:?}"
+                    ))
+                })?;
+            if expr.operator == AssignmentOperator::Assign {
+                lower_return_expression(builder, ctx, &expr.right)?;
+            } else {
+                let bin_op =
+                    compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+                        SourceLoweringError::unsupported(
+                            assignment_operator_tag(expr.operator),
+                            expr.span,
+                        )
+                    })?;
+                let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+                    SourceLoweringError::Internal(format!(
+                        "compound assignment {bin_op:?} has no binary opcode encoding"
+                    ))
+                })?;
+                builder
+                    .emit(
+                        Opcode::GetSuperProperty,
+                        &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode GetSuperProperty (compound lhs): {err:?}"
+                        ))
+                    })?;
+                apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
+            }
+            builder
+                .emit(
+                    Opcode::SetSuperProperty,
+                    &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode SetSuperProperty: {err:?}"))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(1);
+        return lower;
+    }
     let base = materialize_member_base(builder, ctx, &member.object)?;
     let idx = ctx.intern_property_name(member.property.name.as_str())?;
 
@@ -5686,6 +6095,78 @@ fn lower_computed_member_assignment<'a>(
             "optional_member_expression",
             member.span,
         ));
+    }
+    // M28: `super[k] = v` / `super[k] <op>= v`. Receiver is `this`;
+    // key is spilled to a dedicated temp; writes go through
+    // `SetSuperPropertyComputed`.
+    if matches!(&member.object, Expression::Super(_)) {
+        enforce_super_property_binding(ctx, &member.object)?;
+        let receiver_temp = ctx.acquire_temps(1)?;
+        let key_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            builder.emit(Opcode::LdaThis, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaThis (super[k] write): {err:?}"))
+            })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (super[k] receiver): {err:?}"
+                    ))
+                })?;
+            lower_return_expression(builder, ctx, &member.expression)?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Star (super[k] key): {err:?}"))
+                })?;
+            if expr.operator == AssignmentOperator::Assign {
+                lower_return_expression(builder, ctx, &expr.right)?;
+            } else {
+                let bin_op =
+                    compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+                        SourceLoweringError::unsupported(
+                            assignment_operator_tag(expr.operator),
+                            expr.span,
+                        )
+                    })?;
+                let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+                    SourceLoweringError::Internal(format!(
+                        "compound assignment {bin_op:?} has no binary opcode encoding"
+                    ))
+                })?;
+                builder
+                    .emit(
+                        Opcode::GetSuperPropertyComputed,
+                        &[
+                            Operand::Reg(u32::from(receiver_temp)),
+                            Operand::Reg(u32::from(key_temp)),
+                        ],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode GetSuperPropertyComputed (compound lhs): {err:?}"
+                        ))
+                    })?;
+                apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
+            }
+            builder
+                .emit(
+                    Opcode::SetSuperPropertyComputed,
+                    &[
+                        Operand::Reg(u32::from(receiver_temp)),
+                        Operand::Reg(u32::from(key_temp)),
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode SetSuperPropertyComputed: {err:?}"
+                    ))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(2);
+        return lower;
     }
     let base = materialize_member_base(builder, ctx, &member.object)?;
     let key_temp = ctx.acquire_temps(1)?;
@@ -5891,11 +6372,153 @@ fn lower_call_expression(
         Expression::ComputedMemberExpression(member) => {
             lower_computed_method_call(builder, ctx, call, member, has_spread)
         }
+        // M28: `super(args)` — §13.3.7.1 SuperCall. Allowed only
+        // inside a derived-class constructor (enforced via the
+        // `ClassSuperBinding` on this `LoweringContext`). Args land
+        // in a contiguous temp window, then `CallSuper` /
+        // `CallSuperSpread` does the construct + receiver
+        // initialization.
+        Expression::Super(super_tok) => {
+            lower_super_call(builder, ctx, call, super_tok.span, has_spread)
+        }
         other => Err(SourceLoweringError::unsupported(
             "non_identifier_callee",
             other.span(),
         )),
     }
+}
+
+/// Lowers `super(args)` / `super(...args)` inside a derived-class
+/// constructor. Emits `CallSuper` for fixed-arity calls and
+/// `CallSuperSpread` when any argument is spread.
+///
+/// Rejection surface:
+/// - `super_outside_class`: active function has no
+///   `ClassSuperBinding` (plain function / top-level code).
+/// - `super_call_in_non_derived_class`: `ClassSuperBinding` is set
+///   but `allow_super_call` is false (base-class constructor or
+///   method body).
+fn lower_super_call<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    super_span: Span,
+    has_spread: bool,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+    let binding = ctx
+        .class_super_binding
+        .ok_or_else(|| SourceLoweringError::unsupported("super_outside_class", super_span))?;
+    if !binding.allow_super_call {
+        return Err(SourceLoweringError::unsupported(
+            "super_call_in_non_derived_class",
+            super_span,
+        ));
+    }
+
+    if !has_spread {
+        let argc = RegisterIndex::try_from(call.arguments.len()).map_err(|_| {
+            SourceLoweringError::Internal("super argument count exceeds u16".into())
+        })?;
+        let args_base = if argc == 0 {
+            0
+        } else {
+            ctx.acquire_temps(argc)?
+        };
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            for (offset, arg) in call.arguments.iter().enumerate() {
+                let expr = match arg {
+                    Argument::SpreadElement(_) => unreachable!("rejected above"),
+                    other => other.to_expression(),
+                };
+                lower_return_expression(builder, ctx, expr)?;
+                let slot = args_base
+                    .checked_add(RegisterIndex::try_from(offset).map_err(|_| {
+                        SourceLoweringError::Internal("super arg offset overflow".into())
+                    })?)
+                    .ok_or_else(|| {
+                        SourceLoweringError::Internal("super arg slot overflow".into())
+                    })?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!("encode Star (super arg): {err:?}"))
+                    })?;
+            }
+            builder
+                .emit(
+                    Opcode::CallSuper,
+                    &[Operand::RegList {
+                        base: u32::from(args_base),
+                        count: u32::from(argc),
+                    }],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode CallSuper: {err:?}"))
+                })?;
+            Ok(())
+        })();
+        if argc > 0 {
+            ctx.release_temps(argc);
+        }
+        return lower;
+    }
+
+    // Spread path — build an Array of args, then CallSuperSpread.
+    let args_temp = ctx.acquire_temps(1)?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!(
+                "encode CreateArray (super spread args): {err:?}"
+            ))
+        })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(args_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (super spread args): {err:?}"))
+            })?;
+        for arg in call.arguments.iter() {
+            match arg {
+                Argument::SpreadElement(spread) => {
+                    lower_return_expression(builder, ctx, &spread.argument)?;
+                    builder
+                        .emit(
+                            Opcode::SpreadIntoArray,
+                            &[Operand::Reg(u32::from(args_temp))],
+                        )
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode SpreadIntoArray (super arg): {err:?}"
+                            ))
+                        })?;
+                }
+                other => {
+                    lower_return_expression(builder, ctx, other.to_expression())?;
+                    builder
+                        .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(args_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode ArrayPush (super arg): {err:?}"
+                            ))
+                        })?;
+                }
+            }
+        }
+        builder
+            .emit(
+                Opcode::CallSuperSpread,
+                &[Operand::RegList {
+                    base: u32::from(args_temp),
+                    count: 1,
+                }],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode CallSuperSpread: {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(1);
+    lower
 }
 
 /// Direct-call path: `f(args)` where `f` names a known top-level
@@ -6062,26 +6685,60 @@ fn lower_static_method_call<'a>(
     };
     let args_temp_count = argc;
 
+    // M28: `super.method(args)` — the method is looked up via
+    // `GetSuperProperty`, but the call receives the CURRENT
+    // `this` as its receiver per §13.3.7 (SuperProperty preserves
+    // `this`). So: `r_receiver` = `this`, callee pulled through
+    // GetSuperProperty, then an ordinary CallProperty / CallSpread
+    // dispatches against `r_receiver`.
+    let super_method = matches!(&member.object, Expression::Super(_));
     let lower = (|| -> Result<(), SourceLoweringError> {
-        // Receiver → r_receiver.
-        lower_return_expression(builder, ctx, &member.object)?;
-        builder
-            .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Star (method receiver): {err:?}"))
+        if super_method {
+            enforce_super_property_binding(ctx, &member.object)?;
+            // `this` → r_receiver.
+            builder.emit(Opcode::LdaThis, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaThis (super method): {err:?}"))
             })?;
-        // Callee = receiver[name] → r_callee.
-        let idx = ctx.intern_property_name(member.property.name.as_str())?;
-        builder
-            .emit(
-                Opcode::LdaNamedProperty,
-                &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
-            )
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!(
-                    "encode LdaNamedProperty (method callee): {err:?}"
-                ))
-            })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (super method receiver): {err:?}"
+                    ))
+                })?;
+            // Callee = super.method (looked up via GetSuperProperty).
+            let idx = ctx.intern_property_name(member.property.name.as_str())?;
+            builder
+                .emit(
+                    Opcode::GetSuperProperty,
+                    &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode GetSuperProperty (method callee): {err:?}"
+                    ))
+                })?;
+        } else {
+            // Receiver → r_receiver.
+            lower_return_expression(builder, ctx, &member.object)?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Star (method receiver): {err:?}"))
+                })?;
+            // Callee = receiver[name] → r_callee.
+            let idx = ctx.intern_property_name(member.property.name.as_str())?;
+            builder
+                .emit(
+                    Opcode::LdaNamedProperty,
+                    &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaNamedProperty (method callee): {err:?}"
+                    ))
+                })?;
+        }
         builder
             .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
             .map_err(|err| {
@@ -6143,28 +6800,81 @@ fn lower_computed_method_call<'a>(
     };
     let args_temp_count = argc;
 
+    // M28: `super[k](args)` — computed super member call. Like the
+    // static-method case, the receiver is the enclosing frame's
+    // `this`, the callee is resolved via `GetSuperPropertyComputed`,
+    // and dispatch happens through the normal CallProperty /
+    // CallSpread tail.
+    let super_method = matches!(&member.object, Expression::Super(_));
+
     let lower = (|| -> Result<(), SourceLoweringError> {
-        // Receiver.
-        lower_return_expression(builder, ctx, &member.object)?;
-        builder
-            .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
-            .map_err(|err| {
+        if super_method {
+            enforce_super_property_binding(ctx, &member.object)?;
+            // `this` → r_receiver.
+            builder.emit(Opcode::LdaThis, &[]).map_err(|err| {
                 SourceLoweringError::Internal(format!(
-                    "encode Star (computed method receiver): {err:?}"
+                    "encode LdaThis (super computed method): {err:?}"
                 ))
             })?;
-        // Key → acc; LdaKeyedProperty r_receiver → acc = receiver[key].
-        lower_return_expression(builder, ctx, &member.expression)?;
-        builder
-            .emit(
-                Opcode::LdaKeyedProperty,
-                &[Operand::Reg(u32::from(receiver_temp))],
-            )
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!(
-                    "encode LdaKeyedProperty (computed callee): {err:?}"
-                ))
-            })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (super computed method receiver): {err:?}"
+                    ))
+                })?;
+            // Evaluate key → acc; spill into a dedicated temp so the
+            // opcode operand is a register.
+            let key_temp = ctx.acquire_temps(1)?;
+            let inner = (|| -> Result<(), SourceLoweringError> {
+                lower_return_expression(builder, ctx, &member.expression)?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (super computed key): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(
+                        Opcode::GetSuperPropertyComputed,
+                        &[
+                            Operand::Reg(u32::from(receiver_temp)),
+                            Operand::Reg(u32::from(key_temp)),
+                        ],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode GetSuperPropertyComputed: {err:?}"
+                        ))
+                    })?;
+                Ok(())
+            })();
+            ctx.release_temps(1);
+            inner?;
+        } else {
+            // Receiver.
+            lower_return_expression(builder, ctx, &member.object)?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (computed method receiver): {err:?}"
+                    ))
+                })?;
+            // Key → acc; LdaKeyedProperty r_receiver → acc = receiver[key].
+            lower_return_expression(builder, ctx, &member.expression)?;
+            builder
+                .emit(
+                    Opcode::LdaKeyedProperty,
+                    &[Operand::Reg(u32::from(receiver_temp))],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaKeyedProperty (computed callee): {err:?}"
+                    ))
+                })?;
+        }
         builder
             .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
             .map_err(|err| {
@@ -6184,6 +6894,28 @@ fn lower_computed_method_call<'a>(
     ctx.release_temps(args_temp_count);
     ctx.release_temps(2);
     lower
+}
+
+/// M28: compile-time guard for `super.x` / `super[k]` references.
+/// The enclosing function's `ClassSuperBinding` must both exist
+/// (we're inside a class method / constructor) AND allow super
+/// property access. Arrows currently do not inherit the binding,
+/// so this returns `super_outside_class` for them as well.
+fn enforce_super_property_binding<'a>(
+    ctx: &LoweringContext<'a>,
+    super_expr: &'a Expression<'a>,
+) -> Result<(), SourceLoweringError> {
+    let span = super_expr.span();
+    let binding = ctx
+        .class_super_binding
+        .ok_or_else(|| SourceLoweringError::unsupported("super_outside_class", span))?;
+    if !binding.allow_super_property {
+        return Err(SourceLoweringError::unsupported(
+            "super_outside_class",
+            span,
+        ));
+    }
+    Ok(())
 }
 
 /// Shared emission helper for the "args + call opcode" tail of a

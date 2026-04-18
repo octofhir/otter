@@ -1276,6 +1276,314 @@ impl Interpreter {
                     .unwrap_or_else(|| activation.accumulator());
                 return Ok(StepOutcome::Throw(value));
             }
+
+            // §10.2.5 MakeMethod — stamp `[[HomeObject]]` onto the
+            // closure held in `r_closure`. Emitted by the class body
+            // lowering for both methods and the constructor so that
+            // `super.x` references from inside the function's body
+            // resolve against `home_object.[[GetPrototypeOf]]()`.
+            Opcode::SetHomeObject => {
+                let closure_reg = reg(&instr.operands, 0)?;
+                let home_reg = reg(&instr.operands, 1)?;
+                let closure_val = read_reg(activation, function, closure_reg)?;
+                let home_val = read_reg(activation, function, home_reg)?;
+                let Some(closure_handle) = closure_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "SetHomeObject: target is not a closure",
+                    )));
+                };
+                let Some(home_handle) =
+                    home_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "SetHomeObject: home object is not an object",
+                    )));
+                };
+                runtime
+                    .objects
+                    .set_closure_home_object(closure_handle, home_handle)
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!("SetHomeObject: {err:?}")))
+                    })?;
+            }
+
+            // §13.3.7 SuperProperty read — resolves `super.name` against
+            // `activeFunction.[[HomeObject]].[[GetPrototypeOf]]()` with
+            // `thisValue` (carried in `r_receiver`) preserved as the
+            // `[[Get]]` receiver so accessor getters see the correct
+            // `this` binding.
+            Opcode::GetSuperProperty => {
+                let receiver_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let receiver = read_reg(activation, function, receiver_reg)?;
+                let base = super_property_base(activation, runtime)?;
+                let property = resolve_property(function, runtime, prop_id)?;
+                let value = runtime
+                    .ordinary_get(base, property, receiver)
+                    .map_err(|error| match error {
+                        crate::VmNativeCallError::Thrown(value) => {
+                            InterpreterError::UncaughtThrow(value)
+                        }
+                        crate::VmNativeCallError::Internal(msg) => {
+                            InterpreterError::NativeCall(msg)
+                        }
+                    })?;
+                activation.set_accumulator(value);
+            }
+
+            // §13.3.7 SuperProperty read with a computed key — mirrors
+            // `GetSuperProperty` but the key register is evaluated via
+            // `ToPropertyKey` before the lookup.
+            Opcode::GetSuperPropertyComputed => {
+                let receiver_reg = reg(&instr.operands, 0)?;
+                let key_reg = reg(&instr.operands, 1)?;
+                let receiver = read_reg(activation, function, receiver_reg)?;
+                let key = read_reg(activation, function, key_reg)?;
+                let base = super_property_base(activation, runtime)?;
+                let property = key_to_property_name(runtime, key)?;
+                let value = runtime
+                    .ordinary_get(base, property, receiver)
+                    .map_err(|error| match error {
+                        crate::VmNativeCallError::Thrown(value) => {
+                            InterpreterError::UncaughtThrow(value)
+                        }
+                        crate::VmNativeCallError::Internal(msg) => {
+                            InterpreterError::NativeCall(msg)
+                        }
+                    })?;
+                activation.set_accumulator(value);
+            }
+
+            // §13.3.7 SuperProperty write — performs `[[Set]]` on
+            // `activeFunction.[[HomeObject]].[[GetPrototypeOf]]()` with
+            // the receiver supplied in `r_receiver` and the value
+            // carried in the accumulator. Strict-mode `[[Set]]` failures
+            // surface as a TypeError.
+            Opcode::SetSuperProperty => {
+                let receiver_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let receiver = read_reg(activation, function, receiver_reg)?;
+                let value = activation.accumulator();
+                let base = super_property_base(activation, runtime)?;
+                let property = resolve_property(function, runtime, prop_id)?;
+                let ok = runtime
+                    .ordinary_set(base, property, receiver, value)
+                    .map_err(|error| match error {
+                        crate::VmNativeCallError::Thrown(value) => {
+                            InterpreterError::UncaughtThrow(value)
+                        }
+                        crate::VmNativeCallError::Internal(msg) => {
+                            InterpreterError::NativeCall(msg)
+                        }
+                    })?;
+                if !ok {
+                    let err =
+                        runtime.alloc_type_error("Cannot assign to read-only super property")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                }
+            }
+
+            // §13.3.7 SuperProperty write with a computed key.
+            Opcode::SetSuperPropertyComputed => {
+                let receiver_reg = reg(&instr.operands, 0)?;
+                let key_reg = reg(&instr.operands, 1)?;
+                let receiver = read_reg(activation, function, receiver_reg)?;
+                let key = read_reg(activation, function, key_reg)?;
+                let value = activation.accumulator();
+                let base = super_property_base(activation, runtime)?;
+                let property = key_to_property_name(runtime, key)?;
+                let ok = runtime
+                    .ordinary_set(base, property, receiver, value)
+                    .map_err(|error| match error {
+                        crate::VmNativeCallError::Thrown(value) => {
+                            InterpreterError::UncaughtThrow(value)
+                        }
+                        crate::VmNativeCallError::Internal(msg) => {
+                            InterpreterError::NativeCall(msg)
+                        }
+                    })?;
+                if !ok {
+                    let err =
+                        runtime.alloc_type_error("Cannot assign to read-only super property")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                }
+            }
+
+            // §13.3.7.1 SuperCall with spread — `super(...args)`
+            // inside a derived constructor. `RegList` carries a
+            // single register holding an Array whose elements are
+            // flattened into the super() argument list.
+            Opcode::CallSuperSpread => {
+                let (base, count) = reg_list(&instr.operands, 0)?;
+                if count != 1 {
+                    let err = runtime
+                        .alloc_type_error("CallSuperSpread expects a single args-array operand")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                }
+                let base_idx = RegisterIndex::try_from(base).map_err(|_| {
+                    InterpreterError::NativeCall(Box::from(
+                        "CallSuperSpread args register overflow",
+                    ))
+                })?;
+                let args_val = read_reg(activation, function, base_idx)?;
+                let Some(args_handle) =
+                    args_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err =
+                        runtime.alloc_type_error("CallSuperSpread args must be an Array object")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let len = match runtime.objects.array_length(args_handle) {
+                    Ok(Some(n)) => n,
+                    _ => {
+                        let err = runtime
+                            .alloc_type_error("CallSuperSpread args must be an Array object")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                };
+                let mut args: Vec<RegisterValue> = Vec::with_capacity(len);
+                for i in 0..len {
+                    let v = runtime
+                        .objects
+                        .get_index(args_handle, i)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(RegisterValue::undefined);
+                    args.push(v);
+                }
+                match super_call_dispatch(activation, function, runtime, &args)? {
+                    SuperCallOutcome::Continue => {}
+                    SuperCallOutcome::Throw(v) => return Ok(StepOutcome::Throw(v)),
+                }
+            }
+
+            // §13.3.7.1 SuperCall — `super(args)` inside a derived
+            // constructor. Resolves the super constructor from the
+            // active closure's `[[GetPrototypeOf]]()`, forwards the
+            // current frame's `[[NewTarget]]`, and initializes the
+            // derived-constructor `this` binding with the freshly
+            // constructed receiver.
+            Opcode::CallSuper => {
+                let (base, count) = reg_list(&instr.operands, 0)?;
+                let args = read_reg_list(activation, function, base, count)?;
+                match super_call_dispatch(activation, function, runtime, &args)? {
+                    SuperCallOutcome::Continue => {}
+                    SuperCallOutcome::Throw(v) => return Ok(StepOutcome::Throw(v)),
+                }
+            }
+
+            // §15.7.14 ClassDefinitionEvaluation steps 6-7 — wire the
+            // derived class's heritage: `Sub.__proto__ = Super` and
+            // `Sub.prototype.__proto__ = Super.prototype`. Rejects
+            // non-null, non-constructor supers with a TypeError to
+            // match step 5.c.
+            Opcode::SetClassHeritage => {
+                let class_reg = reg(&instr.operands, 0)?;
+                let super_reg = reg(&instr.operands, 1)?;
+                let class_val = read_reg(activation, function, class_reg)?;
+                let super_val = read_reg(activation, function, super_reg)?;
+                let Some(class_handle) = class_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "SetClassHeritage: class is not an object",
+                    )));
+                };
+                // Resolve the class's own prototype object (its
+                // `.prototype` data property, seeded by
+                // `alloc_closure`).
+                let prototype_name = runtime.intern_property_name("prototype");
+                let class_prototype = match runtime.property_lookup(class_handle, prototype_name)? {
+                    Some(lookup) => match lookup.value() {
+                        crate::object::PropertyValue::Data { value, .. } => value,
+                        crate::object::PropertyValue::Accessor { .. } => RegisterValue::undefined(),
+                    },
+                    None => RegisterValue::undefined(),
+                };
+                let Some(class_prototype_handle) = class_prototype
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(
+                        "SetClassHeritage: class prototype slot is missing",
+                    )));
+                };
+
+                // Step 5: classify the superclass expression value.
+                if super_val.is_null() {
+                    // `class Sub extends null {}` — constructorParent
+                    // stays %Function.prototype% (already the default);
+                    // protoParent becomes null.
+                    runtime
+                        .objects
+                        .set_prototype(class_prototype_handle, None)
+                        .map_err(|err| {
+                            InterpreterError::NativeCall(Box::from(format!(
+                                "SetClassHeritage: clear proto parent failed: {err:?}"
+                            )))
+                        })?;
+                } else {
+                    let Some(super_handle) = super_val
+                        .as_object_handle()
+                        .map(crate::object::ObjectHandle)
+                    else {
+                        let err = runtime
+                            .alloc_type_error("Class extends value is not a constructor or null")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    };
+                    if !runtime.is_constructible(super_handle) {
+                        let err = runtime
+                            .alloc_type_error("Class extends value is not a constructor or null")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                    // `Sub.__proto__ = Super` — static method chain.
+                    runtime
+                        .objects
+                        .set_prototype(class_handle, Some(super_handle))
+                        .map_err(|err| {
+                            InterpreterError::NativeCall(Box::from(format!(
+                                "SetClassHeritage: static chain: {err:?}"
+                            )))
+                        })?;
+                    // Read `Super.prototype`, rejecting non-Object +
+                    // non-null per step 5.d.ii.
+                    let super_proto = match runtime.property_lookup(super_handle, prototype_name)? {
+                        Some(lookup) => match lookup.value() {
+                            crate::object::PropertyValue::Data { value, .. } => value,
+                            crate::object::PropertyValue::Accessor { .. } => {
+                                RegisterValue::undefined()
+                            }
+                        },
+                        None => RegisterValue::undefined(),
+                    };
+                    let super_proto_handle = if super_proto.is_null() {
+                        None
+                    } else if let Some(h) = super_proto
+                        .as_object_handle()
+                        .map(crate::object::ObjectHandle)
+                    {
+                        Some(h)
+                    } else {
+                        let err = runtime.alloc_type_error(
+                            "Class extends value does not have a valid prototype",
+                        )?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    };
+                    runtime
+                        .objects
+                        .set_prototype(class_prototype_handle, super_proto_handle)
+                        .map_err(|err| {
+                            InterpreterError::NativeCall(Box::from(format!(
+                                "SetClassHeritage: instance chain: {err:?}"
+                            )))
+                        })?;
+                }
+            }
+
             Opcode::Nop => {}
 
             // Any other opcode is unsupported by this Phase 3b.1
@@ -1467,6 +1775,145 @@ fn loose_eq(a: RegisterValue, b: RegisterValue) -> bool {
     let a_is_null_or_undef = a == RegisterValue::null() || a == RegisterValue::undefined();
     let b_is_null_or_undef = b == RegisterValue::null() || b == RegisterValue::undefined();
     a_is_null_or_undef && b_is_null_or_undef
+}
+
+/// Outcome of [`super_call_dispatch`]. `Continue` means the
+/// derived-ctor frame is still running and the interpreter should
+/// advance PC normally; `Throw` lifts a runtime error into the
+/// caller so it can convert into a `StepOutcome::Throw`.
+enum SuperCallOutcome {
+    Continue,
+    Throw(RegisterValue),
+}
+
+/// §13.3.7.1 SuperCall — shared implementation used by both the
+/// fixed-arity `CallSuper` and spread-arity `CallSuperSpread`
+/// opcodes. Resolves the super constructor from the active
+/// closure's `[[GetPrototypeOf]]()`, forwards `[[NewTarget]]`,
+/// invokes `construct_callable`, and writes the resulting receiver
+/// into the derived frame's `this` slot (and the accumulator) per
+/// §10.2.1.3 step 12.
+fn super_call_dispatch(
+    activation: &mut Activation,
+    function: &Function,
+    runtime: &mut RuntimeState,
+    args: &[RegisterValue],
+) -> Result<SuperCallOutcome, InterpreterError> {
+    let Some(active_closure) = activation.closure_handle() else {
+        return Err(InterpreterError::NativeCall(Box::from(
+            "super call: active closure is missing",
+        )));
+    };
+    let super_ctor = match runtime
+        .objects
+        .get_prototype(active_closure)
+        .map_err(|err| {
+            InterpreterError::NativeCall(Box::from(format!(
+                "super call: prototype lookup failed: {err:?}"
+            )))
+        })? {
+        Some(handle) => handle,
+        None => {
+            let err = runtime.alloc_type_error("Super constructor is null")?;
+            return Ok(SuperCallOutcome::Throw(RegisterValue::from_object_handle(
+                err.0,
+            )));
+        }
+    };
+    if !runtime.is_constructible(super_ctor) {
+        let err = runtime.alloc_type_error("Super constructor is not a constructor")?;
+        return Ok(SuperCallOutcome::Throw(RegisterValue::from_object_handle(
+            err.0,
+        )));
+    }
+    // §10.2.1.3 step 6: `[[NewTarget]]` must be present. Walk arrow
+    // closures up until we find a frame or closure that carries it.
+    let new_target = activation.construct_new_target().or_else(|| {
+        runtime
+            .objects
+            .closure_captured_new_target(active_closure)
+            .ok()
+            .flatten()
+    });
+    let Some(new_target) = new_target else {
+        let err = runtime
+            .alloc_reference_error("super call is only valid inside a derived constructor")?;
+        return Ok(SuperCallOutcome::Throw(RegisterValue::from_object_handle(
+            err.0,
+        )));
+    };
+    // §13.3.7.1 step 9 — `this` must not yet be initialized.
+    if let Some(slot) = function.frame_layout().receiver_slot() {
+        let current = activation.register(slot)?;
+        if current.as_object_handle().is_some() {
+            let err = runtime.alloc_reference_error("Super constructor may only be called once")?;
+            return Ok(SuperCallOutcome::Throw(RegisterValue::from_object_handle(
+                err.0,
+            )));
+        }
+    }
+    let result = runtime.construct_callable(super_ctor, args, new_target);
+    let receiver = match result {
+        Ok(value) => value,
+        Err(crate::VmNativeCallError::Thrown(value)) => {
+            return Ok(SuperCallOutcome::Throw(value));
+        }
+        Err(crate::VmNativeCallError::Internal(msg)) => {
+            return Err(InterpreterError::NativeCall(msg));
+        }
+    };
+    // §10.2.1.3 step 12 — initialize the `this` binding with the
+    // freshly constructed receiver.
+    if let Some(slot) = function.frame_layout().receiver_slot() {
+        activation.set_register(slot, receiver)?;
+    }
+    activation.set_accumulator(receiver);
+    Ok(SuperCallOutcome::Continue)
+}
+
+/// §13.3.7 SuperReference base lookup — resolves
+/// `activeFunction.[[HomeObject]].[[GetPrototypeOf]]()` per
+/// `MakeSuperPropertyReference`. Surfaced as a TypeError when the
+/// active function has no `[[HomeObject]]` (e.g. a regular
+/// function-level closure) or when the home object's prototype is
+/// null — both paths match the spec's "must throw" cases for
+/// super-property access outside a method / on a rootless class.
+fn super_property_base(
+    activation: &Activation,
+    runtime: &mut RuntimeState,
+) -> Result<crate::object::ObjectHandle, InterpreterError> {
+    let Some(active) = activation.closure_handle() else {
+        return Err(InterpreterError::NativeCall(Box::from(
+            "super property reference: active closure is missing",
+        )));
+    };
+    let home = runtime
+        .objects
+        .closure_home_object(active)
+        .map_err(|err| {
+            InterpreterError::NativeCall(Box::from(format!(
+                "super property reference: home lookup failed: {err:?}"
+            )))
+        })?
+        .ok_or_else(|| {
+            InterpreterError::TypeError(Box::from(
+                "super property reference requires an enclosing method",
+            ))
+        })?;
+    let proto = runtime
+        .objects
+        .get_prototype(home)
+        .map_err(|err| {
+            InterpreterError::NativeCall(Box::from(format!(
+                "super property reference: proto lookup failed: {err:?}"
+            )))
+        })?
+        .ok_or_else(|| {
+            InterpreterError::TypeError(Box::from(
+                "super property reference on rootless prototype chain",
+            ))
+        })?;
+    Ok(proto)
 }
 
 /// Resolve a `PropertyNameId` into a runtime-interned id via the

@@ -917,6 +917,7 @@ fn lower_nested_statement<'a>(
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
         Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
         Statement::ForOfStatement(for_of) => lower_for_of_statement(builder, ctx, for_of),
+        Statement::ForInStatement(for_in) => lower_for_in_statement(builder, ctx, for_in),
         Statement::SwitchStatement(sw) => lower_switch_statement(builder, ctx, sw),
         Statement::FunctionDeclaration(func) => {
             lower_nested_function_declaration(builder, ctx, func)
@@ -1482,6 +1483,196 @@ fn lower_for_of_statement<'a>(
         builder
             .bind_label(loop_exit)
             .map_err(|err| SourceLoweringError::Internal(format!("bind for-of exit: {err:?}")))?;
+        Ok(())
+    })();
+
+    ctx.restore_scope(scope);
+    result
+}
+
+/// M31: lowers `for (<left> in <source>) <body>` — §14.7.5.11
+/// ForInOfStatement, `in` variant. Walks the source's own +
+/// inherited enumerable string-keyed property names via the
+/// runtime's property iterator (allocated by `ForInEnumerate`,
+/// stepped by `ForInNext`).
+///
+/// Bytecode shape:
+///
+/// ```text
+///   <lower source> → acc
+///   Star r_src
+///   ForInEnumerate r_src → acc = property_iterator
+///   Star r_iter
+/// loop_top:
+///   ForInNext r_binding r_iter
+///     ; writes done → acc, key → r_binding when not done
+///   JumpIfToBooleanTrue loop_exit
+///   <lower body>
+///   Jump loop_top
+/// loop_exit:
+/// ```
+///
+/// `null` / `undefined` sources don't throw — `ForInEnumerate`
+/// allocates an empty iterator per §14.7.5.6 step 6, so the
+/// body never runs.
+///
+/// Supported LHS forms mirror `for…of`: `let x` / `const x`
+/// (fresh per-loop binding) and plain identifier targets. Same
+/// deferrals apply (destructuring, `var`, upvalue targets).
+fn lower_for_in_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    for_in: &'a oxc_ast::ast::ForInStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::ForStatementLeft;
+    use oxc_ast::ast::VariableDeclarationKind;
+
+    // Snapshot scope so any `let` bindings introduced by `left`
+    // pop on loop exit.
+    let scope = ctx.snapshot_scope();
+
+    // Reserve iterator bookkeeping slots as hidden locals (same
+    // reasoning as `for…of` — nested loops shift the temp base
+    // and would clobber temp-region temps).
+    let src_local = ctx.allocate_anonymous_local()?;
+    let iter_local = ctx.allocate_anonymous_local()?;
+
+    let result = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, &for_in.right)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(src_local))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (for-in source): {err:?}"))
+            })?;
+        builder
+            .emit(
+                Opcode::ForInEnumerate,
+                &[Operand::Reg(u32::from(src_local))],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode ForInEnumerate: {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(iter_local))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (for-in iterator): {err:?}"))
+            })?;
+
+        let binding_reg = match &for_in.left {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.kind == VariableDeclarationKind::Var {
+                    return Err(SourceLoweringError::unsupported(
+                        "for_in_var_binding",
+                        decl.span,
+                    ));
+                }
+                if decl.declarations.len() != 1 {
+                    return Err(SourceLoweringError::unsupported(
+                        "for_in_multiple_bindings",
+                        decl.span,
+                    ));
+                }
+                let declarator = &decl.declarations[0];
+                if declarator.init.is_some() {
+                    return Err(SourceLoweringError::unsupported(
+                        "for_in_binding_initializer",
+                        declarator.span,
+                    ));
+                }
+                let ident_name = match &declarator.id {
+                    oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
+                    other => {
+                        return Err(SourceLoweringError::unsupported(
+                            "for_in_destructuring_binding",
+                            other.span(),
+                        ));
+                    }
+                };
+                let is_const = decl.kind == VariableDeclarationKind::Const;
+                let slot = ctx.allocate_local(ident_name, is_const, declarator.span)?;
+                ctx.mark_initialized(ident_name)?;
+                slot
+            }
+            ForStatementLeft::AssignmentTargetIdentifier(ident) => {
+                let name = ident.name.as_str();
+                let binding = ctx.resolve_identifier(name).ok_or_else(|| {
+                    SourceLoweringError::unsupported("unbound_identifier", ident.span)
+                })?;
+                match binding {
+                    BindingRef::Local {
+                        reg,
+                        initialized: true,
+                        is_const: false,
+                    } => reg,
+                    BindingRef::Param { reg } => reg,
+                    BindingRef::Local { is_const: true, .. } => {
+                        return Err(SourceLoweringError::unsupported(
+                            "const_assignment",
+                            ident.span,
+                        ));
+                    }
+                    BindingRef::Local {
+                        initialized: false, ..
+                    } => {
+                        return Err(SourceLoweringError::unsupported(
+                            "tdz_self_reference",
+                            ident.span,
+                        ));
+                    }
+                    BindingRef::Upvalue { .. } => {
+                        return Err(SourceLoweringError::unsupported(
+                            "for_in_upvalue_target",
+                            ident.span,
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    "for_in_unsupported_left",
+                    other.span(),
+                ));
+            }
+        };
+
+        let loop_top = builder.new_label();
+        let loop_exit = builder.new_label();
+        builder
+            .bind_label(loop_top)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind for-in top: {err:?}")))?;
+        builder
+            .emit(
+                Opcode::ForInNext,
+                &[
+                    Operand::Reg(u32::from(binding_reg)),
+                    Operand::Reg(u32::from(iter_local)),
+                ],
+            )
+            .map_err(|err| SourceLoweringError::Internal(format!("encode ForInNext: {err:?}")))?;
+        builder
+            .emit_jump_to(Opcode::JumpIfToBooleanTrue, loop_exit)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode JumpIfToBooleanTrue (for-in done): {err:?}"
+                ))
+            })?;
+
+        ctx.enter_loop(LoopLabels {
+            break_label: loop_exit,
+            continue_label: Some(loop_top),
+        });
+        let body_result = lower_nested_statement(builder, ctx, &for_in.body);
+        ctx.exit_loop();
+        body_result?;
+
+        builder
+            .emit_jump_to(Opcode::Jump, loop_top)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Jump (for-in back): {err:?}"))
+            })?;
+        builder
+            .bind_label(loop_exit)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind for-in exit: {err:?}")))?;
         Ok(())
     })();
 
@@ -4376,7 +4567,12 @@ fn lower_class_body_core<'a>(
             let (install_op, install_target) =
                 match (method.is_private, method.is_static, method.kind) {
                     (false, _, MethodDefinitionKind::Method) => (
-                        Opcode::StaNamedProperty,
+                        // §15.7.11 — class methods land as
+                        // non-enumerable data properties rather
+                        // than the default enumerable shape of
+                        // `StaNamedProperty`, so they stay out of
+                        // `for…in` / `Object.keys`.
+                        Opcode::DefineClassMethod,
                         if method.is_static {
                             class_temp
                         } else {

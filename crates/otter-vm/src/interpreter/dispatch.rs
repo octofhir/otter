@@ -1639,6 +1639,76 @@ impl Interpreter {
                 }
             }
 
+            // §15.7.11 PropertyDefinitionEvaluation (class body,
+            // method kind) — install `acc` as a non-enumerable
+            // method data property. Spec-correct alternative to
+            // the plain `StaNamedProperty` path, which would
+            // otherwise leak class methods into `for…in` /
+            // `Object.keys`. Computed-key variant reads the key
+            // register; plain key uses the function's property
+            // name table.
+            Opcode::DefineClassMethod => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineClassMethod: target is not an object",
+                    )));
+                };
+                let property = resolve_property(function, runtime, prop_id)?;
+                let value = activation.accumulator();
+                runtime
+                    .objects
+                    .define_own_property(
+                        target_handle,
+                        property,
+                        crate::object::PropertyValue::data_with_attrs(
+                            value,
+                            crate::object::PropertyAttributes::builtin_method(),
+                        ),
+                    )
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!(
+                            "DefineClassMethod: define_own_property failed: {err:?}"
+                        )))
+                    })?;
+            }
+            Opcode::DefineClassMethodComputed => {
+                let target_reg = reg(&instr.operands, 0)?;
+                let key_reg = reg(&instr.operands, 1)?;
+                let target_val = read_reg(activation, function, target_reg)?;
+                let key = read_reg(activation, function, key_reg)?;
+                let Some(target_handle) = target_val
+                    .as_object_handle()
+                    .map(crate::object::ObjectHandle)
+                else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "DefineClassMethodComputed: target is not an object",
+                    )));
+                };
+                let property = key_to_property_name(runtime, key)?;
+                let value = activation.accumulator();
+                runtime
+                    .objects
+                    .define_own_property(
+                        target_handle,
+                        property,
+                        crate::object::PropertyValue::data_with_attrs(
+                            value,
+                            crate::object::PropertyAttributes::builtin_method(),
+                        ),
+                    )
+                    .map_err(|err| {
+                        InterpreterError::NativeCall(Box::from(format!(
+                            "DefineClassMethodComputed: define_own_property failed: {err:?}"
+                        )))
+                    })?;
+            }
+
             // M29: Class field / accessor / private-name opcodes
             //
             // §6.2.12 / §15.7.14 infrastructure — the compiler

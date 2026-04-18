@@ -1656,15 +1656,6 @@ fn for_with_const_init_then_update_is_unsupported() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn for_in_statement_unsupported() {
-    // `for (k in obj)` — separate AST node type. M8 doesn't touch
-    // it; lands later alongside object property iteration.
-    let err = compile("function f() { for (let k in {}) { return k; } return 0; }")
-        .expect_err("for-in at M8");
-    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
-}
-
-#[test]
 fn for_with_bare_expression_init_unsupported() {
     // `for (n; n > 0; n = n - 1)` — init is a bare identifier read,
     // not an assignment. Reject with a stable per-shape tag.
@@ -6254,6 +6245,168 @@ fn for_await_unsupported() {
         .expect_err("for-await");
     assert!(
         matches!(err, SourceLoweringError::Unsupported { .. }),
+        "unexpected err: {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M31: for (k in obj) + property iteration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m31_for_in_counts_own_string_keys() {
+    // Basic for-in: iterate an object literal's own enumerable
+    // string-keyed properties. We sum `obj[k]` to exercise both
+    // the key binding and the keyed read path.
+    let src = "function main() { \
+        let obj = { a: 1, b: 2, c: 3 }; \
+        let total = 0; \
+        for (let k in obj) { total = total + obj[k]; } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m31_for_in_reads_existing_binding() {
+    // Identifier-target form: the loop variable is an existing
+    // `let`, not a fresh binding.
+    let src = "function main() { \
+        let obj = { x: 10, y: 20, z: 30 }; \
+        let k = \"\"; \
+        let last = 0; \
+        for (k in obj) { last = obj[k]; } \
+        return last; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 30);
+}
+
+#[test]
+fn m31_for_in_walks_prototype_chain() {
+    // §14.7.5.6 — for-in enumerates own AND inherited
+    // enumerable properties. The child has its own key, and
+    // the parent class's prototype method `m` is inherited but
+    // methods are non-enumerable, so only the own key appears.
+    // Counting should therefore match the own-only case.
+    let src = "function main() { \
+        class Parent { \
+            m() { return 0; } \
+        } \
+        class Child extends Parent { \
+            constructor() { super(); this.x = 5; } \
+        } \
+        let c = new Child(); \
+        let count = 0; \
+        for (let k in c) { count = count + 1; } \
+        return count; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn m31_for_in_over_null_skips_body() {
+    // `for (k in null)` / `for (k in undefined)` produce no
+    // iterations per §14.7.5.6 step 6 — no throw. Body never
+    // runs.
+    let src = "function main() { \
+        let ran = 0; \
+        for (let k in null) { ran = 1; } \
+        for (let k in undefined) { ran = ran + 10; } \
+        return ran; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn m31_for_in_break_exits_loop() {
+    // `break` inside for-in jumps past the loop exit; we stop
+    // after seeing one key so the accumulator keeps the initial
+    // value.
+    let src = "function main() { \
+        let obj = { a: 1, b: 2, c: 3 }; \
+        let seen = 0; \
+        for (let k in obj) { \
+            seen = seen + 1; \
+            if (seen === 1) { break; } \
+        } \
+        return seen; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn m31_for_in_continue_resumes_next_step() {
+    // `continue` jumps back to ForInNext so we pick up the next
+    // key. Uses a counter + `continue` on odd counts to
+    // accumulate only even-position values.
+    let src = "function main() { \
+        let obj = { a: 10, b: 20, c: 30, d: 40 }; \
+        let total = 0; \
+        let seen = 0; \
+        for (let k in obj) { \
+            seen = seen + 1; \
+            if (seen === 2) { continue; } \
+            total = total + obj[k]; \
+        } \
+        return total; \
+    }";
+    // Sum of three of the four values (skip the 2nd): we don't
+    // pin the iteration order tightly — any permutation would
+    // drop one of {10,20,30,40}; summing three values gives
+    // 100 − skipped. Asserting the common insertion-order
+    // case where the 2nd is `b: 20` → 100 − 20 = 80.
+    assert_eq!(run_int32_function(src, &[]), 80);
+}
+
+#[test]
+fn m31_for_in_nested_loops() {
+    // Nested for-in over two objects — exercises the
+    // iterator-slot-as-anonymous-local fix the same way
+    // M30's nested-for-of test did.
+    let src = "function main() { \
+        let outer = { a: 1, b: 2 }; \
+        let inner = { x: 10, y: 20 }; \
+        let total = 0; \
+        for (let i in outer) { \
+            for (let j in inner) { \
+                total = total + outer[i] + inner[j]; \
+            } \
+        } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 66);
+}
+
+#[test]
+fn for_in_var_binding_unsupported() {
+    // `for (var k in ...)` — hoisting semantics differ from
+    // `let`/`const`; deferred past M31.
+    let err = compile("function f() { for (var k in {}) { return k; } return 0; }")
+        .expect_err("var loop var");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "for_in_var_binding",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn for_in_destructuring_unsupported() {
+    let err = compile("function f() { for (let [a] in {}) { return a; } return 0; }")
+        .expect_err("destructuring loop var");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "for_in_destructuring_binding",
+                ..
+            }
+        ),
         "unexpected err: {err:?}",
     );
 }

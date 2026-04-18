@@ -67,7 +67,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M26      | Arrow functions + lexical `this` binding.                                                                                       | [x]    | 6ecd547 |
 | M27      | Class declaration: constructor + instance methods + static methods.                                                             | [x]    | 0911c9d |
 | M28      | Class inheritance (`extends` + `super` + `super(args)` in constructor).                                                         | [x]    | 0981ec9 |
-| M29      | Class private fields (`#x`) + accessor methods (`get` / `set`).                                                                 | [ ]    |        |
+| M29      | Class private fields (`#x`) + accessor methods (`get` / `set`).                                                                 | [x]    | c9398fe |
 | M30      | `for (x of arr)` + iterator protocol (`Symbol.iterator`, `next()`).                                                             | [ ]    |        |
 | M31      | `for (k in obj)` + property iteration.                                                                                         | [ ]    |        |
 | M32      | Promise runtime + microtask queue.                                                                                             | [ ]    |        |
@@ -119,6 +119,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `ArrowFunctionExpression` (concise / block body, captures outer bindings, curried chains); async arrows deferred | yes | M26 |
 | `ClassDeclaration` (nested) + `NewExpression` + `ThisExpression`: constructor, instance + static methods, §9.2.2.1 return override; extends/fields/accessors/computed keys deferred | yes | M27 |
 | Class `extends` heritage + `super.x` / `super[k]` / `super.m(args)` / `super(args)` in derived constructors; default derived ctor synthesis `constructor(...args) { super(...args); }`; home-object wiring for methods + constructor | yes | M28 |
+| Class public + private instance fields (`x = …`, `#x = …`), static fields, `get` / `set` accessor methods (instance + static), `this.#x` / `obj.#x` read+write + compound `<op>=`, `#name in obj`; private methods/accessors deferred | yes | M29 |
 
 ## Benchmarks
 

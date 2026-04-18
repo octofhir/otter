@@ -59,7 +59,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M18      | Template literals (simple + interpolated).                                                                                       | [x]    | f8ddb59 |
 | M19      | `console.log` + minimal console shim — first "hello world" gate.                                                                | [x]    | 4a41715 |
 | M20      | `SwitchStatement` with `case` / `default` + `break` exits.                                                                     | [x]    | 5bd4a2d |
-| M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [x]    | _pending_ |
+| M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [x]    | fe76e4b |
 | M22      | Default params (`function f(n = 0)`) + rest params (`...rest`).                                                                 | [ ]    |        |
 | M23      | Spread in call args + array literals (`f(...a)`, `[...a, ...b]`).                                                              | [ ]    |        |
 | M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [ ]    |        |

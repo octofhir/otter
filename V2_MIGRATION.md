@@ -134,6 +134,5 @@ cargo test -p otter-jit --release -- --ignored bench2_microbench --nocapture
 ## Notes
 
 - v1 still reachable via `git show <pre-M0-commit>:<path>` for historical reference; the working tree contains only v2.
-- Until M1 lands, `otter run foo.js` returns a `SourceLoweringError::Unsupported { construct: "program", ... }` and a non-zero exit status. This is the expected post-M0 state.
-- Integration tests deleted in M0 are rebuilt incrementally — each subsequent milestone adds fresh tests for the feature it introduces.
+- Integration tests deleted in M0 are rebuilt incrementally — each milestone adds fresh tests for the feature it introduces.
 - The x86_64 `bench2_microbench` rows above were measured with `OTTER_BENCH2_CALLS=1 OTTER_BENCH2_WARMUP_CALLS=1` on Apple Silicon because the default 50-call release benchmark exceeds the fixed 180-second timeout under Rosetta; the benchmark's default path is unchanged for native x86_64 hosts.

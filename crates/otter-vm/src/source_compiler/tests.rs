@@ -6057,6 +6057,141 @@ fn m30_for_of_reads_array_of_computed_values() {
     assert_eq!(run_int32_function(src, &[]), 535);
 }
 
+// ---------------------------------------------------------------------------
+// M30-tail: full iterator protocol (Symbol.iterator + user .next())
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m30t_symbol_global_exposes_iterator_symbol() {
+    // `Symbol` is now on the compiler's global whitelist and
+    // resolves via `LdaGlobal`. The runtime exposes every
+    // well-known symbol as a data property of the Symbol
+    // constructor, so `Symbol.iterator` is a valid property
+    // access — we test the round-trip by reading it, storing
+    // it, and checking the same value comes back.
+    let src = "function main() { \
+        let it = Symbol.iterator; \
+        let it2 = Symbol.iterator; \
+        return (it === it2) ? 1 : 0; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn m30t_for_of_user_iterable_with_symbol_iterator() {
+    // Full §7.4.1 GetIterator path — the class installs a
+    // `[Symbol.iterator]` method on its prototype that returns
+    // an iterator whose `next()` yields `{value, done}`.
+    let src = "function main() { \
+        class Range { \
+            constructor() { this.i = 0; } \
+            next() { \
+                let current = this.i; \
+                if (current === 4) { return { value: 0, done: true }; } \
+                this.i = current + 1; \
+                return { value: current, done: false }; \
+            } \
+        } \
+        Range.prototype[Symbol.iterator] = function() { return this; }; \
+        let total = 0; \
+        for (let v of new Range()) { total = total + v; } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m30t_for_of_iterable_separates_iterator_and_next() {
+    // Iterable exposes its own `[Symbol.iterator]` that returns
+    // a SEPARATE iterator object (not `this`) — this exercises
+    // the two-object protocol where the iterable holds state
+    // for `next()` via a distinct instance. The iterator class
+    // is spelled explicitly to keep all identifier references
+    // class-scoped rather than upvalues (the M6 relational-op
+    // path doesn't accept two-upvalue operands yet).
+    let src = "function main() { \
+        class Iterator { \
+            constructor() { this.i = 0; } \
+            next() { \
+                let current = this.i; \
+                if (current === 5) { return { value: 0, done: true }; } \
+                this.i = current + 1; \
+                return { value: current, done: false }; \
+            } \
+        } \
+        let iterable = {}; \
+        iterable[Symbol.iterator] = function() { return new Iterator(); }; \
+        let total = 0; \
+        for (let v of iterable) { total = total + v; } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 10);
+}
+
+#[test]
+fn m30t_for_of_break_stops_user_iterator() {
+    // `break` inside a user-iterator loop still exits. Since
+    // M30 doesn't yet wire IteratorClose on abrupt completion
+    // for user iterators (`return()` method isn't called), the
+    // iterator just gets GC'd — the accumulator check still
+    // proves the loop exited early.
+    let src = "function main() { \
+        class Counter { \
+            constructor() { this.i = 0; } \
+            next() { \
+                let v = this.i; \
+                this.i = this.i + 1; \
+                return { value: v, done: false }; \
+            } \
+        } \
+        Counter.prototype[Symbol.iterator] = function() { return this; }; \
+        let sum = 0; \
+        for (let v of new Counter()) { \
+            if (v === 3) { break; } \
+            sum = sum + v; \
+        } \
+        return sum; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 3);
+}
+
+#[test]
+fn m30t_for_of_non_iterable_throws() {
+    // Plain object without `[Symbol.iterator]` is not iterable.
+    // Per §7.4.1 step 3, GetIterator throws TypeError — we
+    // catch it to keep the helper's int32 return contract.
+    let src = "function main() { \
+        let caught = 0; \
+        try { \
+            for (let x of {}) { caught = 1; } \
+        } catch (e) { \
+            caught = 2; \
+        } \
+        return caught; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 2);
+}
+
+#[test]
+fn m30t_for_of_iterator_returning_non_object_throws() {
+    // §7.4.2 — `iterator.next()` result must be an Object. A
+    // primitive return triggers TypeError (caught below).
+    let src = "function main() { \
+        class Bad { \
+            next() { return 42; } \
+        } \
+        Bad.prototype[Symbol.iterator] = function() { return this; }; \
+        let caught = 0; \
+        try { \
+            for (let v of new Bad()) { caught = 1; } \
+        } catch (e) { \
+            caught = 2; \
+        } \
+        return caught; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 2);
+}
+
 #[test]
 fn m30_for_of_const_binding_is_readonly() {
     // `const` loop binding: assignment inside the body must

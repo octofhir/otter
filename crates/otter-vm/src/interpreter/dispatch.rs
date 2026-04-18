@@ -1112,28 +1112,26 @@ impl Interpreter {
 
             // ---- Iteration (§5.9) ----
             //
-            // `GetIterator r` — fast path through
-            // `runtime.objects.alloc_iterator` which covers built-in
-            // Array/String/Map/Set/arguments iterables. When the iterable
-            // is not one of the fast-path kinds we surface a TypeError
-            // so callers see a catchable JS error; the full Symbol.iterator
-            // lookup + callable dispatch will land with Phase 3b.9b.
+            // `GetIterator r` — §7.4.1 GetIterator(obj, sync).
+            // Delegates to `RuntimeState::iterator_open`, which
+            // looks up `@@iterator` on `target`, invokes it with
+            // `target` as receiver, and validates the returned
+            // iterator is an Object. Built-in iterables
+            // (Array / String / Map / Set / TypedArray) install
+            // their `@@iterator` slot during intrinsic bootstrap,
+            // so built-in and user-defined iterables share the
+            // same dispatch path.
             Opcode::GetIterator => {
                 let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let Some(handle) = target.as_object_handle() else {
-                    let err = runtime.alloc_type_error("Value is not iterable")?;
-                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
-                };
-                match runtime
-                    .objects
-                    .alloc_iterator(crate::object::ObjectHandle(handle))
-                {
-                    Ok(iterator) => {
-                        activation.set_accumulator(RegisterValue::from_object_handle(iterator.0));
+                match runtime.iterator_open(target) {
+                    Ok(iter) => {
+                        activation.set_accumulator(RegisterValue::from_object_handle(iter.0));
                     }
-                    Err(_) => {
-                        let err = runtime.alloc_type_error("Value is not iterable")?;
-                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    Err(crate::VmNativeCallError::Thrown(value)) => {
+                        return Ok(StepOutcome::Throw(value));
+                    }
+                    Err(crate::VmNativeCallError::Internal(msg)) => {
+                        return Err(InterpreterError::NativeCall(msg));
                     }
                 }
             }
@@ -1156,13 +1154,13 @@ impl Interpreter {
                 activation.set_secondary_result(RegisterValue::from_bool(step.is_done()));
             }
 
-            // §14.7.5 `IteratorStep value_reg iter_reg` — M30
-            // one-shot for-of driver. Calls `iterator.next()`; if
-            // the step is done, writes `true` to acc (so the
-            // caller can `JumpIfTrue` out of the loop). Otherwise
-            // writes `false` to acc and unwraps the step value
-            // into `value_reg`. Mirrors the `ForInNext` shape so
-            // the compiler can reuse the same loop skeleton.
+            // §7.4.2 IteratorStep + §14.7.5 for-of driver —
+            // `IteratorStep value_reg iter_reg`. Calls
+            // `iterator.next()` via `iterator_step_protocol` so
+            // user-defined iterators that expose a `next()`
+            // method go through the full Object-shaped-result
+            // path (ToBoolean(result.done), Get(result.value))
+            // rather than the built-in-only fast path.
             Opcode::IteratorStep => {
                 let value_dst = reg(&instr.operands, 0)?;
                 let iter_val = read_reg(activation, function, reg(&instr.operands, 1)?)?;
@@ -1171,7 +1169,15 @@ impl Interpreter {
                     let err = runtime.alloc_type_error("IteratorStep target is not an iterator")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                 };
-                let step = runtime.iterator_next(iter)?;
+                let step = match runtime.iterator_step_protocol(iter) {
+                    Ok(step) => step,
+                    Err(crate::VmNativeCallError::Thrown(value)) => {
+                        return Ok(StepOutcome::Throw(value));
+                    }
+                    Err(crate::VmNativeCallError::Internal(msg)) => {
+                        return Err(InterpreterError::NativeCall(msg));
+                    }
+                };
                 if step.is_done() {
                     activation.set_accumulator(RegisterValue::from_bool(true));
                 } else {
@@ -2771,15 +2777,22 @@ fn resolve_property(
     Ok(runtime.intern_property_name(property_name))
 }
 
-/// Coerce a `RegisterValue` to a property-name id. Strings intern
-/// directly; numbers/other primitives stringify via `js_to_string`.
-/// Symbols are not yet handled (they live in an orthogonal namespace
-/// that Phase 3b.7 will wire through).
+/// Coerce a `RegisterValue` to a property-name id per §7.1.19
+/// ToPropertyKey. Three cases: symbols intern into their own
+/// namespace via `intern_symbol_property_name` (so
+/// `obj[Symbol.iterator]` lives in a separate bucket from
+/// `obj["Symbol.iterator"]`), string objects pull their text out,
+/// everything else stringifies via `ToString` and interns.
 fn key_to_property_name(
     runtime: &mut RuntimeState,
     key: RegisterValue,
 ) -> Result<crate::property::PropertyNameId, InterpreterError> {
-    // Fast path: key is already a string object — pull its text out.
+    // Symbol path: §7.1.19 step 2 keeps symbols as-is.
+    if let Some(symbol_id) = key.as_symbol_id() {
+        return Ok(runtime.intern_symbol_property_name(symbol_id));
+    }
+    // String fast path: key is already a string object — pull
+    // its text out.
     if let Some(handle) = key.as_object_handle()
         && let Some(s) = runtime
             .objects

@@ -3417,13 +3417,18 @@ fn lower_identifier_reference(
                 })?;
             Ok(())
         }
-        "globalThis" | "Math" | "console" => {
+        "globalThis" | "Math" | "console" | "Symbol" => {
             // M14 anchor: `globalThis`, `Math`.
             // M19 anchor: `console` — the "hello world" gate. The
             // runtime already installs a `console` object on the
             // global with `log`/`warn`/`error`/`info`/`debug`
             // bindings backed by the pluggable `ConsoleBackend`
             // trait (`StdioConsoleBackend` is the CLI default).
+            // M30-tail: `Symbol` exposes well-known symbols
+            // (`Symbol.iterator`, `Symbol.asyncIterator`, …) as
+            // data properties on the constructor, which the
+            // compiler needs so source-level code can install a
+            // custom `[Symbol.iterator]` on a class prototype.
             let idx = ctx.intern_property_name(name)?;
             builder
                 .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])

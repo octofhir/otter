@@ -788,6 +788,96 @@ impl RuntimeState {
         }
     }
 
+    /// §7.4.1 GetIterator(obj, sync) — spec-compliant iterable →
+    /// iterator resolution. Looks up `@@iterator` on `iterable_val`,
+    /// calls it with `iterable_val` as receiver, and returns the
+    /// resulting iterator object. Throws TypeError when `@@iterator`
+    /// is missing / non-callable / returns a non-object.
+    ///
+    /// Intended for the `GetIterator` opcode dispatch and any
+    /// future `for await` plumbing. Built-in iterables (Array,
+    /// String, Map, Set, TypedArray) have `@@iterator` installed by
+    /// the intrinsic bootstrap, so this unified path handles both
+    /// built-in and user-defined iterables uniformly.
+    pub fn iterator_open(
+        &mut self,
+        iterable_val: RegisterValue,
+    ) -> Result<ObjectHandle, VmNativeCallError> {
+        let Some(iterable) = iterable_val.as_object_handle().map(ObjectHandle) else {
+            return Err(self.throw_as_type_error("Value is not iterable"));
+        };
+        let iter_sym = self
+            .intern_symbol_property_name(crate::intrinsics::WellKnownSymbol::Iterator.stable_id());
+        let method_val = self.ordinary_get(iterable, iter_sym, iterable_val)?;
+        let Some(method) = method_val.as_object_handle().map(ObjectHandle) else {
+            return Err(self.throw_as_type_error("Value is not iterable"));
+        };
+        if !self.objects.is_callable(method) {
+            return Err(self.throw_as_type_error("Value is not iterable"));
+        }
+        let iter_val = self.call_callable(method, iterable_val, &[])?;
+        iter_val
+            .as_object_handle()
+            .map(ObjectHandle)
+            .ok_or_else(|| self.throw_as_type_error("Iterator is not an object"))
+    }
+
+    /// §7.4.2 IteratorStep — drives one `iterator.next()` call and
+    /// unpacks `{value, done}`. Tries the built-in fast path
+    /// (`iterator_next`) first; falls back to the protocol path
+    /// (call the iterator's own `next` method, coerce `done` via
+    /// `ToBoolean`, read `value`) for user-defined iterators.
+    ///
+    /// Returns `IteratorStep::done()` when the iterator signals
+    /// completion and `IteratorStep::yield_value(v)` otherwise.
+    pub fn iterator_step_protocol(
+        &mut self,
+        iter: ObjectHandle,
+    ) -> Result<crate::object::IteratorStep, VmNativeCallError> {
+        match self.iterator_next(iter) {
+            Ok(step) => return Ok(step),
+            Err(InterpreterError::InvalidHeapValueKind) => {}
+            Err(other) => return Err(interp_err_to_vm(self, other)),
+        }
+        let iter_val = RegisterValue::from_object_handle(iter.0);
+        let next_prop = self.intern_property_name("next");
+        let next_method = self.ordinary_get(iter, next_prop, iter_val)?;
+        let Some(next_handle) = next_method.as_object_handle().map(ObjectHandle) else {
+            return Err(self.throw_as_type_error("Iterator has no 'next' method"));
+        };
+        if !self.objects.is_callable(next_handle) {
+            return Err(self.throw_as_type_error("Iterator's 'next' is not callable"));
+        }
+        let result = self.call_callable(next_handle, iter_val, &[])?;
+        let Some(result_obj) = result.as_object_handle().map(ObjectHandle) else {
+            return Err(self.throw_as_type_error("Iterator next() result is not an object"));
+        };
+        let done_prop = self.intern_property_name("done");
+        let done_val = self.ordinary_get(result_obj, done_prop, result)?;
+        let done = match self.js_to_boolean(done_val) {
+            Ok(b) => b,
+            Err(err) => return Err(interp_err_to_vm(self, err)),
+        };
+        if done {
+            return Ok(crate::object::IteratorStep::done());
+        }
+        let value_prop = self.intern_property_name("value");
+        let value_val = self.ordinary_get(result_obj, value_prop, result)?;
+        Ok(crate::object::IteratorStep::yield_value(value_val))
+    }
+
+    /// Wraps a plain message string in a JS `TypeError` value and
+    /// returns the `VmNativeCallError::Thrown` variant so callers
+    /// can `?`-propagate without open-coding the allocator dance.
+    /// Internal alloc failures collapse into
+    /// `VmNativeCallError::Internal`.
+    fn throw_as_type_error(&mut self, message: &str) -> VmNativeCallError {
+        match self.alloc_type_error(message) {
+            Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
+            Err(err) => VmNativeCallError::Internal(format!("{err}").into()),
+        }
+    }
+
     pub fn iterator_next(
         &mut self,
         handle: ObjectHandle,
@@ -1431,5 +1521,21 @@ impl RuntimeState {
 impl Default for RuntimeState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Converts an `InterpreterError` raised from a nested path (e.g.
+/// the built-in `iterator_next` fast path) into a
+/// `VmNativeCallError`, collapsing thrown JS values into
+/// `Thrown` and everything else into `Internal`. Mirrors the
+/// inverse conversion performed all over `call_callable`.
+fn interp_err_to_vm(runtime: &mut RuntimeState, err: InterpreterError) -> VmNativeCallError {
+    match err {
+        InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+        InterpreterError::TypeError(message) => match runtime.alloc_type_error(&message) {
+            Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
+            Err(inner) => VmNativeCallError::Internal(format!("{inner}").into()),
+        },
+        other => VmNativeCallError::Internal(format!("{other}").into()),
     }
 }

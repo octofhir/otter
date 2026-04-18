@@ -141,17 +141,9 @@ fn generator_unsupported() {
     ));
 }
 
-#[test]
-fn multi_parameters_unsupported() {
-    let err = compile("function f(a, b) { return a; }").expect_err("two params at M9+");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "multiple_parameters",
-            ..
-        }
-    ));
-}
+// Removed: multi_parameters_unsupported, default_parameter_unsupported,
+// rest_parameter_unsupported — all three shapes are supported as of M22.
+// Positive coverage for each lives in the M22 test block below.
 
 #[test]
 fn destructuring_parameter_unsupported() {
@@ -160,30 +152,6 @@ fn destructuring_parameter_unsupported() {
         err,
         SourceLoweringError::Unsupported {
             construct: "destructuring_parameter",
-            ..
-        }
-    ));
-}
-
-#[test]
-fn default_parameter_unsupported() {
-    let err = compile("function f(n = 0) { return n; }").expect_err("default later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "default_parameter",
-            ..
-        }
-    ));
-}
-
-#[test]
-fn rest_parameter_unsupported() {
-    let err = compile("function f(...rest) { return 1; }").expect_err("rest later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "rest_parameter",
             ..
         }
     ));
@@ -833,21 +801,9 @@ fn compound_const_assignment_unsupported() {
     ));
 }
 
-#[test]
-fn assignment_to_param_unsupported() {
-    // `function f(n) { n = 5; }` is valid JS (parameters are
-    // mutable), but M5 rejects it: parameters live in a different
-    // slot range and the surface is intentionally minimal until M9+
-    // expands the semantics.
-    let err = compile("function f(n) { n = 5; return n; }").expect_err("param assignment at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "assignment_to_param",
-            ..
-        }
-    ));
-}
+// Removed: assignment_to_param_unsupported — parameters are ordinary
+// mutable bindings as of M22; positive coverage in
+// `param_binding_can_be_assigned`.
 
 #[test]
 fn assignment_to_undeclared_unsupported() {
@@ -1882,23 +1838,17 @@ fn call_with_three_int_args_orders_correctly() {
     // Multi-arg call with literal args. Confirms args land in the
     // expected order in the temp window (`base+0`, `base+1`,
     // `base+2`) and `CallDirect` reads them as `[10, 20, 30]`.
-    let src = "function add3(a, b, c) { return a; } \
-               function main() { return add3(10, 20, 30); }";
-    // Wait — our M9 source compiler still rejects multi-param
-    // functions (`a, b, c`). So this test would fail at compile
-    // time.
-    let _ = src;
-    let err = compile(
-        "function add3(a, b, c) { return a; } function main() { return add3(10, 20, 30); }",
-    )
-    .expect_err("multi-param at M9");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "multiple_parameters",
-            ..
-        }
-    ));
+    // Multi-param signatures became a first-class surface at M22;
+    // this was a placeholder rejection test before.
+    let src = "function pickA(a, b, c) { return a; } \
+               function main() { return pickA(10, 20, 30); }";
+    assert_eq!(run_int32_function(src, &[]), 10);
+    let src = "function pickB(a, b, c) { return b; } \
+               function main() { return pickB(10, 20, 30); }";
+    assert_eq!(run_int32_function(src, &[]), 20);
+    let src = "function pickC(a, b, c) { return c; } \
+               function main() { return pickC(10, 20, 30); }";
+    assert_eq!(run_int32_function(src, &[]), 30);
 }
 
 #[test]
@@ -4541,6 +4491,186 @@ fn destructuring_catch_param_rejected() {
             err,
             SourceLoweringError::Unsupported {
                 construct: "destructuring_catch_param",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M22: default params + rest params + multi-param signatures
+// ---------------------------------------------------------------------------
+
+/// Runs a 0-arg function call to `main()` and expects the return to
+/// be an int32. Usable for programs that need multiple params on
+/// the *callee* side but still return an int at the top level.
+fn run_main_int(source: &str) -> i32 {
+    let module = compile(source).expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    result
+        .return_value()
+        .as_i32()
+        .expect("main must return int32")
+}
+
+#[test]
+fn two_param_function_receives_both_args() {
+    let src = "function sum(a, b) { return a + b; } \
+               function main() { return sum(40, 2); }";
+    assert_eq!(run_main_int(src), 42);
+}
+
+#[test]
+fn three_param_function_all_reachable_by_name() {
+    // Body references all three params — each must resolve to its
+    // own register slot.
+    let src = "function calc(a, b, c) { return a + b + c; } \
+               function main() { return calc(1, 2, 3); }";
+    assert_eq!(run_main_int(src), 6);
+}
+
+#[test]
+fn param_default_triggered_by_missing_argument() {
+    // Caller passes fewer args than params → missing slots are
+    // `undefined` → defaults fire.
+    let src = "function f(a, b) { return a + b; } \
+               function main() { return f(5, 3); }";
+    assert_eq!(run_main_int(src), 8);
+    let src = "function f(a, b = 100) { return a + b; } \
+               function main() { return f(5); }";
+    assert_eq!(run_main_int(src), 105);
+}
+
+#[test]
+fn param_default_not_triggered_by_explicit_value() {
+    // Caller supplies the arg → default does not run.
+    let src = "function f(a, b = 100) { return a + b; } \
+               function main() { return f(5, 7); }";
+    assert_eq!(run_main_int(src), 12);
+}
+
+#[test]
+fn param_default_triggered_by_explicit_undefined() {
+    // §10.2.1 — default runs for explicit `undefined` too.
+    let src = "function f(a, b = 100) { return a + b; } \
+               function main() { return f(5, undefined); }";
+    assert_eq!(run_main_int(src), 105);
+}
+
+#[test]
+fn param_default_can_reference_earlier_param() {
+    // Defaults evaluate in source order; later defaults see
+    // earlier params' (possibly defaulted) values.
+    let src = "function f(a, b = a + 1) { return b; } \
+               function main() { return f(10); }";
+    assert_eq!(run_main_int(src), 11);
+}
+
+#[test]
+fn param_default_can_be_a_call_expression() {
+    // Default initializers are full expressions.
+    let src = "function inc(n) { return n + 1; } \
+               function f(a = inc(9)) { return a; } \
+               function main() { return f(); }";
+    assert_eq!(run_main_int(src), 10);
+}
+
+#[test]
+fn param_default_can_be_a_template_literal() {
+    let src = "function greet(name, msg = `hello, ${name}`) { return msg; } \
+               function main() { return greet(\"otter\"); }";
+    assert_eq!(run_string_function(src, &[]), "hello, otter");
+}
+
+#[test]
+fn rest_parameter_collects_extra_args() {
+    // Caller passes more args than non-rest params → extras go
+    // into the rest array.
+    let src = "function f(a, ...rest) { return rest.length; } \
+               function main() { return f(1, 2, 3, 4); }";
+    assert_eq!(run_main_int(src), 3);
+}
+
+#[test]
+fn rest_parameter_preserves_element_order() {
+    // rest[0] is the first extra arg, rest[1] the second, …
+    let src = "function f(...rest) { return rest[0] + rest[1] + rest[2]; } \
+               function main() { return f(1, 10, 100); }";
+    assert_eq!(run_main_int(src), 111);
+}
+
+#[test]
+fn rest_parameter_empty_when_no_extras() {
+    // Caller passes fewer args than non-rest params → rest
+    // materialises an empty array.
+    let src = "function f(a, b, ...rest) { return rest.length; } \
+               function main() { return f(1, 2); }";
+    assert_eq!(run_main_int(src), 0);
+}
+
+#[test]
+fn rest_parameter_no_non_rest_receives_all_args() {
+    let src = "function f(...args) { return args.length; } \
+               function main() { return f(1, 2, 3, 4, 5); }";
+    assert_eq!(run_main_int(src), 5);
+}
+
+#[test]
+fn rest_parameter_with_defaults_mix() {
+    // Combine defaults + rest. Rest captures only args past the
+    // non-rest count.
+    let src = "function f(a = 10, b = 20, ...rest) { return a + b + rest.length; } \
+               function main() { return f(); }";
+    // No args → a=10 (default), b=20 (default), rest=[]
+    assert_eq!(run_main_int(src), 30);
+    let src = "function f(a = 10, b = 20, ...rest) { return a + b + rest.length; } \
+               function main() { return f(1, 2, 3, 4); }";
+    // a=1, b=2, rest=[3, 4]
+    assert_eq!(run_main_int(src), 5);
+}
+
+#[test]
+fn param_binding_can_be_assigned() {
+    // Params are ordinary `let`-like bindings — reassigning works.
+    let src = "function f(a, b) { a = a + 1; return a + b; } \
+               function main() { return f(5, 3); }";
+    assert_eq!(run_main_int(src), 9);
+}
+
+#[test]
+fn param_local_collision_rejected() {
+    // Top-scope `let` can't shadow a parameter of the same name.
+    let err = compile("function f(a) { let a = 1; return a; }").expect_err("duplicate a");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "duplicate_binding",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn destructuring_rest_param_rejected() {
+    // `...[x, y]` uses a destructuring pattern in the rest
+    // position. Not yet supported.
+    let err = compile("function f(...[x, y]) { return x; }").expect_err("rest destructuring");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "rest_destructuring_parameter",
                 ..
             }
         ),

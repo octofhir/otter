@@ -60,7 +60,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M19      | `console.log` + minimal console shim — first "hello world" gate.                                                                | [x]    | 4a41715 |
 | M20      | `SwitchStatement` with `case` / `default` + `break` exits.                                                                     | [x]    | 5bd4a2d |
 | M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [x]    | fe76e4b |
-| M22      | Default params (`function f(n = 0)`) + rest params (`...rest`).                                                                 | [ ]    |        |
+| M22      | Default params (`function f(n = 0)`) + rest params (`...rest`).                                                                 | [x]    | _pending_ |
 | M23      | Spread in call args + array literals (`f(...a)`, `[...a, ...b]`).                                                              | [ ]    |        |
 | M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [ ]    |        |
 | M25      | Closures — nested `FunctionDeclaration` / `FunctionExpression` + upvalue capture.                                                | [ ]    |        |
@@ -112,6 +112,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | Method-call `CallExpression` (`o.m()`, `o[k]()`) + `console` global + host-function dispatch | yes | M19 |
 | `SwitchStatement` with `case` / `default` + `break` exits (fall-through, mid-switch default, nested, string/content compare) | yes | M20 |
 | `ThrowStatement` + `TryStatement` with `catch` / `finally` (nested, rethrow, bindingless catch; normal + exception paths only) | yes | M21 |
+| Multi-param signatures + default initializers + rest params + writable param bindings | yes | M22 |
 
 ## Benchmarks
 

@@ -703,6 +703,26 @@ impl Interpreter {
                 let handle = runtime.alloc_array();
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
+            // §10.4.4 — Rest parameter. Collects `overflow_args`
+            // (arguments beyond the formal non-rest param count)
+            // into a fresh Array and writes the handle to the
+            // accumulator. The compiler emits this at function
+            // entry for `function f(..., ...rest)`; the trailing
+            // `Star r_rest` binds it to the rest local.
+            Opcode::CreateRestParameters => {
+                let arr = runtime.alloc_array();
+                let overflow = std::mem::take(&mut activation.overflow_args);
+                for value in overflow {
+                    // `push_element` bumps length + writes into
+                    // the dense elements slot.
+                    if runtime.objects.push_element(arr, value).is_err() {
+                        let err =
+                            runtime.alloc_type_error("CreateRestParameters: array push failed")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+                activation.set_accumulator(RegisterValue::from_object_handle(arr.0));
+            }
 
             // ---- Coercions reusing runtime helpers ----
             Opcode::ToNumber => {

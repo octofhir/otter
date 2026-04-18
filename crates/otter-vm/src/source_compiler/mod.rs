@@ -121,7 +121,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentOperator,
     AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, ComputedMemberExpression,
-    ConditionalExpression, Expression, FormalParameter, FormalParameters, Function, FunctionBody,
+    ConditionalExpression, Expression, FormalParameters, Function, FunctionBody,
     IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral, ObjectExpression,
     ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
     StaticMemberExpression, TemplateLiteral, UnaryExpression, UnaryOperator, UpdateExpression,
@@ -311,7 +311,8 @@ fn lower_function_declaration<'a>(
         .map(|ident| ident.name.as_str().to_owned())
         .ok_or_else(|| SourceLoweringError::unsupported("anonymous_function", func.span))?;
 
-    let param_count = count_simple_params(&func.params)?;
+    let params_layout = analyze_params(&func.params)?;
+    let param_count = params_layout.param_slot_count();
 
     let body = func
         .body
@@ -325,10 +326,11 @@ fn lower_function_declaration<'a>(
     // seeds the function's `FeedbackTableLayout` for the JIT's
     // int32-trust consumer (see
     // `analyze_template_candidate_with_feedback`).
-    let body_out = lower_function_body(body, &func.params, param_count, function_names)?;
+    let body_out = lower_function_body(body, &func.params, &params_layout, function_names)?;
 
     // FrameLayout: 1 hidden slot for `this`, then `param_count`
-    // parameter slots, then `local_count` `let`/`const` slots, then
+    // parameter slots (non-rest params only; rest lands in a local),
+    // then `local_count` `let`/`const` + rest-param slots, then
     // `temp_count` call-arg scratch slots. The v2 interpreter maps
     // `Ldar r0` through `FrameLayout::resolve_user_visible(0)`, which
     // points at the first parameter (absolute index 1), so parameter
@@ -397,48 +399,198 @@ fn arithmetic_only_feedback_layout(count: u16) -> FeedbackTableLayout {
     FeedbackTableLayout::new(slots)
 }
 
-fn count_simple_params(
-    params: &FormalParameters<'_>,
-) -> Result<RegisterIndex, SourceLoweringError> {
-    if params.rest.is_some() {
-        return Err(SourceLoweringError::unsupported(
-            "rest_parameter",
-            params.span,
-        ));
-    }
-    match params.items.as_slice() {
-        [] => Ok(0),
-        [single] => {
-            validate_simple_param(single)?;
-            Ok(1)
-        }
-        [_, second, ..] => Err(SourceLoweringError::unsupported(
-            "multiple_parameters",
-            second.span,
-        )),
+/// Structured result of `analyze_params`. Captures what the body
+/// lowerer needs to emit correct parameter-setup bytecode at
+/// function entry.
+///
+/// - `names[i]` — identifier name of the i-th non-rest parameter.
+/// - `defaults[i]` — `Some(expr)` when the i-th param has a
+///   default initializer; `None` otherwise.
+/// - `rest_name` — `Some(name)` when the function has a rest
+///   parameter (`function f(..., ...rest)`); `None` otherwise.
+///
+/// The rest parameter lives in a dedicated local slot (allocated
+/// at body-lowering time), **not** in the parameter slot window —
+/// the runtime's `CallDirect` / `CallProperty` paths copy only
+/// non-rest arguments into parameter slots, with anything beyond
+/// that count stashed in `activation.overflow_args` for the
+/// `CreateRestParameters` opcode at function entry to pull into an
+/// array.
+struct ParamsLayout<'a> {
+    names: Vec<&'a str>,
+    defaults: Vec<Option<&'a Expression<'a>>>,
+    rest_name: Option<&'a str>,
+}
+
+impl ParamsLayout<'_> {
+    /// Count of actual parameter slots the FrameLayout reserves —
+    /// one per non-rest param (the rest binding is a local, not a
+    /// param slot).
+    fn param_slot_count(&self) -> RegisterIndex {
+        RegisterIndex::try_from(self.names.len()).unwrap_or(u16::MAX)
     }
 }
 
-fn validate_simple_param(param: &FormalParameter<'_>) -> Result<(), SourceLoweringError> {
-    if param.initializer.is_some() {
-        return Err(SourceLoweringError::unsupported(
-            "default_parameter",
-            param.span,
-        ));
+/// Walks a `FormalParameters` list, validates every param shape we
+/// support at M22 (plain identifier patterns, optional default
+/// initializer, optional single rest parameter), and produces a
+/// `ParamsLayout` the body lowerer can drive off of.
+///
+/// Accepted shapes (per-param):
+/// - `name` — plain identifier.
+/// - `name = <expr>` — identifier with default initializer.
+///
+/// Accepted rest shape:
+/// - `...rest` — plain identifier. No default allowed on rest
+///   (spec forbids it anyway).
+///
+/// Rejected with stable tags:
+/// - `destructuring_parameter` — any non-identifier pattern.
+/// - `rest_destructuring_parameter` — destructuring in a rest.
+/// - (The old `multiple_parameters` tag is removed — multi-param
+///   signatures are a first-class surface now.)
+fn analyze_params<'a>(
+    params: &'a FormalParameters<'a>,
+) -> Result<ParamsLayout<'a>, SourceLoweringError> {
+    let mut names = Vec::with_capacity(params.items.len());
+    let mut defaults = Vec::with_capacity(params.items.len());
+
+    for param in params.items.iter() {
+        let BindingPattern::BindingIdentifier(ident) = &param.pattern else {
+            return Err(SourceLoweringError::unsupported(
+                "destructuring_parameter",
+                param.span,
+            ));
+        };
+        names.push(ident.name.as_str());
+        defaults.push(param.initializer.as_deref());
     }
-    if !matches!(param.pattern, BindingPattern::BindingIdentifier(_)) {
-        return Err(SourceLoweringError::unsupported(
-            "destructuring_parameter",
-            param.span,
-        ));
+
+    // Optional rest parameter. oxc wraps `...rest` in
+    // `FormalParameters.rest: FormalParameterRest`, which itself
+    // contains a `BindingRestElement { argument: BindingPattern }`.
+    let rest_name = if let Some(rest) = params.rest.as_deref() {
+        let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument else {
+            return Err(SourceLoweringError::unsupported(
+                "rest_destructuring_parameter",
+                rest.rest.span,
+            ));
+        };
+        Some(ident.name.as_str())
+    } else {
+        None
+    };
+
+    Ok(ParamsLayout {
+        names,
+        defaults,
+        rest_name,
+    })
+}
+
+/// Emits per-parameter default-initializer bytecode at function
+/// entry, in declaration order. For each param with `default = Some(expr)`:
+///
+/// ```text
+///   Ldar r_param                ; acc = caller-supplied arg (or undefined)
+///   JumpIfNotUndefined skip
+///   <lower default expr>         ; acc = default value
+///   Star r_param
+/// skip:
+/// ```
+///
+/// Spec: §10.2.1 FunctionDeclarationInstantiation — defaults only
+/// evaluate when the parameter binding is `undefined`, matching
+/// both "caller omitted the argument" and "caller passed explicit
+/// `undefined`".
+///
+/// Later defaults can reference earlier params (`f(a, b = a + 1)`)
+/// because the iteration is in source order and each default
+/// `Star`s into the param slot before the next default runs.
+fn emit_default_initializers<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    layout: &ParamsLayout<'a>,
+) -> Result<(), SourceLoweringError> {
+    for (i, default) in layout.defaults.iter().enumerate() {
+        let Some(expr) = default else { continue };
+        let reg = u32::try_from(i)
+            .map_err(|_| SourceLoweringError::Internal("param index overflow".into()))?;
+        let skip = builder.new_label();
+        // Ldar reads the param slot into acc. We intentionally
+        // skip the feedback-slot attachment that
+        // `lower_identifier_read` would add — this is a one-shot
+        // prologue read, and polluting the feedback vector with
+        // it would mark every default as `Any` for no gain.
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(reg)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (default init): {err:?}"))
+            })?;
+        builder
+            .emit_jump_to(Opcode::JumpIfNotUndefined, skip)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode JumpIfNotUndefined (default): {err:?}"
+                ))
+            })?;
+        // Lower default expression into acc, then spill.
+        lower_return_expression(builder, ctx, expr)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(reg)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (default init): {err:?}"))
+            })?;
+        builder
+            .bind_label(skip)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind default skip: {err:?}")))?;
     }
+    Ok(())
+}
+
+/// Materialises the rest parameter's array from
+/// `activation.overflow_args` and binds it to a newly-allocated
+/// local slot. Called at function entry after default
+/// initializers.
+///
+/// `function f(a, b, ...rest)` — the runtime's `CallDirect` /
+/// `CallProperty` copy only the non-rest args into parameter slots
+/// (`param_count = 2` here); any additional arguments land in the
+/// activation's `overflow_args`. `CreateRestParameters` drains
+/// that into a fresh Array, which we then `Star` into `r_rest`.
+///
+/// The rest binding is a local (not a param slot) so it stays out
+/// of the FrameLayout's `parameter_count` — that count matches the
+/// runtime's arg-copy window.
+fn emit_rest_parameter<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    layout: &ParamsLayout<'a>,
+) -> Result<(), SourceLoweringError> {
+    let Some(rest_name) = layout.rest_name else {
+        return Ok(());
+    };
+    // Allocate rest as a `const`-like local. The ES spec treats
+    // rest as a fresh binding (not a param alias); using `const`
+    // semantics rejects accidental reassignment. Catch-clause /
+    // for-init bindings follow the same pattern.
+    let slot = ctx.allocate_local(rest_name, true, Span::default())?;
+    builder
+        .emit(Opcode::CreateRestParameters, &[])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode CreateRestParameters: {err:?}"))
+        })?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Star (rest): {err:?}")))?;
+    ctx.mark_initialized(rest_name)?;
     Ok(())
 }
 
 fn lower_function_body<'a>(
     body: &'a FunctionBody<'a>,
-    params: &'a FormalParameters<'a>,
-    param_count: RegisterIndex,
+    _params: &'a FormalParameters<'a>,
+    layout: &ParamsLayout<'a>,
     function_names: &'a [&'a str],
 ) -> Result<FunctionBodyOutput, SourceLoweringError> {
     if !body.directives.is_empty() {
@@ -448,15 +600,17 @@ fn lower_function_body<'a>(
         ));
     }
 
-    // The function body must end with exactly one `ReturnStatement`
-    // — the v2 dispatcher relies on it for tier-up call exits, and
-    // M6 has no reachability analysis to synthesize a fall-through
-    // `LdaUndefined; Return` for paths that don't return on every
-    // branch. Earlier statements are processed via `lower_top_statement`
-    // (which accepts top-level `let`/`const` plus everything
-    // `lower_nested_statement` accepts).
     let mut builder = BytecodeBuilder::new();
-    let mut ctx = LoweringContext::new(params, param_count, function_names);
+    let mut ctx = LoweringContext::new(layout, function_names);
+
+    // §14.1.21 FunctionDeclarationInstantiation — evaluate default
+    // initializers for any param whose caller-supplied value is
+    // `undefined`, then materialise the rest parameter's array
+    // from `activation.overflow_args`. Both run before any body
+    // statement so `Ldar r_param` later in the body sees a
+    // definite value.
+    emit_default_initializers(&mut builder, &mut ctx, layout)?;
+    emit_rest_parameter(&mut builder, &mut ctx, layout)?;
 
     // Split-off for the tail statement. Empty bodies stay rejected
     // since the frame layout still needs some instruction to exit
@@ -1463,18 +1617,23 @@ struct LocalBinding<'a> {
     is_const: bool,
 }
 
-/// Per-function lowering context: tracks the sole parameter (if any)
-/// plus every `let`/`const` declared so far (with their assigned
-/// register slots and TDZ state), the call-arg temp pool, and the
-/// shared module-level function name table for resolving
-/// `CallExpression` targets. Scoped declarations (currently only
-/// `for` init `let`s) push onto `locals` and pop on scope exit while
-/// `peak_local_count` retains the high-water mark so the
+/// Per-function lowering context: tracks parameters (0..N regular
+/// plus an optional rest param that lives as a local), every
+/// `let`/`const` declared so far (with their assigned register
+/// slots and TDZ state), the call-arg temp pool, and the shared
+/// module-level function name table for resolving `CallExpression`
+/// targets. Scoped declarations push onto `locals` and pop on scope
+/// exit while `peak_local_count` retains the high-water mark so the
 /// [`FrameLayout`] reserves enough slots for the whole function.
 struct LoweringContext<'a> {
-    param_name: Option<&'a str>,
-    /// Number of parameter slots in the frame, used to compute the
-    /// next local slot index (`param_count + locals.len()`).
+    /// Identifiers of the function's regular (non-rest) parameters,
+    /// in declaration order. `param_names[i]` is bound to register
+    /// `i` (user-visible slot `i`, absolute slot `hidden_count + i`).
+    param_names: Vec<&'a str>,
+    /// Number of regular parameter slots in the frame, used to
+    /// compute the next local slot index
+    /// (`param_count + locals.len()`). Excludes the rest param —
+    /// the rest binding lives in the locals region.
     param_count: u16,
     locals: Vec<LocalBinding<'a>>,
     /// High-water mark of `locals.len()`. The frame layout reserves
@@ -1599,20 +1758,11 @@ struct ScopeSnapshot {
 }
 
 impl<'a> LoweringContext<'a> {
-    fn new(
-        params: &'a FormalParameters<'a>,
-        param_count: RegisterIndex,
-        function_names: &'a [&'a str],
-    ) -> Self {
-        let param_name = match params.items.as_slice() {
-            [single] => match &single.pattern {
-                BindingPattern::BindingIdentifier(ident) => Some(ident.name.as_str()),
-                _ => None,
-            },
-            _ => None,
-        };
+    fn new(layout: &ParamsLayout<'a>, function_names: &'a [&'a str]) -> Self {
+        let param_names = layout.names.clone();
+        let param_count = RegisterIndex::try_from(param_names.len()).unwrap_or(u16::MAX);
         Self {
-            param_name,
+            param_names,
             param_count,
             locals: Vec::new(),
             peak_local_count: 0,
@@ -1942,7 +2092,7 @@ impl<'a> LoweringContext<'a> {
         // so they collide with a top-scope `let`/`const` of the same
         // name but NOT with a same-named binding inside a nested
         // block.
-        let param_collision = scope_start == 0 && self.param_name == Some(name);
+        let param_collision = scope_start == 0 && self.param_names.contains(&name);
         if same_scope_duplicate || param_collision {
             return Err(SourceLoweringError::unsupported("duplicate_binding", span));
         }
@@ -2008,10 +2158,18 @@ impl<'a> LoweringContext<'a> {
                 is_const: local.is_const,
             });
         }
-        match self.param_name {
-            Some(param) if param == name => Some(BindingRef::Param { reg: 0 }),
-            _ => None,
+        // Walk params in declaration order; the i-th param lives at
+        // user-visible register `i`. Rest-param lookups fall through
+        // to the locals search above — rest is a local, not a
+        // parameter slot.
+        for (i, param) in self.param_names.iter().enumerate() {
+            if *param == name {
+                let reg = u16::try_from(i)
+                    .expect("param index fits in u16 because param_names length does");
+                return Some(BindingRef::Param { reg });
+            }
         }
+        None
     }
 }
 
@@ -3758,7 +3916,6 @@ fn apply_binary_op_with_complex_rhs(
 /// - non-identifier target (member, destructuring, TS-only) →
 ///   stable per-shape tag;
 /// - unbound identifier → `unbound_identifier`;
-/// - parameter as target → `assignment_to_param`;
 /// - const binding as target → `const_assignment`;
 /// - in-TDZ binding as target → `tdz_self_reference`;
 /// - assignment operator outside `=`/`+=`/`-=`/`*=`/`|=` → stable
@@ -3843,12 +4000,12 @@ fn lower_identifier_assignment<'a>(
                 target_span,
             ));
         }
-        BindingRef::Param { .. } => {
-            return Err(SourceLoweringError::unsupported(
-                "assignment_to_param",
-                target_span,
-            ));
-        }
+        // Parameters are ordinary writable bindings in
+        // non-strict mode (§10.2.1 FunctionDeclarationInstantiation
+        // puts them on the function's VariableEnvironment with
+        // `mutable: true`). Assignment writes back into the
+        // parameter slot.
+        BindingRef::Param { reg } => reg,
     };
 
     if expr.operator == AssignmentOperator::Assign {

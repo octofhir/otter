@@ -362,7 +362,7 @@ fn lower_function_declaration<'a>(
         side_tables,
         feedback_layout,
         Default::default(),
-        Default::default(),
+        body_out.exceptions,
         Default::default(),
     );
 
@@ -383,6 +383,7 @@ struct FunctionBodyOutput {
     property_names: crate::property::PropertyNameTable,
     float_constants: crate::float::FloatTable,
     string_literals: crate::string::StringTable,
+    exceptions: crate::exception::ExceptionTable,
 }
 
 /// Build a `FeedbackTableLayout` with `count` [`FeedbackKind::Arithmetic`]
@@ -511,6 +512,10 @@ fn lower_function_body<'a>(
         })?;
     }
 
+    // Resolve pending exception handlers to concrete PCs before
+    // `finish()` drops the builder's label state.
+    let exception_handlers = ctx.take_exception_handlers(&builder)?;
+
     let bytecode = builder
         .finish()
         .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
@@ -523,6 +528,7 @@ fn lower_function_body<'a>(
         property_names: ctx.take_property_names(),
         float_constants: ctx.take_float_constants(),
         string_literals: ctx.take_string_literals(),
+        exceptions: crate::exception::ExceptionTable::new(exception_handlers),
     })
 }
 
@@ -587,6 +593,8 @@ fn lower_nested_statement<'a>(
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
         Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
         Statement::SwitchStatement(sw) => lower_switch_statement(builder, ctx, sw),
+        Statement::ThrowStatement(throw) => lower_throw_statement(builder, ctx, throw),
+        Statement::TryStatement(try_stmt) => lower_try_statement(builder, ctx, try_stmt),
         Statement::BreakStatement(break_stmt) => lower_break_statement(builder, ctx, break_stmt),
         Statement::ContinueStatement(cont_stmt) => {
             lower_continue_statement(builder, ctx, cont_stmt)
@@ -1143,6 +1151,221 @@ fn lower_switch_statement<'a>(
     lower
 }
 
+/// Lowers `throw <expr>;`. Evaluates the argument into acc, emits
+/// `Opcode::Throw`, and lets the interpreter's throw-transfer path
+/// find the nearest enclosing handler in the function's
+/// `ExceptionTable`.
+///
+/// §14.14 ThrowStatement.
+fn lower_throw_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    throw: &'a oxc_ast::ast::ThrowStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    lower_return_expression(builder, ctx, &throw.argument)?;
+    builder
+        .emit(Opcode::Throw, &[])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Throw: {err:?}")))?;
+    Ok(())
+}
+
+/// Lowers `try { … } catch (e) { … } finally { … }`. Supports four
+/// shapes — try/catch, try/finally, try/catch/finally, and
+/// reject-bare-`try`. Bytecode shape (try/catch/finally — the
+/// richest form):
+///
+/// ```text
+///   try_start:
+///     <lower try body>
+///   try_end:
+///     Jump finally_normal          ; normal exit from try → run finally
+///   catch_start:
+///     LdaException
+///     Star r_e                     ; bind catch parameter (if any)
+///     <lower catch body>
+///   catch_end:
+///     Jump finally_normal          ; normal exit from catch → run finally
+///   finally_handler:
+///     <lower finally body (copy 1)>
+///     ReThrow                      ; re-raise after running finally
+///   finally_normal:
+///     <lower finally body (copy 2)>
+///   after_try:
+/// ```
+///
+/// Registered handlers:
+/// - `(try_start, try_end, catch_start)` — catches throws from the
+///   try body so catch runs.
+/// - `(catch_start, catch_end, finally_handler)` — catches throws
+///   from inside the catch body so finally still runs, then
+///   re-raises.
+///
+/// For try/catch (no finally), the catch body's end just falls
+/// through to `after_try`, and only the first handler is registered.
+/// For try/finally (no catch), there's a single handler
+/// `(try_start, try_end, finally_handler)` and the try body's
+/// normal path jumps directly to `finally_normal`.
+///
+/// Known simplification (M21): `return` / `break` / `continue` from
+/// inside the `try` or `catch` block skips the `finally` body. The
+/// spec requires finally to run even on abrupt completions; wiring
+/// that needs a deferred-completion mechanism that lands in a
+/// later milestone. Normal flow + exception flow are both
+/// spec-compliant here.
+///
+/// §14.15.3 TryStatement, §14.15.4 TryStatement with Finally.
+fn lower_try_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    try_stmt: &'a oxc_ast::ast::TryStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    if try_stmt.handler.is_none() && try_stmt.finalizer.is_none() {
+        // `try { … }` with neither handler nor finalizer is a
+        // parse error in real JS; oxc's parser should reject it
+        // before we see it, but guard anyway.
+        return Err(SourceLoweringError::unsupported(
+            "try_without_catch_or_finally",
+            try_stmt.span,
+        ));
+    }
+
+    let try_start = builder.new_label();
+    let try_end = builder.new_label();
+    let after_try = builder.new_label();
+
+    // Optional labels for the catch and finally chapters.
+    let catch_start = try_stmt.handler.as_ref().map(|_| builder.new_label());
+    let catch_end = try_stmt.handler.as_ref().map(|_| builder.new_label());
+    let finally_handler = try_stmt.finalizer.as_ref().map(|_| builder.new_label());
+    let finally_normal = try_stmt.finalizer.as_ref().map(|_| builder.new_label());
+
+    // 1) Try body.
+    builder
+        .bind_label(try_start)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind try_start: {err:?}")))?;
+    lower_block_statement(builder, ctx, &try_stmt.block)?;
+    builder
+        .bind_label(try_end)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind try_end: {err:?}")))?;
+
+    // 2) Normal-exit jump out of try — either into finally_normal
+    //    (if we have a finalizer) or straight past the handler to
+    //    after_try (catch-only shape).
+    let try_normal_target = finally_normal.unwrap_or(after_try);
+    builder
+        .emit_jump_to(Opcode::Jump, try_normal_target)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Jump (try normal exit): {err:?}"))
+        })?;
+
+    // 3) Catch block, if present.
+    if let (Some(handler), Some(catch_start), Some(catch_end)) =
+        (try_stmt.handler.as_deref(), catch_start, catch_end)
+    {
+        builder
+            .bind_label(catch_start)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind catch_start: {err:?}")))?;
+        // Register handler for the try body.
+        ctx.record_exception_handler(try_start, try_end, catch_start);
+
+        // Scope-snapshot around the catch body so the catch
+        // parameter `e` pops on catch exit. Without finalizer this
+        // is the only scope; with finalizer the binding is still
+        // local to the catch body — finally can't see `e`.
+        let scope = ctx.snapshot_scope();
+
+        // Bind the catch parameter, if any. `catch { … }` without a
+        // param is the "bindingless catch" from ES2019 (§14.15.1).
+        let lower_catch = (|| -> Result<(), SourceLoweringError> {
+            if let Some(param) = handler.param.as_ref() {
+                let BindingPattern::BindingIdentifier(ident) = &param.pattern else {
+                    return Err(SourceLoweringError::unsupported(
+                        "destructuring_catch_param",
+                        param.span,
+                    ));
+                };
+                let name = ident.name.as_str();
+                let slot = ctx.allocate_local(name, false, ident.span)?;
+                // Pull the pending exception into acc, then bind.
+                builder.emit(Opcode::LdaException, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaException: {err:?}"))
+                })?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!("encode Star (catch param): {err:?}"))
+                    })?;
+                ctx.mark_initialized(name)?;
+            } else {
+                // Bindingless catch — still need to clear the
+                // pending exception from the activation so the
+                // next throw/finally path sees a clean slate.
+                builder.emit(Opcode::LdaException, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaException (bindingless): {err:?}"
+                    ))
+                })?;
+            }
+            lower_block_statement(builder, ctx, &handler.body)?;
+            Ok(())
+        })();
+        ctx.restore_scope(scope);
+        lower_catch?;
+
+        builder
+            .bind_label(catch_end)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind catch_end: {err:?}")))?;
+
+        // After catch completes normally, run finally (if any) or
+        // jump past.
+        builder
+            .emit_jump_to(Opcode::Jump, try_normal_target)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Jump (catch normal exit): {err:?}"))
+            })?;
+    }
+
+    // 4) Finally block, if present.
+    if let (Some(finalizer), Some(finally_handler), Some(finally_normal)) = (
+        try_stmt.finalizer.as_deref(),
+        finally_handler,
+        finally_normal,
+    ) {
+        // Register exception-path handler. If there's a catch,
+        // finally catches exceptions from the catch body. If not,
+        // finally catches exceptions from the try body directly.
+        match (catch_start, catch_end) {
+            (Some(cs), Some(ce)) => ctx.record_exception_handler(cs, ce, finally_handler),
+            _ => ctx.record_exception_handler(try_start, try_end, finally_handler),
+        }
+
+        // 4a) Exception-path finally entry — pending exception is
+        //     still set. Emit the finally body, then ReThrow to
+        //     re-raise the pending value (which `LdaException` /
+        //     `ReThrow` read from the activation).
+        builder.bind_label(finally_handler).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind finally_handler: {err:?}"))
+        })?;
+        lower_block_statement(builder, ctx, finalizer)?;
+        builder.emit(Opcode::ReThrow, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode ReThrow (finally): {err:?}"))
+        })?;
+
+        // 4b) Normal-path finally entry — no pending exception;
+        //     run the finally body and fall through to after_try.
+        builder.bind_label(finally_normal).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind finally_normal: {err:?}"))
+        })?;
+        lower_block_statement(builder, ctx, finalizer)?;
+    }
+
+    builder
+        .bind_label(after_try)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind after_try: {err:?}")))?;
+
+    Ok(())
+}
+
 /// Lowers `break;` → `Jump loop_exit` for the innermost enclosing
 /// loop.
 ///
@@ -1331,6 +1554,24 @@ struct LoweringContext<'a> {
     /// function finalisation so the dispatcher can resolve the
     /// `Idx` operand back to a `JsString` at runtime.
     string_literals: RefCell<Vec<String>>,
+    /// Pending exception-handler records (M21). Each entry pairs a
+    /// try-block's `(try_start_label, try_end_label)` range with the
+    /// `handler_label` the interpreter should jump to on an
+    /// in-range throw. PCs are resolved out of the builder's label
+    /// table after all three labels are bound, just before the
+    /// `ExceptionTable` is constructed in
+    /// [`lower_function_body`].
+    pending_handlers: RefCell<Vec<PendingExceptionHandler>>,
+}
+
+/// Pre-resolution form of an `ExceptionHandler`. All three fields
+/// are labels allocated from the current function's
+/// `BytecodeBuilder`; they resolve to PCs at function finalisation.
+#[derive(Debug, Clone, Copy)]
+struct PendingExceptionHandler {
+    try_start: Label,
+    try_end: Label,
+    handler: Label,
 }
 
 /// `break` / `continue` jump targets for one enclosing control
@@ -1384,7 +1625,49 @@ impl<'a> LoweringContext<'a> {
             property_names: RefCell::new(Vec::new()),
             float_constants: RefCell::new(Vec::new()),
             string_literals: RefCell::new(Vec::new()),
+            pending_handlers: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Register a `try { … } catch/finally { … }` protected range
+    /// for emission into the function's `ExceptionTable` after
+    /// labels resolve.
+    fn record_exception_handler(&self, try_start: Label, try_end: Label, handler: Label) {
+        self.pending_handlers
+            .borrow_mut()
+            .push(PendingExceptionHandler {
+                try_start,
+                try_end,
+                handler,
+            });
+    }
+
+    /// Drain the pending-handler list and resolve each entry into a
+    /// concrete [`crate::exception::ExceptionHandler`]. Returns an
+    /// error if any label ended up unbound — that's an internal bug
+    /// in the lowering (every registered handler must have all three
+    /// labels bound before this is called).
+    fn take_exception_handlers(
+        &self,
+        builder: &BytecodeBuilder,
+    ) -> Result<Vec<crate::exception::ExceptionHandler>, SourceLoweringError> {
+        let drained = std::mem::take(&mut *self.pending_handlers.borrow_mut());
+        let mut resolved = Vec::with_capacity(drained.len());
+        for h in drained {
+            let try_start = builder.label_pc(h.try_start).ok_or_else(|| {
+                SourceLoweringError::Internal("exception handler try_start unbound".into())
+            })?;
+            let try_end = builder.label_pc(h.try_end).ok_or_else(|| {
+                SourceLoweringError::Internal("exception handler try_end unbound".into())
+            })?;
+            let handler_pc = builder.label_pc(h.handler).ok_or_else(|| {
+                SourceLoweringError::Internal("exception handler handler unbound".into())
+            })?;
+            resolved.push(crate::exception::ExceptionHandler::new(
+                try_start, try_end, handler_pc,
+            ));
+        }
+        Ok(resolved)
     }
 
     /// Intern a property name into the function's side table,

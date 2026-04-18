@@ -1069,6 +1069,31 @@ impl Interpreter {
             Opcode::Throw => {
                 return Ok(StepOutcome::Throw(activation.accumulator()));
             }
+            // §14.14 ThrowStatement + §14.15.3 TryStatement. The
+            // dispatcher's main loop (see `run_completion_with_runtime`)
+            // already handles the transfer: on
+            // `StepOutcome::Throw(value)`, it calls
+            // `transfer_exception`, which consults the function's
+            // `ExceptionTable`, stashes the value on
+            // `activation.pending_exception`, and jumps to the
+            // handler PC. `LdaException` is the handler's first
+            // opcode — it moves that pending value into acc so
+            // catch parameters and `throw e;` rethrows observe it.
+            // `ReThrow` re-raises the pending exception without
+            // requiring the program to explicitly `throw acc` — used
+            // by the finally-after-throw path.
+            Opcode::LdaException => {
+                let value = activation
+                    .take_pending_exception()
+                    .unwrap_or_else(RegisterValue::undefined);
+                activation.set_accumulator(value);
+            }
+            Opcode::ReThrow => {
+                let value = activation
+                    .take_pending_exception()
+                    .unwrap_or_else(|| activation.accumulator());
+                return Ok(StepOutcome::Throw(value));
+            }
             Opcode::Nop => {}
 
             // Any other opcode is unsupported by this Phase 3b.1

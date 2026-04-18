@@ -4296,3 +4296,254 @@ fn break_outside_switch_and_loop_rejected() {
         "unexpected err: {err:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// M21: throw / try-catch-finally
+// ---------------------------------------------------------------------------
+
+#[test]
+fn throw_literal_caught_by_catch() {
+    // `throw 42` thrown inside try is caught, and the catch
+    // binding receives the thrown value.
+    let program = "function f() { \
+        let caught = -1; \
+        try { throw 42; } catch (e) { caught = e; } \
+        return caught; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 42);
+}
+
+#[test]
+fn throw_string_caught_by_catch() {
+    // Thrown value can be any JS value, not just an Error.
+    let program = "function f() { \
+        let r = \"none\"; \
+        try { throw \"boom\"; } catch (e) { r = e; } \
+        return r; \
+    }";
+    assert_eq!(run_string_function(program, &[]), "boom");
+}
+
+#[test]
+fn try_without_throw_skips_catch() {
+    // When the try body completes normally, the catch body
+    // should not run.
+    let program = "function f() { \
+        let r = 0; \
+        try { r = 10; } catch (e) { r = 999; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 10);
+}
+
+#[test]
+fn catch_binding_is_block_scoped() {
+    // The catch parameter is block-scoped. A later reference to
+    // the same name outside the catch should fail as
+    // unbound_identifier.
+    let err = compile("function f() { try { throw 1; } catch (e) {} return e; }")
+        .expect_err("e out of scope after catch");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "unbound_identifier",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn bindingless_catch_clause() {
+    // `catch { … }` without a parameter (ES2019).
+    let program = "function f() { \
+        let r = 0; \
+        try { throw 1; } catch { r = 99; } \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 99);
+}
+
+#[test]
+fn finally_runs_after_normal_try() {
+    // `finally` runs on the normal-exit path too — exercised by
+    // incrementing a counter in both try body and finally body.
+    let program = "function f() { \
+        let n = 0; \
+        try { n = 1; } finally { n = 10; } \
+        return n; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 10);
+}
+
+#[test]
+fn finally_runs_after_thrown_try_and_rethrows() {
+    // Without a catch, `finally` still runs, then the throw
+    // re-propagates past the finally block (§14.15.3 step 10).
+    // We wrap the inner try/finally inside an outer try/catch
+    // to observe the propagated exception without crashing.
+    let program = "function f() { \
+        let seen_finally = 0; \
+        let caught = 0; \
+        try { \
+            try { throw 7; } finally { seen_finally = 1; } \
+        } catch (e) { caught = e; } \
+        return seen_finally * 100 + caught; \
+    }";
+    // seen_finally = 1, caught = 7 → 1 * 100 + 7 = 107
+    assert_eq!(run_int32_function(program, &[]), 107);
+}
+
+#[test]
+fn finally_runs_after_caught_try() {
+    // try/catch/finally — finally runs after catch body completes.
+    let program = "function f() { \
+        let seq = 0; \
+        try { throw 1; } catch (e) { seq = seq + 1; } finally { seq = seq + 10; } \
+        return seq; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 11);
+}
+
+#[test]
+fn throw_in_catch_body_triggers_finally_and_rethrows() {
+    // Catch re-throws, finally still runs, then exception
+    // propagates to the outer try.
+    let program = "function f() { \
+        let finally_ran = 0; \
+        let caught = 0; \
+        try { \
+            try { throw 1; } catch (e) { throw e; } finally { finally_ran = 1; } \
+        } catch (e) { caught = e; } \
+        return finally_ran * 100 + caught; \
+    }";
+    // finally_ran = 1, caught = 1 → 101
+    assert_eq!(run_int32_function(program, &[]), 101);
+}
+
+#[test]
+fn nested_try_inner_catch_handles_throw() {
+    // Inner catch handles the throw; outer doesn't fire.
+    let program = "function f() { \
+        let inner = 0; \
+        let outer = 0; \
+        try { \
+            try { throw 1; } catch (e) { inner = e; } \
+        } catch (e) { outer = e; } \
+        return inner * 10 + outer; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 10);
+}
+
+#[test]
+fn nested_try_outer_catch_handles_inner_throw() {
+    // Inner has no catch/only-finally → outer catch takes the
+    // exception after the inner finally runs.
+    let program = "function f() { \
+        let finally_ran = 0; \
+        let caught = 0; \
+        try { \
+            try { throw 5; } finally { finally_ran = 1; } \
+        } catch (e) { caught = e; } \
+        return finally_ran * 100 + caught; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 105);
+}
+
+#[test]
+fn rethrow_via_explicit_throw_in_catch() {
+    // `throw e;` inside catch re-raises the caught value.
+    let program = "function f() { \
+        let outer = 0; \
+        try { \
+            try { throw 42; } catch (e) { throw e; } \
+        } catch (e) { outer = e; } \
+        return outer; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 42);
+}
+
+#[test]
+fn throw_object_expression() {
+    // Thrown values are first-class — an object literal survives
+    // the throw+catch round-trip.
+    let program = "function f() { \
+        let r = \"missing\"; \
+        try { throw { name: \"E\" }; } catch (e) { r = e.name; } \
+        return r; \
+    }";
+    assert_eq!(run_string_function(program, &[]), "E");
+}
+
+#[test]
+fn uncaught_throw_propagates_to_caller() {
+    // `throw` from a function with no enclosing try surfaces as
+    // an uncaught-throw completion. We observe it via the
+    // harness's `execute_with_runtime` error path.
+    let module = compile("function f() { throw 1; }").expect("compile");
+    let entry = module.entry();
+    let function = module.function(entry).unwrap();
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new().execute_with_runtime(&module, entry, &registers, &mut runtime);
+    assert!(
+        matches!(
+            result,
+            Err(crate::interpreter::InterpreterError::UncaughtThrow(_))
+        ),
+        "expected UncaughtThrow, got {result:?}",
+    );
+}
+
+#[test]
+fn try_body_can_have_call_expressions() {
+    // Regression: the try body uses `lower_block_statement`,
+    // which accepts any nested-statement surface. A call expression
+    // as a statement + throw via the call should still work.
+    let program = "function inner() { throw 9; } \
+        function main() { \
+            let r = 0; \
+            try { inner(); } catch (e) { r = e; } \
+            return r; \
+        }";
+    assert_eq!(run_int32_function(program, &[]), 9);
+}
+
+#[test]
+fn finally_with_no_exception_does_not_carry_leftover() {
+    // Finally running on the normal path must NOT re-throw a
+    // stale exception from an earlier iteration.
+    let program = "function f() { \
+        let i = 0; \
+        let sum = 0; \
+        while (i < 3) { \
+            try { sum += i + 1; } finally { sum += 10; } \
+            i += 1; \
+        } \
+        return sum; \
+    }";
+    // Loop runs 3 times: body adds 1,2,3 (sum += 6), finally
+    // adds 10 each iter (sum += 30). Total = 36.
+    assert_eq!(run_int32_function(program, &[]), 36);
+}
+
+#[test]
+fn destructuring_catch_param_rejected() {
+    // `catch ({ msg })` uses a destructuring pattern — rejected
+    // until pattern-binding support lands.
+    let err = compile("function f() { try { throw { msg: 1 }; } catch ({ msg }) { return msg; } }")
+        .expect_err("destructuring catch");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "destructuring_catch_param",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}

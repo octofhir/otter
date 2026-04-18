@@ -117,6 +117,19 @@ impl BytecodeBuilder {
         self.bytes.len() as u32
     }
 
+    /// Returns the resolved PC of a bound label, or `None` if the
+    /// label hasn't been bound yet. Callers that need a concrete PC
+    /// for a side-table entry (exception handlers, source-map
+    /// pointers) use this after `bind_label` to wire up a
+    /// `(try_start, try_end, handler_pc)` triple without waiting
+    /// for `finish()`.
+    #[must_use]
+    pub fn label_pc(&self, label: Label) -> Option<u32> {
+        self.labels
+            .get(label.0 as usize)
+            .and_then(|state| state.target_pc)
+    }
+
     /// Allocate a new label. Not yet bound to any PC.
     pub fn new_label(&mut self) -> Label {
         let id = self.labels.len() as u32;

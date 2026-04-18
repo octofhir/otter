@@ -916,6 +916,7 @@ fn lower_nested_statement<'a>(
         Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
         Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
+        Statement::ForOfStatement(for_of) => lower_for_of_statement(builder, ctx, for_of),
         Statement::SwitchStatement(sw) => lower_switch_statement(builder, ctx, sw),
         Statement::FunctionDeclaration(func) => {
             lower_nested_function_declaration(builder, ctx, func)
@@ -1270,6 +1271,222 @@ fn lower_for_statement<'a>(
 
     ctx.restore_scope(scope);
     Ok(())
+}
+
+/// M30: lowers `for (<left> of <iterable>) <body>`.
+///
+/// Bytecode shape:
+///
+/// ```text
+///   <lower iterable> → acc
+///   Star r_src
+///   GetIterator r_src → acc = iterator
+///   Star r_iter
+/// loop_top:                    ; also `continue` target
+///   IteratorStep r_binding r_iter
+///     ; writes done → acc, value → r_binding when not done
+///   JumpIfToBooleanTrue loop_exit
+///   <lower body>
+///   Jump loop_top
+/// loop_exit:
+/// ```
+///
+/// Left-hand side forms supported in M30:
+/// - `let x` / `const x` — fresh binding scoped to the loop body
+///   (note: the M30 lowering reuses one slot per iteration;
+///   spec-accurate CreatePerIterationEnvironment is a follow-up,
+///   relevant only for body closures that capture the binding).
+/// - plain `Identifier` target — assigns to an existing binding.
+///
+/// Deferred to later milestones: `for await`, destructuring
+/// patterns in `left`, iterator-close on abrupt completion
+/// (`break` / `return` through a custom iterator), async
+/// iterators.
+fn lower_for_of_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    for_of: &'a oxc_ast::ast::ForOfStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::ForStatementLeft;
+    use oxc_ast::ast::VariableDeclarationKind;
+    if for_of.r#await {
+        return Err(SourceLoweringError::unsupported(
+            "for_await_of_statement",
+            for_of.span,
+        ));
+    }
+
+    // Snapshot scope so any `let` bindings introduced by `left`
+    // pop on loop exit — mirrors how `for` init bindings work.
+    let scope = ctx.snapshot_scope();
+
+    // 1) Reserve iterator bookkeeping slots as hidden locals.
+    //    Nested `for…of` loops shift `peak_local_count` upward as
+    //    inner body bindings are allocated, so the iterator + src
+    //    registers must live in the locals region rather than the
+    //    temp region. Using `allocate_anonymous_local` keeps them
+    //    safe from later `let`/`const` allocations inside the body.
+    let src_local = ctx.allocate_anonymous_local()?;
+    let iter_local = ctx.allocate_anonymous_local()?;
+    let src_temp = src_local;
+    let iter_temp = iter_local;
+
+    let result = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, &for_of.right)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(src_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (for-of iterable): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::GetIterator, &[Operand::Reg(u32::from(src_temp))])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode GetIterator: {err:?}")))?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(iter_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (for-of iterator): {err:?}"))
+            })?;
+
+        // 2) Resolve the binding register. Three shapes:
+        //    - `let x` / `const x`: allocate a fresh local.
+        //    - `var x`: rejected for M30 (hoisting semantics
+        //      differ; later milestone if needed).
+        //    - `x` (identifier assignment): reuse the existing
+        //      binding's register. Upvalues are rejected here —
+        //      the per-iteration store would need `StaUpvalue`
+        //      after `IteratorStep`, which the M30 lowering
+        //      keeps simple by excluding.
+        let (binding_reg, is_let_like) = match &for_of.left {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.kind == VariableDeclarationKind::Var {
+                    return Err(SourceLoweringError::unsupported(
+                        "for_of_var_binding",
+                        decl.span,
+                    ));
+                }
+                if decl.declarations.len() != 1 {
+                    return Err(SourceLoweringError::unsupported(
+                        "for_of_multiple_bindings",
+                        decl.span,
+                    ));
+                }
+                let declarator = &decl.declarations[0];
+                if declarator.init.is_some() {
+                    return Err(SourceLoweringError::unsupported(
+                        "for_of_binding_initializer",
+                        declarator.span,
+                    ));
+                }
+                let ident_name = match &declarator.id {
+                    oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
+                    other => {
+                        return Err(SourceLoweringError::unsupported(
+                            "for_of_destructuring_binding",
+                            other.span(),
+                        ));
+                    }
+                };
+                let is_const = decl.kind == VariableDeclarationKind::Const;
+                let slot = ctx.allocate_local(ident_name, is_const, declarator.span)?;
+                // The loop treats the slot as initialized from
+                // the first `IteratorStep`; mark it so reads in
+                // the body don't trip the TDZ check.
+                ctx.mark_initialized(ident_name)?;
+                (slot, true)
+            }
+            ForStatementLeft::AssignmentTargetIdentifier(ident) => {
+                let name = ident.name.as_str();
+                let binding = ctx.resolve_identifier(name).ok_or_else(|| {
+                    SourceLoweringError::unsupported("unbound_identifier", ident.span)
+                })?;
+                match binding {
+                    BindingRef::Local {
+                        reg,
+                        initialized: true,
+                        is_const: false,
+                    } => (reg, false),
+                    BindingRef::Param { reg } => (reg, false),
+                    BindingRef::Local { is_const: true, .. } => {
+                        return Err(SourceLoweringError::unsupported(
+                            "const_assignment",
+                            ident.span,
+                        ));
+                    }
+                    BindingRef::Local {
+                        initialized: false, ..
+                    } => {
+                        return Err(SourceLoweringError::unsupported(
+                            "tdz_self_reference",
+                            ident.span,
+                        ));
+                    }
+                    BindingRef::Upvalue { .. } => {
+                        return Err(SourceLoweringError::unsupported(
+                            "for_of_upvalue_target",
+                            ident.span,
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    "for_of_unsupported_left",
+                    other.span(),
+                ));
+            }
+        };
+        let _ = is_let_like;
+
+        // 3) Loop skeleton.
+        let loop_top = builder.new_label();
+        let loop_exit = builder.new_label();
+        builder
+            .bind_label(loop_top)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind for-of top: {err:?}")))?;
+        builder
+            .emit(
+                Opcode::IteratorStep,
+                &[
+                    Operand::Reg(u32::from(binding_reg)),
+                    Operand::Reg(u32::from(iter_temp)),
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode IteratorStep: {err:?}"))
+            })?;
+        builder
+            .emit_jump_to(Opcode::JumpIfToBooleanTrue, loop_exit)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode JumpIfToBooleanTrue (for-of done): {err:?}"
+                ))
+            })?;
+
+        // 4) Body. Register loop labels so nested
+        //    `break` / `continue` target our skeleton — `continue`
+        //    resumes at the iterator-step, `break` jumps past
+        //    the loop.
+        ctx.enter_loop(LoopLabels {
+            break_label: loop_exit,
+            continue_label: Some(loop_top),
+        });
+        let body_result = lower_nested_statement(builder, ctx, &for_of.body);
+        ctx.exit_loop();
+        body_result?;
+
+        builder
+            .emit_jump_to(Opcode::Jump, loop_top)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Jump (for-of back): {err:?}"))
+            })?;
+        builder
+            .bind_label(loop_exit)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind for-of exit: {err:?}")))?;
+        Ok(())
+    })();
+
+    ctx.restore_scope(scope);
+    result
 }
 
 /// Lowers `switch (e) { case v: …; default: …; }`. Bytecode shape:

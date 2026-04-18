@@ -1665,15 +1665,6 @@ fn for_in_statement_unsupported() {
 }
 
 #[test]
-fn for_of_statement_unsupported() {
-    // `for (x of arr)` — separate AST node type. Lands later
-    // alongside iterator protocol.
-    let err = compile("function f() { for (let x of [1]) { return x; } return 0; }")
-        .expect_err("for-of at M8");
-    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
-}
-
-#[test]
 fn for_with_bare_expression_init_unsupported() {
     // `for (n; n > 0; n = n - 1)` — init is a bare identifier read,
     // not an assignment. Reject with a stable per-shape tag.
@@ -5955,6 +5946,181 @@ fn m29p5_multiple_static_blocks_run_in_order() {
         return C.seq; \
     }";
     assert_eq!(run_int32_function(src, &[]), 111);
+}
+
+// ---------------------------------------------------------------------------
+// M30: for (x of iter) + iterator protocol
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m30_for_of_sums_array_elements() {
+    // Basic case — iterate an Array literal and accumulate via
+    // the built-in Array iterator protocol.
+    let src = "function main() { \
+        let total = 0; \
+        for (let x of [1, 2, 3, 4]) { total = total + x; } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 10);
+}
+
+#[test]
+fn m30_for_of_reads_existing_binding() {
+    // Identifier-target form: `for (x of iter)` assigns to an
+    // existing `let` rather than introducing a new binding.
+    let src = "function main() { \
+        let last = 0; \
+        let x = 0; \
+        for (x of [5, 6, 7]) { last = x; } \
+        return last; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn m30_for_of_break_exits_loop() {
+    // `break` inside the body jumps past the loop exit. Partial
+    // sum covers the early-exit path.
+    let src = "function main() { \
+        let total = 0; \
+        for (let x of [1, 2, 3, 4, 5]) { \
+            if (x > 3) { break; } \
+            total = total + x; \
+        } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m30_for_of_continue_resumes_next_step() {
+    // `continue` jumps back to the IteratorStep, so odd values
+    // get skipped and only even elements contribute.
+    let src = "function main() { \
+        let total = 0; \
+        for (let x of [1, 2, 3, 4, 5]) { \
+            if (x === 1 || x === 3 || x === 5) { continue; } \
+            total = total + x; \
+        } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m30_for_of_over_string_iterates_code_points() {
+    // String iterator yields code-point-at-a-time — we just
+    // count iterations to avoid string-comparison plumbing.
+    let src = "function main() { \
+        let n = 0; \
+        for (let c of \"abcd\") { n = n + 1; } \
+        return n; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 4);
+}
+
+#[test]
+fn m30_for_of_nested_loops() {
+    // Nested `for…of` — temps + loop-label stacks are nested
+    // correctly. Uses two separate accumulators to avoid
+    // triple-chained addition (M6's binary-expr pipeline
+    // handles plain `acc + reg` shapes first).
+    let src = "function main() { \
+        let total = 0; \
+        for (let a of [1, 2]) { \
+            let inner = 0; \
+            for (let b of [10, 20, 30]) { \
+                inner = inner + b; \
+            } \
+            total = total + inner; \
+        } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 120);
+}
+
+#[test]
+fn m30_for_of_reads_array_of_computed_values() {
+    // Exercises IteratorStep over a non-literal Array — the
+    // array is built via `Array.from(length)` style here
+    // (actually an array literal of computed expressions). Pins
+    // the built-in-iterator path without requiring
+    // `Symbol.iterator` globals, which arrive later.
+    let src = "function main() { \
+        let n = 0; \
+        let arr = [0, 0, 0, 0, 0]; \
+        arr[0] = 3; arr[1] = 5; arr[2] = 7; arr[3] = 9; arr[4] = 11; \
+        let sum = 0; \
+        for (let v of arr) { sum = sum + v; n = n + 1; } \
+        return sum + n * 100; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 535);
+}
+
+#[test]
+fn m30_for_of_const_binding_is_readonly() {
+    // `const` loop binding: assignment inside the body must
+    // fail at compile time.
+    let err = compile("function f() { for (const x of [1, 2]) { x = 5; } return 0; }")
+        .expect_err("const loop var");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "const_assignment",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn for_of_var_binding_unsupported() {
+    // `for (var x of ...)` — hoisting semantics differ from
+    // `let`/`const`; deferred past M30.
+    let err = compile("function f() { for (var x of [1]) { return x; } return 0; }")
+        .expect_err("var loop var");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "for_of_var_binding",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn for_of_destructuring_unsupported() {
+    // Destructuring in for-of binding is deferred; surface the
+    // dedicated tag so it's easy to widen later.
+    let err = compile("function f() { for (let [a, b] of [[1,2]]) { return a; } return 0; }")
+        .expect_err("destructuring loop var");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "for_of_destructuring_binding",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn for_await_unsupported() {
+    // `for await (x of ...)` — async iteration, lands with the
+    // async-function milestone.
+    let err = compile("async function f() { for await (let x of []) { return x; } return 0; }")
+        .expect_err("for-await");
+    assert!(
+        matches!(err, SourceLoweringError::Unsupported { .. }),
+        "unexpected err: {err:?}",
+    );
 }
 
 #[test]

@@ -1156,6 +1156,30 @@ impl Interpreter {
                 activation.set_secondary_result(RegisterValue::from_bool(step.is_done()));
             }
 
+            // §14.7.5 `IteratorStep value_reg iter_reg` — M30
+            // one-shot for-of driver. Calls `iterator.next()`; if
+            // the step is done, writes `true` to acc (so the
+            // caller can `JumpIfTrue` out of the loop). Otherwise
+            // writes `false` to acc and unwraps the step value
+            // into `value_reg`. Mirrors the `ForInNext` shape so
+            // the compiler can reuse the same loop skeleton.
+            Opcode::IteratorStep => {
+                let value_dst = reg(&instr.operands, 0)?;
+                let iter_val = read_reg(activation, function, reg(&instr.operands, 1)?)?;
+                let Some(iter) = iter_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err = runtime.alloc_type_error("IteratorStep target is not an iterator")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let step = runtime.iterator_next(iter)?;
+                if step.is_done() {
+                    activation.set_accumulator(RegisterValue::from_bool(true));
+                } else {
+                    write_reg(activation, function, value_dst, step.value())?;
+                    activation.set_accumulator(RegisterValue::from_bool(false));
+                }
+            }
+
             // `IteratorClose r` — side-effectful; closes built-in
             // iterators and is a no-op for non-built-ins. Does not
             // write the accumulator (Phase 3b.9b will wire the

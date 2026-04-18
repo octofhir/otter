@@ -215,6 +215,13 @@ pub enum Opcode {
     // compiler can set up derived-class prototype chains without
     // depending on the `Object.setPrototypeOf` intrinsic.
     SetClassHeritage = 0x9A,
+
+    // §14.7.5 IteratorStep — mirrors `ForInNext`: drives a single
+    // `iterator.next()` step while routing `done` to the
+    // accumulator (for `JumpIfTrue`) and the unwrapped `value`
+    // to a register operand. Added in M30 to make `for…of`
+    // lowerable with just the existing jump opcodes.
+    IteratorStep = 0x9B,
     // 0xFE, 0xFF are reserved for Wide / ExtraWide prefixes. Max legal
     // opcode discriminant is 0xFD.
 }
@@ -410,6 +417,7 @@ impl Opcode {
             0x98 => DynamicImport,
             0x99 => ImportMeta,
             0x9A => SetClassHeritage,
+            0x9B => IteratorStep,
             _ => return None,
         })
     }
@@ -532,6 +540,9 @@ impl Opcode {
 
             // §15.7.14 ClassDefinitionEvaluation — heritage wiring.
             SetClassHeritage => OperandShape::of(&[Reg, Reg]),
+
+            // §14.7.5 IteratorStep — (value_reg, iter_reg).
+            IteratorStep => OperandShape::of(&[Reg, Reg]),
         }
     }
 
@@ -701,6 +712,7 @@ impl Opcode {
             DynamicImport => "DynamicImport",
             ImportMeta => "ImportMeta",
             SetClassHeritage => "SetClassHeritage",
+            IteratorStep => "IteratorStep",
         }
     }
 

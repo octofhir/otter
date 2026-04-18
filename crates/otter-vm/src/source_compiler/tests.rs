@@ -145,17 +145,9 @@ fn generator_unsupported() {
 // rest_parameter_unsupported — all three shapes are supported as of M22.
 // Positive coverage for each lives in the M22 test block below.
 
-#[test]
-fn destructuring_parameter_unsupported() {
-    let err = compile("function f({ x }) { return x; }").expect_err("destructuring later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "destructuring_parameter",
-            ..
-        }
-    ));
-}
+// Removed: destructuring_parameter_unsupported — destructuring in
+// function params is supported as of M24. Positive coverage lives in
+// the M24 test block below.
 
 #[test]
 fn division_unsupported_at_m3() {
@@ -566,18 +558,9 @@ fn multiple_declarators_compose() {
     );
 }
 
-#[test]
-fn destructuring_binding_unsupported() {
-    let err =
-        compile("function f() { let [x] = [1]; return x; }").expect_err("destructuring later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "destructuring_binding",
-            ..
-        }
-    ));
-}
+// Removed: destructuring_binding_unsupported — array/object
+// destructuring is supported as of M24. Positive coverage lives in the
+// M24 test block below.
 
 #[test]
 fn duplicate_local_binding_unsupported() {
@@ -4815,4 +4798,222 @@ fn spread_over_non_iterable_throws_type_error() {
         return r; \
     }";
     assert_eq!(run_int32_function(src, &[]), 99);
+}
+
+// ---------------------------------------------------------------------------
+// M24: destructuring patterns (array + object) in `let` bindings and params
+// ---------------------------------------------------------------------------
+
+#[test]
+fn let_array_destructures_two_elements() {
+    let src = "function f() { \
+        let [a, b] = [10, 20]; \
+        return a + b; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 30);
+}
+
+#[test]
+fn let_array_destructures_three_elements_in_order() {
+    let src = "function f() { \
+        let [a, b, c] = [1, 2, 3]; \
+        return a * 100 + b * 10 + c; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 123);
+}
+
+#[test]
+fn let_array_destructure_shorter_source_fills_undefined() {
+    // `let [a, b, c] = [1]` → b = c = undefined. Missing slots
+    // are reachable; using them in arithmetic would coerce to
+    // NaN, so test via member-like access (observe non-undefined).
+    let src = "function f() { \
+        let [a, b] = [42]; \
+        let r = 0; \
+        if (a === 42) r = r + 1; \
+        return r; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn let_array_destructure_with_rest_collects_remainder() {
+    let src = "function f() { \
+        let [first, ...rest] = [100, 200, 300, 400]; \
+        return first + rest.length; \
+    }";
+    // first = 100, rest.length = 3
+    assert_eq!(run_int32_function(src, &[]), 103);
+}
+
+#[test]
+fn let_array_destructure_rest_preserves_values() {
+    let src = "function f() { \
+        let [a, ...tail] = [10, 20, 30]; \
+        return a + tail[0] + tail[1]; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 60);
+}
+
+#[test]
+fn let_object_destructure_shorthand() {
+    let src = "function f() { \
+        let { x, y } = { x: 7, y: 11 }; \
+        return x + y; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 18);
+}
+
+#[test]
+fn let_object_destructure_with_renaming() {
+    // `{ a: x }` binds the source's `a` property to local `x`.
+    let src = "function f() { \
+        let { a: x, b: y } = { a: 3, b: 4 }; \
+        return x * y; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 12);
+}
+
+#[test]
+fn let_object_destructure_with_default() {
+    let src = "function f() { \
+        let { missing = 99 } = {}; \
+        return missing; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 99);
+}
+
+#[test]
+fn let_object_destructure_default_not_triggered_when_present() {
+    let src = "function f() { \
+        let { a = 99 } = { a: 7 }; \
+        return a; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn let_object_destructure_rename_with_default() {
+    let src = "function f() { \
+        let { a: x = 5 } = { a: 3 }; \
+        let { b: y = 10 } = {}; \
+        return x + y; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 13);
+}
+
+#[test]
+fn object_destructure_param_with_default() {
+    // Param is `{ name, score = 0 }` — default on a leaf.
+    let src = "function greet({ name, score = 0 }) { \
+        return score; \
+    } \
+    function main() { return greet({ name: \"a\" }); }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+    let src = "function greet({ name, score = 0 }) { \
+        return score; \
+    } \
+    function main() { return greet({ name: \"a\", score: 42 }); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn array_destructure_param() {
+    let src = "function sum([a, b]) { return a + b; } \
+               function main() { return sum([15, 27]); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn array_destructure_param_with_rest() {
+    let src = "function f([head, ...tail]) { \
+        return head + tail.length; \
+    } \
+    function main() { return f([1, 2, 3, 4]); }";
+    // head=1, tail.length=3
+    assert_eq!(run_int32_function(src, &[]), 4);
+}
+
+#[test]
+fn nested_destructuring_rejected() {
+    let err = compile("function f() { let [[a]] = [[1]]; return a; }").expect_err("nested array");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "nested_destructuring",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn object_rest_destructure_rejected() {
+    let err = compile("function f() { let { a, ...rest } = { a: 1, b: 2 }; return a; }")
+        .expect_err("object rest");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "object_pattern_rest",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn computed_pattern_key_rejected() {
+    let err = compile("function f() { let k = \"a\"; let { [k]: v } = { a: 1 }; return v; }")
+        .expect_err("computed key");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "computed_pattern_key",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn array_pattern_hole_rejected() {
+    // `let [a, , c] = [1, 2, 3]` — the middle element is a hole
+    // (sparse destructuring). Rejected at M24.
+    let err = compile("function f() { let [a, , c] = [1, 2, 3]; return a + c; }")
+        .expect_err("array hole");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "array_pattern_hole",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
+}
+
+#[test]
+fn array_destructure_default_rejected() {
+    // `let [a = 5] = [];` — array-element defaults aren't on the
+    // M24 surface (M25+ will add them). Object-property defaults
+    // still work via the object path.
+    let err =
+        compile("function f() { let [a = 5] = []; return a; }").expect_err("array pattern default");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "array_pattern_default",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
 }

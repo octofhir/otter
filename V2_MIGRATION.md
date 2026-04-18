@@ -62,7 +62,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M21      | `throw` + `try` / `catch` / `finally`.                                                                                         | [x]    | fe76e4b |
 | M22      | Default params (`function f(n = 0)`) + rest params (`...rest`).                                                                 | [x]    | 03cb16f |
 | M23      | Spread in call args + array literals (`f(...a)`, `[...a, ...b]`).                                                              | [x]    | b5cd2f4 |
-| M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [ ]    |        |
+| M24      | Destructuring patterns (array + object) in `let` bindings and params.                                                           | [x]    | _pending_ |
 | M25      | Closures — nested `FunctionDeclaration` / `FunctionExpression` + upvalue capture.                                                | [ ]    |        |
 | M26      | Arrow functions + lexical `this` binding.                                                                                       | [ ]    |        |
 | M27      | Class declaration: constructor + instance methods + static methods.                                                             | [ ]    |        |
@@ -114,6 +114,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `ThrowStatement` + `TryStatement` with `catch` / `finally` (nested, rethrow, bindingless catch; normal + exception paths only) | yes | M21 |
 | Multi-param signatures + default initializers + rest params + writable param bindings | yes | M22 |
 | Spread in `ArrayExpression` and method-call args (`[...a, ...b]`, `o.m(...xs)`); direct-call spread deferred | yes | M23 |
+| Destructuring in `let` + params: array (with rest), object (shorthand, renaming, defaults); no nested/holes/object-rest | yes | M24 |
 
 ## Benchmarks
 

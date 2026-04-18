@@ -119,13 +119,14 @@ use std::cell::{Cell, RefCell};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentOperator,
-    AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern, ComputedMemberExpression,
-    ConditionalExpression, Expression, FormalParameters, Function, FunctionBody,
-    IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral, ObjectExpression,
-    ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
-    StaticMemberExpression, TemplateLiteral, UnaryExpression, UnaryOperator, UpdateExpression,
-    UpdateOperator, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    ArrayExpression, ArrayExpressionElement, ArrayPattern, AssignmentExpression,
+    AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator, BindingPattern,
+    ComputedMemberExpression, ConditionalExpression, Expression, FormalParameters, Function,
+    FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator, NumericLiteral,
+    ObjectExpression, ObjectPattern, ObjectPropertyKind, Program, PropertyKey, PropertyKind,
+    SimpleAssignmentTarget, Statement, StaticMemberExpression, TemplateLiteral, UnaryExpression,
+    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -419,6 +420,13 @@ fn arithmetic_only_feedback_layout(count: u16) -> FeedbackTableLayout {
 struct ParamsLayout<'a> {
     names: Vec<&'a str>,
     defaults: Vec<Option<&'a Expression<'a>>>,
+    /// Per-param destructuring pattern. `Some(&pat)` means the
+    /// param occupies a slot reserved for the raw argument value,
+    /// and `emit_param_destructuring` must bind the pattern's
+    /// leaves to fresh locals after the default-initializer pass.
+    /// `None` means the param is a plain identifier at slot `i`
+    /// and `names[i]` is the user-facing binding.
+    patterns: Vec<Option<&'a BindingPattern<'a>>>,
     rest_name: Option<&'a str>,
 }
 
@@ -454,16 +462,37 @@ fn analyze_params<'a>(
 ) -> Result<ParamsLayout<'a>, SourceLoweringError> {
     let mut names = Vec::with_capacity(params.items.len());
     let mut defaults = Vec::with_capacity(params.items.len());
+    let mut patterns = Vec::with_capacity(params.items.len());
 
     for param in params.items.iter() {
-        let BindingPattern::BindingIdentifier(ident) = &param.pattern else {
-            return Err(SourceLoweringError::unsupported(
-                "destructuring_parameter",
-                param.span,
-            ));
-        };
-        names.push(ident.name.as_str());
-        defaults.push(param.initializer.as_deref());
+        match &param.pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                names.push(ident.name.as_str());
+                defaults.push(param.initializer.as_deref());
+                patterns.push(None);
+            }
+            // M24: array / object destructuring parameter. The
+            // param slot is synthesized (user code can't reach it
+            // — `@p` isn't a legal JS identifier), and
+            // `emit_param_destructuring` binds the pattern's
+            // leaves to fresh locals after the default-init pass.
+            BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
+                names.push("@p");
+                defaults.push(param.initializer.as_deref());
+                patterns.push(Some(&param.pattern));
+            }
+            // `function f(x = 5)` comes through the `BindingIdentifier`
+            // path above — oxc flattens the default into
+            // `param.initializer`, not into an AssignmentPattern.
+            // AssignmentPattern at this level would only arise from
+            // unusual grammar corners; reject with a stable tag.
+            BindingPattern::AssignmentPattern(pat) => {
+                return Err(SourceLoweringError::unsupported(
+                    "assignment_pattern_parameter",
+                    pat.span,
+                ));
+            }
+        }
     }
 
     // Optional rest parameter. oxc wraps `...rest` in
@@ -484,6 +513,7 @@ fn analyze_params<'a>(
     Ok(ParamsLayout {
         names,
         defaults,
+        patterns,
         rest_name,
     })
 }
@@ -544,6 +574,32 @@ fn emit_default_initializers<'a>(
         builder
             .bind_label(skip)
             .map_err(|err| SourceLoweringError::Internal(format!("bind default skip: {err:?}")))?;
+    }
+    Ok(())
+}
+
+/// For each destructuring parameter (array or object pattern),
+/// emits the binding code that extracts leaves from the synthetic
+/// param slot into fresh locals. Runs after
+/// `emit_default_initializers` so `{ a = 1 }` per-leaf defaults
+/// see the post-default param value.
+///
+/// Mirrors the `let` destructuring lowering — same
+/// `lower_pattern_bind` helper, different "source register"
+/// (the param slot, not a hidden local).
+fn emit_param_destructuring<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    layout: &ParamsLayout<'a>,
+) -> Result<(), SourceLoweringError> {
+    for (i, pattern) in layout.patterns.iter().enumerate() {
+        let Some(pat) = pattern else { continue };
+        let param_reg = RegisterIndex::try_from(i)
+            .map_err(|_| SourceLoweringError::Internal("param index overflow".into()))?;
+        // Params are ordinary writable bindings (M22), so we pass
+        // `is_const: false` — matches the spec's Mutable binding
+        // kind for destructuring-param-introduced names.
+        lower_pattern_bind(builder, ctx, pat, param_reg, false)?;
     }
     Ok(())
 }
@@ -610,6 +666,7 @@ fn lower_function_body<'a>(
     // statement so `Ldar r_param` later in the body sees a
     // definite value.
     emit_default_initializers(&mut builder, &mut ctx, layout)?;
+    emit_param_destructuring(&mut builder, &mut ctx, layout)?;
     emit_rest_parameter(&mut builder, &mut ctx, layout)?;
 
     // Split-off for the tail statement. Empty bodies stay rejected
@@ -2123,6 +2180,44 @@ impl<'a> LoweringContext<'a> {
         Ok(slot)
     }
 
+    /// Allocates a "hidden" local slot without a user-visible
+    /// name — used by destructuring lowering to spill the source
+    /// value to a register that won't be reclaimed by later
+    /// `allocate_local` calls. Temps aren't usable here because
+    /// `peak_local_count` can grow after a temp is acquired,
+    /// shifting the temp base over slots now owned by locals
+    /// allocated in between.
+    ///
+    /// The slot is flagged initialized immediately — there's no
+    /// source-level identifier, so TDZ doesn't apply. `resolve_identifier`
+    /// never matches because the name is a synthetic marker
+    /// (`"@"`-prefixed) that isn't a legal JS identifier.
+    fn allocate_anonymous_local(&mut self) -> Result<u16, SourceLoweringError> {
+        // Synthetic name — `@` is not a legal identifier start in
+        // JS, so `resolve_identifier` can't accidentally match it.
+        // We store it as a `&'static str` so the binding outlives
+        // any particular pattern's lifetime.
+        let live_len = RegisterIndex::try_from(self.locals.len())
+            .map_err(|_| SourceLoweringError::Internal("local count overflow".into()))?;
+        let slot = self
+            .param_count
+            .checked_add(live_len)
+            .ok_or_else(|| SourceLoweringError::Internal("hidden local slot overflow".into()))?;
+        self.locals.push(LocalBinding {
+            name: "@hidden",
+            slot,
+            initialized: true,
+            is_const: true,
+        });
+        let new_len = live_len
+            .checked_add(1)
+            .ok_or_else(|| SourceLoweringError::Internal("local count overflow".into()))?;
+        if new_len > self.peak_local_count {
+            self.peak_local_count = new_len;
+        }
+        Ok(slot)
+    }
+
     /// Marks the most recently allocated binding for `name` as
     /// initialized — called immediately after the lowering has
     /// emitted `Star r_slot` for the init result. A binding can only
@@ -2234,33 +2329,437 @@ fn lower_single_declarator<'a>(
     declarator: &'a VariableDeclarator<'a>,
     is_const: bool,
 ) -> Result<(), SourceLoweringError> {
-    let name = match &declarator.id {
-        BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
-        _ => {
-            return Err(SourceLoweringError::unsupported(
-                "destructuring_binding",
-                declarator.span,
-            ));
-        }
-    };
-
     let init = declarator.init.as_ref().ok_or_else(|| {
         SourceLoweringError::unsupported("uninitialized_binding", declarator.span)
     })?;
 
-    let slot = ctx.allocate_local(name, is_const, declarator.span)?;
+    match &declarator.id {
+        BindingPattern::BindingIdentifier(ident) => {
+            let name = ident.name.as_str();
+            let slot = ctx.allocate_local(name, is_const, declarator.span)?;
 
-    // Lower the init into the accumulator. Reading the binding inside
-    // its own initializer hits the `Local { initialized: false }` arm
-    // of `lower_identifier_read` and surfaces as `tdz_self_reference`.
+            // Lower init into acc. Reading the binding inside its
+            // own initializer hits the `Local { initialized: false }`
+            // arm of `lower_identifier_read` and surfaces as
+            // `tdz_self_reference`.
+            lower_return_expression(builder, ctx, init)?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode Star: {err:?}")))?;
+            ctx.mark_initialized(name)?;
+            Ok(())
+        }
+        // M24: `let [a, b, ...rest] = init;` / `let { a, b: x, c = 0 } = init;`
+        // Lower the init into a temp, then bind each pattern leaf.
+        BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
+            lower_destructured_declarator(builder, ctx, &declarator.id, init, is_const)
+        }
+        // `let x = 1 = …;` is not grammatically possible, so an
+        // AssignmentPattern as the top-level declarator id only
+        // shows up through destructuring (e.g. `let { a = 0 } = src;`
+        // where oxc wraps the leaf in AP). Those cases are
+        // dispatched via `lower_pattern_bind`; reaching here at
+        // the top level means something unsupported slipped
+        // through.
+        BindingPattern::AssignmentPattern(pat) => Err(SourceLoweringError::unsupported(
+            "unexpected_assignment_pattern_declarator",
+            pat.span,
+        )),
+    }
+}
+
+/// Lowers a destructuring declarator: `let <pattern> = <init>;`
+/// where `<pattern>` is an `ArrayPattern` or `ObjectPattern`. The
+/// init expression evaluates once into a dedicated temp
+/// (`r_source`); the pattern then binds each leaf identifier as a
+/// fresh local initialised from the matching
+/// indexed / property read.
+///
+/// §14.3.3 BindingPattern-annotated declaration evaluation.
+fn lower_destructured_declarator<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    pattern: &'a BindingPattern<'a>,
+    init: &'a Expression<'a>,
+    is_const: bool,
+) -> Result<(), SourceLoweringError> {
+    // Use an anonymous hidden local (not a temp) for the source
+    // spill. Temps are placed above `peak_local_count`, so any
+    // `allocate_local` we do afterwards for pattern leaves would
+    // bump the local count and overlap with the temp slot —
+    // clobbering the source value mid-destructure. A dedicated
+    // hidden-local slot sits inside the local region and doesn't
+    // move.
+    let src_slot = ctx.allocate_anonymous_local()?;
     lower_return_expression(builder, ctx, init)?;
-
-    // Persist the init result into the local's slot.
     builder
-        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
-        .map_err(|err| SourceLoweringError::Internal(format!("encode Star: {err:?}")))?;
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(src_slot))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (destructure src): {err:?}"))
+        })?;
+    lower_pattern_bind(builder, ctx, pattern, src_slot, is_const)
+}
 
-    ctx.mark_initialized(name)
+/// Recursively lowers a `BindingPattern` whose value lives in
+/// register `src_reg`. Allocates a new local for each leaf
+/// `BindingIdentifier` and emits the indexed / property read that
+/// populates it. `is_const` propagates to every leaf — a
+/// destructuring `const { a } = …` produces a `const` binding for
+/// `a`.
+///
+/// M24 scope — accepted leaves:
+/// - `BindingIdentifier` (array element, array rest argument,
+///   object property value, or bare declarator id).
+///
+/// Rejected with stable tags:
+/// - Nested `ArrayPattern` / `ObjectPattern` leaves →
+///   `nested_destructuring`.
+/// - Array holes (`[a, , b]`) → `array_pattern_hole`.
+/// - Computed object keys (`{ [k]: v }`) →
+///   `computed_pattern_key`.
+/// - Object rest (`{ ...rest }`) → `object_pattern_rest`.
+fn lower_pattern_bind<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    pattern: &'a BindingPattern<'a>,
+    src_reg: RegisterIndex,
+    is_const: bool,
+) -> Result<(), SourceLoweringError> {
+    match pattern {
+        BindingPattern::BindingIdentifier(ident) => {
+            let name = ident.name.as_str();
+            let slot = ctx.allocate_local(name, is_const, ident.span)?;
+            // At this call site the source value is already in acc
+            // (array/object destructuring set it via the per-leaf
+            // emission); the caller just needs to `Star` it into
+            // the new slot.
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (destructure leaf): {err:?}"
+                    ))
+                })?;
+            ctx.mark_initialized(name)?;
+            Ok(())
+        }
+        BindingPattern::ArrayPattern(pat) => {
+            lower_array_pattern(builder, ctx, pat, src_reg, is_const)
+        }
+        BindingPattern::ObjectPattern(pat) => {
+            lower_object_pattern(builder, ctx, pat, src_reg, is_const)
+        }
+        // AssignmentPattern wraps a leaf with a default (`= expr`).
+        // Nested destructuring inside the AP's left isn't
+        // supported at M24 — extract_pattern_leaf surfaces the
+        // stable reject where we care (object-property defaults).
+        // Bare `let [x = 5] = arr;` (array default) would route
+        // here too, but array-pattern defaults aren't supported at
+        // M24 either.
+        BindingPattern::AssignmentPattern(pat) => Err(SourceLoweringError::unsupported(
+            "array_pattern_default",
+            pat.span,
+        )),
+    }
+}
+
+/// Lowers `[a, b, ...rest]` destructuring against the source in
+/// `src_reg`. Array elements use indexed access (`LdaSmi i;
+/// LdaKeyedProperty r_src`), which covers the common case (Array
+/// sources) without the iterator-protocol overhead. Out-of-range
+/// indices return `undefined` naturally through the keyed-property
+/// path, matching the spec's "step beyond the iterator" semantics.
+///
+/// Rest uses `Array.prototype.slice(start)` against `src_reg` so
+/// the resulting rest binding is a fresh Array whose length matches
+/// the source's tail. Requires `slice` on the source's prototype
+/// chain — always the case for plain Array values.
+///
+/// Holes (`[a, , b]` → `elements[1] == None`) rejected at compile
+/// time with `array_pattern_hole`.
+fn lower_array_pattern<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    pat: &'a ArrayPattern<'a>,
+    src_reg: RegisterIndex,
+    is_const: bool,
+) -> Result<(), SourceLoweringError> {
+    for (index, element) in pat.elements.iter().enumerate() {
+        let Some(element_pat) = element.as_ref() else {
+            return Err(SourceLoweringError::unsupported(
+                "array_pattern_hole",
+                pat.span,
+            ));
+        };
+        let idx_i32 = i32::try_from(index)
+            .map_err(|_| SourceLoweringError::Internal("array pattern index overflow".into()))?;
+        // Only leaf identifiers supported for M24 (nested patterns +
+        // array-element defaults rejected below). A leaf means: load
+        // src[index] into acc, then `Star r_slot` via
+        // `lower_pattern_bind`.
+        match element_pat {
+            BindingPattern::BindingIdentifier(_) => {}
+            BindingPattern::AssignmentPattern(_) => {
+                return Err(SourceLoweringError::unsupported(
+                    "array_pattern_default",
+                    pat.span,
+                ));
+            }
+            _ => {
+                return Err(SourceLoweringError::unsupported(
+                    "nested_destructuring",
+                    pat.span,
+                ));
+            }
+        }
+        // acc = index (int); LdaKeyedProperty r_src → acc = src[index].
+        builder
+            .emit(Opcode::LdaSmi, &[Operand::Imm(idx_i32)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaSmi (array pattern index): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(
+                Opcode::LdaKeyedProperty,
+                &[Operand::Reg(u32::from(src_reg))],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaKeyedProperty (array pattern): {err:?}"
+                ))
+            })?;
+        lower_pattern_bind(builder, ctx, element_pat, src_reg, is_const)?;
+    }
+
+    if let Some(rest) = pat.rest.as_deref() {
+        let BindingPattern::BindingIdentifier(ident) = &rest.argument else {
+            return Err(SourceLoweringError::unsupported(
+                "nested_destructuring",
+                rest.span,
+            ));
+        };
+        let rest_name = ident.name.as_str();
+        let rest_slot = ctx.allocate_local(rest_name, is_const, ident.span)?;
+        emit_array_rest_slice(builder, ctx, src_reg, pat.elements.len(), rest_slot)?;
+        ctx.mark_initialized(rest_name)?;
+    }
+    Ok(())
+}
+
+/// Emits `src_reg.slice(start)` and stores the resulting Array into
+/// `rest_slot`. Three temps: receiver + callee + one arg slot. The
+/// method is looked up via the property-name interner so later
+/// accesses to `.slice` dedup.
+fn emit_array_rest_slice(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    src_reg: RegisterIndex,
+    start: usize,
+    rest_slot: RegisterIndex,
+) -> Result<(), SourceLoweringError> {
+    let start_i32 = i32::try_from(start)
+        .map_err(|_| SourceLoweringError::Internal("rest start index overflow".into()))?;
+    let callee_temp = ctx.acquire_temps(1)?;
+    let arg_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // callee = src.slice
+        let slice_idx = ctx.intern_property_name("slice")?;
+        builder
+            .emit(
+                Opcode::LdaNamedProperty,
+                &[Operand::Reg(u32::from(src_reg)), Operand::Idx(slice_idx)],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaNamedProperty (slice): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (slice callee): {err:?}"))
+            })?;
+        // arg = start
+        builder
+            .emit(Opcode::LdaSmi, &[Operand::Imm(start_i32)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaSmi (slice arg): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(arg_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (slice arg): {err:?}"))
+            })?;
+        // CallProperty r_callee, r_src, [arg]
+        builder
+            .emit(
+                Opcode::CallProperty,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::Reg(u32::from(src_reg)),
+                    Operand::RegList {
+                        base: u32::from(arg_temp),
+                        count: 1,
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode CallProperty (slice): {err:?}"))
+            })?;
+        // acc now holds the sliced array; bind.
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(rest_slot))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (rest slot): {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(2);
+    lower
+}
+
+/// Lowers `{ a, b: x, c = 0 }` object destructuring against the
+/// source in `src_reg`. Each property reads via
+/// `LdaNamedProperty r_src, key_idx`; an optional default fires
+/// when the read returns `undefined` via
+/// `JumpIfNotUndefined skip; <lower default>; skip:`.
+///
+/// M24 scope — accepted property shapes:
+/// - Shorthand (`{ a }`) → read `a`, bind `a`.
+/// - Renaming (`{ a: x }`) → read `a`, bind `x`.
+/// - Defaults on either shape (`{ a = 0 }`, `{ a: x = 0 }`).
+///
+/// Rejected:
+/// - Computed keys (`{ [k]: v }`) → `computed_pattern_key`.
+/// - Object rest (`{ ...rest }`) → `object_pattern_rest`.
+/// - Nested patterns (`{ a: { b } }`) → `nested_destructuring`.
+fn lower_object_pattern<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    pat: &'a ObjectPattern<'a>,
+    src_reg: RegisterIndex,
+    is_const: bool,
+) -> Result<(), SourceLoweringError> {
+    if pat.rest.is_some() {
+        return Err(SourceLoweringError::unsupported(
+            "object_pattern_rest",
+            pat.span,
+        ));
+    }
+    for prop in pat.properties.iter() {
+        if prop.computed {
+            return Err(SourceLoweringError::unsupported(
+                "computed_pattern_key",
+                prop.span,
+            ));
+        }
+        let key_name = match &prop.key {
+            PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
+            PropertyKey::StringLiteral(lit) => lit.value.as_str().to_owned(),
+            other => {
+                return Err(SourceLoweringError::unsupported(
+                    property_key_tag(other),
+                    other.span(),
+                ));
+            }
+        };
+        // Only leaf identifier bindings at M24; defaults are
+        // encoded by oxc as an `AssignmentPattern` wrapping the
+        // identifier. We handle that shape separately — for now,
+        // detect the identifier directly on `prop.value`.
+        let (binding_ident, default_expr) = extract_pattern_leaf(&prop.value)?;
+        let key_idx = ctx.intern_property_name(&key_name)?;
+        builder
+            .emit(
+                Opcode::LdaNamedProperty,
+                &[Operand::Reg(u32::from(src_reg)), Operand::Idx(key_idx)],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaNamedProperty (object pattern): {err:?}"
+                ))
+            })?;
+        emit_default_for_destructured_leaf(builder, ctx, default_expr)?;
+        let name = binding_ident.name.as_str();
+        let slot = ctx.allocate_local(name, is_const, binding_ident.span)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (object pattern leaf): {err:?}"))
+            })?;
+        ctx.mark_initialized(name)?;
+    }
+    Ok(())
+}
+
+/// Extracts the leaf `BindingIdentifier` (and optional default
+/// initializer) from a destructuring pattern value. Accepts either
+/// a plain `BindingIdentifier` or an `AssignmentPattern` wrapping
+/// one (which is how oxc represents `{ a = 0 }` / `{ a: x = 0 }`).
+/// Nested patterns are rejected with `nested_destructuring`.
+fn extract_pattern_leaf<'a>(
+    value: &'a BindingPattern<'a>,
+) -> Result<
+    (
+        &'a oxc_ast::ast::BindingIdentifier<'a>,
+        Option<&'a Expression<'a>>,
+    ),
+    SourceLoweringError,
+> {
+    match value {
+        BindingPattern::BindingIdentifier(ident) => Ok((ident, None)),
+        BindingPattern::AssignmentPattern(assign) => {
+            let BindingPattern::BindingIdentifier(ident) = &assign.left else {
+                return Err(SourceLoweringError::unsupported(
+                    "nested_destructuring",
+                    assign.span,
+                ));
+            };
+            Ok((ident, Some(&assign.right)))
+        }
+        BindingPattern::ArrayPattern(p) => Err(SourceLoweringError::unsupported(
+            "nested_destructuring",
+            p.span,
+        )),
+        BindingPattern::ObjectPattern(p) => Err(SourceLoweringError::unsupported(
+            "nested_destructuring",
+            p.span,
+        )),
+    }
+}
+
+/// Inserts the `undefined`-check default-initializer sequence when
+/// a destructuring leaf has a default expression. Same pattern as
+/// M22's param default initializer:
+///
+/// ```text
+///   ; acc = read value
+///   JumpIfNotUndefined skip
+///   <lower default expr>   ; acc = default
+/// skip:
+/// ```
+fn emit_default_for_destructured_leaf<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    default: Option<&'a Expression<'a>>,
+) -> Result<(), SourceLoweringError> {
+    let Some(expr) = default else {
+        return Ok(());
+    };
+    let skip = builder.new_label();
+    builder
+        .emit_jump_to(Opcode::JumpIfNotUndefined, skip)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!(
+                "encode JumpIfNotUndefined (destructure default): {err:?}"
+            ))
+        })?;
+    lower_return_expression(builder, ctx, expr)?;
+    builder
+        .bind_label(skip)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind destructure skip: {err:?}")))?;
+    Ok(())
 }
 
 /// Lower an `Expression::Identifier` reading the named binding into

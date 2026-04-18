@@ -5404,6 +5404,55 @@ fn class_new_with_zero_args() {
 }
 
 #[test]
+fn class_expression_anonymous_binds_to_let() {
+    // `let C = class { … };` — anonymous class expression.
+    let src = "function main() { \
+        let C = class { answer() { return 42; } }; \
+        let c = new C(); \
+        return c.answer(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn class_expression_with_constructor() {
+    let src = "function main() { \
+        let Point = class { \
+            constructor(x) { this.x = x; } \
+            dup() { return this.x + this.x; } \
+        }; \
+        let p = new Point(7); \
+        return p.dup(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 14);
+}
+
+#[test]
+fn class_expression_named_still_constructs() {
+    // Named class expression — the `Box` name is a hint; we
+    // don't bind it in the inner scope yet, but outside it
+    // remains unbound, and the expression still yields a usable
+    // constructor.
+    let src = "function main() { \
+        let Ctor = class Box { \
+            constructor(v) { this.v = v; } \
+        }; \
+        let c = new Ctor(11); \
+        return c.v; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 11);
+}
+
+#[test]
+fn class_expression_static_method() {
+    let src = "function main() { \
+        let M = class { static five() { return 5; } }; \
+        return M.five(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 5);
+}
+
+#[test]
 fn class_extends_still_unsupported() {
     // `extends` lands with M28.
     let err = compile("function main() { class A {} class B extends A {} }").expect_err("extends");

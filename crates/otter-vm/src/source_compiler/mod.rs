@@ -3260,6 +3260,11 @@ fn lower_return_expression<'a>(
         // `this = receiver`, and applies §9.2.2.1's return
         // override.
         Expression::NewExpression(new_expr) => lower_new_expression(builder, ctx, new_expr),
+        // M27: `class { … }` / `class Foo { … }` as an expression —
+        // lowers to the constructor value in acc. No outer binding
+        // is created; callers consume the value directly (e.g. `let
+        // C = class {…}` or `return class {…};`).
+        Expression::ClassExpression(class) => lower_class_expression(builder, ctx, class),
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -3466,6 +3471,60 @@ fn lower_nested_class_declaration<'a>(
     ctx: &mut LoweringContext<'a>,
     class: &'a Class<'a>,
 ) -> Result<(), SourceLoweringError> {
+    let class_ident = class
+        .id
+        .as_ref()
+        .ok_or_else(|| SourceLoweringError::unsupported("anonymous_class", class.span))?;
+    let class_name = class_ident.name.as_str();
+    // Pre-allocate the class-name local BEFORE lowering methods so
+    // `static zero() { return new Point(); }` can resolve the
+    // forward self-reference through the capture path.
+    let class_slot = ctx.allocate_local(class_name, true, class_ident.span)?;
+    lower_class_body_core(builder, ctx, class, Some(class_name))?;
+    // acc = constructor at this point — bind it to the class-name
+    // local and flip the binding from pending to initialized.
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(class_slot))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (class name binding): {err:?}"))
+        })?;
+    ctx.mark_initialized(class_name)?;
+    Ok(())
+}
+
+/// M27: ClassExpression — lowers the class body and leaves the
+/// constructor in acc. Unlike `ClassDeclaration`, no outer binding
+/// is introduced; the caller consumes the acc value (e.g. `let C =
+/// class {…}` or `return class {…};`).
+///
+/// Named class expressions (`class Foo {…}` as expression) are
+/// accepted, but the inner-scope `Foo` binding is NOT exposed to
+/// the class body yet — methods that self-refer to the class by
+/// name would need a dedicated scope frame. Most class expressions
+/// are anonymous in practice, so the trade-off is acceptable for
+/// M27.
+fn lower_class_expression<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    class: &'a Class<'a>,
+) -> Result<(), SourceLoweringError> {
+    let hint = class.id.as_ref().map(|id| id.name.as_str());
+    lower_class_body_core(builder, ctx, class, hint)
+}
+
+/// Shared core for `ClassDeclaration` + `ClassExpression`: validates
+/// class elements, lowers the constructor (real or synthesised)
+/// with the `class_constructor` flag, lowers instance methods onto
+/// `Constructor.prototype` and static methods onto the Constructor
+/// itself, and leaves the Constructor in acc. `name_hint` is the
+/// display name used for the synthesised empty constructor and
+/// passed through to `lower_inner_callable`.
+fn lower_class_body_core<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    class: &'a Class<'a>,
+    name_hint: Option<&str>,
+) -> Result<(), SourceLoweringError> {
     if !class.decorators.is_empty() {
         return Err(SourceLoweringError::unsupported(
             "class_decorator",
@@ -3478,11 +3537,8 @@ fn lower_nested_class_declaration<'a>(
             class.span,
         ));
     }
-    let class_ident = class
-        .id
-        .as_ref()
-        .ok_or_else(|| SourceLoweringError::unsupported("anonymous_class", class.span))?;
-    let class_name = class_ident.name.as_str();
+    let class_name_owned: String = name_hint.map(str::to_owned).unwrap_or_default();
+    let class_name: &str = &class_name_owned;
 
     // 1) Locate the constructor (if any) + collect methods.
     let mut constructor_fn: Option<&'a Function<'a>> = None;
@@ -3549,19 +3605,9 @@ fn lower_nested_class_declaration<'a>(
         }
     }
 
-    // Allocate the class-name local BEFORE lowering methods, so
-    // method bodies can resolve a self-reference (e.g. a `static
-    // zero() { return new Point(); }`) through the capture path.
-    // The binding starts uninitialized; it's flipped to
-    // `initialized` after the final `Star r_class_local` below,
-    // and stays `const`.
-    let class_slot = ctx.allocate_local(class_name, true, class_ident.span)?;
-
-    // 2) Lower the constructor — if none present, lowering the
-    //    empty-body synthetic Function would be complex; instead
-    //    emit an empty constructor inline through a minimal
-    //    bytecode function so `new Foo()` works even without an
-    //    explicit constructor.
+    // 2) Lower the constructor — if none present, synthesise an
+    //    empty one so `new Foo()` still returns the allocated
+    //    receiver.
     let ctor_idx = match constructor_fn {
         Some(func) => {
             let (idx, captures) = lower_inner_callable(
@@ -3684,22 +3730,13 @@ fn lower_nested_class_declaration<'a>(
                 })?;
         }
 
-        // 4) Bind the constructor as a const local with the
-        //    class's name. Acc = constructor after the final Ldar.
-        //    The local was pre-allocated above so method bodies
-        //    could capture a forward reference; flip it to
-        //    initialized here.
+        // 4) Leave the constructor in acc — the caller (declaration
+        //    or expression path) decides whether to bind it anywhere.
         builder
             .emit(Opcode::Ldar, &[Operand::Reg(u32::from(class_temp))])
             .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Ldar (class binding): {err:?}"))
+                SourceLoweringError::Internal(format!("encode Ldar (class result): {err:?}"))
             })?;
-        builder
-            .emit(Opcode::Star, &[Operand::Reg(u32::from(class_slot))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Star (class name binding): {err:?}"))
-            })?;
-        ctx.mark_initialized(class_name)?;
         Ok(())
     })();
     ctx.release_temps(2);

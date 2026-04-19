@@ -7073,6 +7073,72 @@ fn m36_bigint_preserves_precision() {
     assert_eq!(run_int32_function(src, &[]), 1);
 }
 
+// ---------------------------------------------------------------------------
+// P1: Polymorphic inline caches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn p1_hot_property_read_stays_monomorphic_and_returns_cached_value() {
+    // A plain `obj.x` read inside a loop should hit the
+    // monomorphic IC after the first iteration — same shape
+    // every time. Regression test: the cached value must equal
+    // the slow-path value; a wrong shape guard would either
+    // panic or return a stale value.
+    let src = "function main() { \
+            let obj = { a: 10, b: 20 }; \
+            let sum = 0; \
+            let i = 0; \
+            while (i < 100) { sum = sum + obj.a; i = i + 1 } \
+            return sum \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1000);
+}
+
+#[test]
+fn p1_polymorphic_property_read_handles_two_shapes() {
+    // Two objects with the same property name but different
+    // shape paths. The IC should transition monomorphic →
+    // polymorphic without breaking correctness; either shape's
+    // `.value` read must return the right number.
+    let src = "function pick(flag) { \
+            let a = { value: 1, extra: 0 }; \
+            let b = { value: 2 }; \
+            return flag ? a.value : b.value \
+        } \
+        function main() { \
+            let total = 0; \
+            let i = 0; \
+            while (i < 10) { \
+                total = total + pick(i | 1); \
+                total = total + pick(0); \
+                i = i + 1 \
+            } \
+            return total \
+        }";
+    // pick(truthy) returns 1 × 10 times, pick(0) returns 2 × 10 times → 30.
+    assert_eq!(run_int32_function(src, &[]), 30);
+}
+
+#[test]
+fn p1_property_ic_survives_prototype_chain_lookup() {
+    // `obj.method` where `method` lives on the prototype — the
+    // IC should NOT populate (owner != handle), so the slow path
+    // runs every time. Correctness check: the method still
+    // resolves and invokes with the correct receiver.
+    let src = "function main() { \
+            class C { \
+                constructor() { this.n = 7 } \
+                get_n() { return this.n } \
+            } \
+            let c = new C(); \
+            let total = 0; \
+            let i = 0; \
+            while (i < 5) { total = total + c.get_n(); i = i + 1 } \
+            return total \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 35);
+}
+
 #[test]
 fn e1_bigint_primitive_autoboxes_for_method_call() {
     // `(5n).toString()` — BigInt primitive auto-wraps with

@@ -778,7 +778,7 @@ fn lower_function_declaration<'a>(
     // the matching side-table layout so the interpreter and JIT can
     // resolve `bytecode.feedback().get(pc) -> FeedbackSlot` against a
     // well-shaped `FeedbackVector`.
-    let feedback_layout = arithmetic_only_feedback_layout(body_out.feedback_slot_count);
+    let feedback_layout = feedback_layout_from_kinds(&body_out.feedback_slot_kinds);
     // M14 / M15 / M25: wire the accumulated side tables so the
     // dispatcher can resolve `Idx` operands at runtime
     // (property names, string literals, float constants) and
@@ -818,6 +818,11 @@ struct FunctionBodyOutput {
     local_count: RegisterIndex,
     temp_count: RegisterIndex,
     feedback_slot_count: u16,
+    /// P1: per-slot feedback kinds, in allocation order. Used to
+    /// build a heterogeneous `FeedbackTableLayout` — arithmetic
+    /// feedback alongside property inline-cache feedback, call
+    /// target feedback, etc.
+    feedback_slot_kinds: Vec<FeedbackKind>,
     property_names: crate::property::PropertyNameTable,
     float_constants: crate::float::FloatTable,
     string_literals: crate::string::StringTable,
@@ -827,13 +832,18 @@ struct FunctionBodyOutput {
     closures: crate::closure::ClosureTable,
 }
 
-/// Build a `FeedbackTableLayout` with `count` [`FeedbackKind::Arithmetic`]
-/// slots (ids `0..count`). Source-compiled functions allocate slots in
-/// monotonically increasing order, so this direct construction matches
-/// the slot ids produced by `LoweringContext::allocate_arithmetic_feedback`.
-fn arithmetic_only_feedback_layout(count: u16) -> FeedbackTableLayout {
-    let slots: Vec<FeedbackSlotLayout> = (0..count)
-        .map(|i| FeedbackSlotLayout::new(FeedbackSlotId(i), FeedbackKind::Arithmetic))
+/// Build a `FeedbackTableLayout` matching the kinds observed by the
+/// lowering context. Source-compiled functions allocate slots in
+/// monotonically increasing order, so mapping index → (slot id, kind)
+/// lines up with the slot ids produced by
+/// `LoweringContext::allocate_*_feedback`.
+fn feedback_layout_from_kinds(kinds: &[FeedbackKind]) -> FeedbackTableLayout {
+    let slots: Vec<FeedbackSlotLayout> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            FeedbackSlotLayout::new(FeedbackSlotId(u16::try_from(i).unwrap_or(u16::MAX)), *k)
+        })
         .collect();
     FeedbackTableLayout::new(slots)
 }
@@ -1245,6 +1255,7 @@ fn lower_function_body_with_parent<'a>(
             local_count: ctx.local_count(),
             temp_count: ctx.temp_count(),
             feedback_slot_count: ctx.feedback_slot_count(),
+            feedback_slot_kinds: ctx.take_feedback_slot_kinds(),
             property_names: ctx.take_property_names(),
             float_constants: ctx.take_float_constants(),
             string_literals: ctx.take_string_literals(),
@@ -2668,6 +2679,14 @@ struct LoweringContext<'a> {
     /// `Cell` so the expression-lowering helpers that take `&self`
     /// can still allocate a slot.
     next_feedback_slot: Cell<u16>,
+    /// P1: Kind of each allocated feedback slot in emission order.
+    /// Starts empty; every `allocate_*_feedback` call pushes its
+    /// kind. `build_feedback_layout` reads this to construct a
+    /// heterogeneous `FeedbackTableLayout` — without it, every
+    /// slot would be `Arithmetic` and the dispatcher's property
+    /// inline-cache probe would read a fresh `ArithmeticFeedback`
+    /// on every lookup (free miss every iteration).
+    feedback_slot_kinds: RefCell<Vec<FeedbackKind>>,
     /// Innermost-loop-first stack of [`LoopLabels`] frames. Pushed on
     /// loop entry by `lower_while_statement` / `lower_for_statement`
     /// and popped on loop exit. `break` reads `break_label` from the
@@ -2976,6 +2995,7 @@ impl<'a> LoweringContext<'a> {
             peak_temp_count: Cell::new(0),
             function_names,
             next_feedback_slot: Cell::new(0),
+            feedback_slot_kinds: RefCell::new(Vec::new()),
             loop_labels: RefCell::new(Vec::new()),
             scope_starts: RefCell::new(Vec::new()),
             property_names: RefCell::new(Vec::new()),
@@ -3243,6 +3263,29 @@ impl<'a> LoweringContext<'a> {
             "feedback slot counter overflow — pathological function > 65 535 arithmetic ops",
         );
         self.next_feedback_slot.set(id.saturating_add(1));
+        self.feedback_slot_kinds
+            .borrow_mut()
+            .push(FeedbackKind::Arithmetic);
+        FeedbackSlot(id)
+    }
+
+    /// P1: allocate a [`FeedbackKind::Property`] slot. Attached to
+    /// the PC of a `LdaNamedProperty` (or similar) so the
+    /// dispatcher can probe the cached `(shape_id, slot_index)`
+    /// pairs and short-circuit the prototype-chain walk when the
+    /// object's shape still matches one of the observed shapes
+    /// (monomorphic or polymorphic up to 4 shapes, then
+    /// megamorphic fallback).
+    fn allocate_property_feedback(&self) -> FeedbackSlot {
+        let id = self.next_feedback_slot.get();
+        debug_assert!(
+            id < u16::MAX,
+            "feedback slot counter overflow — pathological function > 65 535 feedback ops",
+        );
+        self.next_feedback_slot.set(id.saturating_add(1));
+        self.feedback_slot_kinds
+            .borrow_mut()
+            .push(FeedbackKind::Property);
         FeedbackSlot(id)
     }
 
@@ -3251,6 +3294,13 @@ impl<'a> LoweringContext<'a> {
     /// [`FeedbackTableLayout`].
     fn feedback_slot_count(&self) -> u16 {
         self.next_feedback_slot.get()
+    }
+
+    /// P1: drains the accumulated feedback-kind vector, returning
+    /// it so the function finaliser can shape the
+    /// `FeedbackTableLayout` heterogeneously.
+    fn take_feedback_slot_kinds(&self) -> Vec<FeedbackKind> {
+        std::mem::take(&mut *self.feedback_slot_kinds.borrow_mut())
     }
 
     /// Number of `let`/`const` slots reserved by the frame layout —
@@ -5565,7 +5615,7 @@ fn synthesise_static_block<'a>(
     let bytecode_len = bytecode.bytes().len() as u32;
     let layout = FrameLayout::new(1, 0, ctx.local_count(), ctx.temp_count())
         .map_err(|err| SourceLoweringError::Internal(format!("static block layout: {err:?}")))?;
-    let feedback_layout = arithmetic_only_feedback_layout(ctx.feedback_slot_count());
+    let feedback_layout = feedback_layout_from_kinds(&ctx.take_feedback_slot_kinds());
     let side_tables = crate::module::FunctionSideTables::new(
         ctx.take_property_names(),
         ctx.take_string_literals(),
@@ -5678,7 +5728,7 @@ fn synthesise_field_initializer<'a>(
 
     let layout = FrameLayout::new(1, 0, ctx.local_count(), ctx.temp_count())
         .map_err(|err| SourceLoweringError::Internal(format!("field init layout: {err:?}")))?;
-    let feedback_layout = arithmetic_only_feedback_layout(ctx.feedback_slot_count());
+    let feedback_layout = feedback_layout_from_kinds(&ctx.take_feedback_slot_kinds());
     let side_tables = crate::module::FunctionSideTables::new(
         ctx.take_property_names(),
         ctx.take_string_literals(),
@@ -5982,7 +6032,7 @@ fn lower_inner_callable_with_super<'a>(
 
     let layout = FrameLayout::new(1, param_count, body_out.local_count, body_out.temp_count)
         .map_err(|err| SourceLoweringError::Internal(format!("frame layout invalid: {err:?}")))?;
-    let feedback_layout = arithmetic_only_feedback_layout(body_out.feedback_slot_count);
+    let feedback_layout = feedback_layout_from_kinds(&body_out.feedback_slot_kinds);
     let side_tables = crate::module::FunctionSideTables::new(
         body_out.property_names,
         body_out.string_literals,
@@ -6722,7 +6772,13 @@ fn lower_static_member_read(
     }
     let base = materialize_member_base(builder, ctx, &expr.object)?;
     let idx = ctx.intern_property_name(expr.property.name.as_str())?;
-    builder
+    // P1: attach a property-feedback slot so the dispatcher can
+    // probe the cached `(shape_id, slot_index)` for this PC on
+    // subsequent executions. On first hit the slot transitions
+    // `Uninitialized → Monomorphic`; diverging shapes bump it to
+    // `Polymorphic` (up to 4); beyond that it pins `Megamorphic`
+    // and always takes the slow path.
+    let pc = builder
         .emit(
             Opcode::LdaNamedProperty,
             &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
@@ -6730,6 +6786,8 @@ fn lower_static_member_read(
         .map_err(|err| {
             SourceLoweringError::Internal(format!("encode LdaNamedProperty: {err:?}"))
         })?;
+    let slot = ctx.allocate_property_feedback();
+    builder.attach_feedback(pc, slot);
     if base.temp_count != 0 {
         ctx.release_temps(base.temp_count);
     }

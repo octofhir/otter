@@ -749,20 +749,68 @@ impl Interpreter {
                 // original primitive so accessor getters see the raw
                 // value (spec §7.3.1 OrdinaryGet, receiver preserved).
                 let handle = runtime.property_base_object_handle(target)?;
-                // M29: use `ordinary_get` so accessor getters are
-                // invoked with the target as receiver. Data and
-                // "not found" cases fall through unchanged.
-                let value =
-                    runtime
-                        .ordinary_get(handle, property, target)
-                        .map_err(|err| match err {
-                            crate::VmNativeCallError::Thrown(v) => {
-                                InterpreterError::UncaughtThrow(v)
+                // P1: probe the polymorphic inline cache before taking
+                // the slow path. `PropertyFeedback` holds up to 4
+                // observed `(shape_id, slot_index)` pairs per call
+                // site; `get_shaped` returns the cached value in
+                // O(1) when the object's current shape matches one
+                // of the observed shapes. Any miss — accessor
+                // property, prototype lookup, different shape —
+                // falls through to `ordinary_get` below. The
+                // polymorphic probe is just a small linear scan on
+                // shape_id, and the common case is hot loops
+                // touching one or two shapes on the same PC.
+                let cached_value = if let Some(fb) =
+                    property_feedback_for_pc(function, &frame_runtime.feedback_vector, pc)
+                {
+                    probe_property_inline_cache(fb, &runtime.objects, handle)?
+                } else {
+                    None
+                };
+                let value = if let Some(v) = cached_value {
+                    v
+                } else {
+                    // M29: use `ordinary_get` so accessor getters are
+                    // invoked with the target as receiver. Data and
+                    // "not found" cases fall through unchanged. The
+                    // resolved lookup doubles as the observation
+                    // source for the P1 inline-cache state machine.
+                    let lookup = runtime.property_lookup(handle, property).map_err(|err| {
+                        InterpreterError::NativeCall(format!("property_lookup: {err:?}").into())
+                    })?;
+                    match lookup {
+                        Some(l) => {
+                            // P1: observe the shape + slot offset
+                            // when the lookup hit a data property
+                            // on the direct object (owner ==
+                            // handle). Prototype hits don't
+                            // populate the IC — their shape isn't
+                            // the one we'd guard on next time.
+                            if let Some(cache) = l.cache()
+                                && l.owner() == handle
+                            {
+                                frame_runtime.record_property(
+                                    function,
+                                    pc,
+                                    cache.shape_id(),
+                                    cache.slot_index(),
+                                );
                             }
-                            crate::VmNativeCallError::Internal(msg) => {
-                                InterpreterError::NativeCall(msg)
+                            match l.value() {
+                                crate::object::PropertyValue::Data { value: v, .. } => v,
+                                crate::object::PropertyValue::Accessor { getter, .. } => runtime
+                                    .call_callable_for_accessor(getter, target, &[])
+                                    .map_err(|err| match err {
+                                        InterpreterError::UncaughtThrow(v) => {
+                                            InterpreterError::UncaughtThrow(v)
+                                        }
+                                        other => other,
+                                    })?,
                             }
-                        })?;
+                        }
+                        None => RegisterValue::undefined(),
+                    }
+                };
                 activation.set_accumulator(value);
             }
             Opcode::StaNamedProperty => {
@@ -3050,6 +3098,64 @@ fn super_property_base(
 /// function's property-name side table. Mirrors
 /// `Interpreter::resolve_property_name` from v1 dispatch but takes a
 /// raw u32 (the v2 `Idx` operand) instead of a v1 `RegisterIndex`.
+/// P1: Returns the active [`PropertyFeedback`] for a
+/// `LdaNamedProperty`/`StaNamedProperty` PC if one was allocated
+/// at compile time and the feedback vector layout has grown to
+/// include it. `None` when the op has no attached slot (older
+/// emission sites that haven't been migrated yet) or when the
+/// runtime layout doesn't declare the slot as `Property` kind.
+fn property_feedback_for_pc<'a>(
+    function: &Function,
+    feedback_vector: &'a crate::feedback::FeedbackVector,
+    pc: u32,
+) -> Option<&'a crate::feedback::PropertyFeedback> {
+    let bytecode_slot = function.bytecode().feedback().get(pc)?;
+    let slot = crate::feedback::FeedbackSlotId(bytecode_slot.0);
+    let layout = function.feedback().get(slot)?;
+    if layout.kind() != crate::feedback::FeedbackKind::Property {
+        return None;
+    }
+    feedback_vector.property(slot)
+}
+
+/// P1: Probes the polymorphic inline cache against the current
+/// object's shape. Walks at most 4 cached `(shape_id, slot_index)`
+/// pairs; on a match returns the cached value via `get_shaped`,
+/// otherwise returns `Ok(None)` so the caller falls through to
+/// `ordinary_get`. Megamorphic / uninitialised feedback pins the
+/// slow path.
+fn probe_property_inline_cache(
+    feedback: &crate::feedback::PropertyFeedback,
+    objects: &crate::object::ObjectHeap,
+    handle: crate::object::ObjectHandle,
+) -> Result<Option<RegisterValue>, InterpreterError> {
+    use crate::feedback::PropertyFeedback;
+    let caches: &[crate::object::PropertyInlineCache] = match feedback {
+        PropertyFeedback::Monomorphic(cache) => std::slice::from_ref(cache),
+        PropertyFeedback::Polymorphic(caches) => caches.as_slice(),
+        PropertyFeedback::Uninitialized | PropertyFeedback::Megamorphic => return Ok(None),
+    };
+    for cache in caches {
+        match objects.get_shaped(handle, cache.shape_id(), cache.slot_index()) {
+            Ok(Some(prop)) => {
+                // §9.1.9.1 OrdinaryGet — only the data-property
+                // fast path applies at the IC; accessors bail to
+                // the slow path because calling the getter needs
+                // the full receiver chain.
+                if let crate::object::PropertyValue::Data { value, .. } = prop {
+                    return Ok(Some(value));
+                }
+                return Ok(None);
+            }
+            Ok(None) => continue,
+            // Invalid heap kinds fall through to the generic path —
+            // a real error there still surfaces via `ordinary_get`.
+            Err(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
 fn resolve_property(
     function: &Function,
     runtime: &mut RuntimeState,

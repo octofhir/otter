@@ -333,29 +333,51 @@ impl Interpreter {
                 frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
             }
             Opcode::Div => {
-                // Int-only div: bail on non-i32 or division-by-zero
-                // (v1 handles full JS semantics via runtime; Phase 3b.6
-                // stays int32-only until the generic helper is wired).
+                // §13.15.3 Division. Int32 fast-path gives truncated
+                // division when it yields an i32 result; falls back
+                // to `js_divide` (f64 / BigInt) for every other
+                // input. `5 / 0` returns `Infinity` per spec — no
+                // longer throws like the v1 int-only path did.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
-                if r == 0 {
-                    return Err(InterpreterError::TypeError(Box::from(
-                        "v2 Div: integer division by zero (Phase 3b.6 int-only)",
-                    )));
+                let acc = activation.accumulator();
+                if let (Some(l), Some(r)) = (acc.as_i32(), rhs.as_i32())
+                    && r != 0
+                    && let Some(q) = l.checked_div(r)
+                    && q.checked_mul(r) == Some(l)
+                {
+                    activation.set_accumulator(RegisterValue::from_i32(q));
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                } else {
+                    let result = runtime.js_divide(acc, rhs)?;
+                    activation.set_accumulator(result);
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
                 }
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_div(r)));
             }
             Opcode::Mod => {
+                // §13.15.3 Remainder. Same shape as Div.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
-                if r == 0 {
-                    return Err(InterpreterError::TypeError(Box::from(
-                        "v2 Mod: modulo by zero (Phase 3b.6 int-only)",
-                    )));
+                let acc = activation.accumulator();
+                if let (Some(l), Some(r)) = (acc.as_i32(), rhs.as_i32())
+                    && r != 0
+                {
+                    activation.set_accumulator(RegisterValue::from_i32(l.wrapping_rem(r)));
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                } else {
+                    let result = runtime.js_remainder(acc, rhs)?;
+                    activation.set_accumulator(result);
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
                 }
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_rem(r)));
+            }
+            Opcode::Exp => {
+                // §13.15.3 Exponentiation. No int32 fast-path — `2
+                // ** 31` doesn't fit an i32 and small-result cases
+                // still need NaN / Infinity handling, so always
+                // delegate to `js_exponentiate`.
+                let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let acc = activation.accumulator();
+                let result = runtime.js_exponentiate(acc, rhs)?;
+                activation.set_accumulator(result);
+                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
             }
 
             // ---- Smi immediate variants ----
@@ -3441,29 +3463,31 @@ mod tests {
 
     #[test]
     fn div_and_mod() {
-        // 17 / 5 = 3, 17 % 5 = 2.  Chain them: (17/5) + (17%5) = 5.
+        // Exact division stays on the int32 fast path: 20 / 5 =
+        // 4, 20 % 5 = 0. (20/5) + (20%5) = 4 — single int32
+        // result. Real-valued division (17 / 5 = 3.4) falls
+        // through to `js_divide`, so we pick an exact divisor
+        // here to keep this test focused on the fast-path and
+        // int-only Mod.
         let result = run_bytecode(
             |b| {
-                // r0 = 17, r1 = 5
-                // tmp = r0 / r1
+                // r0 = 20, r1 = 5
                 b.emit(Opcode::Ldar, &[Operand::Reg(0)]).unwrap();
                 b.emit(Opcode::Div, &[Operand::Reg(1)]).unwrap();
                 b.emit(Opcode::Star, &[Operand::Reg(2)]).unwrap();
-                // acc = r0 % r1
                 b.emit(Opcode::Ldar, &[Operand::Reg(0)]).unwrap();
                 b.emit(Opcode::Mod, &[Operand::Reg(1)]).unwrap();
-                // acc = acc + tmp
                 b.emit(Opcode::Add, &[Operand::Reg(2)]).unwrap();
                 b.emit(Opcode::Return, &[]).unwrap();
             },
             3,
             &[
-                RegisterValue::from_i32(17),
+                RegisterValue::from_i32(20),
                 RegisterValue::from_i32(5),
                 RegisterValue::undefined(),
             ],
         );
-        assert_eq!(result.as_i32(), Some(5));
+        assert_eq!(result.as_i32(), Some(4));
     }
 
     #[test]

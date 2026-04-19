@@ -7407,6 +7407,24 @@ fn binary_op_encoding(op: BinaryOperator) -> Option<BinaryOpEncoding> {
             commutative: false,
             label: "UShr",
         },
+        Division => BinaryOpEncoding {
+            reg_opcode: Opcode::Div,
+            smi_opcode: None,
+            commutative: false,
+            label: "Div",
+        },
+        Remainder => BinaryOpEncoding {
+            reg_opcode: Opcode::Mod,
+            smi_opcode: None,
+            commutative: false,
+            label: "Mod",
+        },
+        Exponential => BinaryOpEncoding {
+            reg_opcode: Opcode::Exp,
+            smi_opcode: None,
+            commutative: false,
+            label: "Exp",
+        },
         _ => return None,
     })
 }
@@ -7681,29 +7699,30 @@ fn apply_binary_op_with_acc_lhs(
 ) -> Result<(), SourceLoweringError> {
     match rhs {
         Expression::NumericLiteral(literal) => {
-            let value = int32_from_literal(literal)?;
-            let fits_i8 = (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&value);
-            match (encoding.smi_opcode, fits_i8) {
-                (Some(smi_op), true) => {
-                    let pc = builder
-                        .emit(smi_op, &[Operand::Imm(value)])
-                        .map_err(|err| {
-                            SourceLoweringError::Internal(format!(
-                                "encode {}Smi: {err:?}",
-                                encoding.label
-                            ))
-                        })?;
-                    let slot = ctx.allocate_arithmetic_feedback();
-                    builder.attach_feedback(pc, slot);
-                }
-                _ => {
-                    return Err(SourceLoweringError::unsupported(
-                        "wide_integer_literal_on_rhs",
-                        literal.span,
-                    ));
-                }
+            // If the operator has a dedicated `*Smi` opcode AND
+            // the literal fits `i8`, take the fast path. Otherwise
+            // — no Smi opcode (`^`, `>>>`, `/`, `%`, `**`), wide
+            // literal, or fractional literal — spill to the
+            // generic RHS path so the value goes through a temp
+            // register and the Reg-form opcode does the work.
+            let fits_i8 = int32_from_literal(literal)
+                .ok()
+                .map(|v| (i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&v));
+            if let (Some(smi_op), Some(true)) = (encoding.smi_opcode, fits_i8) {
+                let value = int32_from_literal(literal)?;
+                let pc = builder
+                    .emit(smi_op, &[Operand::Imm(value)])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode {}Smi: {err:?}",
+                            encoding.label
+                        ))
+                    })?;
+                let slot = ctx.allocate_arithmetic_feedback();
+                builder.attach_feedback(pc, slot);
+                return Ok(());
             }
-            Ok(())
+            apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
         }
         Expression::Identifier(ident) => {
             let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {

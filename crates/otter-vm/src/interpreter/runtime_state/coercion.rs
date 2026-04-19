@@ -1147,6 +1147,131 @@ impl RuntimeState {
         Ok(RegisterValue::from_number(lhs_num + rhs_num))
     }
 
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for `/`. Spec:
+    /// ToNumeric both operands, then BigInt::divide if both BigInt,
+    /// else Number::divide. Never string-concatenates.
+    pub(crate) fn js_divide(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(RegisterValue::from_number(l / r));
+        }
+        if lhs.is_bigint() && rhs.is_bigint() {
+            return self.bigint_checked_div(lhs, rhs);
+        }
+        self.js_numeric_binop_fallback(
+            lhs,
+            rhs,
+            |l, r| l / r,
+            "/",
+            |a, b| {
+                // §6.1.6.2.10 BigInt::divide — /0n throws RangeError. We
+                // delegate to the existing `bigint_checked_div` which
+                // rounds toward zero and throws on zero divisor.
+                if b.is_zero() {
+                    num_bigint::BigInt::from(0)
+                } else {
+                    a / b
+                }
+            },
+        )
+    }
+
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for `%`. Same
+    /// ToNumeric pipeline as `/`; Number::remainder matches JS's
+    /// `%` operator (sign follows the dividend).
+    pub(crate) fn js_remainder(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(RegisterValue::from_number(l % r));
+        }
+        if lhs.is_bigint() && rhs.is_bigint() {
+            return self.bigint_binary_op(lhs, rhs, |a, b| {
+                if b.is_zero() {
+                    num_bigint::BigInt::from(0)
+                } else {
+                    a % b
+                }
+            });
+        }
+        self.js_numeric_binop_fallback(
+            lhs,
+            rhs,
+            |l, r| l % r,
+            "%",
+            |a, b| {
+                if b.is_zero() {
+                    num_bigint::BigInt::from(0)
+                } else {
+                    a % b
+                }
+            },
+        )
+    }
+
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for `**`.
+    /// Number::exponentiate maps to `f64::powf`; BigInt::exponentiate
+    /// surfaces through `bigint_binary_op` with `num_bigint::BigInt::pow`.
+    pub(crate) fn js_exponentiate(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(RegisterValue::from_number(l.powf(r)));
+        }
+        self.js_numeric_binop_fallback(
+            lhs,
+            rhs,
+            |l, r| l.powf(r),
+            "**",
+            |a, b| {
+                // Negative exponent on BigInt throws per spec; clamping
+                // here keeps the fallback in arithmetic shape, and the
+                // BigInt-specific early-return above handles the non-
+                // mixed case without relying on this branch.
+                let exp = b
+                    .to_biguint()
+                    .and_then(|u| u32::try_from(u).ok())
+                    .unwrap_or(0);
+                a.pow(exp)
+            },
+        )
+    }
+
+    /// Helper: shared ToNumeric + Number/BigInt dispatch for
+    /// `/`, `%`, `**`, `-`, `*`. Returns `RangeError`-shaped
+    /// errors only via the built-in BigInt paths; otherwise
+    /// f64 arithmetic always succeeds (NaN / Infinity on
+    /// degenerate inputs, per spec).
+    fn js_numeric_binop_fallback(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+        number_op: fn(f64, f64) -> f64,
+        op_name: &'static str,
+        bigint_op: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
+    ) -> Result<RegisterValue, InterpreterError> {
+        let lprim = self.js_to_primitive_with_hint(lhs, ToPrimitiveHint::Number)?;
+        let rprim = self.js_to_primitive_with_hint(rhs, ToPrimitiveHint::Number)?;
+        if lprim.is_bigint() && rprim.is_bigint() {
+            return self.bigint_binary_op(lprim, rprim, bigint_op);
+        }
+        if lprim.is_bigint() || rprim.is_bigint() {
+            return Err(InterpreterError::TypeError(
+                format!("Cannot mix BigInt and other types with '{op_name}'").into(),
+            ));
+        }
+        let l = self.js_to_number(lprim)?;
+        let r = self.js_to_number(rprim)?;
+        Ok(RegisterValue::from_number(number_op(l, r)))
+    }
+
     pub(crate) fn js_typeof(
         &mut self,
         value: RegisterValue,

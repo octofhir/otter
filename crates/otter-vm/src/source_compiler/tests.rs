@@ -219,19 +219,31 @@ fn two_functions_at_top_level_both_compile() {
 // the M24 test block below.
 
 #[test]
-fn division_unsupported_at_m3() {
-    // `/` has no `*Smi` opcode in the v2 ISA and no Reg-form lowering
-    // for the integer-only M3 surface. Stays unsupported as
-    // `Unsupported { construct: "division" }` until later milestones
-    // introduce the float lowering path.
-    let err = compile("function f(n) { return n / 2; }").expect_err("division later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "division",
-            ..
-        }
-    ));
+fn division_compiles_and_falls_back_to_float() {
+    // `/` now lowers through `Opcode::Div` with `js_divide`
+    // handling the non-int32 fallback. Integer-truncation fast
+    // path kicks in when both operands are i32 and the division
+    // is exact; otherwise the runtime produces a Number.
+    assert_eq!(
+        run_int32_function("function f() { return 12 / 3; }", &[]),
+        4
+    );
+}
+
+#[test]
+fn remainder_compiles() {
+    assert_eq!(
+        run_int32_function("function f() { return 17 % 5; }", &[]),
+        2
+    );
+}
+
+#[test]
+fn exponent_compiles() {
+    assert_eq!(
+        run_int32_function("function f() { return 2 ** 10; }", &[]),
+        1024
+    );
 }
 
 #[test]
@@ -323,18 +335,14 @@ fn identifier_plus_identifier_uses_add_reg() {
 }
 
 #[test]
-fn wide_integer_literal_on_rhs_is_unsupported() {
-    // 200 is outside i8 range, so AddSmi can't represent it at the
-    // narrow width we emit. Until M4 lands locals, there is no scratch
-    // slot to materialise the literal into, so this path rejects.
-    let err = compile("function f(n) { return n + 200; }").expect_err("needs scratch slot");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "wide_integer_literal_on_rhs",
-            ..
-        }
-    ));
+fn wide_integer_literal_on_rhs_spills_to_temp() {
+    // 200 is outside i8 range, so `AddSmi` can't represent it.
+    // The complex-RHS spill path materialises the literal into a
+    // temp and uses `Add r_tmp` instead — no longer a rejection.
+    assert_eq!(
+        run_int32_function("function f(n) { return n + 200; }", &[42]),
+        242
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -416,19 +424,13 @@ fn bitwise_xor_register_uses_xor() {
 }
 
 #[test]
-fn bitwise_xor_literal_rhs_is_unsupported() {
-    // No `BitwiseXorSmi` and no scratch slot to materialise the
-    // literal — same `wide_integer_literal_on_rhs` rejection as the
-    // out-of-i8 AddSmi case. Will become supported once M4 lands
-    // local slots that can hold the materialised RHS.
-    let err = compile("function f(n) { return n ^ 1; }").expect_err("xor literal needs scratch");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "wide_integer_literal_on_rhs",
-            ..
-        }
-    ));
+fn bitwise_xor_literal_rhs_spills_to_temp() {
+    // No `BitwiseXorSmi` opcode, so the literal RHS spills to a
+    // temp register. Works end-to-end now.
+    assert_eq!(
+        run_int32_function("function f(n) { return n ^ 1; }", &[2]),
+        3
+    );
 }
 
 #[test]
@@ -476,32 +478,23 @@ fn unsigned_shift_right_register_uses_ushr() {
 }
 
 #[test]
-fn unsigned_shift_right_literal_rhs_is_unsupported() {
-    // Same reason as `BitwiseXor` literal RHS — no `UShrSmi` opcode
-    // and no scratch slot.
-    let err = compile("function f(n) { return n >>> 1; }").expect_err("ushr literal needs scratch");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "wide_integer_literal_on_rhs",
-            ..
-        }
-    ));
+fn unsigned_shift_right_literal_rhs_spills_to_temp() {
+    // No `UShrSmi` opcode — RHS spills to a temp register. Works
+    // like XOR and wide SubSmi above.
+    assert_eq!(
+        run_int32_function("function f(n) { return n >>> 1; }", &[4]),
+        2
+    );
 }
 
 #[test]
-fn wide_subsmi_literal_is_unsupported() {
-    // 200 > i8::MAX, so SubSmi can't encode it; rejects via the same
-    // tag as AddSmi. Confirms the Smi-width check applies uniformly
-    // across operators with a Smi opcode, not just `+`.
-    let err = compile("function f(n) { return n - 200; }").expect_err("needs scratch slot");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "wide_integer_literal_on_rhs",
-            ..
-        }
-    ));
+fn wide_subsmi_literal_spills_to_temp() {
+    // 200 > i8::MAX, so SubSmi can't encode it. Spill path takes
+    // over and emits `Sub r_tmp`.
+    assert_eq!(
+        run_int32_function("function f(n) { return n - 200; }", &[250]),
+        50
+    );
 }
 
 // ---------------------------------------------------------------------------

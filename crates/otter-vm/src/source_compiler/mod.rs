@@ -4171,7 +4171,7 @@ fn lower_identifier_reference(
             Ok(())
         }
         "globalThis" | "Math" | "console" | "Symbol" | "Promise" | "setTimeout" | "setInterval"
-        | "clearTimeout" | "clearInterval" | "queueMicrotask" => {
+        | "clearTimeout" | "clearInterval" | "queueMicrotask" | "URL" | "URLSearchParams" => {
             // M14 anchor: `globalThis`, `Math`.
             // M19 anchor: `console` — the "hello world" gate. The
             // runtime already installs a `console` object on the

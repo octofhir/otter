@@ -188,6 +188,33 @@ impl Interpreter {
                     activation.set_accumulator(RegisterValue::undefined());
                 }
             }
+            // §12.2.6.8 CopyDataProperties — object-spread
+            // implementation. Source value lives in the
+            // accumulator; target object handle is the operand
+            // register. Copies every own-enumerable data property
+            // from source onto target, skipping symbols /
+            // non-enumerable slots per spec. Runtime helper
+            // already handles the full property-walk + excluded-
+            // key matching.
+            Opcode::CopyDataProperties => {
+                let target_val = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let Some(target_handle) = target_val.as_object_handle() else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "CopyDataProperties target must be an object",
+                    )));
+                };
+                let source = activation.accumulator();
+                crate::property_copy::copy_data_properties(
+                    runtime,
+                    crate::object::ObjectHandle(target_handle),
+                    source,
+                    None,
+                )
+                .map_err(|err| match err {
+                    crate::VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                    crate::VmNativeCallError::Internal(msg) => InterpreterError::NativeCall(msg),
+                })?;
+            }
             // M35: §13.3.10 `import(expr)` — delegate to the
             // module-loader's thread-local-context
             // `dynamic_import_resolve`, which resolves + loads the
@@ -1259,6 +1286,73 @@ impl Interpreter {
             // closure [[Construct]], and the return-value override
             // (§9.2.2.1) that keeps primitive returns replaced by the
             // allocated receiver.
+            // §13.3.5 `new C(...args)` — identical to `Construct`
+            // but the arg-window points at a single Array operand
+            // the compiler built from the spread + plain args.
+            Opcode::ConstructSpread => {
+                let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let new_target = read_reg(activation, function, reg(&instr.operands, 1)?)?;
+                let (base, count) = reg_list(&instr.operands, 2)?;
+                if count != 1 {
+                    let err = runtime
+                        .alloc_type_error("ConstructSpread expects a single args-array operand")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                }
+                let base_idx = RegisterIndex::try_from(base).map_err(|_| {
+                    InterpreterError::NativeCall("ConstructSpread args register overflow".into())
+                })?;
+                let args_val = read_reg(activation, function, base_idx)?;
+                let Some(args_handle) =
+                    args_val.as_object_handle().map(crate::object::ObjectHandle)
+                else {
+                    let err =
+                        runtime.alloc_type_error("ConstructSpread args must be an Array object")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let len = match runtime.objects.array_length(args_handle) {
+                    Ok(Some(n)) => n,
+                    _ => {
+                        let err = runtime
+                            .alloc_type_error("ConstructSpread args must be an Array object")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                };
+                let mut args: Vec<RegisterValue> = Vec::with_capacity(len);
+                for i in 0..len {
+                    let v = runtime
+                        .objects
+                        .get_index(args_handle, i)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(RegisterValue::undefined);
+                    args.push(v);
+                }
+                let Some(target_h) = target.as_object_handle() else {
+                    let err = runtime.alloc_type_error("Value is not a constructor")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                let Some(new_target_h) = new_target.as_object_handle() else {
+                    let err = runtime.alloc_type_error("new.target is not a constructor")?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                };
+                match runtime.construct_callable(
+                    crate::object::ObjectHandle(target_h),
+                    &args,
+                    crate::object::ObjectHandle(new_target_h),
+                ) {
+                    Ok(value) => {
+                        activation.refresh_open_upvalues_from_cells(runtime)?;
+                        activation.set_accumulator(value);
+                    }
+                    Err(crate::VmNativeCallError::Thrown(value)) => {
+                        return Ok(StepOutcome::Throw(value));
+                    }
+                    Err(crate::VmNativeCallError::Internal(message)) => {
+                        let err = runtime.alloc_type_error(&message)?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+            }
             Opcode::Construct => {
                 let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let new_target = read_reg(activation, function, reg(&instr.operands, 1)?)?;

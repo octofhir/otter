@@ -6319,17 +6319,12 @@ fn lower_new_expression<'a>(
     expr: &'a NewExpression<'a>,
 ) -> Result<(), SourceLoweringError> {
     use oxc_ast::ast::Argument;
-    // Reject spread-in-`new` for M27 — same rationale as
-    // `spread_in_direct_call`.
-    if expr
+    let has_spread = expr
         .arguments
         .iter()
-        .any(|arg| matches!(arg, Argument::SpreadElement(_)))
-    {
-        return Err(SourceLoweringError::unsupported(
-            "spread_in_new_expression",
-            expr.span,
-        ));
+        .any(|arg| matches!(arg, Argument::SpreadElement(_)));
+    if has_spread {
+        return lower_new_expression_with_spread(builder, ctx, expr);
     }
     let argc = RegisterIndex::try_from(expr.arguments.len())
         .map_err(|_| SourceLoweringError::Internal("new argument count exceeds u16".into()))?;
@@ -6383,6 +6378,81 @@ fn lower_new_expression<'a>(
         ctx.release_temps(argc);
     }
     ctx.release_temps(1);
+    lower
+}
+
+/// Spread-argument `new C(...args)`. Builds a single Array from
+/// the spread + plain arguments and dispatches via
+/// `ConstructSpread` — the same shape the existing
+/// `Construct` path uses, just with the spread arg-window.
+fn lower_new_expression_with_spread<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    expr: &'a NewExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+    let callee_temp = ctx.acquire_temps(1)?;
+    let args_base = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, &expr.callee)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (new spread callee): {err:?}"))
+            })?;
+        builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode CreateArray (new spread): {err:?}"))
+        })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(args_base))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (new spread args): {err:?}"))
+            })?;
+        for arg in expr.arguments.iter() {
+            match arg {
+                Argument::SpreadElement(spread) => {
+                    lower_return_expression(builder, ctx, &spread.argument)?;
+                    builder
+                        .emit(
+                            Opcode::SpreadIntoArray,
+                            &[Operand::Reg(u32::from(args_base))],
+                        )
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode SpreadIntoArray (new): {err:?}"
+                            ))
+                        })?;
+                }
+                other => {
+                    lower_return_expression(builder, ctx, other.to_expression())?;
+                    builder
+                        .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(args_base))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode ArrayPush (new spread arg): {err:?}"
+                            ))
+                        })?;
+                }
+            }
+        }
+        builder
+            .emit(
+                Opcode::ConstructSpread,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: 1,
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode ConstructSpread: {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(2);
     lower
 }
 
@@ -6921,36 +6991,69 @@ fn lower_object_expression(
         for prop_kind in &expr.properties {
             let prop = match prop_kind {
                 ObjectPropertyKind::ObjectProperty(p) => p,
+                // `{ ...source }` — spread. Evaluate `source`,
+                // then copy every own enumerable property onto
+                // the target via `CopyDataProperties` (runtime
+                // helper).
                 ObjectPropertyKind::SpreadProperty(s) => {
-                    return Err(SourceLoweringError::unsupported(
-                        "object_spread_property",
-                        s.span,
-                    ));
+                    lower_return_expression(builder, ctx, &s.argument)?;
+                    builder
+                        .emit(
+                            Opcode::CopyDataProperties,
+                            &[Operand::Reg(u32::from(obj_temp))],
+                        )
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode CopyDataProperties: {err:?}"
+                            ))
+                        })?;
+                    continue;
                 }
             };
-            if prop.computed {
-                return Err(SourceLoweringError::unsupported(
-                    "computed_property_key",
-                    prop.span,
-                ));
-            }
-            if prop.method {
-                return Err(SourceLoweringError::unsupported(
-                    "method_property",
-                    prop.span,
-                ));
-            }
-            if prop.shorthand {
-                return Err(SourceLoweringError::unsupported(
-                    "shorthand_property",
-                    prop.span,
-                ));
-            }
+            // Accessor (get/set) shorthand stays rejected —
+            // `{ get x() {} }` needs a runtime `DefineGetter`
+            // op that we haven't wired into object literals
+            // yet. Property-method / shorthand / computed key
+            // shapes all work now.
             if !matches!(prop.kind, PropertyKind::Init) {
                 return Err(SourceLoweringError::unsupported(
                     "accessor_property",
                     prop.span,
                 ));
+            }
+            // Computed key: `{ [expr]: value }`. Lower the key
+            // expression into a temp, then use `StaKeyedProperty`
+            // so the runtime handles the ToPropertyKey + set.
+            if prop.computed {
+                let key_temp = ctx.acquire_temps(1)?;
+                let computed_lower = (|| -> Result<(), SourceLoweringError> {
+                    lower_return_expression(builder, ctx, prop.key.to_expression())?;
+                    builder
+                        .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Star (obj computed key): {err:?}"
+                            ))
+                        })?;
+                    lower_return_expression(builder, ctx, &prop.value)?;
+                    builder
+                        .emit(
+                            Opcode::StaKeyedProperty,
+                            &[
+                                Operand::Reg(u32::from(obj_temp)),
+                                Operand::Reg(u32::from(key_temp)),
+                            ],
+                        )
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode StaKeyedProperty (obj computed): {err:?}"
+                            ))
+                        })?;
+                    Ok(())
+                })();
+                ctx.release_temps(1);
+                computed_lower?;
+                continue;
             }
             let key_name = match &prop.key {
                 PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
@@ -6962,8 +7065,13 @@ fn lower_object_expression(
                     ));
                 }
             };
-            // Lower the value into acc; the object handle is
-            // safely spilled.
+            // Lower the value into acc. `{ x }` (shorthand) and
+            // `{ foo() {} }` (method) both have their value
+            // correctly modelled by oxc: shorthand's value is an
+            // Identifier reference, method's value is a
+            // FunctionExpression — both already supported by
+            // `lower_return_expression`. No special case
+            // required.
             lower_return_expression(builder, ctx, &prop.value)?;
             let idx = ctx.intern_property_name(&key_name)?;
             builder
@@ -8714,10 +8822,7 @@ fn lower_call_expression(
     match inner_callee {
         Expression::Identifier(ident) => {
             if has_spread {
-                return Err(SourceLoweringError::unsupported(
-                    "spread_in_direct_call",
-                    call.span,
-                ));
+                return lower_direct_call_with_spread(builder, ctx, call, ident);
             }
             lower_direct_call(builder, ctx, call, ident)
         }
@@ -9061,6 +9166,181 @@ fn lower_direct_call<'a>(
         "unbound_function",
         callee_ident.span,
     ))
+}
+
+/// Spread-argument direct call: `f(...args)` / `f(a, ...rest)`.
+/// Loads the callee value into a temp (via the same binding /
+/// global / closure resolution the non-spread path uses), sets
+/// the receiver to `undefined`, builds a single Array from the
+/// spread + plain arguments, and dispatches via `CallSpread`.
+fn lower_direct_call_with_spread<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &'a oxc_ast::ast::CallExpression<'a>,
+    callee_ident: &'a IdentifierReference<'a>,
+) -> Result<(), SourceLoweringError> {
+    let name = callee_ident.name.as_str();
+    let callee_temp = ctx.acquire_temps(1)?;
+    let receiver_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    let args_base = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // 1) Resolve the callee identifier into a value and spill
+        //    it into `callee_temp`. The resolution ladder mirrors
+        //    the non-spread `lower_direct_call`: local / param,
+        //    upvalue, top-level function (via `CreateClosure` of
+        //    the `FunctionIndex`), then the global fallback.
+        if let Some(binding) = ctx.resolve_identifier(name) {
+            match binding {
+                BindingRef::Param { reg }
+                | BindingRef::Local {
+                    reg,
+                    initialized: true,
+                    ..
+                } => {
+                    builder
+                        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Ldar (spread callee): {err:?}"
+                            ))
+                        })?;
+                }
+                BindingRef::Local {
+                    initialized: false, ..
+                } => {
+                    return Err(SourceLoweringError::unsupported(
+                        "tdz_self_reference",
+                        callee_ident.span,
+                    ));
+                }
+                BindingRef::Upvalue { idx } => {
+                    builder
+                        .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode LdaUpvalue (spread callee): {err:?}"
+                            ))
+                        })?;
+                }
+            }
+        } else if let Some(func_idx) = ctx.resolve_function(name) {
+            // Top-level function declaration — materialise the
+            // closure inline via `CreateClosure <func_idx>, 0`
+            // so we don't depend on the runtime having already
+            // installed the global (matters for test harnesses
+            // that invoke declared functions directly without
+            // running the synth top-level first).
+            let pc = builder
+                .emit(
+                    Opcode::CreateClosure,
+                    &[Operand::Idx(func_idx.0), Operand::Imm(0)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CreateClosure (spread callee): {err:?}"
+                    ))
+                })?;
+            ctx.record_closure_template(
+                pc,
+                crate::closure::ClosureTemplate::new(func_idx, Vec::new()),
+            );
+        } else if is_whitelisted_global_name(name) || ctx.is_module_global(name) {
+            let idx = ctx.intern_property_name(name)?;
+            builder
+                .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaGlobal (spread callee): {err:?}"
+                    ))
+                })?;
+        } else {
+            return Err(SourceLoweringError::unsupported(
+                "unbound_function",
+                callee_ident.span,
+            ));
+        }
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (spread callee): {err:?}"))
+            })?;
+
+        // 2) Receiver = undefined. Direct calls have no implicit
+        //    receiver; the runtime passes `undefined` to the
+        //    callee's `this`.
+        builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaUndefined (spread recv): {err:?}"))
+        })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (spread recv): {err:?}"))
+            })?;
+
+        // 3) Build the argument array: start with an empty
+        //    array, push each plain arg, spread each `...expr`
+        //    arg via the existing SpreadIntoArray opcode.
+        builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!(
+                "encode CreateArray (spread direct-call): {err:?}"
+            ))
+        })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(args_base))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Star (spread direct-call args): {err:?}"
+                ))
+            })?;
+        for arg in call.arguments.iter() {
+            match arg {
+                oxc_ast::ast::Argument::SpreadElement(spread) => {
+                    lower_return_expression(builder, ctx, &spread.argument)?;
+                    builder
+                        .emit(
+                            Opcode::SpreadIntoArray,
+                            &[Operand::Reg(u32::from(args_base))],
+                        )
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode SpreadIntoArray (spread direct-call): {err:?}"
+                            ))
+                        })?;
+                }
+                other => {
+                    lower_return_expression(builder, ctx, other.to_expression())?;
+                    builder
+                        .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(args_base))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode ArrayPush (spread direct-call): {err:?}"
+                            ))
+                        })?;
+                }
+            }
+        }
+
+        // 4) Dispatch through CallSpread — same opcode method
+        //    calls use when any arg is a spread.
+        builder
+            .emit(
+                Opcode::CallSpread,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::Reg(u32::from(receiver_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: 1,
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode CallSpread (direct call): {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(3);
+    lower
 }
 
 /// Method-call path for `o.method(args)`. Receiver, callee, and

@@ -1899,21 +1899,18 @@ fn unbound_function_call_unsupported() {
 // calls lives in the M19 test block below.
 
 #[test]
-fn spread_in_direct_call_rejected() {
-    // `f(...[1])` where `f` is a top-level function still rejects —
-    // direct calls go through `CallDirect` which takes a
-    // function-index operand, not a callable handle, and has no
-    // receiver for `CallSpread`. Method-call spread (`o.m(...x)`)
-    // is supported; see the M23 test block for positive coverage.
-    let err = compile("function f(n) { return n; } function main() { return f(...[1]); }")
-        .expect_err("spread in direct call");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "spread_in_direct_call",
-            ..
-        }
-    ));
+fn spread_in_direct_call_routes_through_call_spread() {
+    // `f(...[1, 2])` loads `f` through the regular binding
+    // resolution, pairs it with an `undefined` receiver, builds
+    // an array out of the spread + plain args, and dispatches
+    // via `CallSpread`. No more rejection.
+    assert_eq!(
+        run_int32_function(
+            "function f(a, b) { return a + b } function main() { return f(...[10, 20]) }",
+            &[],
+        ),
+        30
+    );
 }
 
 #[test]
@@ -3308,50 +3305,49 @@ fn object_property_name_interner_dedups() {
 }
 
 #[test]
-fn spread_in_object_rejected() {
-    let err = compile("function f() { return { ...rest }; }").expect_err("spread");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "object_spread_property",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn spread_in_object_copies_own_enumerable_props() {
+    // `{ ...src }` copies own-enumerable data properties via
+    // the `CopyDataProperties` opcode + runtime helper. Result
+    // object carries the same `.a` / `.b` values as the source.
+    let src = "function main() { \
+            let src = { a: 1, b: 2 }; \
+            let o = { ...src, c: 3 }; \
+            return o.a + o.b + o.c \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 6);
 }
 
 #[test]
-fn computed_key_rejected() {
-    // Key is a Numeric/String expression computed at runtime.
-    // Rejected until a future milestone threads ToPropertyKey.
-    let err = compile("function f() { let k = 0; return { [k]: 1 }; }").expect_err("computed");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "computed_property_key",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn computed_key_lowers_via_sta_keyed() {
+    // `{ [k]: v }` lowers to `StaKeyedProperty` with the key
+    // evaluated into a temp register. Runtime coerces via
+    // ToPropertyKey.
+    let src = "function main() { \
+            let k = \"value\"; \
+            let o = { [k]: 42 }; \
+            return o.value \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 42);
 }
 
 #[test]
-fn shorthand_property_rejected() {
-    let err = compile("function f(x) { return { x }; }").expect_err("shorthand");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "shorthand_property",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn shorthand_property_produces_same_value_pair() {
+    // `{ x }` desugars to `{ x: x }`. oxc flags it as
+    // `shorthand=true` but the `value` node IS a normal
+    // Identifier reference — lowering the value through the
+    // regular return-expression path gives the right bytecode.
+    let src = "function main() { let x = 7; let o = { x }; return o.x }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn method_property_produces_callable_value() {
+    // `{ foo() { return 5 } }` — oxc flags `method=true`,
+    // value is a FunctionExpression. Lowering through
+    // `lower_return_expression` produces a closure that
+    // becomes the property's value.
+    let src = "function main() { let o = { foo() { return 5 } }; return o.foo() }";
+    assert_eq!(run_int32_function(src, &[]), 5);
 }
 
 #[test]
@@ -7608,19 +7604,20 @@ fn m35_export_specifier_list_without_declaration() {
 }
 
 #[test]
-fn spread_in_new_expression_unsupported() {
-    let err = compile(
-        "function main() { class C { tag() { return 1; } } let a = [1]; return new C(...a); }",
-    )
-    .expect_err("spread in new");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "spread_in_new_expression",
-                ..
-            }
+fn spread_in_new_expression_routes_through_construct_spread() {
+    // `new C(...args)` builds the arg array the same way
+    // `CallSpread` does, then dispatches via
+    // `ConstructSpread` — the existing Construct opcode with a
+    // spread-argv window.
+    assert_eq!(
+        run_int32_function(
+            "function main() { \
+                class C { constructor(x, y) { this.v = x + y } } \
+                let c = new C(...[10, 5]); \
+                return c.v \
+            }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        15
     );
 }

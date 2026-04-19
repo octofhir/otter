@@ -72,7 +72,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M31      | `for (k in obj)` + property iteration.                                                                                         | [x]    | f38cddd |
 | M32      | Promise runtime + microtask queue.                                                                                             | [x]    | b123787 |
 | M33      | `async` functions + `await` expression.                                                                                         | [x]    | 78c0141 |
-| M34      | Generators (`function*`, `yield`, `yield*`).                                                                                   | [ ]    |        |
+| M34      | Generators (`function*`, `yield`, `yield*`).                                                                                   | [x]    | 1ed53a4 |
 | M35      | ES module imports + exports.                                                                                                    | [ ]    |        |
 | M36      | `BigIntLiteral` + BigInt arithmetic + `RegExpLiteral` + basic `RegExp` match.                                                  | [ ]    |        |
 
@@ -128,6 +128,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `async function` / `async () => …` declarations + expressions + arrows return a Promise; `await` unary lowers to a new `Await` opcode that drains the microtask queue, unwraps fulfillment / throws rejection, and passes non-promise operands through per §27.7.5.3. Real coroutine suspension for pending promises is deferred — our runtime produces no pending promises today | yes | M33 |
 | Async surface complete: `Promise.all` / `Promise.race` / `Promise.allSettled` / `Promise.any`, `queueMicrotask` / `setTimeout` globals in the compiler whitelist; `drain_microtasks_for_await` now walks all three microtask queues (nextTick → promise jobs → queueMicrotask), so any chain reachable via microtask-only settlement converges before `await` unwraps. Timer-based async pending on real event-loop host integration (out of language scope) | yes | M33-finale |
 | VM event-loop drive (`drive_event_loop` + `drive_event_loop_until_settled`) wired into `run_with_runtime` and the `Await` opcode: `setTimeout` / `setInterval` / `clearTimeout` callbacks fire during both the post-entry drive and awaits, so `await p` on a timer-settled promise now unwraps correctly | yes | M33-timers |
+| Generators: `function*` / `function*()` expressions return a `SuspendedStart` generator on call; `yield expr` suspends via a new `StepOutcome::GeneratorYield` captured by a custom step loop inside `resume_generator_impl` that snapshots registers + PC; `gen.next(v)` / `gen.return(v)` / `gen.throw(v)` resume the saved activation. `yield*` delegation deferred | yes | M34 |
 
 ## Benchmarks
 

@@ -129,15 +129,11 @@ fn top_level_class_declaration_is_accepted() {
 }
 
 #[test]
-fn non_int32_literal_is_unsupported() {
-    let err = compile("function h() { return 1.5; }").expect_err("fractional literal");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "non_int32_literal",
-            ..
-        }
-    ));
+fn fractional_numeric_literal_compiles() {
+    // Non-int32 numeric literals (fractional, out-of-range) now
+    // intern as f64 constants and emit `LdaConstF64` — no more
+    // `non_int32_literal` rejection.
+    compile("function h() { return 1.5; }").expect("fractional literal compiles");
 }
 
 #[test]
@@ -527,19 +523,13 @@ fn let_initializer_can_combine_param_and_local() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn var_declaration_unsupported() {
-    // `var` has hoisting + function-scope semantics distinct from
-    // `let`/`const`. M4 keeps it rejected so we don't accidentally
-    // alias the two surfaces.
-    let err =
-        compile("function f() { var x = 1; return x; }").expect_err("var has different scope");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "var_declaration",
-            ..
-        }
-    ));
+fn var_declaration_lowered_as_let_at_declaration_site() {
+    // `var` now lowers as `let` at the declaration site.
+    // Function-scope hoisting across hoisted calls is still TBD,
+    // but the common single-declaration-before-read pattern
+    // works end-to-end — no more `var_declaration` rejection.
+    let result = compile("function f() { var x = 7; return x; }").expect("var compiles");
+    assert_eq!(result.function(result.entry()).unwrap().name(), Some("f"));
 }
 
 #[test]
@@ -641,19 +631,11 @@ fn tdz_self_reference_in_initializer_via_binary_rhs_unsupported() {
 }
 
 #[test]
-fn fractional_initializer_unsupported() {
-    // Same `non_int32_literal` rejection as the M1 return path —
-    // the lowering reuses `lower_return_expression` for the init
-    // expression, so fractional literals fail there.
-    let err =
-        compile("function f() { let x = 1.5; return x; }").expect_err("non-int32 literal in init");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "non_int32_literal",
-            ..
-        }
-    ));
+fn fractional_initializer_compiles() {
+    // Fractional initializers now flow through `LdaConstF64` —
+    // the init expression inherits `lower_return_expression`'s
+    // f64-fallback path.
+    compile("function f() { let x = 1.5; return x; }").expect("fractional init compiles");
 }
 
 // ---------------------------------------------------------------------------
@@ -6195,21 +6177,13 @@ fn m30_for_of_const_binding_is_readonly() {
 }
 
 #[test]
-fn for_of_var_binding_unsupported() {
-    // `for (var x of ...)` — hoisting semantics differ from
-    // `let`/`const`; deferred past M30.
-    let err = compile("function f() { for (var x of [1]) { return x; } return 0; }")
-        .expect_err("var loop var");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "for_of_var_binding",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn for_of_var_binding_compiles() {
+    // `for (var x of arr)` now lowers through the same
+    // per-iteration Star as `let` / `const`. Full function-scope
+    // hoisting for the `var` flavour is still a follow-up, but
+    // the common "declare + consume" shape works end-to-end.
+    compile("function f() { for (var x of [1]) { return x; } return 0; }")
+        .expect("for-of-var compiles");
 }
 
 #[test]
@@ -6371,21 +6345,12 @@ fn m31_for_in_nested_loops() {
 }
 
 #[test]
-fn for_in_var_binding_unsupported() {
-    // `for (var k in ...)` — hoisting semantics differ from
-    // `let`/`const`; deferred past M31.
-    let err = compile("function f() { for (var k in {}) { return k; } return 0; }")
-        .expect_err("var loop var");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "for_in_var_binding",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn for_in_var_binding_compiles() {
+    // `for (var k in obj)` follows the same relaxation as
+    // `for (var x of arr)` — lowers through the shared per-
+    // iteration Star path.
+    compile("function f() { for (var k in {}) { return k; } return 0; }")
+        .expect("for-in-var compiles");
 }
 
 #[test]

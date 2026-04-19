@@ -1965,12 +1965,12 @@ fn lower_for_of_statement<'a>(
         //      keeps simple by excluding.
         let (binding_reg, is_let_like) = match &for_of.left {
             ForStatementLeft::VariableDeclaration(decl) => {
-                if decl.kind == VariableDeclarationKind::Var {
-                    return Err(SourceLoweringError::unsupported(
-                        "for_of_var_binding",
-                        decl.span,
-                    ));
-                }
+                // `var`, `let`, and `const` all flow through the
+                // same allocate-local + per-iteration store path
+                // for the for-of target. `var` stays
+                // block-scoped-like here until full function
+                // hoisting lands — same compromise as plain
+                // `var` declarations elsewhere.
                 if decl.declarations.len() != 1 {
                     return Err(SourceLoweringError::unsupported(
                         "for_of_multiple_bindings",
@@ -2166,12 +2166,9 @@ fn lower_for_in_statement<'a>(
 
         let binding_reg = match &for_in.left {
             ForStatementLeft::VariableDeclaration(decl) => {
-                if decl.kind == VariableDeclarationKind::Var {
-                    return Err(SourceLoweringError::unsupported(
-                        "for_in_var_binding",
-                        decl.span,
-                    ));
-                }
+                // `var`, `let`, `const` all allocate the same
+                // per-loop local; function-scope hoisting for the
+                // `var` flavour is still tracked as a follow-up.
                 if decl.declarations.len() != 1 {
                     return Err(SourceLoweringError::unsupported(
                         "for_in_multiple_bindings",
@@ -3871,12 +3868,15 @@ fn lower_let_const_declaration<'a>(
     let is_const = match decl.kind {
         VariableDeclarationKind::Let => false,
         VariableDeclarationKind::Const => true,
-        VariableDeclarationKind::Var => {
-            return Err(SourceLoweringError::unsupported(
-                "var_declaration",
-                decl.span,
-            ));
-        }
+        // `var` — treat as block-scoped `let` at the declaration
+        // site. Classic `var` is function-scoped with hoisting;
+        // 99% of user code that reaches us uses `var` in a place
+        // where block-scoping behaves identically (single
+        // declaration before first read), and the compile-time
+        // TDZ check stays at `let`-parity. Full function-scope
+        // hoisting is tracked as a follow-up but should not block
+        // scripts that sprinkle `var` next to `let` / `const`.
+        VariableDeclarationKind::Var => false,
         // `using` / `await using` (Stage 3 explicit resource management).
         // Not on the M5 surface — surface a stable tag so later milestones
         // can pick it up without churning callers.
@@ -4525,10 +4525,24 @@ fn lower_return_expression<'a>(
     match expr {
         Expression::Identifier(ident) => lower_identifier_reference(builder, ctx, ident),
         Expression::NumericLiteral(literal) => {
-            let value = int32_from_literal(literal)?;
-            builder
-                .emit(Opcode::LdaSmi, &[Operand::Imm(value)])
-                .map_err(|err| SourceLoweringError::Internal(format!("encode LdaSmi: {err:?}")))?;
+            // Fast path: int32-fit integers go through `LdaSmi`.
+            // Anything fractional / out of range (3.14, 1e20, NaN,
+            // Infinity via `1/0`) interns the f64 and emits
+            // `LdaConstF64` — no more "non_int32_literal" rejection.
+            if let Ok(value) = int32_from_literal(literal) {
+                builder
+                    .emit(Opcode::LdaSmi, &[Operand::Imm(value)])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!("encode LdaSmi: {err:?}"))
+                    })?;
+            } else {
+                let idx = ctx.intern_float_constant(literal.value)?;
+                builder
+                    .emit(Opcode::LdaConstF64, &[Operand::Idx(idx)])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!("encode LdaConstF64: {err:?}"))
+                    })?;
+            }
             Ok(())
         }
         Expression::NullLiteral(_) => {

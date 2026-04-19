@@ -858,16 +858,48 @@ fn assignment_to_undeclared_unsupported() {
 // M17 test block below.
 
 #[test]
-fn destructuring_assignment_target_unsupported() {
-    let err = compile("function f() { let x = 1; [x] = [2]; return x; }")
-        .expect_err("destructuring assign at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "destructuring_assignment_target",
-            ..
-        }
-    ));
+fn destructuring_assignment_to_array_target_works() {
+    // `[x] = [5]` — destructuring assignment to an EXISTING
+    // binding (no `let`/`const` keyword). Evaluates the RHS
+    // once, then assigns each element via the normal identifier-
+    // assignment path.
+    assert_eq!(
+        run_int32_function("function f() { let x = 1; [x] = [5]; return x; }", &[]),
+        5,
+    );
+}
+
+#[test]
+fn destructuring_assignment_to_object_target_works() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let a = 0; let b = 0; ({ a, b } = { a: 2, b: 3 }); return a + b; }",
+            &[],
+        ),
+        5,
+    );
+}
+
+#[test]
+fn destructuring_assignment_to_renamed_object_target_works() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let x = 0; ({ key: x } = { key: 9 }); return x; }",
+            &[],
+        ),
+        9,
+    );
+}
+
+#[test]
+fn destructuring_assignment_with_rest_works() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let a = 0; let rest = []; [a, ...rest] = [1, 2, 3, 4]; return a + rest.length; }",
+            &[],
+        ),
+        4,
+    );
 }
 
 #[test]
@@ -4484,20 +4516,27 @@ fn finally_with_no_exception_does_not_carry_leftover() {
 }
 
 #[test]
-fn destructuring_catch_param_rejected() {
-    // `catch ({ msg })` uses a destructuring pattern — rejected
-    // until pattern-binding support lands.
-    let err = compile("function f() { try { throw { msg: 1 }; } catch ({ msg }) { return msg; } }")
-        .expect_err("destructuring catch");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "destructuring_catch_param",
-                ..
-            }
+fn destructuring_catch_param_object_pattern() {
+    // `catch ({ msg })` — destructuring pattern on the caught
+    // exception. Stash exception in an anon local, then
+    // delegate to the shared pattern-bind helper.
+    assert_eq!(
+        run_int32_function(
+            "function f() { try { throw { msg: 7 }; } catch ({ msg }) { return msg; } }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        7,
+    );
+}
+
+#[test]
+fn destructuring_catch_param_array_pattern() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { try { throw [1, 2]; } catch ([a, b]) { return a + b; } }",
+            &[],
+        ),
+        3,
     );
 }
 

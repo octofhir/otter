@@ -740,22 +740,29 @@ impl Interpreter {
                 let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let prop_id = idx_operand(&instr.operands, 1)?;
                 let property = resolve_property(function, runtime, prop_id)?;
-                let Some(handle) = target.as_object_handle() else {
-                    return Err(InterpreterError::TypeError(Box::from(
-                        "v2 LdaNamedProperty: receiver is not an object",
-                    )));
-                };
+                // E1: auto-box primitive receivers so `(5n).toString`,
+                // `(1).toFixed`, `"s".length` etc. walk the primitive's
+                // prototype chain. `property_base_object_handle` returns
+                // a wrapper for Boolean/Number/BigInt/Symbol and the
+                // object itself for regular object handles — same path
+                // `LdaKeyedProperty` already uses. Receiver stays as the
+                // original primitive so accessor getters see the raw
+                // value (spec §7.3.1 OrdinaryGet, receiver preserved).
+                let handle = runtime.property_base_object_handle(target)?;
                 // M29: use `ordinary_get` so accessor getters are
                 // invoked with the target as receiver. Data and
                 // "not found" cases fall through unchanged.
-                let value = runtime
-                    .ordinary_get(crate::object::ObjectHandle(handle), property, target)
-                    .map_err(|err| match err {
-                        crate::VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
-                        crate::VmNativeCallError::Internal(msg) => {
-                            InterpreterError::NativeCall(msg)
-                        }
-                    })?;
+                let value =
+                    runtime
+                        .ordinary_get(handle, property, target)
+                        .map_err(|err| match err {
+                            crate::VmNativeCallError::Thrown(v) => {
+                                InterpreterError::UncaughtThrow(v)
+                            }
+                            crate::VmNativeCallError::Internal(msg) => {
+                                InterpreterError::NativeCall(msg)
+                            }
+                        })?;
                 activation.set_accumulator(value);
             }
             Opcode::StaNamedProperty => {

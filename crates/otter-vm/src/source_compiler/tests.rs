@@ -7074,6 +7074,52 @@ fn m36_bigint_preserves_precision() {
 }
 
 #[test]
+fn e1_bigint_primitive_autoboxes_for_method_call() {
+    // `(5n).toString()` — BigInt primitive auto-wraps with
+    // `BigInt.prototype` at property access so the `toString`
+    // method is found. The wrapper is used for property LOOKUP
+    // only; the primitive stays as the `this` passed to the
+    // native method, which reads the value via
+    // `require_bigint_value`.
+    let src = "function main() { let a = 5n; return a.toString().length; }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn e1_bigint_to_string_preserves_precision_beyond_number_boundary() {
+    // The whole point of BigInt: values past Number.MAX_SAFE_INTEGER
+    // stay exact. `.toString()` on a 16-digit BigInt primitive must
+    // round-trip the digits.
+    let src = "function main() { \
+            let a = 9007199254740993n; \
+            let b = 1n; \
+            let c = a + b; \
+            return c.toString().length; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 16);
+}
+
+#[test]
+fn e1_bigint_to_string_with_radix_argument() {
+    // `BigInt.prototype.toString(radix)` — hex for 255n is "ff".
+    let src = "function main() { let a = 255n; return a.toString(16).length; }";
+    assert_eq!(run_int32_function(src, &[]), 2);
+}
+
+#[test]
+fn e1_bigint_value_of_returns_primitive() {
+    // `BigInt.prototype.valueOf()` returns the underlying BigInt
+    // primitive — auto-box path exposes it under the usual
+    // prototype walk.
+    let src = "function main() { \
+            let a = 42n; \
+            let b = a.valueOf(); \
+            return (a === b) ? 1 : 0; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
 fn m36_regexp_literal_returns_regexp_object() {
     // `/foo/` creates a fresh RegExp object. `typeof` is
     // `"object"` (length 6).

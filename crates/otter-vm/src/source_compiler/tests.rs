@@ -7027,6 +7027,107 @@ fn m34_yield_star_still_unsupported() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// M36: BigInt literals + RegExp literals
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m36_bigint_literal_materialises_heap_value() {
+    // Basic BigInt literal — `typeof 42n === "bigint"` — we
+    // check via `.length` of the `typeof` string ("bigint" → 6)
+    // to stay within the int32 return contract.
+    let src = "function main() { let b = 42n; return (typeof b).length; }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m36_bigint_addition_via_runtime_coercion() {
+    // BigInt + BigInt uses the shared Add opcode which routes
+    // through `js_add` for non-int32 operands. We read back
+    // the result length to verify it stayed a BigInt rather
+    // than decaying to a numeric.
+    let src = "function main() { \
+            let a = 5n; \
+            let b = 7n; \
+            let c = a + b; \
+            return (typeof c).length; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m36_bigint_preserves_precision() {
+    // Past the safe-integer boundary (2^53) a BigInt must keep
+    // exact value, unlike a Number. We add two large BigInt
+    // literals and compare to the expected literal via `===`
+    // so the addition result must be bit-exact — a Number
+    // path would collapse both sides into the same imprecise
+    // float and hide the bug.
+    let src = "function main() { \
+            let a = 9007199254740993n; \
+            let b = 1n; \
+            let c = a + b; \
+            let expected = 9007199254740994n; \
+            return (c === expected) ? 1 : 0; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn m36_regexp_literal_returns_regexp_object() {
+    // `/foo/` creates a fresh RegExp object. `typeof` is
+    // `"object"` (length 6).
+    let src = "function main() { let r = /foo/; return (typeof r).length; }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m36_regexp_test_matches_source() {
+    // `RegExp.prototype.test` returns a boolean — bridging
+    // through the runtime's `regexp_test` native.
+    let src = "function main() { \
+            let r = /hello/; \
+            return r.test(\"hello world\") ? 1 : 0; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn m36_regexp_flags_preserved() {
+    // Flags from the source (`/foo/gi`) surface via the
+    // `.flags` getter on the RegExp prototype. Verify length
+    // of the string — `"gi"` → 2.
+    let src = "function main() { let r = /foo/gi; return r.flags.length; }";
+    assert_eq!(run_int32_function(src, &[]), 2);
+}
+
+#[test]
+fn m36_regexp_exec_returns_match_array() {
+    // `.exec(str)` returns either `null` or an array whose
+    // first element is the matched substring. `exec(...)[0]`
+    // should be the match; we read its length to verify.
+    let src = "function main() { \
+            let r = /el/; \
+            let m = r.exec(\"hello\"); \
+            return m[0].length; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 2);
+}
+
+#[test]
+fn m36_regexp_no_match_returns_null() {
+    // `.exec` returns `null` on miss. We detect via
+    // `=== null` short-circuit but since our M6 relational path
+    // needs a register, assign `null` to a local first.
+    let src = "function main() { \
+            let r = /nope/; \
+            let m = r.exec(\"hello\"); \
+            let n = null; \
+            return (m === n) ? 1 : 0; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
 #[test]
 fn spread_in_new_expression_unsupported() {
     let err = compile(

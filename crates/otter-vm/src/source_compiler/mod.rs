@@ -384,10 +384,10 @@ fn lower_function_declaration<'a>(
         body_out.property_names,
         body_out.string_literals,
         body_out.float_constants,
-        Default::default(),
+        body_out.bigint_constants,
         body_out.closures,
         Default::default(),
-        Default::default(),
+        body_out.regexp_literals,
     );
     let tables = FunctionTables::new(
         side_tables,
@@ -416,6 +416,8 @@ struct FunctionBodyOutput {
     property_names: crate::property::PropertyNameTable,
     float_constants: crate::float::FloatTable,
     string_literals: crate::string::StringTable,
+    bigint_constants: crate::bigint::BigIntTable,
+    regexp_literals: crate::regexp::RegExpTable,
     exceptions: crate::exception::ExceptionTable,
     closures: crate::closure::ClosureTable,
 }
@@ -841,6 +843,8 @@ fn lower_function_body_with_parent<'a>(
             property_names: ctx.take_property_names(),
             float_constants: ctx.take_float_constants(),
             string_literals: ctx.take_string_literals(),
+            bigint_constants: ctx.take_bigint_constants(),
+            regexp_literals: ctx.take_regexp_literals(),
             exceptions: crate::exception::ExceptionTable::new(exception_handlers),
             closures: closure_table,
         },
@@ -2305,6 +2309,18 @@ struct LoweringContext<'a> {
     /// function finalisation so the dispatcher can resolve the
     /// `Idx` operand back to a `JsString` at runtime.
     string_literals: RefCell<Vec<String>>,
+    /// M36: deduplicated BigInt-literal interner. Each entry is a
+    /// decimal-string representation of an arbitrary-precision
+    /// integer (the source suffix `n` stripped). Handed to
+    /// [`BigIntTable::new`](crate::bigint::BigIntTable::new) at
+    /// function finalisation.
+    bigint_constants: RefCell<Vec<String>>,
+    /// M36: RegExp-literal table. Each entry is a `(pattern, flags)`
+    /// pair; no dedup (two equal-looking literals still produce
+    /// independent RegExp objects per §22.2.1.5). Handed to
+    /// [`RegExpTable::new`](crate::regexp::RegExpTable::new) at
+    /// function finalisation.
+    regexp_literals: RefCell<Vec<(String, String)>>,
     /// Pending exception-handler records (M21). Each entry pairs a
     /// try-block's `(try_start_label, try_end_label)` range with the
     /// `handler_label` the interpreter should jump to on an
@@ -2532,6 +2548,8 @@ impl<'a> LoweringContext<'a> {
             property_names: RefCell::new(Vec::new()),
             float_constants: RefCell::new(Vec::new()),
             string_literals: RefCell::new(Vec::new()),
+            bigint_constants: RefCell::new(Vec::new()),
+            regexp_literals: RefCell::new(Vec::new()),
             pending_handlers: RefCell::new(Vec::new()),
             pending_closure_templates: RefCell::new(Vec::new()),
             module_functions,
@@ -2672,6 +2690,55 @@ impl<'a> LoweringContext<'a> {
     /// Finalise the string-literal interner into an immutable table.
     fn take_string_literals(&self) -> crate::string::StringTable {
         crate::string::StringTable::new(self.string_literals.borrow().clone())
+    }
+
+    /// Intern a BigInt literal's decimal-string representation
+    /// (the source suffix `n` stripped) into the function's
+    /// BigInt-constant side table. Dedup is O(N) on an
+    /// already-small table.
+    fn intern_bigint_literal(&self, decimal: &str) -> Result<u32, SourceLoweringError> {
+        let mut tbl = self.bigint_constants.borrow_mut();
+        if let Some(pos) = tbl.iter().position(|n| n == decimal) {
+            return Ok(pos as u32);
+        }
+        let idx = u32::try_from(tbl.len())
+            .map_err(|_| SourceLoweringError::Internal("bigint constant table overflow".into()))?;
+        tbl.push(decimal.to_owned());
+        Ok(idx)
+    }
+
+    /// Finalise the BigInt-constant interner into an immutable table.
+    fn take_bigint_constants(&self) -> crate::bigint::BigIntTable {
+        let values: Vec<Box<str>> = self
+            .bigint_constants
+            .borrow()
+            .iter()
+            .map(|s| s.clone().into_boxed_str())
+            .collect();
+        crate::bigint::BigIntTable::new(values)
+    }
+
+    /// Register a `(pattern, flags)` RegExp entry, returning its
+    /// index for the `CreateRegExp` opcode's `Idx` operand. No
+    /// dedup — §22.2.1.5 specifies a fresh RegExp object per
+    /// literal evaluation.
+    fn push_regexp_literal(&self, pattern: &str, flags: &str) -> Result<u32, SourceLoweringError> {
+        let mut tbl = self.regexp_literals.borrow_mut();
+        let idx = u32::try_from(tbl.len())
+            .map_err(|_| SourceLoweringError::Internal("regexp literal table overflow".into()))?;
+        tbl.push((pattern.to_owned(), flags.to_owned()));
+        Ok(idx)
+    }
+
+    /// Finalise the RegExp-literal table into its immutable form.
+    fn take_regexp_literals(&self) -> crate::regexp::RegExpTable {
+        let entries: Vec<(Box<str>, Box<str>)> = self
+            .regexp_literals
+            .borrow()
+            .iter()
+            .map(|(p, f)| (p.clone().into_boxed_str(), f.clone().into_boxed_str()))
+            .collect();
+        crate::regexp::RegExpTable::new(entries)
     }
 
     /// Push a fresh [`LoopLabels`] frame onto the stack. Paired 1:1
@@ -3755,6 +3822,34 @@ fn lower_return_expression<'a>(
                 .emit(Opcode::LdaConstStr, &[Operand::Idx(idx)])
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!("encode LdaConstStr: {err:?}"))
+                })?;
+            Ok(())
+        }
+        // M36: §6.1.6.2 BigInt literal — `42n`. oxc provides
+        // the value already normalised to base-10 without the
+        // trailing `n` suffix, which matches what
+        // `alloc_bigint` expects.
+        Expression::BigIntLiteral(lit) => {
+            let idx = ctx.intern_bigint_literal(lit.value.as_str())?;
+            builder
+                .emit(Opcode::LdaConstBigInt, &[Operand::Idx(idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaConstBigInt: {err:?}"))
+                })?;
+            Ok(())
+        }
+        // M36: §22.2 RegExp literal — `/pattern/flags` records
+        // the source form into the function's regexp table and
+        // emits `CreateRegExp`. Each evaluation allocates a
+        // fresh RegExp object (§22.2.1.5) so there's no dedup.
+        Expression::RegExpLiteral(lit) => {
+            let pattern = lit.regex.pattern.text.as_str();
+            let flags = lit.regex.flags.to_string();
+            let idx = ctx.push_regexp_literal(pattern, &flags)?;
+            builder
+                .emit(Opcode::CreateRegExp, &[Operand::Idx(idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode CreateRegExp: {err:?}"))
                 })?;
             Ok(())
         }
@@ -4977,10 +5072,10 @@ fn synthesise_static_block<'a>(
         ctx.take_property_names(),
         ctx.take_string_literals(),
         ctx.take_float_constants(),
-        Default::default(),
+        ctx.take_bigint_constants(),
         ctx.take_closure_table(bytecode_len),
         Default::default(),
-        Default::default(),
+        ctx.take_regexp_literals(),
     );
     let exception_handlers = ctx.take_exception_handlers(&BytecodeBuilder::new())?;
     let tables = FunctionTables::new(
@@ -5090,10 +5185,10 @@ fn synthesise_field_initializer<'a>(
         ctx.take_property_names(),
         ctx.take_string_literals(),
         ctx.take_float_constants(),
-        Default::default(),
+        ctx.take_bigint_constants(),
         ctx.take_closure_table(bytecode_len),
         Default::default(),
-        Default::default(),
+        ctx.take_regexp_literals(),
     );
     // The field-initializer body can't emit `try`/`catch` — it's
     // compiled from individual expressions, not statements — so
@@ -5394,10 +5489,10 @@ fn lower_inner_callable_with_super<'a>(
         body_out.property_names,
         body_out.string_literals,
         body_out.float_constants,
-        Default::default(),
+        body_out.bigint_constants,
         body_out.closures,
         Default::default(),
-        Default::default(),
+        body_out.regexp_literals,
     );
     let tables = FunctionTables::new(
         side_tables,

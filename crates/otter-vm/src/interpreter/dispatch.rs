@@ -135,6 +135,50 @@ impl Interpreter {
                         .unwrap_or_else(RegisterValue::undefined),
                 );
             }
+            // M36: §6.1.6.2 BigInt literal — `42n` → heap BigInt.
+            // Allocates a new BigInt object from the interned
+            // decimal-string representation stored in the
+            // function's side table.
+            Opcode::LdaConstBigInt => {
+                let idx = idx_operand(&instr.operands, 0)?;
+                let Some(s) = function
+                    .bigint_constants()
+                    .get(crate::bigint::BigIntId(idx as u16))
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(format!(
+                        "v2 LdaConstBigInt: bigint id {idx} out of range"
+                    ))));
+                };
+                let handle = runtime.objects.alloc_bigint(s.to_string());
+                // BigInt primitives use the dedicated `TAG_PTR_BIGINT` tag so
+                // `is_bigint()` discriminators and `bigint_binary_op` decoders
+                // both find the value; tagging as a regular object handle
+                // would silently break `js_add`'s BigInt dispatch and trip
+                // `property_lookup` into the `InvalidKind` branch.
+                activation.set_accumulator(RegisterValue::from_bigint_handle(handle.0));
+            }
+            // M36: §22.2 RegExp literal — `/pattern/flags` creates
+            // a RegExp object with `RegExp.prototype` as its
+            // `[[Prototype]]`. Pattern + flags live in the
+            // function's side table.
+            Opcode::CreateRegExp => {
+                let idx = idx_operand(&instr.operands, 0)?;
+                let Some(entry) = function
+                    .regexp_literals()
+                    .get(crate::regexp::RegExpId(idx as u16))
+                else {
+                    return Err(InterpreterError::NativeCall(Box::from(format!(
+                        "v2 CreateRegExp: regexp id {idx} out of range"
+                    ))));
+                };
+                let pattern = entry.pattern.to_string();
+                let flags = entry.flags.to_string();
+                let prototype = runtime.intrinsics().regexp_prototype();
+                let handle = runtime
+                    .objects
+                    .alloc_regexp(&pattern, &flags, Some(prototype));
+                activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
+            }
             Opcode::LdaThis => {
                 // `this` lives in the receiver slot (hidden[0]).
                 if let Some(slot) = function.frame_layout().receiver_slot() {
@@ -419,6 +463,22 @@ impl Interpreter {
                     let rh = crate::object::ObjectHandle(rh);
                     let lstr = runtime.objects.string_value(lh).ok().flatten();
                     let rstr = runtime.objects.string_value(rh).ok().flatten();
+                    match (lstr, rstr) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => false,
+                    }
+                } else if let (Some(lb), Some(rb)) =
+                    (lhs.as_bigint_handle(), rhs.as_bigint_handle())
+                {
+                    // §6.1.6.2.13 BigInt::equal — two distinct BigInt
+                    // heap allocations for the same integer must compare
+                    // strictly equal. Values are stored as decimal
+                    // strings, so a byte-wise compare after canonical
+                    // `to_string()` (no sign noise for 0) suffices.
+                    let lh = crate::object::ObjectHandle(lb);
+                    let rh = crate::object::ObjectHandle(rb);
+                    let lstr = runtime.objects.bigint_value(lh).ok().flatten();
+                    let rstr = runtime.objects.bigint_value(rh).ok().flatten();
                     match (lstr, rstr) {
                         (Some(a), Some(b)) => a == b,
                         _ => false,

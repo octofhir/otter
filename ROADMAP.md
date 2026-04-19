@@ -2,6 +2,8 @@
 
 North star: a JavaScript runtime that is (a) more spec-correct than Node/Bun/Deno, (b) faster than Bun on steady-state and faster than Node on cold-start, (c) the best developer experience in the space, and (d) the only runtime that treats capability-based security, native FFI, and FHIR-native healthcare tooling as first-class surfaces. Nothing less is worth shipping.
 
+CLI surface is Bun-style: the binary is `otter` (crate `otterjs`, renamed in `[[bin]]`). `otter script.ts` runs a file directly — no `run` subcommand; top-level statements work without a `main()` wrapper. Package management is flat: `otter install`, `otter add react`, `otter remove lodash`, `otter exec`, `otter init`, `otter info`.
+
 This is the forward plan. The v2 migration (M0–M36) closed the whole JS syntax surface on the new stack; this document picks up from there.
 
 ## Quality gate (every milestone)

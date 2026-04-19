@@ -70,7 +70,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M29      | Class private fields (`#x`) + accessor methods (`get` / `set`).                                                                 | [x]    | c9398fe |
 | M30      | `for (x of arr)` + iterator protocol (`Symbol.iterator`, `next()`).                                                             | [x]    | cf63969 |
 | M31      | `for (k in obj)` + property iteration.                                                                                         | [x]    | f38cddd |
-| M32      | Promise runtime + microtask queue.                                                                                             | [ ]    |        |
+| M32      | Promise runtime + microtask queue.                                                                                             | [x]    | b123787 |
 | M33      | `async` functions + `await` expression.                                                                                         | [ ]    |        |
 | M34      | Generators (`function*`, `yield`, `yield*`).                                                                                   | [ ]    |        |
 | M35      | ES module imports + exports.                                                                                                    | [ ]    |        |
@@ -124,6 +124,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `for (<let\|const\|ident> of <iterable>) body` over built-in iterables (Array/String/TypedArray) via `GetIterator` + new `IteratorStep` opcode; `break` / `continue` wired through the loop-label stack; `for await`, destructuring LHS, `var` LHS, custom Symbol.iterator iterables deferred | yes | M30 |
 | `Symbol` global + spec-compliant §7.4 iterator protocol: `GetIterator` does `@@iterator` lookup + call, `IteratorStep` falls back to user `.next()` call with `{value, done}` unpack, `ToPropertyKey` recognises symbol keys (`obj[Symbol.iterator] = …`) | yes | M30-tail |
 | `for (<let\|const\|ident> in <source>) body` via `ForInEnumerate` + `ForInNext`, `null` / `undefined` source skips without throwing; class-method installation switched to `DefineClassMethod` so prototype methods stay non-enumerable per §15.7.11 | yes | M31 |
+| `Promise` global + `new Promise(executor)` / `Promise.resolve` / `Promise.reject` / `.then` / `.catch` / `.finally` chaining from user source; `execute_with_runtime` drains the microtask queue before returning so promise callbacks settle before the host regains control | yes | M32 |
 
 ## Benchmarks
 

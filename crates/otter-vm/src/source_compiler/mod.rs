@@ -328,10 +328,6 @@ fn lower_function_declaration<'a>(
     function_names: &'a [&'a str],
     module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
 ) -> Result<VmFunction, SourceLoweringError> {
-    if func.generator {
-        return Err(SourceLoweringError::unsupported("generator", func.span));
-    }
-
     let name = func
         .id
         .as_ref()
@@ -404,7 +400,8 @@ fn lower_function_declaration<'a>(
     Ok(
         VmFunction::new(Some(name), layout, body_out.bytecode, tables)
             .with_strict(func.id.is_some())
-            .with_async(func.r#async),
+            .with_async(func.r#async)
+            .with_generator(func.generator),
     )
 }
 
@@ -905,6 +902,12 @@ fn lower_nested_statement<'a>(
                 // M33: `await p;` as a statement — lower the
                 // expression, result discarded.
                 Expression::AwaitExpression(_) => {
+                    lower_return_expression(builder, ctx, &expr_stmt.expression)
+                }
+                // M34: `yield v;` at statement position — same
+                // pattern, result (the sent-value on resume) is
+                // discarded.
+                Expression::YieldExpression(_) => {
                     lower_return_expression(builder, ctx, &expr_stmt.expression)
                 }
                 other => Err(SourceLoweringError::unsupported(
@@ -3806,6 +3809,33 @@ fn lower_return_expression<'a>(
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Await: {err:?}")))?;
             Ok(())
         }
+        // M34: `yield <expr>` — §14.4 YieldExpression. Lowers
+        // the operand into acc, emits `Yield` (suspends the
+        // generator, returns to the `.next()` caller with
+        // `{ value: acc, done: false }`). On resume, acc carries
+        // the caller-provided sent value.
+        //
+        // `yield*` delegation (`expr.delegate`) is a separate
+        // AST shape and stays deferred to a follow-up.
+        Expression::YieldExpression(yield_expr) => {
+            if yield_expr.delegate {
+                return Err(SourceLoweringError::unsupported(
+                    "yield_star_delegation",
+                    yield_expr.span,
+                ));
+            }
+            if let Some(arg) = yield_expr.argument.as_ref() {
+                lower_return_expression(builder, ctx, arg)?;
+            } else {
+                builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaUndefined (yield): {err:?}"))
+                })?;
+            }
+            builder
+                .emit(Opcode::Yield, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode Yield: {err:?}")))?;
+            Ok(())
+        }
         Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
         Expression::FunctionExpression(func) => lower_function_expression(builder, ctx, func),
         Expression::ArrowFunctionExpression(arrow) => {
@@ -3872,29 +3902,34 @@ fn lower_function_expression<'a>(
     ctx: &LoweringContext<'a>,
     func: &'a Function<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if func.generator {
-        return Err(SourceLoweringError::unsupported("generator", func.span));
-    }
     // Lower the inner function first — the recursive lowering
     // collects the list of outer bindings it captured. The
     // captures come back as a `Vec<CaptureDescriptor>`; each
     // element's slot index matches the inner function's
     // `LdaUpvalue <idx>` operands.
     let (inner_idx, captures) = lower_inner_function_with_captures(func, ctx)?;
-    if func.r#async {
+    {
         let mut fns = ctx.module_functions.borrow_mut();
-        fns[inner_idx as usize].set_async(true);
+        let target = &mut fns[inner_idx as usize];
+        if func.r#async {
+            target.set_async(true);
+        }
+        if func.generator {
+            target.set_generator(true);
+        }
     }
 
     let pc = builder.pc();
+    let flags = match (func.r#async, func.generator) {
+        (true, true) => crate::object::ClosureFlags::async_generator(),
+        (true, false) => crate::object::ClosureFlags::async_fn(),
+        (false, true) => crate::object::ClosureFlags::generator(),
+        (false, false) => crate::object::ClosureFlags::normal(),
+    };
     let template = crate::closure::ClosureTemplate::with_flags(
         crate::module::FunctionIndex(inner_idx),
         captures,
-        if func.r#async {
-            crate::object::ClosureFlags::async_fn()
-        } else {
-            crate::object::ClosureFlags::normal()
-        },
+        flags,
     );
     ctx.record_closure_template(pc, template);
 
@@ -3975,9 +4010,6 @@ fn lower_nested_function_declaration<'a>(
     ctx: &mut LoweringContext<'a>,
     func: &'a Function<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if func.generator {
-        return Err(SourceLoweringError::unsupported("generator", func.span));
-    }
     let name_ident = func
         .id
         .as_ref()
@@ -3987,19 +4019,27 @@ fn lower_nested_function_declaration<'a>(
     // Lower the inner function + record captures against the
     // enclosing context, same as FunctionExpression.
     let (inner_idx, captures) = lower_inner_function_with_captures(func, ctx)?;
-    if func.r#async {
+    {
         let mut fns = ctx.module_functions.borrow_mut();
-        fns[inner_idx as usize].set_async(true);
+        let target = &mut fns[inner_idx as usize];
+        if func.r#async {
+            target.set_async(true);
+        }
+        if func.generator {
+            target.set_generator(true);
+        }
     }
     let pc = builder.pc();
+    let flags = match (func.r#async, func.generator) {
+        (true, true) => crate::object::ClosureFlags::async_generator(),
+        (true, false) => crate::object::ClosureFlags::async_fn(),
+        (false, true) => crate::object::ClosureFlags::generator(),
+        (false, false) => crate::object::ClosureFlags::normal(),
+    };
     let template = crate::closure::ClosureTemplate::with_flags(
         crate::module::FunctionIndex(inner_idx),
         captures,
-        if func.r#async {
-            crate::object::ClosureFlags::async_fn()
-        } else {
-            crate::object::ClosureFlags::normal()
-        },
+        flags,
     );
     ctx.record_closure_template(pc, template);
     builder

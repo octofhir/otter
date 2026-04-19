@@ -155,18 +155,6 @@ fn two_functions_at_top_level_pick_last_as_entry() {
     );
 }
 
-#[test]
-fn generator_unsupported() {
-    let err = compile("function* g() { return 1; }").expect_err("generator lands later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "generator",
-            ..
-        }
-    ));
-}
-
 // Removed: multi_parameters_unsupported, default_parameter_unsupported,
 // rest_parameter_unsupported — all three shapes are supported as of M22.
 // Positive coverage for each lives in the M22 test block below.
@@ -6890,6 +6878,153 @@ fn m33f_clear_timeout_prevents_callback() {
             return state; \
         }";
     assert_eq!(run_promise_state_counter(src, "count"), 5);
+}
+
+// ---------------------------------------------------------------------------
+// M34: Generators (function*, yield, gen.next)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m34_generator_yields_sequence_and_completes() {
+    // Basic `function* () { yield 1; yield 2; yield 3; }` —
+    // three `.next()` calls return the yielded values, the
+    // fourth returns done=true.
+    let src = "function* gen() { yield 1; yield 2; yield 3; } \
+        function main() { \
+            let g = gen(); \
+            let total = 0; \
+            total = total + g.next().value; \
+            total = total + g.next().value; \
+            total = total + g.next().value; \
+            let last = g.next(); \
+            return total + (last.done ? 100 : 0); \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 106);
+}
+
+#[test]
+fn m34_generator_receives_sent_value_on_resume() {
+    // The value passed to `.next(v)` becomes the result of the
+    // paused `yield` expression. This verifies the sent-value
+    // round trip through the accumulator.
+    let src = "function* echo() { \
+            let a = yield 0; \
+            let b = yield a + 1; \
+            return b + 10; \
+        } \
+        function main() { \
+            let g = echo(); \
+            g.next(); \
+            g.next(7); \
+            let last = g.next(20); \
+            return last.value; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 30);
+}
+
+#[test]
+fn m34_generator_captures_arguments() {
+    // Generator parameters are available inside the body on
+    // the first `.next()`. The args are copied from the
+    // creation call into the activation on first resume.
+    let src = "function* range(start, end) { \
+            let i = start; \
+            while (i < end) { yield i; i = i + 1; } \
+        } \
+        function main() { \
+            let g = range(3, 6); \
+            return g.next().value + g.next().value + g.next().value; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 12);
+}
+
+#[test]
+fn m34_generator_works_with_for_of() {
+    // The built-in generator prototype's `@@iterator` returns
+    // the generator itself, so `for (v of gen())` drives it
+    // through the iterator protocol.
+    let src = "function* gen() { yield 10; yield 20; yield 30; } \
+        function main() { \
+            let total = 0; \
+            for (let v of gen()) { total = total + v; } \
+            return total; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 60);
+}
+
+#[test]
+fn m34_generator_done_after_completion() {
+    // Once the generator body returns, further `.next()` calls
+    // yield `{ value: undefined, done: true }` — the
+    // completion marker. Body isn't literally empty (compiler
+    // currently rejects `{}`); a single `return` suffices.
+    let src = "function* single() { yield 7; } \
+        function main() { \
+            let g = single(); \
+            let first = g.next(); \
+            let second = g.next(); \
+            let third = g.next(); \
+            return first.value + (second.done ? 10 : 0) + (third.done ? 100 : 0); \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 117);
+}
+
+#[test]
+fn m34_generator_throw_propagates_to_body() {
+    // `gen.throw(err)` surfaces as a JS throw at the paused
+    // yield point. The body's try/catch can intercept it.
+    let src = "function* guard() { \
+            try { \
+                yield 1; \
+                return 999; \
+            } catch (e) { \
+                return e + 100; \
+            } \
+        } \
+        function main() { \
+            let g = guard(); \
+            g.next(); \
+            let last = g.throw(5); \
+            return last.value; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 105);
+}
+
+#[test]
+fn m34_generator_return_forces_completion() {
+    // `gen.return(v)` marks the generator completed with the
+    // supplied value; subsequent `.next()` calls return
+    // `{ undefined, true }`.
+    let src = "function* counter() { \
+            yield 1; \
+            yield 2; \
+            return 99; \
+        } \
+        function main() { \
+            let g = counter(); \
+            g.next(); \
+            let r = g.return(42); \
+            let after = g.next(); \
+            return r.value + (after.done ? 0 : 1000); \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn m34_yield_star_still_unsupported() {
+    // `yield* iter` delegation deferred — stays rejected
+    // with a stable tag.
+    let err = compile("function* g() { yield* [1, 2, 3]; }").expect_err("yield* lands later");
+    assert!(
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "yield_star_delegation",
+                ..
+            }
+        ),
+        "unexpected err: {err:?}",
+    );
 }
 
 #[test]

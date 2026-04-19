@@ -144,14 +144,270 @@ impl Interpreter {
         }
     }
 
-    /// Resume a suspended generator. Placeholder in M0.
+    /// §27.5.1.1 GeneratorResume / §27.5.1.2 GeneratorResumeAbrupt —
+    /// drives a suspended generator to its next yield / completion.
+    ///
+    /// Dispatches per the generator's current state:
+    /// - `SuspendedStart`: copies the stored arguments into a fresh
+    ///   activation and runs the body from PC 0.
+    /// - `SuspendedYield`: restores the saved register window,
+    ///   places the caller-provided `sent_value` into the
+    ///   accumulator (Next), throws it (Throw), or forces a
+    ///   premature return (Return), then resumes at the PC after
+    ///   the `Yield` opcode.
+    /// - `Completed`: Next/Throw return
+    ///   `{ value: undefined, done: true }` / re-throw, Return
+    ///   returns the supplied value.
+    ///
+    /// The returned register value is an iterator-result object
+    /// (`{ value, done }`) on normal completion; thrown errors
+    /// surface as `VmNativeCallError::Thrown`.
     pub(super) fn resume_generator_impl(
-        _runtime: &mut RuntimeState,
-        _generator: ObjectHandle,
-        _sent_value: RegisterValue,
-        _resume_kind: GeneratorResumeKind,
+        runtime: &mut RuntimeState,
+        generator: ObjectHandle,
+        sent_value: RegisterValue,
+        resume_kind: GeneratorResumeKind,
     ) -> Result<RegisterValue, VmNativeCallError> {
-        Err(VmNativeCallError::Internal(M0_UNSUPPORTED.into()))
+        use crate::frame::{FrameFlags, FrameMetadata};
+        use crate::object::GeneratorState;
+        use crate::property::PropertyNameId;
+
+        use super::Activation;
+        use super::step_outcome::{Completion, StepOutcome};
+
+        let state = runtime.objects.generator_state(generator).map_err(|err| {
+            VmNativeCallError::Internal(format!("generator_state: {err:?}").into())
+        })?;
+
+        // §27.5.1.2 step 3 — resuming an already-completed
+        // generator: Next yields `{ undefined, true }`,
+        // Return yields `{ value, true }`, Throw re-raises.
+        if state == GeneratorState::Completed {
+            return match resume_kind {
+                GeneratorResumeKind::Throw => Err(VmNativeCallError::Thrown(sent_value)),
+                GeneratorResumeKind::Return => {
+                    let handle = runtime.create_iter_result(sent_value, true)?;
+                    Ok(RegisterValue::from_object_handle(handle.0))
+                }
+                GeneratorResumeKind::Next => {
+                    let handle = runtime.create_iter_result(RegisterValue::undefined(), true)?;
+                    Ok(RegisterValue::from_object_handle(handle.0))
+                }
+            };
+        }
+
+        // §27.5.1.2 step 2 — resuming an already-executing
+        // generator is a bug (should be caught by the prototype
+        // dispatch, but guard here too).
+        if state == GeneratorState::Executing {
+            return Err(Self::throw_as_type_error_native(
+                runtime,
+                "generator is already running",
+            ));
+        }
+
+        let (
+            module,
+            function_index,
+            closure_handle,
+            arguments,
+            saved_registers,
+            resume_pc,
+            _resume_reg,
+        ) = runtime
+            .objects
+            .generator_take_state(generator)
+            .map_err(|err| {
+                VmNativeCallError::Internal(format!("generator_take_state: {err:?}").into())
+            })?;
+
+        let callee_function = module
+            .function(function_index)
+            .ok_or(InterpreterError::InvalidCallTarget)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
+
+        let register_count = callee_function.frame_layout().register_count();
+        let mut activation = Activation::with_context(
+            function_index,
+            register_count,
+            FrameMetadata::new(arguments.len() as u16, FrameFlags::default()),
+            closure_handle,
+        );
+
+        if let Some(saved) = saved_registers {
+            activation
+                .copy_registers_from_slice(&saved)
+                .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
+            activation.set_pc(resume_pc);
+            match resume_kind {
+                GeneratorResumeKind::Next => {
+                    activation.set_accumulator(sent_value);
+                }
+                GeneratorResumeKind::Return => {
+                    // §27.5.1.2 GeneratorResumeAbrupt with Return —
+                    // short-circuit: mark completed and return the
+                    // iterator result directly.
+                    let _ = runtime
+                        .objects
+                        .set_generator_state(generator, GeneratorState::Completed);
+                    let handle = runtime.create_iter_result(sent_value, true)?;
+                    return Ok(RegisterValue::from_object_handle(handle.0));
+                }
+                GeneratorResumeKind::Throw => {
+                    // §27.5.1.2 GeneratorResumeAbrupt with
+                    // Throw — the thrown value surfaces at the
+                    // yield point. If the current PC sits
+                    // inside a try handler, route to the
+                    // handler; otherwise propagate the throw
+                    // out of the generator and mark it
+                    // completed.
+                    if !Self::for_runtime(runtime).transfer_exception(
+                        callee_function,
+                        &mut activation,
+                        sent_value,
+                    ) {
+                        let _ = runtime
+                            .objects
+                            .set_generator_state(generator, GeneratorState::Completed);
+                        return Err(VmNativeCallError::Thrown(sent_value));
+                    }
+                }
+            }
+        } else {
+            // First call — bind arguments into parameter slots.
+            let param_count = callee_function.frame_layout().parameter_count();
+            for (i, &arg) in arguments.iter().take(param_count as usize).enumerate() {
+                let abs = callee_function
+                    .frame_layout()
+                    .resolve_user_visible(i as u16)
+                    .ok_or(InterpreterError::RegisterOutOfBounds)
+                    .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
+                activation
+                    .set_register(abs, arg)
+                    .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
+            }
+            if arguments.len() > param_count as usize {
+                activation.overflow_args = arguments[param_count as usize..].to_vec();
+            }
+            // `GeneratorResumeKind::Throw` on a first-call gen:
+            // §27.5.1.2 step 4.b throws before running anything.
+            if matches!(resume_kind, GeneratorResumeKind::Throw) {
+                let _ = runtime
+                    .objects
+                    .set_generator_state(generator, GeneratorState::Completed);
+                return Err(VmNativeCallError::Thrown(sent_value));
+            }
+            if matches!(resume_kind, GeneratorResumeKind::Return) {
+                let _ = runtime
+                    .objects
+                    .set_generator_state(generator, GeneratorState::Completed);
+                let handle = runtime.create_iter_result(sent_value, true)?;
+                return Ok(RegisterValue::from_object_handle(handle.0));
+            }
+        }
+
+        // Custom step loop — like `run_completion_with_runtime`
+        // but intercepts `StepOutcome::GeneratorYield` to
+        // capture register state + PC into the generator
+        // before returning to the `.next()` caller.
+        let interpreter = Self::for_runtime(runtime);
+        let mut frame_runtime = crate::interpreter::FrameRuntimeState::new(callee_function);
+        let completion = loop {
+            activation.begin_step();
+            let outcome = match interpreter.step(
+                callee_function,
+                &module,
+                &mut activation,
+                runtime,
+                &mut frame_runtime,
+            ) {
+                Ok(o) => o,
+                Err(InterpreterError::UncaughtThrow(v)) => break Completion::Throw(v),
+                Err(other) => {
+                    return Err(VmNativeCallError::Internal(format!("{other}").into()));
+                }
+            };
+            match outcome {
+                StepOutcome::Continue => {
+                    activation
+                        .sync_written_open_upvalues(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
+                    activation
+                        .refresh_open_upvalues_from_cells(runtime)
+                        .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
+                }
+                StepOutcome::Return(v) => break Completion::Return(v),
+                StepOutcome::Throw(v) => {
+                    if Self::for_runtime(runtime).transfer_exception(
+                        callee_function,
+                        &mut activation,
+                        v,
+                    ) {
+                        continue;
+                    }
+                    break Completion::Throw(v);
+                }
+                StepOutcome::GeneratorYield {
+                    yielded_value,
+                    resume_register,
+                } => {
+                    // Snapshot activation state into the generator
+                    // so the next `.next()` can resume exactly
+                    // where we left off.
+                    let snapshot: Box<[RegisterValue]> =
+                        activation.registers().to_vec().into_boxed_slice();
+                    runtime
+                        .objects
+                        .generator_save_state(generator, snapshot, activation.pc(), resume_register)
+                        .map_err(|err| {
+                            VmNativeCallError::Internal(
+                                format!("generator_save_state: {err:?}").into(),
+                            )
+                        })?;
+                    let handle = runtime.create_iter_result(yielded_value, false)?;
+                    return Ok(RegisterValue::from_object_handle(handle.0));
+                }
+                StepOutcome::TailCall(_) => {
+                    return Err(VmNativeCallError::Internal(
+                        "tail call inside generator body not supported".into(),
+                    ));
+                }
+                StepOutcome::Suspend { .. } => {
+                    return Err(VmNativeCallError::Internal(
+                        "await inside generator body reached without async wrapper".into(),
+                    ));
+                }
+            }
+        };
+
+        // Body finished or threw — mark generator completed and
+        // return the appropriate iterator result / throw.
+        let _ = runtime
+            .objects
+            .set_generator_state(generator, GeneratorState::Completed);
+        match completion {
+            Completion::Return(v) => {
+                let handle = runtime.create_iter_result(v, true)?;
+                // Borrow of `PropertyNameId` needed to silence
+                // the unused-import warning in some feature
+                // combinations; keep the type alias even though
+                // we don't read from it here.
+                let _unused: PropertyNameId = runtime.intern_property_name("value");
+                Ok(RegisterValue::from_object_handle(handle.0))
+            }
+            Completion::Throw(v) => Err(VmNativeCallError::Thrown(v)),
+        }
+    }
+
+    /// Small helper mirroring the runtime's
+    /// `throw_as_type_error` — but callable from
+    /// `host_runtime.rs` where the runtime-state private helper
+    /// isn't in scope.
+    fn throw_as_type_error_native(runtime: &mut RuntimeState, message: &str) -> VmNativeCallError {
+        match runtime.alloc_type_error(message) {
+            Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
+            Err(err) => VmNativeCallError::Internal(format!("{err}").into()),
+        }
     }
 
     /// Resume a suspended async generator. Placeholder in M0.

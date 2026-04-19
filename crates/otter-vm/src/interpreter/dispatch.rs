@@ -2348,6 +2348,42 @@ impl Interpreter {
                 }
             }
 
+            // §14.4.14 YieldExpression — suspend the generator
+            // at this point. The yielded value is in acc; the
+            // outer `resume_generator_impl` step loop catches
+            // `StepOutcome::GeneratorYield` to snapshot state
+            // + return control to `.next()`. On the next
+            // resume, acc is set to the caller-provided value
+            // (or the accumulator slot is repurposed as the
+            // `sent_value` drop-in).
+            Opcode::Yield => {
+                let yielded = activation.accumulator();
+                // Advance PC first so resume continues AFTER
+                // this Yield opcode rather than re-yielding in
+                // an infinite loop.
+                activation.set_pc(next_pc);
+                return Ok(StepOutcome::GeneratorYield {
+                    yielded_value: yielded,
+                    // v2 uses the accumulator for the sent
+                    // value on resume; the register slot is
+                    // unused but kept for spec-alignment.
+                    resume_register: 0,
+                });
+            }
+            Opcode::SuspendGenerator => {
+                // Explicit suspend-without-value form — used by
+                // `gen.next()` start-path wrappers in some
+                // codegen strategies. We emit `Yield` with
+                // `undefined` instead in the source compiler,
+                // so this path is rarely exercised; keep it
+                // for opcode completeness.
+                activation.set_pc(next_pc);
+                return Ok(StepOutcome::GeneratorYield {
+                    yielded_value: RegisterValue::undefined(),
+                    resume_register: 0,
+                });
+            }
+
             Opcode::Nop => {}
 
             // Any other opcode is unsupported by this Phase 3b.1
@@ -2458,7 +2494,7 @@ impl Interpreter {
         // branch, calling `inner()` where `inner` is an async
         // top-level function would return a plain value instead
         // of a Promise, so downstream `.then(...)` would fail.
-        if callee.is_async() {
+        if callee.is_async() && !callee.is_generator() {
             return match Self::execute_async_function_body(runtime, module, &mut activation) {
                 Ok(v) => Ok(v),
                 Err(InterpreterError::UncaughtThrow(v)) => Err(StepOutcome::Throw(v)),
@@ -2468,6 +2504,20 @@ impl Interpreter {
                 },
                 Err(_) => Err(StepOutcome::Throw(RegisterValue::undefined())),
             };
+        }
+
+        // M34: §27.5.1.1 / §27.6.1.1 — direct calls to
+        // `function* ()` / `async function* ()` top-level
+        // declarations allocate the matching generator object
+        // instead of running the body. `.next()` on the
+        // generator later drives `resume_generator_impl`.
+        if callee.is_generator() {
+            let gen_handle = if callee.is_async() {
+                runtime.alloc_async_generator(module.clone(), callee_idx, None, arguments.to_vec())
+            } else {
+                runtime.alloc_generator(module.clone(), callee_idx, None, arguments.to_vec())
+            };
+            return Ok(RegisterValue::from_object_handle(gen_handle.0));
         }
 
         match self.run_with_tier_up(module, &mut activation, runtime) {

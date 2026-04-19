@@ -295,6 +295,15 @@ impl Function {
         self.r#async = r#async;
     }
 
+    /// Sets the generator flag in place.
+    ///
+    /// Mutator companion to [`Self::with_generator`] — used by
+    /// the source compiler in the same post-push stamping
+    /// pattern as `set_async` (M34).
+    pub fn set_generator(&mut self, generator: bool) {
+        self.generator = generator;
+    }
+
     /// Returns whether this function is a derived class constructor.
     #[must_use]
     pub const fn is_derived_constructor(&self) -> bool {

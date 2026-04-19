@@ -429,13 +429,37 @@ impl Interpreter {
                     ));
                 }
 
-                let is_async = runtime
-                    .objects
-                    .closure_flags(callable)
-                    .is_ok_and(|flags| flags.is_async());
+                let flags = runtime.objects.closure_flags(callable).unwrap_or_default();
+                let is_async = flags.is_async();
+                let is_generator = flags.is_generator();
 
                 let module = runtime.objects.closure_module(callable)?;
                 let callee_index = runtime.objects.closure_callee(callable)?;
+
+                // §27.5.1.1 / §27.6.1.1 — calling a generator (or
+                // async generator) function creates the matching
+                // generator object in `SuspendedStart` and
+                // returns it immediately; the body does not run
+                // until the first `.next()`.
+                if is_generator {
+                    let gen_handle = if is_async {
+                        runtime.alloc_async_generator(
+                            module.clone(),
+                            callee_index,
+                            Some(callable),
+                            arguments.to_vec(),
+                        )
+                    } else {
+                        runtime.alloc_generator(
+                            module.clone(),
+                            callee_index,
+                            Some(callable),
+                            arguments.to_vec(),
+                        )
+                    };
+                    return Ok(RegisterValue::from_object_handle(gen_handle.0));
+                }
+
                 let callee_function = module
                     .function(callee_index)
                     .ok_or(InterpreterError::InvalidCallTarget)?;
@@ -1661,7 +1685,7 @@ impl Interpreter {
         Ok(())
     }
 
-    fn transfer_exception(
+    pub(super) fn transfer_exception(
         &self,
         function: &Function,
         activation: &mut Activation,

@@ -164,7 +164,7 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 | D3  | Chrome DevTools Protocol (CDP) server: breakpoints, step, watch, scope inspect                     | [ ]    |        |
 | D4  | Sampling CPU profiler (Chrome `.cpuprofile` output)                                                 | [ ]    |        |
 | D5  | Memory profiler UI (G7 + G8 → shippable `.heapsnapshot`)                                           | [ ]    |        |
-| D6  | Coloured diagnostics (error with code frame + source snippet, miette-powered)                      | [ ]    |        |
+| D6  | Coloured diagnostics (error with code frame + source snippet, miette-powered)                      | [x]    | 3f17f9b |
 | D7  | Tracing (OpenTelemetry spans from runtime + native bindings for user code)                         | [ ]    |        |
 | D8  | `--inspect` flag that opens a CDP port; attaches Chrome DevTools or VS Code JS Debugger             | [ ]    |        |
 | D9  | `otter doctor`: health check (fs caps, net caps, heap cap, GC stats, runtime version)            | [ ]    |        |

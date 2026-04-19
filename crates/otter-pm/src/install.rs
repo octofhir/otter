@@ -120,7 +120,7 @@ impl Installer {
                     version: entry.version.clone(),
                     resolved: entry.resolved.clone(),
                     integrity: entry.integrity.clone(),
-                    dependencies: HashMap::new(),
+                    dependencies: std::collections::BTreeMap::new(),
                 },
             );
         }
@@ -333,7 +333,11 @@ impl Installer {
                         version: pkg.version.clone(),
                         resolved: pkg.tarball_url.clone(),
                         integrity: pkg.integrity.clone(),
-                        dependencies: pkg.dependencies.clone(),
+                        dependencies: pkg
+                            .dependencies
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     },
                 );
             }
@@ -391,7 +395,11 @@ impl Installer {
                         version: pkg.version.clone(),
                         resolved: pkg.tarball_url.clone(),
                         integrity: pkg.integrity.clone(),
-                        dependencies: pkg.dependencies.clone(),
+                        dependencies: pkg
+                            .dependencies
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     },
                 );
             }
@@ -408,7 +416,11 @@ impl Installer {
                         version: pkg.version.clone(),
                         resolved: pkg.tarball_url.clone(),
                         integrity: pkg.integrity.clone(),
-                        dependencies: pkg.dependencies.clone(),
+                        dependencies: pkg
+                            .dependencies
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     },
                 );
             }

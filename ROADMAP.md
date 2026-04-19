@@ -119,7 +119,7 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 
 | ID  | Scope                                                                                               | Status | Commit |
 |-----|-----------------------------------------------------------------------------------------------------|--------|--------|
-| W1  | URL + URLSearchParams (WHATWG URL spec, UTS#46 IDNA)                                                | [ ]    |        |
+| W1  | URL + URLSearchParams (WHATWG URL spec, UTS#46 IDNA)                                                | [x]    | 367562d |
 | W2  | fetch + Headers + Request + Response (HTTP/1.1 + HTTP/2 + HTTP/3 via `reqwest`/`hyper`)            | [ ]    |        |
 | W3  | WHATWG Streams: ReadableStream, WritableStream, TransformStream, `pipeTo`/`pipeThrough`            | [ ]    |        |
 | W4  | WebCrypto (SubtleCrypto): AES, RSA, ECDSA, ECDH, HMAC, SHA-*, HKDF, PBKDF2                         | [ ]    |        |

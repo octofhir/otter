@@ -1231,19 +1231,40 @@ fn let_inside_if_body_is_block_scoped() {
 }
 
 #[test]
-fn two_literal_comparison_unsupported() {
-    // `5 < 10` — neither operand can land in a register without a
-    // scratch slot, so the relational lowering rejects via
-    // `relational_needs_register_operand`.
-    let err = compile("function f() { if (5 < 10) { return 1; } return 0; }")
-        .expect_err("two-literal comparison at M6");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "relational_needs_register_operand",
-            ..
-        }
-    ));
+fn two_literal_comparison_compiles() {
+    // `5 < 10` — both operands are literals, so neither fits the
+    // identifier/literal fast paths. The complex-operand fallback
+    // now spills LHS to a temp and runs the comparison against
+    // it; result is `true` → `1`.
+    assert_eq!(
+        run_int32_function("function f() { if (5 < 10) { return 1; } return 0; }", &[]),
+        1,
+    );
+}
+
+#[test]
+fn member_access_equality_compiles() {
+    // `o.x === 5` — LHS is a StaticMemberExpression, RHS is a
+    // literal. Both-side complex path takes over.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = { x: 5 }; return (o.x === 5) ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn strict_equality_with_undefined_literal_compiles() {
+    // `o.x === undefined` — classic presence check.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = {}; return (o.x === undefined) ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
 }
 
 #[test]
@@ -3372,21 +3393,24 @@ fn method_property_produces_callable_value() {
 }
 
 #[test]
-fn getter_property_rejected() {
-    let err = compile("function f() { return { get x() { return 1; } }; }").expect_err("getter");
-    // oxc sets `.method = true` for accessor shorthand; we surface
-    // it as `method_property` since both are the same rejection
-    // surface for now.
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "method_property" | "accessor_property",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn getter_property_runs_through_accessor_opcode() {
+    // `{ get x() { return 7 } }` — accessor installs via
+    // `DefineClassGetter`. Reading `o.x` invokes the getter with
+    // `o` as `this`.
+    let src = "function f() { let o = { get x() { return 7 } }; return o.x }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn setter_property_runs_through_accessor_opcode() {
+    // `{ set x(v) { this._x = v } }` — paired with a backing
+    // data property to observe the setter's write.
+    let src = "function f() { \
+        let o = { _x: 0, set x(v) { this._x = v } }; \
+        o.x = 9; \
+        return o._x \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 9);
 }
 
 // Removed: spread_array_element_rejected — spread in array literals is

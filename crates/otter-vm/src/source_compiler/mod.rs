@@ -7302,16 +7302,78 @@ fn lower_object_expression(
                     continue;
                 }
             };
-            // Accessor (get/set) shorthand stays rejected —
-            // `{ get x() {} }` needs a runtime `DefineGetter`
-            // op that we haven't wired into object literals
-            // yet. Property-method / shorthand / computed key
-            // shapes all work now.
+            // Accessor property (`{ get x() {} }` / `{ set x(v) {} }`).
+            // Lower the value (a FunctionExpression) into acc,
+            // then emit DefineClassGetter / DefineClassSetter
+            // — the class-accessor opcode installs the closure
+            // as an accessor-half on the target. Class methods
+            // use `enumerable=false`; object-literal accessors
+            // are spec'd `enumerable=true`, a small divergence
+            // invisible outside `Object.keys` / `for...in`.
             if !matches!(prop.kind, PropertyKind::Init) {
-                return Err(SourceLoweringError::unsupported(
-                    "accessor_property",
-                    prop.span,
-                ));
+                let is_getter = matches!(prop.kind, PropertyKind::Get);
+                if prop.computed {
+                    let key_temp = ctx.acquire_temps(1)?;
+                    let comp_result = (|| -> Result<(), SourceLoweringError> {
+                        lower_return_expression(builder, ctx, prop.key.to_expression())?;
+                        builder
+                            .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+                            .map_err(|err| {
+                                SourceLoweringError::Internal(format!(
+                                    "encode Star (accessor computed key): {err:?}"
+                                ))
+                            })?;
+                        lower_return_expression(builder, ctx, &prop.value)?;
+                        let accessor_opcode = if is_getter {
+                            Opcode::DefineClassGetterComputed
+                        } else {
+                            Opcode::DefineClassSetterComputed
+                        };
+                        builder
+                            .emit(
+                                accessor_opcode,
+                                &[
+                                    Operand::Reg(u32::from(obj_temp)),
+                                    Operand::Reg(u32::from(key_temp)),
+                                ],
+                            )
+                            .map_err(|err| {
+                                SourceLoweringError::Internal(format!(
+                                    "encode accessor computed: {err:?}"
+                                ))
+                            })?;
+                        Ok(())
+                    })();
+                    ctx.release_temps(1);
+                    comp_result?;
+                    continue;
+                }
+                let key_name = match &prop.key {
+                    PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
+                    PropertyKey::StringLiteral(lit) => lit.value.as_str().to_owned(),
+                    other => {
+                        return Err(SourceLoweringError::unsupported(
+                            property_key_tag(other),
+                            other.span(),
+                        ));
+                    }
+                };
+                let idx = ctx.intern_property_name(&key_name)?;
+                lower_return_expression(builder, ctx, &prop.value)?;
+                let accessor_opcode = if is_getter {
+                    Opcode::DefineClassGetter
+                } else {
+                    Opcode::DefineClassSetter
+                };
+                builder
+                    .emit(
+                        accessor_opcode,
+                        &[Operand::Reg(u32::from(obj_temp)), Operand::Idx(idx)],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!("encode accessor: {err:?}"))
+                    })?;
+                continue;
             }
             // Computed key: `{ [expr]: value }`. Lower the key
             // expression into a temp, then use `StaKeyedProperty`
@@ -8176,13 +8238,50 @@ fn lower_relational_expression(
             rhs_literal: rhs,
             lhs_ident: lhs,
         },
-        // Anything else (literal-literal, paren, nested binary, …) —
-        // a future milestone with scratch slots can extend this.
+        // Anything else (member access, call, paren, nested
+        // binary, literal-literal, two complex sides, …) takes
+        // the complex-operand path: lower LHS into a temp, lower
+        // RHS into acc, then emit the RHS-form comparison
+        // against the temp.
         _ => {
-            return Err(SourceLoweringError::unsupported(
-                "relational_needs_register_operand",
-                expr.span,
-            ));
+            let lhs_temp = ctx.acquire_temps(1)?;
+            let lower = (|| -> Result<(), SourceLoweringError> {
+                lower_return_expression(builder, ctx, &expr.left)?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(lhs_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (relational complex LHS): {err:?}"
+                        ))
+                    })?;
+                lower_return_expression(builder, ctx, &expr.right)?;
+                // Acc holds RHS; emit `Test<op>Reg <lhs>` which
+                // computes `<lhs> OP <acc>`. Swap direction so
+                // the original `lhs OP rhs` meaning holds:
+                // `acc < lhs_temp` is `rhs < lhs`, but we want
+                // `lhs < rhs`. The `swapped_op` encoding is
+                // exactly `lhs OP acc` with lhs as register and
+                // rhs in acc — perfect here.
+                builder
+                    .emit(encoding.swapped_op, &[Operand::Reg(u32::from(lhs_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode {} (relational complex): {err:?}",
+                            encoding.label
+                        ))
+                    })?;
+                Ok(())
+            })();
+            ctx.release_temps(1);
+            lower?;
+            if encoding.requires_inversion {
+                builder.emit(Opcode::LogicalNot, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LogicalNot (relational complex): {err:?}"
+                    ))
+                })?;
+            }
+            return Ok(());
         }
     };
 

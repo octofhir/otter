@@ -2353,6 +2353,7 @@ fn lower_for_in_statement<'a>(
                 SourceLoweringError::Internal(format!("encode Star (for-in iterator): {err:?}"))
             })?;
 
+        let mut for_in_destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
         let binding_reg = match &for_in.left {
             ForStatementLeft::VariableDeclaration(decl) => {
                 // `var`, `let`, `const` all allocate the same
@@ -2371,19 +2372,32 @@ fn lower_for_in_statement<'a>(
                         declarator.span,
                     ));
                 }
-                let ident_name = match &declarator.id {
-                    oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
-                    other => {
+                let is_const = decl.kind == VariableDeclarationKind::Const;
+                match &declarator.id {
+                    oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => {
+                        let name = ident.name.as_str();
+                        let slot = ctx.allocate_local(name, is_const, declarator.span)?;
+                        ctx.mark_initialized(name)?;
+                        slot
+                    }
+                    oxc_ast::ast::BindingPattern::ArrayPattern(_)
+                    | oxc_ast::ast::BindingPattern::ObjectPattern(_) => {
+                        // `for (const { k } in obj)` — stash the
+                        // per-iteration KEY in an anon local, run
+                        // the destructure against it at the top of
+                        // the body. For-in keys are strings, so
+                        // destructuring is unusual but still valid.
+                        let iter_val_slot = ctx.allocate_anonymous_local()?;
+                        for_in_destructuring_pattern = Some((&declarator.id, is_const));
+                        iter_val_slot
+                    }
+                    _ => {
                         return Err(SourceLoweringError::unsupported(
                             "for_in_destructuring_binding",
-                            other.span(),
+                            declarator.span,
                         ));
                     }
-                };
-                let is_const = decl.kind == VariableDeclarationKind::Const;
-                let slot = ctx.allocate_local(ident_name, is_const, declarator.span)?;
-                ctx.mark_initialized(ident_name)?;
-                slot
+                }
             }
             ForStatementLeft::AssignmentTargetIdentifier(ident) => {
                 let name = ident.name.as_str();
@@ -2453,7 +2467,12 @@ fn lower_for_in_statement<'a>(
             break_label: loop_exit,
             continue_label: Some(loop_top),
         });
-        let body_result = lower_nested_statement(builder, ctx, &for_in.body);
+        let body_result = (|| -> Result<(), SourceLoweringError> {
+            if let Some((pattern, is_const)) = for_in_destructuring_pattern {
+                lower_pattern_bind(builder, ctx, pattern, binding_reg, is_const)?;
+            }
+            lower_nested_statement(builder, ctx, &for_in.body)
+        })();
         ctx.exit_loop();
         body_result?;
 
@@ -6971,12 +6990,12 @@ fn lower_update_expression(
                 ident.span,
             ));
         }
-        BindingRef::Param { .. } => {
-            return Err(SourceLoweringError::unsupported(
-                "update_on_param",
-                ident.span,
-            ));
-        }
+        // `x++` / `++x` on a parameter: parameters live in
+        // their own register window just like `let` bindings do,
+        // so incrementing writes back to the same slot with no
+        // observable aliasing (spec §14.1.21 treats parameters
+        // as mutable bindings by default).
+        BindingRef::Param { reg } => reg,
         BindingRef::Upvalue { .. } => {
             return Err(SourceLoweringError::unsupported(
                 "update_on_upvalue",
@@ -7436,11 +7455,28 @@ fn lower_array_expression(
                             ))
                         })?;
                 }
-                ArrayExpressionElement::Elision(elision) => {
-                    return Err(SourceLoweringError::unsupported(
-                        "elision_array_element",
-                        elision.span,
-                    ));
+                ArrayExpressionElement::Elision(_elision) => {
+                    // `[1, , 3]` — a hole creates a sparse slot
+                    // whose length counts it but whose indexed
+                    // access returns `undefined` and whose `in`
+                    // check returns `false`. Simulate by pushing
+                    // `undefined`; the resulting array is dense
+                    // but indistinguishable for the vast majority
+                    // of user code. True holes need an
+                    // `ArrayPushHole` opcode that doesn't exist
+                    // yet — follow-up work.
+                    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaUndefined (elision): {err:?}"
+                        ))
+                    })?;
+                    builder
+                        .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(arr_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode ArrayPush (elision): {err:?}"
+                            ))
+                        })?;
                 }
                 // Non-spread, non-hole element. `to_expression`
                 // downcasts the `Expression` variants inlined by

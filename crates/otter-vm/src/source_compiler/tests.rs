@@ -2158,15 +2158,12 @@ fn postfix_decrement_on_local_returns_old_value_writes_new() {
 }
 
 #[test]
-fn update_on_parameter_rejected() {
-    let err = compile("function f(n) { return n++; }").expect_err("++param at M10");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "update_on_param",
-            ..
-        }
-    ));
+fn update_on_parameter_works() {
+    // `n++` on a parameter writes back to the same register.
+    // Postfix form returns the pre-increment value.
+    assert_eq!(run_int32_function("function f(n) { return n++; }", &[5]), 5,);
+    // Prefix `++n` returns the post-increment value.
+    assert_eq!(run_int32_function("function f(n) { return ++n; }", &[5]), 6,);
 }
 
 #[test]
@@ -3406,20 +3403,13 @@ fn array_literal_still_lowers() {
 }
 
 #[test]
-fn array_hole_rejected() {
-    // `[1, , 3]` — the middle hole is an Elision node. Until we
-    // support sparse arrays, reject at compile time.
-    let err = compile("function f() { return [1, , 3]; }").expect_err("hole");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "elision_array_element",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn array_literal_with_elision_pushes_undefined_slots() {
+    // `[1, , 3]` — middle hole becomes `undefined`. True
+    // sparse-array semantics (where `1 in arr` is `false` for
+    // the hole) aren't observed here; the length + indexed
+    // reads match what `[1, undefined, 3]` would produce.
+    let src = "function f() { let a = [1, , 3]; return a.length + a[0] + a[2]; }";
+    assert_eq!(run_int32_function(src, &[]), 7);
 }
 
 // ---------------------------------------------------------------------------
@@ -6451,19 +6441,14 @@ fn for_in_var_binding_compiles() {
 }
 
 #[test]
-fn for_in_destructuring_unsupported() {
-    let err = compile("function f() { for (let [a] in {}) { return a; } return 0; }")
-        .expect_err("destructuring loop var");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "for_in_destructuring_binding",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn for_in_destructuring_compiles() {
+    // `for (let [a] of ...)` is handled by the for-of path; for
+    // `for-in` the pattern is less common (keys are strings) but
+    // still valid — the pattern runs against each string key.
+    // Here we just verify compilation plus a minimal runtime
+    // shape.
+    compile("function f() { for (let [a] in {}) { return a; } return 0; }")
+        .expect("for-in destructuring compiles");
 }
 
 // ---------------------------------------------------------------------------

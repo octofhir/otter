@@ -267,24 +267,40 @@ impl Interpreter {
                 }
             }
             Opcode::Sub => {
+                // §13.15.3 Subtraction. Int32 fast path records
+                // `Int32` feedback; anything else falls through to
+                // `js_subtract` (f64 / BigInt / ToNumeric).
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                activation.set_accumulator(
-                    activation
-                        .accumulator()
-                        .sub_i32(rhs)
-                        .map_err(|_| InterpreterError::TypeError(Box::from("expected int32")))?,
-                );
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                let acc = activation.accumulator();
+                match acc.sub_i32(rhs) {
+                    Ok(diff) => {
+                        activation.set_accumulator(diff);
+                        frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                    }
+                    Err(_) => {
+                        let result = runtime.js_subtract(acc, rhs)?;
+                        activation.set_accumulator(result);
+                        frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
+                    }
+                }
             }
             Opcode::Mul => {
+                // §13.15.3 Multiplication. Int32 fast path first;
+                // falls through to `js_multiply` for everything
+                // else — non-i32 operands, overflow, BigInt, etc.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                activation.set_accumulator(
-                    activation
-                        .accumulator()
-                        .mul_i32(rhs)
-                        .map_err(|_| InterpreterError::TypeError(Box::from("expected int32")))?,
-                );
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                let acc = activation.accumulator();
+                match acc.mul_i32(rhs) {
+                    Ok(prod) => {
+                        activation.set_accumulator(prod);
+                        frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                    }
+                    Err(_) => {
+                        let result = runtime.js_multiply(acc, rhs)?;
+                        activation.set_accumulator(result);
+                        frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
+                    }
+                }
             }
             Opcode::BitwiseOr => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;

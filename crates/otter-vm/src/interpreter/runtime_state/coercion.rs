@@ -1147,6 +1147,32 @@ impl RuntimeState {
         Ok(RegisterValue::from_number(lhs_num + rhs_num))
     }
 
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for `-`. Same
+    /// ToNumeric pipeline as `/` / `%` / `**`; never string-
+    /// concatenates (that's `+`'s special case only).
+    pub(crate) fn js_subtract(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(RegisterValue::from_number(l - r));
+        }
+        self.js_numeric_binop_fallback(lhs, rhs, |l, r| l - r, "-", |a, b| a - b)
+    }
+
+    /// §13.15.3 ApplyStringOrNumericBinaryOperator for `*`.
+    pub(crate) fn js_multiply(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<RegisterValue, InterpreterError> {
+        if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(RegisterValue::from_number(l * r));
+        }
+        self.js_numeric_binop_fallback(lhs, rhs, |l, r| l * r, "*", |a, b| a * b)
+    }
+
     /// §13.15.3 ApplyStringOrNumericBinaryOperator for `/`. Spec:
     /// ToNumeric both operands, then BigInt::divide if both BigInt,
     /// else Number::divide. Never string-concatenates.

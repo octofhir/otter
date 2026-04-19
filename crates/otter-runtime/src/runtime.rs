@@ -204,7 +204,13 @@ impl OtterRuntime {
         self.run_module(&module)
     }
 
-    /// Reads a file and executes it as a JavaScript script.
+    /// Reads a file and executes it as a JavaScript module.
+    /// Module semantics (strict by default, supports `import` /
+    /// `export` / `import.meta`) are the default for any file on
+    /// disk — classic-script semantics stay reachable via
+    /// `run_script` / `-e`. This matches modern toolchains (Bun,
+    /// Node with `--input-type=module`) where every file is
+    /// assumed to be a module.
     pub fn run_file(&mut self, path: &str) -> Result<ExecutionResult, RunError> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| RunError::Runtime(format!("failed to read {path}: {e}")))?;
@@ -212,7 +218,7 @@ impl OtterRuntime {
             .canonicalize()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string());
-        self.run_script(&source, &url)
+        self.run_module_source(&source, &url)
     }
 
     /// Evaluates JavaScript source and returns the completion value of the

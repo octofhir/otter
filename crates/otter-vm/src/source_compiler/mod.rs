@@ -258,11 +258,26 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
     let mut declarations: Vec<&Function<'_>> = Vec::with_capacity(program.body.len());
     let mut names: Vec<&str> = Vec::with_capacity(program.body.len());
     let mut script_body: Vec<&Statement<'_>> = Vec::new();
+    // Binding names introduced at the top level via
+    // `export const` / `export let` / `export class`. The synth
+    // top-level body runs their initialisers as ordinary locals;
+    // the flush-to-globals loop after the body copies each local
+    // onto the global object so `capture_exports` finds the value.
+    let mut exported_const_vars: Vec<String> = Vec::new();
     let mut default_export_local: Option<String> = None;
     for stmt in &program.body {
         match stmt {
             Statement::FunctionDeclaration(func) => {
-                record_function_declaration(func, &mut declarations, &mut names)?;
+                let name = record_function_declaration(func, &mut declarations, &mut names)?;
+                // Top-level function declarations are visible to
+                // every top-level statement in the same module —
+                // mirror them onto the global object so
+                // `LdaGlobal <name>` resolves. The synth
+                // top-level's CreateClosure preamble takes care
+                // of the actual installation.
+                if !module_globals.iter().any(|n| n == name) {
+                    module_globals.push(name.to_string());
+                }
             }
             Statement::ImportDeclaration(decl) => {
                 is_esm = true;
@@ -313,24 +328,79 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
             Statement::ExportNamedDeclaration(decl) => {
                 is_esm = true;
                 if let Some(inner) = &decl.declaration {
-                    // `export function foo() {}` / `export const x = …`.
-                    // Only function declarations reach the current
-                    // subset; other shapes fall through as
-                    // unsupported so later milestones can extend the
-                    // export surface.
-                    let Declaration::FunctionDeclaration(func) = inner else {
-                        return Err(SourceLoweringError::unsupported(
-                            "export_declaration_non_function",
-                            inner.span(),
-                        ));
-                    };
-                    let name =
-                        record_function_declaration(func.as_ref(), &mut declarations, &mut names)?;
-                    module_globals.push(name.to_string());
-                    exports.push(ExportRecord::Named {
-                        local: name.to_string().into(),
-                        exported: name.to_string().into(),
-                    });
+                    match inner {
+                        Declaration::FunctionDeclaration(func) => {
+                            let name = record_function_declaration(
+                                func.as_ref(),
+                                &mut declarations,
+                                &mut names,
+                            )?;
+                            module_globals.push(name.to_string());
+                            exports.push(ExportRecord::Named {
+                                local: name.to_string().into(),
+                                exported: name.to_string().into(),
+                            });
+                        }
+                        Declaration::VariableDeclaration(var_decl) => {
+                            // `export const X = expr` / `export let Y = expr`.
+                            // Inject the inner VariableDeclaration into
+                            // the script body so the RHS evaluates at
+                            // module-eval time, then record each
+                            // declarator's name so the synth top-level
+                            // flushes its local to a same-named global
+                            // before it returns.
+                            for declarator in var_decl.declarations.iter() {
+                                let oxc_ast::ast::BindingPattern::BindingIdentifier(bi) =
+                                    &declarator.id
+                                else {
+                                    return Err(SourceLoweringError::unsupported(
+                                        "export_destructuring_declaration",
+                                        declarator.span,
+                                    ));
+                                };
+                                let name = bi.name.as_str().to_string();
+                                module_globals.push(name.clone());
+                                exports.push(ExportRecord::Named {
+                                    local: name.clone().into(),
+                                    exported: name.clone().into(),
+                                });
+                                exported_const_vars.push(name);
+                            }
+                            script_body.push(stmt);
+                        }
+                        Declaration::ClassDeclaration(_) => {
+                            // `export class C {}` — route the class
+                            // through the script body; top-level class
+                            // declarations already lower to a local
+                            // under the script-body path.
+                            let name = match inner {
+                                Declaration::ClassDeclaration(cls) => cls
+                                    .id
+                                    .as_ref()
+                                    .map(|id| id.name.as_str().to_string())
+                                    .ok_or_else(|| {
+                                        SourceLoweringError::unsupported(
+                                            "anonymous_class",
+                                            inner.span(),
+                                        )
+                                    })?,
+                                _ => unreachable!(),
+                            };
+                            module_globals.push(name.clone());
+                            exports.push(ExportRecord::Named {
+                                local: name.clone().into(),
+                                exported: name.clone().into(),
+                            });
+                            exported_const_vars.push(name);
+                            script_body.push(stmt);
+                        }
+                        _ => {
+                            return Err(SourceLoweringError::unsupported(
+                                "export_declaration_non_function",
+                                inner.span(),
+                            ));
+                        }
+                    }
                 } else if let Some(source) = &decl.source {
                     // `export { x } from "./m"` — re-export named.
                     let specifier = source.value.as_str().to_string();
@@ -423,18 +493,44 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                 }
             }
             Statement::ClassDeclaration(class) => {
-                // Class declarations at top-level are routed
-                // through the script body; the nested-class
-                // lowering handles them end-to-end.
+                // Top-level class declarations are visible to every
+                // other top-level function in the module — add the
+                // name to `module_globals` + `exported_const_vars`
+                // so the synth top-level flushes the local to a
+                // global of the same name. Inner methods of a
+                // top-level function can then refer to the class
+                // via `LdaGlobal`.
+                if let Some(id) = &class.id {
+                    let name = id.name.as_str().to_string();
+                    module_globals.push(name.clone());
+                    exported_const_vars.push(name);
+                }
                 script_body.push(stmt);
-                let _ = class;
+            }
+            Statement::VariableDeclaration(decl) => {
+                // §14.2 top-level `let` / `const` / `var` bindings
+                // in a module are lexically scoped to the module —
+                // but they're visible to every top-level function
+                // in the same file (closures over module scope).
+                // We don't have a closure from top-level functions
+                // into the synth body, so mirror those names onto
+                // the global object instead. `function circleArea
+                // () { return PI * r * r }` after `const PI = …`
+                // resolves `PI` via `LdaGlobal` at call time.
+                for declarator in decl.declarations.iter() {
+                    if let oxc_ast::ast::BindingPattern::BindingIdentifier(bi) = &declarator.id {
+                        let name = bi.name.as_str().to_string();
+                        module_globals.push(name.clone());
+                        exported_const_vars.push(name);
+                    }
+                }
+                script_body.push(stmt);
             }
             other => {
                 // Top-level script statement — `console.log(...)`,
-                // `let x = …`, `if (...) { ... }`, etc. Collect
-                // into `script_body` and synthesise a top-level
-                // entry function that runs them on module
-                // evaluation.
+                // `if (...) { ... }`, etc. Collect into
+                // `script_body` and synthesise a top-level entry
+                // function that runs them on module evaluation.
                 script_body.push(other);
             }
         }
@@ -509,8 +605,13 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
     // statements) still get a top-level entry — its body is just
     // the trailing `LdaUndefined; Return` pair, which runs once
     // and exits with no observable side effect.
-    let top_idx =
-        synthesise_top_level_entry(&module_functions, &names, &module_globals, &script_body)?;
+    let top_idx = synthesise_top_level_entry(
+        &module_functions,
+        &names,
+        &module_globals,
+        &script_body,
+        &exported_const_vars,
+    )?;
     let entry_idx = u32::try_from(top_idx)
         .map_err(|_| SourceLoweringError::Internal("top-level entry index overflow".into()))?;
 
@@ -594,6 +695,7 @@ fn synthesise_top_level_entry<'a>(
     names: &[&str],
     module_globals: &[String],
     script_body: &[&'a Statement<'a>],
+    exported_const_vars: &[String],
 ) -> Result<usize, SourceLoweringError> {
     // Empty params — the top-level entry takes no arguments.
     // `names` carries the top-level function-declaration names so
@@ -606,7 +708,22 @@ fn synthesise_top_level_entry<'a>(
         rest_name: None,
     };
     let mut builder = BytecodeBuilder::new();
+    // Publish `module_globals` via the thread-local override so
+    // the newly-built `LoweringContext` picks up the full list —
+    // the preamble and script body both need to know which
+    // top-level names the module considers module-global, so
+    // `lower_identifier_reference` routes bare references via
+    // `LdaGlobal` (same channel the user-declared top-level
+    // functions already use).
+    let globals_rc: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(module_globals.to_vec()));
+    MODULE_GLOBALS_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = Some(std::rc::Rc::clone(&globals_rc));
+    });
     let mut ctx = LoweringContext::new(&params_layout, names, std::rc::Rc::clone(module_functions));
+    MODULE_GLOBALS_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 
     // Preamble: install each module-global binding on the global
     // object so ESM `capture_exports` finds them. For classic
@@ -645,6 +762,39 @@ fn synthesise_top_level_entry<'a>(
     // the same path function bodies use.
     for stmt in script_body {
         lower_top_statement(&mut builder, &mut ctx, stmt)?;
+    }
+    // Post-body flush: `export const X = expr` allocated a local
+    // for `X` during script-body lowering. Copy each local onto
+    // the global object so the module-loader's `capture_exports`
+    // sees the value when it walks the module namespace.
+    for name in exported_const_vars {
+        let Some(binding) = ctx.resolve_identifier(name) else {
+            continue;
+        };
+        let reg = match binding {
+            BindingRef::Local {
+                reg,
+                initialized: true,
+                ..
+            } => reg,
+            BindingRef::Param { reg } => reg,
+            _ => continue,
+        };
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "top-level encode Ldar (export flush): {err:?}"
+                ))
+            })?;
+        let prop_idx = ctx.intern_property_name(name)?;
+        builder
+            .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "top-level encode StaGlobal (export flush): {err:?}"
+                ))
+            })?;
     }
     // Explicit `LdaUndefined; Return` tail — the module's
     // evaluation completion value is always `undefined` for a
@@ -1456,6 +1606,34 @@ fn lower_top_statement<'a>(
             ctx.record_source_location(builder.pc(), stmt.span().start);
             lower_let_const_declaration(builder, ctx, decl)
         }
+        // `export const X = ...` at the top level — the compiler's
+        // top-level classifier pushes the wrapping
+        // `ExportNamedDeclaration` into the script body because
+        // the inner `VariableDeclaration` can't be borrowed out of
+        // the oxc arena separately. Unwrap it here so the `const`
+        // initialiser runs and allocates a local; the synth
+        // top-level then flushes the local onto the global object
+        // before `capture_exports` harvests the namespace.
+        Statement::ExportNamedDeclaration(decl) => {
+            ctx.record_source_location(builder.pc(), stmt.span().start);
+            match &decl.declaration {
+                Some(Declaration::VariableDeclaration(inner)) => {
+                    lower_let_const_declaration(builder, ctx, inner)
+                }
+                Some(Declaration::ClassDeclaration(cls)) => {
+                    lower_nested_class_declaration(builder, ctx, cls)
+                }
+                // `export function` at the top level was already
+                // recorded as a regular function declaration by
+                // `lower_program` — the synth top-level doesn't
+                // need to re-execute it here. Silent no-op.
+                Some(Declaration::FunctionDeclaration(_)) | None => Ok(()),
+                _ => Err(SourceLoweringError::unsupported(
+                    "export_declaration_non_function",
+                    stmt.span(),
+                )),
+            }
+        }
         _ => lower_nested_statement(builder, ctx, stmt),
     }
 }
@@ -1957,13 +2135,15 @@ fn lower_for_of_statement<'a>(
 
         // 2) Resolve the binding register. Three shapes:
         //    - `let x` / `const x`: allocate a fresh local.
-        //    - `var x`: rejected for M30 (hoisting semantics
-        //      differ; later milestone if needed).
+        //    - `let [a, b]` / `let { x }`: allocate an anonymous
+        //      local to hold each iteration's value; a
+        //      destructuring pattern-bind runs before the body.
         //    - `x` (identifier assignment): reuse the existing
         //      binding's register. Upvalues are rejected here —
         //      the per-iteration store would need `StaUpvalue`
         //      after `IteratorStep`, which the M30 lowering
         //      keeps simple by excluding.
+        let mut destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
         let (binding_reg, is_let_like) = match &for_of.left {
             ForStatementLeft::VariableDeclaration(decl) => {
                 // `var`, `let`, and `const` all flow through the
@@ -1985,22 +2165,31 @@ fn lower_for_of_statement<'a>(
                         declarator.span,
                     ));
                 }
-                let ident_name = match &declarator.id {
-                    oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => ident.name.as_str(),
+                let is_const = decl.kind == VariableDeclarationKind::Const;
+                match &declarator.id {
+                    oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => {
+                        let name = ident.name.as_str();
+                        let slot = ctx.allocate_local(name, is_const, declarator.span)?;
+                        ctx.mark_initialized(name)?;
+                        (slot, true)
+                    }
+                    // Destructuring for-of target: allocate an
+                    // anonymous hidden local to hold the per-
+                    // iteration value, then run the pattern bind
+                    // against it once we enter the body.
+                    oxc_ast::ast::BindingPattern::ArrayPattern(_)
+                    | oxc_ast::ast::BindingPattern::ObjectPattern(_) => {
+                        let iter_val_slot = ctx.allocate_anonymous_local()?;
+                        destructuring_pattern = Some((&declarator.id, is_const));
+                        (iter_val_slot, true)
+                    }
                     other => {
                         return Err(SourceLoweringError::unsupported(
                             "for_of_destructuring_binding",
                             other.span(),
                         ));
                     }
-                };
-                let is_const = decl.kind == VariableDeclarationKind::Const;
-                let slot = ctx.allocate_local(ident_name, is_const, declarator.span)?;
-                // The loop treats the slot as initialized from
-                // the first `IteratorStep`; mark it so reads in
-                // the body don't trip the TDZ check.
-                ctx.mark_initialized(ident_name)?;
-                (slot, true)
+                }
             }
             ForStatementLeft::AssignmentTargetIdentifier(ident) => {
                 let name = ident.name.as_str();
@@ -2078,7 +2267,15 @@ fn lower_for_of_statement<'a>(
             break_label: loop_exit,
             continue_label: Some(loop_top),
         });
-        let body_result = lower_nested_statement(builder, ctx, &for_of.body);
+        let body_result = (|| -> Result<(), SourceLoweringError> {
+            // Destructuring for-of: expand the pattern against
+            // the iterator value now in `binding_reg` so every
+            // leaf becomes a fresh per-iteration local.
+            if let Some((pattern, is_const)) = destructuring_pattern {
+                lower_pattern_bind(builder, ctx, pattern, binding_reg, is_const)?;
+            }
+            lower_nested_statement(builder, ctx, &for_of.body)
+        })();
         ctx.exit_loop();
         body_result?;
 
@@ -9530,6 +9727,18 @@ fn is_whitelisted_global_name(name: &str) -> bool {
         | "structuredClone"
         // Node-compat runtime
         | "process"
+        // Host-injected helpers used by the module-graph loader's
+        // CJS / ESM source rewrites in `otter-runtime`
+        // (`host::module_runtime::transform_*`). User code never
+        // references these directly; the transform emits them.
+        | "__otter_module"
+        | "__otter_cjs_module"
+        | "__otter_cjs_url"
+        | "require"
+        | "module"
+        | "exports"
+        | "__filename"
+        | "__dirname"
     )
 }
 

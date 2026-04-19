@@ -6250,20 +6250,34 @@ fn for_of_var_binding_compiles() {
 }
 
 #[test]
-fn for_of_destructuring_unsupported() {
-    // Destructuring in for-of binding is deferred; surface the
-    // dedicated tag so it's easy to widen later.
-    let err = compile("function f() { for (let [a, b] of [[1,2]]) { return a; } return 0; }")
-        .expect_err("destructuring loop var");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "for_of_destructuring_binding",
-                ..
-            }
+fn for_of_destructuring_array_pattern() {
+    // `for (let [a, b] of [[1,2],[3,4]])` — the array pattern
+    // now expands against the per-iteration value via
+    // `lower_pattern_bind`. Returns the first iteration's `a`.
+    assert_eq!(
+        run_int32_function(
+            "function f() { for (let [a, b] of [[10, 20], [30, 40]]) { return a + b; } return 0; }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        30
+    );
+}
+
+#[test]
+fn for_of_destructuring_object_pattern() {
+    // `for (const { name, age } of users) { … }` — the canonical
+    // array-of-records iteration shape in real-world JS.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                let total = 0; \
+                let users = [{ n: 7 }, { n: 8 }]; \
+                for (const { n } of users) { total = total + n; } \
+                return total; \
+            }",
+            &[],
+        ),
+        15
     );
 }
 

@@ -637,13 +637,13 @@ fn compile_transformed_module(
         (_, SourceType::Json) => Err(VmNativeCallError::Internal(
             format!("JSON modules are not executable yet on hosted path: {url}").into(),
         )),
-        (ModuleType::Esm, _) => otter_vm::source::compile_module(source, url)
-            .map_err(|error| VmNativeCallError::Internal(error.to_string().into())),
-        (ModuleType::CommonJs, SourceType::TypeScript) => {
-            otter_vm::source::compile_module(source, url)
-                .map_err(|error| VmNativeCallError::Internal(error.to_string().into()))
-        }
-        (ModuleType::CommonJs, _) => otter_vm::source::compile_script(source, url)
+        // Default JS on disk is a module. Classic-script semantics
+        // are only reachable via `run_script` / `-e` (explicit
+        // opt-in). Uniform `compile_module` here means `export
+        // const`, `import`, `import.meta`, top-level await etc.
+        // work regardless of the file extension or `package.json`
+        // `type` field.
+        _ => otter_vm::source::compile_module(source, url)
             .map_err(|error| VmNativeCallError::Internal(error.to_string().into())),
     }
 }

@@ -158,7 +158,7 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 | ID  | Scope                                                                                               | Status | Commit |
 |-----|-----------------------------------------------------------------------------------------------------|--------|--------|
 | D1  | REPL (`otterjs repl`): line editor, multi-line, history, tab completion via shape metadata         | [ ]    |        |
-| D2  | Source maps (`SourceMap.from_file`, embedded in Module, used by stack traces)                       | [ ]    |        |
+| D2  | Source maps (`SourceMap.from_file`, embedded in Module, used by stack traces)                       | [x]    | 63fab25 |
 | D3  | Chrome DevTools Protocol (CDP) server: breakpoints, step, watch, scope inspect                     | [ ]    |        |
 | D4  | Sampling CPU profiler (Chrome `.cpuprofile` output)                                                 | [ ]    |        |
 | D5  | Memory profiler UI (G7 + G8 → shippable `.heapsnapshot`)                                           | [ ]    |        |

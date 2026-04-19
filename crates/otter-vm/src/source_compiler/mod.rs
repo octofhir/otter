@@ -8762,10 +8762,11 @@ fn lower_private_field_assignment<'a>(
 }
 
 /// Maps a compound assignment operator to the binary operator whose
-/// encoding it should use. Returns `None` for `=` (handled separately,
-/// no underlying binary op) and for compound forms outside the M5
-/// surface (`/=`, `%=`, `**=`, `<<=`, `>>=`, `>>>=`, `&=`, `^=`,
-/// `||=`, `&&=`, `??=`).
+/// encoding it should use. Returns `None` only for `=` (handled
+/// separately — no underlying binary op) and for the short-circuit
+/// logical compounds (`||=`, `&&=`, `??=`) which need guard-
+/// evaluation semantics the regular binary lowering doesn't
+/// provide.
 fn compound_assign_to_binary_operator(op: AssignmentOperator) -> Option<BinaryOperator> {
     use AssignmentOperator as A;
     use BinaryOperator as B;
@@ -8773,7 +8774,15 @@ fn compound_assign_to_binary_operator(op: AssignmentOperator) -> Option<BinaryOp
         A::Addition => B::Addition,
         A::Subtraction => B::Subtraction,
         A::Multiplication => B::Multiplication,
+        A::Division => B::Division,
+        A::Remainder => B::Remainder,
+        A::Exponential => B::Exponential,
+        A::ShiftLeft => B::ShiftLeft,
+        A::ShiftRight => B::ShiftRight,
+        A::ShiftRightZeroFill => B::ShiftRightZeroFill,
         A::BitwiseOR => B::BitwiseOR,
+        A::BitwiseXOR => B::BitwiseXOR,
+        A::BitwiseAnd => B::BitwiseAnd,
         _ => return None,
     })
 }

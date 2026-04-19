@@ -871,57 +871,32 @@ fn destructuring_assignment_target_unsupported() {
 }
 
 #[test]
-fn unsupported_compound_assign_div() {
-    // `x /= 2` — division has no `*Smi` opcode in the supported set
-    // and division isn't on the M3/M5 binary surface either, so the
-    // assignment lowering rejects with a stable per-operator tag.
-    let err = compile("function f() { let x = 6; x /= 2; return x; }").expect_err("/= at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "division_assign",
-            ..
-        }
-    ));
+fn compound_assign_div_works() {
+    // `x /= 2` now lowers through the shared compound-assign
+    // path — the `Division` binary operator routes through
+    // `js_divide` in the dispatcher.
+    assert_eq!(
+        run_int32_function("function f() { let x = 12; x /= 2; return x; }", &[]),
+        6,
+    );
 }
 
 #[test]
-fn unsupported_compound_assign_xor() {
-    // `^=` lacks a `BitwiseXorSmi` opcode in the v2 ISA. M5 keeps
-    // the operator out of scope rather than falling back to a
-    // scratch-slot materialisation.
-    let err = compile("function f() { let x = 6; x ^= 1; return x; }").expect_err("^= at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "bitwise_xor_assign",
-            ..
-        }
-    ));
+fn compound_assign_xor_works() {
+    // `x ^= 1` has no `*Smi` opcode — spills through the
+    // complex-RHS temp path. End-to-end result is the xor.
+    assert_eq!(
+        run_int32_function("function f() { let x = 6; x ^= 1; return x; }", &[]),
+        7,
+    );
 }
 
 #[test]
-fn unsupported_compound_assign_shl() {
-    let err = compile("function f() { let x = 1; x <<= 2; return x; }").expect_err("<<= at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "shift_left_assign",
-            ..
-        }
-    ));
-}
-
-#[test]
-fn unsupported_compound_assign_logical_or() {
-    let err = compile("function f() { let x = 1; x ||= 2; return x; }").expect_err("||= at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "logical_or_assign",
-            ..
-        }
-    ));
+fn compound_assign_shl_works() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 1; x <<= 2; return x; }", &[]),
+        4,
+    );
 }
 
 #[test]

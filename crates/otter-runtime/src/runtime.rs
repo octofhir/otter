@@ -19,8 +19,11 @@ use crate::host::{
 /// Error from script execution.
 #[derive(Debug)]
 pub enum RunError {
-    /// Source failed to compile.
-    Compile(String),
+    /// Source failed to compile. `Box<CompileDiagnostic>` carries the
+    /// offending span + the original source text + the source URL so
+    /// the CLI can render a miette code frame with a caret on the
+    /// exact AST construct that failed.
+    Compile(Box<crate::diagnostic::CompileDiagnostic>),
     /// Runtime error during execution.
     Runtime(String),
     /// Uncaught JS throw, with structured frames + source text for rich
@@ -32,7 +35,7 @@ pub enum RunError {
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Compile(e) => write!(f, "CompileError: {e}"),
+            Self::Compile(diag) => write!(f, "CompileError: {diag}"),
             Self::Runtime(e) => write!(f, "RuntimeError: {e}"),
             Self::JsThrow(diag) => write!(f, "{diag}"),
         }
@@ -189,8 +192,15 @@ impl OtterRuntime {
         source: &str,
         source_url: &str,
     ) -> Result<ExecutionResult, RunError> {
-        let module = otter_vm::source::compile_script(source, source_url)
-            .map_err(|e| RunError::Compile(e.to_string()))?;
+        let module = otter_vm::source::compile_script(source, source_url).map_err(|e| {
+            RunError::Compile(Box::new(
+                crate::diagnostic::CompileDiagnostic::from_source_lowering_error(
+                    &e,
+                    std::sync::Arc::from(source),
+                    source_url,
+                ),
+            ))
+        })?;
         self.run_module(&module)
     }
 
@@ -209,8 +219,15 @@ impl OtterRuntime {
     /// last expression statement. Uses eval-mode compilation.
     /// Spec: <https://tc39.es/ecma262/#sec-eval-x>
     pub fn eval(&mut self, code: &str) -> Result<ExecutionResult, RunError> {
-        let module = otter_vm::source::compile_eval(code, "<eval>")
-            .map_err(|e| RunError::Compile(e.to_string()))?;
+        let module = otter_vm::source::compile_eval(code, "<eval>").map_err(|e| {
+            RunError::Compile(Box::new(
+                crate::diagnostic::CompileDiagnostic::from_source_lowering_error(
+                    &e,
+                    std::sync::Arc::from(code),
+                    "<eval>",
+                ),
+            ))
+        })?;
         self.run_module(&module)
     }
 
@@ -222,8 +239,15 @@ impl OtterRuntime {
         source: &str,
         source_url: &str,
     ) -> Result<ExecutionResult, RunError> {
-        let module = otter_vm::source::compile_module(source, source_url)
-            .map_err(|e| RunError::Compile(e.to_string()))?;
+        let module = otter_vm::source::compile_module(source, source_url).map_err(|e| {
+            RunError::Compile(Box::new(
+                crate::diagnostic::CompileDiagnostic::from_source_lowering_error(
+                    &e,
+                    std::sync::Arc::from(source),
+                    source_url,
+                ),
+            ))
+        })?;
         self.run_module(&module)
     }
 

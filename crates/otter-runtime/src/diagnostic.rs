@@ -156,6 +156,87 @@ impl Diagnostic for JsRuntimeDiagnostic {
     }
 }
 
+// ============================================================
+// D6: CompileDiagnostic — miette-rendered compile-error snippets
+// ============================================================
+
+/// Structured compile-time diagnostic for a `SourceLoweringError`.
+/// Carries the original source text + the offending span so the
+/// CLI can render a code frame with a caret under the exact
+/// construct that failed, the same way rustc / the JS runtime
+/// itself reports uncaught throws.
+#[derive(Debug)]
+pub struct CompileDiagnostic {
+    /// Short human-readable message (`"SyntaxError: …"`,
+    /// `"unsupported construct: …"`).
+    message: String,
+    /// Source text + URL, packaged so miette can print the frame.
+    source: NamedSource<Arc<str>>,
+    /// `(byte offset, length)` of the offending AST node, when
+    /// the underlying error carries one.
+    span: Option<(usize, usize)>,
+}
+
+impl CompileDiagnostic {
+    /// Builds a compile diagnostic from the compiler's
+    /// [`otter_vm::source_compiler::SourceLoweringError`] plus the
+    /// original source text and URL. The span comes from the
+    /// compiler error itself; for `Internal` errors (no span)
+    /// the frame renders without a caret.
+    pub fn from_source_lowering_error(
+        err: &otter_vm::source_compiler::SourceLoweringError,
+        source_text: Arc<str>,
+        source_url: &str,
+    ) -> Self {
+        let message = err.to_string();
+        let span = err.span().map(|s| {
+            let start = s.start as usize;
+            let end = s.end as usize;
+            (start, end.saturating_sub(start))
+        });
+        Self {
+            message,
+            source: NamedSource::new(source_url, source_text),
+            span,
+        }
+    }
+
+    /// Returns the rendered human message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for CompileDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CompileDiagnostic {}
+
+impl Diagnostic for CompileDiagnostic {
+    fn severity(&self) -> Option<Severity> {
+        Some(Severity::Error)
+    }
+
+    fn source_code(&self) -> Option<&dyn SourceCode> {
+        Some(&self.source as &dyn SourceCode)
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
+        let (offset, len) = self.span?;
+        // Zero-length spans still render — miette treats them as
+        // a caret between two characters. For the compile error
+        // surface that's the parser's exact insertion point.
+        let effective_len = len.max(1);
+        let span =
+            LabeledSpan::new_primary_with_span(Some("here".to_string()), (offset, effective_len));
+        Some(Box::new(std::iter::once(span)))
+    }
+}
+
 /// Build a `JsRuntimeDiagnostic` from an `InterpreterError`. Returns `None`
 /// for non-throw variants and for thrown values that aren't Error objects
 /// (so the caller can fall back to a plain string error).

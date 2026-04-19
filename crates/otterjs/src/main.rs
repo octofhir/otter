@@ -371,36 +371,34 @@ fn pick_graphical_theme() -> GraphicalTheme {
 /// still work.
 fn report_run_error(err: RunError) -> ExitCode {
     match err {
-        RunError::JsThrow(diagnostic) => {
-            let report: Report = Report::new(*diagnostic);
-            let theme = pick_graphical_theme();
-            // Width: prefer COLUMNS, then terminal_size, then default 120.
-            let width = std::env::var("COLUMNS")
-                .ok()
-                .and_then(|w| w.parse::<usize>().ok())
-                .unwrap_or(120);
-            let handler = GraphicalReportHandler::new_themed(theme).with_width(width);
-            let mut rendered = String::new();
-            // Best-effort render. If miette refuses for any reason, fall
-            // back to the textual stack so the user still sees something.
-            if handler
-                .render_report(&mut rendered, report.as_ref())
-                .is_err()
-            {
-                rendered = format!("error: {report}");
-            }
-            eprintln!("{rendered}");
-            ExitCode::from(1)
-        }
-        RunError::Compile(message) => {
-            eprintln!("error: CompileError: {message}");
-            ExitCode::from(1)
-        }
+        RunError::JsThrow(diagnostic) => render_miette(Report::new(*diagnostic)),
+        RunError::Compile(diagnostic) => render_miette(Report::new(*diagnostic)),
         RunError::Runtime(message) => {
             eprintln!("error: {message}");
             ExitCode::from(1)
         }
     }
+}
+
+/// D6: render any miette `Report` through the graphical handler
+/// (source frame + coloured caret) with a plain-text fallback so
+/// pipes and `NO_COLOR=1` still emit something useful.
+fn render_miette(report: Report) -> ExitCode {
+    let theme = pick_graphical_theme();
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|w| w.parse::<usize>().ok())
+        .unwrap_or(120);
+    let handler = GraphicalReportHandler::new_themed(theme).with_width(width);
+    let mut rendered = String::new();
+    if handler
+        .render_report(&mut rendered, report.as_ref())
+        .is_err()
+    {
+        rendered = format!("error: {report}");
+    }
+    eprintln!("{rendered}");
+    ExitCode::from(1)
 }
 
 async fn run_file(path: &Path, script_args: &[String], cli: &Cli) -> ExitCode {

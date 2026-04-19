@@ -55,7 +55,7 @@ impl Lockfile {
 
     /// SHA-256 checksum of the canonical serialization. Drives
     /// the integrity check in S3 (signed lockfiles) and the
-    /// short summary printed by `otterjs pm install`.
+    /// short summary printed by `otterjs install`.
     pub fn checksum(&self) -> Result<String, LockfileError> {
         use sha2::{Digest, Sha256};
         let canonical = self.serialize_canonical()?;

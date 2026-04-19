@@ -126,6 +126,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `for (<let\|const\|ident> in <source>) body` via `ForInEnumerate` + `ForInNext`, `null` / `undefined` source skips without throwing; class-method installation switched to `DefineClassMethod` so prototype methods stay non-enumerable per §15.7.11 | yes | M31 |
 | `Promise` global + `new Promise(executor)` / `Promise.resolve` / `Promise.reject` / `.then` / `.catch` / `.finally` chaining from user source; `execute_with_runtime` drains the microtask queue before returning so promise callbacks settle before the host regains control | yes | M32 |
 | `async function` / `async () => …` declarations + expressions + arrows return a Promise; `await` unary lowers to a new `Await` opcode that drains the microtask queue, unwraps fulfillment / throws rejection, and passes non-promise operands through per §27.7.5.3. Real coroutine suspension for pending promises is deferred — our runtime produces no pending promises today | yes | M33 |
+| Async surface complete: `Promise.all` / `Promise.race` / `Promise.allSettled` / `Promise.any`, `queueMicrotask` / `setTimeout` globals in the compiler whitelist; `drain_microtasks_for_await` now walks all three microtask queues (nextTick → promise jobs → queueMicrotask), so any chain reachable via microtask-only settlement converges before `await` unwraps. Timer-based async pending on real event-loop host integration (out of language scope) | yes | M33-finale |
 
 ## Benchmarks
 

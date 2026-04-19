@@ -122,12 +122,12 @@ use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, ArrayPattern, ArrowFunctionExpression,
     AssignmentExpression, AssignmentOperator, AssignmentTarget, BinaryExpression, BinaryOperator,
     BindingPattern, Class, ClassElement, ComputedMemberExpression, ConditionalExpression,
-    Expression, FormalParameters, Function, FunctionBody, IdentifierReference, LogicalExpression,
-    LogicalOperator, MethodDefinitionKind, NewExpression, NumericLiteral, ObjectExpression,
-    ObjectPattern, ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget,
-    Statement, StaticMemberExpression, TemplateLiteral, UnaryExpression, UnaryOperator,
-    UpdateExpression, UpdateOperator, VariableDeclaration, VariableDeclarationKind,
-    VariableDeclarator,
+    Declaration, ExportDefaultDeclarationKind, Expression, FormalParameters, Function,
+    FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator, MethodDefinitionKind,
+    ModuleExportName, NewExpression, NumericLiteral, ObjectExpression, ObjectPattern,
+    ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
+    StaticMemberExpression, TemplateLiteral, UnaryExpression, UnaryOperator, UpdateExpression,
+    UpdateOperator, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -135,7 +135,10 @@ use oxc_span::{GetSpan, SourceType, Span};
 use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Label, Opcode, Operand};
 use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
 use crate::frame::{FrameLayout, RegisterIndex};
-use crate::module::{Function as VmFunction, FunctionIndex, FunctionTables, Module};
+use crate::module::{
+    ExportRecord, Function as VmFunction, FunctionIndex, FunctionTables, ImportBinding,
+    ImportRecord, Module,
+};
 
 /// Staged AST-to-bytecode compiler for a single source file.
 ///
@@ -202,30 +205,208 @@ impl ModuleCompiler {
 // ---------------------------------------------------------------------------
 
 fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
-    // The program is one or more top-level `FunctionDeclaration`s.
+    // The program is one or more top-level `FunctionDeclaration`s,
+    // optionally mixed with `import` / `export` declarations (M35).
     // Anything else — `class`, `var`, top-level expressions or
-    // statements, imports/exports — surfaces as an `Unsupported`
-    // pointing at the offending node so later milestones can widen
-    // coverage one construct at a time. The conventional `main`
-    // pattern (helpers first, entry last) makes the **last**
-    // function the module's entry.
+    // statements — surfaces as an `Unsupported` pointing at the
+    // offending node so later milestones can widen coverage one
+    // construct at a time. The conventional `main` pattern
+    // (helpers first, entry last) makes the **last** function the
+    // module's entry for script-style programs.
     if program.body.is_empty() {
         return Err(SourceLoweringError::unsupported("program", program.span));
     }
 
-    // First pass: collect each declaration's name. Names must be
-    // available before any body is lowered so cross-function calls
-    // (including forward references and recursion) resolve.
+    // M35 state: collected import/export records, plus the name of
+    // every binding that the runtime installs on the global object
+    // before / during module evaluation. Inner function bodies
+    // resolve bare identifier references against `module_globals`
+    // (via `ctx.is_module_global`) so an imported symbol or a
+    // top-level export can be read/called from a nested function.
+    let mut imports: Vec<ImportRecord> = Vec::new();
+    let mut exports: Vec<ExportRecord> = Vec::new();
+    let mut module_globals: Vec<String> = Vec::new();
+    // Per-source-URL flag: this program uses ES-module syntax
+    // (static `import` / `export` / dynamic `import()`). An empty
+    // set of records with no `import()` expressions means the
+    // program is still a plain script and lands on `Module::new`
+    // (no synthesised module-init, no `new_esm`).
+    let mut is_esm = false;
+
+    // First pass: classify top-level statements into function
+    // declarations (with or without an `export` wrapper) and pure
+    // import/export metadata.
     let mut declarations: Vec<&Function<'_>> = Vec::with_capacity(program.body.len());
     let mut names: Vec<&str> = Vec::with_capacity(program.body.len());
+    let mut default_export_local: Option<String> = None;
     for stmt in &program.body {
-        let func = match stmt {
-            Statement::FunctionDeclaration(func) => func.as_ref(),
+        match stmt {
+            Statement::FunctionDeclaration(func) => {
+                record_function_declaration(func, &mut declarations, &mut names)?;
+            }
             Statement::ClassDeclaration(class) => {
                 return Err(SourceLoweringError::unsupported(
                     "class_declaration",
                     class.span,
                 ));
+            }
+            Statement::ImportDeclaration(decl) => {
+                is_esm = true;
+                let specifier: Box<str> = decl.source.value.as_str().into();
+                let mut bindings: Vec<ImportBinding> = Vec::new();
+                if let Some(specs) = decl.specifiers.as_ref() {
+                    for spec in specs {
+                        match spec {
+                            oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                                let imported = module_export_name_to_string(&s.imported)
+                                    .ok_or_else(|| {
+                                        SourceLoweringError::unsupported(
+                                            "import_specifier_string_literal",
+                                            s.span,
+                                        )
+                                    })?;
+                                let local = s.local.name.as_str().to_string();
+                                module_globals.push(local.clone());
+                                bindings.push(ImportBinding::Named {
+                                    imported: imported.into(),
+                                    local: local.into(),
+                                });
+                            }
+                            oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                                let local = s.local.name.as_str().to_string();
+                                module_globals.push(local.clone());
+                                bindings.push(ImportBinding::Default {
+                                    local: local.into(),
+                                });
+                            }
+                            oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(
+                                s,
+                            ) => {
+                                let local = s.local.name.as_str().to_string();
+                                module_globals.push(local.clone());
+                                bindings.push(ImportBinding::Namespace {
+                                    local: local.into(),
+                                });
+                            }
+                        }
+                    }
+                }
+                imports.push(ImportRecord {
+                    specifier,
+                    bindings,
+                });
+            }
+            Statement::ExportNamedDeclaration(decl) => {
+                is_esm = true;
+                if let Some(inner) = &decl.declaration {
+                    // `export function foo() {}` / `export const x = …`.
+                    // Only function declarations reach the current
+                    // subset; other shapes fall through as
+                    // unsupported so later milestones can extend the
+                    // export surface.
+                    let Declaration::FunctionDeclaration(func) = inner else {
+                        return Err(SourceLoweringError::unsupported(
+                            "export_declaration_non_function",
+                            inner.span(),
+                        ));
+                    };
+                    let name =
+                        record_function_declaration(func.as_ref(), &mut declarations, &mut names)?;
+                    module_globals.push(name.to_string());
+                    exports.push(ExportRecord::Named {
+                        local: name.to_string().into(),
+                        exported: name.to_string().into(),
+                    });
+                } else if let Some(source) = &decl.source {
+                    // `export { x } from "./m"` — re-export named.
+                    let specifier = source.value.as_str().to_string();
+                    for spec in &decl.specifiers {
+                        let local = module_export_name_to_string(&spec.local).ok_or_else(|| {
+                            SourceLoweringError::unsupported(
+                                "export_specifier_string_literal",
+                                spec.span,
+                            )
+                        })?;
+                        let exported =
+                            module_export_name_to_string(&spec.exported).ok_or_else(|| {
+                                SourceLoweringError::unsupported(
+                                    "export_specifier_string_literal",
+                                    spec.span,
+                                )
+                            })?;
+                        exports.push(ExportRecord::ReExportNamed {
+                            specifier: specifier.clone().into(),
+                            imported: local.into(),
+                            exported: exported.into(),
+                        });
+                    }
+                } else {
+                    // `export { x, y }` — references to top-level
+                    // bindings. We record them and rely on the
+                    // module-init to install the local as a global
+                    // before `capture_exports` runs.
+                    for spec in &decl.specifiers {
+                        let local = module_export_name_to_string(&spec.local).ok_or_else(|| {
+                            SourceLoweringError::unsupported(
+                                "export_specifier_string_literal",
+                                spec.span,
+                            )
+                        })?;
+                        let exported =
+                            module_export_name_to_string(&spec.exported).ok_or_else(|| {
+                                SourceLoweringError::unsupported(
+                                    "export_specifier_string_literal",
+                                    spec.span,
+                                )
+                            })?;
+                        module_globals.push(local.clone());
+                        exports.push(ExportRecord::Named {
+                            local: local.into(),
+                            exported: exported.into(),
+                        });
+                    }
+                }
+            }
+            Statement::ExportDefaultDeclaration(decl) => {
+                is_esm = true;
+                // `export default function foo() {}` — must be a
+                // named hoistable declaration at this slice of the
+                // compiler. Anonymous default (`export default
+                // function () {}` / `export default expr`) requires
+                // synthesising a local binding and lowering an
+                // expression at module-init time; deferred.
+                let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &decl.declaration
+                else {
+                    return Err(SourceLoweringError::unsupported(
+                        "export_default_non_function",
+                        decl.span,
+                    ));
+                };
+                let name =
+                    record_function_declaration(func.as_ref(), &mut declarations, &mut names)?;
+                default_export_local = Some(name.to_string());
+                module_globals.push(name.to_string());
+                exports.push(ExportRecord::Default {
+                    local: name.to_string().into(),
+                });
+            }
+            Statement::ExportAllDeclaration(decl) => {
+                is_esm = true;
+                let specifier: Box<str> = decl.source.value.as_str().into();
+                if let Some(exported) = &decl.exported {
+                    let exported = module_export_name_to_string(exported).ok_or_else(|| {
+                        SourceLoweringError::unsupported(
+                            "export_specifier_string_literal",
+                            decl.span,
+                        )
+                    })?;
+                    exports.push(ExportRecord::ReExportNamespace {
+                        specifier,
+                        exported: exported.into(),
+                    });
+                } else {
+                    exports.push(ExportRecord::ReExportAll { specifier });
+                }
             }
             other => {
                 return Err(SourceLoweringError::unsupported(
@@ -233,20 +414,21 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                     other.span(),
                 ));
             }
-        };
-        let name = func
-            .id
-            .as_ref()
-            .map(|ident| ident.name.as_str())
-            .ok_or_else(|| SourceLoweringError::unsupported("anonymous_function", func.span))?;
-        if names.contains(&name) {
-            return Err(SourceLoweringError::unsupported(
-                "duplicate_function_declaration",
-                func.span,
-            ));
         }
-        names.push(name);
-        declarations.push(func);
+    }
+
+    let _ = default_export_local;
+
+    // M35: a module body with no local declarations (e.g. a pure
+    // re-export: `export { x } from "./m";` or `export * from
+    // "./m";`) is valid — the module loader builds the namespace
+    // entirely from the source registry. We still need *some*
+    // function to be the module entry (even a no-op), so the
+    // synthesised module-init slot below becomes the entry. The
+    // `declarations.is_empty()` early-exit stays for non-ESM
+    // programs where an empty source is still meaningless.
+    if declarations.is_empty() && !is_esm {
+        return Err(SourceLoweringError::unsupported("program", program.span));
     }
 
     // Second pass: lower each function with the shared name table
@@ -267,24 +449,247 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
     for _ in 0..declarations.len() {
         module_functions.borrow_mut().push(placeholder_function());
     }
+
+    // M35: publish `module_globals` via a shared top-level
+    // `LoweringContext` before any body is lowered. Every child
+    // context inherits the populated list via the `Rc`, so nested
+    // function bodies that reference an imported symbol resolve
+    // it through `LdaGlobal` without knowing about module
+    // machinery. The context lives only long enough to seed the
+    // list — each `lower_function_declaration` creates its own
+    // context internally (with no parent), so it picks up the
+    // names by constructing a fresh `Rc`. To share, we clone the
+    // Rc into every call.
+    let module_globals_rc: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(module_globals.clone()));
+
     for (top_idx, func) in declarations.iter().enumerate() {
-        let lowered =
-            lower_function_declaration(func, &names, std::rc::Rc::clone(&module_functions))?;
+        let lowered = lower_function_declaration_with_globals(
+            func,
+            &names,
+            std::rc::Rc::clone(&module_functions),
+            std::rc::Rc::clone(&module_globals_rc),
+        )?;
         module_functions.borrow_mut()[top_idx] = lowered;
     }
 
-    // Entry = last top-level declaration. Safe: `declarations` is
-    // non-empty (we returned early above).
-    let entry_idx = u32::try_from(declarations.len() - 1)
-        .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?;
+    // M35: for ES modules, synthesise a module-init function that
+    // runs before `capture_exports` collects values. For every
+    // top-level function declaration whose name is a module
+    // global (an export or a default export), we emit
+    // `CreateClosure <idx>, 0` + `StaGlobal <name>` so the global
+    // object holds a callable value under that name by the time
+    // the host harvests exports. `import` bindings are handled
+    // separately by `populate_import_globals` in the module
+    // loader.
+    let entry_idx = if is_esm {
+        let module_init_idx =
+            synthesise_module_init_function(&module_functions, &names, &module_globals)?;
+        u32::try_from(module_init_idx)
+            .map_err(|_| SourceLoweringError::Internal("module init index overflow".into()))?
+    } else {
+        u32::try_from(declarations.len() - 1)
+            .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?
+    };
 
     let functions = std::rc::Rc::try_unwrap(module_functions)
         .map_err(|_| SourceLoweringError::Internal("module functions still shared".into()))?
         .into_inner();
-    let module = Module::new(None::<&str>, functions, FunctionIndex(entry_idx)).map_err(|err| {
-        SourceLoweringError::Internal(format!("module construction failed: {err}"))
-    })?;
+    let module = if is_esm {
+        Module::new_esm(
+            None::<&str>,
+            functions,
+            FunctionIndex(entry_idx),
+            imports,
+            exports,
+        )
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("module construction failed: {err}"))
+        })?
+    } else {
+        Module::new(None::<&str>, functions, FunctionIndex(entry_idx)).map_err(|err| {
+            SourceLoweringError::Internal(format!("module construction failed: {err}"))
+        })?
+    };
     Ok(module)
+}
+
+/// Records a single `FunctionDeclaration` into the module's
+/// top-level declaration tables. Rejects anonymous or duplicate
+/// names with a stable tag so callers don't repeat the check.
+fn record_function_declaration<'a>(
+    func: &'a Function<'a>,
+    declarations: &mut Vec<&'a Function<'a>>,
+    names: &mut Vec<&'a str>,
+) -> Result<&'a str, SourceLoweringError> {
+    let name = func
+        .id
+        .as_ref()
+        .map(|ident| ident.name.as_str())
+        .ok_or_else(|| SourceLoweringError::unsupported("anonymous_function", func.span))?;
+    if names.contains(&name) {
+        return Err(SourceLoweringError::unsupported(
+            "duplicate_function_declaration",
+            func.span,
+        ));
+    }
+    names.push(name);
+    declarations.push(func);
+    Ok(name)
+}
+
+/// §16.2.1.4 — converts a `ModuleExportName` AST node (which may be
+/// an identifier or a string literal) into the bare string form
+/// the runtime records use. Returns `None` for string-literal
+/// names because the current module surface doesn't carry those
+/// through the runtime registry yet (`"foo \0 bar"` export names
+/// need additional care around UTF-16 and property-key interning).
+fn module_export_name_to_string(name: &ModuleExportName<'_>) -> Option<String> {
+    match name {
+        ModuleExportName::IdentifierName(i) => Some(i.name.as_str().to_string()),
+        ModuleExportName::IdentifierReference(i) => Some(i.name.as_str().to_string()),
+        ModuleExportName::StringLiteral(_) => None,
+    }
+}
+
+/// Appends a synthetic "module-init" [`VmFunction`] to
+/// `module_functions`. Its body materialises each top-level
+/// declaration whose name is a module global as a closure on the
+/// global object so the module loader's `capture_exports` can
+/// read the value back out under that name. Returns the appended
+/// index.
+fn synthesise_module_init_function(
+    module_functions: &std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+    names: &[&str],
+    module_globals: &[String],
+) -> Result<usize, SourceLoweringError> {
+    // Hidden[0] is still the (unused) receiver slot, matching the
+    // conventional frame layout for every other top-level
+    // function. No params, no scratch. A single `u8` of property
+    // names is plenty for the immediate subset.
+    let layout = FrameLayout::new(1, 0, 0, 0)
+        .map_err(|e| SourceLoweringError::Internal(format!("module-init layout: {e:?}")))?;
+    let mut builder = BytecodeBuilder::new();
+    let mut property_names: Vec<String> = Vec::new();
+    // PC → ClosureTemplate map, built alongside bytecode emission.
+    // The runtime looks up the template for each `CreateClosure`
+    // opcode via `ClosureTable::get(pc)`; a missing entry trips
+    // the "no ClosureTemplate for this PC" native-call error, so
+    // every CreateClosure here must register one.
+    let mut pending_templates: Vec<(u32, crate::closure::ClosureTemplate)> = Vec::new();
+    for name in module_globals {
+        let Some(top_idx) = names.iter().position(|n| *n == name.as_str()) else {
+            continue;
+        };
+        let func_idx = u32::try_from(top_idx).map_err(|_| {
+            SourceLoweringError::Internal("module-init function index overflow".into())
+        })?;
+        let pc = builder
+            .emit(
+                Opcode::CreateClosure,
+                &[Operand::Idx(func_idx), Operand::Imm(0)],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("module-init encode CreateClosure: {err:?}"))
+            })?;
+        pending_templates.push((
+            pc,
+            crate::closure::ClosureTemplate::new(FunctionIndex(func_idx), Vec::new()),
+        ));
+        let prop_idx = property_names
+            .iter()
+            .position(|existing| existing == name)
+            .unwrap_or_else(|| {
+                property_names.push(name.clone());
+                property_names.len() - 1
+            });
+        builder
+            .emit(
+                Opcode::StaGlobal,
+                &[Operand::Idx(u32::try_from(prop_idx).unwrap_or(u32::MAX))],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("module-init encode StaGlobal: {err:?}"))
+            })?;
+    }
+    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("module-init encode LdaUndefined: {err:?}"))
+    })?;
+    builder.emit(Opcode::Return, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("module-init encode Return: {err:?}"))
+    })?;
+
+    let bytecode = builder
+        .finish()
+        .map_err(|err| SourceLoweringError::Internal(format!("module-init finish: {err:?}")))?;
+    let bytecode_len = bytecode.bytes().len();
+    let mut templates: Vec<Option<crate::closure::ClosureTemplate>> = vec![None; bytecode_len];
+    for (pc, template) in pending_templates {
+        let idx = pc as usize;
+        if idx < templates.len() {
+            templates[idx] = Some(template);
+        }
+    }
+    let closure_table = crate::closure::ClosureTable::new(templates);
+    let side_tables = crate::module::FunctionSideTables::new(
+        crate::property::PropertyNameTable::new(property_names),
+        crate::string::StringTable::default(),
+        crate::float::FloatTable::default(),
+        crate::bigint::BigIntTable::default(),
+        closure_table,
+        crate::call::CallTable::default(),
+        crate::regexp::RegExpTable::default(),
+    );
+    let tables = FunctionTables::new(
+        side_tables,
+        FeedbackTableLayout::default(),
+        crate::deopt::DeoptTable::default(),
+        crate::exception::ExceptionTable::default(),
+        crate::source_map::SourceMap::default(),
+    );
+    let vm_fn = VmFunction::new(Some("<module-init>"), layout, bytecode, tables);
+    let mut fns = module_functions.borrow_mut();
+    let idx = fns.len();
+    fns.push(vm_fn);
+    Ok(idx)
+}
+
+/// Variant of [`lower_function_declaration`] that injects a shared
+/// `module_globals` table into the lowering context so nested
+/// function bodies resolve imported / exported names via
+/// `LdaGlobal`. The plain [`lower_function_declaration`] keeps
+/// its signature for backwards compatibility with internal
+/// callers (nested-closure recursion).
+fn lower_function_declaration_with_globals<'a>(
+    func: &'a Function<'a>,
+    function_names: &'a [&'a str],
+    module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+    module_globals: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+) -> Result<VmFunction, SourceLoweringError> {
+    MODULE_GLOBALS_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = Some(module_globals);
+    });
+    let result = lower_function_declaration(func, function_names, module_functions);
+    MODULE_GLOBALS_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    result
+}
+
+std::thread_local! {
+    /// Temporary channel carrying the module-globals table from
+    /// [`lower_program`] down into the top-level
+    /// [`LoweringContext::new`] call sites. `lower_function_declaration`
+    /// constructs a `LoweringContext` with `parent = None` (no
+    /// natural inheritance path), so a thread-local override is the
+    /// least invasive way to seed the list without threading a
+    /// module-state parameter through every compiler entry point.
+    /// Cleared in `lower_function_declaration_with_globals` once the
+    /// top-level body has been lowered — child contexts inherit the
+    /// `Rc` via `with_parent`.
+    static MODULE_GLOBALS_OVERRIDE: std::cell::RefCell<
+        Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Maps the residual `Statement` variants we explicitly don't handle at
@@ -2380,6 +2785,20 @@ struct LoweringContext<'a> {
     /// resolution does NOT walk parent classes, so nested-class
     /// access to outer `#x` is rejected (`undeclared_private_name`).
     class_private_names: std::rc::Rc<[String]>,
+    /// M35: names that live on the runtime global object by the time
+    /// this function executes — both `import`-bound locals (set by
+    /// `populate_import_globals`) and top-level `export`ed
+    /// declarations (installed by the synthesised module-init
+    /// function). An identifier reference that doesn't resolve to a
+    /// local / parameter / upvalue / top-level `FunctionDeclaration`
+    /// falls through to `LdaGlobal` when its name is in this list,
+    /// instead of failing with `unbound_identifier`.
+    ///
+    /// Shared by `Rc<RefCell<…>>` across every nested
+    /// `LoweringContext` in the same compilation so a nested
+    /// closure can resolve an imported binding declared at module
+    /// scope without plumbing.
+    module_globals: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 }
 
 /// §13.3.7 / §15.7.14 — per-function metadata describing which
@@ -2534,6 +2953,20 @@ impl<'a> LoweringContext<'a> {
     ) -> Self {
         let param_names = layout.names.clone();
         let param_count = RegisterIndex::try_from(param_names.len()).unwrap_or(u16::MAX);
+        // M35: inherit the module-globals table from the parent if we
+        // have one (nested closures and inner functions live in the
+        // same module). Top-level contexts pick up the table from the
+        // `MODULE_GLOBALS_OVERRIDE` thread-local that `lower_program`
+        // set before dispatching each top-level declaration; when
+        // that override is absent (non-ESM scripts, test helpers
+        // constructing a context directly) we fall back to a fresh
+        // empty list.
+        let module_globals = parent
+            .map(|p| std::rc::Rc::clone(&p.module_globals))
+            .or_else(|| {
+                MODULE_GLOBALS_OVERRIDE.with(|slot| slot.borrow().as_ref().map(std::rc::Rc::clone))
+            })
+            .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
         Self {
             param_names,
             param_count,
@@ -2558,7 +2991,16 @@ impl<'a> LoweringContext<'a> {
             class_super_binding,
             class_private_names: class_private_names
                 .unwrap_or_else(|| std::rc::Rc::<[String]>::from([])),
+            module_globals,
         }
+    }
+
+    /// Returns `true` if `name` is declared as a module-level global
+    /// for the current compilation (see [`module_globals`]). Used by
+    /// identifier-reference and call lowering to route resolution
+    /// through `LdaGlobal` instead of rejecting the name.
+    fn is_module_global(&self, name: &str) -> bool {
+        self.module_globals.borrow().iter().any(|n| n == name)
     }
 
     /// Register a ClosureTemplate at the given `pc`. The PC is the
@@ -3699,10 +4141,30 @@ fn lower_identifier_reference(
                 })?;
             Ok(())
         }
-        _ => Err(SourceLoweringError::unsupported(
-            "unbound_identifier",
-            ident.span,
-        )),
+        _ => {
+            // M35: ES-module imports and top-level exports live on
+            // the global object by the time any function body runs
+            // (`populate_import_globals` + the synthesised
+            // module-init function). An identifier whose name
+            // matches one of those module-level globals resolves
+            // via `LdaGlobal` here instead of hitting the
+            // script-mode `unbound_identifier` rejection.
+            if ctx.is_module_global(name) {
+                let idx = ctx.intern_property_name(name)?;
+                builder
+                    .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaGlobal (module binding): {err:?}"
+                        ))
+                    })?;
+                return Ok(());
+            }
+            Err(SourceLoweringError::unsupported(
+                "unbound_identifier",
+                ident.span,
+            ))
+        }
     }
 }
 
@@ -3957,6 +4419,42 @@ fn lower_return_expression<'a>(
         // is created; callers consume the value directly (e.g. `let
         // C = class {…}` or `return class {…};`).
         Expression::ClassExpression(class) => lower_class_expression(builder, ctx, class),
+        // M35: §13.3.10 `import(expr)` — evaluate the specifier
+        // into a fresh temp, then emit `DynamicImport <reg>`. The
+        // dispatch handler resolves+loads the module and returns
+        // a fulfilled Promise of its namespace.
+        Expression::ImportExpression(import) => {
+            let temp = ctx.acquire_temps(1)?;
+            let lower = (|| -> Result<(), SourceLoweringError> {
+                lower_return_expression(builder, ctx, &import.source)?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (dynamic import spec): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(Opcode::DynamicImport, &[Operand::Reg(u32::from(temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!("encode DynamicImport: {err:?}"))
+                    })?;
+                Ok(())
+            })();
+            ctx.release_temps(1);
+            lower
+        }
+        // M35: `import.meta` — fetch the module-meta namespace
+        // from the runtime. Our current slice exposes a plain
+        // object with one `url` string property.
+        Expression::MetaProperty(meta)
+            if meta.meta.name.as_str() == "import" && meta.property.name.as_str() == "meta" =>
+        {
+            builder.emit(Opcode::ImportMeta, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode ImportMeta: {err:?}"))
+            })?;
+            Ok(())
+        }
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),
@@ -7996,13 +8494,17 @@ fn lower_direct_call<'a>(
     }
     // Last resort: the name isn't a top-level function or a
     // local / param / upvalue, but may still be a whitelisted
-    // global (e.g. `queueMicrotask(cb)` / `setTimeout(cb, 0)`).
+    // global (e.g. `queueMicrotask(cb)` / `setTimeout(cb, 0)`)
+    // or — M35 — an `import`-ed binding / top-level `export`ed
+    // declaration installed on the global object by
+    // `populate_import_globals` / the synthesised module-init.
     // Route through the same `LdaGlobal` path the identifier
     // reference uses, then dispatch as a plain closure call.
     if matches!(
         name,
         "queueMicrotask" | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
-    ) {
+    ) || ctx.is_module_global(name)
+    {
         let argc = RegisterIndex::try_from(call.arguments.len())
             .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
         let callee_temp = ctx.acquire_temps(1)?;

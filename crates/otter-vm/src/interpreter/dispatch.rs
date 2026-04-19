@@ -188,6 +188,50 @@ impl Interpreter {
                     activation.set_accumulator(RegisterValue::undefined());
                 }
             }
+            // M35: §13.3.10 `import(expr)` — delegate to the
+            // module-loader's thread-local-context
+            // `dynamic_import_resolve`, which resolves + loads the
+            // named module and returns a fulfilled Promise of its
+            // namespace object. When called outside an
+            // `execute_module_graph_shared` span the helper
+            // returns `NativeCall("dynamic import: no module …
+            // installed")`, which the normal error path surfaces
+            // to user code as a thrown error.
+            Opcode::DynamicImport => {
+                let spec_reg = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let Some(spec_handle) = spec_reg.as_object_handle() else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "dynamic import: specifier must be a string",
+                    )));
+                };
+                let spec_str = runtime
+                    .objects
+                    .string_value(crate::object::ObjectHandle(spec_handle))?
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        InterpreterError::TypeError(Box::from(
+                            "dynamic import: specifier must be a string",
+                        ))
+                    })?;
+                let promise_value =
+                    crate::module_loader::dynamic_import_resolve(&spec_str, runtime)?;
+                activation.set_accumulator(promise_value);
+            }
+            // M35: `import.meta` — synthesise a fresh plain object
+            // with the single `url` property (other fields, like
+            // `import.meta.resolve`, land in later slices).
+            Opcode::ImportMeta => {
+                let meta = runtime.alloc_object();
+                let url_prop = runtime.intern_property_name("url");
+                let referrer = crate::module_loader::current_dynamic_import_referrer();
+                let url_value = runtime.alloc_string(referrer.as_str());
+                runtime.objects.set_property(
+                    meta,
+                    url_prop,
+                    RegisterValue::from_object_handle(url_value.0),
+                )?;
+                activation.set_accumulator(RegisterValue::from_object_handle(meta.0));
+            }
 
             // ---- Binary arithmetic (int32 fast path; generic bail later) ----
             //

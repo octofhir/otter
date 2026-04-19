@@ -5,11 +5,180 @@
 //!
 //! Spec: <https://tc39.es/ecma262/#sec-source-text-module-records>
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use crate::interpreter::{InterpreterError, RuntimeState};
 use crate::module::{ExportRecord, ImportBinding, Module};
 use crate::value::RegisterValue;
+
+// M35: Dynamic `import(expr)` support. The `DynamicImport` dispatch
+// handler (§13.3.10) in `interpreter::dispatch` has no path to
+// receive host/registry state through the many layers below it,
+// so we hold them in a thread-local `Rc` pair installed by
+// `execute_module_graph` for the duration of module evaluation.
+// Using `Rc<dyn ModuleHost>` + `Rc<RefCell<ModuleRegistry>>`
+// keeps ownership on the ref-count without needing `unsafe` —
+// the crate has `#![forbid(unsafe_code)]`.
+type SharedModuleHost = Rc<dyn ModuleHost>;
+type SharedModuleRegistry = Rc<RefCell<ModuleRegistry>>;
+
+thread_local! {
+    static DYNAMIC_IMPORT_HOST: RefCell<Option<SharedModuleHost>> =
+        const { RefCell::new(None) };
+    static DYNAMIC_IMPORT_REGISTRY: RefCell<Option<SharedModuleRegistry>> =
+        const { RefCell::new(None) };
+    static DYNAMIC_IMPORT_REFERRER: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+struct DynamicImportGuard;
+
+impl Drop for DynamicImportGuard {
+    fn drop(&mut self) {
+        DYNAMIC_IMPORT_HOST.with(|c| *c.borrow_mut() = None);
+        DYNAMIC_IMPORT_REGISTRY.with(|c| *c.borrow_mut() = None);
+        DYNAMIC_IMPORT_REFERRER.with(|c| c.borrow_mut().clear());
+    }
+}
+
+fn install_dynamic_import_context(
+    host: SharedModuleHost,
+    registry: SharedModuleRegistry,
+    referrer: &str,
+) -> DynamicImportGuard {
+    DYNAMIC_IMPORT_HOST.with(|c| *c.borrow_mut() = Some(host));
+    DYNAMIC_IMPORT_REGISTRY.with(|c| *c.borrow_mut() = Some(registry));
+    DYNAMIC_IMPORT_REFERRER.with(|c| *c.borrow_mut() = referrer.to_string());
+    DynamicImportGuard
+}
+
+/// M35: Returns the URL of the currently-evaluating module. Backs
+/// the `import.meta.url` getter on the [`ImportMeta`] opcode.
+/// Empty string when called outside an `execute_module_graph_*`
+/// span.
+pub fn current_dynamic_import_referrer() -> String {
+    DYNAMIC_IMPORT_REFERRER.with(|c| c.borrow().clone())
+}
+
+/// Runs `f` with the dynamic-import context installed so nested
+/// `import(expr)` / `import.meta` opcodes hit the right
+/// host/registry. Used by test harnesses that want to call an
+/// exported function *after* `execute_module_graph_shared` has
+/// returned — the guard drop on that outer call clears the
+/// thread-local, so calls made from outside it would otherwise
+/// see "no module host installed".
+pub fn with_dynamic_import_context<R>(
+    host: Rc<dyn ModuleHost>,
+    registry: Rc<RefCell<ModuleRegistry>>,
+    referrer: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    let _guard = install_dynamic_import_context(host, registry, referrer);
+    f()
+}
+
+/// §13.3.10 — Resolves and loads the module named by `specifier`,
+/// then returns a fulfilled `Promise` of its namespace object.
+/// Called by the `DynamicImport` dispatch handler. Outside an
+/// `execute_module_graph_shared` span (no host/registry installed)
+/// this returns a `NativeCall` error that surfaces as a runtime
+/// `TypeError` on the calling side.
+pub fn dynamic_import_resolve(
+    specifier: &str,
+    runtime: &mut RuntimeState,
+) -> Result<RegisterValue, InterpreterError> {
+    let host: SharedModuleHost = DYNAMIC_IMPORT_HOST
+        .with(|c| c.borrow().clone())
+        .ok_or_else(|| {
+            InterpreterError::NativeCall(Box::from("dynamic import: no module host installed"))
+        })?;
+    let registry: SharedModuleRegistry = DYNAMIC_IMPORT_REGISTRY
+        .with(|c| c.borrow().clone())
+        .ok_or_else(|| {
+            InterpreterError::NativeCall(Box::from("dynamic import: no module registry installed"))
+        })?;
+    let referrer = DYNAMIC_IMPORT_REFERRER.with(|c| c.borrow().clone());
+    let resolved = host
+        .resolve(specifier, &referrer)
+        .map_err(|e| InterpreterError::NativeCall(format!("dynamic import resolve: {e}").into()))?;
+    // Load + evaluate if not already loaded. Shares the same
+    // DFS + link + evaluate pathway as the static graph walker, so
+    // transitive deps of the dynamically-imported module come
+    // along for free.
+    let need_evaluate = !registry.borrow().contains(&resolved);
+    if need_evaluate {
+        let mut visiting: BTreeMap<String, bool> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        visit_module(
+            &resolved,
+            host.as_ref(),
+            &mut registry.borrow_mut(),
+            &mut visiting,
+            &mut order,
+        )?;
+        for url in &order {
+            link_module(url, &mut registry.borrow_mut())?;
+        }
+        let interpreter = crate::Interpreter::for_runtime(runtime);
+        for url in &order {
+            evaluate_module(
+                url,
+                host.as_ref(),
+                &interpreter,
+                runtime,
+                &mut registry.borrow_mut(),
+            )?;
+        }
+    }
+    let ns_value = build_namespace_object(&resolved, &registry.borrow(), runtime);
+    let handle = runtime
+        .alloc_resolved_promise(ns_value)
+        .map_err(|err| match err {
+            crate::VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+            crate::VmNativeCallError::Internal(msg) => InterpreterError::NativeCall(msg),
+        })?;
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+/// Rc-wrapped variant of [`execute_module_graph`] that installs the
+/// dynamic-import context. Callers handing in a borrowed `&dyn
+/// ModuleHost` / `&mut ModuleRegistry` still get to use the
+/// existing entry point; the two-input wrapper is the path that
+/// enables `import(expr)` at runtime.
+pub fn execute_module_graph_shared(
+    entry_url: &str,
+    host: SharedModuleHost,
+    runtime: &mut RuntimeState,
+    registry: SharedModuleRegistry,
+) -> Result<(), InterpreterError> {
+    // Phase 1: Build the module graph — compile and register all modules.
+    let topo_order = build_module_graph(entry_url, host.as_ref(), &mut registry.borrow_mut())?;
+
+    // Phase 2: Link — resolve import bindings.
+    for url in &topo_order {
+        link_module(url, &mut registry.borrow_mut())?;
+    }
+
+    // Phase 3: Evaluate in topological order, with dynamic-import
+    // context installed so a runtime `import(expr)` inside any
+    // module body can resolve + load + evaluate additional
+    // modules on demand.
+    let interpreter = crate::Interpreter::for_runtime(runtime);
+    let _guard = install_dynamic_import_context(Rc::clone(&host), Rc::clone(&registry), entry_url);
+    for url in &topo_order {
+        DYNAMIC_IMPORT_REFERRER.with(|c| *c.borrow_mut() = url.clone());
+        evaluate_module(
+            url,
+            host.as_ref(),
+            &interpreter,
+            runtime,
+            &mut registry.borrow_mut(),
+        )?;
+    }
+
+    Ok(())
+}
 
 /// §16.2.1.2 — Module states during linking/evaluation.
 /// Spec: <https://tc39.es/ecma262/#sec-moduledeclarationlinking>
@@ -160,10 +329,13 @@ pub fn execute_module_graph(
         link_module(url, registry)?;
     }
 
-    // Phase 3: Evaluate in topological order.
+    // Phase 3: Evaluate in topological order. No dynamic-import
+    // context is installed on this (borrow-based) entry point; use
+    // [`execute_module_graph_shared`] when `import(expr)` support
+    // is required during evaluation.
     let interpreter = crate::Interpreter::for_runtime(runtime);
     for url in &topo_order {
-        evaluate_module(url, &interpreter, runtime, registry)?;
+        evaluate_module(url, host, &interpreter, runtime, registry)?;
     }
 
     Ok(())
@@ -280,6 +452,7 @@ fn link_module(url: &str, registry: &mut ModuleRegistry) -> Result<(), Interpret
 /// 4. Capture exports into the namespace.
 fn evaluate_module(
     url: &str,
+    host: &dyn ModuleHost,
     interpreter: &crate::Interpreter,
     runtime: &mut RuntimeState,
     registry: &mut ModuleRegistry,
@@ -298,7 +471,7 @@ fn evaluate_module(
 
     // Pre-populate global object with import values from dependency namespaces.
     // In module mode, import bindings resolve via GetGlobal (no local allocation).
-    populate_import_globals(url, registry, runtime)?;
+    populate_import_globals(url, host, registry, runtime)?;
 
     let module = &registry.get(url).unwrap().module;
 
@@ -310,7 +483,7 @@ fn evaluate_module(
 
     // Capture exports from the global object into the module namespace.
     // Module compilation emits SetGlobal for all exports.
-    capture_exports(url, runtime, registry)?;
+    capture_exports(url, host, runtime, registry)?;
 
     registry.get_mut(url).unwrap().state = ModuleState::Evaluated;
     Ok(())
@@ -321,6 +494,7 @@ fn evaluate_module(
 /// `GetGlobal` at the use site. This function sets those globals before execution.
 fn populate_import_globals(
     url: &str,
+    host: &dyn ModuleHost,
     registry: &ModuleRegistry,
     runtime: &mut RuntimeState,
 ) -> Result<(), InterpreterError> {
@@ -328,13 +502,18 @@ fn populate_import_globals(
         InterpreterError::NativeCall(format!("module not in registry: {url}").into())
     })?;
 
-    // Collect all import bindings to avoid borrow conflicts.
+    // Collect all import bindings to avoid borrow conflicts. The
+    // `specifier` on the record is the raw source-text (e.g.
+    // `"./lib"`); before looking anything up in the registry we
+    // must run it through `host.resolve()` so the canonical URL
+    // matches what `visit_module` stored.
     let bindings: Vec<(String, String, String)> = loaded
         .module
         .imports()
         .iter()
         .flat_map(|import_record| {
-            let source_url = import_record.specifier.to_string();
+            let raw_spec = import_record.specifier.to_string();
+            let source_url = host.resolve(&raw_spec, url).unwrap_or(raw_spec);
             import_record.bindings.iter().map(move |binding| {
                 let (export_name, local_name) = match binding {
                     ImportBinding::Named { imported, local } => {
@@ -385,6 +564,7 @@ fn build_namespace_object(
 /// Module compilation emits SetGlobal for all exported bindings.
 fn capture_exports(
     url: &str,
+    host: &dyn ModuleHost,
     runtime: &mut RuntimeState,
     registry: &mut ModuleRegistry,
 ) -> Result<(), InterpreterError> {
@@ -420,7 +600,11 @@ fn capture_exports(
                 imported,
                 exported,
             } => {
-                let value = registry.get_export(specifier, imported).unwrap_or_default();
+                // Raw specifier → canonical registry URL via host.
+                let resolved = host
+                    .resolve(specifier, url)
+                    .unwrap_or_else(|_| specifier.to_string());
+                let value = registry.get_export(&resolved, imported).unwrap_or_default();
                 registry
                     .get_mut(url)
                     .unwrap()
@@ -429,8 +613,11 @@ fn capture_exports(
             }
             ExportRecord::ReExportAll { specifier } => {
                 // Copy all exports from the source module.
+                let resolved = host
+                    .resolve(specifier, url)
+                    .unwrap_or_else(|_| specifier.to_string());
                 let source_exports: Vec<(String, RegisterValue)> = registry
-                    .get(specifier.as_ref())
+                    .get(&resolved)
                     .map(|m| {
                         m.namespace
                             .iter()
@@ -447,7 +634,10 @@ fn capture_exports(
                 specifier,
                 exported,
             } => {
-                let ns_value = build_namespace_object(specifier, registry, runtime);
+                let resolved = host
+                    .resolve(specifier, url)
+                    .unwrap_or_else(|_| specifier.to_string());
+                let ns_value = build_namespace_object(&resolved, registry, runtime);
                 registry
                     .get_mut(url)
                     .unwrap()

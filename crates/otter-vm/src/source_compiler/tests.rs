@@ -7128,6 +7128,273 @@ fn m36_regexp_no_match_returns_null() {
     assert_eq!(run_int32_function(src, &[]), 1);
 }
 
+// ---------------------------------------------------------------------------
+// M35: ES module imports + exports + dynamic `import()`
+// ---------------------------------------------------------------------------
+
+/// Test helper — runs a two-module graph under an in-memory host,
+/// calls a named export of the entry module with the given int32
+/// args, and returns the i32 result. The exported function must be
+/// installed as a global on the same runtime state that
+/// `execute_module_graph` populates.
+fn run_module_graph_int32(
+    entry_url: &str,
+    modules: &[(&str, &str)],
+    exported_fn: &str,
+    args: &[i32],
+) -> i32 {
+    use crate::module_loader::{InMemoryModuleHost, ModuleRegistry, execute_module_graph};
+    let mut host = InMemoryModuleHost::new();
+    for (url, src) in modules {
+        host.add_module(*url, *src);
+    }
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let mut registry = ModuleRegistry::new();
+    execute_module_graph(entry_url, &host, &mut runtime, &mut registry)
+        .expect("execute_module_graph");
+    // Pull the exported function value out of the entry module's
+    // namespace — it was captured by `capture_exports` after the
+    // synthesised module-init installed it as a global.
+    let value = registry
+        .get_export(entry_url, exported_fn)
+        .expect("entry exports the requested fn");
+    let mut arg_regs: Vec<RegisterValue> =
+        args.iter().map(|&a| RegisterValue::from_i32(a)).collect();
+    let handle = crate::object::ObjectHandle(
+        value
+            .as_object_handle()
+            .expect("exported value must be an object handle"),
+    );
+    let result = runtime
+        .call_callable(handle, RegisterValue::undefined(), arg_regs.as_mut_slice())
+        .expect("call_callable");
+    result
+        .as_i32()
+        .expect("exported fn returned a non-int32 value")
+}
+
+#[test]
+fn m35_static_named_import_from_sibling_module() {
+    // `import { add } from "./lib"; export function main() { return add(2, 3) }`
+    // should resolve `add` through the lib module's namespace and
+    // produce 5.
+    let lib_src = "export function add(a, b) { return a + b }";
+    let entry_src = "import { add } from \"./lib\"; \
+        export function main() { return add(2, 3) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 5);
+}
+
+#[test]
+fn m35_default_import_calls_default_export() {
+    // `export default function add(a, b) { return a + b }` — the
+    // default export name in the loader's namespace is `"default"`.
+    // Consumer grabs it via `import add from "./lib"`.
+    let lib_src = "export default function add(a, b) { return a + b }";
+    let entry_src = "import add from \"./lib\"; \
+        export function main() { return add(4, 5) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 9);
+}
+
+#[test]
+fn m35_namespace_import_exposes_all_exports() {
+    // `import * as ns from "./lib"; ns.add(…)` — the loader builds
+    // a plain object whose own properties are the exported names
+    // of the source module. Property access then picks off `.add`.
+    let lib_src = "export function add(a, b) { return a + b } \
+        export function mul(a, b) { return a * b }";
+    let entry_src = "import * as ns from \"./lib\"; \
+        export function main() { return ns.mul(ns.add(1, 2), 4) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 12);
+}
+
+#[test]
+fn m35_renamed_named_import_uses_local_name() {
+    // `import { add as plus } from "./lib"`. The local binding is
+    // `plus`, not `add`, and must resolve even though the imported
+    // name is different.
+    let lib_src = "export function add(a, b) { return a + b }";
+    let entry_src = "import { add as plus } from \"./lib\"; \
+        export function main() { return plus(10, 11) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 21);
+}
+
+#[test]
+fn m35_re_export_named_from_other_module() {
+    // `export { add } from "./lib"` in `middle` — the loader
+    // wires the source namespace through without the intermediate
+    // module needing a local binding.
+    let lib_src = "export function add(a, b) { return a + b }";
+    let middle_src = "export { add } from \"./lib\"";
+    let entry_src = "import { add } from \"./middle\"; \
+        export function main() { return add(7, 8) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[
+            ("entry", entry_src),
+            ("middle", middle_src),
+            ("lib", lib_src),
+        ],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 15);
+}
+
+#[test]
+fn m35_export_star_from_other_module() {
+    // `export * from "./lib"` — all non-default exports flow
+    // through to the re-exporter's namespace.
+    let lib_src = "export function add(a, b) { return a + b } \
+        export function sub(a, b) { return a - b }";
+    let middle_src = "export * from \"./lib\"";
+    let entry_src = "import { add, sub } from \"./middle\"; \
+        export function main() { return sub(add(10, 5), 3) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[
+            ("entry", entry_src),
+            ("middle", middle_src),
+            ("lib", lib_src),
+        ],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 12);
+}
+
+/// Runs a module graph through the shared-ownership entry point
+/// so dynamic `import()` inside any module body can resolve
+/// through the thread-local-installed host/registry. Pulls the
+/// entry module's named export and calls it with `args`.
+fn run_module_graph_shared_int32(
+    entry_url: &str,
+    modules: &[(&str, &str)],
+    exported_fn: &str,
+    args: &[i32],
+) -> i32 {
+    use crate::module_loader::{InMemoryModuleHost, ModuleRegistry, execute_module_graph_shared};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut host = InMemoryModuleHost::new();
+    for (url, src) in modules {
+        host.add_module(*url, *src);
+    }
+    let host: Rc<dyn crate::module_loader::ModuleHost> = Rc::new(host);
+    let registry = Rc::new(RefCell::new(ModuleRegistry::new()));
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    execute_module_graph_shared(
+        entry_url,
+        Rc::clone(&host),
+        &mut runtime,
+        Rc::clone(&registry),
+    )
+    .expect("execute_module_graph_shared");
+    let registry_ref = registry.borrow();
+    let value = registry_ref
+        .get_export(entry_url, exported_fn)
+        .expect("entry exports the requested fn");
+    drop(registry_ref);
+    let mut arg_regs: Vec<RegisterValue> =
+        args.iter().map(|&a| RegisterValue::from_i32(a)).collect();
+    let handle = crate::object::ObjectHandle(
+        value
+            .as_object_handle()
+            .expect("exported value must be an object handle"),
+    );
+    // Re-install the dynamic-import context for the call so
+    // `import(expr)` + `import.meta` inside the exported function
+    // see the same host/registry the graph was evaluated with.
+    let result = crate::module_loader::with_dynamic_import_context(
+        Rc::clone(&host),
+        Rc::clone(&registry),
+        entry_url,
+        || {
+            runtime
+                .call_callable(handle, RegisterValue::undefined(), arg_regs.as_mut_slice())
+                .expect("call_callable")
+        },
+    );
+    result
+        .as_i32()
+        .expect("exported fn returned a non-int32 value")
+}
+
+#[test]
+fn m35_dynamic_import_loads_module_and_returns_namespace() {
+    // `import("./lib")` returns a Promise. Using `await` inside
+    // the async entry function unwraps the namespace so we can
+    // call `ns.add(...)` directly. The await also drains the
+    // microtask queue, which is the spec-compliant observation
+    // point for the import resolution.
+    let lib_src = "export function add(a, b) { return a + b }";
+    let entry_src = "export async function main() { \
+            let ns = await import(\"./lib\"); \
+            return ns.add(10, 20) \
+        }";
+    let out = run_module_graph_shared_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 30);
+}
+
+#[test]
+fn m35_import_meta_url_matches_module_url() {
+    // `import.meta.url` exposes the currently-evaluating module's
+    // URL. Inside `main` we read the property and compare its
+    // length to the URL string we passed at compile time.
+    let entry_src = "export function main() { \
+            let meta = import.meta; \
+            return meta.url.length \
+        }";
+    let out = run_module_graph_shared_int32("entry", &[("entry", entry_src)], "main", &[]);
+    // The referrer the loader stores when evaluating "entry" is
+    // literally "entry", so the length is 5.
+    assert_eq!(out, 5);
+}
+
+#[test]
+fn m35_export_specifier_list_without_declaration() {
+    // `export { add }` where `add` is a top-level declaration — the
+    // specifier list is parsed even without an inline declaration.
+    let lib_src = "function add(a, b) { return a + b } export { add }";
+    let entry_src = "import { add } from \"./lib\"; \
+        export function main() { return add(2, 3) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 5);
+}
+
 #[test]
 fn spread_in_new_expression_unsupported() {
     let err = compile(

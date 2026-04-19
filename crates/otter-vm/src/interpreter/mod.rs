@@ -964,7 +964,14 @@ impl Interpreter {
         activation: &mut Activation,
         runtime: &mut RuntimeState,
     ) -> Result<ExecutionResult, InterpreterError> {
-        match self.run_completion_with_runtime(module, activation, runtime)? {
+        let completion = self.run_completion_with_runtime(module, activation, runtime)?;
+        // §9.4 HostEnqueuePromiseJob — drain any promise jobs
+        // queued by the just-finished script before returning to
+        // the host. Observable from the caller when the return
+        // value is a shared object that promise callbacks mutate
+        // (M32 Promise runtime entry point).
+        self.drain_microtasks_for_await(runtime, module)?;
+        match completion {
             Completion::Return(return_value) => Ok(ExecutionResult::new(return_value)),
             Completion::Throw(value) => Err(InterpreterError::UncaughtThrow(value)),
         }

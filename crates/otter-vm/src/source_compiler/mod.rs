@@ -3608,7 +3608,7 @@ fn lower_identifier_reference(
                 })?;
             Ok(())
         }
-        "globalThis" | "Math" | "console" | "Symbol" => {
+        "globalThis" | "Math" | "console" | "Symbol" | "Promise" => {
             // M14 anchor: `globalThis`, `Math`.
             // M19 anchor: `console` — the "hello world" gate. The
             // runtime already installs a `console` object on the

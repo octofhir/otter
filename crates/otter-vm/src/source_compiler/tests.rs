@@ -55,6 +55,44 @@ fn run_int32_function(source: &str, args: &[i32]) -> i32 {
         .expect("function returned a non-int32 value")
 }
 
+/// Helper for M32 tests where the entry function returns a
+/// shared state object and microtasks are expected to mutate it
+/// before the test reads a final int32 counter. `execute_with_runtime`
+/// already drains the microtask queue before returning, so by the
+/// time we reach the property read every queued promise job has
+/// had a chance to run.
+fn run_promise_state_counter(source: &str, property: &str) -> i32 {
+    let module = compile(source).expect("compile");
+    let entry_idx = module.entry();
+    let function = module
+        .function(entry_idx)
+        .expect("module has entry function");
+    let register_count = function.frame_layout().register_count();
+    let registers = vec![RegisterValue::undefined(); usize::from(register_count)];
+    let interpreter = Interpreter::new();
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = interpreter
+        .execute_with_runtime(&module, entry_idx, &registers, &mut runtime)
+        .expect("execute_with_runtime");
+    let state_handle = result
+        .return_value()
+        .as_object_handle()
+        .map(crate::object::ObjectHandle)
+        .expect("main did not return an object");
+    let prop_id = runtime.intern_property_name(property);
+    let lookup = runtime
+        .property_lookup(state_handle, prop_id)
+        .expect("property_lookup")
+        .expect("state missing expected property");
+    let value = match lookup.value() {
+        crate::object::PropertyValue::Data { value, .. } => value,
+        crate::object::PropertyValue::Accessor { .. } => {
+            panic!("state property is an accessor")
+        }
+    };
+    value.as_i32().expect("state property is not an int32")
+}
+
 // ---------------------------------------------------------------------------
 // Parse-phase diagnostics
 // ---------------------------------------------------------------------------
@@ -6409,6 +6447,108 @@ fn for_in_destructuring_unsupported() {
         ),
         "unexpected err: {err:?}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// M32: Promise runtime + microtask queue
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m32_promise_resolve_then_runs_callback_via_microtask() {
+    // `Promise.resolve(v).then(cb)` schedules `cb(v)` as a
+    // microtask. `execute_with_runtime` drains the queue before
+    // returning, so the test observes the mutation through the
+    // shared `state` object.
+    let src = "function main() { \
+        let state = { count: 0 }; \
+        Promise.resolve(5).then(function(v) { state.count = v; }); \
+        return state; \
+    }";
+    assert_eq!(run_promise_state_counter(src, "count"), 5);
+}
+
+#[test]
+fn m32_then_chain_runs_in_order() {
+    // `.then(a).then(b)` — the chained `.then`'s callback sees
+    // the return of `a`. Each settles via microtask so both run
+    // before the host regains control.
+    let src = "function main() { \
+        let state = { count: 0 }; \
+        Promise.resolve(1) \
+            .then(function(v) { state.count = v + 10; return v + 100; }) \
+            .then(function(w) { state.count = w + 1; }); \
+        return state; \
+    }";
+    assert_eq!(run_promise_state_counter(src, "count"), 102);
+}
+
+#[test]
+fn m32_new_promise_resolves_from_executor() {
+    // `new Promise((resolve) => resolve(v))` — executor runs
+    // synchronously with `resolve` / `reject` capability
+    // functions. `.then` callback fires on microtask drain.
+    let src = "function main() { \
+        let state = { count: 0 }; \
+        let p = new Promise(function(resolve, reject) { resolve(42); }); \
+        p.then(function(v) { state.count = v; }); \
+        return state; \
+    }";
+    assert_eq!(run_promise_state_counter(src, "count"), 42);
+}
+
+#[test]
+fn m32_reject_routes_to_catch_handler() {
+    // `.catch(h)` is short for `.then(undefined, h)`. A
+    // `reject(r)` call forwards `r` through the rejection
+    // branch.
+    let src = "function main() { \
+        let state = { count: 0 }; \
+        let p = new Promise(function(resolve, reject) { reject(7); }); \
+        p.catch(function(r) { state.count = r + 100; }); \
+        return state; \
+    }";
+    assert_eq!(run_promise_state_counter(src, "count"), 107);
+}
+
+#[test]
+fn m32_thrown_in_then_propagates_to_catch() {
+    // Exception inside a `.then` callback settles the next
+    // promise in the chain as rejected; a following `.catch`
+    // recovers. Mirrors §27.2.5 PerformPromiseThen + §27.2.1.4
+    // PromiseReactionJob's abrupt-completion branch.
+    let src = "function main() { \
+        let state = { count: 0 }; \
+        Promise.resolve(1) \
+            .then(function(v) { throw v + 10; }) \
+            .catch(function(e) { state.count = e + 1; }); \
+        return state; \
+    }";
+    assert_eq!(run_promise_state_counter(src, "count"), 12);
+}
+
+#[test]
+fn m32_promise_reject_static_yields_rejection() {
+    // `Promise.reject(r)` settles rejected synchronously; the
+    // `.catch` handler fires on drain.
+    let src = "function main() { \
+        let state = { count: 0 }; \
+        Promise.reject(3).catch(function(r) { state.count = r + 20; }); \
+        return state; \
+    }";
+    assert_eq!(run_promise_state_counter(src, "count"), 23);
+}
+
+#[test]
+fn m32_finally_runs_regardless_of_settlement() {
+    // `.finally(cb)` runs after either fulfillment or rejection
+    // and is not passed the settlement value.
+    let src = "function main() { \
+        let state = { count: 0 }; \
+        Promise.resolve(1).finally(function() { state.count = state.count + 5; }); \
+        Promise.reject(1).finally(function() { state.count = state.count + 7; }).catch(function(e) { return e; }); \
+        return state; \
+    }";
+    assert_eq!(run_promise_state_counter(src, "count"), 12);
 }
 
 #[test]

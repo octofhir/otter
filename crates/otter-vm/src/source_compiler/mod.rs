@@ -3608,7 +3608,8 @@ fn lower_identifier_reference(
                 })?;
             Ok(())
         }
-        "globalThis" | "Math" | "console" | "Symbol" | "Promise" => {
+        "globalThis" | "Math" | "console" | "Symbol" | "Promise" | "setTimeout" | "setInterval"
+        | "clearTimeout" | "clearInterval" | "queueMicrotask" => {
             // M14 anchor: `globalThis`, `Math`.
             // M19 anchor: `console` — the "hello world" gate. The
             // runtime already installs a `console` object on the
@@ -7858,6 +7859,61 @@ fn lower_direct_call<'a>(
         ctx.release_temps(1);
         return lower;
     }
+    // Last resort: the name isn't a top-level function or a
+    // local / param / upvalue, but may still be a whitelisted
+    // global (e.g. `queueMicrotask(cb)` / `setTimeout(cb, 0)`).
+    // Route through the same `LdaGlobal` path the identifier
+    // reference uses, then dispatch as a plain closure call.
+    if matches!(
+        name,
+        "queueMicrotask" | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
+    ) {
+        let argc = RegisterIndex::try_from(call.arguments.len())
+            .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+        let callee_temp = ctx.acquire_temps(1)?;
+        let args_base = ctx
+            .acquire_temps(argc)
+            .inspect_err(|_| ctx.release_temps(1))?;
+        let lower = (|| -> Result<(), SourceLoweringError> {
+            let idx = ctx.intern_property_name(name)?;
+            builder
+                .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaGlobal (global callable): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (global callable temp): {err:?}"
+                    ))
+                })?;
+            lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+            builder
+                .emit(
+                    Opcode::CallUndefinedReceiver,
+                    &[
+                        Operand::Reg(u32::from(callee_temp)),
+                        Operand::RegList {
+                            base: u32::from(args_base),
+                            count: u32::from(argc),
+                        },
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CallUndefinedReceiver (global callable): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(argc);
+        ctx.release_temps(1);
+        return lower;
+    }
+
     Err(SourceLoweringError::unsupported(
         "unbound_function",
         callee_ident.span,

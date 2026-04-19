@@ -1441,18 +1441,37 @@ impl Interpreter {
         }
     }
 
-    /// Drains microtasks inline during an await suspension.
-    /// This settles promise chains that resolve synchronously (without timers/IO).
+    /// Drains all microtask queues (nextTick → promise jobs →
+    /// `queueMicrotask`) until every queue is empty. Called from
+    /// `run_with_runtime` at entry-point completion and from the
+    /// `Await` opcode so any promise chain settled by a
+    /// microtask-resolution sequence unwraps correctly on
+    /// `await`.
+    ///
+    /// Drain priority matches Node's documented order:
+    /// `process.nextTick` jobs first, then promise reaction jobs,
+    /// then plain `queueMicrotask` callbacks. The outer loop
+    /// restarts until all three queues settle, so chained
+    /// enqueues (e.g. a promise reaction that queues another
+    /// microtask) converge in one call.
     fn drain_microtasks_for_await(
         &self,
         runtime: &mut RuntimeState,
         module: &Module,
     ) -> Result<(), InterpreterError> {
-        // Simple drain loop — process all promise jobs until exhausted.
-        // This mirrors OtterRuntime::drain_microtasks but runs inside the interpreter.
         loop {
             self.check_interrupt()?;
             let mut did_work = false;
+
+            // §17 HostEnqueuePromiseJob + `process.nextTick` —
+            // nextTick drains first.
+            while let Some(job) = runtime.microtasks_mut().pop_next_tick() {
+                self.check_interrupt()?;
+                let _ =
+                    Self::call_function(runtime, module, job.callback, job.this_value, &job.args);
+                did_work = true;
+            }
+
             while let Some(job) = runtime.microtasks_mut().pop_promise_job() {
                 self.check_interrupt()?;
                 let callback_is_self_settling = matches!(
@@ -1500,6 +1519,17 @@ impl Interpreter {
                 }
                 did_work = true;
             }
+
+            // §8.1.6.1 (HTML) `queueMicrotask` callbacks drain
+            // last. Their return values and throws are discarded
+            // per spec — there's no result promise to settle.
+            while let Some(job) = runtime.microtasks_mut().pop_microtask() {
+                self.check_interrupt()?;
+                let _ =
+                    Self::call_function(runtime, module, job.callback, job.this_value, &job.args);
+                did_work = true;
+            }
+
             if !did_work {
                 break;
             }

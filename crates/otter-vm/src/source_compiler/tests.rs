@@ -6636,6 +6636,188 @@ fn m33_async_arrow_function() {
     assert_eq!(run_promise_state_counter(src, "count"), 6);
 }
 
+// ---------------------------------------------------------------------------
+// M33-finale: microtask-deferred settlement + Promise combinators
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m33f_await_microtask_deferred_promise() {
+    // `await p` where `p` is resolved by a separate microtask
+    // (not at construction time). The Await opcode drains the
+    // queue in a loop until the queue is empty, so a single
+    // layer of deferred settlement converges to a fulfilled
+    // promise before the unwrap check. `holder.resolve` stores
+    // the capability function in an object field so the
+    // executor + microtask share it (avoids `let external;`
+    // which the compiler still rejects as
+    // `uninitialized_binding`).
+    let src = "async function run() { \
+            let holder = { resolve: null }; \
+            let p = new Promise(function(resolve) { holder.resolve = resolve; }); \
+            Promise.resolve().then(function() { holder.resolve(77); }); \
+            let v = await p; \
+            return v + 1; \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 78);
+}
+
+#[test]
+fn m33f_await_multi_layer_microtask_chain() {
+    // Multi-hop microtask chain — every `.then` queues the next
+    // reaction. `drain_microtasks_for_await` loops until the
+    // queue is empty, so all three layers settle and the final
+    // promise is fulfilled by the time await inspects it.
+    let src = "async function run() { \
+            let holder = { resolve: null }; \
+            let p = new Promise(function(resolve) { holder.resolve = resolve; }); \
+            Promise.resolve(1) \
+                .then(function(x) { return x + 10; }) \
+                .then(function(x) { return x + 100; }) \
+                .then(function(x) { holder.resolve(x); }); \
+            return await p; \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 111);
+}
+
+#[test]
+fn m33f_promise_all_resolves_with_array() {
+    // `Promise.all([p1, p2, p3])` fulfills with an array of
+    // values once every input settles. We sum the array to
+    // avoid having to inspect each slot.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            Promise.all([Promise.resolve(10), Promise.resolve(20), Promise.resolve(30)]) \
+                .then(function(arr) { state.count = arr[0] + arr[1] + arr[2]; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 60);
+}
+
+#[test]
+fn m33f_promise_all_rejects_on_first_rejection() {
+    // Per §27.2.4.1, `Promise.all` rejects with the first
+    // rejection reason and ignores later settlements.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            Promise.all([Promise.resolve(1), Promise.reject(9), Promise.resolve(3)]) \
+                .catch(function(r) { state.count = r + 100; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 109);
+}
+
+#[test]
+fn m33f_promise_race_settles_with_first() {
+    // `Promise.race` settles with the first input to settle.
+    // Both inputs here are synchronously-fulfilled; the first
+    // wins via declaration order since they queue reactions
+    // in the same microtask tick.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            Promise.race([Promise.resolve(5), Promise.resolve(99)]) \
+                .then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 5);
+}
+
+#[test]
+fn m33f_promise_all_settled_never_rejects() {
+    // `Promise.allSettled` always fulfills with a list of
+    // `{ status, value | reason }` records — rejections don't
+    // short-circuit. Sum `arr[0].value` (fulfilled) and
+    // `arr[1].reason` (rejected) directly instead of switching
+    // on `status`, which would need string-literal `===`.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            Promise.allSettled([Promise.resolve(10), Promise.reject(3)]) \
+                .then(function(arr) { \
+                    state.count = arr[0].value + arr[1].reason; \
+                }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 13);
+}
+
+#[test]
+fn m33f_promise_any_takes_first_fulfilled() {
+    // §27.2.4.3 — `Promise.any` fulfills with the first
+    // fulfilled input and only rejects if ALL inputs reject.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            Promise.any([Promise.reject(1), Promise.resolve(42), Promise.reject(3)]) \
+                .then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 42);
+}
+
+#[test]
+fn m33f_queue_microtask_runs_during_drain() {
+    // `queueMicrotask(cb)` enqueues `cb` as a microtask. The
+    // execute-entry drain picks it up before main() returns to
+    // the host.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            queueMicrotask(function() { state.count = 42; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 42);
+}
+
+#[test]
+fn m33f_queue_microtask_chain_settles_in_one_drain() {
+    // Microtasks that enqueue more microtasks keep running
+    // within the same drain — the loop in
+    // `drain_microtasks_for_await` only exits when the queue
+    // is completely empty.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            queueMicrotask(function() { \
+                state.count = state.count + 1; \
+                queueMicrotask(function() { \
+                    state.count = state.count + 10; \
+                    queueMicrotask(function() { \
+                        state.count = state.count + 100; \
+                    }); \
+                }); \
+            }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 111);
+}
+
+#[test]
+fn m33f_await_promise_all() {
+    // Composed test — `await Promise.all(...)` inside an async
+    // function unwraps the array of results. Exercises the
+    // combinator + await integration end-to-end.
+    let src = "async function run() { \
+            let parts = await Promise.all([ \
+                Promise.resolve(2), \
+                Promise.resolve(3), \
+                Promise.resolve(5) \
+            ]); \
+            return parts[0] + parts[1] + parts[2]; \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 10);
+}
+
 #[test]
 fn spread_in_new_expression_unsupported() {
     let err = compile(

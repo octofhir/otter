@@ -492,32 +492,27 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
         module_functions.borrow_mut()[top_idx] = lowered;
     }
 
-    // Entry selection:
-    //   1. ES module with no script body — synthesised module-init
-    //      (installs exports as globals, M35).
-    //   2. Any program with a non-empty `script_body` — synthesise
-    //      a "top-level" entry function that runs the collected
-    //      statements top-to-bottom (idiomatic JS; no `main`
-    //      wrapper required). For ESM this also installs
-    //      top-level exports as globals so `capture_exports` sees
-    //      them.
-    //   3. Non-ESM classic script without a script body — fall
-    //      back to the last function declaration (conventional
-    //      `main` pattern, kept for backwards compat).
-    let entry_idx = if !script_body.is_empty() {
-        let top_idx =
-            synthesise_top_level_entry(&module_functions, &names, &module_globals, &script_body)?;
-        u32::try_from(top_idx)
-            .map_err(|_| SourceLoweringError::Internal("top-level entry index overflow".into()))?
-    } else if is_esm {
-        let module_init_idx =
-            synthesise_module_init_function(&module_functions, &names, &module_globals)?;
-        u32::try_from(module_init_idx)
-            .map_err(|_| SourceLoweringError::Internal("module init index overflow".into()))?
-    } else {
-        u32::try_from(declarations.len() - 1)
-            .map_err(|_| SourceLoweringError::Internal("function index overflow".into()))?
-    };
+    // Entry: always the synthesised top-level function. The ES
+    // spec has no notion of a "main" function — a module / script
+    // is just the statements at the top level, evaluated once when
+    // the module loads. Top-level function declarations stay
+    // callable via their `FunctionIndex` / `CallDirect`, but
+    // nothing auto-invokes them; explicit calls (top-level or
+    // inside another function) are the only entry points, matching
+    // real JS semantics.
+    //
+    // For ES modules the synth's preamble installs each exported
+    // top-level binding on the global object so `capture_exports`
+    // in the module loader sees the values.
+    //
+    // Classic scripts that declare only functions (no imperative
+    // statements) still get a top-level entry — its body is just
+    // the trailing `LdaUndefined; Return` pair, which runs once
+    // and exits with no observable side effect.
+    let top_idx =
+        synthesise_top_level_entry(&module_functions, &names, &module_globals, &script_body)?;
+    let entry_idx = u32::try_from(top_idx)
+        .map_err(|_| SourceLoweringError::Internal("top-level entry index overflow".into()))?;
 
     let functions = std::rc::Rc::try_unwrap(module_functions)
         .map_err(|_| SourceLoweringError::Internal("module functions still shared".into()))?
@@ -661,10 +656,14 @@ fn synthesise_top_level_entry<'a>(
         SourceLoweringError::Internal(format!("top-level encode Return: {err:?}"))
     })?;
 
-    let bytecode = builder
-        .finish()
-        .map_err(|err| SourceLoweringError::Internal(format!("top-level finish: {err:?}")))?;
-    let bytecode_len_u32 = bytecode.bytes().len() as u32;
+    // Resolve pending exception handlers + bytecode length BEFORE
+    // `builder.finish()` consumes the builder — `finish` drops
+    // the label state that `take_exception_handlers` needs to
+    // resolve try/catch PCs. A stale `BytecodeBuilder::new()`
+    // would see every label as unbound and surface as
+    // `exception handler try_start unbound`.
+    let exception_handlers = ctx.take_exception_handlers(&builder)?;
+    let bytecode_len_u32 = builder.pc();
     // Merge compiler-tracked closure templates (from nested
     // function expressions inside the script body) with our
     // prepended CreateClosure preamble entries.
@@ -681,10 +680,12 @@ fn synthesise_top_level_entry<'a>(
     }
     let closure_table = crate::closure::ClosureTable::new(closure_vec);
 
+    let bytecode = builder
+        .finish()
+        .map_err(|err| SourceLoweringError::Internal(format!("top-level finish: {err:?}")))?;
     let layout = FrameLayout::new(1, 0, ctx.local_count(), ctx.temp_count())
         .map_err(|err| SourceLoweringError::Internal(format!("top-level layout: {err:?}")))?;
     let feedback_layout = feedback_layout_from_kinds(&ctx.take_feedback_slot_kinds());
-    let exception_handlers = ctx.take_exception_handlers(&BytecodeBuilder::new())?;
     let side_tables = crate::module::FunctionSideTables::new(
         ctx.take_property_names(),
         ctx.take_string_literals(),
@@ -4394,19 +4395,12 @@ fn lower_identifier_reference(
                 })?;
             Ok(())
         }
-        "globalThis" | "Math" | "console" | "Symbol" | "Promise" | "setTimeout" | "setInterval"
-        | "clearTimeout" | "clearInterval" | "queueMicrotask" | "URL" | "URLSearchParams" => {
-            // M14 anchor: `globalThis`, `Math`.
-            // M19 anchor: `console` — the "hello world" gate. The
-            // runtime already installs a `console` object on the
-            // global with `log`/`warn`/`error`/`info`/`debug`
-            // bindings backed by the pluggable `ConsoleBackend`
-            // trait (`StdioConsoleBackend` is the CLI default).
-            // M30-tail: `Symbol` exposes well-known symbols
-            // (`Symbol.iterator`, `Symbol.asyncIterator`, …) as
-            // data properties on the constructor, which the
-            // compiler needs so source-level code can install a
-            // custom `[Symbol.iterator]` on a class prototype.
+        n if is_whitelisted_global_name(n) => {
+            // M14+: well-known runtime globals resolve via
+            // `LdaGlobal`. The runtime installs every constructor
+            // + namespace on the global object during boot, so any
+            // name in `is_whitelisted_global_name` is guaranteed
+            // to be live by the time user code runs.
             let idx = ctx.intern_property_name(name)?;
             builder
                 .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
@@ -8796,11 +8790,11 @@ fn lower_direct_call<'a>(
     // `populate_import_globals` / the synthesised module-init.
     // Route through the same `LdaGlobal` path the identifier
     // reference uses, then dispatch as a plain closure call.
-    if matches!(
-        name,
-        "queueMicrotask" | "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval"
-    ) || ctx.is_module_global(name)
-    {
+    // The call-site whitelist mirrors the identifier-reference
+    // whitelist in `lower_identifier_reference`; when either
+    // expands, both do. This keeps `globalFn(args)` and `let g =
+    // globalFn` resolving consistently through `LdaGlobal`.
+    if is_whitelisted_global_name(name) || ctx.is_module_global(name) {
         let argc = RegisterIndex::try_from(call.arguments.len())
             .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
         let callee_temp = ctx.acquire_temps(1)?;
@@ -9432,6 +9426,94 @@ fn lower_call_arguments_into_temps<'a>(
 /// parts and values outside `i32` range — those surface as
 /// `Unsupported { construct: "non_int32_literal" }` because the
 /// widening path (`LoadF64` / `LoadBigInt`) lands in a later milestone.
+/// Identifies names that always resolve to a runtime-installed
+/// global object. Used by both `lower_identifier_reference` and
+/// `lower_direct_call` to route the name through `LdaGlobal`
+/// instead of rejecting as `unbound_identifier`. Keep in sync
+/// with the set of constructors / namespaces the runtime's boot
+/// sequence installs — the runtime owns the actual binding, this
+/// is just the compiler-side allowlist so we emit
+/// runtime-resolvable code.
+fn is_whitelisted_global_name(name: &str) -> bool {
+    matches!(
+        name,
+        // Foundation
+        "globalThis"
+        | "Math"
+        | "JSON"
+        | "console"
+        | "Symbol"
+        | "Promise"
+        | "Reflect"
+        // Core types + constructors
+        | "Object"
+        | "Array"
+        | "String"
+        | "Number"
+        | "Boolean"
+        | "BigInt"
+        | "Function"
+        | "Date"
+        | "RegExp"
+        | "Iterator"
+        | "AsyncIterator"
+        // Error hierarchy
+        | "Error"
+        | "TypeError"
+        | "RangeError"
+        | "SyntaxError"
+        | "ReferenceError"
+        | "EvalError"
+        | "URIError"
+        | "AggregateError"
+        // Collections
+        | "Map"
+        | "Set"
+        | "WeakMap"
+        | "WeakSet"
+        | "WeakRef"
+        | "FinalizationRegistry"
+        // Binary data
+        | "ArrayBuffer"
+        | "SharedArrayBuffer"
+        | "DataView"
+        | "Atomics"
+        | "Int8Array"
+        | "Uint8Array"
+        | "Uint8ClampedArray"
+        | "Int16Array"
+        | "Uint16Array"
+        | "Int32Array"
+        | "Uint32Array"
+        | "Float32Array"
+        | "Float64Array"
+        | "BigInt64Array"
+        | "BigUint64Array"
+        // Proxy
+        | "Proxy"
+        // Event loop / async
+        | "setTimeout"
+        | "setInterval"
+        | "clearTimeout"
+        | "clearInterval"
+        | "queueMicrotask"
+        // Web APIs (otter-web)
+        | "URL"
+        | "URLSearchParams"
+        | "fetch"
+        | "Headers"
+        | "Request"
+        | "Response"
+        | "Blob"
+        | "TextEncoder"
+        | "TextDecoder"
+        | "performance"
+        | "structuredClone"
+        // Node-compat runtime
+        | "process"
+    )
+}
+
 fn int32_from_literal(literal: &NumericLiteral<'_>) -> Result<i32, SourceLoweringError> {
     let value = literal.value;
     if !value.is_finite() || value.fract() != 0.0 {

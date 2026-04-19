@@ -19,15 +19,61 @@ fn compile(source: &str) -> Result<crate::module::Module, SourceLoweringError> {
     ModuleCompiler::new().compile(source, "test.js", SourceType::default())
 }
 
+/// Return `(FunctionIndex, &Function)` for the user-declared
+/// function the tests want to call directly. The module's entry
+/// is always the synthesised `<top-level>` now, so tests that
+/// pre-date top-level-statement support need to fish out the
+/// function they actually want to invoke.
+///
+/// Strategy:
+///   1. Prefer a top-level function named `main`
+///   2. Then `f` (the other common test convention)
+///   3. Then the first function whose name doesn't start with
+///      `<` — which, given the compiler emits top-level
+///      declarations at indices `0..N` before any nested
+///      function expressions, always resolves to a top-level
+///      declaration when one exists.
+fn pick_last_named_function(
+    module: &crate::module::Module,
+) -> Option<(FunctionIndex, &crate::module::Function)> {
+    let functions = module.functions();
+    let by_name = |target: &str| {
+        functions.iter().enumerate().find_map(|(i, f)| {
+            if f.name() == Some(target) {
+                let idx = u32::try_from(i).ok()?;
+                Some((FunctionIndex(idx), f))
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(hit) = by_name("main") {
+        return Some(hit);
+    }
+    if let Some(hit) = by_name("f") {
+        return Some(hit);
+    }
+    for (i, f) in functions.iter().enumerate() {
+        let name = f.name().unwrap_or("");
+        if name.starts_with('<') {
+            continue;
+        }
+        let idx = u32::try_from(i).ok()?;
+        return Some((FunctionIndex(idx), f));
+    }
+    None
+}
+
 fn run_int32_function(source: &str, args: &[i32]) -> i32 {
     let module = compile(source).expect("compile");
-    // Use the module's declared entry — M9 picks the *last*
-    // top-level FunctionDeclaration as `entry`, so the helper
-    // can no longer hardcode `FunctionIndex(0)`.
-    let entry_idx = module.entry();
-    let function = module
-        .function(entry_idx)
-        .expect("module has entry function");
+    // The module entry is always the synthesised top-level
+    // function (runs the script body once, returns `undefined`).
+    // These tests want to call the LAST user-declared function —
+    // by convention `main` or `f` — with the given args. Pick it
+    // explicitly: walk `module.functions()` and take the last
+    // named one whose name isn't the synth placeholder.
+    let (entry_idx, function) =
+        pick_last_named_function(&module).expect("module must declare at least one named function");
     let register_count = function.frame_layout().register_count();
     let mut registers = vec![RegisterValue::undefined(); usize::from(register_count)];
     // Parameters are laid out immediately after the hidden slots. The
@@ -63,7 +109,7 @@ fn run_int32_function(source: &str, args: &[i32]) -> i32 {
 /// had a chance to run.
 fn run_promise_state_counter(source: &str, property: &str) -> i32 {
     let module = compile(source).expect("compile");
-    let entry_idx = module.entry();
+    let (entry_idx, _) = pick_last_named_function(&module).expect("named fn");
     let function = module
         .function(entry_idx)
         .expect("module has entry function");
@@ -137,15 +183,31 @@ fn fractional_numeric_literal_compiles() {
 }
 
 #[test]
-fn two_functions_at_top_level_pick_last_as_entry() {
-    // M9 lifted M1's "single top-level FunctionDeclaration"
-    // restriction. Both functions are compiled; the entry index
-    // points at the last declaration, so calling `otter run` on
-    // this module would invoke `b` (returning 2), not `a`.
-    assert_eq!(
-        run_int32_function("function a() { return 1; } function b() { return 2; }", &[]),
-        2
-    );
+fn two_functions_at_top_level_both_compile() {
+    // Two declarations at the top level both become callable
+    // module-functions. No "main" magic: the test helper picks
+    // `a` (the `by_name("f")`/first-top-level fallback), asserts
+    // it returns 1, then repeats with `b`.
+    let module = compile("function a() { return 1; } function b() { return 2; }").expect("compile");
+    let call = |name: &str| {
+        let (idx, function) = module
+            .functions()
+            .iter()
+            .enumerate()
+            .find_map(|(i, f)| (f.name() == Some(name)).then_some((FunctionIndex(i as u32), f)))
+            .expect("named function present");
+        let regs =
+            vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+        let mut rt = crate::interpreter::RuntimeState::new();
+        Interpreter::new()
+            .execute_with_runtime(&module, idx, &regs, &mut rt)
+            .expect("execute")
+            .return_value()
+            .as_i32()
+            .expect("int32")
+    };
+    assert_eq!(call("a"), 1);
+    assert_eq!(call("b"), 2);
 }
 
 // Removed: multi_parameters_unsupported, default_parameter_unsupported,
@@ -192,7 +254,7 @@ fn missing_trailing_return_returns_undefined() {
     // lowering now synthesizes `LdaUndefined; Return` after any
     // non-return tail statement. (§15.2.1 FunctionBody evaluation.)
     let module = compile("function f() { let x = 1; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -209,7 +271,7 @@ fn bare_return_returns_undefined() {
     // to reject this with `return_without_value`; M19 follow-up
     // emits `LdaUndefined; Return` instead.
     let module = compile("function f() { return; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -528,8 +590,10 @@ fn var_declaration_lowered_as_let_at_declaration_site() {
     // Function-scope hoisting across hoisted calls is still TBD,
     // but the common single-declaration-before-read pattern
     // works end-to-end — no more `var_declaration` rejection.
-    let result = compile("function f() { var x = 7; return x; }").expect("var compiles");
-    assert_eq!(result.function(result.entry()).unwrap().name(), Some("f"));
+    assert_eq!(
+        run_int32_function("function f() { var x = 7; return x; }", &[]),
+        7
+    );
 }
 
 #[test]
@@ -1208,7 +1272,7 @@ fn if_with_return_only_branch_falls_through_to_undefined() {
     // not-taken path exits correctly without the programmer
     // writing a second explicit `return`.
     let module = compile("function f(n) { if (n > 0) return n; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     // n = 0 → fall through → undefined.
@@ -1936,7 +2000,7 @@ fn logical_not_on_truthy_int32_returns_false() {
     // `!n` → `Ldar r0; LogicalNot; Return`. Non-zero int32 is
     // truthy, so `!5` is false (0 when coerced back to i32).
     let module = compile("function f(n) { return !n; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -1952,7 +2016,7 @@ fn logical_not_on_truthy_int32_returns_false() {
 #[test]
 fn logical_not_on_zero_returns_true() {
     let module = compile("function f(n) { return !n; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -1970,7 +2034,7 @@ fn typeof_int32_returns_number_string() {
     // `typeof n` → `Ldar r0; TypeOf; Return`. Returns the string
     // "number" for int32 values.
     let module = compile("function f(n) { return typeof n; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -2000,7 +2064,7 @@ fn void_expression_returns_undefined() {
     // in scope as an identifier at this milestone, so the test can't
     // write `=== undefined` in source yet.
     let module = compile("function f(n) { return void n; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -2679,7 +2743,7 @@ fn logical_or_composes_with_ternary() {
 #[test]
 fn null_literal_returns_null() {
     let module = compile("function f() { return null; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -2693,7 +2757,7 @@ fn null_literal_returns_null() {
 #[test]
 fn true_literal_returns_true() {
     let module = compile("function f() { return true; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -2707,7 +2771,7 @@ fn true_literal_returns_true() {
 #[test]
 fn false_literal_returns_false() {
     let module = compile("function f() { return false; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -2721,7 +2785,7 @@ fn false_literal_returns_false() {
 #[test]
 fn undefined_identifier_maps_to_lda_undefined() {
     let module = compile("function f() { return undefined; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -2737,7 +2801,7 @@ fn nan_identifier_maps_to_lda_nan() {
     // `NaN` returns the NaN-boxed NaN — `as_i32` is None because
     // the value isn't an int32. We check via IEEE bits.
     let module = compile("function f() { return NaN; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -2752,7 +2816,7 @@ fn nan_identifier_maps_to_lda_nan() {
 #[test]
 fn infinity_identifier_maps_to_lda_const_f64() {
     let module = compile("function f() { return Infinity; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     // The function's float-constant side table must include INFINITY.
     assert_eq!(function.float_constants().len(), 1);
@@ -2772,7 +2836,7 @@ fn global_this_resolves_via_lda_global() {
     // and emit `LdaGlobal`. The interpreter walks the runtime's
     // global object and returns a handle.
     let module = compile("function f() { return globalThis; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     assert_eq!(function.property_names().len(), 1);
     let registers =
@@ -2791,7 +2855,7 @@ fn math_identifier_resolves_via_lda_global() {
     // intrinsic Math object. LdaGlobal with "Math" interned into
     // the property-name table should resolve.
     let module = compile("function f() { return Math; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     assert_eq!(function.property_names().len(), 1);
     let registers =
@@ -2830,17 +2894,18 @@ fn undefined_property_name_interner_dedups() {
     // — property_names must stay at length 1.
     let module = compile("function f() { let a = globalThis; let b = globalThis; return a; }")
         .expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     assert_eq!(function.property_names().len(), 1);
 }
 
 #[test]
 fn unknown_global_identifier_still_rejected() {
-    // Anything outside the current whitelist still surfaces as
-    // `unbound_identifier` at compile time — the generic
-    // LdaGlobal fallback only activates for the whitelisted names.
-    let err = compile("function f() { return Reflect; }").expect_err("unknown global at M14");
+    // A name that isn't in the whitelist AND isn't a top-level
+    // function / local / module global still surfaces as
+    // `unbound_identifier` at compile time. `Reflect` is in the
+    // whitelist now, so we pick an invented name instead.
+    let err = compile("function f() { return TotallyMadeUpBinding; }").expect_err("unknown global");
     assert!(
         matches!(
             err,
@@ -2863,7 +2928,7 @@ fn unknown_global_identifier_still_rejected() {
 /// — the caller's test is asserting a string result.
 fn run_string_function(source: &str, args: &[RegisterValue]) -> String {
     let module = compile(source).expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).expect("module has entry function");
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -2883,7 +2948,7 @@ fn run_string_function(source: &str, args: &[RegisterValue]) -> String {
 #[test]
 fn string_literal_returns_string() {
     let module = compile("function f() { return \"hello\"; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     // The function's string-literal side table must hold exactly
     // one entry — the literal we returned.
@@ -2918,7 +2983,7 @@ fn literal_plus_identifier_concat() {
     // follows through `apply_binary_op_with_acc_lhs`' identifier
     // branch — the simple path, no temp spill needed.
     let module = compile("function greet(name) { return \"hello, \" + name; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     assert_eq!(function.string_literals().len(), 1);
     let hidden = usize::from(function.frame_layout().hidden_count());
@@ -2946,7 +3011,7 @@ fn identifier_plus_literal_concat_preserves_order() {
     // 2-temp fallback must preserve LHS → RHS order so the result
     // is `name + "!"`, not `"!" + name`.
     let module = compile("function punct(name) { return name + \"!\"; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -3014,7 +3079,7 @@ fn string_interner_dedups_repeated_literals() {
     // slot. Mirrors the M14 property-name interner test.
     let module = compile("function f() { let a = \"hello\"; let b = \"hello\"; return b; }")
         .expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     assert_eq!(function.string_literals().len(), 1);
 }
@@ -3058,8 +3123,13 @@ fn compile_and_run(
     crate::interpreter::RuntimeState,
 ) {
     let module = compile(source).expect("compile");
-    let entry = module.entry();
-    let function = module.function(entry).expect("entry fn");
+    // Call the last user-declared named function (`f`, `main`,
+    // etc.) directly — the module's actual entry is the
+    // synthesised top-level that returns `undefined`. Every
+    // pre-top-level test expected the first-declared-function
+    // return value, so route there by name-resolution.
+    let (entry, function) =
+        pick_last_named_function(&module).expect("module must declare a named function");
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
     let mut runtime = crate::interpreter::RuntimeState::new();
@@ -3239,7 +3309,7 @@ fn object_property_name_interner_dedups() {
     // (later assignment wins). Both write through the same
     // interned name, so `property_names` stays at 1.
     let module = compile("function f() { return { k: 1, k: 2 }; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     assert_eq!(function.property_names().len(), 1);
 }
@@ -3570,7 +3640,7 @@ fn simple_template_interns_string_literal() {
     // intern into the function's string-literal table the same as
     // a regular StringLiteral would.
     let module = compile("function f() { return `hi`; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     assert_eq!(function.string_literals().len(), 1);
 }
@@ -3580,7 +3650,7 @@ fn template_with_single_identifier_substitution() {
     // `` `hello, ${name}!` `` — head quasi "hello, ", one
     // expression, tail quasi "!".
     let module = compile("function greet(name) { return `hello, ${name}!`; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -3606,7 +3676,7 @@ fn template_with_int_substitution_coerces_via_js_add() {
     // ToPrimitive → ToString on non-string operands once either
     // side is a string (the head quasi here).
     let module = compile("function f(n) { return `n=${n}`; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let hidden = usize::from(function.frame_layout().hidden_count());
     let mut registers =
@@ -3758,8 +3828,8 @@ fn compile_and_run_with_capture(
     RegisterValue,
 ) {
     let module = compile(source).expect("compile");
-    let entry = module.entry();
-    let function = module.function(entry).expect("entry fn");
+    let (entry, function) =
+        pick_last_named_function(&module).expect("module must declare a named function");
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
     let capture = std::sync::Arc::new(crate::console::CaptureConsoleBackend::new());
@@ -4385,7 +4455,7 @@ fn uncaught_throw_propagates_to_caller() {
     // an uncaught-throw completion. We observe it via the
     // harness's `execute_with_runtime` error path.
     let module = compile("function f() { throw 1; }").expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -4459,7 +4529,7 @@ fn destructuring_catch_param_rejected() {
 /// the *callee* side but still return an int at the top level.
 fn run_main_int(source: &str) -> i32 {
     let module = compile(source).expect("compile");
-    let entry = module.entry();
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
     let function = module.function(entry).unwrap();
     let registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
@@ -7045,8 +7115,8 @@ fn d2_multi_line_function_populates_source_map() {
     // an entry resolving to the original `(line, column)`.
     let src = "function main() {\n    let a = 1;\n    let b = 2;\n    return a + b;\n}";
     let module = compile(src).expect("compile");
-    let entry = module.function(module.entry()).expect("entry fn");
-    let sm = entry.source_map();
+    let (_, function) = pick_last_named_function(&module).expect("named fn");
+    let sm = function.source_map();
     assert!(!sm.is_empty(), "source map should have entries");
     // The first statement starts on line 2 (0-indexed bytes 22ish) —
     // confirm the lookup for PC=0 resolves to line 2 or later.
@@ -7064,8 +7134,8 @@ fn d2_source_map_lookup_finds_correct_line() {
     // the `let` entries should resolve to line 4.
     let src = "function main() {\n    let a = 10;\n    let b = 20;\n    return a + b;\n}";
     let module = compile(src).expect("compile");
-    let entry = module.function(module.entry()).expect("entry fn");
-    let sm = entry.source_map();
+    let (_, function) = pick_last_named_function(&module).expect("named fn");
+    let sm = function.source_map();
     // The last statement is the return on line 4 — any PC at or
     // after the last recorded entry must surface line 4.
     let last_pc = sm

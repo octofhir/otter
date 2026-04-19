@@ -529,7 +529,7 @@ impl Interpreter {
     ///
     /// Creates a result promise, runs the function body via `run_completion_with_runtime`,
     /// and settles the promise based on the outcome (return → resolve, throw → reject).
-    fn execute_async_function_body(
+    pub(super) fn execute_async_function_body(
         runtime: &mut RuntimeState,
         module: &Module,
         activation: &mut Activation,

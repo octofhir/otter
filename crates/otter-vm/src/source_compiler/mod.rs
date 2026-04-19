@@ -328,12 +328,6 @@ fn lower_function_declaration<'a>(
     function_names: &'a [&'a str],
     module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
 ) -> Result<VmFunction, SourceLoweringError> {
-    if func.r#async {
-        return Err(SourceLoweringError::unsupported(
-            "async_function",
-            func.span,
-        ));
-    }
     if func.generator {
         return Err(SourceLoweringError::unsupported("generator", func.span));
     }
@@ -409,7 +403,8 @@ fn lower_function_declaration<'a>(
 
     Ok(
         VmFunction::new(Some(name), layout, body_out.bytecode, tables)
-            .with_strict(func.id.is_some()),
+            .with_strict(func.id.is_some())
+            .with_async(func.r#async),
     )
 }
 
@@ -906,6 +901,11 @@ fn lower_nested_statement<'a>(
                 Expression::CallExpression(call) => lower_call_expression(builder, ctx, call),
                 Expression::UpdateExpression(update) => {
                     lower_update_expression(builder, ctx, update)
+                }
+                // M33: `await p;` as a statement — lower the
+                // expression, result discarded.
+                Expression::AwaitExpression(_) => {
+                    lower_return_expression(builder, ctx, &expr_stmt.expression)
                 }
                 other => Err(SourceLoweringError::unsupported(
                     expression_construct_tag(other),
@@ -3793,6 +3793,18 @@ fn lower_return_expression<'a>(
         // the runtime's `[[PrivateElements]]` table against the
         // active class_id.
         Expression::PrivateInExpression(expr) => lower_private_in_expression(builder, ctx, expr),
+        // M33: `await <expr>` — lowers the operand into acc then
+        // emits the `Await` opcode. Runtime semantics: drain the
+        // microtask queue, unwrap settled promises (or throw on
+        // rejection), pass plain values through unchanged per
+        // §27.7.5.3 step 5.
+        Expression::AwaitExpression(await_expr) => {
+            lower_return_expression(builder, ctx, &await_expr.argument)?;
+            builder
+                .emit(Opcode::Await, &[])
+                .map_err(|err| SourceLoweringError::Internal(format!("encode Await: {err:?}")))?;
+            Ok(())
+        }
         Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
         Expression::FunctionExpression(func) => lower_function_expression(builder, ctx, func),
         Expression::ArrowFunctionExpression(arrow) => {
@@ -3859,12 +3871,6 @@ fn lower_function_expression<'a>(
     ctx: &LoweringContext<'a>,
     func: &'a Function<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if func.r#async {
-        return Err(SourceLoweringError::unsupported(
-            "async_function",
-            func.span,
-        ));
-    }
     if func.generator {
         return Err(SourceLoweringError::unsupported("generator", func.span));
     }
@@ -3874,14 +3880,26 @@ fn lower_function_expression<'a>(
     // element's slot index matches the inner function's
     // `LdaUpvalue <idx>` operands.
     let (inner_idx, captures) = lower_inner_function_with_captures(func, ctx)?;
+    if func.r#async {
+        let mut fns = ctx.module_functions.borrow_mut();
+        fns[inner_idx as usize].set_async(true);
+    }
 
     let pc = builder.pc();
-    let template =
-        crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(inner_idx), captures);
+    let template = crate::closure::ClosureTemplate::with_flags(
+        crate::module::FunctionIndex(inner_idx),
+        captures,
+        if func.r#async {
+            crate::object::ClosureFlags::async_fn()
+        } else {
+            crate::object::ClosureFlags::normal()
+        },
+    );
     ctx.record_closure_template(pc, template);
 
     // Emit `CreateClosure <idx>, 0`. The second operand carries
-    // closure flags — all zero for M25 (not generator, not async).
+    // closure flags — dispatch reads them from the closure template
+    // at the PC, so the imm is conventional (zero).
     builder
         .emit(
             Opcode::CreateClosure,
@@ -3907,12 +3925,6 @@ fn lower_arrow_function_expression<'a>(
     ctx: &LoweringContext<'a>,
     arrow: &'a ArrowFunctionExpression<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if arrow.r#async {
-        return Err(SourceLoweringError::unsupported(
-            "async_arrow_function",
-            arrow.span,
-        ));
-    }
     // oxc synthesises the arrow body as a `FunctionBody` whose
     // single statement is a `ReturnStatement` for concise
     // `() => expr` form. Block-body arrows already have a
@@ -3920,9 +3932,20 @@ fn lower_arrow_function_expression<'a>(
     // `lower_inner_callable` unchanged — no special-casing of
     // `arrow.expression` needed.
     let (inner_idx, captures) = lower_inner_callable(ctx, &arrow.params, &arrow.body, None)?;
+    if arrow.r#async {
+        let mut fns = ctx.module_functions.borrow_mut();
+        fns[inner_idx as usize].set_async(true);
+    }
     let pc = builder.pc();
-    let template =
-        crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(inner_idx), captures);
+    let template = crate::closure::ClosureTemplate::with_flags(
+        crate::module::FunctionIndex(inner_idx),
+        captures,
+        if arrow.r#async {
+            crate::object::ClosureFlags::async_arrow()
+        } else {
+            crate::object::ClosureFlags::arrow()
+        },
+    );
     ctx.record_closure_template(pc, template);
     builder
         .emit(
@@ -3951,12 +3974,6 @@ fn lower_nested_function_declaration<'a>(
     ctx: &mut LoweringContext<'a>,
     func: &'a Function<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if func.r#async {
-        return Err(SourceLoweringError::unsupported(
-            "async_function",
-            func.span,
-        ));
-    }
     if func.generator {
         return Err(SourceLoweringError::unsupported("generator", func.span));
     }
@@ -3969,9 +3986,20 @@ fn lower_nested_function_declaration<'a>(
     // Lower the inner function + record captures against the
     // enclosing context, same as FunctionExpression.
     let (inner_idx, captures) = lower_inner_function_with_captures(func, ctx)?;
+    if func.r#async {
+        let mut fns = ctx.module_functions.borrow_mut();
+        fns[inner_idx as usize].set_async(true);
+    }
     let pc = builder.pc();
-    let template =
-        crate::closure::ClosureTemplate::new(crate::module::FunctionIndex(inner_idx), captures);
+    let template = crate::closure::ClosureTemplate::with_flags(
+        crate::module::FunctionIndex(inner_idx),
+        captures,
+        if func.r#async {
+            crate::object::ClosureFlags::async_fn()
+        } else {
+            crate::object::ClosureFlags::normal()
+        },
+    );
     ctx.record_closure_template(pc, template);
     builder
         .emit(

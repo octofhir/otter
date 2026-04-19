@@ -156,18 +156,6 @@ fn two_functions_at_top_level_pick_last_as_entry() {
 }
 
 #[test]
-fn async_function_unsupported() {
-    let err = compile("async function f() { return 1; }").expect_err("async lands later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "async_function",
-            ..
-        }
-    ));
-}
-
-#[test]
 fn generator_unsupported() {
     let err = compile("function* g() { return 1; }").expect_err("generator lands later");
     assert!(matches!(
@@ -5294,24 +5282,6 @@ fn arrow_as_call_argument() {
     assert_eq!(run_int32_function(src, &[]), 50);
 }
 
-#[test]
-fn arrow_async_rejected() {
-    // `async n => n` — async arrows land with M33; stays
-    // rejected with a stable tag until then.
-    let err =
-        compile("function main() { let f = async (n) => n; return 0; }").expect_err("async arrow");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "async_arrow_function",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
-}
-
 // ---------------------------------------------------------------------------
 // M27: Class declarations (constructor + instance/static methods)
 // ---------------------------------------------------------------------------
@@ -6549,6 +6519,121 @@ fn m32_finally_runs_regardless_of_settlement() {
         return state; \
     }";
     assert_eq!(run_promise_state_counter(src, "count"), 12);
+}
+
+// ---------------------------------------------------------------------------
+// M33: async functions + await
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m33_async_function_returns_promise_of_value() {
+    // `async function f() { return v; }` wraps the return in a
+    // Promise; `.then` settles via microtask drain.
+    let src = "async function inner() { return 17; } \
+        function main() { \
+            let state = { count: 0 }; \
+            inner().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 17);
+}
+
+#[test]
+fn m33_await_unwraps_fulfilled_promise() {
+    // `await p` returns p's fulfillment value. The async body
+    // itself returns a Promise; we chain `.then` to observe
+    // the settled result.
+    let src = "async function run() { \
+            let v = await Promise.resolve(11); \
+            return v + 1; \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 12);
+}
+
+#[test]
+fn m33_await_non_promise_passes_through() {
+    // §27.7.5.3 step 5 — `await <non-thenable>` treats the
+    // operand as already-fulfilled, so `await 5` yields 5.
+    let src = "async function run() { \
+            let v = await 5; \
+            return v + 100; \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 105);
+}
+
+#[test]
+fn m33_await_chained_promises() {
+    // `await Promise.resolve(v).then(x => x + 1)` — chained
+    // promise settles via microtask drain, then `await`
+    // unwraps the final value.
+    let src = "async function run() { \
+            let v = await Promise.resolve(10).then(function(x) { return x + 5; }); \
+            return v * 2; \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 30);
+}
+
+#[test]
+fn m33_try_catch_around_await_rejected() {
+    // `try { await rejectedPromise; } catch (e) { ... }` —
+    // the Await opcode throws the rejection reason; the
+    // function's try/catch catches it.
+    let src = "async function run() { \
+            try { \
+                await Promise.reject(42); \
+                return 0; \
+            } catch (e) { \
+                return e + 1; \
+            } \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 43);
+}
+
+#[test]
+fn m33_async_function_rejects_on_thrown() {
+    // Thrown exceptions inside an async body settle its
+    // result promise as rejected; `.catch` handles it.
+    let src = "async function bad() { throw 9; } \
+        function main() { \
+            let state = { count: 0 }; \
+            bad().catch(function(e) { state.count = e + 1; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 10);
+}
+
+#[test]
+fn m33_async_arrow_function() {
+    // Async arrow expressions land via `async (args) => expr`.
+    // Same settlement semantics as async function — await
+    // inside unwraps the promise value.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            let f = async function(n) { return n + 1; }; \
+            f(5).then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 6);
 }
 
 #[test]

@@ -2311,6 +2311,41 @@ impl Interpreter {
                 }
             }
 
+            // §14.6.3 / §27.7.5.3 Await — drain the microtask
+            // queue so any pending `.then` reactions have had a
+            // chance to settle the operand, then unwrap the
+            // resulting promise state:
+            //   - Fulfilled(v)  → acc = v.
+            //   - Rejected(r)   → throw r.
+            //   - Pending       → TypeError (real coroutine
+            //     suspension isn't wired yet; all promises our
+            //     runtime produces settle during the drain).
+            //   - Non-promise   → acc unchanged per §27.7.5.3
+            //     step 5, which treats plain values as already
+            //     fulfilled.
+            Opcode::Await => {
+                let input = activation.accumulator();
+                self.drain_microtasks_for_await(runtime, _module)?;
+                if let Some(handle) = input.as_object_handle()
+                    && let Some(promise) = runtime
+                        .objects
+                        .get_promise(crate::object::ObjectHandle(handle))
+                {
+                    if let Some(value) = promise.fulfilled_value() {
+                        activation.set_accumulator(value);
+                    } else if let Some(reason) = promise.rejected_reason() {
+                        return Ok(StepOutcome::Throw(reason));
+                    } else {
+                        let err = runtime
+                            .alloc_type_error("await on a pending promise is not yet supported")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+                // Non-promise acc stays as-is — spec treats
+                // primitives / non-thenable values as already
+                // fulfilled with themselves.
+            }
+
             Opcode::Nop => {}
 
             // Any other opcode is unsupported by this Phase 3b.1
@@ -2413,6 +2448,24 @@ impl Interpreter {
         // Preserve overflow args for CreateArguments (§10.4.4).
         if arguments.len() > param_count as usize {
             activation.overflow_args = arguments[param_count as usize..].to_vec();
+        }
+
+        // M33: §27.7.5.1 AsyncFunctionStart — direct calls to
+        // `async function` declarations also need to route
+        // through the promise-wrapping driver. Without this
+        // branch, calling `inner()` where `inner` is an async
+        // top-level function would return a plain value instead
+        // of a Promise, so downstream `.then(...)` would fail.
+        if callee.is_async() {
+            return match Self::execute_async_function_body(runtime, module, &mut activation) {
+                Ok(v) => Ok(v),
+                Err(InterpreterError::UncaughtThrow(v)) => Err(StepOutcome::Throw(v)),
+                Err(InterpreterError::TypeError(msg)) => match runtime.alloc_type_error(&msg) {
+                    Ok(h) => Err(StepOutcome::Throw(RegisterValue::from_object_handle(h.0))),
+                    Err(_) => Err(StepOutcome::Throw(RegisterValue::undefined())),
+                },
+                Err(_) => Err(StepOutcome::Throw(RegisterValue::undefined())),
+            };
         }
 
         match self.run_with_tier_up(module, &mut activation, runtime) {

@@ -286,6 +286,15 @@ impl Function {
         self.derived_constructor = derived_constructor;
     }
 
+    /// Sets the async flag in place.
+    ///
+    /// Mutator companion to [`Self::with_async`] — used by the
+    /// source compiler after `lower_inner_function_with_captures`
+    /// pushes the function onto the shared module list (M33).
+    pub fn set_async(&mut self, r#async: bool) {
+        self.r#async = r#async;
+    }
+
     /// Returns whether this function is a derived class constructor.
     #[must_use]
     pub const fn is_derived_constructor(&self) -> bool {

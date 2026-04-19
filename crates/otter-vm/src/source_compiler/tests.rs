@@ -4952,86 +4952,79 @@ fn array_destructure_param_with_rest() {
 }
 
 #[test]
-fn nested_destructuring_rejected() {
-    let err = compile("function f() { let [[a]] = [[1]]; return a; }").expect_err("nested array");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "nested_destructuring",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
+fn nested_array_destructuring_works() {
+    // `[[a]] = [[1]]` — outer array pattern's element is itself
+    // an ArrayPattern. The lowering reads element[0] into a temp
+    // and recurses.
+    assert_eq!(
+        run_int32_function("function f() { let [[a]] = [[7]]; return a; }", &[]),
+        7,
     );
 }
 
 #[test]
-fn object_rest_destructure_rejected() {
-    let err = compile("function f() { let { a, ...rest } = { a: 1, b: 2 }; return a; }")
-        .expect_err("object rest");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "object_pattern_rest",
-                ..
-            }
+fn nested_object_destructuring_works() {
+    // `{ a: { b } }` — nested ObjectPattern.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let { a: { b } } = { a: { b: 9 } }; return b; }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        9,
     );
 }
 
 #[test]
-fn computed_pattern_key_rejected() {
-    let err = compile("function f() { let k = \"a\"; let { [k]: v } = { a: 1 }; return v; }")
-        .expect_err("computed key");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "computed_pattern_key",
-                ..
-            }
+fn object_rest_destructure_copies_remaining_keys() {
+    // `{ a, ...rest }` — `a` binds directly, every other
+    // own-enumerable property lands on a fresh `rest` object.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let { a, ...rest } = { a: 1, b: 2, c: 3 }; return rest.b + rest.c; }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        5,
     );
 }
 
 #[test]
-fn array_pattern_hole_rejected() {
-    // `let [a, , c] = [1, 2, 3]` — the middle element is a hole
-    // (sparse destructuring). Rejected at M24.
-    let err = compile("function f() { let [a, , c] = [1, 2, 3]; return a + c; }")
-        .expect_err("array hole");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "array_pattern_hole",
-                ..
-            }
+fn computed_pattern_key_works() {
+    // `{ [k]: v } = obj` — key evaluates at runtime, value lands
+    // in `v` via `LdaKeyedProperty`.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let k = \"a\"; let { [k]: v } = { a: 42 }; return v; }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        42,
     );
 }
 
 #[test]
-fn array_destructure_default_rejected() {
-    // `let [a = 5] = [];` — array-element defaults aren't on the
-    // M24 surface (M25+ will add them). Object-property defaults
-    // still work via the object path.
-    let err =
-        compile("function f() { let [a = 5] = []; return a; }").expect_err("array pattern default");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "array_pattern_default",
-                ..
-            }
+fn array_pattern_hole_skips_element() {
+    // `[a, , c]` — the middle hole has no binding. Lowerer
+    // advances the index anyway so `c` reads element[2].
+    assert_eq!(
+        run_int32_function(
+            "function f() { let [a, , c] = [1, 2, 3]; return a + c; }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        4,
+    );
+}
+
+#[test]
+fn array_destructure_default_applies_when_undefined() {
+    // `let [a = 5] = []` — element 0 is undefined, so `a` takes
+    // the default value. `let [a = 5] = [7]` keeps the provided
+    // value.
+    assert_eq!(
+        run_int32_function("function f() { let [a = 5] = []; return a; }", &[]),
+        5,
+    );
+    assert_eq!(
+        run_int32_function("function f() { let [a = 5] = [7]; return a; }", &[]),
+        7,
     );
 }
 

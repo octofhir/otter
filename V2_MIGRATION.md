@@ -74,7 +74,7 @@ Each row is one shippable slice, committed as a `feat(vm): … (Mxx)` pair plus 
 | M33      | `async` functions + `await` expression.                                                                                         | [x]    | 78c0141 |
 | M34      | Generators (`function*`, `yield`, `yield*`).                                                                                   | [x]    | 1ed53a4 |
 | M35      | ES module imports + exports.                                                                                                    | [ ]    |        |
-| M36      | `BigIntLiteral` + BigInt arithmetic + `RegExpLiteral` + basic `RegExp` match.                                                  | [ ]    |        |
+| M36      | `BigIntLiteral` + BigInt arithmetic + `RegExpLiteral` + basic `RegExp` match.                                                  | [x]    | 417555c |
 
 Ordering follows a dependency chain where possible (`console.log` after property access + strings, `extends` after class declaration), but nothing is chiselled — M15/M16 can swap, M24/M25 can swap, etc. Re-order at execution time as real blocking dependencies surface.
 
@@ -129,6 +129,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | Async surface complete: `Promise.all` / `Promise.race` / `Promise.allSettled` / `Promise.any`, `queueMicrotask` / `setTimeout` globals in the compiler whitelist; `drain_microtasks_for_await` now walks all three microtask queues (nextTick → promise jobs → queueMicrotask), so any chain reachable via microtask-only settlement converges before `await` unwraps. Timer-based async pending on real event-loop host integration (out of language scope) | yes | M33-finale |
 | VM event-loop drive (`drive_event_loop` + `drive_event_loop_until_settled`) wired into `run_with_runtime` and the `Await` opcode: `setTimeout` / `setInterval` / `clearTimeout` callbacks fire during both the post-entry drive and awaits, so `await p` on a timer-settled promise now unwraps correctly | yes | M33-timers |
 | Generators: `function*` / `function*()` expressions return a `SuspendedStart` generator on call; `yield expr` suspends via a new `StepOutcome::GeneratorYield` captured by a custom step loop inside `resume_generator_impl` that snapshots registers + PC; `gen.next(v)` / `gen.return(v)` / `gen.throw(v)` resume the saved activation. `yield*` delegation deferred | yes | M34 |
+| `BigIntLiteral` (`5n`) lowers to `LdaConstBigInt` with a side-table index into `bigint_constants`; the opcode allocs a heap BigInt tagged with `TAG_PTR_BIGINT` so `is_bigint()`, `js_add`'s `bigint_binary_op` dispatch, and `TestEqualStrict`'s new BigInt-value compare all see it correctly. `RegExpLiteral` (`/pat/flags`) lowers to `CreateRegExp` which allocs a RegExp object rooted at `RegExp.prototype`; `.test` / `.exec` dispatch through the existing RegExp natives. Strict equality now decodes two distinct BigInt heap allocations via `bigint_value` for byte-wise decimal compare (§6.1.6.2.13). Auto-boxing BigInt primitives for method calls (`c.toString()`) deferred | yes | M36 |
 
 ## Benchmarks
 

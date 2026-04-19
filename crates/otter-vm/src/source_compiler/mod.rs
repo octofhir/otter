@@ -196,7 +196,21 @@ impl ModuleCompiler {
             });
         }
 
-        lower_program(&parser_return.program)
+        // D2: build a source-text index once and stash it on a
+        // thread-local so every nested lowering context picks it
+        // up without dragging another parameter through every
+        // `with_parent` call. Cleared at the end so subsequent
+        // compiles (or unrelated contexts that construct a
+        // `LoweringContext` directly) see `None`.
+        let source_index = std::rc::Rc::new(crate::source_map::SourceTextIndex::new(source));
+        SOURCE_INDEX_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = Some(std::rc::Rc::clone(&source_index));
+        });
+        let result = lower_program(&parser_return.program);
+        SOURCE_INDEX_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+        result
     }
 }
 
@@ -690,6 +704,15 @@ std::thread_local! {
     static MODULE_GLOBALS_OVERRIDE: std::cell::RefCell<
         Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
     > = const { std::cell::RefCell::new(None) };
+
+    /// D2: Channel carrying the current module's
+    /// `SourceTextIndex` from `ModuleCompiler::compile` into
+    /// every nested `LoweringContext` so opcode emission can
+    /// record `(pc → (line, column))` entries without plumbing
+    /// the index through every helper.
+    static SOURCE_INDEX_OVERRIDE: std::cell::RefCell<
+        Option<std::rc::Rc<crate::source_map::SourceTextIndex>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Maps the residual `Statement` variants we explicitly don't handle at
@@ -799,7 +822,7 @@ fn lower_function_declaration<'a>(
         feedback_layout,
         Default::default(),
         body_out.exceptions,
-        Default::default(),
+        body_out.source_map,
     );
 
     Ok(
@@ -830,6 +853,11 @@ struct FunctionBodyOutput {
     regexp_literals: crate::regexp::RegExpTable,
     exceptions: crate::exception::ExceptionTable,
     closures: crate::closure::ClosureTable,
+    /// D2: `pc → (line, column)` map built from statement-level
+    /// recordings during lowering. Empty when the compilation
+    /// wasn't fed a source-text index (synthesised functions,
+    /// test harnesses constructing modules manually).
+    source_map: crate::source_map::SourceMap,
 }
 
 /// Build a `FeedbackTableLayout` matching the kinds observed by the
@@ -1179,6 +1207,11 @@ fn lower_function_body_with_parent<'a>(
     }
     let needs_synthetic_return = match last {
         Statement::ReturnStatement(ret) if ret.argument.is_some() => {
+            // D2: the trailing-return fast path bypasses
+            // `lower_top_statement`, so record the source
+            // location here to keep stack traces accurate for
+            // the most common final statement.
+            ctx.record_source_location(builder.pc(), last.span().start);
             let argument = ret.argument.as_ref().expect("checked Some above");
             lower_return_expression(&mut builder, &ctx, argument)?;
             builder
@@ -1263,6 +1296,7 @@ fn lower_function_body_with_parent<'a>(
             regexp_literals: ctx.take_regexp_literals(),
             exceptions: crate::exception::ExceptionTable::new(exception_handlers),
             closures: closure_table,
+            source_map: ctx.take_source_map(),
         },
         captures,
     ))
@@ -1278,7 +1312,13 @@ fn lower_top_statement<'a>(
     stmt: &'a Statement<'a>,
 ) -> Result<(), SourceLoweringError> {
     match stmt {
-        Statement::VariableDeclaration(decl) => lower_let_const_declaration(builder, ctx, decl),
+        Statement::VariableDeclaration(decl) => {
+            // D2: `let`/`const` bypass `lower_nested_statement` (the
+            // central recording point), so record the starting PC
+            // here to keep stack traces / debugger lookups aligned.
+            ctx.record_source_location(builder.pc(), stmt.span().start);
+            lower_let_const_declaration(builder, ctx, decl)
+        }
         _ => lower_nested_statement(builder, ctx, stmt),
     }
 }
@@ -1302,6 +1342,13 @@ fn lower_nested_statement<'a>(
     ctx: &mut LoweringContext<'a>,
     stmt: &'a Statement<'a>,
 ) -> Result<(), SourceLoweringError> {
+    // D2: every statement starts at its AST span's byte offset.
+    // Recording the PC about to be emitted (= current bytecode
+    // length) → (line, column) gives the error reporter and
+    // future debugger a precise anchor without touching any
+    // expression-level helper. Finer granularity (per-opcode)
+    // can layer on top of this later.
+    ctx.record_source_location(builder.pc(), stmt.span().start);
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => {
             // Statement-position expressions: `AssignmentExpression`
@@ -2818,6 +2865,15 @@ struct LoweringContext<'a> {
     /// closure can resolve an imported binding declared at module
     /// scope without plumbing.
     module_globals: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    /// D2: index over the original source text. Shared across
+    /// every nested context in the same compilation; `None` for
+    /// synthesised functions (module-init, static-block) that
+    /// have no user-visible source.
+    source_index: Option<std::rc::Rc<crate::source_map::SourceTextIndex>>,
+    /// D2: per-function pending source-map entries. Drained by
+    /// `take_source_map` into a finalised [`crate::source_map::SourceMap`]
+    /// when the function body finishes lowering.
+    pending_source_map: RefCell<Vec<crate::source_map::SourceMapEntry>>,
 }
 
 /// §13.3.7 / §15.7.14 — per-function metadata describing which
@@ -2986,6 +3042,14 @@ impl<'a> LoweringContext<'a> {
                 MODULE_GLOBALS_OVERRIDE.with(|slot| slot.borrow().as_ref().map(std::rc::Rc::clone))
             })
             .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
+        // D2: each nested context inherits the source-text index
+        // from its parent; top-level contexts pull it from the
+        // thread-local override set by `ModuleCompiler::compile`.
+        let source_index = parent
+            .and_then(|p| p.source_index.as_ref().map(std::rc::Rc::clone))
+            .or_else(|| {
+                SOURCE_INDEX_OVERRIDE.with(|slot| slot.borrow().as_ref().map(std::rc::Rc::clone))
+            });
         Self {
             param_names,
             param_count,
@@ -3012,7 +3076,31 @@ impl<'a> LoweringContext<'a> {
             class_private_names: class_private_names
                 .unwrap_or_else(|| std::rc::Rc::<[String]>::from([])),
             module_globals,
+            source_index,
+            pending_source_map: RefCell::new(Vec::new()),
         }
+    }
+
+    /// D2: record a `(pc → source location)` entry, resolving the
+    /// oxc byte offset through the shared `SourceTextIndex`. No-op
+    /// when the context has no source index (synthesised
+    /// functions, test harnesses constructing a bare context).
+    fn record_source_location(&self, pc: u32, byte_offset: u32) {
+        let Some(idx) = &self.source_index else {
+            return;
+        };
+        let location = idx.resolve(byte_offset);
+        self.pending_source_map
+            .borrow_mut()
+            .push(crate::source_map::SourceMapEntry::new(pc, location));
+    }
+
+    /// D2: drains the accumulated source-map entries, dedup-
+    /// adjacent-same-PC entries, and returns a finalised table
+    /// sorted by PC (emission order is already PC-ascending).
+    fn take_source_map(&self) -> crate::source_map::SourceMap {
+        let entries = std::mem::take(&mut *self.pending_source_map.borrow_mut());
+        crate::source_map::SourceMap::new(entries)
     }
 
     /// Returns `true` if `name` is declared as a module-level global
@@ -6047,7 +6135,7 @@ fn lower_inner_callable_with_super<'a>(
         feedback_layout,
         Default::default(),
         body_out.exceptions,
-        Default::default(),
+        body_out.source_map,
     );
     let inner = VmFunction::new(name, layout, body_out.bytecode, tables);
 

@@ -7074,6 +7074,67 @@ fn m36_bigint_preserves_precision() {
 }
 
 // ---------------------------------------------------------------------------
+// D2: Source maps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d2_multi_line_function_populates_source_map() {
+    // Statement-level source map: each statement's emit PC gets
+    // an entry resolving to the original `(line, column)`.
+    let src = "function main() {\n    let a = 1;\n    let b = 2;\n    return a + b;\n}";
+    let module = compile(src).expect("compile");
+    let entry = module.function(module.entry()).expect("entry fn");
+    let sm = entry.source_map();
+    assert!(!sm.is_empty(), "source map should have entries");
+    // The first statement starts on line 2 (0-indexed bytes 22ish) —
+    // confirm the lookup for PC=0 resolves to line 2 or later.
+    let first = sm.lookup(0).expect("entry at PC 0");
+    assert!(
+        first.line() >= 2,
+        "PC 0 should resolve to body line >= 2, got {}",
+        first.line()
+    );
+}
+
+#[test]
+fn d2_source_map_lookup_finds_correct_line() {
+    // `return a + b` lives on line 4 of this source. A PC beyond
+    // the `let` entries should resolve to line 4.
+    let src = "function main() {\n    let a = 10;\n    let b = 20;\n    return a + b;\n}";
+    let module = compile(src).expect("compile");
+    let entry = module.function(module.entry()).expect("entry fn");
+    let sm = entry.source_map();
+    // The last statement is the return on line 4 — any PC at or
+    // after the last recorded entry must surface line 4.
+    let last_pc = sm
+        .entries()
+        .last()
+        .map(|e| e.pc())
+        .expect("source map has entries");
+    let loc = sm.lookup(last_pc).expect("lookup last entry");
+    assert_eq!(loc.line(), 4, "last statement should be on line 4");
+}
+
+#[test]
+fn d2_synthesised_module_init_has_empty_source_map() {
+    // The synthesised module-init function is not a user
+    // statement — it should not contribute source-map entries.
+    // Use ESM so a module-init is synthesised, and inspect its
+    // source map.
+    let src = "export function main() { return 1 }";
+    let module = ModuleCompiler::new()
+        .compile(src, "test.js", SourceType::mjs())
+        .expect("compile mjs");
+    // The module-init function is the one at module.entry() for
+    // ESM (it runs first). Its source map should be empty.
+    let init = module.function(module.entry()).expect("entry fn");
+    assert!(
+        init.source_map().is_empty(),
+        "synthesised module-init should not have source-map entries"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // P1: Polymorphic inline caches
 // ---------------------------------------------------------------------------
 

@@ -130,3 +130,89 @@ impl Default for SourceMap {
         Self::empty()
     }
 }
+
+// ============================================================
+// D2: SourceTextIndex — byte offset → (line, column) mapping
+// ============================================================
+
+/// Lightweight index over a source-text buffer that resolves byte
+/// offsets to `(line, column)` pairs. Pre-computes the byte
+/// offset of every `\n` so each lookup is `O(log N)` in the
+/// number of lines — amortised `O(1)` for the common case of
+/// sequential statement emission.
+///
+/// Used by the source compiler to populate per-function
+/// [`SourceMap`]s from oxc [`Span`] start offsets.
+#[derive(Debug, Clone)]
+pub struct SourceTextIndex {
+    /// Byte offsets of every `\n` character in the source. Does
+    /// not include a synthetic leading 0; line 1 starts at byte
+    /// 0 implicitly.
+    line_starts: Vec<u32>,
+}
+
+impl SourceTextIndex {
+    /// Builds an index over `source` by scanning once for `\n`.
+    /// Works for `\n` and `\r\n` line endings (the `\r` preceding
+    /// the `\n` stays on the previous line, matching every
+    /// mainstream JS tooling).
+    #[must_use]
+    pub fn new(source: &str) -> Self {
+        let mut line_starts: Vec<u32> = vec![0];
+        for (i, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                // Next line starts immediately after the `\n`.
+                line_starts.push((i as u32).saturating_add(1));
+            }
+        }
+        Self { line_starts }
+    }
+
+    /// Resolves a byte offset to a 1-based `(line, column)` pair.
+    /// Offsets past the end clamp to the last line.
+    #[must_use]
+    pub fn resolve(&self, byte_offset: u32) -> SourceLocation {
+        // Binary-search for the largest line-start ≤ offset.
+        let idx = match self.line_starts.binary_search(&byte_offset) {
+            Ok(i) => i,
+            // binary_search returns the insertion point; the line
+            // containing the offset is one before that.
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        let line = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+        let line_start = self.line_starts[idx];
+        // 1-based column.
+        let column = byte_offset.saturating_sub(line_start).saturating_add(1);
+        SourceLocation::new(line, column)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_text_index_resolves_line_and_column() {
+        let source = "fn main() {\n  return 1;\n}\n";
+        let idx = SourceTextIndex::new(source);
+        // Offset 0 → line 1, col 1 ("f" of "fn").
+        assert_eq!(idx.resolve(0), SourceLocation::new(1, 1));
+        // Offset 12 → start of "  return 1;" → line 2, col 1.
+        assert_eq!(idx.resolve(12), SourceLocation::new(2, 1));
+        // Offset 14 → "return" → line 2, col 3.
+        assert_eq!(idx.resolve(14), SourceLocation::new(2, 3));
+        // Offset 24 → "}" → line 3, col 1.
+        assert_eq!(idx.resolve(24), SourceLocation::new(3, 1));
+    }
+
+    #[test]
+    fn source_text_index_handles_single_line_source() {
+        let source = "let x = 42;";
+        let idx = SourceTextIndex::new(source);
+        assert_eq!(idx.resolve(0), SourceLocation::new(1, 1));
+        assert_eq!(idx.resolve(4), SourceLocation::new(1, 5));
+        // Past the end clamps to the last line.
+        assert_eq!(idx.resolve(u32::MAX), SourceLocation::new(1, u32::MAX));
+    }
+}

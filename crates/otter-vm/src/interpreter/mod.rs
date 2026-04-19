@@ -965,16 +965,140 @@ impl Interpreter {
         runtime: &mut RuntimeState,
     ) -> Result<ExecutionResult, InterpreterError> {
         let completion = self.run_completion_with_runtime(module, activation, runtime)?;
-        // §9.4 HostEnqueuePromiseJob — drain any promise jobs
-        // queued by the just-finished script before returning to
-        // the host. Observable from the caller when the return
-        // value is a shared object that promise callbacks mutate
-        // (M32 Promise runtime entry point).
-        self.drain_microtasks_for_await(runtime, module)?;
+        // Drive the event loop after the entry point returns so
+        // both microtask-settled and timer-fired async work
+        // converges before we hand control back to the host.
+        self.drive_event_loop(runtime, module)?;
         match completion {
             Completion::Return(return_value) => Ok(ExecutionResult::new(return_value)),
             Completion::Throw(value) => Err(InterpreterError::UncaughtThrow(value)),
         }
+    }
+
+    /// Variant of [`Self::drive_event_loop`] used from the
+    /// `Await` opcode: spins the driver only until the given
+    /// promise handle settles (fulfilled or rejected), bailing
+    /// when the driver's time budget is exhausted. Lets an
+    /// `await` on a timer-backed promise resume correctly
+    /// without requiring every unrelated queued job to drain
+    /// first.
+    pub(super) fn drive_event_loop_until_settled(
+        &self,
+        runtime: &mut RuntimeState,
+        module: &Module,
+        target: crate::object::ObjectHandle,
+    ) -> Result<(), InterpreterError> {
+        use std::time::{Duration, Instant};
+
+        let budget = Duration::from_secs(5);
+        let start = Instant::now();
+        loop {
+            self.check_interrupt()?;
+            self.drain_microtasks_for_await(runtime, module)?;
+            if let Some(promise) = runtime.objects.get_promise(target)
+                && !promise.is_pending()
+            {
+                return Ok(());
+            }
+            if !runtime.timers().has_pending() {
+                return Ok(());
+            }
+            if start.elapsed() > budget {
+                return Ok(());
+            }
+
+            let fired = runtime.timers_mut().collect_fired(Instant::now());
+            if fired.is_empty() {
+                let Some(deadline) = runtime.timers().next_deadline() else {
+                    return Ok(());
+                };
+                let now = Instant::now();
+                if deadline <= now {
+                    continue;
+                }
+                let wait = deadline - now;
+                let remaining = budget.saturating_sub(start.elapsed());
+                if wait > remaining {
+                    return Ok(());
+                }
+                std::thread::sleep(wait.min(Duration::from_millis(20)));
+                continue;
+            }
+
+            for timer in fired {
+                self.check_interrupt()?;
+                let _ = Self::call_function(runtime, module, timer.callback, timer.this_value, &[]);
+            }
+        }
+    }
+
+    /// Drains microtasks and fires expired `setTimeout` /
+    /// `setInterval` callbacks until all three microtask queues
+    /// are empty AND no timers are pending. Mirrors the shape of
+    /// `OtterRuntime::run_event_loop` but scoped to the VM —
+    /// callers that want a fuller event loop (host callbacks,
+    /// interrupt-aware sleeps, watchdogs) still reach for
+    /// `otter-runtime`. This simpler driver is enough for the
+    /// VM's own tests + any embedder that just needs Promise +
+    /// setTimeout scripts to converge.
+    fn drive_event_loop(
+        &self,
+        runtime: &mut RuntimeState,
+        module: &Module,
+    ) -> Result<(), InterpreterError> {
+        use std::time::{Duration, Instant};
+
+        // Bounded: 5 seconds is generous for any test-style
+        // workload and avoids hanging on a legitimately
+        // infinite interval. Host embedders that need genuinely
+        // long-running loops should drive the event loop
+        // explicitly via `otter-runtime`.
+        let budget = Duration::from_secs(5);
+        let start = Instant::now();
+
+        loop {
+            self.check_interrupt()?;
+            self.drain_microtasks_for_await(runtime, module)?;
+            if !runtime.timers().has_pending() {
+                break;
+            }
+            if start.elapsed() > budget {
+                break;
+            }
+
+            let fired = runtime.timers_mut().collect_fired(Instant::now());
+            if fired.is_empty() {
+                // No timer expired yet. If the next deadline is
+                // within the remaining budget, sleep until it;
+                // otherwise bail — the caller can re-enter
+                // `execute_with_runtime` later or drop into a
+                // richer event loop.
+                let Some(deadline) = runtime.timers().next_deadline() else {
+                    break;
+                };
+                let now = Instant::now();
+                if deadline <= now {
+                    continue;
+                }
+                let wait = deadline - now;
+                let remaining = budget.saturating_sub(start.elapsed());
+                if wait > remaining {
+                    break;
+                }
+                // Cap per-iteration sleep so interrupt checks
+                // stay responsive without relying on the full
+                // interrupt-signalling path from `otter-runtime`.
+                std::thread::sleep(wait.min(Duration::from_millis(20)));
+                continue;
+            }
+
+            for timer in fired {
+                self.check_interrupt()?;
+                let _ = Self::call_function(runtime, module, timer.callback, timer.this_value, &[]);
+            }
+        }
+
+        Ok(())
     }
 
     /// JSC-style tier-up dispatch for bytecode-closure calls.

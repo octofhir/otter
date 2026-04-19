@@ -2311,39 +2311,41 @@ impl Interpreter {
                 }
             }
 
-            // §14.6.3 / §27.7.5.3 Await — drain the microtask
-            // queue so any pending `.then` reactions have had a
-            // chance to settle the operand, then unwrap the
-            // resulting promise state:
+            // §14.6.3 / §27.7.5.3 Await — drive microtasks +
+            // expired timers until the operand settles, then
+            // unwrap:
             //   - Fulfilled(v)  → acc = v.
             //   - Rejected(r)   → throw r.
-            //   - Pending       → TypeError (real coroutine
-            //     suspension isn't wired yet; all promises our
-            //     runtime produces settle during the drain).
+            //   - Pending after budget → TypeError.
             //   - Non-promise   → acc unchanged per §27.7.5.3
-            //     step 5, which treats plain values as already
-            //     fulfilled.
+            //     step 5 ("already fulfilled with itself").
             Opcode::Await => {
                 let input = activation.accumulator();
-                self.drain_microtasks_for_await(runtime, _module)?;
-                if let Some(handle) = input.as_object_handle()
-                    && let Some(promise) = runtime
-                        .objects
-                        .get_promise(crate::object::ObjectHandle(handle))
-                {
-                    if let Some(value) = promise.fulfilled_value() {
-                        activation.set_accumulator(value);
-                    } else if let Some(reason) = promise.rejected_reason() {
-                        return Ok(StepOutcome::Throw(reason));
-                    } else {
-                        let err = runtime
-                            .alloc_type_error("await on a pending promise is not yet supported")?;
-                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
-                    }
+                let Some(raw) = input.as_object_handle() else {
+                    activation.set_pc(next_pc);
+                    return Ok(StepOutcome::Continue);
+                };
+                let promise_handle = crate::object::ObjectHandle(raw);
+                if runtime.objects.get_promise(promise_handle).is_none() {
+                    // Non-promise object — pass through.
+                    activation.set_pc(next_pc);
+                    return Ok(StepOutcome::Continue);
                 }
-                // Non-promise acc stays as-is — spec treats
-                // primitives / non-thenable values as already
-                // fulfilled with themselves.
+                self.drive_event_loop_until_settled(runtime, _module, promise_handle)?;
+                let promise = runtime
+                    .objects
+                    .get_promise(promise_handle)
+                    .expect("promise kind checked above");
+                if let Some(value) = promise.fulfilled_value() {
+                    activation.set_accumulator(value);
+                } else if let Some(reason) = promise.rejected_reason() {
+                    return Ok(StepOutcome::Throw(reason));
+                } else {
+                    let err = runtime.alloc_type_error(
+                        "await on a pending promise exceeded the event-loop budget",
+                    )?;
+                    return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                }
             }
 
             Opcode::Nop => {}

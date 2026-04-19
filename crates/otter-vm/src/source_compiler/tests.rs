@@ -6819,6 +6819,80 @@ fn m33f_await_promise_all() {
 }
 
 #[test]
+fn m33f_set_timeout_fires_via_drive_event_loop() {
+    // `setTimeout(cb, 0)` enqueues a timer that fires during
+    // the post-entry event-loop drive. The test returns the
+    // state object immediately; by the time the helper reads
+    // `count`, the timer has fired and the callback has
+    // mutated state.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            setTimeout(function() { state.count = 55; }, 0); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 55);
+}
+
+#[test]
+fn m33f_set_timeout_chained_settles_promise() {
+    // Timer callback resolves a shared promise, which a
+    // microtask `.then` then reads. Covers the interleaving of
+    // timer firing + microtask drain inside
+    // `drive_event_loop`.
+    let src = "function main() { \
+            let state = { count: 0 }; \
+            let holder = { resolve: null }; \
+            let p = new Promise(function(resolve) { holder.resolve = resolve; }); \
+            setTimeout(function() { holder.resolve(42); }, 0); \
+            p.then(function(v) { state.count = v + 1; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 43);
+}
+
+#[test]
+fn m33f_await_pending_promise_settled_by_timer() {
+    // `await p` where `p` is ONLY resolved by a setTimeout
+    // callback. This is the canonical "pending promise +
+    // real async source" case. Works now that
+    // `drive_event_loop` fires timers during the
+    // `drain_microtasks_for_await` loop inside `Await`.
+    //
+    // Note: the synchronous-style structure works because our
+    // current `Await` opcode keeps draining microtasks in a
+    // tight loop until the promise settles. When the
+    // `setTimeout` fires (after a sub-millisecond wait inside
+    // the drive loop), the resolve callback settles the
+    // promise, drain picks it up, and the await unwraps.
+    let src = "async function run() { \
+            let holder = { resolve: null }; \
+            let p = new Promise(function(resolve) { holder.resolve = resolve; }); \
+            setTimeout(function() { holder.resolve(9); }, 0); \
+            let v = await p; \
+            return v + 100; \
+        } \
+        function main() { \
+            let state = { count: 0 }; \
+            run().then(function(v) { state.count = v; }); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 109);
+}
+
+#[test]
+fn m33f_clear_timeout_prevents_callback() {
+    // `clearTimeout(id)` cancels a pending timer. The
+    // callback must NOT fire during the drive loop.
+    let src = "function main() { \
+            let state = { count: 5 }; \
+            let id = setTimeout(function() { state.count = 99; }, 0); \
+            clearTimeout(id); \
+            return state; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 5);
+}
+
+#[test]
 fn spread_in_new_expression_unsupported() {
     let err = compile(
         "function main() { class C { tag() { return 1; } } let a = [1]; return new C(...a); }",

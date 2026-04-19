@@ -60,7 +60,7 @@ Acceptance per milestone: `just test262` pass-rate delta > 0 on the relevant sub
 
 | ID  | Scope                                                                                               | Status | Commit |
 |-----|-----------------------------------------------------------------------------------------------------|--------|--------|
-| P1  | Inline-cached property access (polymorphic IC: 4 shapes, fallback to megamorphic probe)             | [ ]    |        |
+| P1  | Inline-cached property access (polymorphic IC: 4 shapes, fallback to megamorphic probe)             | [x]    | d06d2fc |
 | P2  | Dense array fast-path: `push`/`pop`/`shift`/`unshift`/`slice`/`concat` skip hidden-class transitions | [ ]    |        |
 | P3  | String ropes: `+` on strings > 128 chars builds lazy concat tree; flatten on `.length`/compare      | [ ]    |        |
 | P4  | Object literal shape prediction: `{a:1, b:2}` → pre-shaped emit, not three transitions              | [ ]    |        |

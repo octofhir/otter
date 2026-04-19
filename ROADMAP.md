@@ -39,7 +39,7 @@ Work proceeds on eleven parallel tracks. Tracks share the same VM but can usuall
 
 | ID  | Scope                                                                                            | Status | Commit |
 |-----|--------------------------------------------------------------------------------------------------|--------|--------|
-| E1  | BigInt primitive auto-boxing for method calls (`5n.toString()` → wraps + calls prototype method) | [ ]    |        |
+| E1  | BigInt primitive auto-boxing for method calls (`5n.toString()` → wraps + calls prototype method) | [x]    | cf99a87 |
 | E2  | Full Proxy/Reflect surface: `apply`, `construct`, `getPrototypeOf`, `setPrototypeOf`, etc.       | [ ]    |        |
 | E3  | WeakRef + FinalizationRegistry conformance (spec-correct liveness observer timing)               | [ ]    |        |
 | E4  | Temporal API (Stage-3 proposal) behind `--harmony-temporal`                                      | [ ]    |        |

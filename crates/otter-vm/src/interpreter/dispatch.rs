@@ -878,6 +878,56 @@ impl Interpreter {
                 };
                 activation.set_accumulator(value);
             }
+            // §13.5.1 `delete obj.prop` / `delete obj[key]` —
+            // delegates to `ObjectHeap::delete_property_with_registry`
+            // which handles array-length, non-configurable, and
+            // prototype-chain edges per §9.1.10 [[Delete]]. Result
+            // (boolean: whether deletion succeeded) lands in the
+            // accumulator.
+            Opcode::DelNamedProperty => {
+                let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let prop_id = idx_operand(&instr.operands, 1)?;
+                let property = resolve_property(function, runtime, prop_id)?;
+                let Some(handle) = target.as_object_handle() else {
+                    activation.set_accumulator(RegisterValue::from_bool(true));
+                    return Ok(StepOutcome::Continue);
+                };
+                // Split borrow on the runtime struct: `objects`
+                // mutably, `property_names` immutably — both live
+                // as separate fields so Rust disjoint-borrow rules
+                // let us use them side-by-side here.
+                let result = runtime
+                    .objects
+                    .delete_property_with_registry(
+                        crate::object::ObjectHandle(handle),
+                        property,
+                        &runtime.property_names,
+                    )
+                    .unwrap_or(false);
+                activation.set_accumulator(RegisterValue::from_bool(result));
+            }
+            Opcode::DelKeyedProperty => {
+                let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let key = activation.accumulator();
+                let Some(handle) = target.as_object_handle() else {
+                    activation.set_accumulator(RegisterValue::from_bool(true));
+                    return Ok(StepOutcome::Continue);
+                };
+                let property = key_to_property_name(runtime, key)?;
+                // Split borrow on the runtime struct: `objects`
+                // mutably, `property_names` immutably — both live
+                // as separate fields so Rust disjoint-borrow rules
+                // let us use them side-by-side here.
+                let result = runtime
+                    .objects
+                    .delete_property_with_registry(
+                        crate::object::ObjectHandle(handle),
+                        property,
+                        &runtime.property_names,
+                    )
+                    .unwrap_or(false);
+                activation.set_accumulator(RegisterValue::from_bool(result));
+            }
             Opcode::StaNamedProperty => {
                 let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let prop_id = idx_operand(&instr.operands, 1)?;

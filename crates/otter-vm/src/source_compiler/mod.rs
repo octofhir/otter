@@ -1666,13 +1666,13 @@ fn lower_nested_statement<'a>(
     ctx.record_source_location(builder.pc(), stmt.span().start);
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => {
-            // Statement-position expressions: `AssignmentExpression`
-            // (`x = …;`), `CallExpression` (`f();`),
-            // `UpdateExpression` (`x++;` — writes x back, result
-            // value discarded). The last is the canonical
-            // loop-counter idiom. Bare reads, member access, etc.
-            // surface their own tag so a future milestone can widen
-            // them one shape at a time.
+            // Statement-position expressions: lower any value-
+            // producing expression and discard the accumulator on
+            // return. The common shapes (AssignmentExpression,
+            // CallExpression, UpdateExpression) still take the
+            // direct path to avoid the extra indirection, but
+            // `delete obj.x;`, `obj.x;` (bare member read —
+            // triggers a getter), `void expr;`, etc. also work.
             match &expr_stmt.expression {
                 Expression::AssignmentExpression(assign) => {
                     lower_assignment_expression(builder, ctx, assign)
@@ -1681,21 +1681,7 @@ fn lower_nested_statement<'a>(
                 Expression::UpdateExpression(update) => {
                     lower_update_expression(builder, ctx, update)
                 }
-                // M33: `await p;` as a statement — lower the
-                // expression, result discarded.
-                Expression::AwaitExpression(_) => {
-                    lower_return_expression(builder, ctx, &expr_stmt.expression)
-                }
-                // M34: `yield v;` at statement position — same
-                // pattern, result (the sent-value on resume) is
-                // discarded.
-                Expression::YieldExpression(_) => {
-                    lower_return_expression(builder, ctx, &expr_stmt.expression)
-                }
-                other => Err(SourceLoweringError::unsupported(
-                    expression_construct_tag(other),
-                    other.span(),
-                )),
+                _ => lower_return_expression(builder, ctx, &expr_stmt.expression),
             }
         }
         Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
@@ -1970,11 +1956,14 @@ fn lower_for_statement<'a>(
             ForStatementInit::AssignmentExpression(assign) => {
                 lower_assignment_expression(builder, ctx, assign)?;
             }
+            // Any other expression-shaped init (call, update,
+            // sequence, etc.) — lower for side effects, discard
+            // the accumulator. `ForStatementInit` inherits every
+            // `Expression` variant via oxc's `inherit_variants!`
+            // macro, so `to_expression()` gives us the borrowed
+            // Expression to run through the regular lowerer.
             other => {
-                return Err(SourceLoweringError::unsupported(
-                    "for_init_expression",
-                    other.span(),
-                ));
+                lower_return_expression(builder, ctx, other.to_expression())?;
             }
         }
     }
@@ -2039,11 +2028,13 @@ fn lower_for_statement<'a>(
             Expression::UpdateExpression(update_expr) => {
                 lower_update_expression(builder, ctx, update_expr)?;
             }
+            Expression::CallExpression(call) => lower_call_expression(builder, ctx, call)?,
+            // Any other expression in the update slot — lower and
+            // discard. `for (let i = 0; i < n; log(i), i++)` uses
+            // a SequenceExpression; `for (…; …; obj.method())` is
+            // the CallExpression case already above.
             other => {
-                return Err(SourceLoweringError::unsupported(
-                    "for_update_expression",
-                    other.span(),
-                ));
+                lower_return_expression(builder, ctx, other)?;
             }
         }
     }
@@ -6622,7 +6613,82 @@ fn lower_unary_expression(
             })?;
         }
         UnaryOperator::Delete => {
-            return Err(SourceLoweringError::unsupported("delete_unary", expr.span));
+            // §13.5.1 The `delete` Operator. For property accesses
+            // we route through `DelNamedProperty` / `DelKeyedProperty`
+            // opcodes. For bare-identifier deletes (`delete x` in
+            // sloppy mode) JS returns `true` but removes only when
+            // `x` is a configurable global — we conservatively
+            // surface `true` without any side effect to match the
+            // most common test262 cases; actual global removal
+            // can land with S1's capability story.
+            // Note: we lowered the argument above (for side effects
+            // + simple-reference cases); here we emit the delete
+            // against the right target.
+            match &expr.argument {
+                Expression::StaticMemberExpression(member) => {
+                    let target_temp = ctx.acquire_temps(1)?;
+                    let lower = (|| -> Result<(), SourceLoweringError> {
+                        lower_return_expression(builder, ctx, &member.object)?;
+                        builder
+                            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_temp))])
+                            .map_err(|err| {
+                                SourceLoweringError::Internal(format!(
+                                    "encode Star (delete target): {err:?}"
+                                ))
+                            })?;
+                        let idx = ctx.intern_property_name(member.property.name.as_str())?;
+                        builder
+                            .emit(
+                                Opcode::DelNamedProperty,
+                                &[Operand::Reg(u32::from(target_temp)), Operand::Idx(idx)],
+                            )
+                            .map_err(|err| {
+                                SourceLoweringError::Internal(format!(
+                                    "encode DelNamedProperty: {err:?}"
+                                ))
+                            })?;
+                        Ok(())
+                    })();
+                    ctx.release_temps(1);
+                    lower?;
+                }
+                Expression::ComputedMemberExpression(member) => {
+                    let target_temp = ctx.acquire_temps(1)?;
+                    let lower = (|| -> Result<(), SourceLoweringError> {
+                        lower_return_expression(builder, ctx, &member.object)?;
+                        builder
+                            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_temp))])
+                            .map_err(|err| {
+                                SourceLoweringError::Internal(format!(
+                                    "encode Star (delete keyed target): {err:?}"
+                                ))
+                            })?;
+                        lower_return_expression(builder, ctx, &member.expression)?;
+                        builder
+                            .emit(
+                                Opcode::DelKeyedProperty,
+                                &[Operand::Reg(u32::from(target_temp))],
+                            )
+                            .map_err(|err| {
+                                SourceLoweringError::Internal(format!(
+                                    "encode DelKeyedProperty: {err:?}"
+                                ))
+                            })?;
+                        Ok(())
+                    })();
+                    ctx.release_temps(1);
+                    lower?;
+                }
+                _ => {
+                    // `delete expr` on a non-reference returns `true`
+                    // per §13.5.1 step 3.
+                    builder.emit(Opcode::LdaTrue, &[]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaTrue (delete non-reference): {err:?}"
+                        ))
+                    })?;
+                }
+            }
         }
     }
     Ok(())

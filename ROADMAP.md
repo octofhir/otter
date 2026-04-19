@@ -69,7 +69,7 @@ Acceptance per milestone: `just test262` pass-rate delta > 0 on the relevant sub
 | P7  | Hidden-class sharing across isolates (global shape cache)                                           | [ ]    |        |
 | P8  | SIMD-accelerated string scanning (ASCII-only hot paths: `indexOf`, `split`, `includes`)             | [ ]    |        |
 | P9  | Branch prediction feedback → JIT layout (hot branch first)                                          | [ ]    |        |
-| P10 | Startup time: cold-start < 20 ms for `otterjs run hello.js` on M-series; < 40 ms on x86_64          | [ ]    |        |
+| P10 | Startup time: cold-start < 20 ms for `otter run hello.js` on M-series; < 40 ms on x86_64          | [ ]    |        |
 
 Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 
@@ -157,7 +157,7 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 
 | ID  | Scope                                                                                               | Status | Commit |
 |-----|-----------------------------------------------------------------------------------------------------|--------|--------|
-| D1  | REPL (`otterjs repl`): line editor, multi-line, history, tab completion via shape metadata         | [ ]    |        |
+| D1  | REPL (`otter repl`): line editor, multi-line, history, tab completion via shape metadata         | [ ]    |        |
 | D2  | Source maps (`SourceMap.from_file`, embedded in Module, used by stack traces)                       | [x]    | 63fab25 |
 | D3  | Chrome DevTools Protocol (CDP) server: breakpoints, step, watch, scope inspect                     | [ ]    |        |
 | D4  | Sampling CPU profiler (Chrome `.cpuprofile` output)                                                 | [ ]    |        |
@@ -165,7 +165,7 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 | D6  | Coloured diagnostics (error with code frame + source snippet, miette-powered)                      | [ ]    |        |
 | D7  | Tracing (OpenTelemetry spans from runtime + native bindings for user code)                         | [ ]    |        |
 | D8  | `--inspect` flag that opens a CDP port; attaches Chrome DevTools or VS Code JS Debugger             | [ ]    |        |
-| D9  | `otterjs doctor`: health check (fs caps, net caps, heap cap, GC stats, runtime version)            | [ ]    |        |
+| D9  | `otter doctor`: health check (fs caps, net caps, heap cap, GC stats, runtime version)            | [ ]    |        |
 | D10 | Hot-reload / HMR primitive (per-module timestamp check + reset, used by dev servers)                | [ ]    |        |
 
 ---
@@ -176,15 +176,15 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 
 | ID  | Scope                                                                                               | Status | Commit |
 |-----|-----------------------------------------------------------------------------------------------------|--------|--------|
-| T1  | `otterjs install` / `otterjs add` / `otterjs remove` — Bun-style flat CLI, npm registry + tarball    | [x]    | 39b8be4 |
+| T1  | `otter install` / `otter add` / `otter remove` — Bun-style flat CLI, npm registry + tarball    | [x]    | 39b8be4 |
 | T2  | `otter.lock` format (deterministic, diffable)                                                      | [x]    | 39b8be4 |
 | T3  | Workspace support (monorepo: `workspaces: [...]` in package.json)                                  | [ ]    |        |
-| T4  | `otterjs build` — TS/JS bundler backed by oxc, outputs ES modules + source maps                     | [ ]    |        |
-| T5  | `otterjs test` — Jest/vitest-compatible runner with snapshot testing + coverage                     | [ ]    |        |
-| T6  | `otterjs fmt` — single-pass formatter (Prettier-compatible output for JS/TS)                       | [ ]    |        |
-| T7  | `otterjs lint` — rule surface compatible with common eslint rules (`no-unused-vars`, etc.)          | [ ]    |        |
+| T4  | `otter build` — TS/JS bundler backed by oxc, outputs ES modules + source maps                     | [ ]    |        |
+| T5  | `otter test` — Jest/vitest-compatible runner with snapshot testing + coverage                     | [ ]    |        |
+| T6  | `otter fmt` — single-pass formatter (Prettier-compatible output for JS/TS)                       | [ ]    |        |
+| T7  | `otter lint` — rule surface compatible with common eslint rules (`no-unused-vars`, etc.)          | [ ]    |        |
 | T8  | Code coverage (statement + branch) with lcov + HTML reporter                                        | [ ]    |        |
-| T9  | Bench runner (`otterjs bench`) — criterion-style runner for user code                               | [ ]    |        |
+| T9  | Bench runner (`otter bench`) — criterion-style runner for user code                               | [ ]    |        |
 | T10 | `otter.toml` — single config file for every tool (fmt, lint, test, build, bundler settings)         | [ ]    |        |
 
 ---
@@ -242,7 +242,7 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 | X7  | Built-in observability (OpenTelemetry metrics + traces, zero-config default)                        | [ ]    |        |
 | X8  | Deterministic replay: record every I/O boundary, replay offline for debugging                        | [ ]    |        |
 | X9  | Native migration helper for common npm frameworks (adapter shims for express/fastify/hono)          | [ ]    |        |
-| X10 | `otterjs shell` — zsh-/fish-killer built on JS + capabilities (scripting language = your runtime)   | [ ]    |        |
+| X10 | `otter shell` — zsh-/fish-killer built on JS + capabilities (scripting language = your runtime)   | [ ]    |        |
 
 ---
 

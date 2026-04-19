@@ -248,21 +248,21 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
     let mut is_esm = false;
 
     // First pass: classify top-level statements into function
-    // declarations (with or without an `export` wrapper) and pure
-    // import/export metadata.
+    // declarations (with or without an `export` wrapper), pure
+    // import/export metadata, and everything else — the latter
+    // makes up the "script body" that runs top-to-bottom when the
+    // module is evaluated. The script-body path is the idiomatic
+    // JS shape (`console.log("hi")` at file top, `const x = …`
+    // followed by `fetch(...)`, etc.); no `function main() {}`
+    // wrapper required.
     let mut declarations: Vec<&Function<'_>> = Vec::with_capacity(program.body.len());
     let mut names: Vec<&str> = Vec::with_capacity(program.body.len());
+    let mut script_body: Vec<&Statement<'_>> = Vec::new();
     let mut default_export_local: Option<String> = None;
     for stmt in &program.body {
         match stmt {
             Statement::FunctionDeclaration(func) => {
                 record_function_declaration(func, &mut declarations, &mut names)?;
-            }
-            Statement::ClassDeclaration(class) => {
-                return Err(SourceLoweringError::unsupported(
-                    "class_declaration",
-                    class.span,
-                ));
             }
             Statement::ImportDeclaration(decl) => {
                 is_esm = true;
@@ -422,26 +422,31 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                     exports.push(ExportRecord::ReExportAll { specifier });
                 }
             }
+            Statement::ClassDeclaration(class) => {
+                // Class declarations at top-level are routed
+                // through the script body; the nested-class
+                // lowering handles them end-to-end.
+                script_body.push(stmt);
+                let _ = class;
+            }
             other => {
-                return Err(SourceLoweringError::unsupported(
-                    statement_construct_tag(other),
-                    other.span(),
-                ));
+                // Top-level script statement — `console.log(...)`,
+                // `let x = …`, `if (...) { ... }`, etc. Collect
+                // into `script_body` and synthesise a top-level
+                // entry function that runs them on module
+                // evaluation.
+                script_body.push(other);
             }
         }
     }
 
     let _ = default_export_local;
 
-    // M35: a module body with no local declarations (e.g. a pure
-    // re-export: `export { x } from "./m";` or `export * from
-    // "./m";`) is valid — the module loader builds the namespace
-    // entirely from the source registry. We still need *some*
-    // function to be the module entry (even a no-op), so the
-    // synthesised module-init slot below becomes the entry. The
-    // `declarations.is_empty()` early-exit stays for non-ESM
-    // programs where an empty source is still meaningless.
-    if declarations.is_empty() && !is_esm {
+    // A module is valid when it has at least one source-level
+    // artefact: a function, a top-level statement, or an
+    // import/export record. Empty source (all whitespace) still
+    // gets rejected.
+    if declarations.is_empty() && script_body.is_empty() && !is_esm {
         return Err(SourceLoweringError::unsupported("program", program.span));
     }
 
@@ -487,16 +492,24 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
         module_functions.borrow_mut()[top_idx] = lowered;
     }
 
-    // M35: for ES modules, synthesise a module-init function that
-    // runs before `capture_exports` collects values. For every
-    // top-level function declaration whose name is a module
-    // global (an export or a default export), we emit
-    // `CreateClosure <idx>, 0` + `StaGlobal <name>` so the global
-    // object holds a callable value under that name by the time
-    // the host harvests exports. `import` bindings are handled
-    // separately by `populate_import_globals` in the module
-    // loader.
-    let entry_idx = if is_esm {
+    // Entry selection:
+    //   1. ES module with no script body — synthesised module-init
+    //      (installs exports as globals, M35).
+    //   2. Any program with a non-empty `script_body` — synthesise
+    //      a "top-level" entry function that runs the collected
+    //      statements top-to-bottom (idiomatic JS; no `main`
+    //      wrapper required). For ESM this also installs
+    //      top-level exports as globals so `capture_exports` sees
+    //      them.
+    //   3. Non-ESM classic script without a script body — fall
+    //      back to the last function declaration (conventional
+    //      `main` pattern, kept for backwards compat).
+    let entry_idx = if !script_body.is_empty() {
+        let top_idx =
+            synthesise_top_level_entry(&module_functions, &names, &module_globals, &script_body)?;
+        u32::try_from(top_idx)
+            .map_err(|_| SourceLoweringError::Internal("top-level entry index overflow".into()))?
+    } else if is_esm {
         let module_init_idx =
             synthesise_module_init_function(&module_functions, &names, &module_globals)?;
         u32::try_from(module_init_idx)
@@ -572,6 +585,129 @@ fn module_export_name_to_string(name: &ModuleExportName<'_>) -> Option<String> {
 /// global object so the module loader's `capture_exports` can
 /// read the value back out under that name. Returns the appended
 /// index.
+/// Builds the module's top-level entry function from the
+/// collected script-body statements. Runs them top-to-bottom
+/// with full local / temp / closure support — the same body
+/// lowering every regular function uses. For ES modules, the
+/// preamble also installs each exported top-level binding on
+/// the global object so `capture_exports` in the module loader
+/// sees the values by the time it harvests the namespace
+/// (same contract as `synthesise_module_init_function`,
+/// delivered inline here instead of in a separate function).
+fn synthesise_top_level_entry<'a>(
+    module_functions: &std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
+    names: &[&str],
+    module_globals: &[String],
+    script_body: &[&'a Statement<'a>],
+) -> Result<usize, SourceLoweringError> {
+    // Empty params — the top-level entry takes no arguments.
+    // `names` carries the top-level function-declaration names so
+    // `f()` inside the script body can still resolve to its
+    // `FunctionIndex` and emit `CallDirect`.
+    let params_layout = ParamsLayout {
+        names: Vec::new(),
+        defaults: Vec::new(),
+        patterns: Vec::new(),
+        rest_name: None,
+    };
+    let mut builder = BytecodeBuilder::new();
+    let mut ctx = LoweringContext::new(&params_layout, names, std::rc::Rc::clone(module_functions));
+
+    // Preamble: install each module-global binding on the global
+    // object so ESM `capture_exports` finds them. For classic
+    // scripts `module_globals` is empty and this loop is a
+    // no-op — top-level `let` / `const` still uses the regular
+    // local-allocation path in the body lowering.
+    let mut pending_templates: Vec<(u32, crate::closure::ClosureTemplate)> = Vec::new();
+    for name in module_globals {
+        let Some(top_idx) = names.iter().position(|n| *n == name.as_str()) else {
+            continue;
+        };
+        let func_idx = u32::try_from(top_idx).map_err(|_| {
+            SourceLoweringError::Internal("top-level function index overflow".into())
+        })?;
+        let pc = builder
+            .emit(
+                Opcode::CreateClosure,
+                &[Operand::Idx(func_idx), Operand::Imm(0)],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("top-level encode CreateClosure: {err:?}"))
+            })?;
+        pending_templates.push((
+            pc,
+            crate::closure::ClosureTemplate::new(FunctionIndex(func_idx), Vec::new()),
+        ));
+        let prop_idx = ctx.intern_property_name(name)?;
+        builder
+            .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("top-level encode StaGlobal: {err:?}"))
+            })?;
+    }
+
+    // Main body: lower each collected top-level statement through
+    // the same path function bodies use.
+    for stmt in script_body {
+        lower_top_statement(&mut builder, &mut ctx, stmt)?;
+    }
+    // Explicit `LdaUndefined; Return` tail — the module's
+    // evaluation completion value is always `undefined` for a
+    // script-style top-level.
+    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("top-level encode LdaUndefined: {err:?}"))
+    })?;
+    builder.emit(Opcode::Return, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("top-level encode Return: {err:?}"))
+    })?;
+
+    let bytecode = builder
+        .finish()
+        .map_err(|err| SourceLoweringError::Internal(format!("top-level finish: {err:?}")))?;
+    let bytecode_len_u32 = bytecode.bytes().len() as u32;
+    // Merge compiler-tracked closure templates (from nested
+    // function expressions inside the script body) with our
+    // prepended CreateClosure preamble entries.
+    let mut closure_vec: Vec<Option<crate::closure::ClosureTemplate>> =
+        vec![None; bytecode_len_u32 as usize];
+    let compiler_templates = ctx.take_closure_table(bytecode_len_u32);
+    for pc in 0..bytecode_len_u32 {
+        if let Some(tpl) = compiler_templates.get(pc) {
+            closure_vec[pc as usize] = Some(tpl);
+        }
+    }
+    for (pc, tpl) in pending_templates {
+        closure_vec[pc as usize] = Some(tpl);
+    }
+    let closure_table = crate::closure::ClosureTable::new(closure_vec);
+
+    let layout = FrameLayout::new(1, 0, ctx.local_count(), ctx.temp_count())
+        .map_err(|err| SourceLoweringError::Internal(format!("top-level layout: {err:?}")))?;
+    let feedback_layout = feedback_layout_from_kinds(&ctx.take_feedback_slot_kinds());
+    let exception_handlers = ctx.take_exception_handlers(&BytecodeBuilder::new())?;
+    let side_tables = crate::module::FunctionSideTables::new(
+        ctx.take_property_names(),
+        ctx.take_string_literals(),
+        ctx.take_float_constants(),
+        ctx.take_bigint_constants(),
+        closure_table,
+        Default::default(),
+        ctx.take_regexp_literals(),
+    );
+    let tables = FunctionTables::new(
+        side_tables,
+        feedback_layout,
+        Default::default(),
+        crate::exception::ExceptionTable::new(exception_handlers),
+        ctx.take_source_map(),
+    );
+    let vm_fn = VmFunction::new(Some("<top-level>"), layout, bytecode, tables);
+    let mut fns = module_functions.borrow_mut();
+    let idx = fns.len();
+    fns.push(vm_fn);
+    Ok(idx)
+}
+
 fn synthesise_module_init_function(
     module_functions: &std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
     names: &[&str],

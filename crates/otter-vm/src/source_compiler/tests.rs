@@ -120,15 +120,12 @@ fn empty_source_is_unsupported_program() {
 }
 
 #[test]
-fn class_is_unsupported() {
-    let err = compile("class Foo {}").expect_err("classes land post-M10");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "class_declaration",
-            ..
-        }
-    ));
+fn top_level_class_declaration_is_accepted() {
+    // Top-level classes are part of the idiomatic JS surface
+    // since we support top-level statements — `class Foo {}`
+    // without a surrounding `function main()` lowers through
+    // the script-body entry.
+    compile("class Foo {}").expect("top-level class compiles");
 }
 
 #[test]

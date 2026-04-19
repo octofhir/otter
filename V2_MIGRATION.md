@@ -127,6 +127,7 @@ Ordering follows a dependency chain where possible (`console.log` after property
 | `Promise` global + `new Promise(executor)` / `Promise.resolve` / `Promise.reject` / `.then` / `.catch` / `.finally` chaining from user source; `execute_with_runtime` drains the microtask queue before returning so promise callbacks settle before the host regains control | yes | M32 |
 | `async function` / `async () => …` declarations + expressions + arrows return a Promise; `await` unary lowers to a new `Await` opcode that drains the microtask queue, unwraps fulfillment / throws rejection, and passes non-promise operands through per §27.7.5.3. Real coroutine suspension for pending promises is deferred — our runtime produces no pending promises today | yes | M33 |
 | Async surface complete: `Promise.all` / `Promise.race` / `Promise.allSettled` / `Promise.any`, `queueMicrotask` / `setTimeout` globals in the compiler whitelist; `drain_microtasks_for_await` now walks all three microtask queues (nextTick → promise jobs → queueMicrotask), so any chain reachable via microtask-only settlement converges before `await` unwraps. Timer-based async pending on real event-loop host integration (out of language scope) | yes | M33-finale |
+| VM event-loop drive (`drive_event_loop` + `drive_event_loop_until_settled`) wired into `run_with_runtime` and the `Await` opcode: `setTimeout` / `setInterval` / `clearTimeout` callbacks fire during both the post-entry drive and awaits, so `await p` on a timer-settled promise now unwraps correctly | yes | M33-timers |
 
 ## Benchmarks
 

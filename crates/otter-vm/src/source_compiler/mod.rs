@@ -349,22 +349,26 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                             // declarator's name so the synth top-level
                             // flushes its local to a same-named global
                             // before it returns.
+                            //
+                            // §16.2.3.7 Destructuring in an exported
+                            // variable declaration (`export const { a,
+                            // b } = obj`, `export const [x, y] =
+                            // pair`) binds each leaf as its own export
+                            // under its own name. Walk the pattern
+                            // and collect every identifier leaf so
+                            // each leaf local flushes to a same-named
+                            // global.
                             for declarator in var_decl.declarations.iter() {
-                                let oxc_ast::ast::BindingPattern::BindingIdentifier(bi) =
-                                    &declarator.id
-                                else {
-                                    return Err(SourceLoweringError::unsupported(
-                                        "export_destructuring_declaration",
-                                        declarator.span,
-                                    ));
-                                };
-                                let name = bi.name.as_str().to_string();
-                                module_globals.push(name.clone());
-                                exports.push(ExportRecord::Named {
-                                    local: name.clone().into(),
-                                    exported: name.clone().into(),
-                                });
-                                exported_const_vars.push(name);
+                                let mut leaf_names: Vec<String> = Vec::new();
+                                collect_pattern_identifier_names(&declarator.id, &mut leaf_names)?;
+                                for name in leaf_names {
+                                    module_globals.push(name.clone());
+                                    exports.push(ExportRecord::Named {
+                                        local: name.clone().into(),
+                                        exported: name.clone().into(),
+                                    });
+                                    exported_const_vars.push(name);
+                                }
                             }
                             script_body.push(stmt);
                         }
@@ -721,6 +725,50 @@ fn record_function_declaration<'a>(
     names.push(name);
     declarations.push(func);
     Ok(name)
+}
+
+/// Recursively walks a `BindingPattern` and pushes every
+/// `BindingIdentifier` leaf's name onto `out`. Used by
+/// `export const { a, b } = obj` / `export const [x, y] = pair`
+/// to collect every export-generating leaf name. Rest elements
+/// (`export const [...rest] = arr`, `export const { ...rest } =
+/// obj`) also bind a name and are included. Default initializers
+/// on a leaf (`export const { a = 1 } = obj`) peel back to the
+/// BindingIdentifier via the AssignmentPattern wrapper.
+fn collect_pattern_identifier_names<'a>(
+    pattern: &'a oxc_ast::ast::BindingPattern<'a>,
+    out: &mut Vec<String>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::BindingPattern;
+    match pattern {
+        BindingPattern::BindingIdentifier(ident) => {
+            out.push(ident.name.as_str().to_string());
+            Ok(())
+        }
+        BindingPattern::ArrayPattern(pat) => {
+            for element in pat.elements.iter().flatten() {
+                collect_pattern_identifier_names(element, out)?;
+            }
+            if let Some(rest) = pat.rest.as_deref() {
+                collect_pattern_identifier_names(&rest.argument, out)?;
+            }
+            Ok(())
+        }
+        BindingPattern::ObjectPattern(pat) => {
+            for prop in &pat.properties {
+                collect_pattern_identifier_names(&prop.value, out)?;
+            }
+            if let Some(rest) = pat.rest.as_deref() {
+                collect_pattern_identifier_names(&rest.argument, out)?;
+            }
+            Ok(())
+        }
+        BindingPattern::AssignmentPattern(pat) => {
+            // `{ a = 1 }` / `[a = 1]` — the left side is the
+            // actual binding; the right is the default.
+            collect_pattern_identifier_names(&pat.left, out)
+        }
+    }
 }
 
 /// §16.2.1.4 — converts a `ModuleExportName` AST node (which may be
@@ -9097,12 +9145,55 @@ fn lower_relational_expression(
 
     match direction {
         Direction::Forward { rhs_ident } => {
+            // RHS register operand requires a user-visible
+            // register — upvalues and module globals route
+            // through the complex path (LHS spilled, RHS lowered
+            // into acc via `LdaUpvalue` / `LdaGlobal`, then
+            // `swapped_op` emitted).
+            let rhs_binding = ctx.resolve_identifier(rhs_ident.name.as_str());
+            let rhs_direct = matches!(
+                rhs_binding,
+                Some(BindingRef::Param { .. })
+                    | Some(BindingRef::Local {
+                        initialized: true,
+                        ..
+                    })
+            );
+            if !rhs_direct {
+                let lhs_temp = ctx.acquire_temps(1)?;
+                let lower = (|| -> Result<(), SourceLoweringError> {
+                    lower_return_expression(builder, ctx, &expr.left)?;
+                    builder
+                        .emit(Opcode::Star, &[Operand::Reg(u32::from(lhs_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Star (relational global LHS): {err:?}"
+                            ))
+                        })?;
+                    lower_return_expression(builder, ctx, &expr.right)?;
+                    builder
+                        .emit(encoding.swapped_op, &[Operand::Reg(u32::from(lhs_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode {} (relational global): {err:?}",
+                                encoding.label
+                            ))
+                        })?;
+                    Ok(())
+                })();
+                ctx.release_temps(1);
+                lower?;
+                if encoding.requires_inversion {
+                    builder.emit(Opcode::LogicalNot, &[]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LogicalNot (relational global): {err:?}"
+                        ))
+                    })?;
+                }
+                return Ok(());
+            }
             lower_accumulator_operand(builder, ctx, &expr.left)?;
-            let binding = ctx
-                .resolve_identifier(rhs_ident.name.as_str())
-                .ok_or_else(|| {
-                    SourceLoweringError::unsupported("unbound_identifier", rhs_ident.span)
-                })?;
+            let binding = rhs_binding.expect("checked Some above");
             emit_identifier_as_reg_operand(
                 builder,
                 ctx,
@@ -9248,17 +9339,18 @@ fn apply_binary_op_with_acc_lhs(
             apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
         }
         Expression::Identifier(ident) => {
-            let binding = ctx.resolve_identifier(ident.name.as_str()).ok_or_else(|| {
-                SourceLoweringError::unsupported("unbound_identifier", ident.span)
-            })?;
-            // Upvalue bindings don't live in a register — route
-            // through the complex-RHS spill path so the RHS is
-            // read via `LdaUpvalue` into acc, then stitched back
-            // against the spilled LHS.
-            if matches!(binding, BindingRef::Upvalue { .. }) {
-                apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
-            } else {
-                lower_identifier_as_reg_rhs(builder, ctx, encoding, binding, ident.span)
+            // §M35 module globals (imports, top-level exports) and
+            // upvalue bindings don't live in a user-visible
+            // register — both route through the complex-RHS spill
+            // path so the RHS is read via `LdaGlobal` /
+            // `LdaUpvalue` into acc and stitched against the
+            // spilled LHS. Only params / initialised locals can
+            // feed the fast `Op reg` shape.
+            match ctx.resolve_identifier(ident.name.as_str()) {
+                Some(binding) if !matches!(binding, BindingRef::Upvalue { .. }) => {
+                    lower_identifier_as_reg_rhs(builder, ctx, encoding, binding, ident.span)
+                }
+                _ => apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs),
             }
         }
         // Complex RHS shapes — a call, a nested binary, a

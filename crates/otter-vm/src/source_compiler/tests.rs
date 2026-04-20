@@ -7803,6 +7803,39 @@ fn m35_default_expression_export_can_be_imported() {
 }
 
 #[test]
+fn m35_object_destructuring_export() {
+    // `export const { a, b } = src` — the destructuring binds
+    // `a` and `b` each as their own export. The consumer can
+    // import either one by name.
+    let lib_src = "export const { a, b } = { a: 10, b: 32 }";
+    let entry_src = "import { a, b } from \"./lib\"; \
+        export function main() { return a + b }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 42);
+}
+
+#[test]
+fn m35_array_destructuring_export() {
+    // `export const [x, y] = pair` — array-destructuring export
+    // binds each leaf under its own name.
+    let lib_src = "export const [x, y] = [6, 7]";
+    let entry_src = "import { x, y } from \"./lib\"; \
+        export function main() { return x * y }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 42);
+}
+
+#[test]
 fn m35_default_arrow_function_export() {
     // `export default (x, y) => x * y` — common shorthand for
     // tiny utility modules. Verifies arrow-function defaults

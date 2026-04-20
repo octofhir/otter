@@ -28,3 +28,11 @@ pub use scripts::{
     ScriptError, ScriptResult, ScriptRunner, find_package_json, format_scripts_list,
 };
 pub use types::{TypesError, install_bundled_types};
+
+// Re-export the new split crates so downstream code can migrate
+// incrementally without breaking the old `otter_pm::*` import paths.
+// The existing types above (`Lockfile`, `PackageJson`, etc.) continue
+// to work unchanged; the new ones live under `otter_pm::graph` /
+// `otter_pm::manifest` so both can coexist during Phase 1.
+pub use otter_pm_lockfile as graph;
+pub use otter_pm_manifest as manifest;

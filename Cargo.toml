@@ -10,6 +10,8 @@ members = [
     "crates/otter-modules",
     "crates/otter-web",
     "crates/otter-pm",
+    "crates/otter-pm-manifest",
+    "crates/otter-pm-lockfile",
     "crates/otterjs",
 ]
 

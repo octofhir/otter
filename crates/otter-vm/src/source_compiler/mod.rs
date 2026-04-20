@@ -706,6 +706,7 @@ fn synthesise_top_level_entry<'a>(
         defaults: Vec::new(),
         patterns: Vec::new(),
         rest_name: None,
+        rest_pattern: None,
     };
     let mut builder = BytecodeBuilder::new();
     // Publish `module_globals` via the thread-local override so
@@ -1191,6 +1192,11 @@ struct ParamsLayout<'a> {
     /// and `names[i]` is the user-facing binding.
     patterns: Vec<Option<&'a BindingPattern<'a>>>,
     rest_name: Option<&'a str>,
+    /// `function f(...[a, b])` — destructuring rest parameter.
+    /// When set, the rest array still lands in an anonymous
+    /// local; `emit_rest_parameter` then runs a pattern-bind
+    /// against it to populate the leaf identifiers.
+    rest_pattern: Option<&'a BindingPattern<'a>>,
 }
 
 impl ParamsLayout<'_> {
@@ -1261,16 +1267,22 @@ fn analyze_params<'a>(
     // Optional rest parameter. oxc wraps `...rest` in
     // `FormalParameters.rest: FormalParameterRest`, which itself
     // contains a `BindingRestElement { argument: BindingPattern }`.
-    let rest_name = if let Some(rest) = params.rest.as_deref() {
-        let BindingPattern::BindingIdentifier(ident) = &rest.rest.argument else {
-            return Err(SourceLoweringError::unsupported(
-                "rest_destructuring_parameter",
-                rest.rest.span,
-            ));
-        };
-        Some(ident.name.as_str())
-    } else {
-        None
+    // Supports identifier rest (`function f(...rest)`) and
+    // destructuring rest (`function f(...[a, b])` / `...{ a }`).
+    let (rest_name, rest_pattern) = match params.rest.as_deref() {
+        Some(rest) => match &rest.rest.argument {
+            BindingPattern::BindingIdentifier(ident) => (Some(ident.name.as_str()), None),
+            BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
+                (None, Some(&rest.rest.argument))
+            }
+            _ => {
+                return Err(SourceLoweringError::unsupported(
+                    "rest_destructuring_parameter",
+                    rest.rest.span,
+                ));
+            }
+        },
+        None => (None, None),
     };
 
     Ok(ParamsLayout {
@@ -1278,6 +1290,7 @@ fn analyze_params<'a>(
         defaults,
         patterns,
         rest_name,
+        rest_pattern,
     })
 }
 
@@ -1386,23 +1399,42 @@ fn emit_rest_parameter<'a>(
     ctx: &mut LoweringContext<'a>,
     layout: &ParamsLayout<'a>,
 ) -> Result<(), SourceLoweringError> {
-    let Some(rest_name) = layout.rest_name else {
+    // Named rest — the simple `function f(...rest)` case.
+    if let Some(rest_name) = layout.rest_name {
+        // Allocate rest as a `const`-like local. ES spec treats
+        // rest as a fresh binding (not a param alias).
+        let slot = ctx.allocate_local(rest_name, true, Span::default())?;
+        builder
+            .emit(Opcode::CreateRestParameters, &[])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode CreateRestParameters: {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode Star (rest): {err:?}")))?;
+        ctx.mark_initialized(rest_name)?;
         return Ok(());
-    };
-    // Allocate rest as a `const`-like local. The ES spec treats
-    // rest as a fresh binding (not a param alias); using `const`
-    // semantics rejects accidental reassignment. Catch-clause /
-    // for-init bindings follow the same pattern.
-    let slot = ctx.allocate_local(rest_name, true, Span::default())?;
-    builder
-        .emit(Opcode::CreateRestParameters, &[])
-        .map_err(|err| {
-            SourceLoweringError::Internal(format!("encode CreateRestParameters: {err:?}"))
-        })?;
-    builder
-        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
-        .map_err(|err| SourceLoweringError::Internal(format!("encode Star (rest): {err:?}")))?;
-    ctx.mark_initialized(rest_name)?;
+    }
+    // Destructuring rest — `function f(...[a, b])` / `...{ a }`.
+    // Build the rest array into an anonymous local, then let the
+    // shared pattern-bind helper expand the pattern's leaves into
+    // fresh user-visible locals.
+    if let Some(pattern) = layout.rest_pattern {
+        let slot = ctx.allocate_anonymous_local()?;
+        builder
+            .emit(Opcode::CreateRestParameters, &[])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode CreateRestParameters (destruct): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (destruct rest): {err:?}"))
+            })?;
+        lower_pattern_bind(builder, ctx, pattern, slot, true)?;
+    }
     Ok(())
 }
 
@@ -6223,6 +6255,7 @@ fn synthesise_static_block<'a>(
         defaults: Vec::new(),
         patterns: Vec::new(),
         rest_name: None,
+        rest_pattern: None,
     };
     let mut builder = BytecodeBuilder::new();
     let mut ctx = LoweringContext::with_parent(
@@ -6305,6 +6338,7 @@ fn synthesise_field_initializer<'a>(
         defaults: Vec::new(),
         patterns: Vec::new(),
         rest_name: None,
+        rest_pattern: None,
     };
     let mut builder = BytecodeBuilder::new();
     let ctx = LoweringContext::with_parent(

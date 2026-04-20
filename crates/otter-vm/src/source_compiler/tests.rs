@@ -4718,19 +4718,32 @@ fn param_local_collision_rejected() {
 }
 
 #[test]
-fn destructuring_rest_param_rejected() {
-    // `...[x, y]` uses a destructuring pattern in the rest
-    // position. Not yet supported.
-    let err = compile("function f(...[x, y]) { return x; }").expect_err("rest destructuring");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "rest_destructuring_parameter",
-                ..
-            }
+fn destructuring_rest_param_array_pattern() {
+    // `function f(...[x, y])` — rest arg collected into an
+    // array, then array-pattern destructured into leaf locals.
+    // Use an outer wrapper so the test harness doesn't have to
+    // thread `overflow_args` manually.
+    assert_eq!(
+        run_int32_function(
+            "function inner(...[x, y]) { return x + y } \
+             function main() { return inner(3, 4) }",
+            &[],
         ),
-        "unexpected err: {err:?}",
+        7,
+    );
+}
+
+#[test]
+fn destructuring_rest_param_object_pattern() {
+    // Rare in practice (rest is an Array so object-destructuring
+    // binds only `length` / indexed names), but valid.
+    assert_eq!(
+        run_int32_function(
+            "function inner(...{ length }) { return length } \
+             function main() { return inner(1, 2, 3, 4) }",
+            &[],
+        ),
+        4,
     );
 }
 

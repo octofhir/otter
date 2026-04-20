@@ -1521,12 +1521,55 @@ fn continue_skips_rest_of_while_iteration() {
 }
 
 #[test]
-fn do_while_statement_unsupported() {
-    // `do { … } while (test)` is structurally distinct (test runs
-    // *after* the body) and isn't on the M7 plan.
-    let err = compile("function f(n) { let i = 0; do { i = i + 1; } while (i < n); return i; }")
-        .expect_err("do-while at M7");
-    assert!(matches!(err, SourceLoweringError::Unsupported { .. }));
+fn do_while_statement_executes_body_before_test() {
+    // `do { … } while (test)` runs the body at least once. For
+    // n = 5: i starts at 0, increments up to 5, then the test
+    // `i < n` fails and the loop exits.
+    assert_eq!(
+        run_int32_function(
+            "function f(n) { let i = 0; do { i = i + 1; } while (i < n); return i; }",
+            &[5],
+        ),
+        5,
+    );
+}
+
+#[test]
+fn do_while_runs_body_once_even_when_test_is_false() {
+    // Canonical do-while behavior: the body executes before the
+    // test is evaluated, so a `false` test still produces one
+    // iteration. Starting from 0, we increment to 1, fail the
+    // test, and return 1.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let i = 0; do { i = i + 1; } while (false); return i; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn do_while_supports_break_and_continue() {
+    // `break` exits the loop; `continue` skips to the test.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let s = 0; \
+                 let i = 0; \
+                 do { \
+                     i = i + 1; \
+                     if (i === 3) { continue; } \
+                     if (i === 6) { break; } \
+                     s = s + i; \
+                 } while (i < 10); \
+                 return s; \
+             }",
+            &[],
+        ),
+        // i = 1,2,_,4,5 (then break at 6): 1+2+4+5 = 12.
+        12,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3597,27 +3640,125 @@ fn member_read_composes_inside_return_arithmetic() {
 }
 
 #[test]
-fn optional_chain_member_rejected() {
-    // oxc wraps `o?.a` in a `ChainExpression` node rather than
-    // setting `optional: true` on the member — so we surface the
-    // generic `expression` tag rather than a dedicated
-    // `optional_member_expression` tag. Optional chaining lands in
-    // a later milestone; any stable rejection is acceptable here.
-    let err =
-        compile("function f() { let o = { a: 1 }; return o?.a; }").expect_err("optional member");
-    assert!(
-        matches!(err, SourceLoweringError::Unsupported { .. }),
-        "unexpected err: {err:?}",
+fn optional_chain_member_returns_value_when_non_null() {
+    // `o?.a` when `o` is a truthy object: returns `o.a` like a
+    // plain member access.
+    assert_eq!(
+        run_int32_function("function f() { let o = { a: 42 }; return o?.a; }", &[],),
+        42,
     );
 }
 
 #[test]
-fn optional_computed_member_rejected() {
-    let err = compile("function f() { let o = { a: 1 }; return o?.[\"a\"]; }")
-        .expect_err("optional computed member");
-    assert!(
-        matches!(err, SourceLoweringError::Unsupported { .. }),
-        "unexpected err: {err:?}",
+fn optional_chain_member_short_circuits_on_null() {
+    // `null?.a` returns undefined. Using unary `+undefined = NaN`
+    // doesn't round-trip through i32, so we switch to an
+    // equality-based return: `o?.a === undefined` produces `1`
+    // when the chain short-circuits.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = null; return o?.a === undefined ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn optional_chain_member_short_circuits_on_undefined() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = undefined; return o?.a === undefined ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn optional_computed_member_returns_value_when_non_null() {
+    assert_eq!(
+        run_int32_function("function f() { let o = { a: 7 }; return o?.[\"a\"]; }", &[],),
+        7,
+    );
+}
+
+#[test]
+fn optional_computed_member_short_circuits_on_null() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = null; return o?.[\"a\"] === undefined ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn optional_chain_short_circuits_mid_chain() {
+    // `a?.b.c` — once `a?.b` produces undefined, `.c` is skipped
+    // (the chain's single short-circuit label covers every access
+    // downstream of any `?.` gate).
+    assert_eq!(
+        run_int32_function(
+            "function f() { let a = null; return a?.b.c === undefined ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn optional_call_invokes_function_when_non_null() {
+    // `f?.()` when f is a callable closure.
+    assert_eq!(
+        run_int32_function(
+            "function f() { let g = function () { return 7 }; return g?.(); }",
+            &[],
+        ),
+        7,
+    );
+}
+
+#[test]
+fn optional_call_short_circuits_on_null() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let g = null; return g?.() === undefined ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn optional_method_call_passes_correct_this() {
+    // `o.m?.()` calls with `this = o` per §13.3.9.3. Verifies
+    // the member-callee path preserves `this` instead of falling
+    // back to `CallUndefinedReceiver`.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let o = { v: 11, m: function () { return this.v } }; \
+                 return o.m?.(); \
+             }",
+            &[],
+        ),
+        11,
+    );
+}
+
+#[test]
+fn optional_method_call_short_circuits_when_method_missing() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let o = { v: 1 }; \
+                 return o.m?.() === undefined ? 1 : 0; \
+             }",
+            &[],
+        ),
+        1,
     );
 }
 

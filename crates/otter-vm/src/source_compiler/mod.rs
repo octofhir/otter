@@ -1013,6 +1013,7 @@ fn statement_construct_tag(stmt: &Statement<'_>) -> &'static str {
         Statement::ExpressionStatement(_) => "expression_statement",
         Statement::IfStatement(_) => "if_statement",
         Statement::WhileStatement(_) => "while_statement",
+        Statement::DoWhileStatement(_) => "do_while_statement",
         Statement::ForStatement(_) => "for_statement",
         Statement::BlockStatement(_) => "block_statement",
         Statement::ReturnStatement(_) => "return_statement",
@@ -1718,6 +1719,7 @@ fn lower_nested_statement<'a>(
         }
         Statement::IfStatement(if_stmt) => lower_if_statement(builder, ctx, if_stmt),
         Statement::WhileStatement(while_stmt) => lower_while_statement(builder, ctx, while_stmt),
+        Statement::DoWhileStatement(do_stmt) => lower_do_while_statement(builder, ctx, do_stmt),
         Statement::ForStatement(for_stmt) => lower_for_statement(builder, ctx, for_stmt),
         Statement::ForOfStatement(for_of) => lower_for_of_statement(builder, ctx, for_of),
         Statement::ForInStatement(for_in) => lower_for_in_statement(builder, ctx, for_in),
@@ -1935,6 +1937,57 @@ fn lower_while_statement<'a>(
     builder
         .bind_label(loop_exit)
         .map_err(|err| SourceLoweringError::Internal(format!("bind loop exit: {err:?}")))?;
+
+    Ok(())
+}
+
+/// §14.7.2 `do { body } while (test)` — test runs *after* the body,
+/// so the body always executes at least once. Bytecode shape:
+///
+/// ```text
+/// loop_header:
+///   <lower body>
+/// continue_target:
+///   <lower test>
+///   JumpIfToBooleanTrue loop_header
+/// loop_exit:
+/// ```
+///
+/// `continue` jumps past the body to re-run the test (per spec),
+/// `break` exits the loop entirely.
+fn lower_do_while_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    do_stmt: &'a oxc_ast::ast::DoWhileStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    let loop_header = builder.new_label();
+    let continue_target = builder.new_label();
+    let loop_exit = builder.new_label();
+
+    builder
+        .bind_label(loop_header)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind do-while header: {err:?}")))?;
+
+    ctx.enter_loop(LoopLabels {
+        break_label: loop_exit,
+        continue_label: Some(continue_target),
+    });
+    let body_result = lower_nested_statement(builder, ctx, &do_stmt.body);
+    ctx.exit_loop();
+    body_result?;
+
+    builder
+        .bind_label(continue_target)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind do-while continue: {err:?}")))?;
+    lower_return_expression(builder, ctx, &do_stmt.test)?;
+    builder
+        .emit_jump_to(Opcode::JumpIfToBooleanTrue, loop_header)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode JumpIfToBooleanTrue (do-while): {err:?}"))
+        })?;
+    builder
+        .bind_label(loop_exit)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind do-while exit: {err:?}")))?;
 
     Ok(())
 }
@@ -3138,6 +3191,15 @@ struct LoweringContext<'a> {
     /// type itself isn't. `enter_loop` / `exit_loop` are the only
     /// mutators.
     loop_labels: RefCell<Vec<LoopLabels>>,
+    /// Stack of short-circuit labels for the currently-open optional
+    /// chain expressions (§13.3.9). `lower_chain_expression` pushes
+    /// a fresh label before lowering the chain's element tree and
+    /// pops it afterwards. When a member / call with `optional:
+    /// true` is reached inside `lower_static_member_read`-style
+    /// helpers, the helper emits a nullish-check jump to the
+    /// innermost label. `Cell::get`-style peeking is enough (only
+    /// the innermost label matters); reads through `.last()`.
+    optional_chain_short_circuit: RefCell<Vec<Label>>,
     /// Stack of `locals.len()` snapshots marking the start of each
     /// currently-open lexical scope (M12). Pushed by
     /// [`snapshot_scope`](Self::snapshot_scope) and popped by
@@ -3454,6 +3516,7 @@ impl<'a> LoweringContext<'a> {
             next_feedback_slot: Cell::new(0),
             feedback_slot_kinds: RefCell::new(Vec::new()),
             loop_labels: RefCell::new(Vec::new()),
+            optional_chain_short_circuit: RefCell::new(Vec::new()),
             scope_starts: RefCell::new(Vec::new()),
             property_names: RefCell::new(Vec::new()),
             float_constants: RefCell::new(Vec::new()),
@@ -3707,6 +3770,35 @@ impl<'a> LoweringContext<'a> {
     /// `continue_outside_loop` errors.
     fn innermost_loop_labels(&self) -> Option<LoopLabels> {
         self.loop_labels.borrow().last().copied()
+    }
+
+    /// Push a short-circuit label for an optional chain. Paired 1:1
+    /// with [`Self::exit_optional_chain`]. The label is bound after
+    /// the chain's last access so that any `?.` along the way can
+    /// nullish-short-circuit to it.
+    fn enter_optional_chain(&self, short_circuit: Label) {
+        self.optional_chain_short_circuit
+            .borrow_mut()
+            .push(short_circuit);
+    }
+
+    fn exit_optional_chain(&self) {
+        let popped = self.optional_chain_short_circuit.borrow_mut().pop();
+        debug_assert!(
+            popped.is_some(),
+            "exit_optional_chain called without enter_optional_chain",
+        );
+    }
+
+    /// Returns the innermost optional-chain short-circuit label, if
+    /// any. `Some` only while we're actively lowering inside a
+    /// [`ChainExpression`]; property/member/call lowerers peek at
+    /// this to know whether `expr.optional` should trigger a
+    /// short-circuit jump (inside a chain) or stay rejected
+    /// (outside — which the parser doesn't actually produce, but
+    /// the defensive check stays as a guard).
+    fn optional_chain_short_circuit(&self) -> Option<Label> {
+        self.optional_chain_short_circuit.borrow().last().copied()
     }
 
     /// Returns the innermost enclosing `continue`-capable frame's
@@ -5062,6 +5154,82 @@ fn lower_yield_star<'a>(
     lower
 }
 
+/// §13.3.9 `ChainExpression` — the AST wrapper around every
+/// optional-chain surface (`o?.a`, `o?.[k]`, `f?.()`, or any
+/// nesting). The wrapper's `expression` is the actual
+/// member/call/private-field tree that carries `optional: true`
+/// on each short-circuit site.
+///
+/// Lowering:
+///
+/// ```text
+///   <lower chain body, short_circuit on stack>
+///   Jump end                     ; value already in acc
+/// short_circuit:
+///   LdaUndefined                 ; any `?.` null check lands here
+/// end:
+/// ```
+///
+/// While `short_circuit` is on the stack, the per-expression
+/// lowerers (`lower_static_member_read` /
+/// `lower_computed_member_read` / `lower_call_expression`) honour
+/// `expr.optional` by emitting a nullish check against the
+/// materialised base; otherwise those lowerers still reject
+/// `optional: true` defensively.
+fn lower_chain_expression<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    chain: &'a oxc_ast::ast::ChainExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::ChainElement;
+
+    let short_circuit = builder.new_label();
+    let end_label = builder.new_label();
+
+    ctx.enter_optional_chain(short_circuit);
+    let inner = match &chain.expression {
+        ChainElement::CallExpression(call) => lower_call_expression(builder, ctx, call),
+        ChainElement::StaticMemberExpression(member) => {
+            lower_static_member_read(builder, ctx, member)
+        }
+        ChainElement::ComputedMemberExpression(member) => {
+            lower_computed_member_read(builder, ctx, member)
+        }
+        ChainElement::PrivateFieldExpression(member) => {
+            lower_private_field_read(builder, ctx, member)
+        }
+        ChainElement::TSNonNullExpression(_) => {
+            // TS-only assertion; conceptually a no-op to the
+            // runtime. Stays deferred — typed AST nodes don't
+            // flow through an otherwise-untyped lowering.
+            Err(SourceLoweringError::unsupported(
+                "ts_non_null_expression",
+                chain.span,
+            ))
+        }
+    };
+    ctx.exit_optional_chain();
+    inner?;
+
+    builder
+        .emit_jump_to(Opcode::Jump, end_label)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Jump (chain end): {err:?}"))
+        })?;
+    builder.bind_label(short_circuit).map_err(|err| {
+        SourceLoweringError::Internal(format!("bind chain short-circuit: {err:?}"))
+    })?;
+    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!(
+            "encode LdaUndefined (chain short-circuit): {err:?}"
+        ))
+    })?;
+    builder
+        .bind_label(end_label)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind chain end: {err:?}")))?;
+    Ok(())
+}
+
 fn lower_return_expression<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
@@ -5223,6 +5391,12 @@ fn lower_return_expression<'a>(
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Yield: {err:?}")))?;
             Ok(())
         }
+        // §13.3.9 Optional Chains — `o?.a`, `o?.[k]`, `f?.()`,
+        // and any composition thereof. The ChainExpression wraps
+        // the whole chain; individual optional elements inside it
+        // carry `optional: true` and short-circuit to a shared
+        // label that the chain's end installs.
+        Expression::ChainExpression(chain) => lower_chain_expression(builder, ctx, chain),
         Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
         Expression::FunctionExpression(func) => lower_function_expression(builder, ctx, func),
         Expression::ArrowFunctionExpression(arrow) => {
@@ -7766,9 +7940,18 @@ fn materialize_member_base<'a>(
 /// bases, temp-spill for everything else); the property name is
 /// interned into the function's `PropertyNameTable` with dedup.
 ///
-/// Optional chaining (`o?.x`) is rejected — it requires the nullish
-/// short-circuit wiring that lands in a later milestone.
+/// Optional chaining (`o?.x`) is handled via a nullish short-circuit
+/// jump: the caller — [`lower_chain_expression`] — pushes the
+/// chain's short-circuit label onto the context stack before
+/// lowering the chain's inner expression. When this helper sees
+/// `expr.optional == true` and finds an active short-circuit label
+/// on the stack, it emits a `JumpIfNull` / `JumpIfUndefined` pair
+/// against the materialised base object before the property load.
+/// `o?.x` outside any chain is a parser / AST invariant violation
+/// and stays rejected defensively.
 ///
+/// §13.3.9 Optional Chains
+/// <https://tc39.es/ecma262/#sec-optional-chains>
 /// §13.3.2 Property Accessors
 /// <https://tc39.es/ecma262/#sec-property-accessors>
 fn lower_static_member_read(
@@ -7776,12 +7959,17 @@ fn lower_static_member_read(
     ctx: &LoweringContext<'_>,
     expr: &StaticMemberExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    if expr.optional {
-        return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
-            expr.span,
-        ));
-    }
+    let optional_short_circuit = if expr.optional {
+        let Some(short_circuit) = ctx.optional_chain_short_circuit() else {
+            return Err(SourceLoweringError::unsupported(
+                "optional_member_expression",
+                expr.span,
+            ));
+        };
+        Some(short_circuit)
+    } else {
+        None
+    };
     // M28: `super.x` — §13.3.7 SuperReference. Uses the enclosing
     // method's `[[HomeObject]]` (resolved at runtime inside the
     // `GetSuperProperty` opcode) as the lookup base, and the
@@ -7815,6 +8003,9 @@ fn lower_static_member_read(
         return lower;
     }
     let base = materialize_member_base(builder, ctx, &expr.object)?;
+    if let Some(short_circuit) = optional_short_circuit {
+        emit_optional_nullish_short_circuit(builder, base.reg, short_circuit)?;
+    }
     let idx = ctx.intern_property_name(expr.property.name.as_str())?;
     // P1: attach a property-feedback slot so the dispatcher can
     // probe the cached `(shape_id, slot_index)` for this PC on
@@ -7838,6 +8029,38 @@ fn lower_static_member_read(
     Ok(())
 }
 
+/// Emits the nullish short-circuit sequence for an optional member
+/// / call access. `base_reg` holds the object or callee value;
+/// when it's `null` or `undefined` control jumps to `short_circuit`
+/// (where the chain lowerer has arranged for `undefined` to be
+/// loaded into the accumulator). Two jumps beats a single
+/// `TestUndetectable + JumpIfToBooleanTrue` pair in the common
+/// non-null case — both JumpIfNull/JumpIfUndefined are single-byte
+/// tagged tests followed by a 4-byte jump operand with no
+/// boolean-coercion step.
+fn emit_optional_nullish_short_circuit(
+    builder: &mut BytecodeBuilder,
+    base_reg: RegisterIndex,
+    short_circuit: Label,
+) -> Result<(), SourceLoweringError> {
+    builder
+        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(base_reg))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Ldar (optional chain base): {err:?}"))
+        })?;
+    builder
+        .emit_jump_to(Opcode::JumpIfNull, short_circuit)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode JumpIfNull (optional): {err:?}"))
+        })?;
+    builder
+        .emit_jump_to(Opcode::JumpIfUndefined, short_circuit)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode JumpIfUndefined (optional): {err:?}"))
+        })?;
+    Ok(())
+}
+
 /// Lowers `o[k]` into the accumulator. Shape:
 ///
 /// ```text
@@ -7855,12 +8078,17 @@ fn lower_computed_member_read(
     ctx: &LoweringContext<'_>,
     expr: &ComputedMemberExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    if expr.optional {
-        return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
-            expr.span,
-        ));
-    }
+    let optional_short_circuit = if expr.optional {
+        let Some(short_circuit) = ctx.optional_chain_short_circuit() else {
+            return Err(SourceLoweringError::unsupported(
+                "optional_member_expression",
+                expr.span,
+            ));
+        };
+        Some(short_circuit)
+    } else {
+        None
+    };
     // M28: `super[k]` — dynamic-key super property read. Receiver
     // is `this`; key is evaluated into a dedicated temp so the
     // `GetSuperPropertyComputed` operand shape `(Reg, Reg)` matches.
@@ -7904,6 +8132,9 @@ fn lower_computed_member_read(
         return lower;
     }
     let base = materialize_member_base(builder, ctx, &expr.object)?;
+    if let Some(short_circuit) = optional_short_circuit {
+        emit_optional_nullish_short_circuit(builder, base.reg, short_circuit)?;
+    }
     lower_return_expression(builder, ctx, &expr.expression)?;
     builder
         .emit(
@@ -9956,6 +10187,21 @@ fn lower_call_expression(
 ) -> Result<(), SourceLoweringError> {
     use oxc_ast::ast::Argument;
 
+    // §13.3.9 `f?.()` — the callee value is evaluated first, then
+    // nullish-checked against the active chain's short-circuit
+    // label. This path handles the identifier-callee and
+    // member-callee cases by routing through a dynamic-dispatch
+    // helper.
+    if call.optional {
+        let Some(short_circuit) = ctx.optional_chain_short_circuit() else {
+            return Err(SourceLoweringError::unsupported(
+                "optional_call_expression",
+                call.span,
+            ));
+        };
+        return lower_optional_call(builder, ctx, call, short_circuit);
+    }
+
     // Callee classification — strip a single layer of parens so
     // `(f)()` still works, then match on the inner shape. Member
     // callees go through the method-call path so `this` binds
@@ -10008,6 +10254,253 @@ fn lower_call_expression(
             other.span(),
         )),
     }
+}
+
+/// §13.3.9 optional call (`callee?.(args)`) — evaluate the callee,
+/// short-circuit if nullish, otherwise call it. The `this`
+/// binding follows the callee shape:
+///
+/// - Identifier / arbitrary expression → `this = undefined`
+///   (`CallUndefinedReceiver`).
+/// - Static or computed member (`o.m?.()`, `o[k]?.()`) → `this`
+///   binds to the member's base object (`CallProperty`). The
+///   receiver is spilled into a temp before the callee load so the
+///   same value is used for both the `[[Get]]` receiver and the
+///   call's `this`.
+///
+/// Spread arguments (`f?.(...xs)`) and super-callees are rejected
+/// for now — both need reworks of the CallSpread / super paths
+/// that aren't warranted for the initial optional-call milestone.
+fn lower_optional_call<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    short_circuit: Label,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+
+    let inner_callee = match &call.callee {
+        Expression::ParenthesizedExpression(paren) => &paren.expression,
+        other => other,
+    };
+
+    if call
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, Argument::SpreadElement(_)))
+    {
+        return Err(SourceLoweringError::unsupported(
+            "optional_spread_call",
+            call.span,
+        ));
+    }
+
+    let argc = RegisterIndex::try_from(call.arguments.len())
+        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+
+    // Member-callee → `CallProperty` with the receiver as `this`.
+    match inner_callee {
+        Expression::StaticMemberExpression(member) => {
+            let receiver_temp = ctx.acquire_temps(1)?;
+            let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+            let args_base = if argc == 0 {
+                0
+            } else {
+                ctx.acquire_temps(argc)
+                    .inspect_err(|_| ctx.release_temps(2))?
+            };
+            let result = (|| -> Result<(), SourceLoweringError> {
+                lower_return_expression(builder, ctx, &member.object)?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (optional call receiver): {err:?}"
+                        ))
+                    })?;
+                if member.optional {
+                    emit_optional_nullish_short_circuit(builder, receiver_temp, short_circuit)?;
+                }
+                let idx = ctx.intern_property_name(member.property.name.as_str())?;
+                let pc = builder
+                    .emit(
+                        Opcode::LdaNamedProperty,
+                        &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaNamedProperty (optional call): {err:?}"
+                        ))
+                    })?;
+                let slot = ctx.allocate_property_feedback();
+                builder.attach_feedback(pc, slot);
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (optional callee): {err:?}"
+                        ))
+                    })?;
+                emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+                lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+                builder
+                    .emit(
+                        Opcode::CallProperty,
+                        &[
+                            Operand::Reg(u32::from(callee_temp)),
+                            Operand::Reg(u32::from(receiver_temp)),
+                            Operand::RegList {
+                                base: u32::from(args_base),
+                                count: u32::from(argc),
+                            },
+                        ],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode CallProperty (optional): {err:?}"
+                        ))
+                    })?;
+                Ok(())
+            })();
+            if argc > 0 {
+                ctx.release_temps(argc);
+            }
+            ctx.release_temps(2);
+            return result;
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let receiver_temp = ctx.acquire_temps(1)?;
+            let key_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+            let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?;
+            let args_base = if argc == 0 {
+                0
+            } else {
+                ctx.acquire_temps(argc)
+                    .inspect_err(|_| ctx.release_temps(3))?
+            };
+            let result = (|| -> Result<(), SourceLoweringError> {
+                lower_return_expression(builder, ctx, &member.object)?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (optional call receiver[k]): {err:?}"
+                        ))
+                    })?;
+                if member.optional {
+                    emit_optional_nullish_short_circuit(builder, receiver_temp, short_circuit)?;
+                }
+                lower_return_expression(builder, ctx, &member.expression)?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (optional call key): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(Opcode::Ldar, &[Operand::Reg(u32::from(key_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Ldar (optional call key): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(
+                        Opcode::LdaKeyedProperty,
+                        &[Operand::Reg(u32::from(receiver_temp))],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaKeyedProperty (optional call): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (optional callee[k]): {err:?}"
+                        ))
+                    })?;
+                emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+                lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+                builder
+                    .emit(
+                        Opcode::CallProperty,
+                        &[
+                            Operand::Reg(u32::from(callee_temp)),
+                            Operand::Reg(u32::from(receiver_temp)),
+                            Operand::RegList {
+                                base: u32::from(args_base),
+                                count: u32::from(argc),
+                            },
+                        ],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode CallProperty (optional[k]): {err:?}"
+                        ))
+                    })?;
+                Ok(())
+            })();
+            if argc > 0 {
+                ctx.release_temps(argc);
+            }
+            ctx.release_temps(3);
+            return result;
+        }
+        Expression::Super(super_tok) => {
+            return Err(SourceLoweringError::unsupported(
+                "optional_super_call",
+                super_tok.span,
+            ));
+        }
+        _ => {}
+    }
+
+    // Non-member callee — evaluate into a temp, nullish check,
+    // then `CallUndefinedReceiver` with `this = undefined`.
+    let callee_temp = ctx.acquire_temps(1)?;
+    let args_base = if argc == 0 {
+        0
+    } else {
+        ctx.acquire_temps(argc)
+            .inspect_err(|_| ctx.release_temps(1))?
+    };
+    let result = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, inner_callee)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Star (optional direct callee): {err:?}"
+                ))
+            })?;
+        emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+        lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+        builder
+            .emit(
+                Opcode::CallUndefinedReceiver,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: u32::from(argc),
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode CallUndefinedReceiver (optional direct): {err:?}"
+                ))
+            })?;
+        Ok(())
+    })();
+    if argc > 0 {
+        ctx.release_temps(argc);
+    }
+    ctx.release_temps(1);
+    result
 }
 
 /// Lowers `super(args)` / `super(...args)` inside a derived-class

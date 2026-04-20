@@ -3301,6 +3301,8 @@ mod tests {
         use std::process::Command;
 
         let script_path = std::env::temp_dir().join("otter-stencil-invocation-smoke.js");
+        // `main` is called explicitly at top level — the runtime
+        // no longer magically invokes a `main()` entrypoint.
         let script = "function sum(n) { \
                           let s = 0; \
                           let i = 0; \
@@ -3318,7 +3320,8 @@ mod tests {
                               i = i + 1; \
                           } \
                           return out; \
-                      }";
+                      } \
+                      main()";
         fs::write(&script_path, script).expect("write smoke script");
 
         let output = Command::new("cargo")
@@ -3377,6 +3380,12 @@ mod tests {
         // OSR must have fired by the time the loop exits.
         // (`(s + i) | 0` keeps the accumulator int32-tagged so the JIT
         // path stays on the trust-int32 fast path.)
+        // The loop lives inside an explicit `main` function so the
+        // JIT's back-edge OSR instrumentation (which targets
+        // function bodies, not the top-level synthesised
+        // entrypoint) can fire. We then invoke `main()` at top
+        // level — `main` has no runtime-special status anymore, so
+        // scripts that want it called must call it themselves.
         let script = "function main() { \
                           let s = 0; \
                           let i = 0; \
@@ -3385,7 +3394,8 @@ mod tests {
                               i = i + 1; \
                           } \
                           return s; \
-                      }";
+                      } \
+                      main()";
         fs::write(&script_path, script).expect("write smoke script");
 
         let output = Command::new("cargo")

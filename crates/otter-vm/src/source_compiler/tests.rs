@@ -7970,6 +7970,26 @@ fn m35_default_class_export_can_be_imported_and_instantiated() {
 }
 
 #[test]
+fn m35_anonymous_default_class_export_can_be_imported() {
+    // Anonymous default classes lower through the same synthetic
+    // `__otter_default` binding path as default expressions, but
+    // still need full class construction + method installation.
+    let lib_src = "export default class { \
+                       constructor(x) { this.x = x } \
+                       value() { return this.x } \
+                   }";
+    let entry_src = "import Box from \"./lib\"; \
+        export function main() { return new Box(42).value() }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 42);
+}
+
+#[test]
 fn m35_default_expression_export_can_be_imported() {
     // `export default <expression>` — the expression evaluates at
     // module-init time and the result becomes the default export.
@@ -7979,6 +7999,23 @@ fn m35_default_expression_export_can_be_imported() {
     let lib_src = "export default { version: 42 }";
     let entry_src = "import cfg from \"./lib\"; \
         export function main() { return cfg.version }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 42);
+}
+
+#[test]
+fn m35_anonymous_default_function_export_can_be_called() {
+    // Anonymous default functions now skip the declaration-hoist
+    // table and lower through the same module-init binding path
+    // as other default-export values.
+    let lib_src = "export default function (a, b) { return a + b }";
+    let entry_src = "import add from \"./lib\"; \
+        export function main() { return add(19, 23) }";
     let out = run_module_graph_int32(
         "entry",
         &[("entry", entry_src), ("lib", lib_src)],

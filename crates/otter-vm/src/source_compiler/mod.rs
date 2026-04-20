@@ -457,7 +457,7 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
             }
             Statement::ExportDefaultDeclaration(decl) => {
                 is_esm = true;
-                // §16.2.3 `export default …` — three accepted shapes:
+                // §16.2.3 `export default …` — accepted shapes:
                 //
                 //   `export default function foo() {}` — register as
                 //   a named hoistable declaration.
@@ -469,11 +469,12 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                 //
                 //   Anonymous defaults (`export default class {}` /
                 //   `export default function () {}` / `export
-                //   default expr`) require synthesising a fresh
-                //   module-level binding and lowering an expression
-                //   at module-init time; stays deferred.
+                //   default expr`) synthesise a fresh module-level
+                //   binding and lower at module-init time.
                 match &decl.declaration {
-                    ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(func)
+                        if func.id.is_some() =>
+                    {
                         let name = record_function_declaration(
                             func.as_ref(),
                             &mut declarations,
@@ -485,13 +486,8 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                             local: name.to_string().into(),
                         });
                     }
-                    ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                        let Some(id) = &class.id else {
-                            return Err(SourceLoweringError::unsupported(
-                                "export_default_anonymous_class",
-                                decl.span,
-                            ));
-                        };
+                    ExportDefaultDeclarationKind::ClassDeclaration(class) if class.id.is_some() => {
+                        let id = class.id.as_ref().expect("guard ensures named class");
                         let name = id.name.as_str().to_string();
                         // Route through the statement-lowering phase
                         // like any other top-level class. The outer
@@ -529,12 +525,11 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                                 decl.span,
                             ));
                         }
-                        const DEFAULT_LOCAL: &str = "__otter_default";
-                        module_globals.push(DEFAULT_LOCAL.to_string());
-                        exported_const_vars.push(DEFAULT_LOCAL.to_string());
-                        default_export_local = Some(DEFAULT_LOCAL.to_string());
+                        module_globals.push(MODULE_DEFAULT_EXPORT_LOCAL.to_string());
+                        exported_const_vars.push(MODULE_DEFAULT_EXPORT_LOCAL.to_string());
+                        default_export_local = Some(MODULE_DEFAULT_EXPORT_LOCAL.to_string());
                         exports.push(ExportRecord::Default {
-                            local: DEFAULT_LOCAL.into(),
+                            local: MODULE_DEFAULT_EXPORT_LOCAL.into(),
                         });
                         script_body.push(stmt);
                     }
@@ -784,6 +779,8 @@ fn module_export_name_to_string(name: &ModuleExportName<'_>) -> Option<String> {
         ModuleExportName::StringLiteral(_) => None,
     }
 }
+
+const MODULE_DEFAULT_EXPORT_LOCAL: &str = "__otter_default";
 
 /// Appends a synthetic "module-init" [`VmFunction`] to
 /// `module_functions`. Its body materialises each top-level
@@ -1824,29 +1821,50 @@ fn lower_top_statement<'a>(
         Statement::ExportDefaultDeclaration(decl) => {
             ctx.record_source_location(builder.pc(), stmt.span().start);
             match &decl.declaration {
-                ExportDefaultDeclarationKind::ClassDeclaration(cls) => {
+                ExportDefaultDeclarationKind::ClassDeclaration(cls) if cls.id.is_some() => {
                     lower_nested_class_declaration(builder, ctx, cls)
                 }
-                ExportDefaultDeclarationKind::FunctionDeclaration(_) => Ok(()),
+                ExportDefaultDeclarationKind::FunctionDeclaration(func) if func.id.is_some() => {
+                    let _ = func;
+                    Ok(())
+                }
+                ExportDefaultDeclarationKind::ClassDeclaration(cls) => {
+                    lower_class_expression(builder, ctx, cls)?;
+                    lower_default_export_initializer(builder, ctx, stmt.span())
+                }
+                ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                    lower_function_expression(builder, ctx, func)?;
+                    lower_default_export_initializer(builder, ctx, stmt.span())
+                }
                 other => {
-                    const DEFAULT_LOCAL: &str = "__otter_default";
-                    let slot = ctx.allocate_local(DEFAULT_LOCAL, true, stmt.span())?;
                     let expr = other.to_expression();
                     lower_return_expression(builder, ctx, expr)?;
-                    builder
-                        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
-                        .map_err(|err| {
-                            SourceLoweringError::Internal(format!(
-                                "encode Star (export default expr): {err:?}"
-                            ))
-                        })?;
-                    ctx.mark_initialized(DEFAULT_LOCAL)?;
-                    Ok(())
+                    lower_default_export_initializer(builder, ctx, stmt.span())
                 }
             }
         }
         _ => lower_nested_statement(builder, ctx, stmt),
     }
+}
+
+/// Stores the current default-export value from acc into the
+/// synthetic module-local binding used by anonymous default
+/// declarations and default-export expressions.
+///
+/// Spec: https://tc39.es/ecma262/#sec-exports
+fn lower_default_export_initializer<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    span: Span,
+) -> Result<(), SourceLoweringError> {
+    let slot = ctx.allocate_local(MODULE_DEFAULT_EXPORT_LOCAL, true, span)?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (export default expr): {err:?}"))
+        })?;
+    ctx.mark_initialized(MODULE_DEFAULT_EXPORT_LOCAL)?;
+    Ok(())
 }
 
 /// Lowers a single statement in a "nested" context (inside an `if`

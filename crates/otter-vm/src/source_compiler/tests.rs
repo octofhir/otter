@@ -2476,6 +2476,47 @@ fn undeclared_label_is_rejected() {
 }
 
 #[test]
+fn empty_function_body_returns_undefined() {
+    // `function f() {}` — no statements. Per §15.2.1, the
+    // implicit fall-through returns `undefined`. We verify by
+    // calling an empty helper from a wrapper that compares its
+    // result to `undefined`.
+    assert_eq!(
+        run_int32_function(
+            "function helper() {} function f() { return helper() === undefined ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn use_strict_directive_is_accepted() {
+    // `"use strict"` at the top of a function body is a directive
+    // prologue (§14.1.1). The compiler doesn't need to act on
+    // it — ES modules are strict-by-default — but it must not
+    // reject the program.
+    assert_eq!(
+        run_int32_function("function f() { \"use strict\"; return 42; }", &[],),
+        42,
+    );
+}
+
+#[test]
+fn arbitrary_directive_prologue_strings_are_ignored() {
+    // Non-reserved directive strings are legal; implementations
+    // may silently ignore them. This confirms we don't trip on
+    // multiple directives or custom strings.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \"use strict\"; \"use custom\"; return 7; }",
+            &[],
+        ),
+        7,
+    );
+}
+
+#[test]
 fn break_outside_loop_rejected() {
     // `break` at function top level has no enclosing loop. We
     // surface a stable tag instead of emitting a dangling jump.

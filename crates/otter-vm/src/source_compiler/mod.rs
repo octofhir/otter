@@ -1470,12 +1470,13 @@ fn lower_function_body_with_parent<'a>(
     class_super_binding: Option<ClassSuperBinding>,
     class_private_names: Option<std::rc::Rc<[String]>>,
 ) -> Result<(FunctionBodyOutput, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
-    if !body.directives.is_empty() {
-        return Err(SourceLoweringError::unsupported(
-            "directive_prologue",
-            body.directives[0].span,
-        ));
-    }
+    // §14.1.1 Directive prologues — `"use strict"` is already the
+    // default for ES modules, and classes / methods are strict
+    // per spec regardless. Other string-literal directives are
+    // silently ignored (the spec allows implementations to
+    // reserve additional directive strings; nothing requires us
+    // to honour them). Treat the whole prologue as metadata.
+    let _ = &body.directives;
 
     let mut builder = BytecodeBuilder::new();
     let mut ctx = LoweringContext::with_parent(
@@ -1497,13 +1498,43 @@ fn lower_function_body_with_parent<'a>(
     emit_param_destructuring(&mut builder, &mut ctx, layout)?;
     emit_rest_parameter(&mut builder, &mut ctx, layout)?;
 
-    // Split-off for the tail statement. Empty bodies stay rejected
-    // since the frame layout still needs some instruction to exit
-    // through; a caller could fall through to the synthesized
-    // `LdaUndefined; Return` below but callers that pass `{}`
-    // typically expect a stronger signal.
+    // Empty function body — synthesise `LdaUndefined; Return` so
+    // the function exits per §15.2.1 FunctionBody evaluation
+    // (falls through to `return undefined`). This lets
+    // `function f() {}`, `() => {}`, and empty class-method
+    // bodies all compile.
     let Some((last, rest)) = body.statements.split_last() else {
-        return Err(SourceLoweringError::unsupported("empty_body", body.span));
+        builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaUndefined (empty body): {err:?}"))
+        })?;
+        builder.emit(Opcode::Return, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Return (empty body): {err:?}"))
+        })?;
+        let exception_handlers = ctx.take_exception_handlers(&builder)?;
+        let bytecode_len = builder.pc();
+        let closure_table = ctx.take_closure_table(bytecode_len);
+        let bytecode = builder
+            .finish()
+            .map_err(|err| SourceLoweringError::Internal(format!("finalise bytecode: {err:?}")))?;
+        let captures = ctx.take_captures();
+        return Ok((
+            FunctionBodyOutput {
+                bytecode,
+                local_count: ctx.local_count(),
+                temp_count: ctx.temp_count(),
+                feedback_slot_count: ctx.feedback_slot_count(),
+                feedback_slot_kinds: ctx.take_feedback_slot_kinds(),
+                property_names: ctx.take_property_names(),
+                float_constants: ctx.take_float_constants(),
+                string_literals: ctx.take_string_literals(),
+                bigint_constants: ctx.take_bigint_constants(),
+                regexp_literals: ctx.take_regexp_literals(),
+                exceptions: crate::exception::ExceptionTable::new(exception_handlers),
+                closures: closure_table,
+                source_map: ctx.take_source_map(),
+            },
+            captures,
+        ));
     };
 
     // Two tail shapes are accepted:

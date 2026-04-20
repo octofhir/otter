@@ -1944,10 +1944,18 @@ fn lower_nested_statement<'a>(
         Statement::ReturnStatement(ret) => lower_return_statement(builder, ctx, ret),
         Statement::BlockStatement(block) => lower_block_statement(builder, ctx, block),
         Statement::LabeledStatement(labeled) => lower_labeled_statement(builder, ctx, labeled),
-        Statement::VariableDeclaration(decl) => Err(SourceLoweringError::unsupported(
-            "nested_variable_declaration",
-            decl.span,
-        )),
+        Statement::VariableDeclaration(decl) => match decl.kind {
+            // `var` is a valid statement-position body for `if` /
+            // `while` / `do-while` / labelled statements. We already
+            // lower `var` through the shared declaration path as a
+            // declaration-site local, so reuse that here instead of
+            // keeping the stale blanket rejection.
+            VariableDeclarationKind::Var => lower_let_const_declaration(builder, ctx, decl),
+            _ => Err(SourceLoweringError::unsupported(
+                "nested_variable_declaration",
+                decl.span,
+            )),
+        },
         other => Err(SourceLoweringError::unsupported(
             statement_construct_tag(other),
             other.span(),

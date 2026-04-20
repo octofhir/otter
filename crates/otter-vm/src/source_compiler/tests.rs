@@ -603,6 +603,34 @@ fn var_declaration_lowered_as_let_at_declaration_site() {
 }
 
 #[test]
+fn nested_if_var_declaration_lowers() {
+    // Bare statement-position `var` bodies are valid JS (`if (...) var x = ...;`).
+    // They should route through the shared declaration lowerer instead of
+    // tripping the stale `nested_variable_declaration` blanket rejection.
+    assert_eq!(
+        run_int32_function("function f() { if (1) var x = 7; return x; }", &[]),
+        7
+    );
+}
+
+#[test]
+fn nested_do_while_var_declaration_lowers() {
+    // `do Statement while (...)` also allows a bare `var` declaration.
+    assert_eq!(
+        run_int32_function("function f() { do var x = 9; while (0); return x; }", &[]),
+        9
+    );
+}
+
+#[test]
+fn nested_while_var_declaration_compiles() {
+    // When the loop body is a bare `var` statement, the compiler should
+    // still accept the shape even if the body never executes.
+    compile("function f() { while (0) var x = 1; return 0; }")
+        .expect("statement-position while var compiles");
+}
+
+#[test]
 fn uninitialized_let_unsupported() {
     // M4 demands an initializer on every binding — bare `let x;` is
     // rejected; the `let x = undefined;` workaround would also fail

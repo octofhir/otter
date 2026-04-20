@@ -10817,32 +10817,24 @@ fn lower_call_expression(
 ///   same value is used for both the `[[Get]]` receiver and the
 ///   call's `this`.
 ///
-/// Spread arguments (`f?.(...xs)`) and super-callees are rejected
-/// for now — both need reworks of the CallSpread / super paths
-/// that aren't warranted for the initial optional-call milestone.
+/// Spread arguments (`f?.(...xs)`) are supported through the same
+/// `CallSpread` tail the non-optional call paths use. Optional
+/// `super?.(...)` stays rejected.
 fn lower_optional_call<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
     call: &oxc_ast::ast::CallExpression<'a>,
     short_circuit: Label,
 ) -> Result<(), SourceLoweringError> {
-    use oxc_ast::ast::Argument;
-
     let inner_callee = match &call.callee {
         Expression::ParenthesizedExpression(paren) => &paren.expression,
         other => other,
     };
 
-    if call
+    let has_spread = call
         .arguments
         .iter()
-        .any(|arg| matches!(arg, Argument::SpreadElement(_)))
-    {
-        return Err(SourceLoweringError::unsupported(
-            "optional_spread_call",
-            call.span,
-        ));
-    }
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
 
     let argc = RegisterIndex::try_from(call.arguments.len())
         .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
@@ -10852,7 +10844,9 @@ fn lower_optional_call<'a>(
         Expression::StaticMemberExpression(member) => {
             let receiver_temp = ctx.acquire_temps(1)?;
             let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
-            let args_base = if argc == 0 {
+            let args_base = if has_spread {
+                ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?
+            } else if argc == 0 {
                 0
             } else {
                 ctx.acquire_temps(argc)
@@ -10891,27 +10885,20 @@ fn lower_optional_call<'a>(
                         ))
                     })?;
                 emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
-                lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
-                builder
-                    .emit(
-                        Opcode::CallProperty,
-                        &[
-                            Operand::Reg(u32::from(callee_temp)),
-                            Operand::Reg(u32::from(receiver_temp)),
-                            Operand::RegList {
-                                base: u32::from(args_base),
-                                count: u32::from(argc),
-                            },
-                        ],
-                    )
-                    .map_err(|err| {
-                        SourceLoweringError::Internal(format!(
-                            "encode CallProperty (optional): {err:?}"
-                        ))
-                    })?;
+                emit_call_args_and_invoke(
+                    builder,
+                    ctx,
+                    call,
+                    callee_temp,
+                    receiver_temp,
+                    args_base,
+                    has_spread,
+                )?;
                 Ok(())
             })();
-            if argc > 0 {
+            if has_spread {
+                ctx.release_temps(1);
+            } else if argc > 0 {
                 ctx.release_temps(argc);
             }
             ctx.release_temps(2);
@@ -10921,7 +10908,9 @@ fn lower_optional_call<'a>(
             let receiver_temp = ctx.acquire_temps(1)?;
             let key_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
             let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?;
-            let args_base = if argc == 0 {
+            let args_base = if has_spread {
+                ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(3))?
+            } else if argc == 0 {
                 0
             } else {
                 ctx.acquire_temps(argc)
@@ -10972,27 +10961,20 @@ fn lower_optional_call<'a>(
                         ))
                     })?;
                 emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
-                lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
-                builder
-                    .emit(
-                        Opcode::CallProperty,
-                        &[
-                            Operand::Reg(u32::from(callee_temp)),
-                            Operand::Reg(u32::from(receiver_temp)),
-                            Operand::RegList {
-                                base: u32::from(args_base),
-                                count: u32::from(argc),
-                            },
-                        ],
-                    )
-                    .map_err(|err| {
-                        SourceLoweringError::Internal(format!(
-                            "encode CallProperty (optional[k]): {err:?}"
-                        ))
-                    })?;
+                emit_call_args_and_invoke(
+                    builder,
+                    ctx,
+                    call,
+                    callee_temp,
+                    receiver_temp,
+                    args_base,
+                    has_spread,
+                )?;
                 Ok(())
             })();
-            if argc > 0 {
+            if has_spread {
+                ctx.release_temps(1);
+            } else if argc > 0 {
                 ctx.release_temps(argc);
             }
             ctx.release_temps(3);
@@ -11010,6 +10992,54 @@ fn lower_optional_call<'a>(
     // Non-member callee — evaluate into a temp, nullish check,
     // then `CallUndefinedReceiver` with `this = undefined`.
     let callee_temp = ctx.acquire_temps(1)?;
+    if has_spread {
+        let receiver_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+        let args_base = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?;
+        let result = (|| -> Result<(), SourceLoweringError> {
+            lower_return_expression(builder, ctx, inner_callee)?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (optional direct callee): {err:?}"
+                    ))
+                })?;
+            emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+            builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaUndefined (optional spread recv): {err:?}"
+                ))
+            })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(receiver_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (optional spread recv): {err:?}"
+                    ))
+                })?;
+            emit_spread_call_arguments_array(builder, ctx, call, args_base)?;
+            builder
+                .emit(
+                    Opcode::CallSpread,
+                    &[
+                        Operand::Reg(u32::from(callee_temp)),
+                        Operand::Reg(u32::from(receiver_temp)),
+                        Operand::RegList {
+                            base: u32::from(args_base),
+                            count: 1,
+                        },
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CallSpread (optional direct): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        })();
+        ctx.release_temps(3);
+        return result;
+    }
     let args_base = if argc == 0 {
         0
     } else {
@@ -12003,7 +12033,6 @@ fn emit_call_args_and_invoke<'a>(
     args_base: RegisterIndex,
     has_spread: bool,
 ) -> Result<(), SourceLoweringError> {
-    use oxc_ast::ast::Argument;
     if !has_spread {
         let argc = RegisterIndex::try_from(call.arguments.len())
             .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
@@ -12026,7 +12055,31 @@ fn emit_call_args_and_invoke<'a>(
         return Ok(());
     }
 
-    // Spread path — build an Array of args, then CallSpread.
+    emit_spread_call_arguments_array(builder, ctx, call, args_base)?;
+    builder
+        .emit(
+            Opcode::CallSpread,
+            &[
+                Operand::Reg(u32::from(callee_temp)),
+                Operand::Reg(u32::from(receiver_temp)),
+                Operand::RegList {
+                    base: u32::from(args_base),
+                    count: 1,
+                },
+            ],
+        )
+        .map_err(|err| SourceLoweringError::Internal(format!("encode CallSpread: {err:?}")))?;
+    Ok(())
+}
+
+fn emit_spread_call_arguments_array<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    call: &oxc_ast::ast::CallExpression<'a>,
+    args_base: RegisterIndex,
+) -> Result<(), SourceLoweringError> {
+    use oxc_ast::ast::Argument;
+
     builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
         SourceLoweringError::Internal(format!("encode CreateArray (spread args): {err:?}"))
     })?;
@@ -12062,19 +12115,6 @@ fn emit_call_args_and_invoke<'a>(
             }
         }
     }
-    builder
-        .emit(
-            Opcode::CallSpread,
-            &[
-                Operand::Reg(u32::from(callee_temp)),
-                Operand::Reg(u32::from(receiver_temp)),
-                Operand::RegList {
-                    base: u32::from(args_base),
-                    count: 1,
-                },
-            ],
-        )
-        .map_err(|err| SourceLoweringError::Internal(format!("encode CallSpread: {err:?}")))?;
     Ok(())
 }
 

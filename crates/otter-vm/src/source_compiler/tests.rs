@@ -3835,6 +3835,34 @@ fn optional_call_short_circuits_on_null() {
 }
 
 #[test]
+fn optional_call_with_spread_invokes_function_when_non_null() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let g = function (a, b) { return a + b }; \
+                 return g?.(...[19, 23]); \
+             }",
+            &[],
+        ),
+        42,
+    );
+}
+
+#[test]
+fn optional_call_with_spread_short_circuits_on_null() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let g = null; \
+                 return g?.(...[1, 2]) === undefined ? 1 : 0; \
+             }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
 fn optional_method_call_passes_correct_this() {
     // `o.m?.()` calls with `this = o` per §13.3.9.3. Verifies
     // the member-callee path preserves `this` instead of falling
@@ -3848,6 +3876,20 @@ fn optional_method_call_passes_correct_this() {
             &[],
         ),
         11,
+    );
+}
+
+#[test]
+fn optional_method_call_with_spread_preserves_this() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let o = { v: 10, m: function (a, b) { return this.v + a + b } }; \
+                 return o.m?.(...[20, 12]); \
+             }",
+            &[],
+        ),
+        42,
     );
 }
 

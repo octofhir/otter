@@ -109,6 +109,7 @@
 //! ```
 
 mod error;
+mod for_in_of;
 
 #[cfg(test)]
 mod tests;
@@ -117,6 +118,10 @@ pub use error::SourceLoweringError;
 
 use std::cell::{Cell, RefCell};
 
+use for_in_of::{
+    ForInOfAssignmentTarget, ForInOfLeft, classify_for_in_of_left,
+    lower_for_in_of_assignment_target,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, ArrayPattern, ArrowFunctionExpression,
@@ -2521,55 +2526,46 @@ fn lower_for_of_statement<'a>(
                     }
                 }
             }
-            ForStatementLeft::AssignmentTargetIdentifier(ident) => {
-                let name = ident.name.as_str();
-                let binding = ctx.resolve_identifier(name).ok_or_else(|| {
-                    SourceLoweringError::unsupported("unbound_identifier", ident.span)
-                })?;
-                match binding {
-                    BindingRef::Local {
-                        reg,
-                        initialized: true,
-                        is_const: false,
-                    } => (reg, false),
-                    BindingRef::Param { reg } => (reg, false),
-                    BindingRef::Local { is_const: true, .. } => {
-                        return Err(SourceLoweringError::unsupported(
-                            "const_assignment",
-                            ident.span,
-                        ));
-                    }
-                    BindingRef::Local {
-                        initialized: false, ..
-                    } => {
-                        return Err(SourceLoweringError::unsupported(
-                            "tdz_self_reference",
-                            ident.span,
-                        ));
-                    }
-                    BindingRef::Upvalue { idx } => {
-                        let iter_val_slot = ctx.allocate_anonymous_local()?;
-                        upvalue_target = Some((iter_val_slot, idx));
-                        (iter_val_slot, false)
+            _ => match classify_for_in_of_left(&for_of.left, "for_of_unsupported_left")? {
+                ForInOfLeft::Identifier(ident) => {
+                    let name = ident.name.as_str();
+                    let binding = ctx.resolve_identifier(name).ok_or_else(|| {
+                        SourceLoweringError::unsupported("unbound_identifier", ident.span)
+                    })?;
+                    match binding {
+                        BindingRef::Local {
+                            reg,
+                            initialized: true,
+                            is_const: false,
+                        } => (reg, false),
+                        BindingRef::Param { reg } => (reg, false),
+                        BindingRef::Local { is_const: true, .. } => {
+                            return Err(SourceLoweringError::unsupported(
+                                "const_assignment",
+                                ident.span,
+                            ));
+                        }
+                        BindingRef::Local {
+                            initialized: false, ..
+                        } => {
+                            return Err(SourceLoweringError::unsupported(
+                                "tdz_self_reference",
+                                ident.span,
+                            ));
+                        }
+                        BindingRef::Upvalue { idx } => {
+                            let iter_val_slot = ctx.allocate_anonymous_local()?;
+                            upvalue_target = Some((iter_val_slot, idx));
+                            (iter_val_slot, false)
+                        }
                     }
                 }
-            }
-            ForStatementLeft::ArrayAssignmentTarget(pattern) => {
-                let iter_val_slot = ctx.allocate_anonymous_local()?;
-                assignment_target = Some(ForInOfAssignmentTarget::Array(pattern));
-                (iter_val_slot, false)
-            }
-            ForStatementLeft::ObjectAssignmentTarget(pattern) => {
-                let iter_val_slot = ctx.allocate_anonymous_local()?;
-                assignment_target = Some(ForInOfAssignmentTarget::Object(pattern));
-                (iter_val_slot, false)
-            }
-            other => {
-                return Err(SourceLoweringError::unsupported(
-                    "for_of_unsupported_left",
-                    other.span(),
-                ));
-            }
+                ForInOfLeft::AssignmentTarget(target) => {
+                    let iter_val_slot = ctx.allocate_anonymous_local()?;
+                    assignment_target = Some(target);
+                    (iter_val_slot, false)
+                }
+            },
         };
         let _ = is_let_like;
 
@@ -2663,32 +2659,6 @@ fn lower_for_in_of_upvalue_assignment(
             ))
         })?;
     Ok(())
-}
-
-enum ForInOfAssignmentTarget<'a> {
-    Array(&'a oxc_ast::ast::ArrayAssignmentTarget<'a>),
-    Object(&'a oxc_ast::ast::ObjectAssignmentTarget<'a>),
-}
-
-/// Performs ForIn/OfBodyEvaluation's assignment step for
-/// destructuring assignment targets in `for (<lhs> of rhs)` and
-/// `for (<lhs> in rhs)`.
-///
-/// Spec: https://tc39.es/ecma262/#sec-runtime-semantics-forin-div-ofbodyevaluation-lhs-stmt-iterator-lhskind-labelset
-fn lower_for_in_of_assignment_target<'a>(
-    builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'a>,
-    target: ForInOfAssignmentTarget<'a>,
-    iter_value_reg: u16,
-) -> Result<(), SourceLoweringError> {
-    match target {
-        ForInOfAssignmentTarget::Array(pattern) => {
-            destructure_array_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
-        }
-        ForInOfAssignmentTarget::Object(pattern) => {
-            destructure_object_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
-        }
-    }
 }
 
 /// M31: lowers `for (<left> in <source>) <body>` — §14.7.5.11
@@ -2808,55 +2778,46 @@ fn lower_for_in_statement<'a>(
                     }
                 }
             }
-            ForStatementLeft::AssignmentTargetIdentifier(ident) => {
-                let name = ident.name.as_str();
-                let binding = ctx.resolve_identifier(name).ok_or_else(|| {
-                    SourceLoweringError::unsupported("unbound_identifier", ident.span)
-                })?;
-                match binding {
-                    BindingRef::Local {
-                        reg,
-                        initialized: true,
-                        is_const: false,
-                    } => reg,
-                    BindingRef::Param { reg } => reg,
-                    BindingRef::Local { is_const: true, .. } => {
-                        return Err(SourceLoweringError::unsupported(
-                            "const_assignment",
-                            ident.span,
-                        ));
-                    }
-                    BindingRef::Local {
-                        initialized: false, ..
-                    } => {
-                        return Err(SourceLoweringError::unsupported(
-                            "tdz_self_reference",
-                            ident.span,
-                        ));
-                    }
-                    BindingRef::Upvalue { idx } => {
-                        let iter_val_slot = ctx.allocate_anonymous_local()?;
-                        upvalue_target = Some((iter_val_slot, idx));
-                        iter_val_slot
+            _ => match classify_for_in_of_left(&for_in.left, "for_in_unsupported_left")? {
+                ForInOfLeft::Identifier(ident) => {
+                    let name = ident.name.as_str();
+                    let binding = ctx.resolve_identifier(name).ok_or_else(|| {
+                        SourceLoweringError::unsupported("unbound_identifier", ident.span)
+                    })?;
+                    match binding {
+                        BindingRef::Local {
+                            reg,
+                            initialized: true,
+                            is_const: false,
+                        } => reg,
+                        BindingRef::Param { reg } => reg,
+                        BindingRef::Local { is_const: true, .. } => {
+                            return Err(SourceLoweringError::unsupported(
+                                "const_assignment",
+                                ident.span,
+                            ));
+                        }
+                        BindingRef::Local {
+                            initialized: false, ..
+                        } => {
+                            return Err(SourceLoweringError::unsupported(
+                                "tdz_self_reference",
+                                ident.span,
+                            ));
+                        }
+                        BindingRef::Upvalue { idx } => {
+                            let iter_val_slot = ctx.allocate_anonymous_local()?;
+                            upvalue_target = Some((iter_val_slot, idx));
+                            iter_val_slot
+                        }
                     }
                 }
-            }
-            ForStatementLeft::ArrayAssignmentTarget(pattern) => {
-                let iter_val_slot = ctx.allocate_anonymous_local()?;
-                assignment_target = Some(ForInOfAssignmentTarget::Array(pattern));
-                iter_val_slot
-            }
-            ForStatementLeft::ObjectAssignmentTarget(pattern) => {
-                let iter_val_slot = ctx.allocate_anonymous_local()?;
-                assignment_target = Some(ForInOfAssignmentTarget::Object(pattern));
-                iter_val_slot
-            }
-            other => {
-                return Err(SourceLoweringError::unsupported(
-                    "for_in_unsupported_left",
-                    other.span(),
-                ));
-            }
+                ForInOfLeft::AssignmentTarget(target) => {
+                    let iter_val_slot = ctx.allocate_anonymous_local()?;
+                    assignment_target = Some(target);
+                    iter_val_slot
+                }
+            },
         };
 
         let loop_top = builder.new_label();

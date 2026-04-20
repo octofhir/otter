@@ -6519,6 +6519,56 @@ fn m30_for_of_object_assignment_target_sets_defaults_before_break() {
 }
 
 #[test]
+fn m30_for_of_static_member_target_updates_existing_object() {
+    let src = "function main() { \
+        let out = { x: 0 }; \
+        for (out.x of [1, 2, 7]) { } \
+        return out.x; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn m30_for_of_computed_member_target_recomputes_key_each_iteration() {
+    let src = "function main() { \
+        let state = { idx: 0, a: 0, b: 0 }; \
+        let keys = ['a', 'b']; \
+        for (state[keys[state.idx]] of [7, 9]) { \
+            state.idx = state.idx + 1; \
+        } \
+        return state.a * 10 + state.b; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 79);
+}
+
+#[test]
+fn m30_for_of_private_field_target_updates_receiver() {
+    let src = "function main() { \
+        class Box { \
+            #value = 0; \
+            run() { for (this.#value of [3, 8]) { } return this.#value; } \
+        } \
+        return new Box().run(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 8);
+}
+
+#[test]
+fn m30t_for_of_ts_non_null_member_target_compiles() {
+    assert_eq!(
+        run_int32_function_ts(
+            "function f() { \
+                let out = { x: 0 }; \
+                for ((out!).x of [4, 6]) { } \
+                return out.x; \
+            }",
+            &[],
+        ),
+        6,
+    );
+}
+
+#[test]
 fn m30_for_of_break_exits_loop() {
     // `break` inside the body jumps past the loop exit. Partial
     // sum covers the early-exit path.
@@ -6926,6 +6976,33 @@ fn m31_for_in_object_assignment_target_is_set_before_break() {
         return length; \
     }";
     assert_eq!(run_int32_function(src, &[]), 3);
+}
+
+#[test]
+fn m31_for_in_static_member_target_updates_existing_object() {
+    let src = "function main() { \
+        let out = { key: '' }; \
+        let src = { a: 1, b: 2 }; \
+        for (out.key in src) { } \
+        return out.key === 'b' ? 1 : 0; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn m31t_for_in_ts_non_null_member_target_compiles() {
+    assert_eq!(
+        run_int32_function_ts(
+            "function f() { \
+                let out = { key: '' }; \
+                let src = { a: 1, b: 2 }; \
+                for ((out!).key in src) { } \
+                return out.key === 'b' ? 1 : 0; \
+            }",
+            &[],
+        ),
+        1,
+    );
 }
 
 #[test]

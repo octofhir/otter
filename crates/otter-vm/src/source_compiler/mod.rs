@@ -110,6 +110,7 @@
 
 mod error;
 mod for_in_of;
+mod switch_scope;
 
 #[cfg(test)]
 mod tests;
@@ -136,6 +137,7 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
+use switch_scope::{enter_switch_lexical_scope, lower_switch_case_statement};
 
 use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Label, Opcode, Operand};
 use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
@@ -2537,6 +2539,7 @@ fn lower_for_of_statement<'a>(
                             reg,
                             initialized: true,
                             is_const: false,
+                            ..
                         } => (reg, false),
                         BindingRef::Param { reg } => (reg, false),
                         BindingRef::Local { is_const: true, .. } => {
@@ -2789,6 +2792,7 @@ fn lower_for_in_statement<'a>(
                             reg,
                             initialized: true,
                             is_const: false,
+                            ..
                         } => reg,
                         BindingRef::Param { reg } => reg,
                         BindingRef::Local { is_const: true, .. } => {
@@ -2922,6 +2926,7 @@ fn lower_switch_statement<'a>(
     ctx: &mut LoweringContext<'a>,
     sw: &'a oxc_ast::ast::SwitchStatement<'a>,
 ) -> Result<(), SourceLoweringError> {
+    let switch_scope = enter_switch_lexical_scope(builder, ctx, sw)?;
     // 1) Evaluate discriminant into a temp. The compare phase
     //    reloads it before each `TestEqualStrict` so the acc is
     //    predictable when entering the comparison opcode.
@@ -3057,11 +3062,7 @@ fn lower_switch_statement<'a>(
                         ))
                     })?;
                     for stmt in case.consequent.iter() {
-                        // Case bodies reject `let`/`const` (no
-                        // block scoping inside a case yet — the
-                        // M12 scoping work treated switch cases
-                        // as outside its surface).
-                        lower_nested_statement(builder, ctx, stmt)?;
+                        lower_switch_case_statement(builder, ctx, stmt)?;
                     }
                 }
                 Ok(())
@@ -3082,6 +3083,7 @@ fn lower_switch_statement<'a>(
         body_result
     })();
     ctx.release_temps(1); // disc_temp
+    ctx.restore_scope(switch_scope);
     lower
 }
 
@@ -3406,6 +3408,7 @@ enum BindingRef {
         reg: u16,
         initialized: bool,
         is_const: bool,
+        runtime_tdz: bool,
     },
     /// M25: binding resolved in an enclosing scope — accessed
     /// through the inner closure's upvalue list. `idx` is the
@@ -3429,6 +3432,7 @@ struct LocalBinding<'a> {
     slot: u16,
     initialized: bool,
     is_const: bool,
+    runtime_tdz: bool,
 }
 
 /// Per-function lowering context: tracks parameters (0..N regular
@@ -4378,6 +4382,25 @@ impl<'a> LoweringContext<'a> {
         is_const: bool,
         span: Span,
     ) -> Result<u16, SourceLoweringError> {
+        self.allocate_local_with_mode(name, is_const, false, span)
+    }
+
+    fn allocate_hoisted_local(
+        &mut self,
+        name: &'a str,
+        is_const: bool,
+        span: Span,
+    ) -> Result<u16, SourceLoweringError> {
+        self.allocate_local_with_mode(name, is_const, true, span)
+    }
+
+    fn allocate_local_with_mode(
+        &mut self,
+        name: &'a str,
+        is_const: bool,
+        runtime_tdz: bool,
+        span: Span,
+    ) -> Result<u16, SourceLoweringError> {
         let scope_start = self.scope_starts.borrow().last().copied().unwrap_or(0);
         let same_scope_duplicate = self.locals[scope_start..].iter().any(|l| l.name == name);
         // Parameters live in the function's outermost lexical scope,
@@ -4405,6 +4428,7 @@ impl<'a> LoweringContext<'a> {
             slot,
             initialized: false,
             is_const,
+            runtime_tdz,
         });
         let new_len = live_len
             .checked_add(1)
@@ -4443,6 +4467,7 @@ impl<'a> LoweringContext<'a> {
             slot,
             initialized: true,
             is_const: true,
+            runtime_tdz: false,
         });
         let new_len = live_len
             .checked_add(1)
@@ -4496,6 +4521,7 @@ impl<'a> LoweringContext<'a> {
                 reg: local.slot,
                 initialized: local.initialized,
                 is_const: local.is_const,
+                runtime_tdz: local.runtime_tdz,
             });
         }
         for (i, param) in self.param_names.iter().enumerate() {
@@ -5339,6 +5365,114 @@ fn lower_identifier_reference(
     }
 }
 
+fn emit_assert_not_hole(
+    builder: &mut BytecodeBuilder,
+    label: &'static str,
+) -> Result<(), SourceLoweringError> {
+    builder.emit(Opcode::AssertNotHole, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("encode AssertNotHole ({label}): {err:?}"))
+    })?;
+    Ok(())
+}
+
+fn emit_load_binding_value(
+    builder: &mut BytecodeBuilder,
+    binding: BindingRef,
+    ident_span: Span,
+    label: &'static str,
+) -> Result<(), SourceLoweringError> {
+    match binding {
+        BindingRef::Param { reg } => {
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Ldar ({label}): {err:?}"))
+                })?;
+        }
+        BindingRef::Local {
+            reg,
+            initialized: true,
+            runtime_tdz: false,
+            ..
+        } => {
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Ldar ({label}): {err:?}"))
+                })?;
+        }
+        BindingRef::Local {
+            reg,
+            runtime_tdz: true,
+            ..
+        } => {
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Ldar ({label}): {err:?}"))
+                })?;
+            emit_assert_not_hole(builder, label)?;
+        }
+        BindingRef::Local {
+            initialized: false, ..
+        } => {
+            return Err(SourceLoweringError::unsupported(
+                "tdz_self_reference",
+                ident_span,
+            ));
+        }
+        BindingRef::Upvalue { idx } => {
+            builder
+                .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaUpvalue ({label}): {err:?}"))
+                })?;
+            emit_assert_not_hole(builder, label)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_assert_binding_ready_for_write(
+    builder: &mut BytecodeBuilder,
+    binding: BindingRef,
+    ident_span: Span,
+    label: &'static str,
+) -> Result<(), SourceLoweringError> {
+    match binding {
+        BindingRef::Local {
+            reg,
+            runtime_tdz: true,
+            ..
+        } => {
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Ldar ({label}): {err:?}"))
+                })?;
+            emit_assert_not_hole(builder, label)
+        }
+        BindingRef::Param { .. }
+        | BindingRef::Local {
+            initialized: true, ..
+        } => Ok(()),
+        BindingRef::Local {
+            initialized: false, ..
+        } => Err(SourceLoweringError::unsupported(
+            "tdz_self_reference",
+            ident_span,
+        )),
+        BindingRef::Upvalue { idx } => {
+            builder
+                .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode LdaUpvalue ({label}): {err:?}"))
+                })?;
+            emit_assert_not_hole(builder, label)
+        }
+    }
+}
+
 /// Emits `Ldar reg` for an in-scope identifier read. Rejects
 /// uninitialized locals (TDZ self-reference) at compile time so the
 /// runtime never sees a hole on this path.
@@ -5354,40 +5488,25 @@ fn lower_identifier_read(
     binding: BindingRef,
     ident_span: Span,
 ) -> Result<(), SourceLoweringError> {
-    let reg = match binding {
-        BindingRef::Param { reg } => reg,
-        BindingRef::Local {
+    match binding {
+        BindingRef::Param { reg }
+        | BindingRef::Local {
             reg,
             initialized: true,
+            runtime_tdz: false,
             ..
-        } => reg,
-        BindingRef::Local {
-            initialized: false, ..
         } => {
-            return Err(SourceLoweringError::unsupported(
-                "tdz_self_reference",
-                ident_span,
-            ));
-        }
-        BindingRef::Upvalue { idx } => {
-            // M25: captured outer binding. `LdaUpvalue idx` reads
-            // the cell into acc; the dispatcher pulls the current
-            // value through the shared UpvalueCell so outer
-            // mutations are live-visible.
-            builder
-                .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
+            let pc = builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
                 .map_err(|err| {
-                    SourceLoweringError::Internal(format!("encode LdaUpvalue: {err:?}"))
+                    SourceLoweringError::Internal(format!("encode Ldar (identifier read): {err:?}"))
                 })?;
-            return Ok(());
+            let slot = ctx.allocate_arithmetic_feedback();
+            builder.attach_feedback(pc, slot);
+            Ok(())
         }
-    };
-    let pc = builder
-        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
-        .map_err(|err| SourceLoweringError::Internal(format!("encode Ldar: {err:?}")))?;
-    let slot = ctx.allocate_arithmetic_feedback();
-    builder.attach_feedback(pc, slot);
-    Ok(())
+        other => emit_load_binding_value(builder, other, ident_span, "identifier read"),
+    }
 }
 
 /// Emits a Reg-form binary opcode (`Add`/`Sub`/...) reading the given
@@ -7658,6 +7777,7 @@ fn lower_update_expression(
             reg,
             initialized: true,
             is_const: false,
+            ..
         } => reg,
         BindingRef::Local { is_const: true, .. } => {
             return Err(SourceLoweringError::unsupported("const_update", ident.span));
@@ -9320,38 +9440,66 @@ fn emit_identifier_as_reg_operand(
     binding: BindingRef,
     ident_span: Span,
 ) -> Result<u32, SourceLoweringError> {
-    let reg = match binding {
-        BindingRef::Param { reg } => reg,
+    let direct_reg = match binding {
+        BindingRef::Param { reg } => Some(reg),
         BindingRef::Local {
             reg,
             initialized: true,
+            runtime_tdz: false,
             ..
-        } => reg,
+        } => Some(reg),
         BindingRef::Local {
-            initialized: false, ..
+            runtime_tdz: true, ..
+        } => None,
+        BindingRef::Local {
+            initialized: false,
+            runtime_tdz: false,
+            ..
         } => {
             return Err(SourceLoweringError::unsupported(
                 "tdz_self_reference",
                 ident_span,
             ));
         }
-        // Upvalue bindings have no direct register — callers
-        // that reach here should route through the
-        // complex-RHS path instead. We surface a tagged
-        // internal error so accidental plumbing mismatches are
-        // loud.
-        BindingRef::Upvalue { .. } => {
-            return Err(SourceLoweringError::Internal(
-                "upvalue binding reached emit_identifier_as_reg_operand".into(),
-            ));
-        }
+        BindingRef::Upvalue { .. } => None,
     };
-    let pc = builder
-        .emit(opcode, &[Operand::Reg(u32::from(reg))])
-        .map_err(|err| SourceLoweringError::Internal(format!("encode {label}: {err:?}")))?;
-    let slot = ctx.allocate_arithmetic_feedback();
-    builder.attach_feedback(pc, slot);
-    Ok(pc)
+    if let Some(reg) = direct_reg {
+        let pc = builder
+            .emit(opcode, &[Operand::Reg(u32::from(reg))])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode {label}: {err:?}")))?;
+        let slot = ctx.allocate_arithmetic_feedback();
+        builder.attach_feedback(pc, slot);
+        return Ok(pc);
+    }
+
+    let lhs_temp = ctx.acquire_temps(1)?;
+    let rhs_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    let result = (|| -> Result<u32, SourceLoweringError> {
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(lhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star ({label} lhs temp): {err:?}"))
+            })?;
+        emit_load_binding_value(builder, binding, ident_span, label)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(rhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star ({label} rhs temp): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(lhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar ({label} lhs reload): {err:?}"))
+            })?;
+        let pc = builder
+            .emit(opcode, &[Operand::Reg(u32::from(rhs_temp))])
+            .map_err(|err| SourceLoweringError::Internal(format!("encode {label}: {err:?}")))?;
+        let slot = ctx.allocate_arithmetic_feedback();
+        builder.attach_feedback(pc, slot);
+        Ok(pc)
+    })();
+    ctx.release_temps(2);
+    result
 }
 
 /// Applies a binary operation whose LHS is already in the accumulator.
@@ -10085,7 +10233,30 @@ fn assign_identifier_reference<'a>(
             reg,
             initialized: true,
             is_const: false,
+            runtime_tdz: false,
+            ..
         } => {
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (destruct ident target): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        }
+        BindingRef::Local {
+            reg,
+            is_const: false,
+            runtime_tdz: true,
+            ..
+        } => {
+            emit_assert_binding_ready_for_write(
+                builder,
+                binding,
+                ident.span,
+                "destruct ident target",
+            )?;
             builder
                 .emit(Opcode::Star, &[Operand::Reg(u32::from(reg))])
                 .map_err(|err| {
@@ -10105,14 +10276,22 @@ fn assign_identifier_reference<'a>(
             "tdz_self_reference",
             ident.span,
         )),
-        BindingRef::Upvalue { idx } => builder
-            .emit(Opcode::StaUpvalue, &[Operand::Idx(u32::from(idx))])
-            .map(|_| ())
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!(
-                    "encode StaUpvalue (destruct ident target): {err:?}"
-                ))
-            }),
+        BindingRef::Upvalue { idx } => {
+            emit_assert_binding_ready_for_write(
+                builder,
+                binding,
+                ident.span,
+                "destruct ident target",
+            )?;
+            builder
+                .emit(Opcode::StaUpvalue, &[Operand::Idx(u32::from(idx))])
+                .map(|_| ())
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode StaUpvalue (destruct ident target): {err:?}"
+                    ))
+                })
+        }
     }
 }
 
@@ -10133,6 +10312,7 @@ fn lower_identifier_assignment<'a>(
     // path, so handle it separately.
     if let BindingRef::Upvalue { idx } = binding {
         if expr.operator == AssignmentOperator::Assign {
+            emit_assert_binding_ready_for_write(builder, binding, target_span, "assign upvalue")?;
             lower_return_expression(builder, ctx, &expr.right)?;
         } else {
             let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
@@ -10143,14 +10323,7 @@ fn lower_identifier_assignment<'a>(
                     "compound assignment {bin_op:?} has no binary opcode encoding"
                 ))
             })?;
-            // Read current upvalue value into acc.
-            builder
-                .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode LdaUpvalue (compound upvalue lhs): {err:?}"
-                    ))
-                })?;
+            emit_load_binding_value(builder, binding, target_span, "compound upvalue lhs")?;
             apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
         }
         builder
@@ -10164,7 +10337,17 @@ fn lower_identifier_assignment<'a>(
             reg,
             initialized: true,
             is_const: false,
+            runtime_tdz: false,
+            ..
         } => reg,
+        BindingRef::Local {
+            reg,
+            runtime_tdz: true,
+            ..
+        } => {
+            emit_assert_binding_ready_for_write(builder, binding, target_span, "assignment lhs")?;
+            reg
+        }
         BindingRef::Local { is_const: true, .. } => {
             return Err(SourceLoweringError::unsupported(
                 "const_assignment",
@@ -10199,13 +10382,23 @@ fn lower_identifier_assignment<'a>(
                 "compound assignment {bin_op:?} has no binary opcode encoding"
             ))
         })?;
-        let ldar_pc = builder
-            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(target_reg))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Ldar (compound lhs): {err:?}"))
-            })?;
-        let ldar_slot = ctx.allocate_arithmetic_feedback();
-        builder.attach_feedback(ldar_pc, ldar_slot);
+        if matches!(
+            binding,
+            BindingRef::Local {
+                initialized: true,
+                ..
+            }
+        ) {
+            let ldar_pc = builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(target_reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Ldar (compound lhs): {err:?}"))
+                })?;
+            let ldar_slot = ctx.allocate_arithmetic_feedback();
+            builder.attach_feedback(ldar_pc, ldar_slot);
+        } else {
+            emit_load_binding_value(builder, binding, target_span, "compound lhs")?;
+        }
         apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
     }
 
@@ -11229,40 +11422,7 @@ fn lower_direct_call<'a>(
             .acquire_temps(argc)
             .inspect_err(|_| ctx.release_temps(1))?;
         let lower = (|| -> Result<(), SourceLoweringError> {
-            match binding {
-                BindingRef::Param { reg }
-                | BindingRef::Local {
-                    reg,
-                    initialized: true,
-                    ..
-                } => {
-                    // Load the local/param into the callee temp.
-                    builder
-                        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
-                        .map_err(|err| {
-                            SourceLoweringError::Internal(format!(
-                                "encode Ldar (callable local): {err:?}"
-                            ))
-                        })?;
-                }
-                BindingRef::Local {
-                    initialized: false, ..
-                } => {
-                    return Err(SourceLoweringError::unsupported(
-                        "tdz_self_reference",
-                        callee_ident.span,
-                    ));
-                }
-                BindingRef::Upvalue { idx } => {
-                    builder
-                        .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
-                        .map_err(|err| {
-                            SourceLoweringError::Internal(format!(
-                                "encode LdaUpvalue (callable upvalue): {err:?}"
-                            ))
-                        })?;
-                }
-            }
+            emit_load_binding_value(builder, binding, callee_ident.span, "callable binding")?;
             builder
                 .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
                 .map_err(|err| {
@@ -11378,39 +11538,7 @@ fn lower_direct_call_with_spread<'a>(
         //    upvalue, top-level function (via `CreateClosure` of
         //    the `FunctionIndex`), then the global fallback.
         if let Some(binding) = ctx.resolve_identifier(name) {
-            match binding {
-                BindingRef::Param { reg }
-                | BindingRef::Local {
-                    reg,
-                    initialized: true,
-                    ..
-                } => {
-                    builder
-                        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(reg))])
-                        .map_err(|err| {
-                            SourceLoweringError::Internal(format!(
-                                "encode Ldar (spread callee): {err:?}"
-                            ))
-                        })?;
-                }
-                BindingRef::Local {
-                    initialized: false, ..
-                } => {
-                    return Err(SourceLoweringError::unsupported(
-                        "tdz_self_reference",
-                        callee_ident.span,
-                    ));
-                }
-                BindingRef::Upvalue { idx } => {
-                    builder
-                        .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
-                        .map_err(|err| {
-                            SourceLoweringError::Internal(format!(
-                                "encode LdaUpvalue (spread callee): {err:?}"
-                            ))
-                        })?;
-                }
-            }
+            emit_load_binding_value(builder, binding, callee_ident.span, "spread callee")?;
         } else if let Some(func_idx) = ctx.resolve_function(name) {
             // Top-level function declaration — materialise the
             // closure inline via `CreateClosure <func_idx>, 0`

@@ -3136,6 +3136,40 @@ fn run_string_function(source: &str, args: &[RegisterValue]) -> String {
         .into_string()
 }
 
+/// Executes a function and either returns its string result or formats an
+/// uncaught thrown value in the same runtime that created it.
+fn run_string_function_catching(source: &str, args: &[i32]) -> Result<String, String> {
+    let module = compile(source).expect("compile");
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
+    let function = module.function(entry).expect("module has entry function");
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    for (i, v) in args.iter().enumerate() {
+        registers[hidden + i] = RegisterValue::from_i32(*v);
+    }
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    match Interpreter::new().execute_with_runtime(&module, entry, &registers, &mut runtime) {
+        Ok(result) => Ok(runtime
+            .js_to_string_infallible(result.return_value())
+            .into_string()),
+        Err(crate::interpreter::InterpreterError::UncaughtThrow(value)) => {
+            if let Some(handle) = value.as_object_handle() {
+                let (name, message) =
+                    runtime.read_error_name_and_message(crate::object::ObjectHandle(handle));
+                if message.is_empty() {
+                    Err(name)
+                } else {
+                    Err(format!("{name}: {message}"))
+                }
+            } else {
+                Err(runtime.js_to_string_infallible(value).into_string())
+            }
+        }
+        Err(err) => panic!("unexpected interpreter failure: {err:?}"),
+    }
+}
+
 #[test]
 fn string_literal_returns_string() {
     let module = compile("function f() { return \"hello\"; }").expect("compile");
@@ -4544,6 +4578,118 @@ fn switch_empty_case_bodies_fall_through_to_following() {
     assert_eq!(run_int32_function(program, &[1]), 12);
     assert_eq!(run_int32_function(program, &[2]), 12);
     assert_eq!(run_int32_function(program, &[3]), 3);
+}
+
+#[test]
+fn switch_case_lexical_declaration_reads_initialized_binding() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let x = 7; return x; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 7);
+}
+
+#[test]
+fn switch_case_lexical_tdz_on_direct_entry_to_later_case() {
+    let program = "function f(n) { \
+        switch (n) { \
+            case 1: let x = 7; break; \
+            case 2: return x; \
+            default: return 0; \
+        } \
+        return 0; \
+    }";
+    let err = run_string_function_catching(program, &[2]).expect_err("direct entry must hit TDZ");
+    assert!(
+        err.contains("Cannot access uninitialized binding"),
+        "unexpected err: {err}"
+    );
+}
+
+#[test]
+fn switch_case_lexical_tdz_applies_to_case_test_expressions() {
+    let program = "function f() { \
+        switch (0) { \
+            case x: return 1; \
+            case 0: let x = 2; return x; \
+            default: return 3; \
+        } \
+    }";
+    let err =
+        run_string_function_catching(program, &[]).expect_err("case test must observe switch TDZ");
+    assert!(
+        err.contains("Cannot access uninitialized binding"),
+        "unexpected err: {err}"
+    );
+}
+
+#[test]
+fn switch_case_destructuring_lexical_declaration_initializes_hoisted_names() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let { x, y = 9 } = { x: 4 }; return x * 10 + y; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 49);
+}
+
+#[test]
+fn switch_case_object_destructuring_binds_plain_property() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let { x } = { x: 4 }; return x; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 4);
+}
+
+#[test]
+fn switch_case_object_destructuring_applies_default_initializer() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let { y = 9 } = {}; return y; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 9);
+}
+
+#[test]
+fn switch_case_object_destructuring_binds_multiple_names() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let { x, y = 9 } = { x: 4 }; return x + y; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 13);
+}
+
+#[test]
+fn switch_case_object_destructuring_keeps_first_binding_distinct() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let { x, y = 9 } = { x: 4 }; return x; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 4);
+}
+
+#[test]
+fn switch_case_lexical_fallthrough_reads_initialized_binding() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let x = 7; \
+            case 2: return x; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 7);
 }
 
 #[test]

@@ -228,6 +228,10 @@ pub enum Opcode {
     SetPendingJump = 0x9D,
     PushPendingFinally = 0x9E,
     ResumeAbrupt = 0x9F,
+    // Explicit resource management (`using` / `await using`).
+    PushUsingScope = 0xA0,
+    AddDisposableResource = 0xA1,
+    DisposeUsingScope = 0xA2,
     // 0xFE, 0xFF are reserved for Wide / ExtraWide prefixes. Max legal
     // opcode discriminant is 0xFD.
 }
@@ -428,6 +432,9 @@ impl Opcode {
             0x9D => SetPendingJump,
             0x9E => PushPendingFinally,
             0x9F => ResumeAbrupt,
+            0xA0 => PushUsingScope,
+            0xA1 => AddDisposableResource,
+            0xA2 => DisposeUsingScope,
             _ => return None,
         })
     }
@@ -495,11 +502,11 @@ impl Opcode {
             TailCall => OperandShape::of(&[Reg, Reg, RegList]),
 
             // §5.7
-            Return | Throw | ReThrow | Nop | SetPendingReturn | ResumeAbrupt => {
-                OperandShape::of(&[])
-            }
+            Return | Throw | ReThrow | Nop | SetPendingReturn | ResumeAbrupt | PushUsingScope
+            | DisposeUsingScope => OperandShape::of(&[]),
             Abort => OperandShape::of(&[Imm]),
             SetPendingJump | PushPendingFinally => OperandShape::of(&[Imm]),
+            AddDisposableResource => OperandShape::of(&[Reg, Imm]),
 
             // §5.8
             Yield | SuspendGenerator | Await => OperandShape::of(&[]),
@@ -730,6 +737,9 @@ impl Opcode {
             SetPendingJump => "SetPendingJump",
             PushPendingFinally => "PushPendingFinally",
             ResumeAbrupt => "ResumeAbrupt",
+            PushUsingScope => "PushUsingScope",
+            AddDisposableResource => "AddDisposableResource",
+            DisposeUsingScope => "DisposeUsingScope",
         }
     }
 

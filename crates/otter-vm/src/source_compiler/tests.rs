@@ -7793,6 +7793,90 @@ fn m33f_set_timeout_chained_settles_promise() {
     assert_eq!(run_promise_state_counter(src, "count"), 43);
 }
 
+// ---------------------------------------------------------------------------
+// M37: explicit resource management (`using` / `await using`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m37_using_disposes_in_lifo_order_at_block_exit() {
+    let src = "function f() { \
+        let state = { count: 0 }; \
+        { \
+            using a = { [Symbol.dispose]() { state.count = state.count * 10 + 1; } }; \
+            using b = { [Symbol.dispose]() { state.count = state.count * 10 + 2; } }; \
+            state.count = 3; \
+        } \
+        return state.count; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 321);
+}
+
+#[test]
+fn m37_using_runs_before_return_completion() {
+    let src = "function inner(state) { \
+            using x = { [Symbol.dispose]() { state.count = 7; } }; \
+            return 1; \
+        } \
+        function f() { \
+            let state = { count: 0 }; \
+            inner(state); \
+            return state.count; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn m37_using_disposes_earlier_resources_when_later_registration_throws() {
+    let src = "function f() { \
+        let state = { count: 0 }; \
+        try { \
+            using a = { [Symbol.dispose]() { state.count = 1; } }, \
+                  b = { [Symbol.dispose]: 1 }; \
+            return 0; \
+        } catch (e) { \
+            return state.count * 100 + (e.name === 'TypeError'); \
+        } \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 101);
+}
+
+#[test]
+fn m37_using_throw_and_dispose_throw_form_suppressed_error() {
+    let src = "function f() { \
+        try { \
+            using x = { [Symbol.dispose]() { throw new Error('dispose'); } }; \
+            throw new Error('body'); \
+        } catch (e) { \
+            return `${e.name}:${e.error.message}:${e.suppressed.message}`; \
+        } \
+    }";
+    assert_eq!(
+        run_string_function(src, &[]),
+        "SuppressedError:dispose:body"
+    );
+}
+
+#[test]
+fn m37_await_using_awaits_async_disposer_before_settlement() {
+    let src = "async function run() { \
+            let state = { count: 0 }; \
+            { \
+                await using x = { \
+                    [Symbol.asyncDispose]() { \
+                        return Promise.resolve().then(function() { state.count = 5; }); \
+                    } \
+                }; \
+            } \
+            return state; \
+        } \
+        function main() { \
+            let outer = { count: 0 }; \
+            run().then(function(state) { outer.count = state.count; }); \
+            return outer; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 5);
+}
+
 #[test]
 fn m33f_await_pending_promise_settled_by_timer() {
     // `await p` where `p` is ONLY resolved by a setTimeout

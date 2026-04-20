@@ -25,7 +25,7 @@ use crate::frame::RegisterIndex;
 use crate::module::{Function, Module};
 use crate::value::RegisterValue;
 
-use super::activation::PendingAbruptCompletion;
+use super::activation::{PendingAbruptCompletion, UsingEntry};
 use super::step_outcome::{StepOutcome, TailCallPayload};
 use super::{Activation, FrameRuntimeState, Interpreter, InterpreterError, RuntimeState};
 
@@ -1685,8 +1685,25 @@ impl Interpreter {
                             activation.set_pc(target_pc);
                             return Ok(StepOutcome::Continue);
                         }
+                        PendingAbruptCompletion::Throw(value) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
                     }
                 }
+            }
+            Opcode::PushUsingScope => {
+                activation.push_using_scope();
+            }
+            Opcode::AddDisposableResource => {
+                let value = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let await_dispose = imm(&instr.operands, 1)? != 0;
+                match add_disposable_resource(runtime, activation, value, await_dispose) {
+                    Ok(()) => {}
+                    Err(value) => return Ok(StepOutcome::Throw(value)),
+                }
+            }
+            Opcode::DisposeUsingScope => {
+                dispose_using_scope(self, runtime, _module, activation)?;
             }
             // §14.14 ThrowStatement + §14.15.3 TryStatement. The
             // dispatcher's main loop (see `run_completion_with_runtime`)
@@ -3390,6 +3407,219 @@ fn resolve_property(
         .get(id)
         .ok_or(InterpreterError::UnknownPropertyName)?;
     Ok(runtime.intern_property_name(property_name))
+}
+
+fn add_disposable_resource(
+    runtime: &mut RuntimeState,
+    activation: &mut Activation,
+    value: RegisterValue,
+    await_dispose: bool,
+) -> Result<(), RegisterValue> {
+    let Some(entry) = prepare_using_entry(runtime, value, await_dispose)? else {
+        return Ok(());
+    };
+    activation.push_using_entry(entry);
+    Ok(())
+}
+
+fn prepare_using_entry(
+    runtime: &mut RuntimeState,
+    value: RegisterValue,
+    await_dispose: bool,
+) -> Result<Option<UsingEntry>, RegisterValue> {
+    if value == RegisterValue::undefined() || value == RegisterValue::null() {
+        return Ok(None);
+    }
+
+    let target = runtime.property_base_object_handle(value).map_err(|err| {
+        let message = err.to_string();
+        type_error_value(runtime, &message).unwrap_or_else(|_| RegisterValue::undefined())
+    })?;
+
+    let async_prop = runtime
+        .intern_symbol_property_name(crate::intrinsics::WellKnownSymbol::AsyncDispose.stable_id());
+    let sync_prop = runtime
+        .intern_symbol_property_name(crate::intrinsics::WellKnownSymbol::Dispose.stable_id());
+
+    let (method, effective_await) = if await_dispose {
+        let async_method = get_method_for_using(runtime, target, async_prop, value)?;
+        if async_method != RegisterValue::undefined() {
+            (async_method, true)
+        } else {
+            (
+                get_method_for_using(runtime, target, sync_prop, value)?,
+                true,
+            )
+        }
+    } else {
+        (
+            get_method_for_using(runtime, target, sync_prop, value)?,
+            false,
+        )
+    };
+
+    let Some(disposer) = method.as_object_handle().map(crate::object::ObjectHandle) else {
+        if method == RegisterValue::undefined() {
+            let message = if await_dispose {
+                "Object is not async disposable"
+            } else {
+                "Object is not disposable"
+            };
+            return Err(type_error_value(runtime, message)?);
+        }
+        return Err(type_error_value(
+            runtime,
+            "Dispose method must be callable",
+        )?);
+    };
+    if !runtime.objects.is_callable(disposer) {
+        return Err(type_error_value(
+            runtime,
+            "Dispose method must be callable",
+        )?);
+    }
+
+    Ok(Some(UsingEntry::new(value, disposer, effective_await)))
+}
+
+fn get_method_for_using(
+    runtime: &mut RuntimeState,
+    target: crate::object::ObjectHandle,
+    property: crate::property::PropertyNameId,
+    receiver: RegisterValue,
+) -> Result<RegisterValue, RegisterValue> {
+    if runtime.is_proxy(target) {
+        runtime
+            .proxy_get(target, property, receiver)
+            .map_err(|err| {
+                type_error_value(runtime, err.to_string().as_str())
+                    .unwrap_or_else(|_| RegisterValue::undefined())
+            })
+    } else {
+        runtime
+            .ordinary_get(target, property, receiver)
+            .map_err(|err| match err {
+                crate::VmNativeCallError::Thrown(value) => value,
+                crate::VmNativeCallError::Internal(message) => type_error_value(runtime, &message)
+                    .unwrap_or_else(|_| RegisterValue::undefined()),
+            })
+    }
+}
+
+fn dispose_using_scope(
+    interpreter: &Interpreter,
+    runtime: &mut RuntimeState,
+    module: &Module,
+    activation: &mut Activation,
+) -> Result<(), InterpreterError> {
+    let Some(scope_start) = activation.pop_using_scope() else {
+        return Err(InterpreterError::NativeCall(
+            "DisposeUsingScope without matching PushUsingScope".into(),
+        ));
+    };
+
+    let had_pending_exception = activation.pending_exception().is_some();
+    let mut current_throw =
+        activation
+            .pending_exception()
+            .or_else(|| match activation.pending_abrupt_completion() {
+                Some(PendingAbruptCompletion::Throw(value)) => Some(value),
+                _ => None,
+            });
+
+    while activation.using_entry_count() > scope_start {
+        let entry = activation
+            .pop_using_entry()
+            .expect("using entry count checked before pop");
+        if let Err(dispose_error) = run_using_disposer(interpreter, runtime, module, entry) {
+            current_throw = Some(match current_throw {
+                Some(previous) => crate::intrinsics::error_class::alloc_suppressed_error_value(
+                    runtime,
+                    dispose_error,
+                    previous,
+                    RegisterValue::undefined(),
+                )
+                .map_err(|err| match err {
+                    crate::VmNativeCallError::Thrown(value) => {
+                        InterpreterError::UncaughtThrow(value)
+                    }
+                    crate::VmNativeCallError::Internal(message) => {
+                        InterpreterError::NativeCall(message)
+                    }
+                })?,
+                None => dispose_error,
+            });
+        }
+    }
+
+    if had_pending_exception {
+        if let Some(value) = current_throw {
+            activation.set_pending_exception(value);
+        }
+    } else if let Some(value) = current_throw {
+        activation.set_pending_abrupt_completion(PendingAbruptCompletion::Throw(value));
+    }
+
+    Ok(())
+}
+
+fn run_using_disposer(
+    interpreter: &Interpreter,
+    runtime: &mut RuntimeState,
+    module: &Module,
+    entry: UsingEntry,
+) -> Result<(), RegisterValue> {
+    let result = runtime.call_callable(entry.disposer(), entry.receiver(), &[]);
+    let value = match result {
+        Ok(value) => value,
+        Err(crate::VmNativeCallError::Thrown(value)) => return Err(value),
+        Err(crate::VmNativeCallError::Internal(message)) => {
+            return Err(type_error_value(runtime, &message)?);
+        }
+    };
+
+    if !entry.await_dispose() {
+        return Ok(());
+    }
+
+    let Some(raw) = value.as_object_handle() else {
+        return Ok(());
+    };
+    let promise_handle = crate::object::ObjectHandle(raw);
+    if runtime.objects.get_promise(promise_handle).is_none() {
+        return Ok(());
+    }
+
+    interpreter
+        .drive_event_loop_until_settled(runtime, module, promise_handle)
+        .map_err(|err| {
+            type_error_value(runtime, err.to_string().as_str())
+                .unwrap_or_else(|_| RegisterValue::undefined())
+        })?;
+    let promise = runtime
+        .objects
+        .get_promise(promise_handle)
+        .expect("promise kind checked above");
+    if promise.fulfilled_value().is_some() {
+        return Ok(());
+    }
+    if let Some(reason) = promise.rejected_reason() {
+        return Err(reason);
+    }
+    Err(type_error_value(
+        runtime,
+        "await using on a pending promise exceeded the event-loop budget",
+    )?)
+}
+
+fn type_error_value(
+    runtime: &mut RuntimeState,
+    message: &str,
+) -> Result<RegisterValue, RegisterValue> {
+    runtime
+        .alloc_type_error(message)
+        .map(|handle| RegisterValue::from_object_handle(handle.0))
+        .map_err(|_| RegisterValue::undefined())
 }
 
 /// Coerce a `RegisterValue` to a property-name id per §7.1.19

@@ -154,6 +154,8 @@ pub enum IntrinsicKey {
     EvalErrorPrototype,
     /// `%AggregateError.prototype%`
     AggregateErrorPrototype,
+    /// `%SuppressedError.prototype%`
+    SuppressedErrorPrototype,
     /// `%Promise.prototype%`
     PromisePrototype,
     /// `%Map.prototype%`
@@ -235,6 +237,7 @@ pub const CORE_INTRINSIC_GLOBAL_NAMES: &[&str] = &[
     "URIError",
     "EvalError",
     "AggregateError",
+    "SuppressedError",
     "Symbol",
     "Date",
     "RegExp",
@@ -394,6 +397,8 @@ pub struct VmIntrinsics {
     pub(crate) eval_error_constructor: ObjectHandle,
     pub(crate) aggregate_error_prototype: ObjectHandle,
     pub(crate) aggregate_error_constructor: ObjectHandle,
+    pub(crate) suppressed_error_prototype: ObjectHandle,
+    pub(crate) suppressed_error_constructor: ObjectHandle,
     /// V8-extension `Error.prototype.stack` getter — stored so
     /// `Error.captureStackTrace` can install an own accessor on arbitrary
     /// targets.
@@ -516,6 +521,7 @@ impl VmIntrinsics {
             IntrinsicKey::URIErrorPrototype => self.uri_error_prototype,
             IntrinsicKey::EvalErrorPrototype => self.eval_error_prototype,
             IntrinsicKey::AggregateErrorPrototype => self.aggregate_error_prototype,
+            IntrinsicKey::SuppressedErrorPrototype => self.suppressed_error_prototype,
             IntrinsicKey::PromisePrototype => self.promise_prototype,
             IntrinsicKey::MapPrototype => self.map_prototype,
             IntrinsicKey::SetPrototype => self.set_prototype,
@@ -615,6 +621,8 @@ impl VmIntrinsics {
         let eval_error_constructor = heap.alloc_object();
         let aggregate_error_prototype = heap.alloc_object();
         let aggregate_error_constructor = heap.alloc_object();
+        let suppressed_error_prototype = heap.alloc_object();
+        let suppressed_error_constructor = heap.alloc_object();
         let map_constructor = heap.alloc_object();
         let map_prototype = heap.alloc_object();
         let set_constructor = heap.alloc_object();
@@ -772,6 +780,8 @@ impl VmIntrinsics {
             eval_error_constructor,
             aggregate_error_prototype,
             aggregate_error_constructor,
+            suppressed_error_prototype,
+            suppressed_error_constructor,
             error_stack_getter: None,
             error_stack_setter: None,
             map_constructor,
@@ -910,6 +920,12 @@ impl VmIntrinsics {
         heap.set_prototype(self.aggregate_error_prototype, Some(self.error_prototype))?;
         heap.set_prototype(
             self.aggregate_error_constructor,
+            Some(self.function_prototype),
+        )?;
+        // SuppressedError (explicit resource management)
+        heap.set_prototype(self.suppressed_error_prototype, Some(self.error_prototype))?;
+        heap.set_prototype(
+            self.suppressed_error_constructor,
             Some(self.function_prototype),
         )?;
         // Promise: constructor → Function.prototype, prototype → Object.prototype
@@ -2076,7 +2092,7 @@ mod tests {
         );
 
         assert_eq!(intrinsics.namespace_roots().len(), 4);
-        assert_eq!(native_functions.len(), 735);
+        assert_eq!(native_functions.len(), 736);
         assert_eq!(
             heap.get_prototype(intrinsics.global_object()),
             Ok(Some(intrinsics.object_prototype()))

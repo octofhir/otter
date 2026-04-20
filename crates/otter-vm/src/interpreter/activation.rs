@@ -15,6 +15,40 @@ use super::RuntimeState;
 pub(super) enum PendingAbruptCompletion {
     Return(RegisterValue),
     Jump(ProgramCounter),
+    Throw(RegisterValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct UsingEntry {
+    receiver: RegisterValue,
+    disposer: ObjectHandle,
+    await_dispose: bool,
+}
+
+impl UsingEntry {
+    #[must_use]
+    pub const fn new(receiver: RegisterValue, disposer: ObjectHandle, await_dispose: bool) -> Self {
+        Self {
+            receiver,
+            disposer,
+            await_dispose,
+        }
+    }
+
+    #[must_use]
+    pub const fn receiver(self) -> RegisterValue {
+        self.receiver
+    }
+
+    #[must_use]
+    pub const fn disposer(self) -> ObjectHandle {
+        self.disposer
+    }
+
+    #[must_use]
+    pub const fn await_dispose(self) -> bool {
+        self.await_dispose
+    }
 }
 
 /// Mutable activation state for a single executing function frame.
@@ -27,6 +61,8 @@ pub struct Activation {
     pending_exception: Option<RegisterValue>,
     pending_abrupt_completion: Option<PendingAbruptCompletion>,
     pending_finally_stack: Vec<ProgramCounter>,
+    using_scope_markers: Vec<usize>,
+    using_entries: Vec<UsingEntry>,
     pc: ProgramCounter,
     registers: Box<[RegisterValue]>,
     open_upvalues: Box<[Option<ObjectHandle>]>,
@@ -97,6 +133,8 @@ impl Activation {
             pending_exception: None,
             pending_abrupt_completion: None,
             pending_finally_stack: Vec::new(),
+            using_scope_markers: Vec::new(),
+            using_entries: Vec::new(),
             pc: 0,
             registers: vec![RegisterValue::default(); usize::from(register_count)]
                 .into_boxed_slice(),
@@ -165,6 +203,11 @@ impl Activation {
         self.pending_abrupt_completion = Some(value);
     }
 
+    #[must_use]
+    pub(super) const fn pending_abrupt_completion(&self) -> Option<PendingAbruptCompletion> {
+        self.pending_abrupt_completion
+    }
+
     pub(super) fn take_pending_abrupt_completion(&mut self) -> Option<PendingAbruptCompletion> {
         self.pending_abrupt_completion.take()
     }
@@ -183,6 +226,27 @@ impl Activation {
 
     pub(super) fn clear_pending_finally(&mut self) {
         self.pending_finally_stack.clear();
+    }
+
+    pub(super) fn push_using_scope(&mut self) {
+        self.using_scope_markers.push(self.using_entries.len());
+    }
+
+    pub(super) fn pop_using_scope(&mut self) -> Option<usize> {
+        self.using_scope_markers.pop()
+    }
+
+    pub(super) fn push_using_entry(&mut self, entry: UsingEntry) {
+        self.using_entries.push(entry);
+    }
+
+    pub(super) fn pop_using_entry(&mut self) -> Option<UsingEntry> {
+        self.using_entries.pop()
+    }
+
+    #[must_use]
+    pub(super) fn using_entry_count(&self) -> usize {
+        self.using_entries.len()
     }
 
     /// Returns the immutable register slice.

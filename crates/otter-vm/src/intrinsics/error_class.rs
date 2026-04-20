@@ -101,6 +101,12 @@ impl IntrinsicInstaller for ErrorIntrinsic {
             intrinsics.function_prototype,
             cx,
         )?;
+        install_suppressed_error_class(
+            intrinsics.suppressed_error_prototype,
+            &mut intrinsics.suppressed_error_constructor,
+            intrinsics.function_prototype,
+            cx,
+        )?;
 
         // Install Error.prototype.toString on the base Error prototype.
         install_error_to_string(intrinsics, cx)?;
@@ -125,6 +131,7 @@ impl IntrinsicInstaller for ErrorIntrinsic {
             ("URIError", intrinsics.uri_error_constructor),
             ("EvalError", intrinsics.eval_error_constructor),
             ("AggregateError", intrinsics.aggregate_error_constructor),
+            ("SuppressedError", intrinsics.suppressed_error_constructor),
         ];
         for &(name, handle) in globals {
             cx.install_global_value(
@@ -249,6 +256,56 @@ fn install_aggregate_error_class(
     Ok(())
 }
 
+/// `SuppressedError` from explicit resource management. Stores the new
+/// disposal error in `.error` and the older completion in `.suppressed`.
+fn install_suppressed_error_class(
+    prototype: ObjectHandle,
+    constructor: &mut ObjectHandle,
+    function_prototype: ObjectHandle,
+    cx: &mut IntrinsicInstallContext<'_>,
+) -> Result<(), IntrinsicsError> {
+    let descriptor = JsClassDescriptor::new("SuppressedError").with_constructor(
+        NativeFunctionDescriptor::constructor("SuppressedError", 3, suppressed_error_constructor)
+            .with_default_intrinsic(IntrinsicKey::SuppressedErrorPrototype),
+    );
+    let plan = ClassBuilder::from_descriptor(&descriptor)
+        .expect("SuppressedError class descriptor should normalize")
+        .build();
+
+    if let Some(ctor_desc) = plan.constructor() {
+        let host_id = cx.native_functions.register(ctor_desc.clone());
+        let new_ctor = cx.alloc_intrinsic_host_function(host_id, function_prototype)?;
+        install_function_length_name(new_ctor, ctor_desc.length(), ctor_desc.js_name(), cx)?;
+        *constructor = new_ctor;
+    }
+
+    install_class_plan(prototype, *constructor, &plan, function_prototype, cx)?;
+
+    let name_prop = cx.property_names.intern("name");
+    let name_str = cx.heap.alloc_string("SuppressedError");
+    cx.heap.define_own_property(
+        prototype,
+        name_prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(name_str.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
+    )?;
+
+    let message_prop = cx.property_names.intern("message");
+    let empty_str = cx.heap.alloc_string("");
+    cx.heap.define_own_property(
+        prototype,
+        message_prop,
+        PropertyValue::data_with_attrs(
+            RegisterValue::from_object_handle(empty_str.0),
+            PropertyAttributes::from_flags(true, false, true),
+        ),
+    )?;
+
+    Ok(())
+}
+
 /// §20.5.7.1 AggregateError ( errors, message )
 /// Spec: <https://tc39.es/ecma262/#sec-aggregate-error>
 fn aggregate_error_constructor(
@@ -290,6 +347,58 @@ fn aggregate_error_constructor(
         "errors",
         RegisterValue::from_object_handle(errors_list.0),
     )?;
+
+    Ok(RegisterValue::from_object_handle(handle.0))
+}
+
+fn suppressed_error_constructor(
+    _this: &RegisterValue,
+    args: &[RegisterValue],
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let error = args
+        .first()
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let suppressed = args
+        .get(1)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    let message = args
+        .get(2)
+        .copied()
+        .unwrap_or_else(RegisterValue::undefined);
+    alloc_suppressed_error_value(runtime, error, suppressed, message)
+}
+
+pub(crate) fn alloc_suppressed_error_value(
+    runtime: &mut crate::interpreter::RuntimeState,
+    error: RegisterValue,
+    suppressed: RegisterValue,
+    message: RegisterValue,
+) -> Result<RegisterValue, VmNativeCallError> {
+    let handle = error_receiver_from_call(
+        &RegisterValue::undefined(),
+        runtime,
+        runtime.intrinsics().suppressed_error_prototype,
+    )?;
+    install_error_brand(handle, runtime)?;
+    capture_error_stack(runtime, handle, 0)?;
+
+    if message != RegisterValue::undefined() {
+        let msg = runtime
+            .js_to_string(message)
+            .map_err(|err| map_interpreter_error(err, runtime))?;
+        let msg_handle = runtime.alloc_string(msg);
+        define_non_enumerable_data_property(
+            runtime,
+            handle,
+            "message",
+            RegisterValue::from_object_handle(msg_handle.0),
+        )?;
+    }
+    define_non_enumerable_data_property(runtime, handle, "error", error)?;
+    define_non_enumerable_data_property(runtime, handle, "suppressed", suppressed)?;
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }

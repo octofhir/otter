@@ -119,6 +119,70 @@ fn emit_abrupt_completion<'a>(
         })
 }
 
+pub(super) fn lower_synthetic_try_finally<'a, T, F>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    try_body: T,
+    finally_body: F,
+) -> Result<(), SourceLoweringError>
+where
+    T: FnOnce(&mut BytecodeBuilder, &mut LoweringContext<'a>) -> Result<(), SourceLoweringError>,
+    F: Copy + Fn(&mut BytecodeBuilder, &mut LoweringContext<'a>) -> Result<(), SourceLoweringError>,
+{
+    let try_start = builder.new_label();
+    let try_end = builder.new_label();
+    let after_try = builder.new_label();
+    let finally_handler = builder.new_label();
+    let finally_normal = builder.new_label();
+
+    ctx.enter_finally_frame(FinallyFrame {
+        normal_entry: finally_normal,
+    });
+    let try_result = (|| -> Result<(), SourceLoweringError> {
+        builder.bind_label(try_start).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind synth try_start: {err:?}"))
+        })?;
+        try_body(builder, ctx)?;
+        builder
+            .bind_label(try_end)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind synth try_end: {err:?}")))?;
+        builder
+            .emit_jump_to(Opcode::Jump, finally_normal)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Jump (synth try normal exit): {err:?}"
+                ))
+            })?;
+        Ok(())
+    })();
+    ctx.exit_finally_frame();
+    try_result?;
+
+    ctx.record_exception_handler(try_start, try_end, finally_handler);
+
+    builder.bind_label(finally_handler).map_err(|err| {
+        SourceLoweringError::Internal(format!("bind synth finally_handler: {err:?}"))
+    })?;
+    finally_body(builder, ctx)?;
+    builder.emit(Opcode::ReThrow, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("encode ReThrow (synth finally): {err:?}"))
+    })?;
+
+    builder.bind_label(finally_normal).map_err(|err| {
+        SourceLoweringError::Internal(format!("bind synth finally_normal: {err:?}"))
+    })?;
+    finally_body(builder, ctx)?;
+    builder.emit(Opcode::ResumeAbrupt, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("encode ResumeAbrupt (synth finally): {err:?}"))
+    })?;
+
+    builder
+        .bind_label(after_try)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind synth after_try: {err:?}")))?;
+
+    Ok(())
+}
+
 pub(super) fn lower_try_statement<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,

@@ -112,6 +112,7 @@ mod error;
 mod for_in_of;
 mod switch_scope;
 mod try_finally;
+mod using_decl;
 
 #[cfg(test)]
 mod tests;
@@ -141,6 +142,9 @@ use oxc_span::{GetSpan, SourceType, Span};
 use switch_scope::{enter_switch_lexical_scope, lower_switch_case_statement};
 use try_finally::{
     lower_break_statement, lower_continue_statement, lower_return_statement, lower_try_statement,
+};
+use using_decl::{
+    lower_function_top_statement_list, lower_nested_statement_list, lower_top_level_statement_list,
 };
 
 use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Label, Opcode, Operand};
@@ -879,9 +883,7 @@ fn synthesise_top_level_entry<'a>(
 
     // Main body: lower each collected top-level statement through
     // the same path function bodies use.
-    for stmt in script_body {
-        lower_top_statement(&mut builder, &mut ctx, stmt)?;
-    }
+    lower_top_level_statement_list(&mut builder, &mut ctx, script_body)?;
     // Post-body flush: `export const X = expr` allocated a local
     // for `X` during script-body lowering. Copy each local onto
     // the global object so the module-loader's `capture_exports`
@@ -1671,9 +1673,7 @@ fn lower_function_body_with_parent<'a>(
     // because oxc represents it as a `ReturnStatement` with
     // `argument == None`, which `lower_nested_statement` handles as
     // `LdaUndefined; Return` directly.
-    for stmt in rest {
-        lower_top_statement(&mut builder, &mut ctx, stmt)?;
-    }
+    lower_function_top_statement_list(&mut builder, &mut ctx, rest)?;
     let needs_synthetic_return = match last {
         Statement::ReturnStatement(ret) if ret.argument.is_some() => {
             // D2: the trailing-return fast path bypasses
@@ -1727,7 +1727,7 @@ fn lower_function_body_with_parent<'a>(
             // Lower the statement (call-statement, assignment, if,
             // while, block, bare `return;`, …) — it must be a
             // shape `lower_top_statement` already accepts.
-            lower_top_statement(&mut builder, &mut ctx, last)?;
+            lower_function_top_statement_list(&mut builder, &mut ctx, std::slice::from_ref(last))?;
             true
         }
     };
@@ -1775,7 +1775,7 @@ fn lower_function_body_with_parent<'a>(
 /// full M6 statement surface, including `let`/`const` declarations
 /// (which are not allowed inside nested blocks — those go through
 /// [`lower_nested_statement`] instead).
-fn lower_top_statement<'a>(
+pub(super) fn lower_top_statement<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
     stmt: &'a Statement<'a>,
@@ -1892,7 +1892,7 @@ fn lower_default_export_initializer<'a>(
 ///
 /// Takes `&mut ctx` so a `for` whose init is a `let` can call
 /// `allocate_local` without an extra dispatch level.
-fn lower_nested_statement<'a>(
+pub(super) fn lower_nested_statement<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
     stmt: &'a Statement<'a>,
@@ -1991,17 +1991,7 @@ fn lower_block_statement<'a>(
     block: &'a oxc_ast::ast::BlockStatement<'a>,
 ) -> Result<(), SourceLoweringError> {
     let scope = ctx.snapshot_scope();
-    let mut result = Ok(());
-    for inner in &block.body {
-        let step = match inner {
-            Statement::VariableDeclaration(decl) => lower_let_const_declaration(builder, ctx, decl),
-            _ => lower_nested_statement(builder, ctx, inner),
-        };
-        if let Err(err) = step {
-            result = Err(err);
-            break;
-        }
-    }
+    let result = lower_nested_statement_list(builder, ctx, &block.body);
     ctx.restore_scope(scope);
     result
 }
@@ -3149,7 +3139,7 @@ struct LocalBinding<'a> {
 /// targets. Scoped declarations push onto `locals` and pop on scope
 /// exit while `peak_local_count` retains the high-water mark so the
 /// [`FrameLayout`] reserves enough slots for the whole function.
-struct LoweringContext<'a> {
+pub(super) struct LoweringContext<'a> {
     /// Identifiers of the function's regular (non-rest) parameters,
     /// in declaration order. `param_names[i]` is bound to register
     /// `i` (user-visible slot `i`, absolute slot `hidden_count + i`).
@@ -4340,7 +4330,7 @@ impl<'a> LoweringContext<'a> {
 /// detect a self-reference (`let x = x + 1`) at compile time and
 /// reject it as `tdz_self_reference`. After the post-init `Star`,
 /// `mark_initialized` flips the binding to readable.
-fn lower_let_const_declaration<'a>(
+pub(super) fn lower_let_const_declaration<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
     decl: &'a VariableDeclaration<'a>,
@@ -12025,6 +12015,7 @@ fn is_whitelisted_global_name(name: &str) -> bool {
         | "EvalError"
         | "URIError"
         | "AggregateError"
+        | "SuppressedError"
         // Collections
         | "Map"
         | "Set"

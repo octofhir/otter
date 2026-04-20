@@ -7092,20 +7092,35 @@ fn m34_generator_return_forces_completion() {
 }
 
 #[test]
-fn m34_yield_star_still_unsupported() {
-    // `yield* iter` delegation deferred — stays rejected
-    // with a stable tag.
-    let err = compile("function* g() { yield* [1, 2, 3]; }").expect_err("yield* lands later");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "yield_star_delegation",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn m34_yield_star_forwards_inner_iterator_values() {
+    // `yield* inner()` — the inner generator's values flow out
+    // through the outer generator's `.next()` calls.
+    let src = "function* inner() { yield 10; yield 20; yield 30 } \
+         function* outer() { yield* inner() } \
+         function main() { \
+             let g = outer(); \
+             let total = 0; \
+             total = total + g.next().value; \
+             total = total + g.next().value; \
+             total = total + g.next().value; \
+             return total \
+         }";
+    assert_eq!(run_int32_function(src, &[]), 60);
+}
+
+#[test]
+fn m34_yield_star_over_array_iterable() {
+    // `yield* [1, 2, 3]` — array iterables work too.
+    let src = "function* inner() { yield* [1, 2, 3] } \
+         function main() { \
+             let g = inner(); \
+             let total = 0; \
+             total = total + g.next().value; \
+             total = total + g.next().value; \
+             total = total + g.next().value; \
+             return total \
+         }";
+    assert_eq!(run_int32_function(src, &[]), 6);
 }
 
 // ---------------------------------------------------------------------------

@@ -4957,6 +4957,111 @@ fn lower_identifier_as_reg_rhs(
     Ok(())
 }
 
+/// §14.4.14 `yield* <argument>` — delegates iteration to another
+/// iterable. Lowered as:
+///   `GetIterator` on argument → `iter_temp`
+///   loop: `IteratorStep value_temp, iter_temp`
+///   if `done` (acc truthy) break
+///   `Ldar value_temp; Yield`
+///   jump loop_top
+///   exit: `Ldar value_temp` (final value becomes expression's
+///   result)
+///
+/// Scope: forwards values outward per spec. Sent values from
+/// the outer caller's `.next(v)` reach the inner iterator only
+/// as the acc at Yield resume — the inner iterator's `.next()`
+/// doesn't receive them as arguments (full spec requires
+/// `IteratorNext` with a sent-value operand). `.throw()` and
+/// `.return()` completion forwarding are also deferred.
+fn lower_yield_star<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    yield_expr: &'a oxc_ast::ast::YieldExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    let Some(argument) = yield_expr.argument.as_ref() else {
+        return Err(SourceLoweringError::Internal(
+            "yield* without argument is a parse error".into(),
+        ));
+    };
+    let iter_temp = ctx.acquire_temps(1)?;
+    let value_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // Resolve iterable once, stash in `value_temp` as a scratch
+        // source, then convert to iterator and park in `iter_temp`.
+        lower_return_expression(builder, ctx, argument)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(value_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (yield* src): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::GetIterator, &[Operand::Reg(u32::from(value_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode GetIterator (yield*): {err:?}"))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(iter_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (yield* iter): {err:?}"))
+            })?;
+
+        let loop_top = builder.new_label();
+        let loop_exit = builder.new_label();
+        builder
+            .bind_label(loop_top)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind yield* top: {err:?}")))?;
+        builder
+            .emit(
+                Opcode::IteratorStep,
+                &[
+                    Operand::Reg(u32::from(value_temp)),
+                    Operand::Reg(u32::from(iter_temp)),
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode IteratorStep (yield*): {err:?}"))
+            })?;
+        builder
+            .emit_jump_to(Opcode::JumpIfToBooleanTrue, loop_exit)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode JumpIfToBooleanTrue (yield* done): {err:?}"
+                ))
+            })?;
+        // Forward the inner iteration's value to the outer
+        // consumer via a plain Yield.
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(value_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (yield* value): {err:?}"))
+            })?;
+        builder.emit(Opcode::Yield, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Yield (yield*): {err:?}"))
+        })?;
+        builder
+            .emit_jump_to(Opcode::Jump, loop_top)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Jump (yield* back): {err:?}"))
+            })?;
+        builder
+            .bind_label(loop_exit)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind yield* exit: {err:?}")))?;
+        // Final value of `yield* <iter>` expression is the
+        // completion value from the inner iterator's
+        // `{ value: X, done: true }` — `IteratorStep` already
+        // deposited `X` in `value_temp` on the terminating
+        // iteration.
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(value_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (yield* result): {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(2);
+    lower
+}
+
 fn lower_return_expression<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
@@ -5104,10 +5209,7 @@ fn lower_return_expression<'a>(
         // AST shape and stays deferred to a follow-up.
         Expression::YieldExpression(yield_expr) => {
             if yield_expr.delegate {
-                return Err(SourceLoweringError::unsupported(
-                    "yield_star_delegation",
-                    yield_expr.span,
-                ));
+                return lower_yield_star(builder, ctx, yield_expr);
             }
             if let Some(arg) = yield_expr.argument.as_ref() {
                 lower_return_expression(builder, ctx, arg)?;

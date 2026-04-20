@@ -6390,6 +6390,50 @@ fn m30_for_of_upvalue_target_is_set_before_break() {
 }
 
 #[test]
+fn m30_for_of_array_assignment_target_updates_existing_bindings() {
+    // `for ([a, b] of pairs)` reuses existing bindings rather
+    // than introducing loop-scoped locals, so the final
+    // destructured values remain visible after the loop exits.
+    let src = "function main() { \
+        let a = 0; \
+        let b = 0; \
+        for ([a, b] of [[10, 20], [30, 40]]) { } \
+        return a * 100 + b; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 3040);
+}
+
+#[test]
+fn m30_for_of_array_assignment_target_is_visible_inside_body() {
+    // The destructuring assignment step runs before the body, so
+    // body reads observe the current tuple's elements on each
+    // iteration.
+    let src = "function main() { \
+        let a = 0; \
+        let b = 0; \
+        let total = 0; \
+        for ([a, b] of [[1, 2], [3, 4]]) { total = total + a + b; } \
+        return total; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 10);
+}
+
+#[test]
+fn m30_for_of_object_assignment_target_sets_defaults_before_break() {
+    // Object assignment-target patterns share the same
+    // pre-body assignment step, including default initializers.
+    let src = "function main() { \
+        let x = 0; \
+        let y = 0; \
+        for ({ x = 9, y } of [{ y: 4 }, { x: 7, y: 8 }]) { \
+            break; \
+        } \
+        return x * 10 + y; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 94);
+}
+
+#[test]
 fn m30_for_of_break_exits_loop() {
     // `break` inside the body jumps past the loop exit. Partial
     // sum covers the early-exit path.

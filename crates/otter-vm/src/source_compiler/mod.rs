@@ -2454,6 +2454,7 @@ fn lower_for_of_statement<'a>(
         //      binding's register, or spill through a hidden
         //      local before storing into an upvalue.
         let mut destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
+        let mut assignment_target: Option<ForOfAssignmentTarget<'a>> = None;
         let mut upvalue_target: Option<(u16, u16)> = None;
         let (binding_reg, is_let_like) = match &for_of.left {
             ForStatementLeft::VariableDeclaration(decl) => {
@@ -2535,6 +2536,16 @@ fn lower_for_of_statement<'a>(
                     }
                 }
             }
+            ForStatementLeft::ArrayAssignmentTarget(pattern) => {
+                let iter_val_slot = ctx.allocate_anonymous_local()?;
+                assignment_target = Some(ForOfAssignmentTarget::Array(pattern));
+                (iter_val_slot, false)
+            }
+            ForStatementLeft::ObjectAssignmentTarget(pattern) => {
+                let iter_val_slot = ctx.allocate_anonymous_local()?;
+                assignment_target = Some(ForOfAssignmentTarget::Object(pattern));
+                (iter_val_slot, false)
+            }
             other => {
                 return Err(SourceLoweringError::unsupported(
                     "for_of_unsupported_left",
@@ -2570,6 +2581,9 @@ fn lower_for_of_statement<'a>(
             })?;
         if let Some((iter_val_reg, upvalue_idx)) = upvalue_target {
             lower_for_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
+        }
+        if let Some(target) = assignment_target {
+            lower_for_of_assignment_target(builder, ctx, target, binding_reg)?;
         }
 
         // 4) Body. Register loop labels so nested
@@ -2630,6 +2644,31 @@ fn lower_for_of_upvalue_assignment(
             ))
         })?;
     Ok(())
+}
+
+enum ForOfAssignmentTarget<'a> {
+    Array(&'a oxc_ast::ast::ArrayAssignmentTarget<'a>),
+    Object(&'a oxc_ast::ast::ObjectAssignmentTarget<'a>),
+}
+
+/// Performs §14.7.5.13 ForIn/OfBodyEvaluation's assignment step
+/// for destructuring assignment targets in `for (<lhs> of rhs)`.
+///
+/// Spec: https://tc39.es/ecma262/#sec-runtime-semantics-forin-div-ofbodyevaluation-lhs-stmt-iterator-lhskind-labelset
+fn lower_for_of_assignment_target<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    target: ForOfAssignmentTarget<'a>,
+    iter_value_reg: u16,
+) -> Result<(), SourceLoweringError> {
+    match target {
+        ForOfAssignmentTarget::Array(pattern) => {
+            destructure_array_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
+        }
+        ForOfAssignmentTarget::Object(pattern) => {
+            destructure_object_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
+        }
+    }
 }
 
 /// M31: lowers `for (<left> in <source>) <body>` — §14.7.5.11
@@ -9591,58 +9630,7 @@ fn lower_array_destructuring_assignment<'a>(
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Star (array destruct src): {err:?}"))
             })?;
-        for (index, element) in pattern.elements.iter().enumerate() {
-            let Some(elem) = element.as_ref() else {
-                continue;
-            };
-            let idx_i32 = i32::try_from(index).map_err(|_| {
-                SourceLoweringError::Internal("array destruct assign index overflow".into())
-            })?;
-            // acc = index; LdaKeyedProperty src_temp → acc = src[i].
-            builder
-                .emit(Opcode::LdaSmi, &[Operand::Imm(idx_i32)])
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode LdaSmi (array destruct idx): {err:?}"
-                    ))
-                })?;
-            builder
-                .emit(
-                    Opcode::LdaKeyedProperty,
-                    &[Operand::Reg(u32::from(src_temp))],
-                )
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode LdaKeyedProperty (array destruct): {err:?}"
-                    ))
-                })?;
-            assign_destructured_target(builder, ctx, elem)?;
-        }
-        if let Some(rest) = pattern.rest.as_deref() {
-            // `[..., ...rest] = arr` — slice(consumed) into acc,
-            // then assign to the rest target.
-            let slice_target = ctx.acquire_temps(1)?;
-            let slice_lower = (|| -> Result<(), SourceLoweringError> {
-                emit_array_rest_slice(
-                    builder,
-                    ctx,
-                    src_temp,
-                    pattern.elements.len(),
-                    slice_target,
-                )?;
-                builder
-                    .emit(Opcode::Ldar, &[Operand::Reg(u32::from(slice_target))])
-                    .map_err(|err| {
-                        SourceLoweringError::Internal(format!(
-                            "encode Ldar (array destruct rest): {err:?}"
-                        ))
-                    })?;
-                assign_destructured_target_from_assignment_target(builder, ctx, &rest.target)?;
-                Ok(())
-            })();
-            ctx.release_temps(1);
-            slice_lower?;
-        }
+        destructure_array_assignment_from_temp(builder, ctx, pattern, src_temp)?;
         // Leave the RHS value in acc so the assignment-expression
         // yields the source per §13.15.2.
         builder
@@ -9680,121 +9668,7 @@ fn lower_object_destructuring_assignment<'a>(
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Star (obj destruct src): {err:?}"))
             })?;
-        let mut excluded_keys: Vec<String> = Vec::new();
-        for prop in pattern.properties.iter() {
-            match prop {
-                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(
-                    ident_prop,
-                ) => {
-                    // `{ foo }` / `{ foo = default }` — key and
-                    // binding share the same name.
-                    let name = ident_prop.binding.name.as_str().to_owned();
-                    let key_idx = ctx.intern_property_name(&name)?;
-                    excluded_keys.push(name.clone());
-                    builder
-                        .emit(
-                            Opcode::LdaNamedProperty,
-                            &[Operand::Reg(u32::from(src_temp)), Operand::Idx(key_idx)],
-                        )
-                        .map_err(|err| {
-                            SourceLoweringError::Internal(format!(
-                                "encode LdaNamedProperty (obj destruct ident): {err:?}"
-                            ))
-                        })?;
-                    if let Some(default_expr) = &ident_prop.init {
-                        emit_default_for_destructured_leaf(builder, ctx, Some(default_expr))?;
-                    }
-                    assign_identifier_reference(builder, ctx, &ident_prop.binding)?;
-                }
-                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(
-                    kv_prop,
-                ) => {
-                    // `{ key: target }` / `{ [computed]: target }`.
-                    let (key_idx, key_is_computed, key_name_for_rest) = match &kv_prop.name {
-                        PropertyKey::StaticIdentifier(ident) => {
-                            let name = ident.name.as_str().to_owned();
-                            let idx = ctx.intern_property_name(&name)?;
-                            (Some(idx), false, Some(name))
-                        }
-                        PropertyKey::StringLiteral(lit) => {
-                            let name = lit.value.as_str().to_owned();
-                            let idx = ctx.intern_property_name(&name)?;
-                            (Some(idx), false, Some(name))
-                        }
-                        other => {
-                            // Computed key — evaluate into a temp.
-                            let key_temp = ctx.acquire_temps(1)?;
-                            let result = (|| -> Result<(), SourceLoweringError> {
-                                lower_return_expression(builder, ctx, other.to_expression())?;
-                                builder
-                                    .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
-                                    .map_err(|err| {
-                                        SourceLoweringError::Internal(format!(
-                                            "encode Star (obj destruct key): {err:?}"
-                                        ))
-                                    })?;
-                                builder
-                                    .emit(Opcode::Ldar, &[Operand::Reg(u32::from(key_temp))])
-                                    .map_err(|err| {
-                                        SourceLoweringError::Internal(format!(
-                                            "encode Ldar (obj destruct key): {err:?}"
-                                        ))
-                                    })?;
-                                builder
-                                    .emit(
-                                        Opcode::LdaKeyedProperty,
-                                        &[Operand::Reg(u32::from(src_temp))],
-                                    )
-                                    .map_err(|err| {
-                                        SourceLoweringError::Internal(format!(
-                                            "encode LdaKeyedProperty (obj destruct): {err:?}"
-                                        ))
-                                    })?;
-                                Ok(())
-                            })();
-                            ctx.release_temps(1);
-                            result?;
-                            (None, true, None)
-                        }
-                    };
-                    if !key_is_computed && let Some(idx) = key_idx {
-                        builder
-                            .emit(
-                                Opcode::LdaNamedProperty,
-                                &[Operand::Reg(u32::from(src_temp)), Operand::Idx(idx)],
-                            )
-                            .map_err(|err| {
-                                SourceLoweringError::Internal(format!(
-                                    "encode LdaNamedProperty (obj destruct named): {err:?}"
-                                ))
-                            })?;
-                    }
-                    if let Some(name) = key_name_for_rest {
-                        excluded_keys.push(name);
-                    }
-                    assign_destructured_target(builder, ctx, &kv_prop.binding)?;
-                }
-            }
-        }
-        if let Some(rest) = pattern.rest.as_deref() {
-            // Copy every own-enumerable property except the ones
-            // already bound, assign the result to the rest target.
-            let rest_target = ctx.acquire_temps(1)?;
-            let rest_lower = (|| -> Result<(), SourceLoweringError> {
-                emit_object_rest_copy(builder, ctx, src_temp, &excluded_keys, rest_target)?;
-                builder
-                    .emit(Opcode::Ldar, &[Operand::Reg(u32::from(rest_target))])
-                    .map_err(|err| {
-                        SourceLoweringError::Internal(format!(
-                            "encode Ldar (obj destruct rest): {err:?}"
-                        ))
-                    })?;
-                assign_destructured_target_from_assignment_target(builder, ctx, &rest.target)?;
-                Ok(())
-            })();
-            ctx.release_temps(1);
-            rest_lower?;
-        }
+        destructure_object_assignment_from_temp(builder, ctx, pattern, src_temp)?;
         // Yield the RHS as the assignment's value.
         builder
             .emit(Opcode::Ldar, &[Operand::Reg(u32::from(src_temp))])
@@ -10058,6 +9932,23 @@ fn destructure_array_assignment_from_temp<'a>(
             })?;
         assign_destructured_target(builder, ctx, elem)?;
     }
+    if let Some(rest) = pattern.rest.as_deref() {
+        let slice_target = ctx.acquire_temps(1)?;
+        let slice_lower = (|| -> Result<(), SourceLoweringError> {
+            emit_array_rest_slice(builder, ctx, src_temp, pattern.elements.len(), slice_target)?;
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(slice_target))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Ldar (array destruct rest): {err:?}"
+                    ))
+                })?;
+            assign_destructured_target_from_assignment_target(builder, ctx, &rest.target)?;
+            Ok(())
+        })();
+        ctx.release_temps(1);
+        slice_lower?;
+    }
     Ok(())
 }
 
@@ -10067,11 +9958,13 @@ fn destructure_object_assignment_from_temp<'a>(
     pattern: &'a oxc_ast::ast::ObjectAssignmentTarget<'a>,
     src_temp: RegisterIndex,
 ) -> Result<(), SourceLoweringError> {
+    let mut excluded_keys: Vec<String> = Vec::new();
     for prop in pattern.properties.iter() {
         match prop {
             oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
-                let name = p.binding.name.as_str();
-                let key_idx = ctx.intern_property_name(name)?;
+                let name = p.binding.name.as_str().to_owned();
+                excluded_keys.push(name.clone());
+                let key_idx = ctx.intern_property_name(&name)?;
                 builder
                     .emit(
                         Opcode::LdaNamedProperty,
@@ -10088,30 +9981,87 @@ fn destructure_object_assignment_from_temp<'a>(
                 assign_identifier_reference(builder, ctx, &p.binding)?;
             }
             oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(kv) => {
-                let key_name = match &kv.name {
-                    PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
-                    PropertyKey::StringLiteral(lit) => lit.value.as_str().to_owned(),
+                let (key_idx, key_is_computed, key_name_for_rest) = match &kv.name {
+                    PropertyKey::StaticIdentifier(ident) => {
+                        let name = ident.name.as_str().to_owned();
+                        let idx = ctx.intern_property_name(&name)?;
+                        (Some(idx), false, Some(name))
+                    }
+                    PropertyKey::StringLiteral(lit) => {
+                        let name = lit.value.as_str().to_owned();
+                        let idx = ctx.intern_property_name(&name)?;
+                        (Some(idx), false, Some(name))
+                    }
                     other => {
-                        return Err(SourceLoweringError::unsupported(
-                            property_key_tag(other),
-                            other.span(),
-                        ));
+                        let key_temp = ctx.acquire_temps(1)?;
+                        let result = (|| -> Result<(), SourceLoweringError> {
+                            lower_return_expression(builder, ctx, other.to_expression())?;
+                            builder
+                                .emit(Opcode::Star, &[Operand::Reg(u32::from(key_temp))])
+                                .map_err(|err| {
+                                    SourceLoweringError::Internal(format!(
+                                        "encode Star (obj destruct key): {err:?}"
+                                    ))
+                                })?;
+                            builder
+                                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(key_temp))])
+                                .map_err(|err| {
+                                    SourceLoweringError::Internal(format!(
+                                        "encode Ldar (obj destruct key): {err:?}"
+                                    ))
+                                })?;
+                            builder
+                                .emit(
+                                    Opcode::LdaKeyedProperty,
+                                    &[Operand::Reg(u32::from(src_temp))],
+                                )
+                                .map_err(|err| {
+                                    SourceLoweringError::Internal(format!(
+                                        "encode LdaKeyedProperty (obj destruct): {err:?}"
+                                    ))
+                                })?;
+                            Ok(())
+                        })();
+                        ctx.release_temps(1);
+                        result?;
+                        (None, true, None)
                     }
                 };
-                let key_idx = ctx.intern_property_name(&key_name)?;
-                builder
-                    .emit(
-                        Opcode::LdaNamedProperty,
-                        &[Operand::Reg(u32::from(src_temp)), Operand::Idx(key_idx)],
-                    )
-                    .map_err(|err| {
-                        SourceLoweringError::Internal(format!(
-                            "encode LdaNamedProperty (nested obj destruct kv): {err:?}"
-                        ))
-                    })?;
+                if !key_is_computed && let Some(idx) = key_idx {
+                    builder
+                        .emit(
+                            Opcode::LdaNamedProperty,
+                            &[Operand::Reg(u32::from(src_temp)), Operand::Idx(idx)],
+                        )
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode LdaNamedProperty (nested obj destruct kv): {err:?}"
+                            ))
+                        })?;
+                }
+                if let Some(name) = key_name_for_rest {
+                    excluded_keys.push(name);
+                }
                 assign_destructured_target(builder, ctx, &kv.binding)?;
             }
         }
+    }
+    if let Some(rest) = pattern.rest.as_deref() {
+        let rest_target = ctx.acquire_temps(1)?;
+        let rest_lower = (|| -> Result<(), SourceLoweringError> {
+            emit_object_rest_copy(builder, ctx, src_temp, &excluded_keys, rest_target)?;
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(rest_target))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Ldar (obj destruct rest): {err:?}"
+                    ))
+                })?;
+            assign_destructured_target_from_assignment_target(builder, ctx, &rest.target)?;
+            Ok(())
+        })();
+        ctx.release_temps(1);
+        rest_lower?;
     }
     Ok(())
 }

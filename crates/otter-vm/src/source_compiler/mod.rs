@@ -1757,6 +1757,7 @@ fn lower_nested_statement<'a>(
             Ok(())
         }
         Statement::BlockStatement(block) => lower_block_statement(builder, ctx, block),
+        Statement::LabeledStatement(labeled) => lower_labeled_statement(builder, ctx, labeled),
         Statement::VariableDeclaration(decl) => Err(SourceLoweringError::unsupported(
             "nested_variable_declaration",
             decl.span,
@@ -1809,6 +1810,59 @@ fn lower_block_statement<'a>(
     }
     ctx.restore_scope(scope);
     result
+}
+
+/// §14.13 `LabelName : Statement` — attaches a label to the
+/// enclosed statement so `break labelName` / `continue labelName`
+/// can target it.
+///
+/// - Iteration body (`for` / `while` / `do-while` / `for-of` /
+///   `for-in`) or `switch`: the label is stashed on the context
+///   via `set_pending_loop_label`; the nested lowerer consumes it
+///   when it pushes its `LoopLabels` frame, so the stack stays a
+///   single level deep.
+/// - Anything else (a block, an expression statement, an `if`,
+///   another labelled statement): a dedicated break-only frame
+///   is pushed so `break labelName` from deep inside the body
+///   jumps past the labelled statement. `continue labelName` in
+///   that position is §14.11 invalid (no iteration target) and
+///   reported as `undeclared_label`.
+fn lower_labeled_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    labeled: &'a oxc_ast::ast::LabeledStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    let name: std::rc::Rc<str> = std::rc::Rc::from(labeled.label.name.as_str());
+    match &labeled.body {
+        Statement::WhileStatement(_)
+        | Statement::DoWhileStatement(_)
+        | Statement::ForStatement(_)
+        | Statement::ForOfStatement(_)
+        | Statement::ForInStatement(_)
+        | Statement::SwitchStatement(_) => {
+            // Let the iteration / switch lowerer pick up the label.
+            ctx.set_pending_loop_label(std::rc::Rc::clone(&name));
+            lower_nested_statement(builder, ctx, &labeled.body)
+        }
+        _ => {
+            // Break-only labelled statement — `break labelName`
+            // jumps to the synthesized exit label, any other
+            // control flow passes through.
+            let break_label = builder.new_label();
+            ctx.enter_loop(LoopLabels {
+                break_label,
+                continue_label: None,
+                label: Some(std::rc::Rc::clone(&name)),
+            });
+            let result = lower_nested_statement(builder, ctx, &labeled.body);
+            ctx.exit_loop();
+            result?;
+            builder.bind_label(break_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind labelled block exit: {err:?}"))
+            })?;
+            Ok(())
+        }
+    }
 }
 
 /// Lowers an `if (test) consequent` (with optional `else alternate`).
@@ -1924,6 +1978,7 @@ fn lower_while_statement<'a>(
     ctx.enter_loop(LoopLabels {
         break_label: loop_exit,
         continue_label: Some(loop_header),
+        label: ctx.take_pending_loop_label(),
     });
     let body_result = lower_nested_statement(builder, ctx, &while_stmt.body);
     ctx.exit_loop();
@@ -1971,6 +2026,7 @@ fn lower_do_while_statement<'a>(
     ctx.enter_loop(LoopLabels {
         break_label: loop_exit,
         continue_label: Some(continue_target),
+        label: ctx.take_pending_loop_label(),
     });
     let body_result = lower_nested_statement(builder, ctx, &do_stmt.body);
     ctx.exit_loop();
@@ -2089,6 +2145,7 @@ fn lower_for_statement<'a>(
     ctx.enter_loop(LoopLabels {
         break_label: loop_exit,
         continue_label: Some(loop_continue),
+        label: ctx.take_pending_loop_label(),
     });
     let body_result = lower_nested_statement(builder, ctx, &for_stmt.body);
     ctx.exit_loop();
@@ -2342,6 +2399,7 @@ fn lower_for_of_statement<'a>(
         ctx.enter_loop(LoopLabels {
             break_label: loop_exit,
             continue_label: Some(loop_top),
+            label: ctx.take_pending_loop_label(),
         });
         let body_result = (|| -> Result<(), SourceLoweringError> {
             // Destructuring for-of: expand the pattern against
@@ -2551,6 +2609,7 @@ fn lower_for_in_statement<'a>(
         ctx.enter_loop(LoopLabels {
             break_label: loop_exit,
             continue_label: Some(loop_top),
+            label: ctx.take_pending_loop_label(),
         });
         let body_result = (|| -> Result<(), SourceLoweringError> {
             if let Some((pattern, is_const)) = for_in_destructuring_pattern {
@@ -2745,6 +2804,7 @@ fn lower_switch_statement<'a>(
             ctx.enter_loop(LoopLabels {
                 break_label: switch_exit,
                 continue_label: None,
+                label: ctx.take_pending_loop_label(),
             });
 
             let lower_cases = (|| -> Result<(), SourceLoweringError> {
@@ -3031,17 +3091,20 @@ fn lower_break_statement<'a>(
     ctx: &LoweringContext<'a>,
     break_stmt: &'a oxc_ast::ast::BreakStatement<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if break_stmt.label.is_some() {
-        return Err(SourceLoweringError::unsupported(
-            "labelled_break",
-            break_stmt.span,
-        ));
-    }
-    let labels = ctx
-        .innermost_loop_labels()
-        .ok_or_else(|| SourceLoweringError::unsupported("break_outside_loop", break_stmt.span))?;
+    // §14.13.3 `break labelName` — walk the loop-labels stack to
+    // find the matching labelled frame, and target its break
+    // label. Plain `break` still uses the innermost loop /
+    // switch / labelled block.
+    let target = if let Some(label) = &break_stmt.label {
+        ctx.find_break_label_by_name(label.name.as_str())
+            .ok_or_else(|| SourceLoweringError::unsupported("undeclared_label", break_stmt.span))?
+    } else {
+        ctx.innermost_break_label().ok_or_else(|| {
+            SourceLoweringError::unsupported("break_outside_loop", break_stmt.span)
+        })?
+    };
     builder
-        .emit_jump_to(Opcode::Jump, labels.break_label)
+        .emit_jump_to(Opcode::Jump, target)
         .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (break): {err:?}")))?;
     Ok(())
 }
@@ -3059,20 +3122,24 @@ fn lower_continue_statement<'a>(
     ctx: &LoweringContext<'a>,
     cont_stmt: &'a oxc_ast::ast::ContinueStatement<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if cont_stmt.label.is_some() {
-        return Err(SourceLoweringError::unsupported(
-            "labelled_continue",
-            cont_stmt.span,
-        ));
-    }
-    // `continue` walks past any enclosing `switch` frames (which
-    // push break-only labels with `continue_label: None`) to find
-    // the innermost frame that actually has a continue target.
-    // Spec §14.11 IterationStatement: `continue` binds to the
-    // innermost *iteration* statement, not just any break-frame.
-    let target = ctx
-        .innermost_continue_label()
-        .ok_or_else(|| SourceLoweringError::unsupported("continue_outside_loop", cont_stmt.span))?;
+    // §14.13.3 `continue labelName` — walk the loop-labels stack
+    // for the matching labelled iteration frame. Labelled
+    // non-iteration frames (labelled blocks / switches) are
+    // skipped: `continue` requires an iteration target per §14.11.
+    let target = if let Some(label) = &cont_stmt.label {
+        ctx.find_continue_label_by_name(label.name.as_str())
+            .ok_or_else(|| SourceLoweringError::unsupported("undeclared_label", cont_stmt.span))?
+    } else {
+        // `continue` walks past any enclosing `switch` frames
+        // (which push break-only labels with `continue_label:
+        // None`) to find the innermost frame that actually has a
+        // continue target. Spec §14.11 IterationStatement:
+        // `continue` binds to the innermost *iteration*
+        // statement, not just any break-frame.
+        ctx.innermost_continue_label().ok_or_else(|| {
+            SourceLoweringError::unsupported("continue_outside_loop", cont_stmt.span)
+        })?
+    };
     builder
         .emit_jump_to(Opcode::Jump, target)
         .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (continue): {err:?}")))?;
@@ -3200,6 +3267,16 @@ struct LoweringContext<'a> {
     /// innermost label. `Cell::get`-style peeking is enough (only
     /// the innermost label matters); reads through `.last()`.
     optional_chain_short_circuit: RefCell<Vec<Label>>,
+    /// §14.13 Labelled statements — when a `LabeledStatement`
+    /// immediately wraps an iteration statement (`for` / `while` /
+    /// `do-while` / `for-of` / `for-in`) or a `switch`, the label
+    /// is stashed here before the body is lowered. The loop /
+    /// switch lowerer consumes the label when it pushes its
+    /// `LoopLabels` frame so `break labelName` / `continue
+    /// labelName` can find the matching frame. Cleared after every
+    /// push — nested labels on a single statement aren't a thing,
+    /// so a single slot is enough.
+    pending_loop_label: std::cell::RefCell<Option<std::rc::Rc<str>>>,
     /// Stack of `locals.len()` snapshots marking the start of each
     /// currently-open lexical scope (M12). Pushed by
     /// [`snapshot_scope`](Self::snapshot_scope) and popped by
@@ -3448,10 +3525,15 @@ struct PendingClosureTemplate {
 /// then jumps back to the header); for `switch`, `None` since
 /// `continue` inside a switch body walks past the switch to the
 /// enclosing loop (§14.11).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LoopLabels {
     break_label: Label,
     continue_label: Option<Label>,
+    /// §14.13 Labelled statement — name of the immediately-enclosing
+    /// `LabeledStatement` if any, shared via `Rc<str>` so the
+    /// break/continue lowerers can compare against label identifiers
+    /// without reallocating per frame. `None` for plain loops.
+    label: Option<std::rc::Rc<str>>,
 }
 
 /// Snapshot of [`LoweringContext::locals`] length, returned by
@@ -3517,6 +3599,7 @@ impl<'a> LoweringContext<'a> {
             feedback_slot_kinds: RefCell::new(Vec::new()),
             loop_labels: RefCell::new(Vec::new()),
             optional_chain_short_circuit: RefCell::new(Vec::new()),
+            pending_loop_label: std::cell::RefCell::new(None),
             scope_starts: RefCell::new(Vec::new()),
             property_names: RefCell::new(Vec::new()),
             float_constants: RefCell::new(Vec::new()),
@@ -3755,6 +3838,46 @@ impl<'a> LoweringContext<'a> {
         self.loop_labels.borrow_mut().push(labels);
     }
 
+    /// §14.13 — stash a label so the immediately-following iteration
+    /// statement picks it up when pushing its `LoopLabels` frame.
+    fn set_pending_loop_label(&self, name: std::rc::Rc<str>) {
+        *self.pending_loop_label.borrow_mut() = Some(name);
+    }
+
+    /// Drain the pending label (if any) and return it. Called by
+    /// every loop / switch lowerer at `enter_loop` time.
+    fn take_pending_loop_label(&self) -> Option<std::rc::Rc<str>> {
+        self.pending_loop_label.borrow_mut().take()
+    }
+
+    /// Walk the loop-labels stack from innermost out and return the
+    /// break label of the frame whose `label` matches `name`. Used
+    /// by `break labelName` — spec §14.12 returns
+    /// `undeclared_label` when no frame matches.
+    fn find_break_label_by_name(&self, name: &str) -> Option<Label> {
+        self.loop_labels
+            .borrow()
+            .iter()
+            .rev()
+            .find(|f| f.label.as_deref() == Some(name))
+            .map(|f| f.break_label)
+    }
+
+    /// Walk the loop-labels stack from innermost out and return the
+    /// continue label of the first frame whose `label` matches
+    /// `name` AND that has a continue target. `continue labelName`
+    /// is valid only for iteration statements (§14.11 / §14.13) —
+    /// a labelled `switch` or labelled block doesn't accept
+    /// `continue`.
+    fn find_continue_label_by_name(&self, name: &str) -> Option<Label> {
+        self.loop_labels
+            .borrow()
+            .iter()
+            .rev()
+            .find(|f| f.label.as_deref() == Some(name))
+            .and_then(|f| f.continue_label)
+    }
+
     /// Pop the most-recent [`LoopLabels`] frame. Panics in
     /// `debug_assertions` if the stack is empty, because that would
     /// mean an unbalanced `enter_loop` / `exit_loop` pair — a
@@ -3764,12 +3887,12 @@ impl<'a> LoweringContext<'a> {
         debug_assert!(popped.is_some(), "exit_loop called without enter_loop");
     }
 
-    /// Returns the innermost loop's [`LoopLabels`], if any. `None`
+    /// Returns the innermost loop's break target, if any. `None`
     /// means we're currently lowering code outside every loop — the
     /// statement handlers use this to surface `break_outside_loop` /
     /// `continue_outside_loop` errors.
-    fn innermost_loop_labels(&self) -> Option<LoopLabels> {
-        self.loop_labels.borrow().last().copied()
+    fn innermost_break_label(&self) -> Option<Label> {
+        self.loop_labels.borrow().last().map(|f| f.break_label)
     }
 
     /// Push a short-circuit label for an optional chain. Paired 1:1

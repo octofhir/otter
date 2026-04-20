@@ -2385,30 +2385,92 @@ fn continue_in_nested_while_only_affects_innermost() {
 }
 
 #[test]
-fn labelled_break_rejected() {
-    // `outer:` is a LabeledStatement wrapper that the compiler
-    // doesn't recognise yet — it's rejected before we even reach
-    // the labelled break. Surface any Unsupported tag so the
-    // negative expectation is robust to future label-statement
-    // support; the lowering-side check for
-    // `break_stmt.label.is_some()` is exercised indirectly by
-    // the other M11 tests which confirm unlabelled break works.
-    let err = compile("function f(n) { outer: while (n > 0) { break outer; } return n; }")
-        .expect_err("labelled break at M11");
-    assert!(
-        matches!(err, SourceLoweringError::Unsupported { .. }),
-        "unexpected err: {err:?}",
+fn labelled_break_exits_outer_loop() {
+    // `break outer` from inside a nested loop jumps past the
+    // outer `while` — the inner loop's short-circuit doesn't
+    // matter because we exit both at once.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let hit = 0; \
+                 outer: while (1) { \
+                     while (1) { \
+                         hit = 42; \
+                         break outer; \
+                     } \
+                     hit = 999; \
+                 } \
+                 return hit; \
+             }",
+            &[],
+        ),
+        42,
     );
 }
 
 #[test]
-fn labelled_continue_rejected() {
-    let err = compile(
-        "function f(n) { let i = n; outer: while (i > 0) { i = i - 1; continue outer; } return i; }",
-    )
-    .expect_err("labelled continue at M11");
+fn labelled_continue_resumes_outer_loop() {
+    // `continue outer` re-runs the outer loop's test, skipping
+    // both the inner loop's remaining body and the outer loop's
+    // tail. Canonical example: filter + sum with nested loops.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let sum = 0; \
+                 let i = 0; \
+                 outer: while (i < 3) { \
+                     i = i + 1; \
+                     let j = 0; \
+                     while (j < 3) { \
+                         j = j + 1; \
+                         if (j === 2) { continue outer; } \
+                         sum = sum + j; \
+                     } \
+                 } \
+                 return sum; \
+             }",
+            &[],
+        ),
+        // Per outer iteration: j = 1 then skip at j = 2 → sum += 1.
+        // Three outer iterations → 3.
+        3,
+    );
+}
+
+#[test]
+fn labelled_block_supports_break() {
+    // `break labelName` from inside a labelled block jumps past
+    // the whole block without needing a loop wrapper. Per
+    // §14.13 this form accepts `break` but not `continue`.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let hit = 0; \
+                 outer: { \
+                     hit = 1; \
+                     break outer; \
+                     hit = 2; \
+                 } \
+                 return hit; \
+             }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn undeclared_label_is_rejected() {
+    let err = compile("function f() { while (1) { break nonexistent; } return 0; }")
+        .expect_err("undeclared label");
     assert!(
-        matches!(err, SourceLoweringError::Unsupported { .. }),
+        matches!(
+            err,
+            SourceLoweringError::Unsupported {
+                construct: "undeclared_label",
+                ..
+            }
+        ),
         "unexpected err: {err:?}",
     );
 }

@@ -4923,6 +4923,73 @@ fn finally_runs_after_caught_try() {
 }
 
 #[test]
+fn finally_runs_before_return_completion() {
+    let program = "function main() { \
+        let state = 0; \
+        function inner() { \
+            try { state = 1; return 7; } finally { state = state + 10; } \
+        } \
+        let returned = inner(); \
+        return state * 100 + returned; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 1107);
+}
+
+#[test]
+fn nested_finally_chain_runs_before_return_completion() {
+    let program = "function main() { \
+        let state = 0; \
+        function inner() { \
+            try { \
+                try { state = 1; return 7; } finally { state = state * 10 + 2; } \
+            } finally { \
+                state = state * 10 + 3; \
+            } \
+        } \
+        let returned = inner(); \
+        return state * 100 + returned; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 12307);
+}
+
+#[test]
+fn finally_runs_before_break_completion() {
+    let program = "function main() { \
+        let state = 0; \
+        let i = 0; \
+        while (i < 3) { \
+            try { state = state * 10 + 1; break; } finally { state = state * 10 + 2; } \
+            i = i + 1; \
+        } \
+        return state; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 12);
+}
+
+#[test]
+fn finally_runs_before_continue_completion() {
+    let program = "function main() { \
+        let state = 0; \
+        let i = 0; \
+        while (i < 3) { \
+            i = i + 1; \
+            try { state = state * 10 + i; continue; } finally { state = state * 10 + 9; } \
+            state = state * 10 + 5; \
+        } \
+        return state; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 192939);
+}
+
+#[test]
+fn finally_return_overrides_pending_return() {
+    let program = "function main() { \
+        try { return 1; } finally { return 2; } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 2);
+}
+
+#[test]
 fn throw_in_catch_body_triggers_finally_and_rethrows() {
     // Catch re-throws, finally still runs, then exception
     // propagates to the outer try.

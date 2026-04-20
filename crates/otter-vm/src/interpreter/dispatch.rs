@@ -25,6 +25,7 @@ use crate::frame::RegisterIndex;
 use crate::module::{Function, Module};
 use crate::value::RegisterValue;
 
+use super::activation::PendingAbruptCompletion;
 use super::step_outcome::{StepOutcome, TailCallPayload};
 use super::{Activation, FrameRuntimeState, Interpreter, InterpreterError, RuntimeState};
 
@@ -1646,6 +1647,46 @@ impl Interpreter {
             }
             Opcode::Throw => {
                 return Ok(StepOutcome::Throw(activation.accumulator()));
+            }
+            Opcode::SetPendingReturn => {
+                activation.set_pending_abrupt_completion(PendingAbruptCompletion::Return(
+                    activation.accumulator(),
+                ));
+            }
+            Opcode::SetPendingJump => {
+                let target = imm(&instr.operands, 0)?;
+                let target = u32::try_from(target).map_err(|_| {
+                    InterpreterError::NativeCall(Box::from(
+                        "SetPendingJump target pc must be non-negative",
+                    ))
+                })?;
+                activation.set_pending_abrupt_completion(PendingAbruptCompletion::Jump(target));
+            }
+            Opcode::PushPendingFinally => {
+                let target = imm(&instr.operands, 0)?;
+                let target = u32::try_from(target).map_err(|_| {
+                    InterpreterError::NativeCall(Box::from(
+                        "PushPendingFinally target pc must be non-negative",
+                    ))
+                })?;
+                activation.push_pending_finally(target);
+            }
+            Opcode::ResumeAbrupt => {
+                if let Some(target_pc) = activation.pop_pending_finally() {
+                    activation.set_pc(target_pc);
+                    return Ok(StepOutcome::Continue);
+                }
+                if let Some(completion) = activation.take_pending_abrupt_completion() {
+                    match completion {
+                        PendingAbruptCompletion::Return(value) => {
+                            return Ok(StepOutcome::Return(value));
+                        }
+                        PendingAbruptCompletion::Jump(target_pc) => {
+                            activation.set_pc(target_pc);
+                            return Ok(StepOutcome::Continue);
+                        }
+                    }
+                }
             }
             // §14.14 ThrowStatement + §14.15.3 TryStatement. The
             // dispatcher's main loop (see `run_completion_with_runtime`)

@@ -222,6 +222,12 @@ pub enum Opcode {
     // to a register operand. Added in M30 to make `for…of`
     // lowerable with just the existing jump opcodes.
     IteratorStep = 0x9B,
+    // §14.15 TryStatement / Finally — saves and resumes pending
+    // non-throw abrupt completions while `finally` bodies unwind.
+    SetPendingReturn = 0x9C,
+    SetPendingJump = 0x9D,
+    PushPendingFinally = 0x9E,
+    ResumeAbrupt = 0x9F,
     // 0xFE, 0xFF are reserved for Wide / ExtraWide prefixes. Max legal
     // opcode discriminant is 0xFD.
 }
@@ -418,6 +424,10 @@ impl Opcode {
             0x99 => ImportMeta,
             0x9A => SetClassHeritage,
             0x9B => IteratorStep,
+            0x9C => SetPendingReturn,
+            0x9D => SetPendingJump,
+            0x9E => PushPendingFinally,
+            0x9F => ResumeAbrupt,
             _ => return None,
         })
     }
@@ -485,8 +495,11 @@ impl Opcode {
             TailCall => OperandShape::of(&[Reg, Reg, RegList]),
 
             // §5.7
-            Return | Throw | ReThrow | Nop => OperandShape::of(&[]),
+            Return | Throw | ReThrow | Nop | SetPendingReturn | ResumeAbrupt => {
+                OperandShape::of(&[])
+            }
             Abort => OperandShape::of(&[Imm]),
+            SetPendingJump | PushPendingFinally => OperandShape::of(&[Imm]),
 
             // §5.8
             Yield | SuspendGenerator | Await => OperandShape::of(&[]),
@@ -713,6 +726,10 @@ impl Opcode {
             ImportMeta => "ImportMeta",
             SetClassHeritage => "SetClassHeritage",
             IteratorStep => "IteratorStep",
+            SetPendingReturn => "SetPendingReturn",
+            SetPendingJump => "SetPendingJump",
+            PushPendingFinally => "PushPendingFinally",
+            ResumeAbrupt => "ResumeAbrupt",
         }
     }
 

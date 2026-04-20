@@ -111,6 +111,7 @@
 mod error;
 mod for_in_of;
 mod switch_scope;
+mod try_finally;
 
 #[cfg(test)]
 mod tests;
@@ -138,6 +139,9 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 use switch_scope::{enter_switch_lexical_scope, lower_switch_case_statement};
+use try_finally::{
+    lower_break_statement, lower_continue_statement, lower_return_statement, lower_try_statement,
+};
 
 use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Label, Opcode, Operand};
 use crate::feedback::{FeedbackKind, FeedbackSlotId, FeedbackSlotLayout, FeedbackTableLayout};
@@ -1937,28 +1941,7 @@ fn lower_nested_statement<'a>(
         Statement::ContinueStatement(cont_stmt) => {
             lower_continue_statement(builder, ctx, cont_stmt)
         }
-        Statement::ReturnStatement(ret) => {
-            // §14.9 — `return;` returns `undefined`. Bare `return`
-            // without an argument lowers to `LdaUndefined; Return`;
-            // `return <expr>;` evaluates the expression into acc
-            // and exits.
-            match ret.argument.as_ref() {
-                Some(argument) => {
-                    lower_return_expression(builder, ctx, argument)?;
-                }
-                None => {
-                    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
-                        SourceLoweringError::Internal(format!(
-                            "encode LdaUndefined (bare return): {err:?}"
-                        ))
-                    })?;
-                }
-            }
-            builder
-                .emit(Opcode::Return, &[])
-                .map_err(|err| SourceLoweringError::Internal(format!("encode Return: {err:?}")))?;
-            Ok(())
-        }
+        Statement::ReturnStatement(ret) => lower_return_statement(builder, ctx, ret),
         Statement::BlockStatement(block) => lower_block_statement(builder, ctx, block),
         Statement::LabeledStatement(labeled) => lower_labeled_statement(builder, ctx, labeled),
         Statement::VariableDeclaration(decl) => Err(SourceLoweringError::unsupported(
@@ -3105,291 +3088,6 @@ fn lower_throw_statement<'a>(
     Ok(())
 }
 
-/// Lowers `try { … } catch (e) { … } finally { … }`. Supports four
-/// shapes — try/catch, try/finally, try/catch/finally, and
-/// reject-bare-`try`. Bytecode shape (try/catch/finally — the
-/// richest form):
-///
-/// ```text
-///   try_start:
-///     <lower try body>
-///   try_end:
-///     Jump finally_normal          ; normal exit from try → run finally
-///   catch_start:
-///     LdaException
-///     Star r_e                     ; bind catch parameter (if any)
-///     <lower catch body>
-///   catch_end:
-///     Jump finally_normal          ; normal exit from catch → run finally
-///   finally_handler:
-///     <lower finally body (copy 1)>
-///     ReThrow                      ; re-raise after running finally
-///   finally_normal:
-///     <lower finally body (copy 2)>
-///   after_try:
-/// ```
-///
-/// Registered handlers:
-/// - `(try_start, try_end, catch_start)` — catches throws from the
-///   try body so catch runs.
-/// - `(catch_start, catch_end, finally_handler)` — catches throws
-///   from inside the catch body so finally still runs, then
-///   re-raises.
-///
-/// For try/catch (no finally), the catch body's end just falls
-/// through to `after_try`, and only the first handler is registered.
-/// For try/finally (no catch), there's a single handler
-/// `(try_start, try_end, finally_handler)` and the try body's
-/// normal path jumps directly to `finally_normal`.
-///
-/// Known simplification (M21): `return` / `break` / `continue` from
-/// inside the `try` or `catch` block skips the `finally` body. The
-/// spec requires finally to run even on abrupt completions; wiring
-/// that needs a deferred-completion mechanism that lands in a
-/// later milestone. Normal flow + exception flow are both
-/// spec-compliant here.
-///
-/// §14.15.3 TryStatement, §14.15.4 TryStatement with Finally.
-fn lower_try_statement<'a>(
-    builder: &mut BytecodeBuilder,
-    ctx: &mut LoweringContext<'a>,
-    try_stmt: &'a oxc_ast::ast::TryStatement<'a>,
-) -> Result<(), SourceLoweringError> {
-    if try_stmt.handler.is_none() && try_stmt.finalizer.is_none() {
-        // `try { … }` with neither handler nor finalizer is a
-        // parse error in real JS; oxc's parser should reject it
-        // before we see it, but guard anyway.
-        return Err(SourceLoweringError::unsupported(
-            "try_without_catch_or_finally",
-            try_stmt.span,
-        ));
-    }
-
-    let try_start = builder.new_label();
-    let try_end = builder.new_label();
-    let after_try = builder.new_label();
-
-    // Optional labels for the catch and finally chapters.
-    let catch_start = try_stmt.handler.as_ref().map(|_| builder.new_label());
-    let catch_end = try_stmt.handler.as_ref().map(|_| builder.new_label());
-    let finally_handler = try_stmt.finalizer.as_ref().map(|_| builder.new_label());
-    let finally_normal = try_stmt.finalizer.as_ref().map(|_| builder.new_label());
-
-    // 1) Try body.
-    builder
-        .bind_label(try_start)
-        .map_err(|err| SourceLoweringError::Internal(format!("bind try_start: {err:?}")))?;
-    lower_block_statement(builder, ctx, &try_stmt.block)?;
-    builder
-        .bind_label(try_end)
-        .map_err(|err| SourceLoweringError::Internal(format!("bind try_end: {err:?}")))?;
-
-    // 2) Normal-exit jump out of try — either into finally_normal
-    //    (if we have a finalizer) or straight past the handler to
-    //    after_try (catch-only shape).
-    let try_normal_target = finally_normal.unwrap_or(after_try);
-    builder
-        .emit_jump_to(Opcode::Jump, try_normal_target)
-        .map_err(|err| {
-            SourceLoweringError::Internal(format!("encode Jump (try normal exit): {err:?}"))
-        })?;
-
-    // 3) Catch block, if present.
-    if let (Some(handler), Some(catch_start), Some(catch_end)) =
-        (try_stmt.handler.as_deref(), catch_start, catch_end)
-    {
-        builder
-            .bind_label(catch_start)
-            .map_err(|err| SourceLoweringError::Internal(format!("bind catch_start: {err:?}")))?;
-        // Register handler for the try body.
-        ctx.record_exception_handler(try_start, try_end, catch_start);
-
-        // Scope-snapshot around the catch body so the catch
-        // parameter `e` pops on catch exit. Without finalizer this
-        // is the only scope; with finalizer the binding is still
-        // local to the catch body — finally can't see `e`.
-        let scope = ctx.snapshot_scope();
-
-        // Bind the catch parameter, if any. `catch { … }` without a
-        // param is the "bindingless catch" from ES2019 (§14.15.1).
-        let lower_catch = (|| -> Result<(), SourceLoweringError> {
-            if let Some(param) = handler.param.as_ref() {
-                // Pull the pending exception into acc so both the
-                // identifier and destructuring catch-param paths
-                // can consume it.
-                builder.emit(Opcode::LdaException, &[]).map_err(|err| {
-                    SourceLoweringError::Internal(format!("encode LdaException: {err:?}"))
-                })?;
-                match &param.pattern {
-                    BindingPattern::BindingIdentifier(ident) => {
-                        let name = ident.name.as_str();
-                        let slot = ctx.allocate_local(name, false, ident.span)?;
-                        builder
-                            .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
-                            .map_err(|err| {
-                                SourceLoweringError::Internal(format!(
-                                    "encode Star (catch param): {err:?}"
-                                ))
-                            })?;
-                        ctx.mark_initialized(name)?;
-                    }
-                    // Destructuring catch param — `catch ({ message })`,
-                    // `catch ([first, ...])`. Stash the exception
-                    // in an anonymous local, then destructure
-                    // against it using the shared pattern-bind
-                    // helper.
-                    BindingPattern::ArrayPattern(_)
-                    | BindingPattern::ObjectPattern(_)
-                    | BindingPattern::AssignmentPattern(_) => {
-                        let exc_slot = ctx.allocate_anonymous_local()?;
-                        builder
-                            .emit(Opcode::Star, &[Operand::Reg(u32::from(exc_slot))])
-                            .map_err(|err| {
-                                SourceLoweringError::Internal(format!(
-                                    "encode Star (destructured catch): {err:?}"
-                                ))
-                            })?;
-                        lower_pattern_bind(builder, ctx, &param.pattern, exc_slot, false)?;
-                    }
-                }
-            } else {
-                // Bindingless catch — still need to clear the
-                // pending exception from the activation so the
-                // next throw/finally path sees a clean slate.
-                builder.emit(Opcode::LdaException, &[]).map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode LdaException (bindingless): {err:?}"
-                    ))
-                })?;
-            }
-            lower_block_statement(builder, ctx, &handler.body)?;
-            Ok(())
-        })();
-        ctx.restore_scope(scope);
-        lower_catch?;
-
-        builder
-            .bind_label(catch_end)
-            .map_err(|err| SourceLoweringError::Internal(format!("bind catch_end: {err:?}")))?;
-
-        // After catch completes normally, run finally (if any) or
-        // jump past.
-        builder
-            .emit_jump_to(Opcode::Jump, try_normal_target)
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Jump (catch normal exit): {err:?}"))
-            })?;
-    }
-
-    // 4) Finally block, if present.
-    if let (Some(finalizer), Some(finally_handler), Some(finally_normal)) = (
-        try_stmt.finalizer.as_deref(),
-        finally_handler,
-        finally_normal,
-    ) {
-        // Register exception-path handler. If there's a catch,
-        // finally catches exceptions from the catch body. If not,
-        // finally catches exceptions from the try body directly.
-        match (catch_start, catch_end) {
-            (Some(cs), Some(ce)) => ctx.record_exception_handler(cs, ce, finally_handler),
-            _ => ctx.record_exception_handler(try_start, try_end, finally_handler),
-        }
-
-        // 4a) Exception-path finally entry — pending exception is
-        //     still set. Emit the finally body, then ReThrow to
-        //     re-raise the pending value (which `LdaException` /
-        //     `ReThrow` read from the activation).
-        builder.bind_label(finally_handler).map_err(|err| {
-            SourceLoweringError::Internal(format!("bind finally_handler: {err:?}"))
-        })?;
-        lower_block_statement(builder, ctx, finalizer)?;
-        builder.emit(Opcode::ReThrow, &[]).map_err(|err| {
-            SourceLoweringError::Internal(format!("encode ReThrow (finally): {err:?}"))
-        })?;
-
-        // 4b) Normal-path finally entry — no pending exception;
-        //     run the finally body and fall through to after_try.
-        builder.bind_label(finally_normal).map_err(|err| {
-            SourceLoweringError::Internal(format!("bind finally_normal: {err:?}"))
-        })?;
-        lower_block_statement(builder, ctx, finalizer)?;
-    }
-
-    builder
-        .bind_label(after_try)
-        .map_err(|err| SourceLoweringError::Internal(format!("bind after_try: {err:?}")))?;
-
-    Ok(())
-}
-
-/// Lowers `break;` → `Jump loop_exit` for the innermost enclosing
-/// loop.
-///
-/// Labelled breaks (`break outer;`) are rejected with a stable
-/// `labelled_break` tag; the label-tracking plumbing lands with
-/// broader labelled-statement support (M11+). A bare `break`
-/// outside any loop surfaces as `break_outside_loop` so users get a
-/// clear compile-time diagnostic instead of a silent fall-through.
-fn lower_break_statement<'a>(
-    builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'a>,
-    break_stmt: &'a oxc_ast::ast::BreakStatement<'a>,
-) -> Result<(), SourceLoweringError> {
-    // §14.13.3 `break labelName` — walk the loop-labels stack to
-    // find the matching labelled frame, and target its break
-    // label. Plain `break` still uses the innermost loop /
-    // switch / labelled block.
-    let target = if let Some(label) = &break_stmt.label {
-        ctx.find_break_label_by_name(label.name.as_str())
-            .ok_or_else(|| SourceLoweringError::unsupported("undeclared_label", break_stmt.span))?
-    } else {
-        ctx.innermost_break_label().ok_or_else(|| {
-            SourceLoweringError::unsupported("break_outside_loop", break_stmt.span)
-        })?
-    };
-    builder
-        .emit_jump_to(Opcode::Jump, target)
-        .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (break): {err:?}")))?;
-    Ok(())
-}
-
-/// Lowers `continue;` → `Jump continue_label` for the innermost
-/// enclosing loop.
-///
-/// For `while`, `continue_label` is the loop header (the test
-/// re-runs). For `for`, it's the update clause (which then falls
-/// through to the loop header). Labelled continues and continue
-/// outside a loop surface their own stable tags for the same
-/// reasons as [`lower_break_statement`].
-fn lower_continue_statement<'a>(
-    builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'a>,
-    cont_stmt: &'a oxc_ast::ast::ContinueStatement<'a>,
-) -> Result<(), SourceLoweringError> {
-    // §14.13.3 `continue labelName` — walk the loop-labels stack
-    // for the matching labelled iteration frame. Labelled
-    // non-iteration frames (labelled blocks / switches) are
-    // skipped: `continue` requires an iteration target per §14.11.
-    let target = if let Some(label) = &cont_stmt.label {
-        ctx.find_continue_label_by_name(label.name.as_str())
-            .ok_or_else(|| SourceLoweringError::unsupported("undeclared_label", cont_stmt.span))?
-    } else {
-        // `continue` walks past any enclosing `switch` frames
-        // (which push break-only labels with `continue_label:
-        // None`) to find the innermost frame that actually has a
-        // continue target. Spec §14.11 IterationStatement:
-        // `continue` binds to the innermost *iteration*
-        // statement, not just any break-frame.
-        ctx.innermost_continue_label().ok_or_else(|| {
-            SourceLoweringError::unsupported("continue_outside_loop", cont_stmt.span)
-        })?
-    };
-    builder
-        .emit_jump_to(Opcode::Jump, target)
-        .map_err(|err| SourceLoweringError::Internal(format!("encode Jump (continue): {err:?}")))?;
-    Ok(())
-}
-
 /// Resolved binding for a JS identifier reference. Mirrors the
 /// `[hidden | params | locals]` frame layout: `Param.reg` is the
 /// user-visible register index of the parameter (0 for the sole M5
@@ -3504,6 +3202,11 @@ struct LoweringContext<'a> {
     /// type itself isn't. `enter_loop` / `exit_loop` are the only
     /// mutators.
     loop_labels: RefCell<Vec<LoopLabels>>,
+    /// Innermost-finally-last stack of normal-path finalizer entry
+    /// labels. `return` / `break` / `continue` queue the outer
+    /// entries here so `ResumeAbrupt` can unwind through each
+    /// `finally` block before resuming the original completion.
+    finally_frames: RefCell<Vec<FinallyFrame>>,
     /// Stack of short-circuit labels for the currently-open optional
     /// chain expressions (§13.3.9). `lower_chain_expression` pushes
     /// a fresh label before lowering the chain's element tree and
@@ -3782,6 +3485,11 @@ struct LoopLabels {
     label: Option<std::rc::Rc<str>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FinallyFrame {
+    normal_entry: Label,
+}
+
 /// Snapshot of [`LoweringContext::locals`] length, returned by
 /// [`LoweringContext::snapshot_scope`] and consumed by
 /// [`LoweringContext::restore_scope`]. Used to give scoped
@@ -3844,6 +3552,7 @@ impl<'a> LoweringContext<'a> {
             next_feedback_slot: Cell::new(0),
             feedback_slot_kinds: RefCell::new(Vec::new()),
             loop_labels: RefCell::new(Vec::new()),
+            finally_frames: RefCell::new(Vec::new()),
             optional_chain_short_circuit: RefCell::new(Vec::new()),
             pending_loop_label: std::cell::RefCell::new(None),
             scope_starts: RefCell::new(Vec::new()),
@@ -4082,6 +3791,26 @@ impl<'a> LoweringContext<'a> {
     /// caller.
     fn enter_loop(&self, labels: LoopLabels) {
         self.loop_labels.borrow_mut().push(labels);
+    }
+
+    fn enter_finally_frame(&self, frame: FinallyFrame) {
+        self.finally_frames.borrow_mut().push(frame);
+    }
+
+    fn exit_finally_frame(&self) {
+        let popped = self.finally_frames.borrow_mut().pop();
+        debug_assert!(
+            popped.is_some(),
+            "exit_finally_frame called without enter_finally_frame",
+        );
+    }
+
+    fn active_finally_targets(&self) -> Vec<Label> {
+        self.finally_frames
+            .borrow()
+            .iter()
+            .map(|frame| frame.normal_entry)
+            .collect()
     }
 
     /// §14.13 — stash a label so the immediately-following iteration

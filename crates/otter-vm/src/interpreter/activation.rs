@@ -11,6 +11,12 @@ use crate::value::RegisterValue;
 use super::InterpreterError;
 use super::RuntimeState;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum PendingAbruptCompletion {
+    Return(RegisterValue),
+    Jump(ProgramCounter),
+}
+
 /// Mutable activation state for a single executing function frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Activation {
@@ -19,6 +25,8 @@ pub struct Activation {
     closure_handle: Option<ObjectHandle>,
     construct_new_target: Option<ObjectHandle>,
     pending_exception: Option<RegisterValue>,
+    pending_abrupt_completion: Option<PendingAbruptCompletion>,
+    pending_finally_stack: Vec<ProgramCounter>,
     pc: ProgramCounter,
     registers: Box<[RegisterValue]>,
     open_upvalues: Box<[Option<ObjectHandle>]>,
@@ -87,6 +95,8 @@ impl Activation {
             closure_handle,
             construct_new_target: None,
             pending_exception: None,
+            pending_abrupt_completion: None,
+            pending_finally_stack: Vec::new(),
             pc: 0,
             registers: vec![RegisterValue::default(); usize::from(register_count)]
                 .into_boxed_slice(),
@@ -149,6 +159,30 @@ impl Activation {
 
     pub(super) fn take_pending_exception(&mut self) -> Option<RegisterValue> {
         self.pending_exception.take()
+    }
+
+    pub(super) fn set_pending_abrupt_completion(&mut self, value: PendingAbruptCompletion) {
+        self.pending_abrupt_completion = Some(value);
+    }
+
+    pub(super) fn take_pending_abrupt_completion(&mut self) -> Option<PendingAbruptCompletion> {
+        self.pending_abrupt_completion.take()
+    }
+
+    pub(super) fn clear_pending_abrupt_completion(&mut self) {
+        self.pending_abrupt_completion = None;
+    }
+
+    pub(super) fn push_pending_finally(&mut self, target_pc: ProgramCounter) {
+        self.pending_finally_stack.push(target_pc);
+    }
+
+    pub(super) fn pop_pending_finally(&mut self) -> Option<ProgramCounter> {
+        self.pending_finally_stack.pop()
+    }
+
+    pub(super) fn clear_pending_finally(&mut self) {
+        self.pending_finally_stack.clear();
     }
 
     /// Returns the immutable register slice.

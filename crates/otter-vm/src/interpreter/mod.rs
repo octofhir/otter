@@ -1695,6 +1695,8 @@ impl Interpreter {
             return false;
         };
 
+        activation.clear_pending_abrupt_completion();
+        activation.clear_pending_finally();
         activation.set_pending_exception(value);
         activation.set_pc(handler.handler_pc());
         true

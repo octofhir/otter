@@ -2454,7 +2454,7 @@ fn lower_for_of_statement<'a>(
         //      binding's register, or spill through a hidden
         //      local before storing into an upvalue.
         let mut destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
-        let mut assignment_target: Option<ForOfAssignmentTarget<'a>> = None;
+        let mut assignment_target: Option<ForInOfAssignmentTarget<'a>> = None;
         let mut upvalue_target: Option<(u16, u16)> = None;
         let (binding_reg, is_let_like) = match &for_of.left {
             ForStatementLeft::VariableDeclaration(decl) => {
@@ -2538,12 +2538,12 @@ fn lower_for_of_statement<'a>(
             }
             ForStatementLeft::ArrayAssignmentTarget(pattern) => {
                 let iter_val_slot = ctx.allocate_anonymous_local()?;
-                assignment_target = Some(ForOfAssignmentTarget::Array(pattern));
+                assignment_target = Some(ForInOfAssignmentTarget::Array(pattern));
                 (iter_val_slot, false)
             }
             ForStatementLeft::ObjectAssignmentTarget(pattern) => {
                 let iter_val_slot = ctx.allocate_anonymous_local()?;
-                assignment_target = Some(ForOfAssignmentTarget::Object(pattern));
+                assignment_target = Some(ForInOfAssignmentTarget::Object(pattern));
                 (iter_val_slot, false)
             }
             other => {
@@ -2583,7 +2583,7 @@ fn lower_for_of_statement<'a>(
             lower_for_in_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
         }
         if let Some(target) = assignment_target {
-            lower_for_of_assignment_target(builder, ctx, target, binding_reg)?;
+            lower_for_in_of_assignment_target(builder, ctx, target, binding_reg)?;
         }
 
         // 4) Body. Register loop labels so nested
@@ -2647,26 +2647,27 @@ fn lower_for_in_of_upvalue_assignment(
     Ok(())
 }
 
-enum ForOfAssignmentTarget<'a> {
+enum ForInOfAssignmentTarget<'a> {
     Array(&'a oxc_ast::ast::ArrayAssignmentTarget<'a>),
     Object(&'a oxc_ast::ast::ObjectAssignmentTarget<'a>),
 }
 
-/// Performs §14.7.5.13 ForIn/OfBodyEvaluation's assignment step
-/// for destructuring assignment targets in `for (<lhs> of rhs)`.
+/// Performs ForIn/OfBodyEvaluation's assignment step for
+/// destructuring assignment targets in `for (<lhs> of rhs)` and
+/// `for (<lhs> in rhs)`.
 ///
 /// Spec: https://tc39.es/ecma262/#sec-runtime-semantics-forin-div-ofbodyevaluation-lhs-stmt-iterator-lhskind-labelset
-fn lower_for_of_assignment_target<'a>(
+fn lower_for_in_of_assignment_target<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
-    target: ForOfAssignmentTarget<'a>,
+    target: ForInOfAssignmentTarget<'a>,
     iter_value_reg: u16,
 ) -> Result<(), SourceLoweringError> {
     match target {
-        ForOfAssignmentTarget::Array(pattern) => {
+        ForInOfAssignmentTarget::Array(pattern) => {
             destructure_array_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
         }
-        ForOfAssignmentTarget::Object(pattern) => {
+        ForInOfAssignmentTarget::Object(pattern) => {
             destructure_object_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
         }
     }
@@ -2742,6 +2743,7 @@ fn lower_for_in_statement<'a>(
             })?;
 
         let mut for_in_destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
+        let mut assignment_target: Option<ForInOfAssignmentTarget<'a>> = None;
         let mut upvalue_target: Option<(u16, u16)> = None;
         let binding_reg = match &for_in.left {
             ForStatementLeft::VariableDeclaration(decl) => {
@@ -2821,6 +2823,16 @@ fn lower_for_in_statement<'a>(
                     }
                 }
             }
+            ForStatementLeft::ArrayAssignmentTarget(pattern) => {
+                let iter_val_slot = ctx.allocate_anonymous_local()?;
+                assignment_target = Some(ForInOfAssignmentTarget::Array(pattern));
+                iter_val_slot
+            }
+            ForStatementLeft::ObjectAssignmentTarget(pattern) => {
+                let iter_val_slot = ctx.allocate_anonymous_local()?;
+                assignment_target = Some(ForInOfAssignmentTarget::Object(pattern));
+                iter_val_slot
+            }
             other => {
                 return Err(SourceLoweringError::unsupported(
                     "for_in_unsupported_left",
@@ -2852,6 +2864,9 @@ fn lower_for_in_statement<'a>(
             })?;
         if let Some((iter_val_reg, upvalue_idx)) = upvalue_target {
             lower_for_in_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
+        }
+        if let Some(target) = assignment_target {
+            lower_for_in_of_assignment_target(builder, ctx, target, binding_reg)?;
         }
 
         ctx.enter_loop(LoopLabels {

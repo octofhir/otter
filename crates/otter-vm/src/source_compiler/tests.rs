@@ -6802,6 +6802,48 @@ fn m31_for_in_upvalue_target_is_set_before_break() {
 }
 
 #[test]
+fn m31_for_in_array_assignment_target_updates_existing_bindings() {
+    // `for ([a, b] in obj)` destructures each string key into
+    // existing bindings, so the final key's characters remain
+    // visible after the loop exits.
+    let src = "function main() { \
+        let a = \"\"; \
+        let b = \"\"; \
+        for ([a, b] in { ab: 1, cd: 2 }) { } \
+        return a + b; \
+    }";
+    assert_eq!(run_string_function(src, &[]), "cd");
+}
+
+#[test]
+fn m31_for_in_array_assignment_target_is_visible_inside_body() {
+    // The destructuring assignment step still happens before the
+    // body, so reads of the reassigned bindings see the current
+    // key's characters on each iteration.
+    let src = "function main() { \
+        let a = \"\"; \
+        let b = \"\"; \
+        let total = \"\"; \
+        for ([a, b] in { ab: 1, cd: 2 }) { total = total + a + b; } \
+        return total; \
+    }";
+    assert_eq!(run_string_function(src, &[]), "abcd");
+}
+
+#[test]
+fn m31_for_in_object_assignment_target_is_set_before_break() {
+    // Object assignment-target patterns run against the current
+    // key string before the body executes, so `length` is set by
+    // the first key even when the body breaks immediately.
+    let src = "function main() { \
+        let length = 0; \
+        for ({ length } in { cat: 1, dog: 2 }) { break; } \
+        return length; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 3);
+}
+
+#[test]
 fn m31_for_in_walks_prototype_chain() {
     // §14.7.5.6 — for-in enumerates own AND inherited
     // enumerable properties. The child has its own key, and

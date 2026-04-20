@@ -2393,7 +2393,8 @@ fn lower_for_statement<'a>(
 ///   (note: the M30 lowering reuses one slot per iteration;
 ///   spec-accurate CreatePerIterationEnvironment is a follow-up,
 ///   relevant only for body closures that capture the binding).
-/// - plain `Identifier` target — assigns to an existing binding.
+/// - plain `Identifier` target — assigns to an existing binding,
+///   including a captured outer binding.
 ///
 /// Deferred to later milestones: `for await`, destructuring
 /// patterns in `left`, iterator-close on abrupt completion
@@ -2450,11 +2451,10 @@ fn lower_for_of_statement<'a>(
         //      local to hold each iteration's value; a
         //      destructuring pattern-bind runs before the body.
         //    - `x` (identifier assignment): reuse the existing
-        //      binding's register. Upvalues are rejected here —
-        //      the per-iteration store would need `StaUpvalue`
-        //      after `IteratorStep`, which the M30 lowering
-        //      keeps simple by excluding.
+        //      binding's register, or spill through a hidden
+        //      local before storing into an upvalue.
         let mut destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
+        let mut upvalue_target: Option<(u16, u16)> = None;
         let (binding_reg, is_let_like) = match &for_of.left {
             ForStatementLeft::VariableDeclaration(decl) => {
                 // `var`, `let`, and `const` all flow through the
@@ -2528,11 +2528,10 @@ fn lower_for_of_statement<'a>(
                             ident.span,
                         ));
                     }
-                    BindingRef::Upvalue { .. } => {
-                        return Err(SourceLoweringError::unsupported(
-                            "for_of_upvalue_target",
-                            ident.span,
-                        ));
+                    BindingRef::Upvalue { idx } => {
+                        let iter_val_slot = ctx.allocate_anonymous_local()?;
+                        upvalue_target = Some((iter_val_slot, idx));
+                        (iter_val_slot, false)
                     }
                 }
             }
@@ -2569,6 +2568,9 @@ fn lower_for_of_statement<'a>(
                     "encode JumpIfToBooleanTrue (for-of done): {err:?}"
                 ))
             })?;
+        if let Some((iter_val_reg, upvalue_idx)) = upvalue_target {
+            lower_for_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
+        }
 
         // 4) Body. Register loop labels so nested
         //    `break` / `continue` target our skeleton — `continue`
@@ -2604,6 +2606,30 @@ fn lower_for_of_statement<'a>(
 
     ctx.restore_scope(scope);
     result
+}
+
+/// Performs §14.7.5.13 ForIn/OfBodyEvaluation's assignment step
+/// for `for (x of iterable)` when `x` resolves to an upvalue.
+///
+/// Spec: https://tc39.es/ecma262/#sec-runtime-semantics-forin-div-ofbodyevaluation-lhs-stmt-iterator-lhskind-labelset
+fn lower_for_of_upvalue_assignment(
+    builder: &mut BytecodeBuilder,
+    iter_value_reg: u16,
+    upvalue_idx: u16,
+) -> Result<(), SourceLoweringError> {
+    builder
+        .emit(Opcode::Ldar, &[Operand::Reg(u32::from(iter_value_reg))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Ldar (for-of upvalue target): {err:?}"))
+        })?;
+    builder
+        .emit(Opcode::StaUpvalue, &[Operand::Idx(u32::from(upvalue_idx))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!(
+                "encode StaUpvalue (for-of upvalue target): {err:?}"
+            ))
+        })?;
+    Ok(())
 }
 
 /// M31: lowers `for (<left> in <source>) <body>` — §14.7.5.11

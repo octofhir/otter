@@ -6339,6 +6339,57 @@ fn m30_for_of_reads_existing_binding() {
 }
 
 #[test]
+fn m30_for_of_upvalue_target_updates_outer_binding() {
+    // `for (x of values)` inside a nested function assigns into
+    // the captured outer binding, so the outer frame observes
+    // the final iterator value after the loop completes.
+    let src = "function main() { \
+        let x = 0; \
+        function consume(values) { \
+            for (x of values) { } \
+        } \
+        consume([5, 6, 7]); \
+        return x; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn m30_for_of_upvalue_target_is_visible_inside_body() {
+    // §14.7.5.13 assigns the iterator value before the body
+    // runs, so reads of the captured binding inside the loop see
+    // the current element rather than the previous iteration.
+    let src = "function main() { \
+        let x = 0; \
+        function consume(values) { \
+            let total = 0; \
+            for (x of values) { total = total + x; } \
+            return total * 10 + x; \
+        } \
+        return consume([1, 2, 3]); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 63);
+}
+
+#[test]
+fn m30_for_of_upvalue_target_is_set_before_break() {
+    // Abrupt completion still happens after the loop-assignment
+    // step, so a `break` from the body preserves the current
+    // iteration value in the captured binding.
+    let src = "function main() { \
+        let x = 0; \
+        function consume(values) { \
+            for (x of values) { \
+                break; \
+            } \
+            return x; \
+        } \
+        return consume([2, 4, 6]); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 2);
+}
+
+#[test]
 fn m30_for_of_break_exits_loop() {
     // `break` inside the body jumps past the loop exit. Partial
     // sum covers the early-exit path.

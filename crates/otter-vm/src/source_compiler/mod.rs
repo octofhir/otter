@@ -5521,6 +5521,12 @@ fn lower_return_expression<'a>(
         // label that the chain's end installs.
         Expression::ChainExpression(chain) => lower_chain_expression(builder, ctx, chain),
         Expression::TemplateLiteral(tpl) => lower_template_literal(builder, ctx, tpl),
+        // §13.3.11 `` tag`...${x}...` `` — call `tag(strings,
+        // ...values)` where `strings` is the cooked-parts array
+        // with a `.raw` property pointing at the raw-parts array.
+        Expression::TaggedTemplateExpression(tagged) => {
+            lower_tagged_template_expression(builder, ctx, tagged)
+        }
         Expression::FunctionExpression(func) => lower_function_expression(builder, ctx, func),
         Expression::ArrowFunctionExpression(arrow) => {
             lower_arrow_function_expression(builder, ctx, arrow)
@@ -8466,6 +8472,190 @@ fn concat_step(
     let slot = ctx.allocate_arithmetic_feedback();
     builder.attach_feedback(add_pc, slot);
     Ok(())
+}
+
+/// §13.3.11 `` tag`quasi0${e0}quasi1…` `` — lowers a tagged
+/// template call into `tag(strings, e0, e1, …)` where `strings`
+/// is the cooked-parts array with a `.raw` property pointing at
+/// the raw-parts array.
+///
+/// Bytecode shape (`N` = substitution count):
+///
+/// ```text
+///   <lower tag>; Star r_callee
+///   CreateArray; Star r_args[0]          ; strings (cooked)
+///   <for each cooked>: LdaConstStr; ArrayPush r_args[0]
+///   CreateArray; Star r_raw              ; raw array
+///   <for each raw>: LdaConstStr; ArrayPush r_raw
+///   Ldar r_raw; StaNamedProperty r_args[0], "raw"_idx
+///   <lower e0>; Star r_args[1]
+///   …
+///   <lower eN>; Star r_args[N]
+///   CallUndefinedReceiver r_callee, RegList { base: r_args, count: N + 1 }
+/// ```
+///
+/// Departs from the spec in one place: §13.2.8.3 / §13.2.8.4
+/// require that the cooked and raw arrays be frozen and cached
+/// per template-site across invocations. A fresh array is built
+/// on every call — observable only via
+/// `template === sameTemplateFn()` identity tests, which aren't
+/// in the common path.
+fn lower_tagged_template_expression<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    tagged: &'a oxc_ast::ast::TaggedTemplateExpression<'a>,
+) -> Result<(), SourceLoweringError> {
+    let tpl = &tagged.quasi;
+    if tpl.quasis.len() != tpl.expressions.len() + 1 {
+        return Err(SourceLoweringError::Internal(format!(
+            "tagged template has {} quasis for {} expressions",
+            tpl.quasis.len(),
+            tpl.expressions.len(),
+        )));
+    }
+
+    let argc = RegisterIndex::try_from(tpl.expressions.len() + 1)
+        .map_err(|_| SourceLoweringError::Internal("tagged template argc overflow".into()))?;
+
+    let callee_temp = ctx.acquire_temps(1)?;
+    let args_base = ctx
+        .acquire_temps(argc)
+        .inspect_err(|_| ctx.release_temps(1))?;
+    let raw_temp = ctx
+        .acquire_temps(1)
+        .inspect_err(|_| ctx.release_temps(argc + 1))?;
+
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        // 1) Evaluate the tag expression → callee_temp.
+        lower_return_expression(builder, ctx, &tagged.tag)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (tagged tag): {err:?}"))
+            })?;
+
+        // 2) Build the cooked strings array directly into
+        //    args_base[0] — it becomes the first argument to the
+        //    tag call.
+        builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode CreateArray (tagged cooked): {err:?}"))
+        })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(args_base))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (tagged cooked arr): {err:?}"))
+            })?;
+        for quasi in tpl.quasis.iter() {
+            // Per §13.2.8.5, invalid escape sequences leave
+            // cooked as `undefined`; unsupported for now so we
+            // stay clear of the spec's `undefined` entry shape.
+            let cooked = quasi.value.cooked.as_deref().ok_or_else(|| {
+                SourceLoweringError::unsupported("invalid_template_escape", quasi.span)
+            })?;
+            let cooked_idx = ctx.intern_string_literal(cooked)?;
+            builder
+                .emit(Opcode::LdaConstStr, &[Operand::Idx(cooked_idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaConstStr (tagged cooked): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(args_base))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode ArrayPush (tagged cooked): {err:?}"
+                    ))
+                })?;
+        }
+
+        // 3) Build the raw strings array.
+        builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode CreateArray (tagged raw): {err:?}"))
+        })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(raw_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (tagged raw arr): {err:?}"))
+            })?;
+        for quasi in tpl.quasis.iter() {
+            let raw_idx = ctx.intern_string_literal(quasi.value.raw.as_str())?;
+            builder
+                .emit(Opcode::LdaConstStr, &[Operand::Idx(raw_idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaConstStr (tagged raw): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(raw_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode ArrayPush (tagged raw): {err:?}"))
+                })?;
+        }
+
+        // 4) strings.raw = raw.
+        let raw_name_idx = ctx.intern_property_name("raw")?;
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(raw_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Ldar (tagged raw): {err:?}"))
+            })?;
+        builder
+            .emit(
+                Opcode::StaNamedProperty,
+                &[
+                    Operand::Reg(u32::from(args_base)),
+                    Operand::Idx(raw_name_idx),
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode StaNamedProperty (tagged raw): {err:?}"
+                ))
+            })?;
+
+        // 5) Lower each substitution into args_base[1..].
+        for (i, expr) in tpl.expressions.iter().enumerate() {
+            lower_return_expression(builder, ctx, expr)?;
+            let slot = args_base
+                .checked_add(RegisterIndex::try_from(i + 1).map_err(|_| {
+                    SourceLoweringError::Internal("tagged arg slot overflow".into())
+                })?)
+                .ok_or_else(|| {
+                    SourceLoweringError::Internal("tagged arg slot overflow (add)".into())
+                })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Star (tagged arg): {err:?}"))
+                })?;
+        }
+
+        // 6) Dispatch with `this = undefined`.
+        builder
+            .emit(
+                Opcode::CallUndefinedReceiver,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: u32::from(argc),
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode CallUndefinedReceiver (tagged): {err:?}"
+                ))
+            })?;
+        Ok(())
+    })();
+
+    ctx.release_temps(1); // raw_temp
+    ctx.release_temps(argc); // args
+    ctx.release_temps(1); // callee_temp
+    lower
 }
 
 /// Stable tag for unsupported `PropertyKey` shapes — surfaces in

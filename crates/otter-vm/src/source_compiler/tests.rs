@@ -4012,16 +4012,57 @@ fn template_substitution_can_itself_be_a_template() {
 }
 
 #[test]
-fn tagged_template_rejected() {
-    // `` tag`hi` `` uses the `TaggedTemplateExpression` AST node,
-    // which is a separate variant not wired through
-    // `lower_template_literal`. Stays rejected until a future
-    // milestone adds the tagged-call protocol.
-    let err =
-        compile("function f() { let tag = 1; return tag`hi`; }").expect_err("tagged template");
-    assert!(
-        matches!(err, SourceLoweringError::Unsupported { .. }),
-        "unexpected err: {err:?}",
+fn tagged_template_invokes_tag_with_strings_and_substitutions() {
+    // `tag`a${x}b${y}c`` calls `tag(["a","b","c"], x, y)`. The
+    // tag here sums `strings.length + strings[0].length + x + y`
+    // — verifies both the strings array delivery and the
+    // per-substitution argument delivery.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let tag = function (strings, x, y) { \
+                     return strings.length + strings[0].length + x + y; \
+                 }; \
+                 return tag`a${10}bc${20}d`; \
+             }",
+            &[],
+        ),
+        // strings = ["a", "bc", "d"] → length 3. strings[0] = "a" → 1.
+        // x + y = 30. total = 3 + 1 + 30 = 34.
+        34,
+    );
+}
+
+#[test]
+fn tagged_template_exposes_raw_strings() {
+    // The tag's first argument carries a `raw` property — here
+    // we just check its length to confirm the raw array is
+    // attached and the right size.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let tag = function (strings) { \
+                     return strings.raw.length; \
+                 }; \
+                 return tag`abc${1}def`; \
+             }",
+            &[],
+        ),
+        2,
+    );
+}
+
+#[test]
+fn tagged_template_with_no_substitutions_passes_single_element_array() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let tag = function (strings) { return strings.length; }; \
+                 return tag`hello`; \
+             }",
+            &[],
+        ),
+        1,
     );
 }
 

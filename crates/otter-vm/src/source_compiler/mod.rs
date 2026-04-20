@@ -502,11 +502,37 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
                         exports.push(ExportRecord::Default { local: name.into() });
                         script_body.push(stmt);
                     }
-                    _ => {
-                        return Err(SourceLoweringError::unsupported(
-                            "export_default_non_function",
-                            decl.span,
-                        ));
+                    other => {
+                        // `export default <expr>` and anonymous
+                        // `export default function () {}` / `export
+                        // default class {}` all collapse to
+                        // "evaluate the right-hand side at module
+                        // init, bind to a synthetic module-level
+                        // `default` local, and register that local
+                        // as the default export." The binding is
+                        // named `__otter_default` — reserved and
+                        // not reachable by user identifier refs
+                        // (starts with `__otter_` which the compiler
+                        // treats as internal).
+                        if !matches!(
+                            other,
+                            ExportDefaultDeclarationKind::ClassDeclaration(_)
+                                | ExportDefaultDeclarationKind::FunctionDeclaration(_)
+                        ) && !other.is_expression()
+                        {
+                            return Err(SourceLoweringError::unsupported(
+                                "export_default_non_function",
+                                decl.span,
+                            ));
+                        }
+                        const DEFAULT_LOCAL: &str = "__otter_default";
+                        module_globals.push(DEFAULT_LOCAL.to_string());
+                        exported_const_vars.push(DEFAULT_LOCAL.to_string());
+                        default_export_local = Some(DEFAULT_LOCAL.to_string());
+                        exports.push(ExportRecord::Default {
+                            local: DEFAULT_LOCAL.into(),
+                        });
+                        script_body.push(stmt);
                     }
                 }
             }
@@ -1734,17 +1760,19 @@ fn lower_top_statement<'a>(
                 )),
             }
         }
-        // §16.2.3 `export default class Foo {}` — the outer
-        // wrapper is pushed into `script_body` unchanged by
-        // `lower_program`. Unwrap it here and lower the inner
-        // class declaration; the `exported_const_vars` flush at
-        // the top-level tail then installs `Foo` on the global
-        // object so the module-loader's namespace harvest sees
-        // it. `export default function` is already hoisted as a
-        // real `FunctionDeclaration` in `lower_program`, so the
-        // wrapper doesn't appear in `script_body` for that
-        // shape; guard with a stable tag if we ever reach here
-        // with a non-class default.
+        // §16.2.3 `export default …` — the outer wrapper is
+        // pushed into `script_body` unchanged by `lower_program`
+        // for every non-named-function shape. Dispatch by the
+        // inner declaration kind:
+        //
+        // - Named class → same path as a top-level class decl;
+        //   the class name is the export local.
+        // - Named function → already registered as a regular
+        //   top-level declaration; no-op at script time.
+        // - Expression / anonymous → evaluate into acc and bind
+        //   the result to `__otter_default` so the
+        //   exported-const flush at the top-level tail installs
+        //   it on the global object.
         Statement::ExportDefaultDeclaration(decl) => {
             ctx.record_source_location(builder.pc(), stmt.span().start);
             match &decl.declaration {
@@ -1752,10 +1780,21 @@ fn lower_top_statement<'a>(
                     lower_nested_class_declaration(builder, ctx, cls)
                 }
                 ExportDefaultDeclarationKind::FunctionDeclaration(_) => Ok(()),
-                _ => Err(SourceLoweringError::unsupported(
-                    "export_default_non_function",
-                    stmt.span(),
-                )),
+                other => {
+                    const DEFAULT_LOCAL: &str = "__otter_default";
+                    let slot = ctx.allocate_local(DEFAULT_LOCAL, true, stmt.span())?;
+                    let expr = other.to_expression();
+                    lower_return_expression(builder, ctx, expr)?;
+                    builder
+                        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Star (export default expr): {err:?}"
+                            ))
+                        })?;
+                    ctx.mark_initialized(DEFAULT_LOCAL)?;
+                    Ok(())
+                }
             }
         }
         _ => lower_nested_statement(builder, ctx, stmt),

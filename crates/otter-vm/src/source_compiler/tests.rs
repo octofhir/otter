@@ -7784,6 +7784,42 @@ fn m35_default_class_export_can_be_imported_and_instantiated() {
 }
 
 #[test]
+fn m35_default_expression_export_can_be_imported() {
+    // `export default <expression>` — the expression evaluates at
+    // module-init time and the result becomes the default export.
+    // Canonical pattern for factories, constants, and configured
+    // objects. Here we export a plain object and read a field on
+    // the consumer side.
+    let lib_src = "export default { version: 42 }";
+    let entry_src = "import cfg from \"./lib\"; \
+        export function main() { return cfg.version }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 42);
+}
+
+#[test]
+fn m35_default_arrow_function_export() {
+    // `export default (x, y) => x * y` — common shorthand for
+    // tiny utility modules. Verifies arrow-function defaults
+    // flow through the expression path too.
+    let lib_src = "export default (x, y) => x * y";
+    let entry_src = "import mul from \"./lib\"; \
+        export function main() { return mul(6, 7) }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 42);
+}
+
+#[test]
 fn m35_namespace_import_exposes_all_exports() {
     // `import * as ns from "./lib"; ns.add(…)` — the loader builds
     // a plain object whose own properties are the exported names

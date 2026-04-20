@@ -6753,6 +6753,55 @@ fn m31_for_in_reads_existing_binding() {
 }
 
 #[test]
+fn m31_for_in_upvalue_target_updates_outer_binding() {
+    // `for (k in obj)` inside a nested function writes through
+    // to the captured outer binding, so the last enumerated key
+    // remains visible after the loop exits.
+    let src = "function main() { \
+        let k = \"\"; \
+        function consume(obj) { \
+            for (k in obj) { } \
+        } \
+        consume({ a: 1, b: 2, c: 3 }); \
+        return k; \
+    }";
+    assert_eq!(run_string_function(src, &[]), "c");
+}
+
+#[test]
+fn m31_for_in_upvalue_target_is_visible_inside_body() {
+    // The for-in assignment step runs before the body, so keyed
+    // reads through the captured binding see the current key on
+    // each iteration.
+    let src = "function main() { \
+        let k = \"\"; \
+        function consume(obj) { \
+            let total = 0; \
+            for (k in obj) { total = total + obj[k]; } \
+            return total; \
+        } \
+        return consume({ a: 1, b: 2, c: 3 }); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 6);
+}
+
+#[test]
+fn m31_for_in_upvalue_target_is_set_before_break() {
+    // Abrupt completion still happens after the per-iteration
+    // key assignment, so breaking out of the body preserves the
+    // current key in the captured binding.
+    let src = "function main() { \
+        let k = \"\"; \
+        function consume(obj) { \
+            for (k in obj) { break; } \
+            return k; \
+        } \
+        return consume({ first: 1, second: 2 }); \
+    }";
+    assert_eq!(run_string_function(src, &[]), "first");
+}
+
+#[test]
 fn m31_for_in_walks_prototype_chain() {
     // §14.7.5.6 — for-in enumerates own AND inherited
     // enumerable properties. The child has its own key, and

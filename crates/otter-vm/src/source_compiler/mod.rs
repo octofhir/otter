@@ -2580,7 +2580,7 @@ fn lower_for_of_statement<'a>(
                 ))
             })?;
         if let Some((iter_val_reg, upvalue_idx)) = upvalue_target {
-            lower_for_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
+            lower_for_in_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
         }
         if let Some(target) = assignment_target {
             lower_for_of_assignment_target(builder, ctx, target, binding_reg)?;
@@ -2622,11 +2622,12 @@ fn lower_for_of_statement<'a>(
     result
 }
 
-/// Performs §14.7.5.13 ForIn/OfBodyEvaluation's assignment step
-/// for `for (x of iterable)` when `x` resolves to an upvalue.
+/// Performs ForIn/OfBodyEvaluation's assignment step for
+/// `for (x of iterable)` / `for (x in object)` when `x` resolves
+/// to an upvalue.
 ///
 /// Spec: https://tc39.es/ecma262/#sec-runtime-semantics-forin-div-ofbodyevaluation-lhs-stmt-iterator-lhskind-labelset
-fn lower_for_of_upvalue_assignment(
+fn lower_for_in_of_upvalue_assignment(
     builder: &mut BytecodeBuilder,
     iter_value_reg: u16,
     upvalue_idx: u16,
@@ -2698,8 +2699,9 @@ fn lower_for_of_assignment_target<'a>(
 /// body never runs.
 ///
 /// Supported LHS forms mirror `for…of`: `let x` / `const x`
-/// (fresh per-loop binding) and plain identifier targets. Same
-/// deferrals apply (destructuring, `var`, upvalue targets).
+/// (fresh per-loop binding) and plain identifier targets,
+/// including captured outer bindings. Same deferrals apply
+/// (destructuring assignment targets, `var` hoisting details).
 fn lower_for_in_statement<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
@@ -2740,6 +2742,7 @@ fn lower_for_in_statement<'a>(
             })?;
 
         let mut for_in_destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
+        let mut upvalue_target: Option<(u16, u16)> = None;
         let binding_reg = match &for_in.left {
             ForStatementLeft::VariableDeclaration(decl) => {
                 // `var`, `let`, `const` all allocate the same
@@ -2811,11 +2814,10 @@ fn lower_for_in_statement<'a>(
                             ident.span,
                         ));
                     }
-                    BindingRef::Upvalue { .. } => {
-                        return Err(SourceLoweringError::unsupported(
-                            "for_in_upvalue_target",
-                            ident.span,
-                        ));
+                    BindingRef::Upvalue { idx } => {
+                        let iter_val_slot = ctx.allocate_anonymous_local()?;
+                        upvalue_target = Some((iter_val_slot, idx));
+                        iter_val_slot
                     }
                 }
             }
@@ -2848,6 +2850,9 @@ fn lower_for_in_statement<'a>(
                     "encode JumpIfToBooleanTrue (for-in done): {err:?}"
                 ))
             })?;
+        if let Some((iter_val_reg, upvalue_idx)) = upvalue_target {
+            lower_for_in_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
+        }
 
         ctx.enter_loop(LoopLabels {
             break_label: loop_exit,

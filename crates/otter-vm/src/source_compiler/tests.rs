@@ -19,6 +19,10 @@ fn compile(source: &str) -> Result<crate::module::Module, SourceLoweringError> {
     ModuleCompiler::new().compile(source, "test.js", SourceType::default())
 }
 
+fn compile_ts(source: &str) -> Result<crate::module::Module, SourceLoweringError> {
+    ModuleCompiler::new().compile(source, "test.ts", SourceType::ts())
+}
+
 /// Return `(FunctionIndex, &Function)` for the user-declared
 /// function the tests want to call directly. The module's entry
 /// is always the synthesised `<top-level>` now, so tests that
@@ -66,6 +70,15 @@ fn pick_last_named_function(
 
 fn run_int32_function(source: &str, args: &[i32]) -> i32 {
     let module = compile(source).expect("compile");
+    run_int32_function_from_module(module, args)
+}
+
+fn run_int32_function_ts(source: &str, args: &[i32]) -> i32 {
+    let module = compile_ts(source).expect("compile");
+    run_int32_function_from_module(module, args)
+}
+
+fn run_int32_function_from_module(module: crate::module::Module, args: &[i32]) -> i32 {
     // The module entry is always the synthesised top-level
     // function (runs the script body once, returns `undefined`).
     // These tests want to call the LAST user-declared function —
@@ -3798,6 +3811,25 @@ fn optional_computed_member_short_circuits_on_null() {
 }
 
 #[test]
+fn optional_chain_allows_ts_non_null_member_base() {
+    assert_eq!(
+        run_int32_function_ts("function f() { let o = { a: 42 }; return (o!)?.a; }", &[]),
+        42,
+    );
+}
+
+#[test]
+fn optional_chain_ts_non_null_still_short_circuits_on_null() {
+    assert_eq!(
+        run_int32_function_ts(
+            "function f() { let o = null; return (o!)?.a === undefined ? 1 : 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
 fn optional_chain_short_circuits_mid_chain() {
     // `a?.b.c` — once `a?.b` produces undefined, `.c` is skipped
     // (the chain's single short-circuit label covers every access
@@ -3808,6 +3840,17 @@ fn optional_chain_short_circuits_mid_chain() {
             &[],
         ),
         1,
+    );
+}
+
+#[test]
+fn optional_call_allows_ts_non_null_callee() {
+    assert_eq!(
+        run_int32_function_ts(
+            "function f() { let g = function () { return 7 }; return (g!)?.(); }",
+            &[],
+        ),
+        7,
     );
 }
 

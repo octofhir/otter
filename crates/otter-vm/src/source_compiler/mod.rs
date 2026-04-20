@@ -5602,14 +5602,8 @@ fn lower_chain_expression<'a>(
         ChainElement::PrivateFieldExpression(member) => {
             lower_private_field_read(builder, ctx, member)
         }
-        ChainElement::TSNonNullExpression(_) => {
-            // TS-only assertion; conceptually a no-op to the
-            // runtime. Stays deferred — typed AST nodes don't
-            // flow through an otherwise-untyped lowering.
-            Err(SourceLoweringError::unsupported(
-                "ts_non_null_expression",
-                chain.span,
-            ))
+        ChainElement::TSNonNullExpression(expr) => {
+            lower_return_expression(builder, ctx, &expr.expression)
         }
     };
     ctx.exit_optional_chain();
@@ -5794,6 +5788,11 @@ fn lower_return_expression<'a>(
                 .emit(Opcode::Yield, &[])
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Yield: {err:?}")))?;
             Ok(())
+        }
+        // TS-only non-null assertion. Runtime semantics are a
+        // no-op; just lower the wrapped expression.
+        Expression::TSNonNullExpression(expr) => {
+            lower_return_expression(builder, ctx, &expr.expression)
         }
         // §13.3.9 Optional Chains — `o?.a`, `o?.[k]`, `f?.()`,
         // and any composition thereof. The ChainExpression wraps

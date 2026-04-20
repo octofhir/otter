@@ -453,26 +453,62 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
             }
             Statement::ExportDefaultDeclaration(decl) => {
                 is_esm = true;
-                // `export default function foo() {}` — must be a
-                // named hoistable declaration at this slice of the
-                // compiler. Anonymous default (`export default
-                // function () {}` / `export default expr`) requires
-                // synthesising a local binding and lowering an
-                // expression at module-init time; deferred.
-                let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &decl.declaration
-                else {
-                    return Err(SourceLoweringError::unsupported(
-                        "export_default_non_function",
-                        decl.span,
-                    ));
-                };
-                let name =
-                    record_function_declaration(func.as_ref(), &mut declarations, &mut names)?;
-                default_export_local = Some(name.to_string());
-                module_globals.push(name.to_string());
-                exports.push(ExportRecord::Default {
-                    local: name.to_string().into(),
-                });
+                // §16.2.3 `export default …` — three accepted shapes:
+                //
+                //   `export default function foo() {}` — register as
+                //   a named hoistable declaration.
+                //
+                //   `export default class Foo {}` — hoist onto the
+                //   synthesised top-level script via the same path
+                //   as a plain top-level class declaration; bind the
+                //   default export to `Foo` on the global object.
+                //
+                //   Anonymous defaults (`export default class {}` /
+                //   `export default function () {}` / `export
+                //   default expr`) require synthesising a fresh
+                //   module-level binding and lowering an expression
+                //   at module-init time; stays deferred.
+                match &decl.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+                        let name = record_function_declaration(
+                            func.as_ref(),
+                            &mut declarations,
+                            &mut names,
+                        )?;
+                        default_export_local = Some(name.to_string());
+                        module_globals.push(name.to_string());
+                        exports.push(ExportRecord::Default {
+                            local: name.to_string().into(),
+                        });
+                    }
+                    ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                        let Some(id) = &class.id else {
+                            return Err(SourceLoweringError::unsupported(
+                                "export_default_anonymous_class",
+                                decl.span,
+                            ));
+                        };
+                        let name = id.name.as_str().to_string();
+                        // Route through the statement-lowering phase
+                        // like any other top-level class. The outer
+                        // `Statement::ExportDefaultDeclaration` itself
+                        // drops into `script_body` unchanged; the
+                        // script-body lowerer recognises the default
+                        // wrapper and delegates to
+                        // `lower_nested_class_declaration`.
+                        module_globals.push(name.clone());
+                        exported_const_vars.push(name.clone());
+                        default_export_local = Some(name.clone());
+                        exports.push(ExportRecord::Default { local: name.into() });
+                        script_body.push(stmt);
+                    }
+                    _ => {
+                        return Err(SourceLoweringError::unsupported(
+                            "export_default_non_function",
+                            decl.span,
+                        ));
+                    }
+                }
             }
             Statement::ExportAllDeclaration(decl) => {
                 is_esm = true;
@@ -1694,6 +1730,30 @@ fn lower_top_statement<'a>(
                 Some(Declaration::FunctionDeclaration(_)) | None => Ok(()),
                 _ => Err(SourceLoweringError::unsupported(
                     "export_declaration_non_function",
+                    stmt.span(),
+                )),
+            }
+        }
+        // §16.2.3 `export default class Foo {}` — the outer
+        // wrapper is pushed into `script_body` unchanged by
+        // `lower_program`. Unwrap it here and lower the inner
+        // class declaration; the `exported_const_vars` flush at
+        // the top-level tail then installs `Foo` on the global
+        // object so the module-loader's namespace harvest sees
+        // it. `export default function` is already hoisted as a
+        // real `FunctionDeclaration` in `lower_program`, so the
+        // wrapper doesn't appear in `script_body` for that
+        // shape; guard with a stable tag if we ever reach here
+        // with a non-class default.
+        Statement::ExportDefaultDeclaration(decl) => {
+            ctx.record_source_location(builder.pc(), stmt.span().start);
+            match &decl.declaration {
+                ExportDefaultDeclarationKind::ClassDeclaration(cls) => {
+                    lower_nested_class_declaration(builder, ctx, cls)
+                }
+                ExportDefaultDeclarationKind::FunctionDeclaration(_) => Ok(()),
+                _ => Err(SourceLoweringError::unsupported(
+                    "export_default_non_function",
                     stmt.span(),
                 )),
             }

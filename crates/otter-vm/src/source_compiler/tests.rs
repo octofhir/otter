@@ -7762,6 +7762,28 @@ fn m35_default_import_calls_default_export() {
 }
 
 #[test]
+fn m35_default_class_export_can_be_imported_and_instantiated() {
+    // `export default class Foo { ... }` — the class name becomes
+    // the default export binding. Consumers grab it via the usual
+    // `import Foo from "./lib"` form. Verifies the class's
+    // instance methods work correctly after the default-export
+    // indirection.
+    let lib_src = "export default class Point { \
+                       constructor(x, y) { this.x = x; this.y = y } \
+                       sum() { return this.x + this.y } \
+                   }";
+    let entry_src = "import Point from \"./lib\"; \
+        export function main() { return new Point(3, 4).sum() }";
+    let out = run_module_graph_int32(
+        "entry",
+        &[("entry", entry_src), ("lib", lib_src)],
+        "main",
+        &[],
+    );
+    assert_eq!(out, 7);
+}
+
+#[test]
 fn m35_namespace_import_exposes_all_exports() {
     // `import * as ns from "./lib"; ns.add(…)` — the loader builds
     // a plain object whose own properties are the exported names

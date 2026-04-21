@@ -273,7 +273,7 @@ fn lower_using_decl<'a>(
 ) -> Result<(), SourceLoweringError> {
     if decl.declarations.is_empty() {
         return Err(SourceLoweringError::unsupported(
-            "empty_variable_declaration",
+            "parser_recovery_empty_using_decl",
             decl.span,
         ));
     }

@@ -4402,7 +4402,7 @@ pub(super) fn lower_let_const_declaration<'a>(
 
     if decl.declarations.is_empty() {
         return Err(SourceLoweringError::unsupported(
-            "empty_variable_declaration",
+            "parser_recovery_empty_var_decl",
             decl.span,
         ));
     }

@@ -88,7 +88,7 @@ fn lower_switch_lexical_declaration<'a>(
     let is_const = decl.kind == VariableDeclarationKind::Const;
     if decl.declarations.is_empty() {
         return Err(SourceLoweringError::unsupported(
-            "empty_variable_declaration",
+            "parser_recovery_empty_switch_lexical_decl",
             decl.span,
         ));
     }

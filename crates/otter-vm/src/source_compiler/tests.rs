@@ -6256,6 +6256,44 @@ fn m28_super_property_assignment_writes_to_this() {
 }
 
 #[test]
+fn m28_optional_super_static_method_call_preserves_this() {
+    let src = "function main() { \
+            class Parent { get() { return this.value; } } \
+            class Child extends Parent { \
+                constructor() { super(); this.value = 11; } \
+                ask() { return super.get?.(); } \
+            } \
+            return new Child().ask(); \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 11);
+}
+
+#[test]
+fn m28_optional_super_method_call_short_circuits_missing_method() {
+    let src = "function main() { \
+            class Parent {} \
+            class Child extends Parent { \
+                ask() { return super.missing?.() === undefined ? 42 : 0; } \
+            } \
+            return new Child().ask(); \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn m28_optional_super_computed_method_call_preserves_this() {
+    let src = "function main() { \
+            class Parent { get() { return this.value + 1; } } \
+            class Child extends Parent { \
+                constructor() { super(); this.value = 12; } \
+                ask() { return super['get']?.(); } \
+            } \
+            return new Child().ask(); \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 13);
+}
+
+#[test]
 fn m28_super_outside_class_is_unsupported() {
     // `super` used in a regular function body has no enclosing
     // `ClassSuperBinding` — the compiler surfaces

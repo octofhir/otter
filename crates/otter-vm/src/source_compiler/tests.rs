@@ -4749,6 +4749,49 @@ fn switch_case_lexical_fallthrough_reads_initialized_binding() {
 }
 
 #[test]
+fn switch_case_var_declaration_is_visible_after_switch() {
+    let program = "function f(n) { \
+        switch (n) { \
+            case 1: var x = 7; break; \
+            default: var x = 3; \
+        } \
+        return x; \
+    }";
+    assert_eq!(run_int32_function(program, &[1]), 7);
+    assert_eq!(run_int32_function(program, &[2]), 3);
+}
+
+#[test]
+fn switch_case_var_is_hoisted_before_discriminant() {
+    let program = "function f() { \
+        switch (typeof x) { \
+            case \"undefined\": var x = 9; break; \
+            default: var x = 1; \
+        } \
+        return x; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 9);
+}
+
+#[test]
+fn switch_case_var_without_matching_case_stays_undefined() {
+    let program = "function f() { \
+        switch (0) { case 1: var x = 7; break; } \
+        return typeof x; \
+    }";
+    assert_eq!(run_string_function(program, &[]), "undefined");
+}
+
+#[test]
+fn switch_case_var_destructuring_assigns_hoisted_bindings() {
+    let program = "function f() { \
+        switch (1) { case 1: var { x, y = 9 } = { x: 4 }; break; } \
+        return x * 10 + y; \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 49);
+}
+
+#[test]
 fn break_inside_switch_does_not_escape_outer_loop() {
     // `break` inside a case targets the innermost break-frame —
     // the switch, not the enclosing while.

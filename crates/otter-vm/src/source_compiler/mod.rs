@@ -139,7 +139,9 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
-use switch_scope::{enter_switch_lexical_scope, lower_switch_case_statement};
+use switch_scope::{
+    enter_switch_lexical_scope, hoist_switch_var_declarations, lower_switch_case_statement,
+};
 use try_finally::{
     lower_break_statement, lower_continue_statement, lower_return_statement, lower_try_statement,
 };
@@ -2940,6 +2942,7 @@ fn lower_switch_statement<'a>(
     ctx: &mut LoweringContext<'a>,
     sw: &'a oxc_ast::ast::SwitchStatement<'a>,
 ) -> Result<(), SourceLoweringError> {
+    hoist_switch_var_declarations(builder, ctx, sw)?;
     let switch_scope = enter_switch_lexical_scope(builder, ctx, sw)?;
     // 1) Evaluate discriminant into a temp. The compare phase
     //    reloads it before each `TestEqualStrict` so the acc is
@@ -4160,6 +4163,21 @@ impl<'a> LoweringContext<'a> {
         span: Span,
     ) -> Result<u16, SourceLoweringError> {
         self.allocate_local_with_mode(name, is_const, true, span)
+    }
+
+    fn allocate_initialized_local(
+        &mut self,
+        name: &'a str,
+        is_const: bool,
+        span: Span,
+    ) -> Result<u16, SourceLoweringError> {
+        let slot = self.allocate_local_with_mode(name, is_const, false, span)?;
+        let local = self
+            .locals
+            .last_mut()
+            .ok_or_else(|| SourceLoweringError::Internal("missing initialized local".into()))?;
+        local.initialized = true;
+        Ok(slot)
     }
 
     fn allocate_local_with_mode(

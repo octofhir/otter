@@ -4,6 +4,55 @@ use oxc_ast::ast::{
     VariableDeclarationKind, VariableDeclarator,
 };
 
+#[derive(Clone, Copy)]
+enum SwitchBindingMode {
+    Lexical { is_const: bool },
+    Var,
+}
+
+pub(super) fn hoist_switch_var_declarations<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    sw: &'a SwitchStatement<'a>,
+) -> Result<(), SourceLoweringError> {
+    let mut seen: Vec<&'a str> = Vec::new();
+    for case in &sw.cases {
+        for stmt in &case.consequent {
+            let Statement::VariableDeclaration(decl) = stmt else {
+                continue;
+            };
+            if decl.kind != VariableDeclarationKind::Var {
+                continue;
+            }
+            for declarator in &decl.declarations {
+                let mut bindings = Vec::new();
+                collect_switch_binding_identifiers(&declarator.id, &mut bindings);
+                for ident in bindings {
+                    let name = ident.name.as_str();
+                    if seen.contains(&name) {
+                        continue;
+                    }
+                    seen.push(name);
+                    let slot = ctx.allocate_initialized_local(name, false, ident.span)?;
+                    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaUndefined (switch var hoist): {err:?}"
+                        ))
+                    })?;
+                    builder
+                        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Star (switch var hoist): {err:?}"
+                            ))
+                        })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn enter_switch_lexical_scope<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
@@ -71,10 +120,7 @@ pub(super) fn lower_switch_case_statement<'a>(
             VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing => Err(
                 SourceLoweringError::unsupported("parser_recovery_switch_using_decl", decl.span),
             ),
-            VariableDeclarationKind::Var => Err(SourceLoweringError::unsupported(
-                "switch_var_declaration",
-                decl.span,
-            )),
+            VariableDeclarationKind::Var => lower_switch_var_declaration(builder, ctx, decl),
         },
         _ => lower_nested_statement(builder, ctx, stmt),
     }
@@ -124,10 +170,65 @@ fn lower_switch_lexical_declarator<'a>(
                             "encode Star (switch destruct src): {err:?}"
                         ))
                     })?;
-                lower_switch_pattern_bind_existing(builder, ctx, pattern, src_slot, is_const)
+                lower_switch_pattern_bind_existing(
+                    builder,
+                    ctx,
+                    pattern,
+                    src_slot,
+                    SwitchBindingMode::Lexical { is_const },
+                )
             })()
         }
     }
+}
+
+fn lower_switch_var_declaration<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    decl: &'a VariableDeclaration<'a>,
+) -> Result<(), SourceLoweringError> {
+    if decl.declarations.is_empty() {
+        return Err(SourceLoweringError::unsupported(
+            "parser_recovery_empty_switch_var_decl",
+            decl.span,
+        ));
+    }
+
+    for declarator in &decl.declarations {
+        let Some(init) = declarator.init.as_ref() else {
+            continue;
+        };
+        match &declarator.id {
+            BindingPattern::BindingIdentifier(ident) => {
+                lower_return_expression(builder, ctx, init)?;
+                lower_switch_binding_identifier_from_acc(
+                    builder,
+                    ctx,
+                    ident,
+                    SwitchBindingMode::Var,
+                )?;
+            }
+            pattern => {
+                let src_slot = ctx.allocate_anonymous_local()?;
+                lower_return_expression(builder, ctx, init)?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(src_slot))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (switch var destruct src): {err:?}"
+                        ))
+                    })?;
+                lower_switch_pattern_bind_existing(
+                    builder,
+                    ctx,
+                    pattern,
+                    src_slot,
+                    SwitchBindingMode::Var,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn lower_switch_lexical_identifier_init<'a>(
@@ -193,21 +294,21 @@ fn lower_switch_pattern_bind_existing<'a>(
     ctx: &mut LoweringContext<'a>,
     pattern: &'a BindingPattern<'a>,
     src_reg: RegisterIndex,
-    is_const: bool,
+    mode: SwitchBindingMode,
 ) -> Result<(), SourceLoweringError> {
     match pattern {
         BindingPattern::BindingIdentifier(ident) => {
-            lower_switch_binding_identifier_from_acc(builder, ctx, ident, is_const)
+            lower_switch_binding_identifier_from_acc(builder, ctx, ident, mode)
         }
         BindingPattern::ArrayPattern(pat) => {
-            lower_switch_array_pattern(builder, ctx, pat, src_reg, is_const)
+            lower_switch_array_pattern(builder, ctx, pat, src_reg, mode)
         }
         BindingPattern::ObjectPattern(pat) => {
-            lower_switch_object_pattern(builder, ctx, pat, src_reg, is_const)
+            lower_switch_object_pattern(builder, ctx, pat, src_reg, mode)
         }
         BindingPattern::AssignmentPattern(assign) => {
             emit_default_for_destructured_leaf(builder, ctx, Some(&assign.right))?;
-            lower_switch_assign_target(builder, ctx, &assign.left, is_const)
+            lower_switch_assign_target(builder, ctx, &assign.left, mode)
         }
     }
 }
@@ -216,35 +317,15 @@ fn lower_switch_binding_identifier_from_acc<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
     ident: &'a BindingIdentifier<'a>,
-    is_const: bool,
+    mode: SwitchBindingMode,
 ) -> Result<(), SourceLoweringError> {
-    let binding = ctx
-        .resolve_own(ident.name.as_str())
-        .ok_or_else(|| SourceLoweringError::Internal("missing switch lexical binding".into()))?;
-    let BindingRef::Local {
-        reg,
-        initialized: false,
-        is_const: binding_const,
-        runtime_tdz: true,
-    } = binding
-    else {
-        return Err(SourceLoweringError::Internal(format!(
-            "switch binding {} is not pending lexical local",
-            ident.name.as_str()
-        )));
-    };
-    if binding_const != is_const {
-        return Err(SourceLoweringError::Internal(format!(
-            "switch binding constness mismatch for {}",
-            ident.name.as_str()
-        )));
-    }
+    let reg = resolve_switch_binding_target(ctx, ident, mode)?;
     builder
         .emit(Opcode::Star, &[Operand::Reg(u32::from(reg))])
         .map_err(|err| {
             SourceLoweringError::Internal(format!("encode Star (switch lexical leaf): {err:?}"))
         })?;
-    ctx.mark_initialized(ident.name.as_str())
+    finish_switch_binding_write(ctx, ident, mode)
 }
 
 fn lower_switch_array_pattern<'a>(
@@ -252,7 +333,7 @@ fn lower_switch_array_pattern<'a>(
     ctx: &mut LoweringContext<'a>,
     pat: &'a oxc_ast::ast::ArrayPattern<'a>,
     src_reg: RegisterIndex,
-    is_const: bool,
+    mode: SwitchBindingMode,
 ) -> Result<(), SourceLoweringError> {
     for (index, element) in pat.elements.iter().enumerate() {
         let Some(element_pat) = element.as_ref() else {
@@ -280,7 +361,7 @@ fn lower_switch_array_pattern<'a>(
         match element_pat {
             BindingPattern::AssignmentPattern(assign) => {
                 emit_default_for_destructured_leaf(builder, ctx, Some(&assign.right))?;
-                lower_switch_assign_target(builder, ctx, &assign.left, is_const)?;
+                lower_switch_assign_target(builder, ctx, &assign.left, mode)?;
             }
             BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
                 let nested_slot = ctx.allocate_anonymous_local()?;
@@ -291,16 +372,10 @@ fn lower_switch_array_pattern<'a>(
                             "encode Star (switch array nested): {err:?}"
                         ))
                     })?;
-                lower_switch_pattern_bind_existing(
-                    builder,
-                    ctx,
-                    element_pat,
-                    nested_slot,
-                    is_const,
-                )?;
+                lower_switch_pattern_bind_existing(builder, ctx, element_pat, nested_slot, mode)?;
             }
             _ => {
-                lower_switch_pattern_bind_existing(builder, ctx, element_pat, src_reg, is_const)?;
+                lower_switch_pattern_bind_existing(builder, ctx, element_pat, src_reg, mode)?;
             }
         }
     }
@@ -308,28 +383,14 @@ fn lower_switch_array_pattern<'a>(
     if let Some(rest) = pat.rest.as_deref() {
         match &rest.argument {
             BindingPattern::BindingIdentifier(ident) => {
-                let rest_binding = ctx.resolve_own(ident.name.as_str()).ok_or_else(|| {
-                    SourceLoweringError::Internal("missing switch rest binding".into())
-                })?;
-                let BindingRef::Local {
-                    reg,
-                    initialized: false,
-                    runtime_tdz: true,
-                    ..
-                } = rest_binding
-                else {
-                    return Err(SourceLoweringError::Internal(format!(
-                        "switch rest binding {} not pending",
-                        ident.name.as_str()
-                    )));
-                };
+                let reg = resolve_switch_binding_target(ctx, ident, mode)?;
                 emit_array_rest_slice(builder, ctx, src_reg, pat.elements.len(), reg)?;
-                ctx.mark_initialized(ident.name.as_str())?;
+                finish_switch_binding_write(ctx, ident, mode)?;
             }
             nested @ (BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_)) => {
                 let rest_slot = ctx.allocate_anonymous_local()?;
                 emit_array_rest_slice(builder, ctx, src_reg, pat.elements.len(), rest_slot)?;
-                lower_switch_pattern_bind_existing(builder, ctx, nested, rest_slot, is_const)?;
+                lower_switch_pattern_bind_existing(builder, ctx, nested, rest_slot, mode)?;
             }
             _ => {
                 return Err(SourceLoweringError::unsupported(
@@ -346,11 +407,11 @@ fn lower_switch_assign_target<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
     target: &'a BindingPattern<'a>,
-    is_const: bool,
+    mode: SwitchBindingMode,
 ) -> Result<(), SourceLoweringError> {
     match target {
         BindingPattern::BindingIdentifier(ident) => {
-            lower_switch_binding_identifier_from_acc(builder, ctx, ident, is_const)
+            lower_switch_binding_identifier_from_acc(builder, ctx, ident, mode)
         }
         BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
             let nested_slot = ctx.allocate_anonymous_local()?;
@@ -361,11 +422,11 @@ fn lower_switch_assign_target<'a>(
                         "encode Star (switch assign-target nested): {err:?}"
                     ))
                 })?;
-            lower_switch_pattern_bind_existing(builder, ctx, target, nested_slot, is_const)
+            lower_switch_pattern_bind_existing(builder, ctx, target, nested_slot, mode)
         }
         BindingPattern::AssignmentPattern(nested) => {
             emit_default_for_destructured_leaf(builder, ctx, Some(&nested.right))?;
-            lower_switch_assign_target(builder, ctx, &nested.left, is_const)
+            lower_switch_assign_target(builder, ctx, &nested.left, mode)
         }
     }
 }
@@ -375,7 +436,7 @@ fn lower_switch_object_pattern<'a>(
     ctx: &mut LoweringContext<'a>,
     pat: &'a oxc_ast::ast::ObjectPattern<'a>,
     src_reg: RegisterIndex,
-    is_const: bool,
+    mode: SwitchBindingMode,
 ) -> Result<(), SourceLoweringError> {
     let mut extracted_keys: Vec<String> = Vec::new();
     for prop in &pat.properties {
@@ -442,7 +503,7 @@ fn lower_switch_object_pattern<'a>(
         match &prop.value {
             BindingPattern::AssignmentPattern(assign) => {
                 emit_default_for_destructured_leaf(builder, ctx, Some(&assign.right))?;
-                lower_switch_assign_target(builder, ctx, &assign.left, is_const)?;
+                lower_switch_assign_target(builder, ctx, &assign.left, mode)?;
             }
             BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
                 let nested_slot = ctx.allocate_anonymous_local()?;
@@ -453,16 +514,10 @@ fn lower_switch_object_pattern<'a>(
                             "encode Star (switch object nested): {err:?}"
                         ))
                     })?;
-                lower_switch_pattern_bind_existing(
-                    builder,
-                    ctx,
-                    &prop.value,
-                    nested_slot,
-                    is_const,
-                )?;
+                lower_switch_pattern_bind_existing(builder, ctx, &prop.value, nested_slot, mode)?;
             }
             BindingPattern::BindingIdentifier(ident) => {
-                lower_switch_binding_identifier_from_acc(builder, ctx, ident, is_const)?;
+                lower_switch_binding_identifier_from_acc(builder, ctx, ident, mode)?;
             }
         }
         let _ = key_name_for_rest;
@@ -475,23 +530,58 @@ fn lower_switch_object_pattern<'a>(
                 rest.span,
             ));
         };
-        let binding = ctx.resolve_own(rest_ident.name.as_str()).ok_or_else(|| {
-            SourceLoweringError::Internal("missing switch object rest binding".into())
-        })?;
-        let BindingRef::Local {
-            reg,
-            initialized: false,
-            runtime_tdz: true,
-            ..
-        } = binding
-        else {
-            return Err(SourceLoweringError::Internal(format!(
-                "switch object rest binding {} not pending",
-                rest_ident.name.as_str()
-            )));
-        };
+        let reg = resolve_switch_binding_target(ctx, rest_ident, mode)?;
         emit_object_rest_copy(builder, ctx, src_reg, &extracted_keys, reg)?;
-        ctx.mark_initialized(rest_ident.name.as_str())?;
+        finish_switch_binding_write(ctx, rest_ident, mode)?;
     }
     Ok(())
+}
+
+fn resolve_switch_binding_target(
+    ctx: &LoweringContext<'_>,
+    ident: &BindingIdentifier<'_>,
+    mode: SwitchBindingMode,
+) -> Result<RegisterIndex, SourceLoweringError> {
+    let binding = ctx
+        .resolve_own(ident.name.as_str())
+        .ok_or_else(|| SourceLoweringError::Internal("missing switch binding".into()))?;
+    match (mode, binding) {
+        (
+            SwitchBindingMode::Lexical { is_const },
+            BindingRef::Local {
+                reg,
+                initialized: false,
+                is_const: binding_const,
+                runtime_tdz: true,
+            },
+        ) if binding_const == is_const => Ok(reg),
+        (
+            SwitchBindingMode::Var,
+            BindingRef::Local {
+                reg,
+                initialized: true,
+                is_const: false,
+                runtime_tdz: false,
+            },
+        ) => Ok(reg),
+        (SwitchBindingMode::Lexical { .. }, _) => Err(SourceLoweringError::Internal(format!(
+            "switch binding {} is not pending lexical local",
+            ident.name.as_str()
+        ))),
+        (SwitchBindingMode::Var, _) => Err(SourceLoweringError::Internal(format!(
+            "switch var binding {} is not initialized mutable local",
+            ident.name.as_str()
+        ))),
+    }
+}
+
+fn finish_switch_binding_write(
+    ctx: &mut LoweringContext<'_>,
+    ident: &BindingIdentifier<'_>,
+    mode: SwitchBindingMode,
+) -> Result<(), SourceLoweringError> {
+    match mode {
+        SwitchBindingMode::Lexical { .. } => ctx.mark_initialized(ident.name.as_str()),
+        SwitchBindingMode::Var => Ok(()),
+    }
 }

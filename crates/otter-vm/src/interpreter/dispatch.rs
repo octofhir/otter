@@ -605,14 +605,13 @@ impl Interpreter {
                 frame_runtime.record_arithmetic(function, pc, observation);
             }
             Opcode::TestEqual => {
-                // Loose equality (§7.2.14). Phase 3b.6: for int32/null/
-                // undefined pairs, fall back to strict equality plus the
-                // `null == undefined` special case. Number/string/object
-                // coercion is deferred to Phase 3b.7 when we reuse the
-                // existing `RuntimeState` coercion helpers.
+                // Loose equality (§7.2.15 IsLooselyEqual). Delegate to
+                // RuntimeState so number/string/object/BigInt coercions share
+                // the same abstract-operation implementation as runtime APIs.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let lhs = activation.accumulator();
-                activation.set_accumulator(RegisterValue::from_bool(loose_eq(lhs, rhs)));
+                let result = runtime.js_loose_eq(lhs, rhs)?;
+                activation.set_accumulator(RegisterValue::from_bool(result));
             }
             Opcode::TestNull => {
                 let b = activation.accumulator() == RegisterValue::null();
@@ -2993,19 +2992,6 @@ fn read_reg_list(
         out.push(activation.read_bytecode_register(function, r)?);
     }
     Ok(out)
-}
-
-/// Loose equality (§7.2.14) for the subset the Phase 3b.6 dispatcher
-/// handles: strict equality plus the `null == undefined` special case.
-/// Full numeric / string coercion lands with Phase 3b.7 once
-/// `RuntimeState::js_loose_equals` is wired here.
-fn loose_eq(a: RegisterValue, b: RegisterValue) -> bool {
-    if a == b {
-        return true;
-    }
-    let a_is_null_or_undef = a == RegisterValue::null() || a == RegisterValue::undefined();
-    let b_is_null_or_undef = b == RegisterValue::null() || b == RegisterValue::undefined();
-    a_is_null_or_undef && b_is_null_or_undef
 }
 
 /// Outcome of [`super_call_dispatch`]. `Continue` means the

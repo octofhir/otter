@@ -8855,6 +8855,18 @@ fn relational_op_encoding(op: BinaryOperator) -> Option<RelationalOpEncoding> {
             requires_inversion: false,
             label: "TestGreaterThanOrEqual",
         },
+        Equality => RelationalOpEncoding {
+            forward_op: Opcode::TestEqual,
+            swapped_op: Opcode::TestEqual,
+            requires_inversion: false,
+            label: "TestEqual",
+        },
+        Inequality => RelationalOpEncoding {
+            forward_op: Opcode::TestEqual,
+            swapped_op: Opcode::TestEqual,
+            requires_inversion: true,
+            label: "TestEqual",
+        },
         StrictEquality => RelationalOpEncoding {
             forward_op: Opcode::TestEqualStrict,
             swapped_op: Opcode::TestEqualStrict,

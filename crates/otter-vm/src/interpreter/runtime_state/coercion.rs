@@ -78,6 +78,9 @@ impl RuntimeState {
             return Ok(true);
         }
 
+        let lhs_is_string = self.value_is_string(lhs)?;
+        let rhs_is_string = self.value_is_string(rhs)?;
+
         // §7.2.15 step 10-11: BigInt == Number comparison.
         if lhs.is_bigint() && rhs.as_number().is_some() {
             return self.bigint_equals_number(lhs, rhs);
@@ -87,7 +90,7 @@ impl RuntimeState {
         }
 
         // §7.2.15 step 12-13: BigInt == String comparison.
-        if lhs.is_bigint() && self.value_is_string(rhs)? {
+        if lhs.is_bigint() && rhs_is_string {
             let rhs_str = self.js_to_string(rhs)?;
             if let Ok(rhs_val) = rhs_str.parse::<num_bigint::BigInt>() {
                 let lhs_val = self.parse_bigint_value(lhs)?;
@@ -95,13 +98,33 @@ impl RuntimeState {
             }
             return Ok(false);
         }
-        if self.value_is_string(lhs)? && rhs.is_bigint() {
+        if lhs_is_string && rhs.is_bigint() {
             let lhs_str = self.js_to_string(lhs)?;
             if let Ok(lhs_val) = lhs_str.parse::<num_bigint::BigInt>() {
                 let rhs_val = self.parse_bigint_value(rhs)?;
                 return Ok(lhs_val == rhs_val);
             }
             return Ok(false);
+        }
+
+        // §7.2.15 steps 6-7: Number/String pairs compare after ToNumber.
+        if lhs.as_number().is_some() && rhs_is_string {
+            let rhs_number = RegisterValue::from_number(self.js_to_number(rhs)?);
+            return self.js_loose_eq(lhs, rhs_number);
+        }
+        if lhs_is_string && rhs.as_number().is_some() {
+            let lhs_number = RegisterValue::from_number(self.js_to_number(lhs)?);
+            return self.js_loose_eq(lhs_number, rhs);
+        }
+
+        // §7.2.15 steps 8-9: Boolean compares as ToNumber(boolean).
+        if lhs.as_bool().is_some() {
+            let lhs_number = RegisterValue::from_number(self.js_to_number(lhs)?);
+            return self.js_loose_eq(lhs_number, rhs);
+        }
+        if rhs.as_bool().is_some() {
+            let rhs_number = RegisterValue::from_number(self.js_to_number(rhs)?);
+            return self.js_loose_eq(lhs, rhs_number);
         }
 
         let coerced_lhs = self.coerce_loose_equality_primitive(lhs)?;

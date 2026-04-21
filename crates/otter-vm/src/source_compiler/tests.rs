@@ -1409,20 +1409,40 @@ fn strict_equality_with_undefined_literal_compiles() {
 }
 
 #[test]
-fn comparison_with_unsupported_operator_falls_through_to_binary() {
-    // `n != 5` (loose `!=`, not `!==`). The binary-op encoding
-    // returns None for it (still a "comparison" tag) and the
-    // relational lowering doesn't accept loose equality either, so
-    // it surfaces via `binary_operator_tag`.
-    let err = compile("function f(n) { if (n != 5) { return 1; } return 0; }")
-        .expect_err("loose equality at M6");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "comparison",
-            ..
-        }
-    ));
+fn loose_equality_number_string_coerces() {
+    // `==` lowers through TestEqual, whose dispatch path delegates to
+    // RuntimeState::js_loose_eq for §7.2.15 coercion.
+    assert_eq!(
+        run_int32_function(
+            "function f() { if (1 == \"1\") { return 1; } return 0; }",
+            &[]
+        ),
+        1
+    );
+}
+
+#[test]
+fn loose_inequality_inverts_test_equal() {
+    // `!=` emits TestEqual followed by LogicalNot, mirroring `!==`'s
+    // inversion shape but using loose equality semantics.
+    assert_eq!(
+        run_int32_function(
+            "function f() { if (0 != false) { return 1; } return 0; }",
+            &[]
+        ),
+        0
+    );
+}
+
+#[test]
+fn loose_equality_nullish_special_case() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { if (null == undefined) { return 1; } return 0; }",
+            &[],
+        ),
+        1
+    );
 }
 
 #[test]

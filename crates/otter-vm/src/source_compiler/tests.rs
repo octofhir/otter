@@ -7878,6 +7878,63 @@ fn m37_await_using_awaits_async_disposer_before_settlement() {
 }
 
 #[test]
+fn m37_for_of_using_disposes_each_iteration() {
+    let src = "function f() { \
+            let state = { count: 0 }; \
+            function make(v) { \
+                return { value: v, [Symbol.dispose]() { state.count = state.count * 10 + v + 4; } }; \
+            } \
+            for (using x of [make(1), make(2)]) { \
+                state.count = state.count * 10 + x.value; \
+            } \
+            return state.count; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1526);
+}
+
+#[test]
+fn m37_for_of_using_disposes_before_continue_and_break() {
+    let src = "function f() { \
+            let state = { count: 0 }; \
+            function make(v) { \
+                return { value: v, [Symbol.dispose]() { state.count = state.count * 10 + v + 5; } }; \
+            } \
+            for (using x of [make(1), make(2), make(3)]) { \
+                state.count = state.count * 10 + x.value; \
+                if (x.value === 1) continue; \
+                if (x.value === 2) break; \
+            } \
+            return state.count; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1627);
+}
+
+#[test]
+fn m37_for_of_await_using_awaits_each_iteration_disposer() {
+    let src = "async function run() { \
+            let state = { count: 0 }; \
+            function make(v) { \
+                return { \
+                    value: v, \
+                    [Symbol.asyncDispose]() { \
+                        return Promise.resolve().then(function() { state.count = state.count * 10 + v + 6; }); \
+                    } \
+                }; \
+            } \
+            for (await using x of [make(1), make(2)]) { \
+                state.count = state.count * 10 + x.value; \
+            } \
+            return state; \
+        } \
+        function main() { \
+            let outer = { count: 0 }; \
+            run().then(function(state) { outer.count = state.count; }); \
+            return outer; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 1728);
+}
+
+#[test]
 fn m33f_await_pending_promise_settled_by_timer() {
     // `await p` where `p` is ONLY resolved by a setTimeout
     // callback. This is the canonical "pending promise +

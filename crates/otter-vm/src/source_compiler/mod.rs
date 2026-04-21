@@ -144,7 +144,8 @@ use try_finally::{
     lower_break_statement, lower_continue_statement, lower_return_statement, lower_try_statement,
 };
 use using_decl::{
-    lower_function_top_statement_list, lower_nested_statement_list, lower_top_level_statement_list,
+    lower_function_top_statement_list, lower_loop_using_iteration, lower_nested_statement_list,
+    lower_top_level_statement_list,
 };
 
 use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Label, Opcode, Operand};
@@ -2462,6 +2463,7 @@ fn lower_for_of_statement<'a>(
         let mut destructuring_pattern: Option<(&BindingPattern<'a>, bool)> = None;
         let mut assignment_target: Option<ForInOfAssignmentTarget<'a>> = None;
         let mut upvalue_target: Option<(u16, u16)> = None;
+        let mut loop_using_await_dispose: Option<bool> = None;
         let (binding_reg, is_let_like) = match &for_of.left {
             ForStatementLeft::VariableDeclaration(decl) => {
                 // `var`, `let`, and `const` all flow through the
@@ -2483,7 +2485,15 @@ fn lower_for_of_statement<'a>(
                         declarator.span,
                     ));
                 }
-                let is_const = decl.kind == VariableDeclarationKind::Const;
+                let is_using = matches!(
+                    decl.kind,
+                    VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+                );
+                let is_const = decl.kind == VariableDeclarationKind::Const || is_using;
+                if is_using {
+                    loop_using_await_dispose =
+                        Some(decl.kind == VariableDeclarationKind::AwaitUsing);
+                }
                 match &declarator.id {
                     oxc_ast::ast::BindingPattern::BindingIdentifier(ident) => {
                         let name = ident.name.as_str();
@@ -2496,14 +2506,20 @@ fn lower_for_of_statement<'a>(
                     // iteration value, then run the pattern bind
                     // against it once we enter the body.
                     oxc_ast::ast::BindingPattern::ArrayPattern(_)
-                    | oxc_ast::ast::BindingPattern::ObjectPattern(_) => {
+                    | oxc_ast::ast::BindingPattern::ObjectPattern(_)
+                        if !is_using =>
+                    {
                         let iter_val_slot = ctx.allocate_anonymous_local()?;
                         destructuring_pattern = Some((&declarator.id, is_const));
                         (iter_val_slot, true)
                     }
                     other => {
                         return Err(SourceLoweringError::unsupported(
-                            "for_of_destructuring_binding",
+                            if is_using {
+                                "using_declaration"
+                            } else {
+                                "for_of_destructuring_binding"
+                            },
                             other.span(),
                         ));
                     }
@@ -2593,15 +2609,21 @@ fn lower_for_of_statement<'a>(
             continue_label: Some(loop_top),
             label: ctx.take_pending_loop_label(),
         });
-        let body_result = (|| -> Result<(), SourceLoweringError> {
-            // Destructuring for-of: expand the pattern against
-            // the iterator value now in `binding_reg` so every
-            // leaf becomes a fresh per-iteration local.
-            if let Some((pattern, is_const)) = destructuring_pattern {
-                lower_pattern_bind(builder, ctx, pattern, binding_reg, is_const)?;
-            }
-            lower_nested_statement(builder, ctx, &for_of.body)
-        })();
+        let body_result = if let Some(await_dispose) = loop_using_await_dispose {
+            lower_loop_using_iteration(builder, ctx, binding_reg, await_dispose, |builder, ctx| {
+                lower_nested_statement(builder, ctx, &for_of.body)
+            })
+        } else {
+            (|| -> Result<(), SourceLoweringError> {
+                // Destructuring for-of: expand the pattern against
+                // the iterator value now in `binding_reg` so every
+                // leaf becomes a fresh per-iteration local.
+                if let Some((pattern, is_const)) = destructuring_pattern {
+                    lower_pattern_bind(builder, ctx, pattern, binding_reg, is_const)?;
+                }
+                lower_nested_statement(builder, ctx, &for_of.body)
+            })()
+        };
         ctx.exit_loop();
         body_result?;
 

@@ -174,17 +174,60 @@ fn lower_using_declaration<'a>(
                 SourceLoweringError::Internal(format!("encode Star (using init): {err:?}"))
             })?;
         ctx.mark_initialized(name)?;
-        builder
-            .emit(
-                Opcode::AddDisposableResource,
-                &[
-                    Operand::Reg(u32::from(slot)),
-                    Operand::Imm(if await_dispose { 1 } else { 0 }),
-                ],
-            )
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode AddDisposableResource: {err:?}"))
-            })?;
+        emit_add_disposable_resource(builder, slot, await_dispose)?;
     }
+    Ok(())
+}
+
+pub(super) fn lower_loop_using_iteration<'a, LowerBody>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    resource_reg: u16,
+    await_dispose: bool,
+    lower_body: LowerBody,
+) -> Result<(), SourceLoweringError>
+where
+    LowerBody:
+        FnOnce(&mut BytecodeBuilder, &mut LoweringContext<'a>) -> Result<(), SourceLoweringError>,
+{
+    builder.emit(Opcode::PushUsingScope, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("encode PushUsingScope (loop using): {err:?}"))
+    })?;
+    lower_synthetic_try_finally(
+        builder,
+        ctx,
+        |builder, ctx| {
+            emit_add_disposable_resource(builder, resource_reg, await_dispose)?;
+            lower_body(builder, ctx)
+        },
+        |builder, _ctx| {
+            builder
+                .emit(Opcode::DisposeUsingScope, &[])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode DisposeUsingScope (loop using): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        },
+    )
+}
+
+fn emit_add_disposable_resource(
+    builder: &mut BytecodeBuilder,
+    resource_reg: u16,
+    await_dispose: bool,
+) -> Result<(), SourceLoweringError> {
+    builder
+        .emit(
+            Opcode::AddDisposableResource,
+            &[
+                Operand::Reg(u32::from(resource_reg)),
+                Operand::Imm(if await_dispose { 1 } else { 0 }),
+            ],
+        )
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode AddDisposableResource: {err:?}"))
+        })?;
     Ok(())
 }

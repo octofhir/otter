@@ -394,7 +394,7 @@ fn lower_switch_array_pattern<'a>(
             }
             _ => {
                 return Err(SourceLoweringError::unsupported(
-                    "nested_destructuring",
+                    "parser_recovery_array_rest_assignment",
                     rest.span,
                 ));
             }
@@ -526,7 +526,7 @@ fn lower_switch_object_pattern<'a>(
     if let Some(rest) = pat.rest.as_deref() {
         let BindingPattern::BindingIdentifier(rest_ident) = &rest.argument else {
             return Err(SourceLoweringError::unsupported(
-                "nested_destructuring",
+                "parser_recovery_object_rest_pattern",
                 rest.span,
             ));
         };

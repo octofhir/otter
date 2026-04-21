@@ -4520,17 +4520,10 @@ fn lower_destructured_declarator<'a>(
 /// destructuring `const { a } = …` produces a `const` binding for
 /// `a`.
 ///
-/// M24 scope — accepted leaves:
-/// - `BindingIdentifier` (array element, array rest argument,
-///   object property value, or bare declarator id).
-///
 /// Rejected with stable tags:
-/// - Nested `ArrayPattern` / `ObjectPattern` leaves →
-///   `nested_destructuring`.
 /// - Array holes (`[a, , b]`) → `array_pattern_hole`.
 /// - Computed object keys (`{ [k]: v }`) →
 ///   `computed_pattern_key`.
-/// - Object rest (`{ ...rest }`) → `object_pattern_rest`.
 fn lower_pattern_bind<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
@@ -4667,7 +4660,7 @@ fn lower_array_pattern<'a>(
             }
             _ => {
                 return Err(SourceLoweringError::unsupported(
-                    "nested_destructuring",
+                    "parser_recovery_array_rest_assignment",
                     rest.span,
                 ));
             }
@@ -4798,15 +4791,8 @@ fn emit_array_rest_slice(
 /// when the read returns `undefined` via
 /// `JumpIfNotUndefined skip; <lower default>; skip:`.
 ///
-/// M24 scope — accepted property shapes:
-/// - Shorthand (`{ a }`) → read `a`, bind `a`.
-/// - Renaming (`{ a: x }`) → read `a`, bind `x`.
-/// - Defaults on either shape (`{ a = 0 }`, `{ a: x = 0 }`).
-///
 /// Rejected:
 /// - Computed keys (`{ [k]: v }`) → `computed_pattern_key`.
-/// - Object rest (`{ ...rest }`) → `object_pattern_rest`.
-/// - Nested patterns (`{ a: { b } }`) → `nested_destructuring`.
 fn lower_object_pattern<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
@@ -4929,7 +4915,7 @@ fn lower_object_pattern<'a>(
     if let Some(rest) = pat.rest.as_deref() {
         let BindingPattern::BindingIdentifier(rest_ident) = &rest.argument else {
             return Err(SourceLoweringError::unsupported(
-                "nested_destructuring",
+                "parser_recovery_object_rest_pattern",
                 rest.span,
             ));
         };
@@ -4991,42 +4977,6 @@ fn emit_object_rest_copy(
             })?;
     }
     Ok(())
-}
-
-/// Extracts the leaf `BindingIdentifier` (and optional default
-/// initializer) from a destructuring pattern value. Accepts either
-/// a plain `BindingIdentifier` or an `AssignmentPattern` wrapping
-/// one (which is how oxc represents `{ a = 0 }` / `{ a: x = 0 }`).
-/// Nested patterns are rejected with `nested_destructuring`.
-fn extract_pattern_leaf<'a>(
-    value: &'a BindingPattern<'a>,
-) -> Result<
-    (
-        &'a oxc_ast::ast::BindingIdentifier<'a>,
-        Option<&'a Expression<'a>>,
-    ),
-    SourceLoweringError,
-> {
-    match value {
-        BindingPattern::BindingIdentifier(ident) => Ok((ident, None)),
-        BindingPattern::AssignmentPattern(assign) => {
-            let BindingPattern::BindingIdentifier(ident) = &assign.left else {
-                return Err(SourceLoweringError::unsupported(
-                    "nested_destructuring",
-                    assign.span,
-                ));
-            };
-            Ok((ident, Some(&assign.right)))
-        }
-        BindingPattern::ArrayPattern(p) => Err(SourceLoweringError::unsupported(
-            "nested_destructuring",
-            p.span,
-        )),
-        BindingPattern::ObjectPattern(p) => Err(SourceLoweringError::unsupported(
-            "nested_destructuring",
-            p.span,
-        )),
-    }
 }
 
 /// Inserts the `undefined`-check default-initializer sequence when

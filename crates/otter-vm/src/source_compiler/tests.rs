@@ -972,6 +972,64 @@ fn destructuring_assignment_with_rest_works() {
 }
 
 #[test]
+fn nested_destructuring_declaration_patterns_work() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                let { a: { b }, c: [d] } = { a: { b: 6 }, c: [4] }; \
+                return b * 10 + d; \
+            }",
+            &[],
+        ),
+        64,
+    );
+}
+
+#[test]
+fn nested_destructuring_declaration_defaults_work() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                let { a: { b = 7 } = {} } = {}; \
+                return b; \
+            }",
+            &[],
+        ),
+        7,
+    );
+}
+
+#[test]
+fn nested_array_rest_destructuring_declaration_works() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                let [...[a, b]] = [1, 2, 3]; \
+                return a * 10 + b; \
+            }",
+            &[],
+        ),
+        12,
+    );
+}
+
+#[test]
+fn nested_destructuring_assignment_patterns_work() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                let b = 0; \
+                let d = 0; \
+                ({ a: { b }, c: [d] } = { a: { b: 5 }, c: [8] }); \
+                return b * 10 + d; \
+            }",
+            &[],
+        ),
+        58,
+    );
+}
+
+#[test]
 fn compound_assign_div_works() {
     // `x /= 2` now lowers through the shared compound-assign
     // path — the `Division` binary operator routes through
@@ -4789,6 +4847,28 @@ fn switch_case_var_destructuring_assigns_hoisted_bindings() {
         return x * 10 + y; \
     }";
     assert_eq!(run_int32_function(program, &[]), 49);
+}
+
+#[test]
+fn switch_case_nested_destructuring_lexical_declaration_works() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let { a: { b }, c: [d] } = { a: { b: 3 }, c: [4] }; return b * 10 + d; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 34);
+}
+
+#[test]
+fn switch_case_nested_array_rest_destructuring_works() {
+    let program = "function f() { \
+        switch (1) { \
+            case 1: let [...[a, b]] = [7, 8, 9]; return a * 10 + b; \
+            default: return 0; \
+        } \
+    }";
+    assert_eq!(run_int32_function(program, &[]), 78);
 }
 
 #[test]

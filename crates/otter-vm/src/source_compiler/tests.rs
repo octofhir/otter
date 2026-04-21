@@ -176,6 +176,20 @@ fn invalid_for_of_ts_asserted_expression_left_reports_parse() {
     assert!(matches!(err, SourceLoweringError::Parse { .. }));
 }
 
+#[test]
+fn invalid_for_in_expression_left_reports_parse() {
+    let err = compile("function f() { let a = 0, b = 0; for (a + b in { x: 1 }) {} }")
+        .expect_err("invalid for-in assignment target must surface as Parse");
+    assert!(matches!(err, SourceLoweringError::Parse { .. }));
+}
+
+#[test]
+fn invalid_for_in_ts_asserted_expression_left_reports_parse() {
+    let err = compile_ts("function f() { let a = 0; for ((a + 1) as any in { x: 1 }) {} }")
+        .expect_err("invalid TS for-in assignment target must surface as Parse");
+    assert!(matches!(err, SourceLoweringError::Parse { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // Unsupported shapes (expected negatives)
 // ---------------------------------------------------------------------------

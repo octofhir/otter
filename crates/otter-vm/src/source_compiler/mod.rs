@@ -2795,7 +2795,7 @@ fn lower_for_in_statement<'a>(
                     }
                 }
             }
-            _ => match classify_for_in_of_left(&for_in.left, "for_in_unsupported_left")? {
+            _ => match classify_for_in_of_left(&for_in.left, "parser_recovery_for_in_lhs")? {
                 ForInOfLeft::Identifier(ident) => {
                     let name = ident.name.as_str();
                     let binding = ctx.resolve_identifier(name).ok_or_else(|| {

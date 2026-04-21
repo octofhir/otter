@@ -106,6 +106,7 @@
 //!   Return
 //! ```
 
+mod direct_calls;
 mod error;
 mod for_in_of;
 mod optional_calls;
@@ -120,6 +121,7 @@ pub use error::SourceLoweringError;
 
 use std::cell::{Cell, RefCell};
 
+use direct_calls::lower_expression_direct_call;
 use for_in_of::{
     ForInOfAssignmentTarget, ForInOfLeft, classify_for_in_of_left,
     lower_for_in_of_assignment_target,
@@ -10575,7 +10577,7 @@ fn lower_accumulator_operand(
     lower_return_expression(builder, ctx, expr)
 }
 
-/// Lowers a `CallExpression`. Three callee shapes are accepted:
+/// Lowers a `CallExpression`. Four callee shapes are accepted:
 ///
 /// - Identifier naming a top-level `FunctionDeclaration` — emits
 ///   `CallDirect func_idx, argv` for the tightest invocation path
@@ -10585,11 +10587,9 @@ fn lower_accumulator_operand(
 ///   the member's base per §13.3.6.
 /// - `o[k](args)` (ComputedMemberExpression callee) — same opcode,
 ///   key resolved via `LdaKeyedProperty`.
-///
-/// Everything else (parenthesised non-identifier, CallExpression
-/// callee, …) still rejects with `non_identifier_callee` — those
-/// require first-class function values that land in later
-/// milestones.
+/// - Any other expression that evaluates to a callable —
+///   `(function(){})()`, `factory()()`, `(cond ? f : g)()` — emits
+///   `CallUndefinedReceiver` / `CallSpread` with `this = undefined`.
 ///
 /// Direct-call shape:
 ///
@@ -10681,10 +10681,7 @@ fn lower_call_expression(
         Expression::Super(super_tok) => {
             lower_super_call(builder, ctx, call, super_tok.span, has_spread)
         }
-        other => Err(SourceLoweringError::unsupported(
-            "non_identifier_callee",
-            other.span(),
-        )),
+        other => lower_expression_direct_call(builder, ctx, call, other, has_spread),
     }
 }
 

@@ -5940,6 +5940,44 @@ fn function_expression_without_captures_returns_value() {
 }
 
 #[test]
+fn function_expression_iife_invokes_closure_value() {
+    let src = "function main() { return (function(n) { return n + 1; })(41); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn call_expression_result_can_be_called_directly() {
+    let src = "function make() { return function(n) { return n + 2; }; } \
+               function main() { return make()(40); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn conditional_expression_callee_selects_callable() {
+    let src = "function main() { \
+        let f = function(n) { return n + 1; }; \
+        let g = function(n) { return n + 100; }; \
+        return (1 ? f : g)(41); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn expression_direct_call_with_spread_arguments() {
+    let src = "function main() { return (function(a, b) { return a + b; })(...[19, 23]); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn parenthesized_method_call_still_preserves_this() {
+    let src = "function main() { \
+        let o = { v: 42, m: function() { return this.v; } }; \
+        return (o.m)(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
 fn function_expression_with_param_returns_result() {
     let src = "function main() { let dbl = function(n) { return n + n; }; return dbl(21); }";
     assert_eq!(run_int32_function(src, &[]), 42);

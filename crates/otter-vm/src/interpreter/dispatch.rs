@@ -613,6 +613,18 @@ impl Interpreter {
                 let result = runtime.js_loose_eq(lhs, rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(result));
             }
+            Opcode::TestInstanceOf => {
+                let lhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let rhs = activation.accumulator();
+                let result = runtime.js_instance_of(lhs, rhs)?;
+                activation.set_accumulator(RegisterValue::from_bool(result));
+            }
+            Opcode::TestIn => {
+                let lhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let rhs = activation.accumulator();
+                let result = runtime.js_has_property(lhs, rhs)?;
+                activation.set_accumulator(RegisterValue::from_bool(result));
+            }
             Opcode::TestNull => {
                 let b = activation.accumulator() == RegisterValue::null();
                 activation.set_accumulator(RegisterValue::from_bool(b));

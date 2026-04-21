@@ -114,6 +114,27 @@ fn run_int32_function_from_module(module: crate::module::Module, args: &[i32]) -
         .expect("function returned a non-int32 value")
 }
 
+fn run_bool_function(source: &str, args: &[i32]) -> bool {
+    let module = compile(source).expect("compile");
+    let (entry_idx, function) =
+        pick_last_named_function(&module).expect("module must declare at least one named function");
+    let hidden = usize::from(function.frame_layout().hidden_count());
+    let mut registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    for (i, arg) in args.iter().enumerate() {
+        registers[hidden + i] = RegisterValue::from_i32(*arg);
+    }
+    let interpreter = Interpreter::new();
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = interpreter
+        .execute_with_runtime(&module, entry_idx, &registers, &mut runtime)
+        .expect("execute_with_runtime");
+    result
+        .return_value()
+        .as_bool()
+        .expect("function returned a non-bool value")
+}
+
 /// Helper for M32 tests where the entry function returns a
 /// shared state object and microtasks are expected to mutate it
 /// before the test reads a final int32 counter. `execute_with_runtime`
@@ -302,15 +323,10 @@ fn exponent_compiles() {
 }
 
 #[test]
-fn unbound_identifier_unsupported() {
-    let err = compile("function f(n) { return m; }").expect_err("globals later");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "unbound_identifier",
-            ..
-        }
-    ));
+fn unknown_global_identifier_throws_reference_error() {
+    let err = run_string_function_catching("function f() { return TotallyMadeUpBinding; }", &[])
+        .expect_err("unknown global should throw");
+    assert_eq!(err, "ReferenceError: TotallyMadeUpBinding is not defined");
 }
 
 #[test]
@@ -673,19 +689,28 @@ fn nested_while_var_declaration_compiles() {
 }
 
 #[test]
-fn uninitialized_let_unsupported() {
-    // M4 demands an initializer on every binding — bare `let x;` is
-    // rejected; the `let x = undefined;` workaround would also fail
-    // because `undefined` is `Identifier("undefined")` which isn't in
-    // scope.
-    let err = compile("function f() { let x; return 1; }").expect_err("let without init at M4");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "uninitialized_binding",
-            ..
-        }
+fn uninitialized_let_defaults_to_undefined() {
+    assert!(run_bool_function(
+        "function f() { let x; return x === undefined; }",
+        &[]
     ));
+}
+
+#[test]
+fn uninitialized_var_declarators_default_to_undefined() {
+    assert!(run_bool_function(
+        "function f() { var expectedName, actualName; \
+            return expectedName === undefined && actualName === undefined; }",
+        &[]
+    ));
+}
+
+#[test]
+fn uninitialized_binding_preserves_declarator_order() {
+    assert_eq!(
+        run_int32_function("function f() { let x, y = (x = 3); return x + y; }", &[]),
+        6
+    );
 }
 
 #[test]
@@ -1446,6 +1471,30 @@ fn loose_equality_nullish_special_case() {
 }
 
 #[test]
+fn instanceof_matches_error_constructor() {
+    assert!(run_bool_function(
+        "function f() { try { MissingGlobal; } catch (e) { return e instanceof ReferenceError; } return false; }",
+        &[],
+    ));
+}
+
+#[test]
+fn in_operator_finds_own_property() {
+    assert!(run_bool_function(
+        "function f() { let o = { x: 1 }; return \"x\" in o; }",
+        &[],
+    ));
+}
+
+#[test]
+fn in_operator_non_object_rhs_throws_type_error() {
+    assert!(run_bool_function(
+        "function f() { try { return \"x\" in 1; } catch (e) { return e instanceof TypeError; } }",
+        &[],
+    ));
+}
+
+#[test]
 fn if_with_return_only_branch_falls_through_to_undefined() {
     // `if (n > 0) return n;` returns `n` when taken, and
     // `undefined` when the `if` branch isn't taken. M19 follow-up
@@ -2109,18 +2158,10 @@ fn one_arg_call_with_local_variable_passes_value() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unbound_function_call_unsupported() {
-    // `nope` doesn't name a top-level function. Surfaces as
-    // `unbound_function`, distinct from the identifier-read
-    // `unbound_identifier` rejection.
-    let err = compile("function main() { return nope(); }").expect_err("unknown function at M9");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "unbound_function",
-            ..
-        }
-    ));
+fn unknown_global_function_call_throws_reference_error() {
+    let err = run_string_function_catching("function main() { return nope(); }", &[])
+        .expect_err("unknown global call should throw");
+    assert_eq!(err, "ReferenceError: nope is not defined");
 }
 
 // Removed: member_call_unsupported — method-call lowering is supported
@@ -2182,14 +2223,9 @@ fn duplicate_top_level_function_unsupported() {
 fn _calling_a_param_suppressed_placeholder() {
     // Deleted companion assertion — M25 positive coverage lives
     // in the M25 test block below.
-    let err = compile("function f() { return bogus(); }").expect_err("unbound still");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "unbound_function",
-            ..
-        }
-    ));
+    let err = run_string_function_catching("function f() { return bogus(); }", &[])
+        .expect_err("unknown global call should throw");
+    assert_eq!(err, "ReferenceError: bogus is not defined");
 }
 
 // Removed: new_expression_unsupported — `new` is supported as of
@@ -3002,21 +3038,12 @@ fn const_inside_block_rejects_reassignment() {
 
 #[test]
 fn let_in_block_not_visible_after_block() {
-    // Reading `y` after its containing block has closed must
-    // surface as an unbound identifier — bindings pop off the
-    // lexical environment on block exit.
-    let err =
-        compile("function f() { { let y = 1; } return y; }").expect_err("use after block at M12");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "unbound_identifier",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+    // Reading `y` after its containing block has closed falls
+    // through to script global lookup and throws ReferenceError
+    // when the global binding is absent.
+    let err = run_string_function_catching("function f() { { let y = 1; } return y; }", &[])
+        .expect_err("use after block");
+    assert_eq!(err, "ReferenceError: y is not defined");
 }
 
 #[test]
@@ -3407,22 +3434,12 @@ fn undefined_property_name_interner_dedups() {
 }
 
 #[test]
-fn unknown_global_identifier_still_rejected() {
-    // A name that isn't in the whitelist AND isn't a top-level
-    // function / local / module global still surfaces as
-    // `unbound_identifier` at compile time. `Reflect` is in the
-    // whitelist now, so we pick an invented name instead.
-    let err = compile("function f() { return TotallyMadeUpBinding; }").expect_err("unknown global");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "unbound_identifier",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+fn unknown_global_identifier_resolves_at_runtime() {
+    // Script-mode bare names use global environment lookup. Unknown
+    // globals therefore compile and raise ReferenceError at runtime.
+    let err = run_string_function_catching("function f() { return TotallyMadeUpBinding; }", &[])
+        .expect_err("unknown global should throw");
+    assert_eq!(err, "ReferenceError: TotallyMadeUpBinding is not defined");
 }
 
 // ---------------------------------------------------------------------------
@@ -5284,20 +5301,14 @@ fn try_without_throw_skips_catch() {
 #[test]
 fn catch_binding_is_block_scoped() {
     // The catch parameter is block-scoped. A later reference to
-    // the same name outside the catch should fail as
-    // unbound_identifier.
-    let err = compile("function f() { try { throw 1; } catch (e) {} return e; }")
-        .expect_err("e out of scope after catch");
-    assert!(
-        matches!(
-            err,
-            SourceLoweringError::Unsupported {
-                construct: "unbound_identifier",
-                ..
-            }
-        ),
-        "unexpected err: {err:?}",
-    );
+    // the same name outside the catch should not resolve to the
+    // catch binding; it falls through to global lookup.
+    let err = run_string_function_catching(
+        "function f() { try { throw 1; } catch (e) {} return e; }",
+        &[],
+    )
+    .expect_err("e out of scope after catch");
+    assert_eq!(err, "ReferenceError: e is not defined");
 }
 
 #[test]

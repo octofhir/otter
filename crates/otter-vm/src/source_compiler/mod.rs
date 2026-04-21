@@ -4486,20 +4486,31 @@ fn lower_single_declarator<'a>(
     declarator: &'a VariableDeclarator<'a>,
     is_const: bool,
 ) -> Result<(), SourceLoweringError> {
-    let init = declarator.init.as_ref().ok_or_else(|| {
-        SourceLoweringError::unsupported("uninitialized_binding", declarator.span)
-    })?;
-
     match &declarator.id {
         BindingPattern::BindingIdentifier(ident) => {
+            if is_const && declarator.init.is_none() {
+                return Err(SourceLoweringError::unsupported(
+                    "uninitialized_const_binding",
+                    declarator.span,
+                ));
+            }
             let name = ident.name.as_str();
             let slot = ctx.allocate_local(name, is_const, declarator.span)?;
 
-            // Lower init into acc. Reading the binding inside its
-            // own initializer hits the `Local { initialized: false }`
-            // arm of `lower_identifier_read` and surfaces as
-            // `tdz_self_reference`.
-            lower_return_expression(builder, ctx, init)?;
+            // Lower init into acc, or use `undefined` for `var x;`
+            // / `let x;` per §14.3.1. Reading the binding inside
+            // its own initializer still hits the `Local {
+            // initialized: false }` arm of `lower_identifier_read`
+            // and surfaces as `tdz_self_reference`.
+            if let Some(init) = declarator.init.as_ref() {
+                lower_return_expression(builder, ctx, init)?;
+            } else {
+                builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaUndefined (uninitialized binding): {err:?}"
+                    ))
+                })?;
+            }
             builder
                 .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Star: {err:?}")))?;
@@ -4509,6 +4520,12 @@ fn lower_single_declarator<'a>(
         // M24: `let [a, b, ...rest] = init;` / `let { a, b: x, c = 0 } = init;`
         // Lower the init into a temp, then bind each pattern leaf.
         BindingPattern::ArrayPattern(_) | BindingPattern::ObjectPattern(_) => {
+            let init = declarator.init.as_ref().ok_or_else(|| {
+                SourceLoweringError::unsupported(
+                    "uninitialized_destructuring_binding",
+                    declarator.span,
+                )
+            })?;
             lower_destructured_declarator(builder, ctx, &declarator.id, init, is_const)
         }
         // `let x = 1 = …;` is not grammatically possible, so an
@@ -5066,14 +5083,13 @@ fn emit_default_for_destructured_leaf<'a>(
 /// 2. Well-known global constant (M14) — emits a dedicated opcode:
 ///    `undefined` → `LdaUndefined`, `NaN` → `LdaNaN`, `Infinity` →
 ///    `LdaConstF64` against an interned `f64::INFINITY`.
-/// 3. Well-known global property (M14) — `globalThis`, `Math`, and
-///    any other recognised name emit `LdaGlobal` with the name
-///    interned into the function's `PropertyNameTable`.
-/// 4. Otherwise — surface the pre-existing `unbound_identifier`
-///    compile-time rejection. Generalising this to "always emit
-///    `LdaGlobal`" would match the ES spec's dynamic-lookup model,
-///    but keeping the reject lets later milestones extend the
-///    whitelist intentionally.
+/// 3. Any remaining bare identifier emits `LdaGlobal` with the
+///    name interned into the function's `PropertyNameTable`.
+///    This matches script-mode global environment lookup: if the
+///    global binding is absent at runtime, `LdaGlobal` raises a
+///    `ReferenceError` instead of rejecting valid source at
+///    compile time. Test262 relies on this because harness files
+///    are evaluated one after another in the same realm.
 fn lower_identifier_reference(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'_>,
@@ -5105,12 +5121,7 @@ fn lower_identifier_reference(
                 })?;
             Ok(())
         }
-        n if is_whitelisted_global_name(n) => {
-            // M14+: well-known runtime globals resolve via
-            // `LdaGlobal`. The runtime installs every constructor
-            // + namespace on the global object during boot, so any
-            // name in `is_whitelisted_global_name` is guaranteed
-            // to be live by the time user code runs.
+        _ => {
             let idx = ctx.intern_property_name(name)?;
             builder
                 .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
@@ -5118,30 +5129,6 @@ fn lower_identifier_reference(
                     SourceLoweringError::Internal(format!("encode LdaGlobal: {err:?}"))
                 })?;
             Ok(())
-        }
-        _ => {
-            // M35: ES-module imports and top-level exports live on
-            // the global object by the time any function body runs
-            // (`populate_import_globals` + the synthesised
-            // module-init function). An identifier whose name
-            // matches one of those module-level globals resolves
-            // via `LdaGlobal` here instead of hitting the
-            // script-mode `unbound_identifier` rejection.
-            if ctx.is_module_global(name) {
-                let idx = ctx.intern_property_name(name)?;
-                builder
-                    .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
-                    .map_err(|err| {
-                        SourceLoweringError::Internal(format!(
-                            "encode LdaGlobal (module binding): {err:?}"
-                        ))
-                    })?;
-                return Ok(());
-            }
-            Err(SourceLoweringError::unsupported(
-                "unbound_identifier",
-                ident.span,
-            ))
         }
     }
 }
@@ -8800,6 +8787,12 @@ fn lower_binary_expression(
         lower_accumulator_operand(builder, ctx, &expr.left)?;
         return apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right);
     }
+    if matches!(
+        expr.operator,
+        BinaryOperator::In | BinaryOperator::Instanceof
+    ) {
+        return lower_membership_expression(builder, ctx, expr);
+    }
     if let Some(rel_encoding) = relational_op_encoding(expr.operator) {
         return lower_relational_expression(builder, ctx, expr, rel_encoding);
     }
@@ -8807,6 +8800,36 @@ fn lower_binary_expression(
         binary_operator_tag(expr.operator),
         expr.span,
     ))
+}
+
+fn lower_membership_expression(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    expr: &BinaryExpression<'_>,
+) -> Result<(), SourceLoweringError> {
+    let lhs_temp = ctx.acquire_temps(1)?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        lower_return_expression(builder, ctx, &expr.left)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(lhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (membership LHS): {err:?}"))
+            })?;
+        lower_return_expression(builder, ctx, &expr.right)?;
+        let opcode = match expr.operator {
+            BinaryOperator::In => Opcode::TestIn,
+            BinaryOperator::Instanceof => Opcode::TestInstanceOf,
+            _ => unreachable!("caller filters membership operators"),
+        };
+        builder
+            .emit(opcode, &[Operand::Reg(u32::from(lhs_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode membership test: {err:?}"))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(1);
+    lower
 }
 
 /// Per-operator opcode pair for the M6 relational operators. The
@@ -9037,15 +9060,60 @@ fn lower_relational_expression(
             rhs_literal,
             lhs_ident,
         } => {
+            let lhs_binding = ctx.resolve_identifier(lhs_ident.name.as_str());
+            let lhs_direct = matches!(
+                lhs_binding,
+                Some(BindingRef::Param { .. })
+                    | Some(BindingRef::Local {
+                        initialized: true,
+                        ..
+                    })
+            );
+            if !lhs_direct {
+                let lhs_temp = ctx.acquire_temps(1)?;
+                let lower = (|| -> Result<(), SourceLoweringError> {
+                    lower_return_expression(builder, ctx, &expr.left)?;
+                    builder
+                        .emit(Opcode::Star, &[Operand::Reg(u32::from(lhs_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode Star (relational global literal LHS): {err:?}"
+                            ))
+                        })?;
+                    let value = int32_from_literal(rhs_literal)?;
+                    builder
+                        .emit(Opcode::LdaSmi, &[Operand::Imm(value)])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode LdaSmi (relational global literal RHS): {err:?}"
+                            ))
+                        })?;
+                    builder
+                        .emit(encoding.swapped_op, &[Operand::Reg(u32::from(lhs_temp))])
+                        .map_err(|err| {
+                            SourceLoweringError::Internal(format!(
+                                "encode {} (relational global literal): {err:?}",
+                                encoding.label
+                            ))
+                        })?;
+                    Ok(())
+                })();
+                ctx.release_temps(1);
+                lower?;
+                if encoding.requires_inversion {
+                    builder.emit(Opcode::LogicalNot, &[]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LogicalNot (relational global literal): {err:?}"
+                        ))
+                    })?;
+                }
+                return Ok(());
+            }
             let value = int32_from_literal(rhs_literal)?;
             builder
                 .emit(Opcode::LdaSmi, &[Operand::Imm(value)])
                 .map_err(|err| SourceLoweringError::Internal(format!("encode LdaSmi: {err:?}")))?;
-            let binding = ctx
-                .resolve_identifier(lhs_ident.name.as_str())
-                .ok_or_else(|| {
-                    SourceLoweringError::unsupported("unbound_identifier", lhs_ident.span)
-                })?;
+            let binding = lhs_binding.expect("checked Some above");
             emit_identifier_as_reg_operand(
                 builder,
                 ctx,
@@ -10821,69 +10889,53 @@ fn lower_direct_call<'a>(
         ctx.release_temps(1);
         return lower;
     }
-    // Last resort: the name isn't a top-level function or a
-    // local / param / upvalue, but may still be a whitelisted
-    // global (e.g. `queueMicrotask(cb)` / `setTimeout(cb, 0)`)
-    // or — M35 — an `import`-ed binding / top-level `export`ed
-    // declaration installed on the global object by
-    // `populate_import_globals` / the synthesised module-init.
-    // Route through the same `LdaGlobal` path the identifier
-    // reference uses, then dispatch as a plain closure call.
-    // The call-site whitelist mirrors the identifier-reference
-    // whitelist in `lower_identifier_reference`; when either
-    // expands, both do. This keeps `globalFn(args)` and `let g =
-    // globalFn` resolving consistently through `LdaGlobal`.
-    if is_whitelisted_global_name(name) || ctx.is_module_global(name) {
-        let argc = RegisterIndex::try_from(call.arguments.len())
-            .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
-        let callee_temp = ctx.acquire_temps(1)?;
-        let args_base = ctx
-            .acquire_temps(argc)
-            .inspect_err(|_| ctx.release_temps(1))?;
-        let lower = (|| -> Result<(), SourceLoweringError> {
-            let idx = ctx.intern_property_name(name)?;
-            builder
-                .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode LdaGlobal (global callable): {err:?}"
-                    ))
-                })?;
-            builder
-                .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode Star (global callable temp): {err:?}"
-                    ))
-                })?;
-            lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
-            builder
-                .emit(
-                    Opcode::CallUndefinedReceiver,
-                    &[
-                        Operand::Reg(u32::from(callee_temp)),
-                        Operand::RegList {
-                            base: u32::from(args_base),
-                            count: u32::from(argc),
-                        },
-                    ],
-                )
-                .map_err(|err| {
-                    SourceLoweringError::Internal(format!(
-                        "encode CallUndefinedReceiver (global callable): {err:?}"
-                    ))
-                })?;
-            Ok(())
-        })();
-        ctx.release_temps(argc);
-        ctx.release_temps(1);
-        return lower;
-    }
-
-    Err(SourceLoweringError::unsupported(
-        "unbound_function",
-        callee_ident.span,
-    ))
+    // Last resort: script-mode global lookup. If the binding is
+    // absent at runtime, `LdaGlobal` throws ReferenceError before
+    // the call dispatch, matching ordinary ECMAScript semantics.
+    let argc = RegisterIndex::try_from(call.arguments.len())
+        .map_err(|_| SourceLoweringError::Internal("call argument count exceeds u16".into()))?;
+    let callee_temp = ctx.acquire_temps(1)?;
+    let args_base = ctx
+        .acquire_temps(argc)
+        .inspect_err(|_| ctx.release_temps(1))?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        let idx = ctx.intern_property_name(name)?;
+        builder
+            .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaGlobal (global callable): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Star (global callable temp): {err:?}"
+                ))
+            })?;
+        lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
+        builder
+            .emit(
+                Opcode::CallUndefinedReceiver,
+                &[
+                    Operand::Reg(u32::from(callee_temp)),
+                    Operand::RegList {
+                        base: u32::from(args_base),
+                        count: u32::from(argc),
+                    },
+                ],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode CallUndefinedReceiver (global callable): {err:?}"
+                ))
+            })?;
+        Ok(())
+    })();
+    ctx.release_temps(argc);
+    ctx.release_temps(1);
+    lower
 }
 
 /// Spread-argument direct call: `f(...args)` / `f(a, ...rest)`.
@@ -10930,7 +10982,7 @@ fn lower_direct_call_with_spread<'a>(
                 pc,
                 crate::closure::ClosureTemplate::new(func_idx, Vec::new()),
             );
-        } else if is_whitelisted_global_name(name) || ctx.is_module_global(name) {
+        } else {
             let idx = ctx.intern_property_name(name)?;
             builder
                 .emit(Opcode::LdaGlobal, &[Operand::Idx(idx)])
@@ -10939,11 +10991,6 @@ fn lower_direct_call_with_spread<'a>(
                         "encode LdaGlobal (spread callee): {err:?}"
                     ))
                 })?;
-        } else {
-            return Err(SourceLoweringError::unsupported(
-                "unbound_function",
-                callee_ident.span,
-            ));
         }
         builder
             .emit(Opcode::Star, &[Operand::Reg(u32::from(callee_temp))])
@@ -11609,107 +11656,6 @@ fn lower_call_arguments_into_temps<'a>(
 /// parts and values outside `i32` range — those surface as
 /// `Unsupported { construct: "non_int32_literal" }` because the
 /// widening path (`LoadF64` / `LoadBigInt`) lands in a later milestone.
-/// Identifies names that always resolve to a runtime-installed
-/// global object. Used by both `lower_identifier_reference` and
-/// `lower_direct_call` to route the name through `LdaGlobal`
-/// instead of rejecting as `unbound_identifier`. Keep in sync
-/// with the set of constructors / namespaces the runtime's boot
-/// sequence installs — the runtime owns the actual binding, this
-/// is just the compiler-side allowlist so we emit
-/// runtime-resolvable code.
-fn is_whitelisted_global_name(name: &str) -> bool {
-    matches!(
-        name,
-        // Foundation
-        "globalThis"
-        | "Math"
-        | "JSON"
-        | "console"
-        | "Symbol"
-        | "Promise"
-        | "Reflect"
-        // Core types + constructors
-        | "Object"
-        | "Array"
-        | "String"
-        | "Number"
-        | "Boolean"
-        | "BigInt"
-        | "Function"
-        | "Date"
-        | "RegExp"
-        | "Iterator"
-        | "AsyncIterator"
-        // Error hierarchy
-        | "Error"
-        | "TypeError"
-        | "RangeError"
-        | "SyntaxError"
-        | "ReferenceError"
-        | "EvalError"
-        | "URIError"
-        | "AggregateError"
-        | "SuppressedError"
-        // Collections
-        | "Map"
-        | "Set"
-        | "WeakMap"
-        | "WeakSet"
-        | "WeakRef"
-        | "FinalizationRegistry"
-        // Binary data
-        | "ArrayBuffer"
-        | "SharedArrayBuffer"
-        | "DataView"
-        | "Atomics"
-        | "Int8Array"
-        | "Uint8Array"
-        | "Uint8ClampedArray"
-        | "Int16Array"
-        | "Uint16Array"
-        | "Int32Array"
-        | "Uint32Array"
-        | "Float32Array"
-        | "Float64Array"
-        | "BigInt64Array"
-        | "BigUint64Array"
-        // Proxy
-        | "Proxy"
-        // Event loop / async
-        | "setTimeout"
-        | "setInterval"
-        | "clearTimeout"
-        | "clearInterval"
-        | "queueMicrotask"
-        // Web APIs (otter-web)
-        | "URL"
-        | "URLSearchParams"
-        | "fetch"
-        | "Headers"
-        | "Request"
-        | "Response"
-        | "Blob"
-        | "TextEncoder"
-        | "TextDecoder"
-        | "performance"
-        | "structuredClone"
-        // Node-compat runtime
-        | "process"
-        // Host-injected helpers used by the module-graph loader's
-        // CJS / ESM source rewrites in `otter-runtime`
-        // (`host::module_runtime::transform_*`). User code never
-        // references these directly; the transform emits them.
-        | "__otter_module"
-        | "__otter_cjs_module"
-        | "__otter_cjs_url"
-        | "require"
-        | "module"
-        | "exports"
-        | "__filename"
-        | "__dirname"
-    )
-}
-
 fn int32_from_literal(literal: &NumericLiteral<'_>) -> Result<i32, SourceLoweringError> {
     let value = literal.value;
     if !value.is_finite() || value.fract() != 0.0 {

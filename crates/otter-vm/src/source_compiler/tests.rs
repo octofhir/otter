@@ -2384,6 +2384,60 @@ fn update_on_parameter_works() {
 }
 
 #[test]
+fn postfix_update_on_captured_binding_returns_old_and_writes_new() {
+    let src = "function make() { \
+        let n = 0; \
+        let inc = function() { return n++; }; \
+        let first = inc(); \
+        let second = inc(); \
+        return first * 100 + second * 10 + n; \
+    } \
+    function main() { return make(); }";
+    assert_eq!(run_int32_function(src, &[]), 12);
+}
+
+#[test]
+fn prefix_update_on_captured_binding_returns_new_value() {
+    let src = "function make() { \
+        let n = 40; \
+        let bump = function() { return ++n; }; \
+        return bump() + n; \
+    } \
+    function main() { return make(); }";
+    assert_eq!(run_int32_function(src, &[]), 82);
+}
+
+#[test]
+fn update_on_captured_parameter_writes_parameter_cell() {
+    let src = "function outer(n) { \
+        let bump = function() { return n++; }; \
+        let first = bump(); \
+        return first * 10 + bump() + n; \
+    } \
+    function main() { return outer(4); }";
+    assert_eq!(run_int32_function(src, &[]), 51);
+}
+
+#[test]
+fn update_on_captured_const_rejected() {
+    let err = compile(
+        "function outer() { \
+            const n = 1; \
+            return function() { return ++n; }; \
+        } \
+        function main() { return outer()(); }",
+    )
+    .expect_err("captured const update");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "const_update",
+            ..
+        }
+    ));
+}
+
+#[test]
 fn postfix_increment_on_static_member_returns_old_and_writes_new() {
     assert_eq!(
         run_int32_function(
@@ -6157,6 +6211,25 @@ fn compound_assign_on_captured_binding() {
     } \
     function main() { return make(); }";
     assert_eq!(run_int32_function(src, &[]), 12);
+}
+
+#[test]
+fn assignment_to_captured_const_rejected() {
+    let err = compile(
+        "function make() { \
+            const total = 0; \
+            return function(n) { total = n; }; \
+        } \
+        function main() { return make()(1); }",
+    )
+    .expect_err("captured const assignment");
+    assert!(matches!(
+        err,
+        SourceLoweringError::Unsupported {
+            construct: "const_assignment",
+            ..
+        }
+    ));
 }
 
 #[test]

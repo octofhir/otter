@@ -44,13 +44,17 @@ fn lower_identifier_update(
     let binding = ctx
         .resolve_identifier(ident.name.as_str())
         .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", ident.span))?;
-    let target_reg = match binding {
+    enum Target {
+        Reg(u16),
+        Upvalue(u16),
+    }
+    let target = match binding {
         BindingRef::Local {
             reg,
             initialized: true,
             is_const: false,
             ..
-        } => reg,
+        } => Target::Reg(reg),
         BindingRef::Local { is_const: true, .. } => {
             return Err(SourceLoweringError::unsupported("const_update", ident.span));
         }
@@ -62,23 +66,38 @@ fn lower_identifier_update(
                 ident.span,
             ));
         }
-        BindingRef::Param { reg } => reg,
-        BindingRef::Upvalue { .. } => {
-            return Err(SourceLoweringError::unsupported(
-                "update_on_upvalue",
-                ident.span,
-            ));
+        BindingRef::Param { reg } => Target::Reg(reg),
+        BindingRef::Upvalue {
+            idx,
+            is_const: false,
+        } => Target::Upvalue(idx),
+        BindingRef::Upvalue { is_const: true, .. } => {
+            return Err(SourceLoweringError::unsupported("const_update", ident.span));
         }
     };
 
     lower_identifier_read(builder, ctx, binding, ident.span)?;
-    apply_update_to_loaded_value(builder, ctx, expr, |builder| {
-        builder
-            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Star (identifier update): {err:?}"))
-            })?;
-        Ok(())
+    apply_update_to_loaded_value(builder, ctx, expr, |builder| match target {
+        Target::Reg(target_reg) => {
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (identifier update): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        }
+        Target::Upvalue(idx) => {
+            builder
+                .emit(Opcode::StaUpvalue, &[Operand::Idx(u32::from(idx))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode StaUpvalue (identifier update): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        }
     })
 }
 

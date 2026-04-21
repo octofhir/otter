@@ -2570,10 +2570,19 @@ fn lower_for_of_statement<'a>(
                                 ident.span,
                             ));
                         }
-                        BindingRef::Upvalue { idx } => {
+                        BindingRef::Upvalue {
+                            idx,
+                            is_const: false,
+                        } => {
                             let iter_val_slot = ctx.allocate_anonymous_local()?;
                             upvalue_target = Some((iter_val_slot, idx));
                             (iter_val_slot, false)
+                        }
+                        BindingRef::Upvalue { is_const: true, .. } => {
+                            return Err(SourceLoweringError::unsupported(
+                                "const_assignment",
+                                ident.span,
+                            ));
                         }
                     }
                 }
@@ -2829,10 +2838,19 @@ fn lower_for_in_statement<'a>(
                                 ident.span,
                             ));
                         }
-                        BindingRef::Upvalue { idx } => {
+                        BindingRef::Upvalue {
+                            idx,
+                            is_const: false,
+                        } => {
                             let iter_val_slot = ctx.allocate_anonymous_local()?;
                             upvalue_target = Some((iter_val_slot, idx));
                             iter_val_slot
+                        }
+                        BindingRef::Upvalue { is_const: true, .. } => {
+                            return Err(SourceLoweringError::unsupported(
+                                "const_assignment",
+                                ident.span,
+                            ));
                         }
                     }
                 }
@@ -3149,9 +3167,11 @@ enum BindingRef {
     /// M25: binding resolved in an enclosing scope — accessed
     /// through the inner closure's upvalue list. `idx` is the
     /// `LdaUpvalue`/`StaUpvalue` operand (0-based in capture
-    /// order).
+    /// order). `is_const` mirrors the original binding so write
+    /// guards still work across closure boundaries.
     Upvalue {
         idx: u16,
+        is_const: bool,
     },
 }
 
@@ -3483,6 +3503,7 @@ fn record_private_decl(
 struct CaptureEntry {
     name: String,
     descriptor: crate::closure::CaptureDescriptor,
+    is_const: bool,
 }
 
 /// Pre-resolution form of an `ExceptionHandler`. All three fields
@@ -4324,7 +4345,10 @@ impl<'a> LoweringContext<'a> {
         for (idx, entry) in self.captures.borrow().iter().enumerate() {
             if entry.name == name {
                 let idx = u16::try_from(idx).expect("capture idx fits in u16");
-                return Some(BindingRef::Upvalue { idx });
+                return Some(BindingRef::Upvalue {
+                    idx,
+                    is_const: entry.is_const,
+                });
             }
         }
         None
@@ -4333,44 +4357,58 @@ impl<'a> LoweringContext<'a> {
     fn resolve_capture(&self, name: &str) -> Option<BindingRef> {
         let parent = self.parent?;
         // Probe parent's own scope first.
-        let desc = match parent.resolve_own(name) {
-            Some(BindingRef::Local { reg, .. }) | Some(BindingRef::Param { reg }) => {
-                Some(crate::closure::CaptureDescriptor::Register(
+        let resolved = match parent.resolve_own(name) {
+            Some(BindingRef::Local { reg, is_const, .. }) => Some((
+                crate::closure::CaptureDescriptor::Register(
                     crate::bytecode::BytecodeRegister::new(reg),
-                ))
-            }
-            Some(BindingRef::Upvalue { idx }) => Some(crate::closure::CaptureDescriptor::Upvalue(
-                crate::closure::UpvalueId(idx),
+                ),
+                is_const,
+            )),
+            Some(BindingRef::Param { reg }) => Some((
+                crate::closure::CaptureDescriptor::Register(
+                    crate::bytecode::BytecodeRegister::new(reg),
+                ),
+                false,
+            )),
+            Some(BindingRef::Upvalue { idx, is_const }) => Some((
+                crate::closure::CaptureDescriptor::Upvalue(crate::closure::UpvalueId(idx)),
+                is_const,
             )),
             None => None,
         };
-        if let Some(descriptor) = desc {
-            return Some(self.record_capture(name, descriptor));
+        if let Some((descriptor, is_const)) = resolved {
+            return Some(self.record_capture(name, descriptor, is_const));
         }
         // Parent didn't have it directly — recurse into parent's
         // parent. Parent grows its own captures list as part of
         // the recursive resolution, giving us a `parent_idx` to
         // chain through.
-        let Some(BindingRef::Upvalue { idx: parent_idx }) = parent.resolve_capture(name) else {
+        let Some(BindingRef::Upvalue {
+            idx: parent_idx,
+            is_const,
+        }) = parent.resolve_capture(name)
+        else {
             return None;
         };
         let desc =
             crate::closure::CaptureDescriptor::Upvalue(crate::closure::UpvalueId(parent_idx));
-        Some(self.record_capture(name, desc))
+        Some(self.record_capture(name, desc, is_const))
     }
 
     fn record_capture(
         &self,
         name: &str,
         descriptor: crate::closure::CaptureDescriptor,
+        is_const: bool,
     ) -> BindingRef {
         let mut captures = self.captures.borrow_mut();
         let idx = u16::try_from(captures.len()).expect("capture count fits in u16");
         captures.push(CaptureEntry {
             name: name.to_owned(),
             descriptor,
+            is_const,
         });
-        BindingRef::Upvalue { idx }
+        BindingRef::Upvalue { idx, is_const }
     }
 
     fn take_captures(&self) -> Vec<crate::closure::CaptureDescriptor> {
@@ -5162,7 +5200,7 @@ fn emit_load_binding_value(
                 ident_span,
             ));
         }
-        BindingRef::Upvalue { idx } => {
+        BindingRef::Upvalue { idx, .. } => {
             builder
                 .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
                 .map_err(|err| {
@@ -5203,7 +5241,14 @@ fn emit_assert_binding_ready_for_write(
             "tdz_self_reference",
             ident_span,
         )),
-        BindingRef::Upvalue { idx } => {
+        BindingRef::Upvalue { is_const: true, .. } => Err(SourceLoweringError::unsupported(
+            "const_assignment",
+            ident_span,
+        )),
+        BindingRef::Upvalue {
+            idx,
+            is_const: false,
+        } => {
             builder
                 .emit(Opcode::LdaUpvalue, &[Operand::Idx(u32::from(idx))])
                 .map_err(|err| {
@@ -9864,7 +9909,10 @@ fn assign_identifier_reference<'a>(
             "tdz_self_reference",
             ident.span,
         )),
-        BindingRef::Upvalue { idx } => {
+        BindingRef::Upvalue {
+            idx,
+            is_const: false,
+        } => {
             emit_assert_binding_ready_for_write(
                 builder,
                 binding,
@@ -9880,6 +9928,10 @@ fn assign_identifier_reference<'a>(
                     ))
                 })
         }
+        BindingRef::Upvalue { is_const: true, .. } => Err(SourceLoweringError::unsupported(
+            "const_assignment",
+            ident.span,
+        )),
     }
 }
 
@@ -9898,7 +9950,11 @@ fn lower_identifier_assignment<'a>(
     // M25: assignment to an upvalue target goes through
     // `StaUpvalue` — a different shape from the register-based
     // path, so handle it separately.
-    if let BindingRef::Upvalue { idx } = binding {
+    if let BindingRef::Upvalue {
+        idx,
+        is_const: false,
+    } = binding
+    {
         if expr.operator == AssignmentOperator::Assign {
             emit_assert_binding_ready_for_write(builder, binding, target_span, "assign upvalue")?;
             lower_return_expression(builder, ctx, &expr.right)?;
@@ -9918,6 +9974,12 @@ fn lower_identifier_assignment<'a>(
             .emit(Opcode::StaUpvalue, &[Operand::Idx(u32::from(idx))])
             .map_err(|err| SourceLoweringError::Internal(format!("encode StaUpvalue: {err:?}")))?;
         return Ok(());
+    }
+    if let BindingRef::Upvalue { is_const: true, .. } = binding {
+        return Err(SourceLoweringError::unsupported(
+            "const_assignment",
+            target_span,
+        ));
     }
 
     let target_reg = match binding {

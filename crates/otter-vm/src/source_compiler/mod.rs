@@ -8186,17 +8186,7 @@ fn lower_static_member_read(
     ctx: &LoweringContext<'_>,
     expr: &StaticMemberExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    let optional_short_circuit = if expr.optional {
-        let Some(short_circuit) = ctx.optional_chain_short_circuit() else {
-            return Err(SourceLoweringError::unsupported(
-                "optional_member_expression",
-                expr.span,
-            ));
-        };
-        Some(short_circuit)
-    } else {
-        None
-    };
+    let optional_short_circuit = optional_member_short_circuit(ctx, expr.optional)?;
     // M28: `super.x` — §13.3.7 SuperReference. Uses the enclosing
     // method's `[[HomeObject]]` (resolved at runtime inside the
     // `GetSuperProperty` opcode) as the lookup base, and the
@@ -8288,6 +8278,18 @@ fn emit_optional_nullish_short_circuit(
     Ok(())
 }
 
+fn optional_member_short_circuit(
+    ctx: &LoweringContext<'_>,
+    optional: bool,
+) -> Result<Option<Label>, SourceLoweringError> {
+    if !optional {
+        return Ok(None);
+    }
+    ctx.optional_chain_short_circuit().map(Some).ok_or_else(|| {
+        SourceLoweringError::Internal("optional member outside ChainExpression".into())
+    })
+}
+
 /// Lowers `o[k]` into the accumulator. Shape:
 ///
 /// ```text
@@ -8296,7 +8298,9 @@ fn emit_optional_nullish_short_circuit(
 ///   LdaKeyedProperty r_base     ; acc = r_base[acc]
 /// ```
 ///
-/// Optional chaining rejected.
+/// Optional chaining mirrors the static-member path: `o?.[k]`
+/// short-circuits after the base evaluation and before evaluating
+/// the computed key.
 ///
 /// §13.3.2 Property Accessors
 /// <https://tc39.es/ecma262/#sec-property-accessors>
@@ -8305,17 +8309,7 @@ fn lower_computed_member_read(
     ctx: &LoweringContext<'_>,
     expr: &ComputedMemberExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    let optional_short_circuit = if expr.optional {
-        let Some(short_circuit) = ctx.optional_chain_short_circuit() else {
-            return Err(SourceLoweringError::unsupported(
-                "optional_member_expression",
-                expr.span,
-            ));
-        };
-        Some(short_circuit)
-    } else {
-        None
-    };
+    let optional_short_circuit = optional_member_short_circuit(ctx, expr.optional)?;
     // M28: `super[k]` — dynamic-key super property read. Receiver
     // is `this`; key is evaluated into a dedicated temp so the
     // `GetSuperPropertyComputed` operand shape `(Reg, Reg)` matches.
@@ -10172,7 +10166,7 @@ fn lower_static_member_assignment<'a>(
 ) -> Result<(), SourceLoweringError> {
     if member.optional {
         return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
+            "parser_recovery_optional_member_assignment",
             member.span,
         ));
     }
@@ -10311,7 +10305,7 @@ fn lower_computed_member_assignment<'a>(
 ) -> Result<(), SourceLoweringError> {
     if member.optional {
         return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
+            "parser_recovery_optional_member_assignment",
             member.span,
         ));
     }
@@ -10463,7 +10457,7 @@ fn lower_private_field_assignment<'a>(
 ) -> Result<(), SourceLoweringError> {
     if member.optional {
         return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
+            "parser_recovery_optional_member_assignment",
             member.span,
         ));
     }
@@ -11141,12 +11135,7 @@ fn lower_private_method_call<'a>(
     member: &'a oxc_ast::ast::PrivateFieldExpression<'a>,
     has_spread: bool,
 ) -> Result<(), SourceLoweringError> {
-    if member.optional {
-        return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
-            member.span,
-        ));
-    }
+    let optional_short_circuit = optional_member_short_circuit(ctx, member.optional)?;
     let name = member.field.name.as_str();
     enforce_private_name_declared(ctx, name, member.span)?;
     let receiver_temp = ctx.acquire_temps(1)?;
@@ -11176,6 +11165,9 @@ fn lower_private_method_call<'a>(
                     "encode Star (private method receiver): {err:?}"
                 ))
             })?;
+        if let Some(short_circuit) = optional_short_circuit {
+            emit_optional_nullish_short_circuit(builder, receiver_temp, short_circuit)?;
+        }
         // Callee: GetPrivateField r_recv, name_idx — runtime
         // returns the method closure (for Method element) or
         // invokes the getter (for Accessor element) per §7.3.32.
@@ -11220,12 +11212,7 @@ fn lower_static_method_call<'a>(
     member: &StaticMemberExpression<'a>,
     has_spread: bool,
 ) -> Result<(), SourceLoweringError> {
-    if member.optional {
-        return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
-            member.span,
-        ));
-    }
+    let optional_short_circuit = optional_member_short_circuit(ctx, member.optional)?;
     let receiver_temp = ctx.acquire_temps(1)?;
     let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
     let (args_base, argc) = if has_spread {
@@ -11285,6 +11272,9 @@ fn lower_static_method_call<'a>(
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!("encode Star (method receiver): {err:?}"))
                 })?;
+            if let Some(short_circuit) = optional_short_circuit {
+                emit_optional_nullish_short_circuit(builder, receiver_temp, short_circuit)?;
+            }
             // Callee = receiver[name] → r_callee.
             let idx = ctx.intern_property_name(member.property.name.as_str())?;
             builder
@@ -11336,12 +11326,7 @@ fn lower_computed_method_call<'a>(
     member: &ComputedMemberExpression<'a>,
     has_spread: bool,
 ) -> Result<(), SourceLoweringError> {
-    if member.optional {
-        return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
-            member.span,
-        ));
-    }
+    let optional_short_circuit = optional_member_short_circuit(ctx, member.optional)?;
     let receiver_temp = ctx.acquire_temps(1)?;
     let callee_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
     let (args_base, argc) = if has_spread {
@@ -11421,6 +11406,9 @@ fn lower_computed_method_call<'a>(
                         "encode Star (computed method receiver): {err:?}"
                     ))
                 })?;
+            if let Some(short_circuit) = optional_short_circuit {
+                emit_optional_nullish_short_circuit(builder, receiver_temp, short_circuit)?;
+            }
             // Key → acc; LdaKeyedProperty r_receiver → acc = receiver[key].
             lower_return_expression(builder, ctx, &member.expression)?;
             builder
@@ -11515,15 +11503,13 @@ fn lower_private_field_read<'a>(
     ctx: &LoweringContext<'a>,
     expr: &'a oxc_ast::ast::PrivateFieldExpression<'a>,
 ) -> Result<(), SourceLoweringError> {
-    if expr.optional {
-        return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
-            expr.span,
-        ));
-    }
+    let optional_short_circuit = optional_member_short_circuit(ctx, expr.optional)?;
     let name = expr.field.name.as_str();
     enforce_private_name_declared(ctx, name, expr.span)?;
     let base = materialize_member_base(builder, ctx, &expr.object)?;
+    if let Some(short_circuit) = optional_short_circuit {
+        emit_optional_nullish_short_circuit(builder, base.reg, short_circuit)?;
+    }
     let idx = ctx.intern_property_name(name)?;
     builder
         .emit(

@@ -149,7 +149,7 @@ fn assign_private_field<'a>(
 ) -> Result<(), SourceLoweringError> {
     if member.optional {
         return Err(SourceLoweringError::unsupported(
-            "optional_member_expression",
+            "parser_recovery_optional_member_assignment",
             member.span,
         ));
     }

@@ -190,6 +190,20 @@ fn invalid_for_in_ts_asserted_expression_left_reports_parse() {
     assert!(matches!(err, SourceLoweringError::Parse { .. }));
 }
 
+#[test]
+fn invalid_optional_member_assignment_reports_parse() {
+    let err = compile("function f() { let o = { x: 0 }; o?.x = 1; return o.x; }")
+        .expect_err("optional chain assignment target must surface as Parse");
+    assert!(matches!(err, SourceLoweringError::Parse { .. }));
+}
+
+#[test]
+fn invalid_optional_member_update_reports_parse() {
+    let err = compile("function f() { let o = { x: 0 }; o?.x++; return o.x; }")
+        .expect_err("optional chain update target must surface as Parse");
+    assert!(matches!(err, SourceLoweringError::Parse { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // Unsupported shapes (expected negatives)
 // ---------------------------------------------------------------------------
@@ -4083,6 +4097,55 @@ fn optional_method_call_passes_correct_this() {
 }
 
 #[test]
+fn optional_member_method_call_passes_correct_this() {
+    // `o?.m()` short-circuits on the receiver, not on the
+    // method value; when present, the call still receives `o` as
+    // `this`.
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let o = { v: 39, m: function (n) { return this.v + n } }; \
+                 return o?.m(3); \
+             }",
+            &[],
+        ),
+        42,
+    );
+}
+
+#[test]
+fn optional_member_method_call_skips_arguments_on_null_base() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let hit = 0; \
+                 let o = null; \
+                 o?.m(hit = 1); \
+                 return hit; \
+             }",
+            &[],
+        ),
+        0,
+    );
+}
+
+#[test]
+fn optional_computed_method_call_skips_key_on_null_base() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let hit = 0; \
+                 let o = null; \
+                 o?.[hit = 1](); \
+                 return hit; \
+             }",
+            &[],
+        ),
+        0,
+    );
+}
+
+#[test]
 fn optional_method_call_with_spread_preserves_this() {
     assert_eq!(
         run_int32_function(
@@ -6537,6 +6600,31 @@ fn m29_private_field_with_this_access() {
 }
 
 #[test]
+fn m29_optional_private_field_returns_value_when_non_null() {
+    let src = "function main() { \
+        class C { \
+            #x = 42; \
+            get(o) { return o?.#x; } \
+        } \
+        let c = new C(); \
+        return c.get(c); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn m29_optional_private_field_short_circuits_on_null() {
+    let src = "function main() { \
+        class C { \
+            #x = 1; \
+            get(o) { return o?.#x === undefined ? 1 : 0; } \
+        } \
+        return new C().get(null); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
 fn m29_private_field_write_through_method() {
     // Setting `this.#x` via a mutator method and reading it back
     // in another method exercises the full `SetPrivateField` /
@@ -6698,6 +6786,33 @@ fn m29p5_private_method_invoked_via_this() {
         return new C().get(); \
     }";
     assert_eq!(run_int32_function(src, &[]), 20);
+}
+
+#[test]
+fn m29p5_optional_private_method_call_preserves_this() {
+    let src = "function main() { \
+        class C { \
+            constructor() { this.v = 40; } \
+            #add(n) { return this.v + n; } \
+            call(o) { return o?.#add(2); } \
+        } \
+        let c = new C(); \
+        return c.call(c); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn m29p5_optional_private_method_call_skips_arguments_on_null_base() {
+    let src = "function main() { \
+        let hit = 0; \
+        class C { \
+            #add(n) { return n; } \
+            call(o) { o?.#add(hit = 1); return hit; } \
+        } \
+        return new C().call(null); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
 }
 
 #[test]

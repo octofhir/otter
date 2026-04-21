@@ -2384,6 +2384,86 @@ fn update_on_parameter_works() {
 }
 
 #[test]
+fn postfix_increment_on_static_member_returns_old_and_writes_new() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = { x: 5 }; let old = o.x++; return old * 10 + o.x; }",
+            &[],
+        ),
+        56,
+    );
+}
+
+#[test]
+fn prefix_decrement_on_static_member_returns_new_value() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = { x: 5 }; return --o.x + o.x; }",
+            &[]
+        ),
+        8,
+    );
+}
+
+#[test]
+fn computed_member_update_evaluates_key_once() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { \
+                 let o = { x: 7 }; \
+                 let keys = [\"x\"]; \
+                 let hits = 0; \
+                 let old = o[keys[hits++]]++; \
+                 return old * 100 + o.x * 10 + hits; \
+             }",
+            &[],
+        ),
+        781,
+    );
+}
+
+#[test]
+fn private_field_update_round_trips_value() {
+    let src = "function main() { \
+        class C { \
+            #x = 10; \
+            bump() { return this.#x++; } \
+            read() { return this.#x; } \
+        } \
+        let c = new C(); \
+        let old = c.bump(); \
+        return old * 10 + c.read(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 111);
+}
+
+#[test]
+fn super_static_member_update_writes_receiver() {
+    let src = "function main() { \
+        class Parent {} \
+        Parent.prototype.answer = 40; \
+        class Child extends Parent { \
+            bump() { let old = super.answer++; return old * 100 + this.answer; } \
+        } \
+        return new Child().bump(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 4041);
+}
+
+#[test]
+fn super_computed_member_update_writes_receiver() {
+    let src = "function main() { \
+        class Parent {} \
+        Parent.prototype.answer = 40; \
+        class Child extends Parent { \
+            bump() { let key = \"answer\"; return ++super[key] + this.answer; } \
+        } \
+        return new Child().bump(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 82);
+}
+
+#[test]
 fn update_on_const_rejected() {
     let err = compile("function f() { const x = 5; return ++x; }").expect_err("++const at M10");
     assert!(matches!(

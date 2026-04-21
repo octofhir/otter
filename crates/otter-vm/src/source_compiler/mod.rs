@@ -112,6 +112,7 @@ mod for_in_of;
 mod optional_calls;
 mod switch_scope;
 mod try_finally;
+mod updates;
 mod using_decl;
 
 #[cfg(test)]
@@ -147,6 +148,7 @@ use switch_scope::{
 use try_finally::{
     lower_break_statement, lower_continue_statement, lower_return_statement, lower_try_statement,
 };
+use updates::lower_update_expression;
 use using_decl::{
     lower_classic_for_using_statement, lower_function_top_statement_list,
     lower_loop_using_iteration, lower_nested_statement_list, lower_top_level_statement_list,
@@ -7454,153 +7456,6 @@ fn lower_unary_expression(
                 }
             }
         }
-    }
-    Ok(())
-}
-
-/// Lowers `++x` / `x++` / `--x` / `x--` onto a writable local
-/// binding.
-///
-/// Prefix form (`++x`) bytecode shape:
-///
-/// ```text
-///   Ldar r_x         ; acc = old x
-///   Inc              ; acc = old + 1
-///   Star r_x         ; x = new value (also in acc for composition)
-/// ```
-///
-/// Postfix form (`x++`) bytecode shape:
-///
-/// ```text
-///   Ldar r_x         ; acc = old x
-///   Star r_temp      ; temp = old (preserved for the expression's value)
-///   Inc              ; acc = old + 1
-///   Star r_x         ; x = new value
-///   Ldar r_temp      ; acc = old (the expression result)
-/// ```
-///
-/// The int32 envelope means `ToNumber` coercion is implicit: the
-/// operand is int32 throughout, so `Inc`/`Dec` produces int32 with
-/// wraparound semantics that match `x + 1 | 0` / `x - 1 | 0`. A
-/// future milestone that grows past int32 will need an explicit
-/// `ToNumber` step to preserve JS postfix semantics ("return the
-/// coerced number, write the incremented value").
-///
-/// Rejects:
-/// - non-identifier target → `non_identifier_update_target`;
-/// - unbound identifier → `unbound_identifier`;
-/// - parameter as target → `update_on_param`;
-/// - `const` binding as target → `const_update`;
-/// - in-TDZ binding → `tdz_self_reference`.
-fn lower_update_expression(
-    builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'_>,
-    expr: &UpdateExpression<'_>,
-) -> Result<(), SourceLoweringError> {
-    // 1) Target must be a plain identifier; anything else (member,
-    //    computed, TS-only) is out of scope for M10.
-    let ident = match &expr.argument {
-        SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => ident.as_ref(),
-        _ => {
-            return Err(SourceLoweringError::unsupported(
-                "non_identifier_update_target",
-                expr.span,
-            ));
-        }
-    };
-    let binding = ctx
-        .resolve_identifier(ident.name.as_str())
-        .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", ident.span))?;
-    let target_reg = match binding {
-        BindingRef::Local {
-            reg,
-            initialized: true,
-            is_const: false,
-            ..
-        } => reg,
-        BindingRef::Local { is_const: true, .. } => {
-            return Err(SourceLoweringError::unsupported("const_update", ident.span));
-        }
-        BindingRef::Local {
-            initialized: false, ..
-        } => {
-            return Err(SourceLoweringError::unsupported(
-                "tdz_self_reference",
-                ident.span,
-            ));
-        }
-        // `x++` / `++x` on a parameter: parameters live in
-        // their own register window just like `let` bindings do,
-        // so incrementing writes back to the same slot with no
-        // observable aliasing (spec §14.1.21 treats parameters
-        // as mutable bindings by default).
-        BindingRef::Param { reg } => reg,
-        BindingRef::Upvalue { .. } => {
-            return Err(SourceLoweringError::unsupported(
-                "update_on_upvalue",
-                ident.span,
-            ));
-        }
-    };
-
-    let op_opcode = match expr.operator {
-        UpdateOperator::Increment => Opcode::Inc,
-        UpdateOperator::Decrement => Opcode::Dec,
-    };
-    let op_label = match expr.operator {
-        UpdateOperator::Increment => "Inc",
-        UpdateOperator::Decrement => "Dec",
-    };
-
-    // 2) Load old value into acc. Reuses `lower_identifier_read` so
-    //    the emitted `Ldar` also picks up a fresh arithmetic feedback
-    //    slot for M_JIT_C.2 / M_JIT_C.3 consumption.
-    lower_identifier_read(builder, ctx, binding, ident.span)?;
-
-    if expr.prefix {
-        // Prefix: Inc/Dec in place, Star back.
-        builder
-            .emit(op_opcode, &[])
-            .map_err(|err| SourceLoweringError::Internal(format!("encode {op_label}: {err:?}")))?;
-        builder
-            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Star (prefix update): {err:?}"))
-            })?;
-    } else {
-        // Postfix: spill old to a temp, Inc/Dec, Star back, reload
-        // the spilled old value into acc so the expression's value
-        // is the pre-increment int32. The temp is released once we
-        // reload, matching the LIFO contract callers rely on for
-        // nested calls.
-        let temp = ctx.acquire_temps(1)?;
-        builder
-            .emit(Opcode::Star, &[Operand::Reg(u32::from(temp))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!(
-                    "encode Star (postfix old-value spill): {err:?}"
-                ))
-            })
-            .inspect_err(|_| ctx.release_temps(1))?;
-        builder
-            .emit(op_opcode, &[])
-            .map_err(|err| SourceLoweringError::Internal(format!("encode {op_label}: {err:?}")))
-            .inspect_err(|_| ctx.release_temps(1))?;
-        builder
-            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Star (postfix update): {err:?}"))
-            })
-            .inspect_err(|_| ctx.release_temps(1))?;
-        // Reload old value. No feedback slot attached — this is a
-        // purely mechanical temp reload, not a user-facing read.
-        builder
-            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(temp))])
-            .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode Ldar (postfix old reload): {err:?}"))
-            })
-            .inspect_err(|_| ctx.release_temps(1))?;
-        ctx.release_temps(1);
     }
     Ok(())
 }

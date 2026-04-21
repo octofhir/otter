@@ -162,6 +162,20 @@ fn syntax_error_reports_parse() {
     assert!(matches!(err, SourceLoweringError::Parse { .. }));
 }
 
+#[test]
+fn invalid_for_of_expression_left_reports_parse() {
+    let err = compile("function f() { let a = 0, b = 0; for (a + b of [1]) {} }")
+        .expect_err("invalid for-of assignment target must surface as Parse");
+    assert!(matches!(err, SourceLoweringError::Parse { .. }));
+}
+
+#[test]
+fn invalid_for_of_ts_asserted_expression_left_reports_parse() {
+    let err = compile_ts("function f() { let a = 0; for ((a + 1) as any of [1]) {} }")
+        .expect_err("invalid TS for-of assignment target must surface as Parse");
+    assert!(matches!(err, SourceLoweringError::Parse { .. }));
+}
+
 // ---------------------------------------------------------------------------
 // Unsupported shapes (expected negatives)
 // ---------------------------------------------------------------------------

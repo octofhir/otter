@@ -2109,6 +2109,18 @@ fn spread_in_direct_call_routes_through_call_spread() {
 }
 
 #[test]
+fn spread_in_direct_call_mixes_regular_and_spread_args() {
+    assert_eq!(
+        run_int32_function(
+            "function pack(a, b, c, d) { return a * 1000 + b * 100 + c * 10 + d; } \
+             function main() { return pack(1, ...[2, 3], 4); }",
+            &[],
+        ),
+        1234,
+    );
+}
+
+#[test]
 fn duplicate_top_level_function_unsupported() {
     // Two `function f`s in the same module — JS would silently
     // pick the last (function-decl hoisting overrides). M9
@@ -5597,8 +5609,6 @@ fn spread_flows_through_rest_parameter() {
     // End-to-end rest + spread: `g(...xs)` where `g` uses `...args`
     // collects them all back into a rest array. The resulting
     // length should match the original array's length.
-    // (Direct-call spread is rejected, so we route through a
-    // method call on a host-backed console for the observation.)
     let (capture, _ret) = compile_and_run_with_capture(
         "function main() { \
             let xs = [\"a\", \"b\", \"c\"]; \

@@ -10652,9 +10652,8 @@ fn lower_call_expression(
     };
 
     // M23: any `...expr` argument forces the CallSpread path.
-    // `CallSpread` expects a receiver (direct calls don't have
-    // one), so direct-call-with-spread is rejected until a future
-    // milestone exposes top-level function handles as values.
+    // Direct calls use `undefined` as the receiver; method calls
+    // preserve their evaluated receiver.
     let has_spread = call
         .arguments
         .iter()
@@ -11668,10 +11667,9 @@ fn emit_spread_call_arguments_array<'a>(
 
 /// Lowers each `CallExpression` argument into the accumulator and
 /// spills it into the corresponding temp slot starting at `base`.
-/// Rejects spread arguments (`f(...arr)`) with a stable tag so
-/// the caller's temp-window accounting stays straight. Shared by
-/// the direct-call and method-call paths so the evaluation-order
-/// and slot-layout contract is identical.
+/// Non-spread call paths must route spread arguments through
+/// `emit_spread_call_arguments_array` instead; seeing one here is
+/// an internal routing bug, not a user-facing compile-surface gap.
 fn lower_call_arguments_into_temps<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
@@ -11682,10 +11680,10 @@ fn lower_call_arguments_into_temps<'a>(
     for (offset, arg) in call.arguments.iter().enumerate() {
         let expr = match arg {
             Argument::SpreadElement(spread) => {
-                return Err(SourceLoweringError::unsupported(
-                    "spread_call_arg",
-                    spread.span,
-                ));
+                return Err(SourceLoweringError::Internal(format!(
+                    "lower_call_arguments_into_temps called with spread argument at {:?}",
+                    spread.span
+                )));
             }
             other => other.to_expression(),
         };

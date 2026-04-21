@@ -53,7 +53,7 @@ pub(super) fn lower_classic_for_using_statement<'a>(
             ctx,
             vec![loop_continue, loop_exit],
             |builder, ctx| {
-                lower_using_declaration(builder, ctx, decl)?;
+                lower_using_decl(builder, ctx, decl)?;
                 lower_classic_for_after_using_init(
                     builder,
                     ctx,
@@ -182,7 +182,7 @@ where
                 builder,
                 ctx,
                 |builder, ctx| {
-                    lower_using_declaration(builder, ctx, decl)?;
+                    lower_using_decl(builder, ctx, decl)?;
                     lower_statement_list_slice(builder, ctx, rest, lower_non_using)
                 },
                 |builder, _ctx| {
@@ -234,7 +234,7 @@ where
                 builder,
                 ctx,
                 |builder, ctx| {
-                    lower_using_declaration(builder, ctx, decl)?;
+                    lower_using_decl(builder, ctx, decl)?;
                     lower_statement_list_ref_slice(builder, ctx, rest, lower_non_using)
                 },
                 |builder, _ctx| {
@@ -266,7 +266,7 @@ fn lower_nested_block_statement<'a>(
     }
 }
 
-fn lower_using_declaration<'a>(
+fn lower_using_decl<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &mut LoweringContext<'a>,
     decl: &'a VariableDeclaration<'a>,
@@ -284,7 +284,7 @@ fn lower_using_declaration<'a>(
         })?;
         let BindingPattern::BindingIdentifier(ident) = &declarator.id else {
             return Err(SourceLoweringError::unsupported(
-                "using_declaration",
+                "parser_recovery_using_binding_pattern",
                 declarator.id.span(),
             ));
         };

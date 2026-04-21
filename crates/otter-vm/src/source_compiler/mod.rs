@@ -2527,7 +2527,7 @@ fn lower_for_of_statement<'a>(
                     other => {
                         return Err(SourceLoweringError::unsupported(
                             if is_using {
-                                "using_declaration"
+                                "parser_recovery_for_of_using_pattern"
                             } else {
                                 "for_of_destructuring_binding"
                             },
@@ -4388,12 +4388,13 @@ pub(super) fn lower_let_const_declaration<'a>(
         // hoisting is tracked as a follow-up but should not block
         // scripts that sprinkle `var` next to `let` / `const`.
         VariableDeclarationKind::Var => false,
-        // `using` / `await using` (Stage 3 explicit resource management).
-        // Not on the M5 surface — surface a stable tag so later milestones
-        // can pick it up without churning callers.
+        // `using` / `await using` should be routed through
+        // `using_decl.rs` before reaching this generic declaration
+        // helper. If parser recovery or a new caller gets here,
+        // keep the failure explicit.
         VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing => {
             return Err(SourceLoweringError::unsupported(
-                "using_declaration",
+                "parser_recovery_unrouted_using_decl",
                 decl.span,
             ));
         }

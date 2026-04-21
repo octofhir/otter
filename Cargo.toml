@@ -10,6 +10,7 @@ members = [
     "crates/otter-modules",
     "crates/otter-web",
     "crates/otter-pm",
+    "crates/otter-test262",
     "crates/otter-pm-manifest",
     "crates/otter-pm-lockfile",
     "crates/otterjs",
@@ -30,6 +31,12 @@ strip = false          # Keep symbols for profiling
 # debug = true           # Include debug info for flamegraph
 panic = "abort"        # No unwinding (smaller binary)
 opt-level = 3          # Maximum optimization
+
+# Release profile for test262 runner — needs panic=unwind for catch_unwind
+[profile.test262]
+inherits = "release"
+panic = "unwind"
+split-debuginfo = "off"  # Keep debug symbols in the binary (required for samply on macOS)
 
 # Fast release for development iteration
 [profile.release-fast]

@@ -606,7 +606,7 @@ fn var_declaration_lowered_as_let_at_declaration_site() {
 fn nested_if_var_declaration_lowers() {
     // Bare statement-position `var` bodies are valid JS (`if (...) var x = ...;`).
     // They should route through the shared declaration lowerer instead of
-    // tripping the stale `nested_variable_declaration` blanket rejection.
+    // tripping the old blanket nested-declaration rejection.
     assert_eq!(
         run_int32_function("function f() { if (1) var x = 7; return x; }", &[]),
         7

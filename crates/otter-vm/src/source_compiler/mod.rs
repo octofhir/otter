@@ -30,11 +30,9 @@
 //!   later.
 //! - `let`/`const` accept multiple declarators in one statement
 //!   (`let s = 0, i = 0;`), each with its own slot allocation.
-//! - Inside an `if` branch or a `while` body: only assignment
-//!   statements, nested `if` statements, `while` statements, `return`
-//!   statements, and nested blocks of the same. `let`/`const` inside
-//!   any nested block is rejected as `nested_variable_declaration`
-//!   until block scoping lands.
+//! - Inside an `if` branch or a `while` body: assignment
+//!   statements, nested control-flow statements, declarations inside
+//!   block statements, and inline `return` statements are accepted.
 //! - Assignment: `AssignmentExpression` whose target is a plain
 //!   identifier referencing an in-scope `let`. Supported operators are
 //!   `=`, `+=`, `-=`, `*=`, `|=`. Assignment to a `const`, to a
@@ -1345,11 +1343,13 @@ impl ParamsLayout<'_> {
 /// - `...rest` — plain identifier. No default allowed on rest
 ///   (spec forbids it anyway).
 ///
-/// Rejected with stable tags:
-/// - `destructuring_parameter` — any non-identifier pattern.
-/// - `rest_destructuring_parameter` — destructuring in a rest.
-/// - (The old `multiple_parameters` tag is removed — multi-param
-///   signatures are a first-class surface now.)
+/// Parser-recovery guards:
+/// - `parser_recovery_formal_param_assignment` — oxc documents
+///   top-level `AssignmentPattern` as invalid in `FormalParameter`;
+///   real parameter defaults arrive through `param.initializer`.
+/// - `parser_recovery_rest_parameter_pattern` — rest initializers
+///   are syntax errors before lowering; identifier and
+///   destructuring rest patterns are first-class surfaces.
 fn analyze_params<'a>(
     params: &'a FormalParameters<'a>,
 ) -> Result<ParamsLayout<'a>, SourceLoweringError> {
@@ -1377,11 +1377,11 @@ fn analyze_params<'a>(
             // `function f(x = 5)` comes through the `BindingIdentifier`
             // path above — oxc flattens the default into
             // `param.initializer`, not into an AssignmentPattern.
-            // AssignmentPattern at this level would only arise from
-            // unusual grammar corners; reject with a stable tag.
+            // AssignmentPattern at this level is parser recovery:
+            // real defaults are carried by `param.initializer`.
             BindingPattern::AssignmentPattern(pat) => {
                 return Err(SourceLoweringError::unsupported(
-                    "assignment_pattern_parameter",
+                    "parser_recovery_formal_param_assignment",
                     pat.span,
                 ));
             }
@@ -1401,7 +1401,7 @@ fn analyze_params<'a>(
             }
             _ => {
                 return Err(SourceLoweringError::unsupported(
-                    "rest_destructuring_parameter",
+                    "parser_recovery_rest_parameter_pattern",
                     rest.rest.span,
                 ));
             }
@@ -1955,7 +1955,7 @@ pub(super) fn lower_nested_statement<'a>(
             // keeping the stale blanket rejection.
             VariableDeclarationKind::Var => lower_let_const_declaration(builder, ctx, decl),
             _ => Err(SourceLoweringError::unsupported(
-                "nested_variable_declaration",
+                "parser_recovery_bare_nested_lexical_declaration",
                 decl.span,
             )),
         },

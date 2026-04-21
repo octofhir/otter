@@ -35,7 +35,7 @@ pub(super) fn enter_switch_lexical_scope<'a>(
                 }
                 VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing => {
                     return Err(SourceLoweringError::unsupported(
-                        "using_declaration",
+                        "parser_recovery_switch_using_decl",
                         decl.span,
                     ));
                 }
@@ -69,7 +69,7 @@ pub(super) fn lower_switch_case_statement<'a>(
                 lower_switch_lexical_declaration(builder, ctx, decl)
             }
             VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing => Err(
-                SourceLoweringError::unsupported("using_declaration", decl.span),
+                SourceLoweringError::unsupported("parser_recovery_switch_using_decl", decl.span),
             ),
             VariableDeclarationKind::Var => Err(SourceLoweringError::unsupported(
                 "switch_var_declaration",

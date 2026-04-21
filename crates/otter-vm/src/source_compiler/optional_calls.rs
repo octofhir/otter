@@ -240,7 +240,7 @@ pub(super) fn lower_optional_call<'a>(
         }
         Expression::Super(super_tok) => {
             return Err(SourceLoweringError::unsupported(
-                "optional_super_call",
+                "parser_recovery_direct_optional_super",
                 super_tok.span,
             ));
         }

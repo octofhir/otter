@@ -1,8 +1,13 @@
 use super::*;
 use crate::bytecode::{BytecodeBuilder, Opcode, Operand};
-use oxc_ast::ast::{BindingPattern, Statement, VariableDeclaration, VariableDeclarationKind};
+use oxc_ast::ast::{
+    BindingPattern, Expression, ForStatement, Statement, VariableDeclaration,
+    VariableDeclarationKind,
+};
 
-use super::try_finally::lower_synthetic_try_finally;
+use super::try_finally::{
+    lower_synthetic_try_finally, lower_synthetic_try_finally_with_internal_jumps,
+};
 
 pub(super) fn lower_function_top_statement_list<'a>(
     builder: &mut BytecodeBuilder,
@@ -26,6 +31,124 @@ pub(super) fn lower_top_level_statement_list<'a>(
     statements: &[&'a Statement<'a>],
 ) -> Result<(), SourceLoweringError> {
     lower_statement_list_ref_slice(builder, ctx, statements, lower_top_statement)
+}
+
+pub(super) fn lower_classic_for_using_statement<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    for_stmt: &'a ForStatement<'a>,
+    decl: &'a VariableDeclaration<'a>,
+) -> Result<(), SourceLoweringError> {
+    let scope = ctx.snapshot_scope();
+    let loop_header = builder.new_label();
+    let loop_exit = builder.new_label();
+    let loop_continue = builder.new_label();
+
+    let result = (|| -> Result<(), SourceLoweringError> {
+        builder.emit(Opcode::PushUsingScope, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode PushUsingScope (for using): {err:?}"))
+        })?;
+        lower_synthetic_try_finally_with_internal_jumps(
+            builder,
+            ctx,
+            vec![loop_continue, loop_exit],
+            |builder, ctx| {
+                lower_using_declaration(builder, ctx, decl)?;
+                lower_classic_for_after_using_init(
+                    builder,
+                    ctx,
+                    for_stmt,
+                    loop_header,
+                    loop_continue,
+                    loop_exit,
+                )
+            },
+            |builder, _ctx| {
+                builder
+                    .emit(Opcode::DisposeUsingScope, &[])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode DisposeUsingScope (for using): {err:?}"
+                        ))
+                    })?;
+                Ok(())
+            },
+        )
+    })();
+    ctx.restore_scope(scope);
+    result
+}
+
+fn lower_classic_for_after_using_init<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    for_stmt: &'a ForStatement<'a>,
+    loop_header: Label,
+    loop_continue: Label,
+    loop_exit: Label,
+) -> Result<(), SourceLoweringError> {
+    builder
+        .bind_label(loop_header)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind for using header: {err:?}")))?;
+
+    if let Some(test) = &for_stmt.test {
+        lower_return_expression(builder, ctx, test)?;
+    } else {
+        builder.emit(Opcode::LdaTrue, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaTrue (for using): {err:?}"))
+        })?;
+    }
+    builder
+        .emit_jump_to(Opcode::JumpIfToBooleanFalse, loop_exit)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!(
+                "encode JumpIfToBooleanFalse (for using): {err:?}"
+            ))
+        })?;
+
+    ctx.enter_loop(LoopLabels {
+        break_label: loop_exit,
+        continue_label: Some(loop_continue),
+        label: ctx.take_pending_loop_label(),
+    });
+    let body_result = lower_nested_statement(builder, ctx, &for_stmt.body);
+    ctx.exit_loop();
+    body_result?;
+
+    builder.bind_label(loop_continue).map_err(|err| {
+        SourceLoweringError::Internal(format!("bind for using continue: {err:?}"))
+    })?;
+    lower_classic_for_update(builder, ctx, for_stmt.update.as_ref())?;
+
+    builder
+        .emit_jump_to(Opcode::Jump, loop_header)
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Jump (for using back): {err:?}"))
+        })?;
+    builder
+        .bind_label(loop_exit)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind for using exit: {err:?}")))?;
+    Ok(())
+}
+
+fn lower_classic_for_update<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    update: Option<&'a Expression<'a>>,
+) -> Result<(), SourceLoweringError> {
+    let Some(update) = update else {
+        return Ok(());
+    };
+    match update {
+        Expression::AssignmentExpression(assign) => {
+            lower_assignment_expression(builder, ctx, assign)
+        }
+        Expression::UpdateExpression(update_expr) => {
+            lower_update_expression(builder, ctx, update_expr)
+        }
+        Expression::CallExpression(call) => lower_call_expression(builder, ctx, call),
+        other => lower_return_expression(builder, ctx, other),
+    }
 }
 
 fn lower_statement_list_slice<'a, Lower>(

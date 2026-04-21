@@ -63,7 +63,11 @@ fn emit_abrupt_completion<'a>(
     ctx: &LoweringContext<'a>,
     completion: AbruptCompletionTarget,
 ) -> Result<(), SourceLoweringError> {
-    let finally_targets = ctx.active_finally_targets();
+    let jump_target = match completion {
+        AbruptCompletionTarget::Return => None,
+        AbruptCompletionTarget::Jump(target) => Some(target),
+    };
+    let finally_targets = ctx.active_finally_targets_for_jump(jump_target);
     if finally_targets.is_empty() {
         return match completion {
             AbruptCompletionTarget::Return => builder
@@ -137,6 +141,73 @@ where
 
     ctx.enter_finally_frame(FinallyFrame {
         normal_entry: finally_normal,
+        internal_jumps: Vec::new(),
+    });
+    let try_result = (|| -> Result<(), SourceLoweringError> {
+        builder.bind_label(try_start).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind synth try_start: {err:?}"))
+        })?;
+        try_body(builder, ctx)?;
+        builder
+            .bind_label(try_end)
+            .map_err(|err| SourceLoweringError::Internal(format!("bind synth try_end: {err:?}")))?;
+        builder
+            .emit_jump_to(Opcode::Jump, finally_normal)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Jump (synth try normal exit): {err:?}"
+                ))
+            })?;
+        Ok(())
+    })();
+    ctx.exit_finally_frame();
+    try_result?;
+
+    ctx.record_exception_handler(try_start, try_end, finally_handler);
+
+    builder.bind_label(finally_handler).map_err(|err| {
+        SourceLoweringError::Internal(format!("bind synth finally_handler: {err:?}"))
+    })?;
+    finally_body(builder, ctx)?;
+    builder.emit(Opcode::ReThrow, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("encode ReThrow (synth finally): {err:?}"))
+    })?;
+
+    builder.bind_label(finally_normal).map_err(|err| {
+        SourceLoweringError::Internal(format!("bind synth finally_normal: {err:?}"))
+    })?;
+    finally_body(builder, ctx)?;
+    builder.emit(Opcode::ResumeAbrupt, &[]).map_err(|err| {
+        SourceLoweringError::Internal(format!("encode ResumeAbrupt (synth finally): {err:?}"))
+    })?;
+
+    builder
+        .bind_label(after_try)
+        .map_err(|err| SourceLoweringError::Internal(format!("bind synth after_try: {err:?}")))?;
+
+    Ok(())
+}
+
+pub(super) fn lower_synthetic_try_finally_with_internal_jumps<'a, T, F>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    internal_jumps: Vec<Label>,
+    try_body: T,
+    finally_body: F,
+) -> Result<(), SourceLoweringError>
+where
+    T: FnOnce(&mut BytecodeBuilder, &mut LoweringContext<'a>) -> Result<(), SourceLoweringError>,
+    F: Copy + Fn(&mut BytecodeBuilder, &mut LoweringContext<'a>) -> Result<(), SourceLoweringError>,
+{
+    let try_start = builder.new_label();
+    let try_end = builder.new_label();
+    let after_try = builder.new_label();
+    let finally_handler = builder.new_label();
+    let finally_normal = builder.new_label();
+
+    ctx.enter_finally_frame(FinallyFrame {
+        normal_entry: finally_normal,
+        internal_jumps,
     });
     let try_result = (|| -> Result<(), SourceLoweringError> {
         builder.bind_label(try_start).map_err(|err| {
@@ -204,7 +275,10 @@ pub(super) fn lower_try_statement<'a>(
     let finally_normal = try_stmt.finalizer.as_ref().map(|_| builder.new_label());
 
     if let Some(normal_entry) = finally_normal {
-        ctx.enter_finally_frame(FinallyFrame { normal_entry });
+        ctx.enter_finally_frame(FinallyFrame {
+            normal_entry,
+            internal_jumps: Vec::new(),
+        });
     }
 
     let try_catch_result = (|| -> Result<(), SourceLoweringError> {

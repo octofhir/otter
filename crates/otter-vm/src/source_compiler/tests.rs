@@ -7916,6 +7916,85 @@ fn m37_await_using_awaits_async_disposer_before_settlement() {
 }
 
 #[test]
+fn m37_classic_for_using_disposes_once_after_normal_exit() {
+    let src = "function f() { \
+            let state = { count: 0 }; \
+            let i = 0; \
+            for (using x = { [Symbol.dispose]() { state.count = state.count * 10 + 9; } }; \
+                 i < 3; \
+                 i = i + 1) { \
+                state.count = state.count * 10 + i + 1; \
+            } \
+            return state.count; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1239);
+}
+
+#[test]
+fn m37_classic_for_using_continue_does_not_dispose_early() {
+    let src = "function f() { \
+            let state = { count: 0 }; \
+            let i = 0; \
+            for (using x = { [Symbol.dispose]() { state.count = state.count * 10 + 9; } }; \
+                 i < 3; \
+                 i = i + 1) { \
+                state.count = state.count * 10 + i + 1; \
+                if (i < 2) continue; \
+            } \
+            return state.count; \
+        }";
+    assert_eq!(run_int32_function(src, &[]), 1239);
+}
+
+#[test]
+fn m37_classic_for_using_disposes_on_break_and_return() {
+    let break_src = "function f() { \
+            let state = { count: 0 }; \
+            for (using x = { [Symbol.dispose]() { state.count = state.count * 10 + 9; } }; ; ) { \
+                state.count = state.count + 1; \
+                break; \
+            } \
+            return state.count; \
+        }";
+    assert_eq!(run_int32_function(break_src, &[]), 19);
+
+    let return_src = "function inner(state) { \
+            for (using x = { [Symbol.dispose]() { state.count = 7; } }; ; ) { \
+                return 4; \
+            } \
+            return 0; \
+        } \
+        function f() { \
+            let state = { count: 0 }; \
+            let result = inner(state); \
+            return state.count * 10 + result; \
+        }";
+    assert_eq!(run_int32_function(return_src, &[]), 74);
+}
+
+#[test]
+fn m37_classic_for_await_using_awaits_after_loop_exit() {
+    let src = "async function run() { \
+            let state = { count: 0 }; \
+            let i = 0; \
+            for (await using x = { \
+                    [Symbol.asyncDispose]() { \
+                        return Promise.resolve().then(function() { state.count = state.count * 10 + 9; }); \
+                    } \
+                 }; i < 2; i = i + 1) { \
+                state.count = state.count * 10 + i + 1; \
+            } \
+            return state; \
+        } \
+        function main() { \
+            let outer = { count: 0 }; \
+            run().then(function(state) { outer.count = state.count; }); \
+            return outer; \
+        }";
+    assert_eq!(run_promise_state_counter(src, "count"), 129);
+}
+
+#[test]
 fn m37_for_of_using_disposes_each_iteration() {
     let src = "function f() { \
             let state = { count: 0 }; \

@@ -146,8 +146,8 @@ use try_finally::{
     lower_break_statement, lower_continue_statement, lower_return_statement, lower_try_statement,
 };
 use using_decl::{
-    lower_function_top_statement_list, lower_loop_using_iteration, lower_nested_statement_list,
-    lower_top_level_statement_list,
+    lower_classic_for_using_statement, lower_function_top_statement_list,
+    lower_loop_using_iteration, lower_nested_statement_list, lower_top_level_statement_list,
 };
 
 use crate::bytecode::{Bytecode, BytecodeBuilder, FeedbackSlot, Label, Opcode, Operand};
@@ -2268,6 +2268,15 @@ fn lower_for_statement<'a>(
 ) -> Result<(), SourceLoweringError> {
     use oxc_ast::ast::ForStatementInit;
 
+    if let Some(ForStatementInit::VariableDeclaration(decl)) = &for_stmt.init
+        && matches!(
+            decl.kind,
+            VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing
+        )
+    {
+        return lower_classic_for_using_statement(builder, ctx, for_stmt, decl);
+    }
+
     // Snapshot scope so any `let` introduced by the init pops on exit.
     let scope = ctx.snapshot_scope();
 
@@ -3507,9 +3516,10 @@ struct LoopLabels {
     label: Option<std::rc::Rc<str>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct FinallyFrame {
     normal_entry: Label,
+    internal_jumps: Vec<Label>,
 }
 
 /// Snapshot of [`LoweringContext::locals`] length, returned by
@@ -3827,9 +3837,16 @@ impl<'a> LoweringContext<'a> {
         );
     }
 
-    fn active_finally_targets(&self) -> Vec<Label> {
-        self.finally_frames
-            .borrow()
+    fn active_finally_targets_for_jump(&self, target: Option<Label>) -> Vec<Label> {
+        let frames = self.finally_frames.borrow();
+        let start = target
+            .and_then(|target| {
+                frames
+                    .iter()
+                    .rposition(|frame| frame.internal_jumps.contains(&target))
+            })
+            .map_or(0, |idx| idx + 1);
+        frames[start..]
             .iter()
             .map(|frame| frame.normal_entry)
             .collect()

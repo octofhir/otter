@@ -106,6 +106,7 @@
 //!   Return
 //! ```
 
+mod assignment_targets;
 mod direct_calls;
 mod error;
 mod for_in_of;
@@ -122,6 +123,7 @@ pub use error::SourceLoweringError;
 
 use std::cell::{Cell, RefCell};
 
+use assignment_targets::{AssignmentTargetRef, unwrap_assignment_target};
 use direct_calls::lower_expression_direct_call;
 use for_in_of::{
     ForInOfAssignmentTarget, ForInOfLeft, classify_for_in_of_left,
@@ -136,9 +138,9 @@ use oxc_ast::ast::{
     Declaration, ExportDefaultDeclarationKind, Expression, FormalParameters, Function,
     FunctionBody, IdentifierReference, LogicalExpression, LogicalOperator, MethodDefinitionKind,
     ModuleExportName, NewExpression, NumericLiteral, ObjectExpression, ObjectPattern,
-    ObjectPropertyKind, Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
-    StaticMemberExpression, TemplateLiteral, UnaryExpression, UnaryOperator, UpdateExpression,
-    UpdateOperator, VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    ObjectPropertyKind, Program, PropertyKey, PropertyKind, Statement, StaticMemberExpression,
+    TemplateLiteral, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -9340,40 +9342,29 @@ fn lower_assignment_expression(
     ctx: &LoweringContext<'_>,
     expr: &AssignmentExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    // Dispatch on target shape. Identifier + static/computed member
-    // are the three supported write targets as of M17. Everything
-    // else (private fields, destructuring, TS-only) stays rejected
-    // with a stable per-shape tag so future widenings don't have to
-    // unify the error-surface story retroactively.
-    match &expr.left {
-        AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+    // Dispatch on target shape after peeling TypeScript-only LHS
+    // wrappers (`x! =`, `(obj as T).x =`, etc.). Those wrappers are
+    // runtime no-ops, so the underlying JS reference determines the
+    // emitted store path.
+    match unwrap_assignment_target(&expr.left)? {
+        AssignmentTargetRef::Identifier(ident) => {
             lower_identifier_assignment(builder, ctx, expr, ident)
         }
-        AssignmentTarget::StaticMemberExpression(member) => {
+        AssignmentTargetRef::StaticMember(member) => {
             lower_static_member_assignment(builder, ctx, expr, member)
         }
-        AssignmentTarget::ComputedMemberExpression(member) => {
+        AssignmentTargetRef::ComputedMember(member) => {
             lower_computed_member_assignment(builder, ctx, expr, member)
         }
-        AssignmentTarget::PrivateFieldExpression(member) => {
+        AssignmentTargetRef::PrivateField(member) => {
             lower_private_field_assignment(builder, ctx, expr, member)
         }
-        AssignmentTarget::ArrayAssignmentTarget(pattern) => {
+        AssignmentTargetRef::Array(pattern) => {
             lower_array_destructuring_assignment(builder, ctx, expr, pattern)
         }
-        AssignmentTarget::ObjectAssignmentTarget(pattern) => {
+        AssignmentTargetRef::Object(pattern) => {
             lower_object_destructuring_assignment(builder, ctx, expr, pattern)
         }
-        // TS-only assignment targets (`x as T = ...`, `x! = ...`,
-        // etc.). Treated as one bucket — all are out of scope until
-        // the source compiler grows TS-specific handling.
-        AssignmentTarget::TSAsExpression(_)
-        | AssignmentTarget::TSSatisfiesExpression(_)
-        | AssignmentTarget::TSNonNullExpression(_)
-        | AssignmentTarget::TSTypeAssertion(_) => Err(SourceLoweringError::unsupported(
-            "ts_assignment_target",
-            expr.span,
-        )),
     }
 }
 

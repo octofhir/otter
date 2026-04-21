@@ -2438,6 +2438,28 @@ fn update_on_captured_const_rejected() {
 }
 
 #[test]
+fn ts_non_null_update_target_writes_binding() {
+    assert_eq!(
+        run_int32_function_ts(
+            "function f() { let x: number = 4; let old = x!++; return old * 10 + x; }",
+            &[]
+        ),
+        45,
+    );
+}
+
+#[test]
+fn ts_type_assertion_update_target_writes_member() {
+    assert_eq!(
+        run_int32_function_ts(
+            "function f() { let o = { x: 8 }; return ++(o.x as number) + o.x; }",
+            &[],
+        ),
+        18,
+    );
+}
+
+#[test]
 fn postfix_increment_on_static_member_returns_old_and_writes_new() {
     assert_eq!(
         run_int32_function(
@@ -5670,6 +5692,25 @@ fn param_binding_can_be_assigned() {
     let src = "function f(a, b) { a = a + 1; return a + b; } \
                function main() { return f(5, 3); }";
     assert_eq!(run_main_int(src), 9);
+}
+
+#[test]
+fn ts_non_null_assignment_target_writes_binding() {
+    assert_eq!(
+        run_int32_function_ts("function f() { let x: number = 1; x! = 9; return x; }", &[]),
+        9,
+    );
+}
+
+#[test]
+fn ts_type_assertion_assignment_target_writes_member() {
+    assert_eq!(
+        run_int32_function_ts(
+            "function f() { let o = { x: 1 }; (o.x as number) = 7; return o.x; }",
+            &[],
+        ),
+        7,
+    );
 }
 
 #[test]

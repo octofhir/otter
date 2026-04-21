@@ -1,3 +1,4 @@
+use super::assignment_targets::{SimpleAssignmentTargetRef, unwrap_simple_assignment_target};
 use super::*;
 
 /// Lowers `++x`, `x++`, `--x`, and `x--`.
@@ -12,26 +13,19 @@ pub(super) fn lower_update_expression(
     ctx: &LoweringContext<'_>,
     expr: &UpdateExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
-    match &expr.argument {
-        SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
-            lower_identifier_update(builder, ctx, expr, ident.as_ref())
+    match unwrap_simple_assignment_target(&expr.argument)? {
+        SimpleAssignmentTargetRef::Identifier(ident) => {
+            lower_identifier_update(builder, ctx, expr, ident)
         }
-        SimpleAssignmentTarget::StaticMemberExpression(member) => {
+        SimpleAssignmentTargetRef::StaticMember(member) => {
             lower_static_member_update(builder, ctx, expr, member)
         }
-        SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+        SimpleAssignmentTargetRef::ComputedMember(member) => {
             lower_computed_member_update(builder, ctx, expr, member)
         }
-        SimpleAssignmentTarget::PrivateFieldExpression(member) => {
+        SimpleAssignmentTargetRef::PrivateField(member) => {
             lower_private_field_update(builder, ctx, expr, member)
         }
-        SimpleAssignmentTarget::TSAsExpression(_)
-        | SimpleAssignmentTarget::TSSatisfiesExpression(_)
-        | SimpleAssignmentTarget::TSNonNullExpression(_)
-        | SimpleAssignmentTarget::TSTypeAssertion(_) => Err(SourceLoweringError::unsupported(
-            "ts_assignment_target",
-            expr.span,
-        )),
     }
 }
 

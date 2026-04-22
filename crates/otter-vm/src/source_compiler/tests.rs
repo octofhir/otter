@@ -1534,6 +1534,28 @@ fn loose_equality_distinct_objects_are_false() {
 }
 
 #[test]
+fn loose_equality_object_primitive_uses_default_to_primitive_hint() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let seen = ''; let x = { [Symbol.toPrimitive](hint) { seen = hint; return 1; } }; if ((x == true) === true && seen === 'default') { return 1; } return 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn loose_equality_wrapper_objects_coerce_to_primitives() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { if ((new Boolean(true) == '1') === true && ('1' == new Boolean(true)) === true && (new Number(-1) == '-1') === true && (new String('x') == 'x') === true) { return 1; } return 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
 fn unary_negation_handles_non_int32_numbers() {
     assert_eq!(
         run_int32_function(

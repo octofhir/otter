@@ -59,6 +59,7 @@ pub(super) enum YieldStarResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToPrimitiveHint {
+    Default,
     String,
     Number,
 }

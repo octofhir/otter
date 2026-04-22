@@ -87,15 +87,21 @@ impl RuntimeState {
             return Ok(!lhs_num.is_nan() && !rhs_num.is_nan() && lhs_num == rhs_num);
         }
 
+        let lhs_is_string = self.value_is_primitive_string(lhs)?;
+        let rhs_is_string = self.value_is_primitive_string(rhs)?;
+
         // Same-Type Object pairs were already checked by strict_eq above.
         // Distinct object references compare false for loose equality;
-        // ToPrimitive only applies to Object-vs-primitive pairs.
-        if lhs.as_object_handle().is_some() && rhs.as_object_handle().is_some() {
+        // ToPrimitive only applies to Object-vs-primitive pairs. Heap strings
+        // are object handles internally, but are primitive strings
+        // semantically, so they must still flow through the string cases below.
+        if lhs.as_object_handle().is_some()
+            && rhs.as_object_handle().is_some()
+            && !lhs_is_string
+            && !rhs_is_string
+        {
             return Ok(false);
         }
-
-        let lhs_is_string = self.value_is_string(lhs)?;
-        let rhs_is_string = self.value_is_string(rhs)?;
 
         // §7.2.15 step 10-11: BigInt == Number comparison.
         if lhs.is_bigint() && rhs.as_number().is_some() {
@@ -370,8 +376,8 @@ impl RuntimeState {
         };
 
         let method_names = match hint {
+            ToPrimitiveHint::Default | ToPrimitiveHint::Number => ["valueOf", "toString"],
             ToPrimitiveHint::String => ["toString", "valueOf"],
-            ToPrimitiveHint::Number => ["valueOf", "toString"],
         };
 
         for method_name in method_names {
@@ -442,6 +448,7 @@ impl RuntimeState {
             }
 
             let hint_value = match hint {
+                ToPrimitiveHint::Default => self.alloc_string("default"),
                 ToPrimitiveHint::String => self.alloc_string("string"),
                 ToPrimitiveHint::Number => self.alloc_string("number"),
             };
@@ -473,7 +480,7 @@ impl RuntimeState {
         let Some(_handle) = value.as_object_handle().map(ObjectHandle) else {
             return Ok(value);
         };
-        self.js_to_primitive_with_hint(value, ToPrimitiveHint::Number)
+        self.js_to_primitive_with_hint(value, ToPrimitiveHint::Default)
     }
 
     pub(crate) fn js_to_string(
@@ -1038,6 +1045,15 @@ impl RuntimeState {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Checks for ECMAScript Type(String). String wrappers are Object values
+    /// and must not match this in loose equality dispatch.
+    fn value_is_primitive_string(&self, value: RegisterValue) -> Result<bool, InterpreterError> {
+        let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
+            return Ok(false);
+        };
+        Ok(self.objects.string_value(handle)?.is_some())
     }
 
     /// §6.1.6.2 BigInt arithmetic helper — performs a binary operation on two

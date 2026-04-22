@@ -899,6 +899,12 @@ fn synthesise_top_level_entry<'a>(
     MODULE_GLOBALS_OVERRIDE.with(|slot| {
         *slot.borrow_mut() = None;
     });
+    // This is the synthesised top-level script body. Each top-level
+    // `var`/`let`/`const NAME = init;` that the program classifier
+    // registered as a module-global must be mirrored onto
+    // `globalThis.NAME` at its binding site so a nested function
+    // called mid-body reads the value via `LdaGlobal`.
+    ctx.enable_top_level_global_mirroring();
 
     // Preamble: install each module-global binding on the global
     // object so ESM `capture_exports` finds them. For classic
@@ -3460,6 +3466,13 @@ pub(super) struct LoweringContext<'a> {
     /// `take_source_map` into a finalised [`crate::source_map::SourceMap`]
     /// when the function body finishes lowering.
     pending_source_map: RefCell<Vec<crate::source_map::SourceMapEntry>>,
+    /// §9.1.1.4: `true` when this context is the synthesised top-
+    /// level entry's body; each `var`/`let`/`const NAME = init;`
+    /// tracked as a module-global is mirrored onto `globalThis.NAME`
+    /// right after its local store so a nested call made mid-body
+    /// reads the freshly-bound value via `LdaGlobal`. Off by default
+    /// — only the top-level entry flips it on.
+    mirror_top_level_decls_to_global: Cell<bool>,
 }
 
 /// §13.3.7 / §15.7.14 — per-function metadata describing which
@@ -3679,6 +3692,7 @@ impl<'a> LoweringContext<'a> {
             module_globals,
             source_index,
             pending_source_map: RefCell::new(Vec::new()),
+            mirror_top_level_decls_to_global: Cell::new(false),
         }
     }
 
@@ -3710,6 +3724,22 @@ impl<'a> LoweringContext<'a> {
     /// through `LdaGlobal` instead of rejecting the name.
     fn is_module_global(&self, name: &str) -> bool {
         self.module_globals.borrow().iter().any(|n| n == name)
+    }
+
+    /// When `true`, every `var`/`let`/`const NAME = init;` that maps
+    /// to a top-level module-global gets its value mirrored onto
+    /// `globalThis.NAME` at the binding site (via `StaGlobal`) so
+    /// nested calls invoked mid-body see the value. Set only on the
+    /// synthesised top-level entry; nested contexts inherit `false`.
+    fn enable_top_level_global_mirroring(&self) {
+        self.mirror_top_level_decls_to_global.set(true);
+    }
+
+    /// Returns `true` when the current binding site should mirror to
+    /// `globalThis` — i.e. mirroring is enabled for this context AND
+    /// the name is already tracked as a module-global.
+    fn should_mirror_top_level_decl_to_global(&self, name: &str) -> bool {
+        self.mirror_top_level_decls_to_global.get() && self.is_module_global(name)
     }
 
     /// Register a ClosureTemplate at the given `pc`. The PC is the
@@ -4565,6 +4595,37 @@ fn lower_single_declarator<'a>(
                 ));
             }
             let name = ident.name.as_str();
+            // §9.1.1.4 CreateGlobalVarBinding — for the synthesised
+            // top-level entry, a `var`/`let`/`const NAME = init;`
+            // tracked as a module-global binds the value directly on
+            // `globalThis.NAME`. Skipping the local allocation keeps
+            // reads AND writes consistent: every reference (from the
+            // script body itself or from a nested function called
+            // mid-body) resolves through `LdaGlobal`/`StaGlobal`
+            // against the single canonical slot. The post-body flush
+            // still runs but becomes a harmless no-op for these
+            // names (the values are already on the global object).
+            if ctx.should_mirror_top_level_decl_to_global(name) {
+                if let Some(init) = declarator.init.as_ref() {
+                    lower_return_expression(builder, ctx, init)?;
+                } else {
+                    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode LdaUndefined (top-level global init): {err:?}"
+                        ))
+                    })?;
+                }
+                let prop_idx = ctx.intern_property_name(name)?;
+                builder
+                    .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode StaGlobal (top-level global decl): {err:?}"
+                        ))
+                    })?;
+                return Ok(());
+            }
+
             let (slot, reused_var) = if is_var {
                 ctx.allocate_var_local(name, declarator.span)?
             } else {

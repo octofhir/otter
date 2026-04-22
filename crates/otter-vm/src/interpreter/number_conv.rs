@@ -39,8 +39,31 @@ pub(super) fn parse_string_to_number(s: &str) -> f64 {
     match trimmed {
         "Infinity" | "+Infinity" => f64::INFINITY,
         "-Infinity" => f64::NEG_INFINITY,
-        _ => trimmed.parse::<f64>().unwrap_or(f64::NAN),
+        _ => parse_non_decimal_integer_literal(trimmed)
+            .map(|value| value as f64)
+            .unwrap_or_else(|| trimmed.parse::<f64>().unwrap_or(f64::NAN)),
     }
+}
+
+fn parse_non_decimal_integer_literal(s: &str) -> Option<u64> {
+    let (digits, radix) = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .map(|digits| (digits, 16))
+        .or_else(|| {
+            s.strip_prefix("0o")
+                .or_else(|| s.strip_prefix("0O"))
+                .map(|digits| (digits, 8))
+        })
+        .or_else(|| {
+            s.strip_prefix("0b")
+                .or_else(|| s.strip_prefix("0B"))
+                .map(|digits| (digits, 2))
+        })?;
+    if digits.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
 }
 
 pub(super) fn canonical_string_exotic_index(property_name: &str) -> Option<usize> {

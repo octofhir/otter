@@ -23,6 +23,10 @@ fn compile_ts(source: &str) -> Result<crate::module::Module, SourceLoweringError
     ModuleCompiler::new().compile(source, "test.ts", SourceType::ts())
 }
 
+fn compile_eval(source: &str) -> Result<crate::module::Module, SourceLoweringError> {
+    ModuleCompiler::new().compile_eval(source, "eval.js", SourceType::default())
+}
+
 /// Return `(FunctionIndex, &Function)` for the user-declared
 /// function the tests want to call directly. The module's entry
 /// is always the synthesised `<top-level>` now, so tests that
@@ -133,6 +137,20 @@ fn run_bool_function(source: &str, args: &[i32]) -> bool {
         .return_value()
         .as_bool()
         .expect("function returned a non-bool value")
+}
+
+fn run_eval_value(source: &str) -> RegisterValue {
+    let module = compile_eval(source).expect("compile eval");
+    let entry_idx = module.entry();
+    let function = module.function(entry_idx).expect("module has entry");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let interpreter = Interpreter::new();
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    interpreter
+        .execute_with_runtime(&module, entry_idx, &registers, &mut runtime)
+        .expect("execute eval")
+        .return_value()
 }
 
 /// Helper for M32 tests where the entry function returns a
@@ -689,6 +707,22 @@ fn nested_while_var_declaration_compiles() {
 }
 
 #[test]
+fn duplicate_var_redeclaration_reuses_binding() {
+    assert_eq!(
+        run_int32_function("function f() { var x = 1; var x = 2; return x; }", &[]),
+        2
+    );
+}
+
+#[test]
+fn duplicate_var_without_initializer_preserves_value() {
+    assert_eq!(
+        run_int32_function("function f() { var x = 3; var x; return x; }", &[]),
+        3
+    );
+}
+
+#[test]
 fn uninitialized_let_defaults_to_undefined() {
     assert!(run_bool_function(
         "function f() { let x; return x === undefined; }",
@@ -947,18 +981,30 @@ fn compound_const_assignment_unsupported() {
 // `param_binding_can_be_assigned`.
 
 #[test]
-fn assignment_to_undeclared_unsupported() {
-    // `q = 5` where `q` is undeclared — JS implicit-global semantics
-    // are out of scope (and rejected by strict mode anyway). Surfaces
-    // as `unbound_identifier`.
-    let err = compile("function f() { q = 5; return 1; }").expect_err("implicit global at M5");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "unbound_identifier",
-            ..
-        }
-    ));
+fn assignment_to_undeclared_creates_global_binding() {
+    assert_eq!(
+        run_int32_function("function f() { q = 5; return q; }", &[]),
+        5
+    );
+}
+
+#[test]
+fn assignment_to_undeclared_yields_assigned_value() {
+    assert_eq!(
+        run_int32_function("function f() { let z = (q = 7); return z; }", &[]),
+        7
+    );
+}
+
+#[test]
+fn equality_lhs_unbound_read_throws_before_rhs_assignment() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { try { x == (x = 1); return 0; } catch (e) { return e instanceof ReferenceError ? 1 : 2; } }",
+            &[],
+        ),
+        1,
+    );
 }
 
 // Removed: member_assignment_target is supported as of M17 —
@@ -1444,6 +1490,61 @@ fn loose_equality_number_string_coerces() {
         ),
         1
     );
+}
+
+#[test]
+fn loose_equality_boolean_number_coerces() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { if (true == 1 && false == 0) { return 1; } return 0; }",
+            &[],
+        ),
+        1
+    );
+}
+
+#[test]
+fn loose_equality_nan_number_pairs_are_false() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { if ((Number.NaN == true) === false && (Number.NaN == Number.NaN) === false) { return 1; } return 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn loose_equality_non_decimal_string_to_number() {
+    assert_eq!(
+        run_int32_function("function f() { return (255 == \"0xff\") ? 1 : 0; }", &[]),
+        1,
+    );
+}
+
+#[test]
+fn unary_negation_handles_non_int32_numbers() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { if ((Number.POSITIVE_INFINITY == -Number.NEGATIVE_INFINITY) && (\"-1.100\" == -1.10)) { return 1; } return 0; }",
+            &[],
+        ),
+        1,
+    );
+}
+
+#[test]
+fn eval_returns_trailing_expression_completion() {
+    let value = run_eval_value("var x = 2; x");
+    assert_eq!(value.as_i32(), Some(2));
+}
+
+#[test]
+fn direct_eval_returns_loose_equality_completion() {
+    assert!(run_bool_function(
+        "function f() { return eval(\"true\\u0009==\\u00091\") === true; }",
+        &[],
+    ));
 }
 
 #[test]

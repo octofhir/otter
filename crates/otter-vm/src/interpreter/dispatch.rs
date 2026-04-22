@@ -497,8 +497,13 @@ impl Interpreter {
                 activation.set_accumulator(RegisterValue::from_i32(l.wrapping_sub(1)));
             }
             Opcode::Negate => {
-                let l = i32_of(activation.accumulator())?;
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_neg()));
+                let value = activation.accumulator();
+                if let Some(l) = value.as_i32() {
+                    activation.set_accumulator(RegisterValue::from_i32(l.wrapping_neg()));
+                } else {
+                    let n = runtime.js_to_number(value)?;
+                    activation.set_accumulator(RegisterValue::from_number(-n));
+                }
             }
             Opcode::BitwiseNot => {
                 let l = i32_of(activation.accumulator())?;

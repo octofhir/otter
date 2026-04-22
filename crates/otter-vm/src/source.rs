@@ -56,7 +56,7 @@ pub fn compile_eval(source: &str, source_url: &str) -> Result<Module, SourceLowe
     // Eval inherits the surrounding SourceType; we approximate with the
     // classic-script default. A dedicated eval mode will land with the
     // broader eval/$262 work post-M1.
-    ModuleCompiler::new().compile(source, source_url, SourceType::default())
+    ModuleCompiler::new().compile_eval(source, source_url, SourceType::default())
 }
 
 /// Eval mode variant used by field initializers (§B.3.5.2). Same contract
@@ -65,5 +65,5 @@ pub fn compile_eval_field_init(
     source: &str,
     source_url: &str,
 ) -> Result<Module, SourceLoweringError> {
-    ModuleCompiler::new().compile(source, source_url, SourceType::default())
+    ModuleCompiler::new().compile_eval(source, source_url, SourceType::default())
 }

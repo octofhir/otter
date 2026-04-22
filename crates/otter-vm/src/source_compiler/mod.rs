@@ -173,6 +173,12 @@ use crate::module::{
 #[derive(Debug, Default)]
 pub struct ModuleCompiler;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopLevelCompletion {
+    Undefined,
+    LastExpressionStatement,
+}
+
 impl ModuleCompiler {
     /// Creates a new, empty compiler.
     #[must_use]
@@ -197,6 +203,37 @@ impl ModuleCompiler {
         source: &str,
         source_url: &str,
         source_type: SourceType,
+    ) -> Result<Module, SourceLoweringError> {
+        self.compile_with_completion(
+            source,
+            source_url,
+            source_type,
+            TopLevelCompletion::Undefined,
+        )
+    }
+
+    /// Parse and lower `source` for `eval`, preserving the completion
+    /// value of a trailing expression statement.
+    pub fn compile_eval(
+        &self,
+        source: &str,
+        source_url: &str,
+        source_type: SourceType,
+    ) -> Result<Module, SourceLoweringError> {
+        self.compile_with_completion(
+            source,
+            source_url,
+            source_type,
+            TopLevelCompletion::LastExpressionStatement,
+        )
+    }
+
+    fn compile_with_completion(
+        &self,
+        source: &str,
+        source_url: &str,
+        source_type: SourceType,
+        completion: TopLevelCompletion,
     ) -> Result<Module, SourceLoweringError> {
         let _ = source_url;
         let allocator = Allocator::default();
@@ -230,7 +267,7 @@ impl ModuleCompiler {
         SOURCE_INDEX_OVERRIDE.with(|slot| {
             *slot.borrow_mut() = Some(std::rc::Rc::clone(&source_index));
         });
-        let result = lower_program(&parser_return.program);
+        let result = lower_program(&parser_return.program, completion);
         SOURCE_INDEX_OVERRIDE.with(|slot| {
             *slot.borrow_mut() = None;
         });
@@ -242,7 +279,10 @@ impl ModuleCompiler {
 // Lowering
 // ---------------------------------------------------------------------------
 
-fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
+fn lower_program(
+    program: &Program<'_>,
+    completion: TopLevelCompletion,
+) -> Result<Module, SourceLoweringError> {
     // The program is one or more top-level `FunctionDeclaration`s,
     // optionally mixed with `import` / `export` declarations (M35).
     // Anything else — `class`, `var`, top-level expressions or
@@ -696,6 +736,7 @@ fn lower_program(program: &Program<'_>) -> Result<Module, SourceLoweringError> {
         &module_globals,
         &script_body,
         &exported_const_vars,
+        completion,
     )?;
     let entry_idx = u32::try_from(top_idx)
         .map_err(|_| SourceLoweringError::Internal("top-level entry index overflow".into()))?;
@@ -827,6 +868,7 @@ fn synthesise_top_level_entry<'a>(
     module_globals: &[String],
     script_body: &[&'a Statement<'a>],
     exported_const_vars: &[String],
+    completion: TopLevelCompletion,
 ) -> Result<usize, SourceLoweringError> {
     // Empty params — the top-level entry takes no arguments.
     // `names` carries the top-level function-declaration names so
@@ -926,12 +968,13 @@ fn synthesise_top_level_entry<'a>(
                 ))
             })?;
     }
-    // Explicit `LdaUndefined; Return` tail — the module's
-    // evaluation completion value is always `undefined` for a
-    // script-style top-level.
-    builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
-        SourceLoweringError::Internal(format!("top-level encode LdaUndefined: {err:?}"))
-    })?;
+    let returns_trailing_expression = completion == TopLevelCompletion::LastExpressionStatement
+        && matches!(script_body.last(), Some(Statement::ExpressionStatement(_)));
+    if !returns_trailing_expression {
+        builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("top-level encode LdaUndefined: {err:?}"))
+        })?;
+    }
     builder.emit(Opcode::Return, &[]).map_err(|err| {
         SourceLoweringError::Internal(format!("top-level encode Return: {err:?}"))
     })?;
@@ -3190,6 +3233,7 @@ struct LocalBinding<'a> {
     slot: u16,
     initialized: bool,
     is_const: bool,
+    is_var: bool,
     runtime_tdz: bool,
 }
 
@@ -4180,7 +4224,27 @@ impl<'a> LoweringContext<'a> {
         is_const: bool,
         span: Span,
     ) -> Result<u16, SourceLoweringError> {
-        self.allocate_local_with_mode(name, is_const, false, span)
+        self.allocate_local_with_mode(name, is_const, false, false, span)
+    }
+
+    fn allocate_var_local(
+        &mut self,
+        name: &'a str,
+        span: Span,
+    ) -> Result<(u16, bool), SourceLoweringError> {
+        let scope_start = self.scope_starts.borrow().last().copied().unwrap_or(0);
+        if let Some(local) = self.locals[scope_start..]
+            .iter()
+            .rev()
+            .find(|local| local.name == name)
+        {
+            if local.is_var && !local.is_const {
+                return Ok((local.slot, true));
+            }
+            return Err(SourceLoweringError::unsupported("duplicate_binding", span));
+        }
+        self.allocate_local_with_mode(name, false, false, true, span)
+            .map(|slot| (slot, false))
     }
 
     fn allocate_hoisted_local(
@@ -4189,7 +4253,7 @@ impl<'a> LoweringContext<'a> {
         is_const: bool,
         span: Span,
     ) -> Result<u16, SourceLoweringError> {
-        self.allocate_local_with_mode(name, is_const, true, span)
+        self.allocate_local_with_mode(name, is_const, true, false, span)
     }
 
     fn allocate_initialized_local(
@@ -4198,7 +4262,7 @@ impl<'a> LoweringContext<'a> {
         is_const: bool,
         span: Span,
     ) -> Result<u16, SourceLoweringError> {
-        let slot = self.allocate_local_with_mode(name, is_const, false, span)?;
+        let slot = self.allocate_local_with_mode(name, is_const, false, false, span)?;
         let local = self
             .locals
             .last_mut()
@@ -4212,6 +4276,7 @@ impl<'a> LoweringContext<'a> {
         name: &'a str,
         is_const: bool,
         runtime_tdz: bool,
+        is_var: bool,
         span: Span,
     ) -> Result<u16, SourceLoweringError> {
         let scope_start = self.scope_starts.borrow().last().copied().unwrap_or(0);
@@ -4241,6 +4306,7 @@ impl<'a> LoweringContext<'a> {
             slot,
             initialized: false,
             is_const,
+            is_var,
             runtime_tdz,
         });
         let new_len = live_len
@@ -4280,6 +4346,7 @@ impl<'a> LoweringContext<'a> {
             slot,
             initialized: true,
             is_const: true,
+            is_var: false,
             runtime_tdz: false,
         });
         let new_len = live_len
@@ -4461,6 +4528,7 @@ pub(super) fn lower_let_const_declaration<'a>(
             ));
         }
     };
+    let is_var = decl.kind == VariableDeclarationKind::Var;
 
     if decl.declarations.is_empty() {
         return Err(SourceLoweringError::unsupported(
@@ -4475,7 +4543,7 @@ pub(super) fn lower_let_const_declaration<'a>(
     // declarator allocates its own slot and runs through the same
     // single-declarator path the M4 lowering already had.
     for declarator in decl.declarations.iter() {
-        lower_single_declarator(builder, ctx, declarator, is_const)?;
+        lower_single_declarator(builder, ctx, declarator, is_const, is_var)?;
     }
     Ok(())
 }
@@ -4485,6 +4553,7 @@ fn lower_single_declarator<'a>(
     ctx: &mut LoweringContext<'a>,
     declarator: &'a VariableDeclarator<'a>,
     is_const: bool,
+    is_var: bool,
 ) -> Result<(), SourceLoweringError> {
     match &declarator.id {
         BindingPattern::BindingIdentifier(ident) => {
@@ -4495,7 +4564,15 @@ fn lower_single_declarator<'a>(
                 ));
             }
             let name = ident.name.as_str();
-            let slot = ctx.allocate_local(name, is_const, declarator.span)?;
+            let (slot, reused_var) = if is_var {
+                ctx.allocate_var_local(name, declarator.span)?
+            } else {
+                (ctx.allocate_local(name, is_const, declarator.span)?, false)
+            };
+
+            if reused_var && declarator.init.is_none() {
+                return Ok(());
+            }
 
             // Lower init into acc, or use `undefined` for `var x;`
             // / `let x;` per §14.3.1. Reading the binding inside
@@ -4514,7 +4591,9 @@ fn lower_single_declarator<'a>(
             builder
                 .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
                 .map_err(|err| SourceLoweringError::Internal(format!("encode Star: {err:?}")))?;
-            ctx.mark_initialized(name)?;
+            if !reused_var {
+                ctx.mark_initialized(name)?;
+            }
             Ok(())
         }
         // M24: `let [a, b, ...rest] = init;` / `let { a, b: x, c = 0 } = init;`
@@ -9412,7 +9491,6 @@ fn apply_binary_op_with_complex_rhs(
 /// Rejects:
 /// - non-identifier target (member, destructuring, TS-only) →
 ///   stable per-shape tag;
-/// - unbound identifier → `unbound_identifier`;
 /// - const binding as target → `const_assignment`;
 /// - in-TDZ binding as target → `tdz_self_reference`;
 /// - assignment operator outside `=`/`+=`/`-=`/`*=`/`|=` → stable
@@ -10014,9 +10092,22 @@ fn lower_identifier_assignment<'a>(
 ) -> Result<(), SourceLoweringError> {
     let target_ident = ident.name.as_str();
     let target_span = ident.span;
-    let binding = ctx
-        .resolve_identifier(target_ident)
-        .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", target_span))?;
+    let Some(binding) = ctx.resolve_identifier(target_ident) else {
+        if expr.operator != AssignmentOperator::Assign {
+            return Err(SourceLoweringError::unsupported(
+                "unbound_identifier",
+                target_span,
+            ));
+        }
+        lower_return_expression(builder, ctx, &expr.right)?;
+        let prop_idx = ctx.intern_property_name(target_ident)?;
+        builder
+            .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode StaGlobal (assignment): {err:?}"))
+            })?;
+        return Ok(());
+    };
 
     // M25: assignment to an upvalue target goes through
     // `StaUpvalue` — a different shape from the register-based

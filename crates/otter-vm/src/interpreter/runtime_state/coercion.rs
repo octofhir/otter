@@ -78,6 +78,15 @@ impl RuntimeState {
             return Ok(true);
         }
 
+        // §7.2.15 step 1 delegates same-Type Number pairs to
+        // Number::equal. NaN is never loosely equal to anything,
+        // including itself; handling that terminal case here also
+        // prevents the primitive-coercion fallback from recursing on
+        // a still-NaN pair.
+        if let (Some(lhs_num), Some(rhs_num)) = (lhs.as_number(), rhs.as_number()) {
+            return Ok(!lhs_num.is_nan() && !rhs_num.is_nan() && lhs_num == rhs_num);
+        }
+
         let lhs_is_string = self.value_is_string(lhs)?;
         let rhs_is_string = self.value_is_string(rhs)?;
 

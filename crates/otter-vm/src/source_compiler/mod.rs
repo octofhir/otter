@@ -7606,6 +7606,31 @@ fn lower_unary_expression(
         return Ok(());
     }
 
+    // §13.5.1 `delete <Identifier>` — unresolvable-reference case
+    // must yield `true` in sloppy mode without triggering the usual
+    // GetValue (which would throw). Strict-mode is an early syntax
+    // error — caught by the parser, not us. For resolvable local /
+    // param / upvalue bindings, return `false` (they can't be
+    // deleted).
+    if matches!(expr.operator, UnaryOperator::Delete)
+        && let Expression::Identifier(_) = &expr.argument
+    {
+        let opcode = match &expr.argument {
+            Expression::Identifier(ident) => {
+                if ctx.resolve_identifier(ident.name.as_str()).is_some() {
+                    Opcode::LdaFalse
+                } else {
+                    Opcode::LdaTrue
+                }
+            }
+            _ => unreachable!(),
+        };
+        builder.emit(opcode, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode delete identifier: {err:?}"))
+        })?;
+        return Ok(());
+    }
+
     // Evaluate the argument into the accumulator first. The operand
     // lowering already handles every shape
     // `lower_return_expression` accepts, including nested unary /

@@ -2512,11 +2512,29 @@ fn delete_on_computed_property_returns_true() {
 }
 
 #[test]
-fn delete_on_non_reference_returns_true() {
-    // `delete x` where `x` is a plain local reference — per
-    // §13.5.1 step 3 returns `true` without removing anything.
+fn delete_on_local_binding_returns_false() {
+    // `delete x` where `x` resolves to a local / param / upvalue
+    // binding returns `false` in sloppy mode per §13.5.1 step 5.d.ii
+    // (strict mode is an early SyntaxError — caught by the parser).
+    // The local is never actually removed.
     assert_eq!(
         run_int32_function("function f() { let x = 5; return delete x ? 1 : 0; }", &[],),
+        0,
+    );
+}
+
+#[test]
+fn delete_on_unresolved_identifier_returns_true() {
+    // `delete undeclared` in sloppy mode — the reference is
+    // unresolvable (§13.5.1 step 5.b) so the operator yields `true`
+    // without throwing a ReferenceError. Previously the unconditional
+    // argument-evaluation pre-step emitted `LdaGlobal` which threw;
+    // the Delete path now short-circuits for bare identifiers.
+    assert_eq!(
+        run_int32_function(
+            "function f() { return delete totally_unbound_name ? 1 : 0; }",
+            &[],
+        ),
         1,
     );
 }

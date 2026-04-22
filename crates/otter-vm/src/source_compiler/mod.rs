@@ -7586,6 +7586,26 @@ fn lower_unary_expression(
     ctx: &LoweringContext<'_>,
     expr: &UnaryExpression<'_>,
 ) -> Result<(), SourceLoweringError> {
+    // §13.5.3 `typeof` on an unresolvable reference must return
+    // `"undefined"` rather than throw — so for the specific shape
+    // `typeof <bare-identifier>` where the identifier doesn't
+    // resolve to a local/param/upvalue, emit `TypeOfGlobal` which
+    // swallows the missing-global case. Every other argument shape
+    // (member access, call, literal, etc.) falls through to the
+    // standard evaluate-then-apply path.
+    if matches!(expr.operator, UnaryOperator::Typeof)
+        && let Expression::Identifier(ident) = &expr.argument
+        && ctx.resolve_identifier(ident.name.as_str()).is_none()
+    {
+        let prop_idx = ctx.intern_property_name(ident.name.as_str())?;
+        builder
+            .emit(Opcode::TypeOfGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode TypeOfGlobal: {err:?}"))
+            })?;
+        return Ok(());
+    }
+
     // Evaluate the argument into the accumulator first. The operand
     // lowering already handles every shape
     // `lower_return_expression` accepts, including nested unary /

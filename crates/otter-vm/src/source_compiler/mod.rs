@@ -9438,33 +9438,15 @@ fn apply_binary_op_with_acc_lhs(
                 _ => apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs),
             }
         }
-        // Complex RHS shapes — a call, a nested binary, a
-        // parenthesised binary, an assignment expression, a unary /
-        // update expression, a null/boolean/string literal, etc.
-        // The RHS lowering would clobber acc (which currently holds
-        // the LHS), so we spill LHS to a temp first, then re-stitch.
-        Expression::CallExpression(_)
-        | Expression::BinaryExpression(_)
-        | Expression::ParenthesizedExpression(_)
-        | Expression::AssignmentExpression(_)
-        | Expression::UnaryExpression(_)
-        | Expression::UpdateExpression(_)
-        | Expression::ConditionalExpression(_)
-        | Expression::LogicalExpression(_)
-        | Expression::StringLiteral(_)
-        | Expression::NullLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::ObjectExpression(_)
-        | Expression::ArrayExpression(_)
-        | Expression::StaticMemberExpression(_)
-        | Expression::ComputedMemberExpression(_)
-        | Expression::TemplateLiteral(_) => {
-            apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs)
-        }
-        other => Err(SourceLoweringError::unsupported(
-            expression_construct_tag(other),
-            other.span(),
-        )),
+        // Any other RHS shape — `new T(args)`, a function / arrow /
+        // class expression, a chain, a template-tag call, etc.
+        // `apply_binary_op_with_complex_rhs` spills the LHS to a
+        // temp and drives the RHS through `lower_return_expression`,
+        // which handles every Expression variant the expression
+        // lowerer knows about. The fast-path arms above stay as
+        // optimisations; unrecognised shapes no longer stall the
+        // whole compound assignment on a construct-tag error.
+        _ => apply_binary_op_with_complex_rhs(builder, ctx, encoding, rhs),
     }
 }
 

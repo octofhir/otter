@@ -9806,6 +9806,79 @@ fn logical_nullish_assign_on_private_field_short_circuits() {
 }
 
 #[test]
+fn compound_assign_on_implicit_global_writes_back() {
+    // `x += 5` where `x` is not in scope targets a global reference
+    // (§9.1.1.4 GlobalEnvironmentRecord + §13.15.2): LdaGlobal
+    // reads, the binary op runs in acc, StaGlobal writes back.
+    let src = "function main() { \
+        x = 10; \
+        function bump() { x += 5; } \
+        bump(); \
+        return x; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 15);
+}
+
+#[test]
+fn compound_assign_on_undeclared_global_throws_reference_error() {
+    // Without a prior plain assignment, the binding is absent on
+    // globalThis — `x += 1` must throw ReferenceError from LdaGlobal,
+    // matching the spec's GetValue(ref) behaviour for an unresolved
+    // reference.
+    let err =
+        run_string_function_catching("function f() { undeclared_compound += 1; return 0; }", &[])
+            .expect_err("undeclared compound should throw");
+    assert_eq!(err, "ReferenceError: undeclared_compound is not defined");
+}
+
+#[test]
+fn logical_or_assign_on_implicit_global_writes_when_falsy() {
+    let src = "function main() { \
+        g = 0; \
+        function bump() { g ||= 42; } \
+        bump(); \
+        return g; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn logical_nullish_assign_on_implicit_global_short_circuits_on_zero() {
+    // `g` is 0 (not nullish) so `??=` leaves it alone even though
+    // the LHS is falsy. Distinguishes `??=` from `||=` on globals.
+    let src = "function main() { \
+        g = 0; \
+        function bump() { g ??= 77; } \
+        bump(); \
+        return g; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn postfix_increment_on_implicit_global_writes_back() {
+    // `c++` on a global: LdaGlobal reads the current value, Inc
+    // produces the new value, StaGlobal writes it back. The old
+    // value reaches the completion through the postfix spill.
+    let src = "function main() { \
+        c = 10; \
+        function bump() { return c++; } \
+        let prev = bump(); \
+        return c - prev; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn prefix_increment_on_undeclared_global_throws_reference_error() {
+    // `++x` on an absent binding: LdaGlobal throws ReferenceError
+    // before Inc ever runs.
+    let err = run_string_function_catching("function f() { ++undeclared_update; return 0; }", &[])
+        .expect_err("undeclared update should throw");
+    assert_eq!(err, "ReferenceError: undeclared_update is not defined");
+}
+
+#[test]
 fn logical_or_assign_on_super_property() {
     // `super.x ||= 5` — GetSuperProperty reads from the parent's
     // prototype; since the parent defines `x = 0`, the OR-short-

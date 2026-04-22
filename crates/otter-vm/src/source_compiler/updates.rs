@@ -35,9 +35,30 @@ fn lower_identifier_update(
     expr: &UpdateExpression<'_>,
     ident: &IdentifierReference<'_>,
 ) -> Result<(), SourceLoweringError> {
-    let binding = ctx
-        .resolve_identifier(ident.name.as_str())
-        .ok_or_else(|| SourceLoweringError::unsupported("unbound_identifier", ident.span))?;
+    // `counter++` / `++counter` against an unresolved identifier reads
+    // through the global reference (§13.4.{2,4,5,6}.1): GetValue(ref)
+    // → LdaGlobal (throws ReferenceError if absent), Inc/Dec on the
+    // coerced number, PutValue(ref) → StaGlobal.
+    let Some(binding) = ctx.resolve_identifier(ident.name.as_str()) else {
+        let prop_idx = ctx.intern_property_name(ident.name.as_str())?;
+        builder
+            .emit(Opcode::LdaGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaGlobal (identifier update): {err:?}"
+                ))
+            })?;
+        return apply_update_to_loaded_value(builder, ctx, expr, |builder| {
+            builder
+                .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode StaGlobal (identifier update): {err:?}"
+                    ))
+                })?;
+            Ok(())
+        });
+    };
     enum Target {
         Reg(u16),
         Upvalue(u16),

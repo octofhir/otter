@@ -10094,18 +10094,67 @@ fn lower_identifier_assignment<'a>(
     let target_ident = ident.name.as_str();
     let target_span = ident.span;
     let Some(binding) = ctx.resolve_identifier(target_ident) else {
-        if expr.operator != AssignmentOperator::Assign {
-            return Err(SourceLoweringError::unsupported(
-                "unbound_identifier",
-                target_span,
-            ));
-        }
-        lower_return_expression(builder, ctx, &expr.right)?;
+        // Unresolved identifier → the assignment targets a global
+        // reference (§13.15.2 + §9.1.1.4 GlobalEnvironmentRecord).
+        // For plain `=` we skip the read and just StaGlobal; for
+        // compound / logical we still need to GetValue(ref) first —
+        // which is exactly LdaGlobal's semantics (throws ReferenceError
+        // when the binding is genuinely absent on the global object).
         let prop_idx = ctx.intern_property_name(target_ident)?;
+        if let Some(kind) = logical_assignment::classify(expr.operator) {
+            builder
+                .emit(Opcode::LdaGlobal, &[Operand::Idx(prop_idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaGlobal (logical global lhs): {err:?}"
+                    ))
+                })?;
+            let end_label = builder.new_label();
+            logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode StaGlobal (logical global): {err:?}"
+                    ))
+                })?;
+            builder.bind_label(end_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind logical global end: {err:?}"))
+            })?;
+            return Ok(());
+        }
+        if expr.operator == AssignmentOperator::Assign {
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode StaGlobal (assignment): {err:?}"))
+                })?;
+            return Ok(());
+        }
+        let bin_op = compound_assign_to_binary_operator(expr.operator).ok_or_else(|| {
+            SourceLoweringError::unsupported(assignment_operator_tag(expr.operator), expr.span)
+        })?;
+        let encoding = binary_op_encoding(bin_op).ok_or_else(|| {
+            SourceLoweringError::Internal(format!(
+                "compound assignment {bin_op:?} has no binary opcode encoding"
+            ))
+        })?;
+        builder
+            .emit(Opcode::LdaGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaGlobal (compound global lhs): {err:?}"
+                ))
+            })?;
+        apply_binary_op_with_acc_lhs(builder, ctx, &encoding, &expr.right)?;
         builder
             .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
             .map_err(|err| {
-                SourceLoweringError::Internal(format!("encode StaGlobal (assignment): {err:?}"))
+                SourceLoweringError::Internal(format!(
+                    "encode StaGlobal (compound global): {err:?}"
+                ))
             })?;
         return Ok(());
     };

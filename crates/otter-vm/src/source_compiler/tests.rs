@@ -9615,3 +9615,209 @@ fn spread_in_new_expression_routes_through_construct_spread() {
         15
     );
 }
+
+// ---------------------------------------------------------------------------
+// Logical compound assignment (`||=`, `&&=`, `??=`) — ES2021, §13.15.2
+// ---------------------------------------------------------------------------
+
+#[test]
+fn logical_or_assign_local_falsy_writes() {
+    // `x ||= 5` when x is falsy: the write fires and x ends up 5.
+    assert_eq!(
+        run_int32_function("function f() { let x = 0; x ||= 5; return x; }", &[]),
+        5,
+    );
+}
+
+#[test]
+fn logical_or_assign_local_truthy_short_circuits() {
+    // `x ||= 5` when x is already truthy: assignment is skipped,
+    // x is preserved.
+    assert_eq!(
+        run_int32_function("function f() { let x = 3; x ||= 5; return x; }", &[]),
+        3,
+    );
+}
+
+#[test]
+fn logical_and_assign_local_truthy_writes() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 7; x &&= 9; return x; }", &[]),
+        9,
+    );
+}
+
+#[test]
+fn logical_and_assign_local_falsy_short_circuits() {
+    assert_eq!(
+        run_int32_function("function f() { let x = 0; x &&= 9; return x; }", &[]),
+        0,
+    );
+}
+
+#[test]
+fn logical_nullish_assign_writes_when_undefined() {
+    // `x ??= 5` — x starts as `undefined`, so the write fires.
+    assert_eq!(
+        run_int32_function("function f() { let x; x ??= 5; return x; }", &[]),
+        5,
+    );
+}
+
+#[test]
+fn logical_nullish_assign_short_circuits_on_zero() {
+    // `x ??= 7` — x is 0, which is *not* nullish, so the assign
+    // is skipped. This distinguishes `??=` from `||=`: the latter
+    // would overwrite here because 0 is falsy.
+    assert_eq!(
+        run_int32_function("function f() { let x = 0; x ??= 7; return x; }", &[]),
+        0,
+    );
+}
+
+#[test]
+fn logical_or_assign_does_not_evaluate_rhs_on_short_circuit() {
+    // Observable proof that the RHS is elided when the LHS
+    // short-circuits: `bump` bumps `calls`, so the result tells
+    // us whether the RHS ran.
+    //
+    //   x = 3 (truthy) → `x ||= bump()` short-circuits → calls stays 0.
+    let src = "function main() { \
+        let calls = 0; \
+        function bump() { calls += 1; return 7; } \
+        let x = 3; \
+        x ||= bump(); \
+        return calls; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn logical_and_assign_does_not_evaluate_rhs_on_short_circuit() {
+    // `x = 0 (falsy) → x &&= bump()` short-circuits.
+    let src = "function main() { \
+        let calls = 0; \
+        function bump() { calls += 1; return 7; } \
+        let x = 0; \
+        x &&= bump(); \
+        return calls; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn logical_or_assign_on_captured_binding() {
+    // Upvalue target: inner closure assigns to a binding captured
+    // from `make`. `counter` starts at 0 (falsy) so `||=` writes.
+    let src = "function make() { \
+        let counter = 0; \
+        let bump = function() { counter ||= 42; }; \
+        bump(); \
+        return counter; \
+    } \
+    function main() { return make(); }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn logical_nullish_assign_on_captured_binding_short_circuits() {
+    // Upvalue target: `counter` is 0 (not nullish), so `??=`
+    // leaves it alone.
+    let src = "function make() { \
+        let counter = 0; \
+        let bump = function() { counter ??= 99; }; \
+        bump(); \
+        return counter; \
+    } \
+    function main() { return make(); }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn logical_or_assign_on_static_member() {
+    // `o.x ||= 5` — o.x is undefined (falsy), so write fires.
+    assert_eq!(
+        run_int32_function("function f() { let o = {}; o.x ||= 5; return o.x; }", &[]),
+        5,
+    );
+}
+
+#[test]
+fn logical_or_assign_on_static_member_short_circuits() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let o = { x: 10 }; o.x ||= 5; return o.x; }",
+            &[],
+        ),
+        10,
+    );
+}
+
+#[test]
+fn logical_nullish_assign_on_computed_member_preserves_key_evaluation_order() {
+    // `o[keyExpr] ??= rhs` — keyExpr must evaluate exactly once
+    // per §13.15.2 (EvaluatePropertyAccess + PutValue each hold
+    // the same reference record). `bump` bumps `calls`; we check
+    // that regardless of whether the short-circuit fires, the
+    // key expression ran exactly once.
+    let src = "function main() { \
+        let calls = 0; \
+        function key() { calls += 1; return \"n\"; } \
+        let o = {}; \
+        o[key()] ??= 7; \
+        return calls; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
+#[test]
+fn logical_and_assign_on_computed_member_short_circuits() {
+    // Falsy LHS (0) on a computed member: `&&=` must skip the
+    // store.
+    let src = "function main() { \
+        let o = { n: 0 }; \
+        o[\"n\"] &&= 99; \
+        return o.n; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn logical_or_assign_on_private_field_writes() {
+    // `this.#p ||= 5` — private field starts as 0 (falsy), so
+    // the write fires. Exercises GetPrivateField + SetPrivateField
+    // with the logical short-circuit in between.
+    let src = "function main() { \
+        class C { #p = 0; bump() { this.#p ||= 5; return this.#p; } } \
+        let c = new C(); \
+        return c.bump(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 5);
+}
+
+#[test]
+fn logical_nullish_assign_on_private_field_short_circuits() {
+    let src = "function main() { \
+        class C { #p = 0; maybe() { this.#p ??= 77; return this.#p; } } \
+        let c = new C(); \
+        return c.maybe(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 0);
+}
+
+#[test]
+fn logical_or_assign_on_super_property() {
+    // `super.x ||= 5` — GetSuperProperty reads from the parent's
+    // prototype; since the parent defines `x = 0`, the OR-short-
+    // circuit falls through and SetSuperProperty writes 5 onto
+    // the instance (leaving the parent prototype intact).
+    let src = "function main() { \
+        class A { constructor() { this.x = 0; } } \
+        class B extends A { \
+            bump() { super.x ||= 5; return this.x; } \
+        } \
+        let b = new B(); \
+        return b.bump(); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 5);
+}

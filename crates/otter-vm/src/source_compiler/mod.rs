@@ -110,6 +110,7 @@ mod assignment_targets;
 mod direct_calls;
 mod error;
 mod for_in_of;
+mod logical_assignment;
 mod optional_calls;
 mod switch_scope;
 mod try_finally;
@@ -10117,6 +10118,30 @@ fn lower_identifier_assignment<'a>(
         is_const: false,
     } = binding
     {
+        // Logical compound (`||=`, `&&=`, `??=`) short-circuits on
+        // the LHS and therefore needs a gated store — the StaUpvalue
+        // below must run only on the fall-through path.
+        if let Some(kind) = logical_assignment::classify(expr.operator) {
+            emit_assert_binding_ready_for_write(
+                builder,
+                binding,
+                target_span,
+                "assign upvalue (logical)",
+            )?;
+            emit_load_binding_value(builder, binding, target_span, "logical upvalue lhs")?;
+            let end_label = builder.new_label();
+            logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .emit(Opcode::StaUpvalue, &[Operand::Idx(u32::from(idx))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode StaUpvalue (logical): {err:?}"))
+                })?;
+            builder.bind_label(end_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind logical upvalue end: {err:?}"))
+            })?;
+            return Ok(());
+        }
         if expr.operator == AssignmentOperator::Assign {
             emit_assert_binding_ready_for_write(builder, binding, target_span, "assign upvalue")?;
             lower_return_expression(builder, ctx, &expr.right)?;
@@ -10182,6 +10207,41 @@ fn lower_identifier_assignment<'a>(
         BindingRef::Param { reg } => reg,
         BindingRef::Upvalue { .. } => unreachable!("handled above"),
     };
+
+    // Logical compound (`||=`, `&&=`, `??=`) gates the Star on the
+    // short-circuit outcome, so it can't reuse the unconditional
+    // Star below.
+    if let Some(kind) = logical_assignment::classify(expr.operator) {
+        if matches!(
+            binding,
+            BindingRef::Local {
+                initialized: true,
+                ..
+            }
+        ) {
+            let ldar_pc = builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(target_reg))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!("encode Ldar (logical lhs): {err:?}"))
+                })?;
+            let ldar_slot = ctx.allocate_arithmetic_feedback();
+            builder.attach_feedback(ldar_pc, ldar_slot);
+        } else {
+            emit_load_binding_value(builder, binding, target_span, "logical lhs")?;
+        }
+        let end_label = builder.new_label();
+        logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+        lower_return_expression(builder, ctx, &expr.right)?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(target_reg))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (logical): {err:?}"))
+            })?;
+        builder.bind_label(end_label).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind logical local end: {err:?}"))
+        })?;
+        return Ok(());
+    }
 
     if expr.operator == AssignmentOperator::Assign {
         lower_return_expression(builder, ctx, &expr.right)?;
@@ -10271,6 +10331,35 @@ fn lower_static_member_assignment<'a>(
                         "encode Star (super.x receiver): {err:?}"
                     ))
                 })?;
+            if let Some(kind) = logical_assignment::classify(expr.operator) {
+                builder
+                    .emit(
+                        Opcode::GetSuperProperty,
+                        &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode GetSuperProperty (logical lhs): {err:?}"
+                        ))
+                    })?;
+                let end_label = builder.new_label();
+                logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+                lower_return_expression(builder, ctx, &expr.right)?;
+                builder
+                    .emit(
+                        Opcode::SetSuperProperty,
+                        &[Operand::Reg(u32::from(receiver_temp)), Operand::Idx(idx)],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode SetSuperProperty (logical): {err:?}"
+                        ))
+                    })?;
+                builder.bind_label(end_label).map_err(|err| {
+                    SourceLoweringError::Internal(format!("bind logical super.x end: {err:?}"))
+                })?;
+                return Ok(());
+            }
             if expr.operator == AssignmentOperator::Assign {
                 lower_return_expression(builder, ctx, &expr.right)?;
             } else {
@@ -10315,6 +10404,35 @@ fn lower_static_member_assignment<'a>(
     let idx = ctx.intern_property_name(member.property.name.as_str())?;
 
     let lower = (|| -> Result<(), SourceLoweringError> {
+        if let Some(kind) = logical_assignment::classify(expr.operator) {
+            builder
+                .emit(
+                    Opcode::LdaNamedProperty,
+                    &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaNamedProperty (logical lhs): {err:?}"
+                    ))
+                })?;
+            let end_label = builder.new_label();
+            logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .emit(
+                    Opcode::StaNamedProperty,
+                    &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode StaNamedProperty (logical): {err:?}"
+                    ))
+                })?;
+            builder.bind_label(end_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind logical o.x end: {err:?}"))
+            })?;
+            return Ok(());
+        }
         if expr.operator == AssignmentOperator::Assign {
             lower_return_expression(builder, ctx, &expr.right)?;
         } else {
@@ -10414,6 +10532,41 @@ fn lower_computed_member_assignment<'a>(
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!("encode Star (super[k] key): {err:?}"))
                 })?;
+            if let Some(kind) = logical_assignment::classify(expr.operator) {
+                builder
+                    .emit(
+                        Opcode::GetSuperPropertyComputed,
+                        &[
+                            Operand::Reg(u32::from(receiver_temp)),
+                            Operand::Reg(u32::from(key_temp)),
+                        ],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode GetSuperPropertyComputed (logical lhs): {err:?}"
+                        ))
+                    })?;
+                let end_label = builder.new_label();
+                logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+                lower_return_expression(builder, ctx, &expr.right)?;
+                builder
+                    .emit(
+                        Opcode::SetSuperPropertyComputed,
+                        &[
+                            Operand::Reg(u32::from(receiver_temp)),
+                            Operand::Reg(u32::from(key_temp)),
+                        ],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode SetSuperPropertyComputed (logical): {err:?}"
+                        ))
+                    })?;
+                builder.bind_label(end_label).map_err(|err| {
+                    SourceLoweringError::Internal(format!("bind logical super[k] end: {err:?}"))
+                })?;
+                return Ok(());
+            }
             if expr.operator == AssignmentOperator::Assign {
                 lower_return_expression(builder, ctx, &expr.right)?;
             } else {
@@ -10474,6 +10627,47 @@ fn lower_computed_member_assignment<'a>(
             .map_err(|err| {
                 SourceLoweringError::Internal(format!("encode Star (computed key spill): {err:?}"))
             })?;
+
+        if let Some(kind) = logical_assignment::classify(expr.operator) {
+            // Reload key into acc for LdaKeyedProperty.
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(key_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Ldar (computed logical key): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(
+                    Opcode::LdaKeyedProperty,
+                    &[Operand::Reg(u32::from(base.reg))],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode LdaKeyedProperty (logical lhs): {err:?}"
+                    ))
+                })?;
+            let end_label = builder.new_label();
+            logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .emit(
+                    Opcode::StaKeyedProperty,
+                    &[
+                        Operand::Reg(u32::from(base.reg)),
+                        Operand::Reg(u32::from(key_temp)),
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode StaKeyedProperty (logical): {err:?}"
+                    ))
+                })?;
+            builder.bind_label(end_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind logical o[k] end: {err:?}"))
+            })?;
+            return Ok(());
+        }
 
         if expr.operator == AssignmentOperator::Assign {
             lower_return_expression(builder, ctx, &expr.right)?;
@@ -10548,6 +10742,35 @@ fn lower_private_field_assignment<'a>(
     let idx = ctx.intern_property_name(name)?;
 
     let lower = (|| -> Result<(), SourceLoweringError> {
+        if let Some(kind) = logical_assignment::classify(expr.operator) {
+            builder
+                .emit(
+                    Opcode::GetPrivateField,
+                    &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode GetPrivateField (logical lhs): {err:?}"
+                    ))
+                })?;
+            let end_label = builder.new_label();
+            logical_assignment::emit_short_circuit_jump(builder, kind, end_label)?;
+            lower_return_expression(builder, ctx, &expr.right)?;
+            builder
+                .emit(
+                    Opcode::SetPrivateField,
+                    &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode SetPrivateField (logical): {err:?}"
+                    ))
+                })?;
+            builder.bind_label(end_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind logical #field end: {err:?}"))
+            })?;
+            return Ok(());
+        }
         if expr.operator == AssignmentOperator::Assign {
             lower_return_expression(builder, ctx, &expr.right)?;
         } else {

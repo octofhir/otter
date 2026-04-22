@@ -5803,6 +5803,24 @@ fn lower_return_expression<'a>(
             })?;
             Ok(())
         }
+        // §13.16 Comma Operator — `(a, b, c)`. Evaluate each sub-
+        // expression left-to-right, discarding the accumulator value
+        // of all but the final one, which becomes the expression's
+        // completion. The parser guarantees at least two expressions;
+        // we defensively pass a single-element sequence straight
+        // through to the inner lowering so degenerate parser output
+        // stays harmless.
+        Expression::SequenceExpression(seq) => {
+            let Some((last, head)) = seq.expressions.split_last() else {
+                return Err(SourceLoweringError::Internal(
+                    "SequenceExpression with no expressions".into(),
+                ));
+            };
+            for discarded in head {
+                lower_return_expression(builder, ctx, discarded)?;
+            }
+            lower_return_expression(builder, ctx, last)
+        }
         other => Err(SourceLoweringError::unsupported(
             expression_construct_tag(other),
             other.span(),

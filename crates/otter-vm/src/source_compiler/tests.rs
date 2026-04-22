@@ -9878,6 +9878,63 @@ fn prefix_increment_on_undeclared_global_throws_reference_error() {
     assert_eq!(err, "ReferenceError: undeclared_update is not defined");
 }
 
+// ---------------------------------------------------------------------------
+// Sequence (comma) expression — §13.16
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sequence_expression_returns_last_value() {
+    // `(a, b, c)` evaluates left-to-right, yields the last.
+    assert_eq!(
+        run_int32_function("function f() { return (1, 2, 3); }", &[]),
+        3,
+    );
+}
+
+#[test]
+fn sequence_expression_runs_all_subexpressions_for_side_effects() {
+    // Each sub-expression's side effect must fire. `(x = 1, x += 2,
+    // x += 4, x)` should leave x = 7 and yield x.
+    let src = "function f() { \
+        let x = 0; \
+        return (x = 1, x += 2, x += 4, x); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn sequence_expression_in_for_update_runs_left_to_right() {
+    // Classic `for (;; i++, j--)` idiom. Both updates must fire
+    // every iteration.
+    let src = "function f() { \
+        let i = 0; \
+        let j = 10; \
+        while (i < 5) { \
+            (i++, j--); \
+        } \
+        return j; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 5);
+}
+
+#[test]
+fn sequence_expression_as_call_argument_is_single_arg() {
+    // `f((1, 2))` passes exactly one argument (the sequence's
+    // completion value, 2), not two arguments — the parens
+    // create a single expression around the SequenceExpression.
+    let src = "function one(x) { return x + 100; } \
+               function f() { return one((1, 2)); }";
+    assert_eq!(run_int32_function(src, &[]), 102);
+}
+
+#[test]
+fn sequence_expression_composes_with_ternary() {
+    // `(a, b) ? t : f` — the test evaluates the whole sequence,
+    // so only the last value (b) drives the branch.
+    let src = "function f() { return (1, 0) ? 10 : 20; }";
+    assert_eq!(run_int32_function(src, &[]), 20);
+}
+
 #[test]
 fn logical_or_assign_on_super_property() {
     // `super.x ||= 5` — GetSuperProperty reads from the parent's

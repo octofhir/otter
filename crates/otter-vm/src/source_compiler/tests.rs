@@ -1507,7 +1507,7 @@ fn loose_equality_boolean_number_coerces() {
 fn loose_equality_nan_number_pairs_are_false() {
     assert_eq!(
         run_int32_function(
-            "function f() { if ((Number.NaN == true) === false && (Number.NaN == Number.NaN) === false) { return 1; } return 0; }",
+            "function f() { if ((Number.NaN == true) === false && (Number.NaN == Number.NaN) === false && (Number.NaN == undefined) === false) { return 1; } return 0; }",
             &[],
         ),
         1,
@@ -1518,6 +1518,17 @@ fn loose_equality_nan_number_pairs_are_false() {
 fn loose_equality_non_decimal_string_to_number() {
     assert_eq!(
         run_int32_function("function f() { return (255 == \"0xff\") ? 1 : 0; }", &[]),
+        1,
+    );
+}
+
+#[test]
+fn loose_equality_distinct_objects_are_false() {
+    assert_eq!(
+        run_int32_function(
+            "function f() { let x = {}; let y = x; if (({} == {}) === false && (new Boolean(true) == new Boolean(true)) === false && (x == y) === true) { return 1; } return 0; }",
+            &[],
+        ),
         1,
     );
 }

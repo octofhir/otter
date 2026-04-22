@@ -87,6 +87,13 @@ impl RuntimeState {
             return Ok(!lhs_num.is_nan() && !rhs_num.is_nan() && lhs_num == rhs_num);
         }
 
+        // Same-Type Object pairs were already checked by strict_eq above.
+        // Distinct object references compare false for loose equality;
+        // ToPrimitive only applies to Object-vs-primitive pairs.
+        if lhs.as_object_handle().is_some() && rhs.as_object_handle().is_some() {
+            return Ok(false);
+        }
+
         let lhs_is_string = self.value_is_string(lhs)?;
         let rhs_is_string = self.value_is_string(rhs)?;
 
@@ -141,7 +148,7 @@ impl RuntimeState {
         if coerced_lhs == coerced_rhs {
             return Ok(true);
         }
-        if coerced_lhs != lhs || coerced_rhs != rhs {
+        if coerced_lhs.raw_bits() != lhs.raw_bits() || coerced_rhs.raw_bits() != rhs.raw_bits() {
             return self.js_loose_eq(coerced_lhs, coerced_rhs);
         }
 

@@ -7940,6 +7940,8 @@ fn lower_object_expression(
                 let key_name = match &prop.key {
                     PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
                     PropertyKey::StringLiteral(lit) => lit.value.as_str().to_owned(),
+                    PropertyKey::NumericLiteral(lit) => numeric_literal_property_key(lit.value),
+                    PropertyKey::BigIntLiteral(lit) => lit.value.as_str().to_owned(),
                     other => {
                         return Err(SourceLoweringError::unsupported(
                             property_key_tag(other),
@@ -8001,6 +8003,15 @@ fn lower_object_expression(
             let key_name = match &prop.key {
                 PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
                 PropertyKey::StringLiteral(lit) => lit.value.as_str().to_owned(),
+                // §13.2.5.4 — numeric-literal keys stringify per the
+                // CanonicalNumericIndexString algorithm (essentially
+                // `ToString(n)`), so `{0: "a", 1.5: "b"}` becomes
+                // `{"0": "a", "1.5": "b"}` at runtime.
+                PropertyKey::NumericLiteral(lit) => numeric_literal_property_key(lit.value),
+                // §13.2.5.4 — BigInt keys stringify without the `n`
+                // suffix (`{1n: "a"}` → `{"1": "a"}`). oxc hands us
+                // the already-normalised base-10 digits.
+                PropertyKey::BigIntLiteral(lit) => lit.value.as_str().to_owned(),
                 other => {
                     return Err(SourceLoweringError::unsupported(
                         property_key_tag(other),
@@ -8800,6 +8811,21 @@ fn lower_tagged_template_expression<'a>(
     ctx.release_temps(argc); // args
     ctx.release_temps(1); // callee_temp
     lower
+}
+
+/// §7.1.17 ToString for a numeric property-key literal. Integer
+/// values format without a decimal point, matching
+/// `Number.prototype.toString` / ES2024 §7.1.17 — so `{0: ...}`
+/// becomes property name `"0"`, not `"0.0"`. `NaN` and `Infinity`
+/// can't reach here (parser rejects them as property keys) but the
+/// fallback uses Rust's default f64 `Display`, which is fine for the
+/// rare fractional literal case.
+fn numeric_literal_property_key(value: f64) -> String {
+    if value.is_finite() && value == value.trunc() && value.abs() < 1e21 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
 }
 
 /// Stable tag for unsupported `PropertyKey` shapes — surfaces in

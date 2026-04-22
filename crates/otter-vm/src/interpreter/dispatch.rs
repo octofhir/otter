@@ -461,16 +461,33 @@ impl Interpreter {
                 }
             }
             Opcode::SubSmi => {
+                // Mirror AddSmi: fall through to `js_subtract` when
+                // acc isn't int32 so `obj - 2` on a Number object or
+                // a string works per §13.15.3.
                 let v = imm(&instr.operands, 0)?;
-                let l = i32_of(activation.accumulator())?;
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_sub(v)));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                let acc = activation.accumulator();
+                if let Some(l) = acc.as_i32() {
+                    activation.set_accumulator(RegisterValue::from_i32(l.wrapping_sub(v)));
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                } else {
+                    let rhs = RegisterValue::from_i32(v);
+                    let result = runtime.js_subtract(acc, rhs)?;
+                    activation.set_accumulator(result);
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
+                }
             }
             Opcode::MulSmi => {
                 let v = imm(&instr.operands, 0)?;
-                let l = i32_of(activation.accumulator())?;
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_mul(v)));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                let acc = activation.accumulator();
+                if let Some(l) = acc.as_i32() {
+                    activation.set_accumulator(RegisterValue::from_i32(l.wrapping_mul(v)));
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                } else {
+                    let rhs = RegisterValue::from_i32(v);
+                    let result = runtime.js_multiply(acc, rhs)?;
+                    activation.set_accumulator(result);
+                    frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Any);
+                }
             }
             Opcode::BitwiseOrSmi => {
                 let v = imm(&instr.operands, 0)?;
@@ -517,12 +534,25 @@ impl Interpreter {
 
             // ---- Unary ops on accumulator ----
             Opcode::Inc => {
-                let l = i32_of(activation.accumulator())?;
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_add(1)));
+                // §13.4.4.1 / §13.4.5.1 ToNumeric before the +1.
+                // `new Number(5)++`, `"3"++`, `true++` all need to
+                // coerce to a number first rather than throw.
+                let acc = activation.accumulator();
+                if let Some(l) = acc.as_i32() {
+                    activation.set_accumulator(RegisterValue::from_i32(l.wrapping_add(1)));
+                } else {
+                    let n = runtime.js_to_number(acc)?;
+                    activation.set_accumulator(RegisterValue::from_number(n + 1.0));
+                }
             }
             Opcode::Dec => {
-                let l = i32_of(activation.accumulator())?;
-                activation.set_accumulator(RegisterValue::from_i32(l.wrapping_sub(1)));
+                let acc = activation.accumulator();
+                if let Some(l) = acc.as_i32() {
+                    activation.set_accumulator(RegisterValue::from_i32(l.wrapping_sub(1)));
+                } else {
+                    let n = runtime.js_to_number(acc)?;
+                    activation.set_accumulator(RegisterValue::from_number(n - 1.0));
+                }
             }
             Opcode::Negate => {
                 let value = activation.accumulator();

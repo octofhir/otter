@@ -5030,6 +5030,11 @@ fn lower_object_pattern<'a>(
             let key_name = match &prop.key {
                 PropertyKey::StaticIdentifier(ident) => ident.name.as_str().to_owned(),
                 PropertyKey::StringLiteral(lit) => lit.value.as_str().to_owned(),
+                // Object destructuring pattern — `let { 0: x, 1n: y }
+                // = obj;` — numeric / BigInt keys stringify the same
+                // way as in object literals.
+                PropertyKey::NumericLiteral(lit) => numeric_literal_property_key(lit.value),
+                PropertyKey::BigIntLiteral(lit) => lit.value.as_str().to_owned(),
                 other => {
                     return Err(SourceLoweringError::unsupported(
                         property_key_tag(other),
@@ -6233,6 +6238,13 @@ fn lower_class_body_core<'a>(
                 let (key_name_owned, is_private_method) = match &method.key {
                     PropertyKey::StaticIdentifier(ident) => (ident.name.to_string(), false),
                     PropertyKey::StringLiteral(lit) => (lit.value.to_string(), false),
+                    // §15.7.11 — numeric / BigInt method keys stringify
+                    // as property names. `class C { 0() {} 1n() {} }`
+                    // binds `"0"` and `"1"` on the prototype.
+                    PropertyKey::NumericLiteral(lit) => {
+                        (numeric_literal_property_key(lit.value), false)
+                    }
+                    PropertyKey::BigIntLiteral(lit) => (lit.value.to_string(), false),
                     PropertyKey::PrivateIdentifier(ident) => {
                         // Private methods live in the class's
                         // private-name namespace — register the
@@ -6312,6 +6324,34 @@ fn lower_class_body_core<'a>(
                         }
                     }
                     PropertyKey::StringLiteral(lit) => {
+                        let field = ClassField {
+                            name: lit.value.to_string(),
+                            is_private: false,
+                            initializer: prop.value.as_ref(),
+                            span: prop.span,
+                        };
+                        if prop.r#static {
+                            static_fields.push(field);
+                        } else {
+                            instance_fields.push(field);
+                        }
+                    }
+                    // §15.7.10 — numeric / BigInt class field keys
+                    // stringify the same way as object-literal keys.
+                    PropertyKey::NumericLiteral(lit) => {
+                        let field = ClassField {
+                            name: numeric_literal_property_key(lit.value),
+                            is_private: false,
+                            initializer: prop.value.as_ref(),
+                            span: prop.span,
+                        };
+                        if prop.r#static {
+                            static_fields.push(field);
+                        } else {
+                            instance_fields.push(field);
+                        }
+                    }
+                    PropertyKey::BigIntLiteral(lit) => {
                         let field = ClassField {
                             name: lit.value.to_string(),
                             is_private: false,

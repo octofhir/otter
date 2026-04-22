@@ -331,50 +331,62 @@ impl Interpreter {
                 }
             }
             Opcode::BitwiseOr => {
+                // §13.12.3 Bitwise operators — each operand goes
+                // through ToInt32 (§7.1.6), which in turn calls
+                // ToNumber. `as_i32()` is the fast path for pure
+                // int32 operands; anything else — a heap Number,
+                // Boolean object, string convertible to a number,
+                // etc. — falls through to `js_to_int32` so the op
+                // returns the spec-defined result instead of a
+                // TypeError.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
+                let acc = activation.accumulator();
+                let (l, r, feedback) = coerce_int32_pair(runtime, acc, rhs)?;
                 activation.set_accumulator(RegisterValue::from_i32(l | r));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::BitwiseAnd => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
+                let acc = activation.accumulator();
+                let (l, r, feedback) = coerce_int32_pair(runtime, acc, rhs)?;
                 activation.set_accumulator(RegisterValue::from_i32(l & r));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::BitwiseXor => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
+                let acc = activation.accumulator();
+                let (l, r, feedback) = coerce_int32_pair(runtime, acc, rhs)?;
                 activation.set_accumulator(RegisterValue::from_i32(l ^ r));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::Shl => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
+                let acc = activation.accumulator();
+                let (l, r, feedback) = coerce_int32_pair(runtime, acc, rhs)?;
                 // §13.9.2 — shift amount masked to low 5 bits.
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shl((r as u32) & 0x1F)));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::Shr => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
+                let acc = activation.accumulator();
+                let (l, r, feedback) = coerce_int32_pair(runtime, acc, rhs)?;
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shr((r as u32) & 0x1F)));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::UShr => {
+                // §13.9.3 — UShr coerces LHS via ToUint32 (i32 bit
+                // pattern reused as u32).
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())? as u32;
-                let r = i32_of(rhs)? as u32;
+                let acc = activation.accumulator();
+                let (l, r, feedback) = coerce_int32_pair(runtime, acc, rhs)?;
+                let l = l as u32;
+                let r = r as u32;
                 activation
                     .set_accumulator(RegisterValue::from_i32((l.wrapping_shr(r & 0x1F)) as i32));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::Div => {
                 // §13.15.3 Division. Int32 fast-path gives truncated
@@ -462,29 +474,45 @@ impl Interpreter {
             }
             Opcode::BitwiseOrSmi => {
                 let v = imm(&instr.operands, 0)?;
-                let l = i32_of(activation.accumulator())?;
+                let acc = activation.accumulator();
+                let (l, feedback) = match acc.as_i32() {
+                    Some(l) => (l, ArithmeticFeedback::Int32),
+                    None => (runtime.js_to_int32(acc)?, ArithmeticFeedback::Any),
+                };
                 activation.set_accumulator(RegisterValue::from_i32(l | v));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::BitwiseAndSmi => {
                 let v = imm(&instr.operands, 0)?;
-                let l = i32_of(activation.accumulator())?;
+                let acc = activation.accumulator();
+                let (l, feedback) = match acc.as_i32() {
+                    Some(l) => (l, ArithmeticFeedback::Int32),
+                    None => (runtime.js_to_int32(acc)?, ArithmeticFeedback::Any),
+                };
                 activation.set_accumulator(RegisterValue::from_i32(l & v));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::ShlSmi => {
                 let v = imm(&instr.operands, 0)?;
-                let l = i32_of(activation.accumulator())?;
+                let acc = activation.accumulator();
+                let (l, feedback) = match acc.as_i32() {
+                    Some(l) => (l, ArithmeticFeedback::Int32),
+                    None => (runtime.js_to_int32(acc)?, ArithmeticFeedback::Any),
+                };
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shl((v as u32) & 0x1F)));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
             Opcode::ShrSmi => {
                 let v = imm(&instr.operands, 0)?;
-                let l = i32_of(activation.accumulator())?;
+                let acc = activation.accumulator();
+                let (l, feedback) = match acc.as_i32() {
+                    Some(l) => (l, ArithmeticFeedback::Int32),
+                    None => (runtime.js_to_int32(acc)?, ArithmeticFeedback::Any),
+                };
                 activation
                     .set_accumulator(RegisterValue::from_i32(l.wrapping_shr((v as u32) & 0x1F)));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_arithmetic(function, pc, feedback);
             }
 
             // ---- Unary ops on accumulator ----
@@ -3697,6 +3725,28 @@ fn i32_of(v: RegisterValue) -> Result<i32, InterpreterError> {
     v.as_i32().ok_or_else(|| {
         InterpreterError::TypeError(Box::from("operand expected int32 in v2 dispatch"))
     })
+}
+
+/// §7.1.6 ToInt32 — fast int32 pass-through, slow path falls back to
+/// the runtime helper (handles Booleans, Number objects, strings,
+/// `null`/`undefined`, etc. per §7.1.4 ToNumber). Returns both coerced
+/// operands together with the arithmetic feedback tag: `Int32` when
+/// both were already int32, `Any` when any slow-path coercion ran.
+fn coerce_int32_pair(
+    runtime: &mut crate::interpreter::RuntimeState,
+    lhs: RegisterValue,
+    rhs: RegisterValue,
+) -> Result<(i32, i32, ArithmeticFeedback), InterpreterError> {
+    match (lhs.as_i32(), rhs.as_i32()) {
+        (Some(l), Some(r)) => Ok((l, r, ArithmeticFeedback::Int32)),
+        (Some(l), None) => Ok((l, runtime.js_to_int32(rhs)?, ArithmeticFeedback::Any)),
+        (None, Some(r)) => Ok((runtime.js_to_int32(lhs)?, r, ArithmeticFeedback::Any)),
+        (None, None) => Ok((
+            runtime.js_to_int32(lhs)?,
+            runtime.js_to_int32(rhs)?,
+            ArithmeticFeedback::Any,
+        )),
+    }
 }
 
 fn jump_target(end_pc: u32, offset: i32) -> u32 {

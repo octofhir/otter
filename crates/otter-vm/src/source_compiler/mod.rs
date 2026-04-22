@@ -10068,10 +10068,21 @@ fn assign_identifier_reference<'a>(
 ) -> Result<(), SourceLoweringError> {
     let name = ident.name.as_str();
     let Some(binding) = ctx.resolve_identifier(name) else {
-        return Err(SourceLoweringError::unsupported(
-            "unbound_identifier",
-            ident.span,
-        ));
+        // Unresolved identifier target — the destructuring leaf
+        // refers to a global reference (§9.1.1.4 + §13.15.2). Plain
+        // assignment already routes through `StaGlobal` for this
+        // case, so keep destructuring symmetric: `[v2, vNull] = vals`
+        // at the top level stores each leaf on `globalThis` via
+        // StaGlobal rather than rejecting the whole pattern.
+        let prop_idx = ctx.intern_property_name(name)?;
+        builder
+            .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode StaGlobal (destructured ident target): {err:?}"
+                ))
+            })?;
+        return Ok(());
     };
     match binding {
         BindingRef::Param { reg }

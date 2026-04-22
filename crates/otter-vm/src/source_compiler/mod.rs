@@ -5866,6 +5866,19 @@ fn lower_return_expression<'a>(
             })?;
             Ok(())
         }
+        // §13.3.12 `new.target` — inside a [[Construct]] call the
+        // expression yields the constructor that was invoked via
+        // `new`; in an ordinary call it yields `undefined`.
+        // `LdaNewTarget` already reads the active frame's slot, so
+        // the compiler just needs to emit it.
+        Expression::MetaProperty(meta)
+            if meta.meta.name.as_str() == "new" && meta.property.name.as_str() == "target" =>
+        {
+            builder.emit(Opcode::LdaNewTarget, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!("encode LdaNewTarget: {err:?}"))
+            })?;
+            Ok(())
+        }
         // §13.16 Comma Operator — `(a, b, c)`. Evaluate each sub-
         // expression left-to-right, discarding the accumulator value
         // of all but the final one, which becomes the expression's

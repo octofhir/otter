@@ -510,11 +510,15 @@ impl Interpreter {
                 activation.set_accumulator(RegisterValue::from_i32(!l));
             }
             Opcode::LogicalNot => {
-                let b = activation.accumulator().is_truthy();
+                // §7.1.2 ToBoolean — must be runtime-aware so empty
+                // strings (falsy) and 0n BigInt (falsy) coerce right.
+                // `Value::is_truthy()` can't reach heap values, so
+                // routing through `js_to_boolean` is mandatory.
+                let b = runtime.js_to_boolean(activation.accumulator())?;
                 activation.set_accumulator(RegisterValue::from_bool(!b));
             }
             Opcode::ToBoolean => {
-                let b = activation.accumulator().is_truthy();
+                let b = runtime.js_to_boolean(activation.accumulator())?;
                 activation.set_accumulator(RegisterValue::from_bool(b));
             }
             Opcode::TypeOf => {
@@ -654,14 +658,18 @@ impl Interpreter {
             }
             Opcode::JumpIfToBooleanTrue => {
                 let off = jump_off(&instr.operands, 0)?;
-                if activation.accumulator().is_truthy() {
+                // §7.1.2 ToBoolean — heap strings (""/non-empty) and
+                // BigInt (0n/non-zero) must dispatch through the
+                // runtime-aware helper, not `is_truthy()` which
+                // defaults object-tagged values to truthy.
+                if runtime.js_to_boolean(activation.accumulator())? {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfToBooleanFalse => {
                 let off = jump_off(&instr.operands, 0)?;
-                if !activation.accumulator().is_truthy() {
+                if !runtime.js_to_boolean(activation.accumulator())? {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }

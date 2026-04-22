@@ -248,15 +248,24 @@ fn invalid_optional_member_update_reports_parse() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn empty_source_is_unsupported_program() {
-    let err = compile("").expect_err("empty input has no program body at M1");
-    assert!(matches!(
-        err,
-        SourceLoweringError::Unsupported {
-            construct: "program",
-            ..
-        }
-    ));
+fn empty_source_compiles_to_noop_module() {
+    // §16.1 Scripts / §16.2 Modules: an empty program is a valid
+    // production. Running it yields `undefined` with no side
+    // effects — matches browser + Node + unblocks test262 harness
+    // files like `harness/compareArray.js` that contain only a
+    // doc comment.
+    let module = compile("").expect("empty input compiles to a valid module");
+    let entry = module.function(module.entry()).expect("entry fn");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(entry.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, module.entry(), &registers, &mut runtime)
+        .expect("execute empty module");
+    assert!(
+        result.return_value().is_undefined(),
+        "empty module entry must return undefined"
+    );
 }
 
 #[test]

@@ -292,9 +292,12 @@ fn lower_program(
     // construct at a time. The conventional `main` pattern
     // (helpers first, entry last) makes the **last** function the
     // module's entry for script-style programs.
-    if program.body.is_empty() {
-        return Err(SourceLoweringError::unsupported("program", program.span));
-    }
+    //
+    // An empty script body is a valid program (§16.1 Scripts / §16.2
+    // Modules: the Script / ModuleBody production is optional). Fall
+    // through — the rest of the classifier produces a single
+    // synthesised top-level that just returns `undefined`, matching
+    // what a browser would do for an empty .js / .mjs file.
 
     // M35 state: collected import/export records, plus the name of
     // every binding that the runtime installs on the global object
@@ -664,13 +667,12 @@ fn lower_program(
 
     let _ = default_export_local;
 
-    // A module is valid when it has at least one source-level
-    // artefact: a function, a top-level statement, or an
-    // import/export record. Empty source (all whitespace) still
-    // gets rejected.
-    if declarations.is_empty() && script_body.is_empty() && !is_esm {
-        return Err(SourceLoweringError::unsupported("program", program.span));
-    }
+    // A completely empty program (whitespace + comments only) is a
+    // valid Script / Module. Fall through to the synth top-level
+    // path so the resulting Module evaluates to `undefined` with no
+    // observable side effects — matches both browser and Node
+    // behaviour and unblocks test262 harness files like
+    // `harness/compareArray.js` that carry only a doc comment.
 
     // Second pass: lower each function with the shared name table
     // available so `f(args)` inside one body can resolve `f` to its

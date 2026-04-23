@@ -53,6 +53,13 @@ pub enum InterpreterError {
     /// when the shared OOM flag is set and surfaced to the host as a
     /// catchable `RangeError` by the outer runtime layer.
     OutOfMemory,
+    /// The JS call depth exceeded
+    /// [`super::runtime_state::MAX_JS_STACK_DEPTH`](crate::interpreter::MAX_JS_STACK_DEPTH).
+    /// Surfaced to user JS as a catchable
+    /// `RangeError("Maximum call stack size exceeded")` by the outer
+    /// runtime layer. Protects the native Rust thread stack against
+    /// unbounded recursion (`function f(){f()}; f();`).
+    StackOverflow,
 }
 
 impl fmt::Display for InterpreterError {
@@ -101,6 +108,7 @@ impl fmt::Display for InterpreterError {
             Self::UncaughtThrow(value) => write!(f, "uncaught throw: {:?}", value),
             Self::NativeCall(message) => write!(f, "native host call failed: {message}"),
             Self::OutOfMemory => f.write_str("out of memory: heap limit exceeded"),
+            Self::StackOverflow => f.write_str("Maximum call stack size exceeded"),
         }
     }
 }

@@ -21,61 +21,50 @@ use crate::value::RegisterValue;
 // Using `Rc<dyn ModuleHost>` + `Rc<RefCell<ModuleRegistry>>`
 // keeps ownership on the ref-count without needing `unsafe` —
 // the crate has `#![forbid(unsafe_code)]`.
-type SharedModuleHost = Rc<dyn ModuleHost>;
-type SharedModuleRegistry = Rc<RefCell<ModuleRegistry>>;
+pub type SharedModuleHost = Rc<dyn ModuleHost>;
+pub type SharedModuleRegistry = Rc<RefCell<ModuleRegistry>>;
 
-thread_local! {
-    static DYNAMIC_IMPORT_HOST: RefCell<Option<SharedModuleHost>> =
-        const { RefCell::new(None) };
-    static DYNAMIC_IMPORT_REGISTRY: RefCell<Option<SharedModuleRegistry>> =
-        const { RefCell::new(None) };
-    static DYNAMIC_IMPORT_REFERRER: RefCell<String> = const { RefCell::new(String::new()) };
-}
-
-struct DynamicImportGuard;
-
-impl Drop for DynamicImportGuard {
-    fn drop(&mut self) {
-        DYNAMIC_IMPORT_HOST.with(|c| *c.borrow_mut() = None);
-        DYNAMIC_IMPORT_REGISTRY.with(|c| *c.borrow_mut() = None);
-        DYNAMIC_IMPORT_REFERRER.with(|c| c.borrow_mut().clear());
-    }
-}
-
-fn install_dynamic_import_context(
-    host: SharedModuleHost,
-    registry: SharedModuleRegistry,
-    referrer: &str,
-) -> DynamicImportGuard {
-    DYNAMIC_IMPORT_HOST.with(|c| *c.borrow_mut() = Some(host));
-    DYNAMIC_IMPORT_REGISTRY.with(|c| *c.borrow_mut() = Some(registry));
-    DYNAMIC_IMPORT_REFERRER.with(|c| *c.borrow_mut() = referrer.to_string());
-    DynamicImportGuard
+/// Snapshot of the previous dynamic-import context captured by
+/// [`RuntimeState::install_dynamic_import_context`] — restore it via
+/// [`RuntimeState::restore_dynamic_import_context`] when the span ends.
+///
+/// S6: replaces the old thread-local RAII guard. Runtime fields move
+/// ownership onto the owning `RuntimeState` so multi-threaded embedders
+/// can drive independent runtimes without clobbering each other.
+pub struct SavedDynamicImportContext {
+    pub(crate) host: Option<SharedModuleHost>,
+    pub(crate) registry: Option<SharedModuleRegistry>,
+    pub(crate) referrer: String,
 }
 
 /// M35: Returns the URL of the currently-evaluating module. Backs
 /// the `import.meta.url` getter on the [`ImportMeta`] opcode.
 /// Empty string when called outside an `execute_module_graph_*`
-/// span.
-pub fn current_dynamic_import_referrer() -> String {
-    DYNAMIC_IMPORT_REFERRER.with(|c| c.borrow().clone())
+/// span. S6: now reads from the runtime's per-instance field
+/// instead of a thread-local.
+pub fn current_dynamic_import_referrer(runtime: &RuntimeState) -> String {
+    runtime.current_dynamic_import_referrer().to_string()
 }
 
 /// Runs `f` with the dynamic-import context installed so nested
 /// `import(expr)` / `import.meta` opcodes hit the right
 /// host/registry. Used by test harnesses that want to call an
 /// exported function *after* `execute_module_graph_shared` has
-/// returned — the guard drop on that outer call clears the
-/// thread-local, so calls made from outside it would otherwise
-/// see "no module host installed".
+/// returned — the outer call's restore clears the context, so calls
+/// made from outside it would otherwise see "no module host installed".
+///
+/// S6: save/restore replaces the thread-local RAII guard.
 pub fn with_dynamic_import_context<R>(
+    runtime: &mut RuntimeState,
     host: Rc<dyn ModuleHost>,
     registry: Rc<RefCell<ModuleRegistry>>,
     referrer: &str,
-    f: impl FnOnce() -> R,
+    f: impl FnOnce(&mut RuntimeState) -> R,
 ) -> R {
-    let _guard = install_dynamic_import_context(host, registry, referrer);
-    f()
+    let saved = runtime.install_dynamic_import_context(host, registry, referrer);
+    let result = f(runtime);
+    runtime.restore_dynamic_import_context(saved);
+    result
 }
 
 /// §13.3.10 — Resolves and loads the module named by `specifier`,
@@ -88,17 +77,13 @@ pub fn dynamic_import_resolve(
     specifier: &str,
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, InterpreterError> {
-    let host: SharedModuleHost = DYNAMIC_IMPORT_HOST
-        .with(|c| c.borrow().clone())
-        .ok_or_else(|| {
-            InterpreterError::NativeCall(Box::from("dynamic import: no module host installed"))
-        })?;
-    let registry: SharedModuleRegistry = DYNAMIC_IMPORT_REGISTRY
-        .with(|c| c.borrow().clone())
-        .ok_or_else(|| {
-            InterpreterError::NativeCall(Box::from("dynamic import: no module registry installed"))
-        })?;
-    let referrer = DYNAMIC_IMPORT_REFERRER.with(|c| c.borrow().clone());
+    let host: SharedModuleHost = runtime.dynamic_import_host().ok_or_else(|| {
+        InterpreterError::NativeCall(Box::from("dynamic import: no module host installed"))
+    })?;
+    let registry: SharedModuleRegistry = runtime.dynamic_import_registry().ok_or_else(|| {
+        InterpreterError::NativeCall(Box::from("dynamic import: no module registry installed"))
+    })?;
+    let referrer = runtime.current_dynamic_import_referrer().to_string();
     let resolved = host
         .resolve(specifier, &referrer)
         .map_err(|e| InterpreterError::NativeCall(format!("dynamic import resolve: {e}").into()))?;
@@ -163,21 +148,27 @@ pub fn execute_module_graph_shared(
     // Phase 3: Evaluate in topological order, with dynamic-import
     // context installed so a runtime `import(expr)` inside any
     // module body can resolve + load + evaluate additional
-    // modules on demand.
+    // modules on demand. S6: context lives on `RuntimeState`, so we
+    // save/restore via the runtime's own helpers.
     let interpreter = crate::Interpreter::for_runtime(runtime);
-    let _guard = install_dynamic_import_context(Rc::clone(&host), Rc::clone(&registry), entry_url);
+    let saved_ctx =
+        runtime.install_dynamic_import_context(Rc::clone(&host), Rc::clone(&registry), entry_url);
+    let mut evaluate_result: Result<(), InterpreterError> = Ok(());
     for url in &topo_order {
-        DYNAMIC_IMPORT_REFERRER.with(|c| *c.borrow_mut() = url.clone());
-        evaluate_module(
+        runtime.set_dynamic_import_referrer(url.clone());
+        if let Err(err) = evaluate_module(
             url,
             host.as_ref(),
             &interpreter,
             runtime,
             &mut registry.borrow_mut(),
-        )?;
+        ) {
+            evaluate_result = Err(err);
+            break;
+        }
     }
-
-    Ok(())
+    runtime.restore_dynamic_import_context(saved_ctx);
+    evaluate_result
 }
 
 /// §16.2.1.2 — Module states during linking/evaluation.

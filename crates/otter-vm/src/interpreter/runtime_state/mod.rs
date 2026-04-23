@@ -111,7 +111,133 @@ impl RuntimeState {
             tier_up_budgets: std::collections::HashMap::new(),
             tier_up_blacklisted: std::collections::HashSet::new(),
             tier_up_hook: None,
+            call_depth: 0,
+            dynamic_import_host: None,
+            dynamic_import_registry: None,
+            dynamic_import_referrer: String::new(),
+            math_random_state: None,
         }
+    }
+
+    /// S6: advances the xorshift128+ PRNG backing `Math.random()`, seeding
+    /// it on first use. Per-runtime so two runtimes on two OS threads
+    /// produce independent sequences — a correctness requirement for
+    /// multi-tenant embedders that might seed determinism elsewhere.
+    pub fn next_math_random_u64(&mut self) -> u64 {
+        let (mut s0, mut s1) = self.math_random_state.unwrap_or_else(|| {
+            let mut buf = [0u8; 16];
+            if getrandom::getrandom(&mut buf).is_err() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0xDEAD_BEEF_CAFE_BABE);
+                buf[..8].copy_from_slice(&ts.to_le_bytes());
+                buf[8..16].copy_from_slice(
+                    &ts.wrapping_mul(6364136223846793005).to_le_bytes(),
+                );
+            }
+            let a = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let b = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            if a == 0 && b == 0 { (1, 1) } else { (a, b) }
+        });
+        let result = s0.wrapping_add(s1);
+        s1 ^= s0;
+        s0 = s0.rotate_left(24) ^ s1 ^ (s1 << 16);
+        s1 = s1.rotate_left(37);
+        self.math_random_state = Some((s0, s1));
+        result
+    }
+
+    // ─── S6: dynamic-import context on the runtime ──────────────────────
+
+    /// Currently-evaluating module URL (backs `import.meta.url`). Empty
+    /// outside a `execute_module_graph_shared` span.
+    #[must_use]
+    pub fn current_dynamic_import_referrer(&self) -> &str {
+        &self.dynamic_import_referrer
+    }
+
+    /// Returns the installed dynamic-import host, if any. Read by
+    /// `module_loader::dynamic_import_resolve` when a `DynamicImport`
+    /// opcode fires from inside a running module body.
+    #[must_use]
+    pub fn dynamic_import_host(&self) -> Option<crate::module_loader::SharedModuleHost> {
+        self.dynamic_import_host.clone()
+    }
+
+    /// Returns the installed dynamic-import registry, if any.
+    #[must_use]
+    pub fn dynamic_import_registry(&self) -> Option<crate::module_loader::SharedModuleRegistry> {
+        self.dynamic_import_registry.clone()
+    }
+
+    /// Updates the referrer (current evaluating module URL) without
+    /// touching host/registry. Called between module evaluations inside
+    /// the graph walker so nested `import.meta.url` reflects the
+    /// currently-executing body.
+    pub fn set_dynamic_import_referrer(&mut self, referrer: String) {
+        self.dynamic_import_referrer = referrer;
+    }
+
+    /// Installs the dynamic-import context for a `execute_module_graph_shared`
+    /// span and returns a snapshot of the previous values so the caller
+    /// can restore them via [`restore_dynamic_import_context`]. The
+    /// save/restore pattern replaces the former thread-local RAII guard
+    /// (see S6 in PRODUCTION_READINESS_PLAN.md).
+    pub fn install_dynamic_import_context(
+        &mut self,
+        host: crate::module_loader::SharedModuleHost,
+        registry: crate::module_loader::SharedModuleRegistry,
+        referrer: &str,
+    ) -> crate::module_loader::SavedDynamicImportContext {
+        let saved = crate::module_loader::SavedDynamicImportContext {
+            host: self.dynamic_import_host.take(),
+            registry: self.dynamic_import_registry.take(),
+            referrer: std::mem::take(&mut self.dynamic_import_referrer),
+        };
+        self.dynamic_import_host = Some(host);
+        self.dynamic_import_registry = Some(registry);
+        self.dynamic_import_referrer = referrer.to_string();
+        saved
+    }
+
+    /// Restores a previously-captured [`SavedDynamicImportContext`].
+    /// Must be called for every [`install_dynamic_import_context`] — do
+    /// NOT forget: a leaked context would keep `Rc<dyn ModuleHost>`
+    /// alive past the owning run, leaking embedder state across calls.
+    pub fn restore_dynamic_import_context(
+        &mut self,
+        saved: crate::module_loader::SavedDynamicImportContext,
+    ) {
+        self.dynamic_import_host = saved.host;
+        self.dynamic_import_registry = saved.registry;
+        self.dynamic_import_referrer = saved.referrer;
+    }
+
+    /// Enters a new JS call frame: increments [`call_depth`](Self::call_depth)
+    /// after checking it against [`super::MAX_JS_STACK_DEPTH`]. Returns
+    /// [`InterpreterError::StackOverflow`] when the limit would be
+    /// exceeded, mirroring V8's `RangeError: Maximum call stack size
+    /// exceeded`. Every successful entry MUST be paired with
+    /// [`exit_js_frame`](Self::exit_js_frame).
+    pub(super) fn enter_js_frame(&mut self) -> Result<(), InterpreterError> {
+        if self.call_depth >= super::MAX_JS_STACK_DEPTH {
+            return Err(InterpreterError::StackOverflow);
+        }
+        self.call_depth += 1;
+        Ok(())
+    }
+
+    /// Exits a JS call frame previously entered via
+    /// [`enter_js_frame`](Self::enter_js_frame). Saturates at zero so a
+    /// mismatched pair does not underflow; a mismatch is a VM bug caught
+    /// in debug builds by the underlying assertion.
+    pub(super) fn exit_js_frame(&mut self) {
+        debug_assert!(
+            self.call_depth > 0,
+            "exit_js_frame without matching enter_js_frame"
+        );
+        self.call_depth = self.call_depth.saturating_sub(1);
     }
 
     /// Get or create a persistent FeedbackVector for a function.
@@ -221,6 +347,52 @@ impl RuntimeState {
         } else {
             Ok(())
         }
+    }
+
+    /// Same cooperative interrupt poll as [`check_interrupt`], but returns
+    /// [`InterpreterError::Interrupted`] directly — for use inside the
+    /// interpreter's step loop and its helpers, where the result is a
+    /// `Result<_, InterpreterError>` and going through the native-call
+    /// sentinel promotion path would be unnecessary ceremony.
+    ///
+    /// S1: this is the unified "yield tick" that every native-bounded
+    /// loop iterating user-reachable data must call at the head of each
+    /// iteration. Cost: one `Relaxed` atomic load + branch, ~2 CPU cycles
+    /// in the predicted-not-taken case.
+    pub fn check_interrupt_interp(&self) -> Result<(), InterpreterError> {
+        if self.is_execution_interrupted() {
+            Err(InterpreterError::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// S3 back-edge poll: observes both the cooperative interrupt signal
+    /// (timeout / SIGINT / `signal_shutdown`) and the heap OOM flag set
+    /// by [`otter_gc::typed::TypedHeap::alloc`] when the configured hard
+    /// cap has been crossed. Intended as the single check called from
+    /// the interpreter's step loop on every backward jump, the only
+    /// place where a tight JS CPU loop (e.g. `while(true){}`) or a
+    /// tight allocator loop (e.g. `while(true) x = {};`) can be
+    /// interrupted cooperatively without re-entering native code.
+    ///
+    /// Returns `Ok(())` on the fast path (two `Relaxed` atomic loads
+    /// that are predicted not-taken). The `Err` variants are surfaced
+    /// to user JS as:
+    /// - [`InterpreterError::Interrupted`] → `InterpreterError` (host
+    ///   maps to `RunError::Runtime("interrupted")`).
+    /// - [`InterpreterError::OutOfMemory`] → catchable
+    ///   `RangeError("out of memory: heap limit exceeded")` via the
+    ///   outer runtime layer.
+    pub fn poll_back_edge(&self) -> Result<(), InterpreterError> {
+        use std::sync::atomic::Ordering;
+        if self.is_execution_interrupted() {
+            return Err(InterpreterError::Interrupted);
+        }
+        if self.objects.oom_flag().load(Ordering::Relaxed) {
+            return Err(InterpreterError::OutOfMemory);
+        }
+        Ok(())
     }
 
     /// Returns `Err(OutOfMemory)` if the object heap has signalled that the

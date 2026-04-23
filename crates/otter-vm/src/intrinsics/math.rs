@@ -710,43 +710,15 @@ fn is_odd_integer(v: f64) -> bool {
 fn math_random(
     _this: &RegisterValue,
     _args: &[RegisterValue],
-    _runtime: &mut RuntimeState,
+    runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    use std::cell::Cell;
-
-    thread_local! {
-        static STATE: Cell<(u64, u64)> = {
-            // Seed from system entropy.
-            let mut buf = [0u8; 16];
-            getrandom::getrandom(&mut buf).unwrap_or_else(|_| {
-                // Fallback: use address of the Cell + timestamp bits.
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0xDEAD_BEEF_CAFE_BABE);
-                buf[..8].copy_from_slice(&ts.to_le_bytes());
-                buf[8..16].copy_from_slice(&(ts.wrapping_mul(6364136223846793005)).to_le_bytes());
-            });
-            let s0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let s1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            // Ensure non-zero state.
-            Cell::new(if s0 == 0 && s1 == 0 { (1, 1) } else { (s0, s1) })
-        };
-    }
-
-    STATE.with(|state| {
-        let (mut s0, mut s1) = state.get();
-        // xorshift128+
-        let result = s0.wrapping_add(s1);
-        s1 ^= s0;
-        s0 = s0.rotate_left(24) ^ s1 ^ (s1 << 16);
-        s1 = s1.rotate_left(37);
-        state.set((s0, s1));
-        // Map to [0, 1) — use upper 52 bits as mantissa.
-        let mantissa = result >> 12; // 52 bits
-        let value = (mantissa as f64) / ((1u64 << 52) as f64);
-        Ok(RegisterValue::from_number(value))
-    })
+    // S6: xorshift128+ state now lives on the runtime so two runtimes
+    // on two OS threads produce independent sequences. Mantissa layout
+    // (top 52 bits) unchanged.
+    let result = runtime.next_math_random_u64();
+    let mantissa = result >> 12;
+    let value = (mantissa as f64) / ((1u64 << 52) as f64);
+    Ok(RegisterValue::from_number(value))
 }
 
 // ---------------------------------------------------------------------------

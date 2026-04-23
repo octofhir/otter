@@ -272,7 +272,7 @@ impl Interpreter {
             Opcode::ImportMeta => {
                 let meta = runtime.alloc_object();
                 let url_prop = runtime.intern_property_name("url");
-                let referrer = crate::module_loader::current_dynamic_import_referrer();
+                let referrer = runtime.current_dynamic_import_referrer().to_string();
                 let url_value = runtime.alloc_string(referrer.as_str());
                 runtime.objects.set_property(
                     meta,
@@ -1740,7 +1740,13 @@ impl Interpreter {
                         return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                     }
                 };
+                // S1 watchdog tick: spreading an attacker-controlled
+                // iterator that always returns `{done:false}` would
+                // otherwise hang the thread. `check_interrupt_interp`
+                // surfaces `InterpreterError::Interrupted` so the host
+                // (timeout, ^C, signal_shutdown) can unwind the VM.
                 loop {
+                    runtime.check_interrupt_interp()?;
                     let step = runtime.iterator_next(iter)?;
                     if step.is_done() {
                         break;
@@ -3040,6 +3046,11 @@ impl Interpreter {
                 Ok(h) => Err(StepOutcome::Throw(RegisterValue::from_object_handle(h.0))),
                 Err(_) => Err(StepOutcome::Throw(RegisterValue::undefined())),
             },
+            // S2: surface stack exhaustion as a catchable RangeError so
+            // user `try/catch` sees the same shape V8/JSC produce.
+            Err(InterpreterError::StackOverflow) => Err(StepOutcome::Throw(
+                runtime.alloc_range_error_value("Maximum call stack size exceeded"),
+            )),
             Err(_) => Err(StepOutcome::Throw(RegisterValue::undefined())),
         }
     }

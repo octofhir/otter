@@ -51,7 +51,7 @@ pub use host::{
     ModuleType, PermissionDenied, ResolvedModule, RuntimeProfile, SourceType, current_capabilities,
     current_process, parse_env_file,
 };
-pub use runtime::{OtterRuntime, RunError};
+pub use runtime::{OtterRuntime, RunError, signal_shutdown};
 
 // Re-export commonly used types from otter-vm so users don't need to
 // depend on otter-vm directly.

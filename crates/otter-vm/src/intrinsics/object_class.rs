@@ -1360,7 +1360,13 @@ fn object_assign(
             })?
         };
 
-        for key_id in keys {
+        for (poll_idx, key_id) in keys.into_iter().enumerate() {
+            // S1: copying properties from a hostile source (deep proto
+            // chain, many accessors) can take unbounded wall-clock time
+            // per key — poll the interrupt flag every 1024 iterations.
+            if poll_idx.is_multiple_of(1024) {
+                runtime.check_interrupt()?;
+            }
             let value = runtime
                 .own_property_value(source, key_id)
                 .map_err(|e| with_vm_context(e, "Object.assign get"))?;

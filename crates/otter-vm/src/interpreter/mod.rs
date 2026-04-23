@@ -144,7 +144,47 @@ pub struct RuntimeState {
     /// `Arc<dyn TierUpHook>` lets us cheaply clone the hook on the hot path
     /// without entangling the `RuntimeState` borrow with the hook borrow.
     pub(super) tier_up_hook: Option<Arc<dyn TierUpHook>>,
+    /// Current JS call depth (non-tail native-recursive activations).
+    /// Incremented on every entry into [`Interpreter::run_completion_with_runtime`]
+    /// and decremented on every return path. Guarded against
+    /// [`MAX_JS_STACK_DEPTH`] so deep recursion surfaces a catchable
+    /// `RangeError` ("Maximum call stack size exceeded") instead of
+    /// overflowing the native Rust thread stack.
+    pub(super) call_depth: u32,
+    /// S6: per-runtime dynamic-import context. Replaces the thread-local
+    /// `DYNAMIC_IMPORT_HOST` / `DYNAMIC_IMPORT_REGISTRY` /
+    /// `DYNAMIC_IMPORT_REFERRER` so multi-threaded embedders (Axum,
+    /// rayon, worker threads) can drive independent runtimes without
+    /// corrupting shared state. Installed for the lifetime of a
+    /// `execute_module_graph_shared` span via
+    /// [`install_dynamic_import_context`] + [`restore_dynamic_import_context`].
+    pub(super) dynamic_import_host: Option<crate::module_loader::SharedModuleHost>,
+    pub(super) dynamic_import_registry: Option<crate::module_loader::SharedModuleRegistry>,
+    pub(super) dynamic_import_referrer: String,
+    /// S6: per-runtime PRNG state for `Math.random()`. Replaces the old
+    /// thread-local xorshift128+ state so each runtime gets its own
+    /// reproducible sequence. Seeded lazily on first use (see
+    /// `intrinsics::math::math_random`).
+    pub(super) math_random_state: Option<(u64, u64)>,
 }
+
+/// Maximum JavaScript call depth before the interpreter raises
+/// [`InterpreterError::StackOverflow`]. Converted to a catchable
+/// `RangeError` ("Maximum call stack size exceeded") at the VM/native
+/// boundary, mirroring V8/JSC.
+///
+/// Sized to stay safe under a standard 2 MB test / worker thread stack.
+/// Empirically each `run_completion_with_runtime` activation consumes
+/// 60–100 KB of native Rust stack in debug builds (register box, shadow
+/// stack push, frame-runtime state, dispatch locals without inlining).
+/// 24 × 100 KB ≈ 2.4 MB is already on the edge, so this limit is the
+/// ceiling a test thread can sustain without `SIGSEGV`.
+///
+/// This is intentionally far lower than V8's ~12 000 default — raising
+/// it requires task **C6** (per-call allocation elimination and frame
+/// slimming) to shrink per-activation native stack usage. See
+/// `PRODUCTION_READINESS_PLAN.md` §8 [C6].
+pub const MAX_JS_STACK_DEPTH: u32 = 24;
 
 /// Minimal interpreter shell for the new VM backend.
 #[derive(Debug, Clone)]
@@ -1326,6 +1366,26 @@ impl Interpreter {
         activation: &mut Activation,
         runtime: &mut RuntimeState,
     ) -> Result<Completion, InterpreterError> {
+        // S2 stack-overflow guard: every non-tail JS activation grows the
+        // native Rust stack by one frame. Cap the JS-visible call depth at
+        // `MAX_JS_STACK_DEPTH` so pathological recursion surfaces a
+        // catchable `RangeError` instead of `SIGSEGV`-ing the host. Tail
+        // calls do not recurse here — they re-enter the step loop in-place
+        // and do not invoke this function. The `exit_js_frame` call below
+        // runs on every return path because the inner body is wrapped in
+        // a `match` block that covers the result.
+        runtime.enter_js_frame()?;
+        let result = self.run_completion_with_runtime_inner(module, activation, runtime);
+        runtime.exit_js_frame();
+        result
+    }
+
+    fn run_completion_with_runtime_inner(
+        &self,
+        module: &Module,
+        activation: &mut Activation,
+        runtime: &mut RuntimeState,
+    ) -> Result<Completion, InterpreterError> {
         let previous_module = runtime.enter_module(module);
 
         // These are mutable because TailCallClosure can replace them in-place.
@@ -1397,6 +1457,15 @@ impl Interpreter {
                     let _ = crate::intrinsics::error_class::capture_error_stack(runtime, error, 0);
                     StepOutcome::Throw(RegisterValue::from_object_handle(error.0))
                 }
+                // S2: deep recursion surfaces as a catchable
+                // `RangeError: Maximum call stack size exceeded` so user
+                // `try/catch` sees it instead of the host process
+                // crashing. Mirrors V8/JSC behavior on stack exhaustion.
+                Err(InterpreterError::StackOverflow) => {
+                    let value =
+                        runtime.alloc_range_error_value("Maximum call stack size exceeded");
+                    StepOutcome::Throw(value)
+                }
                 Err(error) => {
                     runtime.restore_module(previous_module);
                     runtime.truncate_frame_info_stack(shadow_baseline);
@@ -1420,12 +1489,21 @@ impl Interpreter {
             // Bailouts from the OSR'd code update PC + accumulator on
             // the activation in-place, so the outer loop simply resumes
             // interpretation at the bailout PC on the next iteration.
-            if matches!(outcome, StepOutcome::Continue)
-                && activation.pc() < pc_before_step
-                && let Some(osr_outcome) =
+            if matches!(outcome, StepOutcome::Continue) && activation.pc() < pc_before_step {
+                // S3: the single place in the hot dispatch path where a
+                // tight JS CPU loop (`while(true){}`) or a tight
+                // allocator loop crosses the interpreter bookkeeping.
+                // Poll interrupt + OOM once per back-edge so the
+                // watchdog, SIGINT handler, and heap-cap signal can all
+                // surface promptly without having to wait for the loop
+                // to re-enter native intrinsic code. Two `Relaxed`
+                // atomic loads, ~4 cycles predicted not-taken.
+                runtime.poll_back_edge()?;
+                if let Some(osr_outcome) =
                     self.try_back_edge_osr(&current_module, activation, runtime)
-            {
-                outcome = osr_outcome;
+                {
+                    outcome = osr_outcome;
+                }
             }
 
             match outcome {

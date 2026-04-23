@@ -9590,12 +9590,12 @@ fn run_module_graph_shared_int32(
     // `import(expr)` + `import.meta` inside the exported function
     // see the same host/registry the graph was evaluated with.
     let result = crate::module_loader::with_dynamic_import_context(
+        &mut runtime,
         Rc::clone(&host),
         Rc::clone(&registry),
         entry_url,
-        || {
-            runtime
-                .call_callable(handle, RegisterValue::undefined(), arg_regs.as_mut_slice())
+        |rt| {
+            rt.call_callable(handle, RegisterValue::undefined(), arg_regs.as_mut_slice())
                 .expect("call_callable")
         },
     );
@@ -10009,4 +10009,298 @@ fn logical_or_assign_on_super_property() {
         return b.bump(); \
     }";
     assert_eq!(run_int32_function(src, &[]), 5);
+}
+
+// ---------------------------------------------------------------------------
+// S2: stack overflow protection
+//
+// Before these tests existed, deep JS recursion overflowed the native Rust
+// thread stack and `SIGSEGV`-ed the host process. The fix adds a bounded
+// JS call-depth counter (`MAX_JS_STACK_DEPTH` in
+// `crates/otter-vm/src/interpreter/mod.rs`) and surfaces exhaustion as a
+// catchable `RangeError`, mirroring V8's `Maximum call stack size exceeded`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s2_unbounded_recursion_surfaces_as_range_error() {
+    // Top-level script: `function f(){ f(); } f();`. The uncaught
+    // recursion previously reached Rust stack exhaustion; it must now
+    // surface to the host as an `UncaughtThrow` carrying a `RangeError`
+    // object — same shape V8 / JSC produce.
+    let src = "function f(){ f(); } f();";
+    let module = compile(src).expect("compile recursive script");
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let err = crate::interpreter::Interpreter::new()
+        .execute_module(&module, &mut runtime)
+        .expect_err("recursion must produce an error, not succeed");
+    let value = match err {
+        crate::interpreter::InterpreterError::UncaughtThrow(value) => value,
+        other => panic!("expected UncaughtThrow(RangeError), got {other:?}"),
+    };
+    let handle = value
+        .as_object_handle()
+        .expect("thrown value must be an object handle");
+    let prototype = runtime
+        .objects
+        .get_prototype(crate::object::ObjectHandle(handle))
+        .expect("error instance has a readable prototype");
+    assert_eq!(
+        prototype,
+        Some(runtime.intrinsics().range_error_prototype),
+        "thrown object must be a RangeError"
+    );
+    let message_prop = runtime.intern_property_name("message");
+    let lookup = runtime
+        .objects
+        .get_property(crate::object::ObjectHandle(handle), message_prop)
+        .expect("error.message is readable")
+        .expect("error.message is present");
+    let message_value = match lookup.value() {
+        crate::object::PropertyValue::Data { value, .. } => value,
+        crate::object::PropertyValue::Accessor { .. } => {
+            panic!("error.message must be a data property")
+        }
+    };
+    let message_handle = message_value
+        .as_object_handle()
+        .expect("error.message must be a string handle");
+    let text = runtime
+        .objects
+        .string_value(crate::object::ObjectHandle(message_handle))
+        .expect("error.message string readable")
+        .expect("error.message populated");
+    assert_eq!(text.to_rust_string(), "Maximum call stack size exceeded");
+}
+
+#[test]
+fn s2_stack_overflow_is_catchable_via_try_catch() {
+    // The RangeError raised by the call-depth guard must be catchable
+    // by user-level `try { … } catch (e) { … }`. `main()` returns the
+    // caught error's message so the harness can assert on it.
+    let src = "function main() { \
+        function f(){ f(); } \
+        try { f(); return 1; } catch (e) { return e.message.length > 0 ? 42 : 0; } \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 42);
+}
+
+#[test]
+fn s2_mutual_recursion_also_bounded() {
+    // Two mutually recursive functions must also hit the cap and throw
+    // a catchable RangeError. Guards against a future regression that
+    // ties depth tracking to a single closure identity.
+    let src = "function main() { \
+        function a(){ b(); } \
+        function b(){ a(); } \
+        try { a(); return 0; } catch (e) { return 7; } \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 7);
+}
+
+#[test]
+fn s2_shallow_recursion_still_works() {
+    // Regression guard: the depth cap must not fire on normal recursive
+    // code. `main` calls `sum(10)`, which stays well below
+    // [`MAX_JS_STACK_DEPTH`] (12 JS frames incl. `main`). Uses iterative
+    // reduction (not nested declarations) to keep the construct
+    // independent of unrelated compiler features.
+    let src = "function sum(n){ return n === 0 ? 0 : n + sum(n - 1); } \
+               function main(){ return sum(10); }";
+    assert_eq!(run_int32_function(src, &[]), 10 * 11 / 2);
+}
+
+// ---------------------------------------------------------------------------
+// S1: native-loop watchdog coverage
+//
+// The interpreter polls the interrupt flag at every bytecode back-edge,
+// but native loops inside dispatch opcodes and built-in intrinsics used
+// to ignore the flag entirely — a hostile iterator, an infinite sequence
+// from an object's `[Symbol.iterator]`, or a pathological regex could
+// hang the VM forever. These tests exercise the hardened call sites.
+// ---------------------------------------------------------------------------
+
+/// Runs `source` as a top-level script with the interrupt flag fired
+/// from another thread after `fire_after`. Returns the final
+/// `InterpreterError`. Used to confirm that long native loops observe
+/// the flag and unwind promptly.
+fn run_with_delayed_interrupt(
+    source: &str,
+    fire_after: std::time::Duration,
+) -> crate::interpreter::InterpreterError {
+    let module = compile(source).expect("compile S1 fixture");
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    runtime.set_active_interrupt_flag(Some(flag.clone()));
+    let fire_flag = flag.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(fire_after);
+        fire_flag.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let interpreter =
+        crate::interpreter::Interpreter::new().with_interrupt_flag(flag);
+    interpreter
+        .execute_module(&module, &mut runtime)
+        .expect_err("interrupted execution must return Err")
+}
+
+#[test]
+fn s1_spread_into_array_polls_interrupt_on_large_source() {
+    // Spreading a very long array drives the `SpreadIntoArray` opcode
+    // loop hard. Before S1 the loop ignored the interrupt flag entirely
+    // — the test timed out. With the S1 tick at the head of each
+    // iteration the interrupt surfaces within milliseconds.
+    //
+    // `new Array(N)` allocates a length-only array (no dense storage),
+    // so iteration yields `undefined` per slot cheaply; the hot path is
+    // `iterator_next` + `push_element`, which is exactly what the
+    // watchdog must be able to interrupt.
+    // Top-level `main()` call is what drives execution — the synth
+    // script body is what `execute_module` runs, so the spread must
+    // happen at top level (not inside a never-called helper).
+    let src = "const big = new Array(10_000_000); \
+               const out = [...big]; out.length;";
+    let started = std::time::Instant::now();
+    let err = run_with_delayed_interrupt(src, std::time::Duration::from_millis(50));
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, crate::interpreter::InterpreterError::Interrupted),
+        "expected InterpreterError::Interrupted, got {err:?}"
+    );
+    // Generous upper bound keeps the test stable on loaded CI; the
+    // pre-S1 behaviour was to never return, so anything under the
+    // bound proves the watchdog works.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "spread should exit within 5 s, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn s6_dynamic_import_context_is_per_runtime() {
+    // S6: installing the dynamic-import context on one runtime must
+    // NOT affect a sibling runtime, even on the same OS thread. Before
+    // the fix both lived in a `thread_local!` so consecutive installs
+    // would step on each other.
+    use crate::module_loader::{InMemoryModuleHost, ModuleRegistry};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let host: Rc<dyn crate::module_loader::ModuleHost> = Rc::new({
+        let mut h = InMemoryModuleHost::new();
+        h.add_module("a", "");
+        h
+    });
+    let registry = Rc::new(RefCell::new(ModuleRegistry::new()));
+
+    let mut rt_a = crate::interpreter::RuntimeState::new();
+    let rt_b = crate::interpreter::RuntimeState::new();
+
+    // Install on A with referrer "a-url", leave B untouched.
+    let saved = rt_a.install_dynamic_import_context(
+        Rc::clone(&host),
+        Rc::clone(&registry),
+        "a-url",
+    );
+    assert_eq!(rt_a.current_dynamic_import_referrer(), "a-url");
+    assert_eq!(
+        rt_b.current_dynamic_import_referrer(),
+        "",
+        "B must not observe A's installed context"
+    );
+    assert!(
+        rt_a.dynamic_import_host().is_some(),
+        "A keeps its installed host"
+    );
+    assert!(
+        rt_b.dynamic_import_host().is_none(),
+        "B must have no host installed"
+    );
+    rt_a.restore_dynamic_import_context(saved);
+    assert_eq!(rt_a.current_dynamic_import_referrer(), "");
+    assert!(rt_a.dynamic_import_host().is_none());
+}
+
+#[test]
+fn s6_math_random_state_is_per_runtime() {
+    // S6: Math.random must deliver an independent sequence per runtime
+    // so a user who instantiates a second OtterRuntime with a known
+    // seed (future API) does not observe the first runtime's advances.
+    // Here we just verify the two runtimes produce independent u64s,
+    // which they cannot if the PRNG state is shared via thread_local.
+    let mut rt_a = crate::interpreter::RuntimeState::new();
+    let mut rt_b = crate::interpreter::RuntimeState::new();
+    // Both seed lazily; draws from each runtime advance ONLY its own
+    // state. The two 64-bit sequences almost certainly differ in the
+    // first 8 draws under any system entropy; probability of a false
+    // positive is < 2^-512.
+    let a: Vec<u64> = (0..8).map(|_| rt_a.next_math_random_u64()).collect();
+    let b: Vec<u64> = (0..8).map(|_| rt_b.next_math_random_u64()).collect();
+    assert_ne!(a, b, "independent runtimes must produce independent PRNG output");
+}
+
+#[test]
+fn s3_while_true_loop_observes_interrupt_at_back_edge() {
+    // A tight `while(true){}` never enters native intrinsic code, so it
+    // used to hang forever even with the interrupt flag fired — Jump
+    // opcodes did not poll. S3 adds `poll_back_edge` at every back-edge,
+    // giving the watchdog / SIGINT / shutdown handler a hook to unwind
+    // the CPU-loop case.
+    let src = "while (true) {}";
+    let started = std::time::Instant::now();
+    let err = run_with_delayed_interrupt(src, std::time::Duration::from_millis(30));
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, crate::interpreter::InterpreterError::Interrupted),
+        "expected InterpreterError::Interrupted, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "while(true) should exit within 3 s, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn s3_alloc_loop_observes_oom_at_back_edge() {
+    // Before S3 the OOM flag was set on first overshoot but the
+    // interpreter never polled it outside of intrinsic call boundaries,
+    // so a tight `while(true) x = {};` could overshoot the heap cap by
+    // hundreds of MB before surfacing. The back-edge poll now raises
+    // `InterpreterError::OutOfMemory` promptly — surfaced to user JS as
+    // a catchable `RangeError`.
+    use otter_gc::heap::GcConfig;
+    let src = "let arr = []; while (true) { arr.push({ a: 1 }); }";
+    let module = compile(src).expect("compile S3 alloc fixture");
+    let mut runtime = crate::interpreter::RuntimeState::with_gc_config(GcConfig {
+        max_heap_bytes: Some(256 * 1024),
+        ..GcConfig::default()
+    });
+    let err = crate::interpreter::Interpreter::new()
+        .with_oom_flag(runtime.oom_flag())
+        .execute_module(&module, &mut runtime)
+        .expect_err("OOM path must surface an error");
+    assert!(
+        matches!(err, crate::interpreter::InterpreterError::OutOfMemory),
+        "expected InterpreterError::OutOfMemory, got {err:?}"
+    );
+}
+
+#[test]
+fn s1_map_constructor_polls_interrupt_for_huge_iterable() {
+    // `new Map(hugeArray)` walks the whole iterable before returning.
+    // With `MAP_SET_POLL_INTERVAL = 4096` the loop observes the
+    // interrupt flag at least every few milliseconds on modern
+    // hardware, so a delayed interrupt surfaces promptly.
+    let src = "const big = new Array(10_000_000); \
+               const m = new Map(big); m;";
+    let started = std::time::Instant::now();
+    let err = run_with_delayed_interrupt(src, std::time::Duration::from_millis(50));
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, crate::interpreter::InterpreterError::Interrupted),
+        "expected InterpreterError::Interrupted, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "Map constructor should exit within 5 s, took {elapsed:?}"
+    );
 }

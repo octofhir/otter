@@ -288,6 +288,14 @@ impl RuntimeState {
                         Err(_) => VmNativeCallError::Internal(message),
                     }
                 }
+                InterpreterError::StackOverflow => {
+                    // S2: surface as catchable RangeError so user try/catch
+                    // can observe it, mirroring V8's
+                    // `RangeError: Maximum call stack size exceeded`.
+                    VmNativeCallError::Thrown(
+                        self.alloc_range_error_value("Maximum call stack size exceeded"),
+                    )
+                }
                 InterpreterError::NativeCall(message) => VmNativeCallError::Internal(message),
                 other => VmNativeCallError::Internal(format!("{other}").into()),
             })
@@ -485,6 +493,14 @@ impl RuntimeState {
                     .run_completion_with_runtime(&module, &mut activation, self)
                     .map_err(|error| match error {
                         InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                        InterpreterError::StackOverflow => {
+                            // S2: catchable RangeError on stack exhaustion.
+                            VmNativeCallError::Thrown(
+                                self.alloc_range_error_value(
+                                    "Maximum call stack size exceeded",
+                                ),
+                            )
+                        }
                         InterpreterError::NativeCall(message)
                         | InterpreterError::TypeError(message) => {
                             VmNativeCallError::Internal(message)

@@ -173,6 +173,12 @@ fn map_constructor(
             .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
             .unwrap_or(0);
         for i in 0..length {
+            // S1: Map construction absorbs an arbitrarily long array.
+            // Poll every MAP_SET_POLL_INTERVAL iterations so a 16M-entry
+            // iterable can be interrupted cooperatively.
+            if i.is_multiple_of(MAP_SET_POLL_INTERVAL) {
+                runtime.check_interrupt()?;
+            }
             let entry = runtime.get_array_index_value(arr_handle, i)?;
             if let Some(entry_val) = entry
                 && let Some(eh) = entry_val.as_object_handle().map(ObjectHandle)
@@ -197,6 +203,12 @@ fn map_constructor(
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
+
+/// S1: interval at which the Map/Set constructor absorption loops poll
+/// the interrupt flag. Value matches `OOM_POLL_INTERVAL` in
+/// `array_class.rs` so the cost per iteration is identical across hot
+/// native loops.
+const MAP_SET_POLL_INTERVAL: usize = 4096;
 
 fn map_get(
     this: &RegisterValue,
@@ -494,6 +506,11 @@ fn set_constructor(
             .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
             .unwrap_or(0);
         for i in 0..length {
+            // S1: same rationale as map_constructor above — bound-user
+            // iterable absorption must be interruptible.
+            if i.is_multiple_of(MAP_SET_POLL_INTERVAL) {
+                runtime.check_interrupt()?;
+            }
             if let Some(value) = runtime.get_array_index_value(arr_handle, i)? {
                 runtime
                     .objects_mut()

@@ -285,6 +285,13 @@ async fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // S5: install graceful shutdown on SIGINT (Ctrl-C) and SIGTERM so the
+    // running VM stops cooperatively instead of being killed by the
+    // kernel. Calls `otter_runtime::signal_shutdown()` which fires the
+    // interrupt flag on every active run. The second Ctrl-C within the
+    // same process escalates to immediate exit, matching Node / Deno.
+    install_signal_handlers();
+
     let cli = Cli::parse();
 
     if let Some(ref code) = cli.print {
@@ -343,6 +350,66 @@ fn command_temporarily_disabled(command: &str) -> Result<()> {
     Err(anyhow::anyhow!(
         "`otter {command}` is temporarily disabled during the new VM migration"
     ))
+}
+
+/// S5: installs process-wide signal handlers so SIGINT / SIGTERM trigger
+/// cooperative shutdown instead of killing the host.
+///
+/// First signal fires `otter_runtime::signal_shutdown()` which sets the
+/// interrupt flag on every active run; the interpreter's watchdog poll
+/// surfaces it as `InterpreterError::Interrupted` on the next back-edge.
+///
+/// Second signal within the same process (e.g. the user holding Ctrl-C
+/// because a long native loop has not yet reached a watchdog poll —
+/// tracked as task **S1** in `PRODUCTION_READINESS_PLAN.md`) escalates
+/// to `std::process::exit(130)`, matching Node's and Deno's behavior
+/// ("pressing Ctrl-C twice force-quits").
+fn install_signal_handlers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ALREADY_FIRED: AtomicBool = AtomicBool::new(false);
+
+    fn on_signal() {
+        if ALREADY_FIRED.swap(true, Ordering::AcqRel) {
+            // Second signal → hard exit. 130 = 128 + SIGINT, the POSIX
+            // convention Node and shells use.
+            std::process::exit(130);
+        }
+        let fired = otter_runtime::signal_shutdown();
+        if fired == 0 {
+            // Nothing is running — just terminate.
+            std::process::exit(130);
+        }
+        eprintln!(
+            "otter: interrupt received, shutting down ({fired} active run{})",
+            if fired == 1 { "" } else { "s" }
+        );
+    }
+
+    // Ctrl-C (SIGINT). Tokio's `ctrl_c` handles both Unix SIGINT and
+    // Windows CTRL_C_EVENT uniformly, so the CLI binary works on every
+    // supported host.
+    tokio::spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                on_signal();
+            } else {
+                break;
+            }
+        }
+    });
+
+    // SIGTERM on Unix — Docker / systemd / supervisor stop requests.
+    // Skipped on non-Unix targets where the concept does not exist.
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            while term.recv().await.is_some() {
+                on_signal();
+            }
+        }
+    });
 }
 
 /// Picks the right miette `GraphicalTheme` based on `NO_COLOR` and whether

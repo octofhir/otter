@@ -134,6 +134,90 @@ impl RunInterrupt {
     }
 }
 
+// ---------------------------------------------------------------------------
+// S5: process-wide interrupt registry
+//
+// Tracks all active [`RunInterrupt`] instances so a CLI or embedder can
+// signal graceful shutdown (SIGINT / SIGTERM) without holding a per-run
+// reference. Entries are stored as `Weak` so a completed run drops cleanly
+// when its `Arc<RunInterrupt>` goes out of scope.
+// ---------------------------------------------------------------------------
+
+static ACTIVE_INTERRUPTS: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Weak<RunInterrupt>>>> =
+    std::sync::OnceLock::new();
+
+fn active_interrupts() -> &'static std::sync::Mutex<Vec<std::sync::Weak<RunInterrupt>>> {
+    ACTIVE_INTERRUPTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn register_run_interrupt(interrupt: &Arc<RunInterrupt>) {
+    let mut guard = active_interrupts()
+        .lock()
+        .expect("active interrupts mutex poisoned");
+    // Opportunistically purge dead entries so the list does not grow
+    // unbounded in long-running embedders that cycle many runtimes.
+    guard.retain(|w| w.strong_count() > 0);
+    guard.push(Arc::downgrade(interrupt));
+}
+
+fn unregister_run_interrupt(interrupt: &Arc<RunInterrupt>) {
+    let mut guard = active_interrupts()
+        .lock()
+        .expect("active interrupts mutex poisoned");
+    let target = Arc::as_ptr(interrupt);
+    guard.retain(|w| {
+        // Keep entries whose target is live and NOT equal to the one
+        // we're removing. `Weak::as_ptr` returns the target pointer
+        // without upgrading, which is exactly what we want.
+        std::sync::Weak::as_ptr(w) != target
+    });
+}
+
+/// Signals graceful shutdown to every currently-running [`OtterRuntime`]
+/// on this process. Each active run observes a cooperative interrupt at
+/// the next watchdog poll and surfaces it as `InterpreterError::Interrupted`
+/// (or — if the poll happens inside user JS — as a catchable abrupt
+/// completion via the host-level error mapping).
+///
+/// Safe to call from a signal-handling thread or a Tokio task. Returns
+/// the number of interrupts fired.
+///
+/// ```rust,no_run
+/// // Typical CLI usage: install once at process start.
+/// tokio::spawn(async {
+///     if tokio::signal::ctrl_c().await.is_ok() {
+///         otter_runtime::signal_shutdown();
+///     }
+/// });
+/// ```
+pub fn signal_shutdown() -> usize {
+    let guard = active_interrupts()
+        .lock()
+        .expect("active interrupts mutex poisoned");
+    let mut fired = 0usize;
+    for weak in guard.iter() {
+        if let Some(interrupt) = weak.upgrade() {
+            interrupt.fire();
+            fired += 1;
+        }
+    }
+    fired
+}
+
+/// RAII guard that removes a [`RunInterrupt`] from the process-wide
+/// active-interrupt list on drop. Paired with [`register_run_interrupt`]
+/// at the top of each `run_*` method so the list stays clean under
+/// normal returns, early errors, and panics.
+struct ActiveInterruptGuard {
+    interrupt: Arc<RunInterrupt>,
+}
+
+impl Drop for ActiveInterruptGuard {
+    fn drop(&mut self) {
+        unregister_run_interrupt(&self.interrupt);
+    }
+}
+
 impl Drop for OtterRuntime {
     fn drop(&mut self) {
         // Dump JIT telemetry before cleanup if requested.
@@ -280,6 +364,16 @@ impl OtterRuntime {
         // can poll it; cleared at the end of this call so the next
         // `run_module` invocation gets a fresh one.
         self.current_interrupt = Some(interrupt.clone());
+        // S5: register with the process-wide signal-shutdown list so
+        // `otter_runtime::signal_shutdown()` (called from a SIGINT /
+        // SIGTERM handler) can fire the flag while a run is in flight.
+        register_run_interrupt(&interrupt);
+        // RAII guard ensures we unregister on every return path (normal
+        // return, panic, early error) — otherwise the weak entry would
+        // linger until the next `register_run_interrupt` purge sweep.
+        let _active_guard = ActiveInterruptGuard {
+            interrupt: interrupt.clone(),
+        };
 
         let run_result =
             (|| -> Result<ExecutionResult, otter_vm::interpreter::InterpreterError> {
@@ -363,6 +457,11 @@ impl OtterRuntime {
         let _interrupt_guard = self
             .timeout
             .map(|timeout| TimeoutGuard::arm(interrupt.clone(), timeout));
+        // S5: expose to process-wide shutdown (see `signal_shutdown`).
+        register_run_interrupt(&interrupt);
+        let _active_guard = ActiveInterruptGuard {
+            interrupt: interrupt.clone(),
+        };
         self.current_interrupt = Some(interrupt);
         self.state
             .set_active_interrupt_flag(Some(interrupt_flag.clone()));
@@ -784,5 +883,93 @@ fn timeout_watchdog_loop(watchdog: &'static TimeoutWatchdog) {
                 .wait(heap)
                 .expect("timeout watchdog mutex poisoned");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S5 tests — process-wide shutdown signalling
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod s5_tests {
+    use super::*;
+
+    #[test]
+    fn signal_shutdown_with_no_runs_reports_zero() {
+        // With no active runs, `signal_shutdown()` must be a no-op that
+        // reports zero fired interrupts. Required so CLIs can install a
+        // signal handler eagerly at startup without worrying about
+        // ordering versus the first run.
+        let fired = signal_shutdown();
+        assert_eq!(fired, 0, "no active runs, should fire no interrupts");
+    }
+
+    #[test]
+    fn register_and_unregister_roundtrip_keeps_list_clean() {
+        // Registering then unregistering must leave the weak list free
+        // of the entry we pushed (after the opportunistic purge).
+        let interrupt = Arc::new(RunInterrupt::new());
+        register_run_interrupt(&interrupt);
+        let guard_before = active_interrupts()
+            .lock()
+            .expect("active interrupts mutex poisoned");
+        assert!(
+            guard_before
+                .iter()
+                .any(|w| std::sync::Weak::as_ptr(w) == Arc::as_ptr(&interrupt)),
+            "registration must leave a live weak entry"
+        );
+        drop(guard_before);
+        unregister_run_interrupt(&interrupt);
+        let guard_after = active_interrupts()
+            .lock()
+            .expect("active interrupts mutex poisoned");
+        assert!(
+            guard_after
+                .iter()
+                .all(|w| std::sync::Weak::as_ptr(w) != Arc::as_ptr(&interrupt)),
+            "unregister must remove the matching entry"
+        );
+    }
+
+    #[test]
+    fn signal_shutdown_fires_active_interrupt() {
+        // Simulate a run in flight: register a RunInterrupt, call
+        // `signal_shutdown()`, confirm the flag is set. Mirrors the
+        // exact flow a SIGINT handler takes in the CLI.
+        let interrupt = Arc::new(RunInterrupt::new());
+        register_run_interrupt(&interrupt);
+        assert!(!interrupt.interrupted(), "flag should start clear");
+        let fired = signal_shutdown();
+        assert!(fired >= 1, "at least our interrupt must fire");
+        assert!(
+            interrupt.interrupted(),
+            "registered interrupt must observe shutdown"
+        );
+        unregister_run_interrupt(&interrupt);
+    }
+
+    #[test]
+    fn drop_of_weak_entry_is_purged_on_next_register() {
+        // Registering a fresh interrupt must opportunistically purge
+        // dead weak entries, so long-running processes that cycle many
+        // `OtterRuntime` instances do not grow the list unboundedly.
+        {
+            let transient = Arc::new(RunInterrupt::new());
+            register_run_interrupt(&transient);
+            // `transient` drops here — weak entry becomes dangling.
+        }
+        let alive = Arc::new(RunInterrupt::new());
+        register_run_interrupt(&alive);
+        let guard = active_interrupts()
+            .lock()
+            .expect("active interrupts mutex poisoned");
+        let dead = guard.iter().filter(|w| w.strong_count() == 0).count();
+        assert_eq!(
+            dead, 0,
+            "register_run_interrupt must purge dead weak entries"
+        );
+        drop(guard);
+        unregister_run_interrupt(&alive);
     }
 }

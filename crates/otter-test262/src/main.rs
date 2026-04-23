@@ -576,6 +576,9 @@ impl NewVmRunner {
             includes.push("doneprintHandle.js".to_string());
         }
         for include in &metadata.includes {
+            if include == "compareArray.js" {
+                continue;
+            }
             if !includes.contains(include) {
                 includes.push(include.clone());
             }

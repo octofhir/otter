@@ -357,6 +357,29 @@ impl OtterRuntime {
         specifier: &str,
         referrer: Option<&str>,
     ) -> Result<ExecutionResult, RunError> {
+        self.state.clear_oom_flag();
+        let interrupt = Arc::new(RunInterrupt::new());
+        let interrupt_flag = interrupt.flag();
+        let _interrupt_guard = self
+            .timeout
+            .map(|timeout| TimeoutGuard::arm(interrupt.clone(), timeout));
+        self.current_interrupt = Some(interrupt);
+        self.state
+            .set_active_interrupt_flag(Some(interrupt_flag.clone()));
+
+        let result = self.run_entry_specifier_interruptible(specifier, referrer);
+
+        self.current_interrupt = None;
+        self.state.set_active_interrupt_flag(None);
+
+        result
+    }
+
+    fn run_entry_specifier_interruptible(
+        &mut self,
+        specifier: &str,
+        referrer: Option<&str>,
+    ) -> Result<ExecutionResult, RunError> {
         let loader = ModuleLoader::new(self.host.loader().clone());
         let graph = loader
             .load_graph(specifier, referrer)

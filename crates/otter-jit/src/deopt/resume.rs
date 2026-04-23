@@ -84,6 +84,14 @@ pub fn execute_module_entry_with_runtime(
     interrupt_flag: *const u8,
     interrupt_arc: Option<Arc<AtomicBool>>,
 ) -> Result<ExecutionResult, DeoptError> {
+    if !crate::config::jit_config().enabled {
+        let mut interpreter = Interpreter::new();
+        if let Some(flag) = interrupt_arc {
+            interpreter = interpreter.with_interrupt_flag(flag);
+        }
+        return Ok(interpreter.execute_module(module, runtime)?);
+    }
+
     let function_index = module.entry();
     let function = module
         .function(function_index)

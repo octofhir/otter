@@ -106,6 +106,9 @@ impl TierUpHook for DefaultTierUpHook {
         runtime_ptr: *mut (),
         interrupt_flag: *const u8,
     ) -> TierUpExecResult {
+        if !jit_config().enabled {
+            return TierUpExecResult::NotCompiled;
+        }
         let function = match module.function(function_index) {
             Some(f) => f,
             None => return TierUpExecResult::NotCompiled,
@@ -223,6 +226,9 @@ impl TierUpHook for DefaultTierUpHook {
         byte_pc: u32,
         accumulator_raw: u64,
     ) -> TierUpExecResult {
+        if !jit_config().enabled {
+            return TierUpExecResult::NotCompiled;
+        }
         let function = match module.function(function_index) {
             Some(f) => f,
             None => return TierUpExecResult::NotCompiled,
@@ -324,6 +330,9 @@ impl TierUpHook for DefaultTierUpHook {
         function_index: FunctionIndex,
         runtime_ptr: *mut (),
     ) -> bool {
+        if !jit_config().enabled {
+            return false;
+        }
         if runtime_ptr.is_null() {
             return false;
         }

@@ -684,6 +684,7 @@ impl RuntimeState {
         })?;
         let mut enumerable = Vec::with_capacity(keys.len());
         for key in keys {
+            self.check_interrupt()?;
             if self.property_names.is_symbol(key) {
                 continue;
             }
@@ -834,6 +835,7 @@ impl RuntimeState {
         &mut self,
         iter: ObjectHandle,
     ) -> Result<crate::object::IteratorStep, VmNativeCallError> {
+        self.check_interrupt()?;
         match self.iterator_next(iter) {
             Ok(step) => return Ok(step),
             Err(InterpreterError::InvalidHeapValueKind) => {}

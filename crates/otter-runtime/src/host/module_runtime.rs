@@ -498,7 +498,11 @@ fn evaluate_loaded_module(
     } else {
         let module =
             compile_transformed_module(&transformed_source, url, module_type, source_type)?;
-        match execute_module_entry_with_runtime(&module, runtime, std::ptr::null(), None) {
+        let interrupt_flag = runtime.active_interrupt_flag();
+        let interrupt_ptr = interrupt_flag.as_ref().map_or(std::ptr::null(), |flag| {
+            std::sync::Arc::as_ptr(flag).cast::<u8>()
+        });
+        match execute_module_entry_with_runtime(&module, runtime, interrupt_ptr, interrupt_flag) {
             Ok(_) => Ok(()),
             Err(DeoptError::Interpreter(error)) => {
                 // Stash the raw thrown value (when present) so the outer

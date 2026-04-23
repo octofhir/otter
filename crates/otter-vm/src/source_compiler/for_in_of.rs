@@ -101,10 +101,20 @@ pub(super) fn lower_for_in_of_assignment_target<'a>(
     ctx: &LoweringContext<'a>,
     target: ForInOfAssignmentTarget<'a>,
     iter_value_reg: u16,
+    use_iterator_destructuring: bool,
 ) -> Result<(), SourceLoweringError> {
     match target {
         ForInOfAssignmentTarget::Array(pattern) => {
-            destructure_array_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
+            if use_iterator_destructuring {
+                destructure_array_assignment_from_temp(builder, ctx, pattern, iter_value_reg)
+            } else {
+                destructure_array_assignment_from_temp_indexed(
+                    builder,
+                    ctx,
+                    pattern,
+                    iter_value_reg,
+                )
+            }
         }
         ForInOfAssignmentTarget::Object(pattern) => {
             destructure_object_assignment_from_temp(builder, ctx, pattern, iter_value_reg)

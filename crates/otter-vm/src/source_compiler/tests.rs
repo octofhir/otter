@@ -6296,6 +6296,26 @@ fn array_destructure_default_applies_when_undefined() {
     );
 }
 
+#[test]
+fn destructuring_propagates_thrown_default_initializer() {
+    let src = "function main() { \
+        function thrower() { throw new Error(\"boom\"); } \
+        let iterator = { \
+            [Symbol.iterator]() { return this; }, \
+            next() { return { done: false }; }, \
+            get return() { throw \"bad\"; } \
+        }; \
+        try { \
+            let a; \
+            [a = thrower()] = iterator; \
+        } catch (e) { \
+            return e.message === \"boom\" ? 1 : 2; \
+        } \
+        return 0; \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 1);
+}
+
 // ---------------------------------------------------------------------------
 // M25: FunctionExpression + closures (upvalue capture)
 // ---------------------------------------------------------------------------

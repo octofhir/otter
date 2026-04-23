@@ -2677,7 +2677,7 @@ fn lower_for_of_statement<'a>(
             lower_for_in_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
         }
         if let Some(target) = assignment_target {
-            lower_for_in_of_assignment_target(builder, ctx, target, binding_reg)?;
+            lower_for_in_of_assignment_target(builder, ctx, target, binding_reg, true)?;
         }
 
         // 4) Body. Register loop labels so nested
@@ -2941,7 +2941,7 @@ fn lower_for_in_statement<'a>(
             lower_for_in_of_upvalue_assignment(builder, iter_val_reg, upvalue_idx)?;
         }
         if let Some(target) = assignment_target {
-            lower_for_in_of_assignment_target(builder, ctx, target, binding_reg)?;
+            lower_for_in_of_assignment_target(builder, ctx, target, binding_reg, false)?;
         }
 
         ctx.enter_loop(LoopLabels {
@@ -10017,6 +10017,242 @@ fn assign_destructured_target_from_assignment_target<'a>(
 }
 
 fn destructure_array_assignment_from_temp<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'a>,
+    pattern: &'a oxc_ast::ast::ArrayAssignmentTarget<'a>,
+    src_temp: RegisterIndex,
+) -> Result<(), SourceLoweringError> {
+    let iter_temp = ctx.acquire_temps(1)?;
+    let value_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(1))?;
+    let done_temp = ctx.acquire_temps(1).inspect_err(|_| ctx.release_temps(2))?;
+    let lower = (|| -> Result<(), SourceLoweringError> {
+        builder
+            .emit(Opcode::GetIterator, &[Operand::Reg(u32::from(src_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode GetIterator (array destruct): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(iter_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (array destruct iter): {err:?}"))
+            })?;
+        builder.emit(Opcode::LdaFalse, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaFalse (array destruct done): {err:?}"))
+        })?;
+        builder
+            .emit(Opcode::Star, &[Operand::Reg(u32::from(done_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!("encode Star (array destruct done): {err:?}"))
+            })?;
+
+        let try_start = builder.new_label();
+        let try_end = builder.new_label();
+        let close_handler = builder.new_label();
+        let after_try = builder.new_label();
+        builder.bind_label(try_start).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind array destruct try_start: {err:?}"))
+        })?;
+
+        for element in pattern.elements.iter() {
+            let done_label = builder.new_label();
+            let value_ready = builder.new_label();
+            builder
+                .emit(
+                    Opcode::IteratorStep,
+                    &[
+                        Operand::Reg(u32::from(value_temp)),
+                        Operand::Reg(u32::from(iter_temp)),
+                    ],
+                )
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode IteratorStep (array destruct): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(Opcode::Star, &[Operand::Reg(u32::from(done_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Star (array destruct done): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit_jump_to(Opcode::JumpIfToBooleanTrue, done_label)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode JumpIfToBooleanTrue (array destruct done): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit(Opcode::Ldar, &[Operand::Reg(u32::from(value_temp))])
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Ldar (array destruct value): {err:?}"
+                    ))
+                })?;
+            builder
+                .emit_jump_to(Opcode::Jump, value_ready)
+                .map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode Jump (array destruct value ready): {err:?}"
+                    ))
+                })?;
+            builder.bind_label(done_label).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind array destruct done: {err:?}"))
+            })?;
+            builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode LdaUndefined (array destruct done): {err:?}"
+                ))
+            })?;
+            builder.bind_label(value_ready).map_err(|err| {
+                SourceLoweringError::Internal(format!("bind array destruct value_ready: {err:?}"))
+            })?;
+            if let Some(elem) = element.as_ref() {
+                assign_destructured_target(builder, ctx, elem)?;
+            }
+        }
+
+        if let Some(rest) = pattern.rest.as_deref() {
+            let rest_target = ctx.acquire_temps(1)?;
+            let rest_lower = (|| -> Result<(), SourceLoweringError> {
+                builder.emit(Opcode::CreateArray, &[]).map_err(|err| {
+                    SourceLoweringError::Internal(format!(
+                        "encode CreateArray (array destruct rest): {err:?}"
+                    ))
+                })?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(rest_target))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (array destruct rest): {err:?}"
+                        ))
+                    })?;
+                let rest_loop = builder.new_label();
+                let rest_done = builder.new_label();
+                builder.bind_label(rest_loop).map_err(|err| {
+                    SourceLoweringError::Internal(format!("bind array destruct rest loop: {err:?}"))
+                })?;
+                builder
+                    .emit(
+                        Opcode::IteratorStep,
+                        &[
+                            Operand::Reg(u32::from(value_temp)),
+                            Operand::Reg(u32::from(iter_temp)),
+                        ],
+                    )
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode IteratorStep (array destruct rest): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(Opcode::Star, &[Operand::Reg(u32::from(done_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Star (array destruct rest done): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit_jump_to(Opcode::JumpIfToBooleanTrue, rest_done)
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode JumpIfToBooleanTrue (array destruct rest): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(Opcode::Ldar, &[Operand::Reg(u32::from(value_temp))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Ldar (array destruct rest value): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit(Opcode::ArrayPush, &[Operand::Reg(u32::from(rest_target))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode ArrayPush (array destruct rest): {err:?}"
+                        ))
+                    })?;
+                builder
+                    .emit_jump_to(Opcode::Jump, rest_loop)
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Jump (array destruct rest loop): {err:?}"
+                        ))
+                    })?;
+                builder.bind_label(rest_done).map_err(|err| {
+                    SourceLoweringError::Internal(format!("bind array destruct rest done: {err:?}"))
+                })?;
+                builder
+                    .emit(Opcode::Ldar, &[Operand::Reg(u32::from(rest_target))])
+                    .map_err(|err| {
+                        SourceLoweringError::Internal(format!(
+                            "encode Ldar (array destruct rest result): {err:?}"
+                        ))
+                    })?;
+                assign_destructured_target_from_assignment_target(builder, ctx, &rest.target)?;
+                Ok(())
+            })();
+            ctx.release_temps(1);
+            rest_lower?;
+        }
+
+        builder.bind_label(try_end).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind array destruct try_end: {err:?}"))
+        })?;
+        builder
+            .emit_jump_to(Opcode::Jump, after_try)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Jump (array destruct after): {err:?}"
+                ))
+            })?;
+        ctx.record_exception_handler(try_start, try_end, close_handler);
+
+        builder.bind_label(close_handler).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind array destruct close_handler: {err:?}"))
+        })?;
+        let skip_close = builder.new_label();
+        builder
+            .emit(Opcode::Ldar, &[Operand::Reg(u32::from(done_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode Ldar (array destruct close done): {err:?}"
+                ))
+            })?;
+        builder
+            .emit_jump_to(Opcode::JumpIfToBooleanTrue, skip_close)
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode JumpIfToBooleanTrue (array destruct skip close): {err:?}"
+                ))
+            })?;
+        builder
+            .emit(Opcode::IteratorClose, &[Operand::Reg(u32::from(iter_temp))])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode IteratorClose (array destruct): {err:?}"
+                ))
+            })?;
+        builder.bind_label(skip_close).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind array destruct skip_close: {err:?}"))
+        })?;
+        builder.emit(Opcode::ReThrow, &[]).map_err(|err| {
+            SourceLoweringError::Internal(format!("encode ReThrow (array destruct): {err:?}"))
+        })?;
+        builder.bind_label(after_try).map_err(|err| {
+            SourceLoweringError::Internal(format!("bind array destruct after_try: {err:?}"))
+        })?;
+        Ok(())
+    })();
+    ctx.release_temps(3);
+    lower
+}
+
+fn destructure_array_assignment_from_temp_indexed<'a>(
     builder: &mut BytecodeBuilder,
     ctx: &LoweringContext<'a>,
     pattern: &'a oxc_ast::ast::ArrayAssignmentTarget<'a>,

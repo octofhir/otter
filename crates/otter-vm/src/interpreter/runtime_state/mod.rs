@@ -866,6 +866,60 @@ impl RuntimeState {
         Ok(crate::object::IteratorStep::yield_value(value_val))
     }
 
+    /// §7.4.11 IteratorClose for both built-in and user-defined
+    /// iterators. When `suppress_throw` is true, JS throws produced
+    /// while fetching/calling `.return` are ignored so an existing
+    /// abrupt completion remains the externally visible result.
+    pub fn iterator_close_protocol(
+        &mut self,
+        iter: ObjectHandle,
+        suppress_throw: bool,
+    ) -> Result<(), VmNativeCallError> {
+        self.check_interrupt()?;
+        match self.objects.iterator_close(iter) {
+            Ok(()) => return Ok(()),
+            Err(crate::object::ObjectError::InvalidKind) => {}
+            Err(error) => {
+                return Err(VmNativeCallError::Internal(
+                    format!("iterator close failed: {error:?}").into(),
+                ));
+            }
+        }
+
+        let iter_val = RegisterValue::from_object_handle(iter.0);
+        let return_prop = self.intern_property_name("return");
+        let return_method = match self.ordinary_get(iter, return_prop, iter_val) {
+            Ok(value) => value,
+            Err(VmNativeCallError::Thrown(_)) if suppress_throw => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if return_method == RegisterValue::undefined() || return_method == RegisterValue::null() {
+            return Ok(());
+        }
+        let Some(return_handle) = return_method.as_object_handle().map(ObjectHandle) else {
+            if suppress_throw {
+                return Ok(());
+            }
+            return Err(self.throw_as_type_error("Iterator return is not callable"));
+        };
+        if !self.objects.is_callable(return_handle) {
+            if suppress_throw {
+                return Ok(());
+            }
+            return Err(self.throw_as_type_error("Iterator return is not callable"));
+        }
+
+        let result = match self.call_callable(return_handle, iter_val, &[]) {
+            Ok(value) => value,
+            Err(VmNativeCallError::Thrown(_)) if suppress_throw => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if result.as_object_handle().is_none() && !suppress_throw {
+            return Err(self.throw_as_type_error("Iterator return result is not an object"));
+        }
+        Ok(())
+    }
+
     /// Wraps a plain message string in a JS `TypeError` value and
     /// returns the `VmNativeCallError::Thrown` variant so callers
     /// can `?`-propagate without open-coding the allocator dance.

@@ -1610,16 +1610,26 @@ impl Interpreter {
                 }
             }
 
-            // `IteratorClose r` — side-effectful; closes built-in
-            // iterators and is a no-op for non-built-ins. Does not
-            // write the accumulator (Phase 3b.9b will wire the
-            // `.return()` protocol for custom iterators).
+            // `IteratorClose r` — side-effectful; closes built-ins
+            // and user iterators via `.return()`. If this executes
+            // while unwinding an existing abrupt completion, throws
+            // from `.return` are ignored per §7.4.11.
             Opcode::IteratorClose => {
                 let iter_val = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 if let Some(h) = iter_val.as_object_handle() {
-                    let _ = runtime
-                        .objects
-                        .iterator_close(crate::object::ObjectHandle(h));
+                    let suppress_throw = activation.pending_exception().is_some()
+                        || activation.pending_abrupt_completion().is_some();
+                    match runtime
+                        .iterator_close_protocol(crate::object::ObjectHandle(h), suppress_throw)
+                    {
+                        Ok(()) => {}
+                        Err(crate::VmNativeCallError::Thrown(value)) => {
+                            return Ok(StepOutcome::Throw(value));
+                        }
+                        Err(crate::VmNativeCallError::Internal(msg)) => {
+                            return Err(InterpreterError::NativeCall(msg));
+                        }
+                    }
                 }
             }
 

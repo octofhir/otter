@@ -6256,6 +6256,18 @@ fn object_rest_destructure_copies_remaining_keys() {
 }
 
 #[test]
+fn object_rest_destructure_excludes_computed_number_key() {
+    let src = "function f() { \
+        let a = 1; \
+        let b, rest; \
+        let vals = { [a]: [1], bar: 2 }; \
+        ({ [a]: b, ...rest } = vals); \
+        return b[0] + rest.bar + (rest[1] === undefined ? 10 : 100); \
+    }";
+    assert_eq!(run_int32_function(src, &[]), 13);
+}
+
+#[test]
 fn computed_pattern_key_works() {
     // `{ [k]: v } = obj` — key evaluates at runtime, value lands
     // in `v` via `LdaKeyedProperty`.

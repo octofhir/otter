@@ -216,6 +216,27 @@ impl Interpreter {
                     crate::VmNativeCallError::Internal(msg) => InterpreterError::NativeCall(msg),
                 })?;
             }
+            Opcode::CopyDataPropertiesExcept => {
+                let target_val = read_reg(activation, function, reg(&instr.operands, 0)?)?;
+                let Some(target_handle) = target_val.as_object_handle() else {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "CopyDataPropertiesExcept target must be an object",
+                    )));
+                };
+                let (base, count) = reg_list(&instr.operands, 1)?;
+                let excluded = read_reg_list(activation, function, base, count)?;
+                let source = activation.accumulator();
+                crate::property_copy::copy_data_properties_except(
+                    runtime,
+                    crate::object::ObjectHandle(target_handle),
+                    source,
+                    &excluded,
+                )
+                .map_err(|err| match err {
+                    crate::VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
+                    crate::VmNativeCallError::Internal(msg) => InterpreterError::NativeCall(msg),
+                })?;
+            }
             // M35: §13.3.10 `import(expr)` — delegate to the
             // module-loader's thread-local-context
             // `dynamic_import_resolve`, which resolves + loads the

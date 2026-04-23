@@ -24,7 +24,20 @@ fn excluded_property_names(
     let excluded_values = runtime.list_from_array_like(excluded_handle)?;
     let mut excluded = Vec::with_capacity(excluded_values.len());
     for value in excluded_values {
+        runtime.check_interrupt()?;
         excluded.push(runtime.property_name_from_value(value)?);
+    }
+    Ok(excluded)
+}
+
+fn excluded_property_names_from_values(
+    runtime: &mut RuntimeState,
+    excluded_values: &[RegisterValue],
+) -> Result<Vec<PropertyNameId>, VmNativeCallError> {
+    let mut excluded = Vec::with_capacity(excluded_values.len());
+    for value in excluded_values {
+        runtime.check_interrupt()?;
+        excluded.push(runtime.property_name_from_value(*value)?);
     }
     Ok(excluded)
 }
@@ -50,6 +63,39 @@ pub(crate) fn copy_data_properties(
                 other => VmNativeCallError::Internal(format!("{other}").into()),
             })?;
     let excluded = excluded_property_names(runtime, excluded_keys)?;
+    copy_data_properties_with_excluded_names(runtime, target, source_handle, excluded)
+}
+
+pub(crate) fn copy_data_properties_except(
+    runtime: &mut RuntimeState,
+    target: ObjectHandle,
+    source: RegisterValue,
+    excluded_values: &[RegisterValue],
+) -> Result<(), VmNativeCallError> {
+    if source == RegisterValue::undefined() || source == RegisterValue::null() {
+        return Ok(());
+    }
+
+    let source_handle =
+        runtime
+            .property_base_object_handle(source)
+            .map_err(|error| match error {
+                InterpreterError::UncaughtThrow(value) => VmNativeCallError::Thrown(value),
+                InterpreterError::NativeCall(message) | InterpreterError::TypeError(message) => {
+                    VmNativeCallError::Internal(message)
+                }
+                other => VmNativeCallError::Internal(format!("{other}").into()),
+            })?;
+    let excluded = excluded_property_names_from_values(runtime, excluded_values)?;
+    copy_data_properties_with_excluded_names(runtime, target, source_handle, excluded)
+}
+
+fn copy_data_properties_with_excluded_names(
+    runtime: &mut RuntimeState,
+    target: ObjectHandle,
+    source_handle: ObjectHandle,
+    excluded: Vec<PropertyNameId>,
+) -> Result<(), VmNativeCallError> {
     let keys = runtime.own_property_keys(source_handle).map_err(|error| {
         VmNativeCallError::Internal(
             format!("copy data properties ownKeys failed: {error:?}").into(),
@@ -57,6 +103,7 @@ pub(crate) fn copy_data_properties(
     })?;
 
     for property in keys {
+        runtime.check_interrupt()?;
         if excluded.contains(&property) {
             continue;
         }

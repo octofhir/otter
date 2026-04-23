@@ -531,7 +531,27 @@ fn lower_switch_object_pattern<'a>(
             ));
         };
         let reg = resolve_switch_binding_target(ctx, rest_ident, mode)?;
-        emit_object_rest_copy(builder, ctx, src_reg, &extracted_keys, reg)?;
+        let excluded_base = if extracted_keys.is_empty() {
+            None
+        } else {
+            let count = RegisterIndex::try_from(extracted_keys.len()).map_err(|_| {
+                SourceLoweringError::Internal("object rest exclusion count overflow".into())
+            })?;
+            let base = ctx.acquire_temps(count)?;
+            for (offset, key) in extracted_keys.iter().enumerate() {
+                emit_string_literal_to_register(builder, ctx, key, base + offset as RegisterIndex)?;
+            }
+            Some((base, extracted_keys.len(), count))
+        };
+        emit_object_rest_copy(
+            builder,
+            src_reg,
+            excluded_base.map(|(base, len, _)| (base, len)),
+            reg,
+        )?;
+        if let Some((_, _, count)) = excluded_base {
+            ctx.release_temps(count);
+        }
         finish_switch_binding_write(ctx, rest_ident, mode)?;
     }
     Ok(())

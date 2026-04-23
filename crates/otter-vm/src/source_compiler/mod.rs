@@ -5004,10 +5004,17 @@ fn lower_object_pattern<'a>(
     src_reg: RegisterIndex,
     is_const: bool,
 ) -> Result<(), SourceLoweringError> {
-    // Track the set of property names bound so far so the rest
-    // element (if any) can exclude them from the copy.
-    let mut extracted_keys: Vec<String> = Vec::new();
-    for prop in pat.properties.iter() {
+    let excluded_base = if pat.rest.is_some() && !pat.properties.is_empty() {
+        let count = RegisterIndex::try_from(pat.properties.len()).map_err(|_| {
+            SourceLoweringError::Internal("object rest exclusion count overflow".into())
+        })?;
+        Some(ctx.acquire_temps(count)?)
+    } else {
+        None
+    };
+
+    for (prop_index, prop) in pat.properties.iter().enumerate() {
+        let exclusion_slot = excluded_base.map(|base| base + prop_index as RegisterIndex);
         // Resolve the key: static identifier / string literal
         // both stringify to a known name; computed keys evaluate
         // an expression and use `LdaKeyedProperty`.
@@ -5015,7 +5022,7 @@ fn lower_object_pattern<'a>(
             // Computed key — evaluate the expression once into a
             // temp so both the property read and the rest-key
             // exclusion can reuse it.
-            let temp = ctx.acquire_temps(1)?;
+            let temp = exclusion_slot.unwrap_or(ctx.acquire_temps(1)?);
             let key_expr = prop.key.to_expression();
             lower_return_expression(builder, ctx, key_expr)?;
             builder
@@ -5043,7 +5050,9 @@ fn lower_object_pattern<'a>(
                 }
             };
             let idx = ctx.intern_property_name(&key_name)?;
-            extracted_keys.push(key_name.clone());
+            if let Some(slot) = exclusion_slot {
+                emit_string_literal_to_register(builder, ctx, &key_name, slot)?;
+            }
             (None, Some(key_name), Some(idx))
         };
         // Read the property value into acc via Lda(Named|Keyed)Property.
@@ -5065,7 +5074,9 @@ fn lower_object_pattern<'a>(
                         "encode LdaKeyedProperty (object pattern): {err:?}"
                     ))
                 })?;
-            ctx.release_temps(1);
+            if exclusion_slot.is_none() {
+                ctx.release_temps(1);
+            }
         } else if let Some(idx) = static_key_idx {
             builder
                 .emit(
@@ -5130,9 +5141,38 @@ fn lower_object_pattern<'a>(
         };
         let rest_name = rest_ident.name.as_str();
         let rest_slot = ctx.allocate_local(rest_name, is_const, rest_ident.span)?;
-        emit_object_rest_copy(builder, ctx, src_reg, &extracted_keys, rest_slot)?;
+        emit_object_rest_copy(
+            builder,
+            src_reg,
+            excluded_base.map(|base| (base, pat.properties.len())),
+            rest_slot,
+        )?;
         ctx.mark_initialized(rest_name)?;
     }
+    if excluded_base.is_some() {
+        let count = RegisterIndex::try_from(pat.properties.len()).map_err(|_| {
+            SourceLoweringError::Internal("object rest exclusion count overflow".into())
+        })?;
+        ctx.release_temps(count);
+    }
+    Ok(())
+}
+
+fn emit_string_literal_to_register(
+    builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
+    value: &str,
+    slot: RegisterIndex,
+) -> Result<(), SourceLoweringError> {
+    let idx = ctx.intern_string_literal(value)?;
+    builder
+        .emit(Opcode::LdaConstStr, &[Operand::Idx(idx)])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode LdaConstStr (rest key): {err:?}"))
+        })?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+        .map_err(|err| SourceLoweringError::Internal(format!("encode Star (rest key): {err:?}")))?;
     Ok(())
 }
 
@@ -5141,9 +5181,8 @@ fn lower_object_pattern<'a>(
 /// bound above. Drops the result into `rest_slot`.
 fn emit_object_rest_copy(
     builder: &mut BytecodeBuilder,
-    ctx: &LoweringContext<'_>,
     src_reg: RegisterIndex,
-    excluded_keys: &[String],
+    excluded_regs: Option<(RegisterIndex, usize)>,
     rest_slot: RegisterIndex,
 ) -> Result<(), SourceLoweringError> {
     builder.emit(Opcode::CreateObject, &[]).map_err(|err| {
@@ -5154,34 +5193,41 @@ fn emit_object_rest_copy(
         .map_err(|err| {
             SourceLoweringError::Internal(format!("encode Star (obj rest target): {err:?}"))
         })?;
-    // Copy all own-enumerable properties from src. Excluding the
-    // already-bound keys is spec-correct (§14.3.3 RestDestructuring)
-    // but `CopyDataProperties` currently only takes a single-
-    // argument form — the loop below re-deletes the excluded keys
-    // from the rest object after the bulk copy.
     builder
         .emit(Opcode::Ldar, &[Operand::Reg(u32::from(src_reg))])
         .map_err(|err| {
             SourceLoweringError::Internal(format!("encode Ldar (obj rest src): {err:?}"))
         })?;
-    builder
-        .emit(
-            Opcode::CopyDataProperties,
-            &[Operand::Reg(u32::from(rest_slot))],
-        )
-        .map_err(|err| {
-            SourceLoweringError::Internal(format!("encode CopyDataProperties (obj rest): {err:?}"))
-        })?;
-    for key in excluded_keys {
-        let idx = ctx.intern_property_name(key)?;
+    if let Some((base, count)) = excluded_regs {
         builder
             .emit(
-                Opcode::DelNamedProperty,
-                &[Operand::Reg(u32::from(rest_slot)), Operand::Idx(idx)],
+                Opcode::CopyDataPropertiesExcept,
+                &[
+                    Operand::Reg(u32::from(rest_slot)),
+                    Operand::RegList {
+                        base: u32::from(base),
+                        count: u32::try_from(count).map_err(|_| {
+                            SourceLoweringError::Internal(
+                                "object rest exclusion count overflow".into(),
+                            )
+                        })?,
+                    },
+                ],
             )
             .map_err(|err| {
                 SourceLoweringError::Internal(format!(
-                    "encode DelNamedProperty (obj rest exclusion): {err:?}"
+                    "encode CopyDataPropertiesExcept (obj rest): {err:?}"
+                ))
+            })?;
+    } else {
+        builder
+            .emit(
+                Opcode::CopyDataProperties,
+                &[Operand::Reg(u32::from(rest_slot))],
+            )
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "encode CopyDataProperties (obj rest): {err:?}"
                 ))
             })?;
     }
@@ -10310,13 +10356,24 @@ fn destructure_object_assignment_from_temp<'a>(
     pattern: &'a oxc_ast::ast::ObjectAssignmentTarget<'a>,
     src_temp: RegisterIndex,
 ) -> Result<(), SourceLoweringError> {
-    let mut excluded_keys: Vec<String> = Vec::new();
-    for prop in pattern.properties.iter() {
+    let excluded_base = if pattern.rest.is_some() && !pattern.properties.is_empty() {
+        let count = RegisterIndex::try_from(pattern.properties.len()).map_err(|_| {
+            SourceLoweringError::Internal("object rest exclusion count overflow".into())
+        })?;
+        Some(ctx.acquire_temps(count)?)
+    } else {
+        None
+    };
+
+    for (prop_index, prop) in pattern.properties.iter().enumerate() {
+        let exclusion_slot = excluded_base.map(|base| base + prop_index as RegisterIndex);
         match prop {
             oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
                 let name = p.binding.name.as_str().to_owned();
-                excluded_keys.push(name.clone());
                 let key_idx = ctx.intern_property_name(&name)?;
+                if let Some(slot) = exclusion_slot {
+                    emit_string_literal_to_register(builder, ctx, &name, slot)?;
+                }
                 builder
                     .emit(
                         Opcode::LdaNamedProperty,
@@ -10345,7 +10402,7 @@ fn destructure_object_assignment_from_temp<'a>(
                         (Some(idx), false, Some(name))
                     }
                     other => {
-                        let key_temp = ctx.acquire_temps(1)?;
+                        let key_temp = exclusion_slot.unwrap_or(ctx.acquire_temps(1)?);
                         let result = (|| -> Result<(), SourceLoweringError> {
                             lower_return_expression(builder, ctx, other.to_expression())?;
                             builder
@@ -10374,11 +10431,18 @@ fn destructure_object_assignment_from_temp<'a>(
                                 })?;
                             Ok(())
                         })();
-                        ctx.release_temps(1);
+                        if exclusion_slot.is_none() {
+                            ctx.release_temps(1);
+                        }
                         result?;
                         (None, true, None)
                     }
                 };
+                if let Some(name) = key_name_for_rest.as_ref()
+                    && let Some(slot) = exclusion_slot
+                {
+                    emit_string_literal_to_register(builder, ctx, name, slot)?;
+                }
                 if !key_is_computed && let Some(idx) = key_idx {
                     builder
                         .emit(
@@ -10391,9 +10455,6 @@ fn destructure_object_assignment_from_temp<'a>(
                             ))
                         })?;
                 }
-                if let Some(name) = key_name_for_rest {
-                    excluded_keys.push(name);
-                }
                 assign_destructured_target(builder, ctx, &kv.binding)?;
             }
         }
@@ -10401,7 +10462,12 @@ fn destructure_object_assignment_from_temp<'a>(
     if let Some(rest) = pattern.rest.as_deref() {
         let rest_target = ctx.acquire_temps(1)?;
         let rest_lower = (|| -> Result<(), SourceLoweringError> {
-            emit_object_rest_copy(builder, ctx, src_temp, &excluded_keys, rest_target)?;
+            emit_object_rest_copy(
+                builder,
+                src_temp,
+                excluded_base.map(|base| (base, pattern.properties.len())),
+                rest_target,
+            )?;
             builder
                 .emit(Opcode::Ldar, &[Operand::Reg(u32::from(rest_target))])
                 .map_err(|err| {
@@ -10414,6 +10480,12 @@ fn destructure_object_assignment_from_temp<'a>(
         })();
         ctx.release_temps(1);
         rest_lower?;
+    }
+    if excluded_base.is_some() {
+        let count = RegisterIndex::try_from(pattern.properties.len()).map_err(|_| {
+            SourceLoweringError::Internal("object rest exclusion count overflow".into())
+        })?;
+        ctx.release_temps(count);
     }
     Ok(())
 }

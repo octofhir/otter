@@ -777,6 +777,16 @@ fn main() {
         eprintln!("Memory profile enabled (interval: every {memory_profile_interval} tests)");
     }
 
+    // Pre-test diagnostic: print the test path to stderr and flush
+    // so a hang in the runtime can be pinpointed. Gated on verbose
+    // >= 3 or an explicit trace env var so it doesn't spam the
+    // progress bar during ordinary runs. `-vvv` users get it for
+    // free; everyone else can flip `OTTER_TEST262_TRACE=1`.
+    let trace_tests = cli.verbose >= 3
+        || std::env::var("OTTER_TEST262_TRACE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+
     for (test_index, path) in tests.iter().enumerate() {
         if memory_profile && test_index.is_multiple_of(memory_profile_interval) {
             let stats = probe_heap_baseline(&runner);
@@ -789,6 +799,15 @@ fn main() {
                 );
                 memory_baseline = Some(stats);
             }
+        }
+        if trace_tests {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "[RUN {test_index}/{test_count}] {}",
+                path.display()
+            );
+            let _ = std::io::stderr().flush();
         }
         let results = runner.run_test_all_modes(path);
 

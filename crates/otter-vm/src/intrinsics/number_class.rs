@@ -126,7 +126,7 @@ fn number_to_fixed(
         )?);
     }
     if number.is_nan() {
-        let handle = runtime.alloc_string("NaN");
+        let handle = runtime.alloc_string("NaN")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     if number.is_infinite() {
@@ -135,11 +135,11 @@ fn number_to_fixed(
         } else {
             "-Infinity"
         };
-        let handle = runtime.alloc_string(s);
+        let handle = runtime.alloc_string(s)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let text = format!("{number:.prec$}", prec = digits as usize);
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -156,7 +156,7 @@ fn number_to_precision(
         .unwrap_or_else(RegisterValue::undefined);
     if precision == RegisterValue::undefined() {
         let text = number_to_decimal_string(number);
-        let handle = runtime.alloc_string(text);
+        let handle = runtime.alloc_string(text)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let p = precision
@@ -171,7 +171,7 @@ fn number_to_precision(
     }
     if number.is_nan() || number.is_infinite() {
         let text = number_to_decimal_string(number);
-        let handle = runtime.alloc_string(text);
+        let handle = runtime.alloc_string(text)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let text = format!("{number:.prec$e}", prec = (p as usize).saturating_sub(1));
@@ -197,7 +197,7 @@ fn number_to_precision(
                 (p as usize).saturating_sub(1 + (number.abs().log10().floor().max(0.0) as usize))
         )
     };
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -210,7 +210,7 @@ fn number_to_exponential(
     let number = this_number_value(*this, runtime)?;
     if number.is_nan() || number.is_infinite() {
         let text = number_to_decimal_string(number);
-        let handle = runtime.alloc_string(text);
+        let handle = runtime.alloc_string(text)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let frac = args.first().copied().and_then(|v| {
@@ -243,7 +243,7 @@ fn number_to_exponential(
     } else {
         text
     };
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -306,7 +306,7 @@ fn number_to_locale_string(
     let number = this_number_value(*this, runtime)?;
 
     if number.is_nan() {
-        let handle = runtime.alloc_string("NaN");
+        let handle = runtime.alloc_string("NaN")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     if number.is_infinite() {
@@ -315,7 +315,7 @@ fn number_to_locale_string(
         } else {
             "Infinity"
         };
-        let handle = runtime.alloc_string(s);
+        let handle = runtime.alloc_string(s)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
 
@@ -330,7 +330,7 @@ fn number_to_locale_string(
         ryu::Buffer::new().format(number).to_string()
     };
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -372,7 +372,7 @@ fn number_to_string(
         number_to_radix_string(number, radix_mv)
     };
 
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -886,7 +886,7 @@ pub(crate) fn box_number_object_with_prototype(
     prototype: ObjectHandle,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let wrapper = runtime.alloc_object_with_prototype(Some(prototype));
+    let wrapper = runtime.alloc_object_with_prototype(Some(prototype))?;
     set_number_data(wrapper, primitive, runtime)?;
     Ok(RegisterValue::from_object_handle(wrapper.0))
 }

@@ -22,8 +22,12 @@ use super::{
 impl RuntimeState {
     pub(crate) fn invalid_array_length_error(&mut self) -> InterpreterError {
         let prototype = self.intrinsics().range_error_prototype;
-        let handle = self.alloc_object_with_prototype(Some(prototype));
-        let message = self.alloc_string("Invalid array length");
+        let Ok(handle) = self.alloc_object_with_prototype(Some(prototype)) else {
+            return InterpreterError::OutOfMemory;
+        };
+        let Ok(message) = self.alloc_string("Invalid array length") else {
+            return InterpreterError::OutOfMemory;
+        };
         let message_prop = self.intern_property_name("message");
         self.objects
             .set_property(
@@ -246,7 +250,7 @@ impl RuntimeState {
         // 3. Define the "name" own property. The slot installed by
         //    `alloc_closure` is configurable, so re-defining it is legal.
         let name_property = self.intern_property_name("name");
-        let name_value = self.alloc_string(full_name);
+        let name_value = self.alloc_string(full_name)?;
         self.objects
             .define_own_property(
                 closure,
@@ -310,7 +314,7 @@ impl RuntimeState {
         }
         if value.is_bigint() {
             let wrapper =
-                self.alloc_object_with_prototype(Some(self.intrinsics().bigint_prototype()));
+                self.alloc_object_with_prototype(Some(self.intrinsics().bigint_prototype()))?;
             return Ok(wrapper);
         }
         if value.is_symbol() {
@@ -448,9 +452,9 @@ impl RuntimeState {
             }
 
             let hint_value = match hint {
-                ToPrimitiveHint::Default => self.alloc_string("default"),
-                ToPrimitiveHint::String => self.alloc_string("string"),
-                ToPrimitiveHint::Number => self.alloc_string("number"),
+                ToPrimitiveHint::Default => self.alloc_string("default")?,
+                ToPrimitiveHint::String => self.alloc_string("string")?,
+                ToPrimitiveHint::Number => self.alloc_string("number")?,
             };
             let result = self
                 .call_callable(
@@ -957,8 +961,8 @@ impl RuntimeState {
         message: &str,
     ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().reference_error_prototype;
-        let handle = self.alloc_object_with_prototype(Some(prototype));
-        let msg_handle = self.objects.alloc_string(message);
+        let handle = self.alloc_object_with_prototype(Some(prototype))?;
+        let msg_handle = self.objects.alloc_string(message)?;
         let msg_prop = self.intern_property_name("message");
         self.objects.set_property(
             handle,
@@ -971,8 +975,8 @@ impl RuntimeState {
     /// Allocate a TypeError object with the correct prototype chain.
     pub fn alloc_type_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().type_error_prototype;
-        let handle = self.alloc_object_with_prototype(Some(prototype));
-        let msg_handle = self.objects.alloc_string(message);
+        let handle = self.alloc_object_with_prototype(Some(prototype))?;
+        let msg_handle = self.objects.alloc_string(message)?;
         let msg_prop = self.intern_property_name("message");
         self.objects.set_property(
             handle,
@@ -985,8 +989,8 @@ impl RuntimeState {
     /// Allocates one RangeError instance with the given message.
     pub fn alloc_range_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().range_error_prototype;
-        let handle = self.alloc_object_with_prototype(Some(prototype));
-        let msg_handle = self.objects.alloc_string(message);
+        let handle = self.alloc_object_with_prototype(Some(prototype))?;
+        let msg_handle = self.objects.alloc_string(message)?;
         let msg_prop = self.intern_property_name("message");
         self.objects.set_property(
             handle,
@@ -1003,10 +1007,10 @@ impl RuntimeState {
         status: &str,
         value_key: &str,
         value: RegisterValue,
-    ) -> ObjectHandle {
-        let obj = self.alloc_object();
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let obj = self.alloc_object()?;
         let status_prop = self.intern_property_name("status");
-        let status_str = self.objects.alloc_string(status);
+        let status_str = self.objects.alloc_string(status)?;
         let _ = self.objects.set_property(
             obj,
             status_prop,
@@ -1014,7 +1018,7 @@ impl RuntimeState {
         );
         let value_prop = self.intern_property_name(value_key);
         let _ = self.objects.set_property(obj, value_prop, value);
-        obj
+        Ok(obj)
     }
 
     /// §19.2.1 Step 1: If x is not a String, return None.
@@ -1091,7 +1095,7 @@ impl RuntimeState {
             .map_err(|_| InterpreterError::InvalidConstant)?;
 
         let result = op(&lhs_val, &rhs_val);
-        let handle = self.alloc_bigint(&result.to_string());
+        let handle = self.alloc_bigint(&result.to_string())?;
         Ok(RegisterValue::from_bigint_handle(handle.0))
     }
 
@@ -1180,7 +1184,7 @@ impl RuntimeState {
         if lhs_is_string || rhs_is_string {
             let mut text = self.js_to_string(lprim)?.into_string();
             text.push_str(&self.js_to_string(rprim)?);
-            let value = self.alloc_string(text);
+            let value = self.alloc_string(text)?;
             return Ok(RegisterValue::from_object_handle(value.0));
         }
 
@@ -1407,7 +1411,7 @@ impl RuntimeState {
             "undefined"
         };
 
-        let string = self.alloc_string(kind);
+        let string = self.alloc_string(kind)?;
         Ok(RegisterValue::from_object_handle(string.0))
     }
 }

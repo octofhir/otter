@@ -112,6 +112,6 @@ pub fn construct_temporal(
     payload: TemporalPayload,
     prototype: ObjectHandle,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> ObjectHandle {
+) -> Result<ObjectHandle, crate::interpreter::InterpreterError> {
     runtime.alloc_native_object_with_prototype(Some(prototype), payload)
 }

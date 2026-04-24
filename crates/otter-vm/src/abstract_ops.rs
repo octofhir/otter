@@ -390,9 +390,12 @@ mod tests {
     #[test]
     fn same_value_compares_string_primitive_contents() {
         let mut heap = ObjectHeap::new();
-        let lhs = RegisterValue::from_object_handle(heap.alloc_string("otter").0);
-        let rhs = RegisterValue::from_object_handle(heap.alloc_string("otter").0);
-        let other = RegisterValue::from_object_handle(heap.alloc_string("vm").0);
+        let lhs =
+            RegisterValue::from_object_handle(heap.alloc_string("otter").expect("alloc string").0);
+        let rhs =
+            RegisterValue::from_object_handle(heap.alloc_string("otter").expect("alloc string").0);
+        let other =
+            RegisterValue::from_object_handle(heap.alloc_string("vm").expect("alloc string").0);
 
         assert_eq!(same_value(&heap, lhs, rhs), Ok(true));
         assert_eq!(same_value(&heap, lhs, other), Ok(false));

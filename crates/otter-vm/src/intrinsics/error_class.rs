@@ -176,7 +176,7 @@ fn install_error_class(
 
     // Set prototype.name = error type name.
     let name_prop = cx.property_names.intern("name");
-    let name_str = cx.heap.alloc_string(name);
+    let name_str = cx.heap.alloc_string(name)?;
     cx.heap.define_own_property(
         prototype,
         name_prop,
@@ -188,7 +188,7 @@ fn install_error_class(
 
     // Set prototype.message = "" (default empty message).
     let message_prop = cx.property_names.intern("message");
-    let empty_str = cx.heap.alloc_string("");
+    let empty_str = cx.heap.alloc_string("")?;
     cx.heap.define_own_property(
         prototype,
         message_prop,
@@ -231,7 +231,7 @@ fn install_aggregate_error_class(
 
     // Set prototype.name = "AggregateError".
     let name_prop = cx.property_names.intern("name");
-    let name_str = cx.heap.alloc_string("AggregateError");
+    let name_str = cx.heap.alloc_string("AggregateError")?;
     cx.heap.define_own_property(
         prototype,
         name_prop,
@@ -243,7 +243,7 @@ fn install_aggregate_error_class(
 
     // Set prototype.message = "" (default empty message).
     let message_prop = cx.property_names.intern("message");
-    let empty_str = cx.heap.alloc_string("");
+    let empty_str = cx.heap.alloc_string("")?;
     cx.heap.define_own_property(
         prototype,
         message_prop,
@@ -282,7 +282,7 @@ fn install_suppressed_error_class(
     install_class_plan(prototype, *constructor, &plan, function_prototype, cx)?;
 
     let name_prop = cx.property_names.intern("name");
-    let name_str = cx.heap.alloc_string("SuppressedError");
+    let name_str = cx.heap.alloc_string("SuppressedError")?;
     cx.heap.define_own_property(
         prototype,
         name_prop,
@@ -293,7 +293,7 @@ fn install_suppressed_error_class(
     )?;
 
     let message_prop = cx.property_names.intern("message");
-    let empty_str = cx.heap.alloc_string("");
+    let empty_str = cx.heap.alloc_string("")?;
     cx.heap.define_own_property(
         prototype,
         message_prop,
@@ -326,7 +326,7 @@ fn aggregate_error_constructor(
         let msg = runtime
             .js_to_string(message_arg)
             .map_err(|error| map_interpreter_error(error, runtime))?;
-        let msg_handle = runtime.alloc_string(msg);
+        let msg_handle = runtime.alloc_string(msg)?;
         define_non_enumerable_data_property(
             runtime,
             handle,
@@ -389,7 +389,7 @@ pub(crate) fn alloc_suppressed_error_value(
         let msg = runtime
             .js_to_string(message)
             .map_err(|err| map_interpreter_error(err, runtime))?;
-        let msg_handle = runtime.alloc_string(msg);
+        let msg_handle = runtime.alloc_string(msg)?;
         define_non_enumerable_data_property(
             runtime,
             handle,
@@ -637,7 +637,7 @@ fn error_to_string(
         format!("{name}: {msg}")
     };
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -659,7 +659,7 @@ fn error_constructor(
         let msg = runtime
             .js_to_string(*msg_arg)
             .map_err(|error| map_interpreter_error(error, runtime))?;
-        let msg_handle = runtime.alloc_string(msg);
+        let msg_handle = runtime.alloc_string(msg)?;
         define_non_enumerable_data_property(
             runtime,
             handle,
@@ -739,7 +739,7 @@ fn error_receiver_from_call(
         }
     }
 
-    Ok(runtime.alloc_object_with_prototype(Some(prototype)))
+    Ok(runtime.alloc_object_with_prototype(Some(prototype))?)
 }
 
 fn iterable_to_array(
@@ -752,7 +752,7 @@ fn iterable_to_array(
     };
 
     let iterator = get_iterator_object(runtime, iterable_handle, iterable)?;
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     let mut index = 0usize;
     loop {
         let (done, value) = runtime
@@ -903,7 +903,7 @@ pub(crate) fn capture_error_stack(
     extra_skip: usize,
 ) -> Result<(), VmNativeCallError> {
     let snapshot = runtime.capture_stack_snapshot(extra_skip);
-    let frames_handle = runtime.objects_mut().alloc_error_stack_frames(snapshot);
+    let frames_handle = runtime.objects_mut().alloc_error_stack_frames(snapshot)?;
     define_non_enumerable_data_property(
         runtime,
         handle,
@@ -1036,7 +1036,7 @@ fn error_stack_getter(
     };
 
     let formatted = crate::stack_frame::format_v8_stack(&name, &message, &frames);
-    let str_handle = runtime.alloc_string(formatted);
+    let str_handle = runtime.alloc_string(formatted)?;
     let value = RegisterValue::from_object_handle(str_handle.0);
 
     // Memoize.

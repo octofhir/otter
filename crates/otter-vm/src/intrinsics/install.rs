@@ -53,7 +53,7 @@ impl<'a> IntrinsicInstallContext<'a> {
         &mut self,
         prototype: Option<ObjectHandle>,
     ) -> Result<ObjectHandle, IntrinsicsError> {
-        let handle = self.heap.alloc_object();
+        let handle = self.heap.alloc_object()?;
         self.heap.set_prototype(handle, prototype)?;
         Ok(handle)
     }
@@ -63,7 +63,7 @@ impl<'a> IntrinsicInstallContext<'a> {
         function: crate::host::HostFunctionId,
         prototype: ObjectHandle,
     ) -> Result<ObjectHandle, IntrinsicsError> {
-        let handle = self.heap.alloc_host_function(function, self.realm);
+        let handle = self.heap.alloc_host_function(function, self.realm)?;
         self.heap.set_prototype(handle, Some(prototype))?;
         Ok(handle)
     }
@@ -237,7 +237,7 @@ pub(super) fn install_function_length_name(
         ),
     )?;
     let name_prop = cx.property_names.intern("name");
-    let name_handle = cx.heap.alloc_string(name);
+    let name_handle = cx.heap.alloc_string(name)?;
     cx.heap.define_own_property(
         handle,
         name_prop,

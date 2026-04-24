@@ -158,7 +158,7 @@ fn map_constructor(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype =
         runtime.subclass_prototype_or_default(*this, runtime.intrinsics().map_prototype);
-    let handle = runtime.objects_mut().alloc_map(Some(prototype));
+    let handle = runtime.objects_mut().alloc_map(Some(prototype))?;
 
     // If iterable argument provided, add entries.
     if let Some(iterable) = args.first().copied()
@@ -375,7 +375,7 @@ fn create_map_iterator(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_map(*this, runtime)?;
-    let iterator = runtime.objects_mut().alloc_map_iterator(handle, kind);
+    let iterator = runtime.objects_mut().alloc_map_iterator(handle, kind)?;
     let proto = runtime.intrinsics().map_iterator_prototype();
     runtime
         .objects_mut()
@@ -492,7 +492,7 @@ fn set_constructor(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype =
         runtime.subclass_prototype_or_default(*this, runtime.intrinsics().set_prototype);
-    let handle = runtime.objects_mut().alloc_set(Some(prototype));
+    let handle = runtime.objects_mut().alloc_set(Some(prototype))?;
 
     if let Some(iterable) = args.first().copied()
         && iterable != RegisterValue::undefined()
@@ -658,7 +658,7 @@ fn create_set_iterator(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_set(*this, runtime)?;
-    let iterator = runtime.objects_mut().alloc_set_iterator(handle, kind);
+    let iterator = runtime.objects_mut().alloc_set_iterator(handle, kind)?;
     let proto = runtime.intrinsics().set_iterator_prototype();
     runtime
         .objects_mut()
@@ -686,7 +686,7 @@ fn set_intersection(
         .set_entries(this_set)
         .map_err(map_obj_err)?;
     let set_proto = runtime.intrinsics().set_prototype;
-    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+    let result = runtime.objects_mut().alloc_set(Some(set_proto))?;
 
     for entry in this_entries.into_iter().flatten() {
         if runtime.objects().set_has(other_set, entry).unwrap_or(false) {
@@ -711,7 +711,7 @@ fn set_union(
     let other_set = require_set_arg(args, runtime)?;
 
     let set_proto = runtime.intrinsics().set_prototype;
-    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+    let result = runtime.objects_mut().alloc_set(Some(set_proto))?;
 
     // Add all from this.
     let this_entries = runtime
@@ -755,7 +755,7 @@ fn set_difference(
         .set_entries(this_set)
         .map_err(map_obj_err)?;
     let set_proto = runtime.intrinsics().set_prototype;
-    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+    let result = runtime.objects_mut().alloc_set(Some(set_proto))?;
 
     for entry in this_entries.into_iter().flatten() {
         if !runtime.objects().set_has(other_set, entry).unwrap_or(false) {
@@ -780,7 +780,7 @@ fn set_symmetric_difference(
     let other_set = require_set_arg(args, runtime)?;
 
     let set_proto = runtime.intrinsics().set_prototype;
-    let result = runtime.objects_mut().alloc_set(Some(set_proto));
+    let result = runtime.objects_mut().alloc_set(Some(set_proto))?;
 
     // Elements in this but not in other.
     let this_entries = runtime
@@ -947,7 +947,7 @@ fn map_group_by(
 
     // Result is a new Map.
     let map_proto = runtime.intrinsics().map_prototype;
-    let result = runtime.objects_mut().alloc_map(Some(map_proto));
+    let result = runtime.objects_mut().alloc_map(Some(map_proto))?;
 
     // We track group keys in order. For each callback result, we check if we
     // already have a Map entry for that key (using SameValueZero). If yes,
@@ -975,7 +975,7 @@ fn map_group_by(
         let group = if let Some((_, arr)) = existing {
             *arr
         } else {
-            let arr = runtime.alloc_array();
+            let arr = runtime.alloc_array()?;
             groups.push((key, arr));
             arr
         };

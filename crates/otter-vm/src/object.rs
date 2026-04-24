@@ -1875,6 +1875,12 @@ impl Clone for ObjectHeap {
 }
 
 impl ObjectHeap {
+    #[inline]
+    fn alloc_heap_value(&mut self, value: HeapValue) -> Result<ObjectHandle, ObjectError> {
+        let handle = self.heap.alloc(value)?;
+        Ok(ObjectHandle(handle.0))
+    }
+
     /// Creates an empty object heap with the default GC configuration
     /// (no heap cap).
     #[must_use]
@@ -2003,32 +2009,31 @@ impl ObjectHeap {
     }
 
     /// Allocates a plain empty object.
-    pub fn alloc_object(&mut self) -> ObjectHandle {
+    pub fn alloc_object(&mut self) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self
-            .heap
-            .alloc(HeapValue::Object(Box::new(JsObject::new(shape_id))));
-        ObjectHandle(h.0)
+        self.alloc_heap_value(HeapValue::Object(Box::new(JsObject::new(shape_id))))
     }
 
     /// Allocates an ordinary object that carries one native payload link.
-    pub fn alloc_native_object(&mut self, payload: NativePayloadId) -> ObjectHandle {
+    pub fn alloc_native_object(
+        &mut self,
+        payload: NativePayloadId,
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::NativeObject {
+        self.alloc_heap_value(HeapValue::NativeObject {
             prototype: None,
             extensible: true,
             shape_id,
             keys: Vec::new(),
             values: Vec::new(),
             payload,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates an empty dense array.
-    pub fn alloc_array(&mut self) -> ObjectHandle {
+    pub fn alloc_array(&mut self) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::Array {
+        self.alloc_heap_value(HeapValue::Array {
             prototype: None,
             extensible: true,
             shape_id,
@@ -2039,26 +2044,29 @@ impl ObjectHeap {
             elements_writable: true,
             elements_configurable: true,
             length_writable: true,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates an empty Map object.
-    pub fn alloc_map(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::Map {
+    pub fn alloc_map(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::Map {
             prototype,
             entries: Vec::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates an empty Set object.
-    pub fn alloc_set(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::Set {
+    pub fn alloc_set(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::Set {
             prototype,
             entries: Vec::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a fixed-length ArrayBuffer object with zero-initialized storage.
@@ -2076,7 +2084,7 @@ impl ObjectHeap {
         // `Vec::with_capacity` allocator panic.
         self.heap.reserve_bytes(byte_length)?;
         let data = vec![0u8; byte_length];
-        Ok(self.alloc_array_buffer_full(data, byte_length, false, prototype))
+        self.alloc_array_buffer_full(data, byte_length, false, prototype)
     }
 
     /// Allocates an ArrayBuffer object with explicit backing bytes (fixed-length).
@@ -2084,7 +2092,7 @@ impl ObjectHeap {
         &mut self,
         data: Vec<u8>,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let len = data.len();
         self.alloc_array_buffer_full(data, len, false, prototype)
     }
@@ -2104,7 +2112,7 @@ impl ObjectHeap {
         // front rather than discovered later when growth allocates.
         self.heap.reserve_bytes(max_byte_length)?;
         let data = vec![0u8; byte_length];
-        Ok(self.alloc_array_buffer_full(data, max_byte_length, true, prototype))
+        self.alloc_array_buffer_full(data, max_byte_length, true, prototype)
     }
 
     /// Allocates an ArrayBuffer with all fields specified.
@@ -2114,9 +2122,9 @@ impl ObjectHeap {
         max_byte_length: usize,
         resizable: bool,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::ArrayBuffer {
+        self.alloc_heap_value(HeapValue::ArrayBuffer {
             prototype,
             extensible: true,
             shape_id,
@@ -2126,8 +2134,7 @@ impl ObjectHeap {
             detached: false,
             max_byte_length,
             resizable,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a SharedArrayBuffer with explicit growth metadata.
@@ -2139,9 +2146,9 @@ impl ObjectHeap {
         max_byte_length: usize,
         growable: bool,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::SharedArrayBuffer {
+        self.alloc_heap_value(HeapValue::SharedArrayBuffer {
             prototype,
             extensible: true,
             shape_id,
@@ -2150,8 +2157,7 @@ impl ObjectHeap {
             max_byte_length,
             growable,
             data,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a SharedArrayBuffer with zero-initialized storage.
@@ -2161,7 +2167,7 @@ impl ObjectHeap {
         max_byte_length: usize,
         growable: bool,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         self.alloc_shared_array_buffer_with_data(
             vec![0; byte_length],
             max_byte_length,
@@ -2330,7 +2336,7 @@ impl ObjectHeap {
         } else {
             data[start..end].to_vec()
         };
-        Ok(self.alloc_array_buffer_with_data(bytes, prototype))
+        self.alloc_array_buffer_with_data(bytes, prototype)
     }
 
     /// Copies bytes from one ArrayBuffer to another.
@@ -2454,7 +2460,7 @@ impl ObjectHeap {
         } else {
             data[start..end].to_vec()
         };
-        Ok(self.alloc_shared_array_buffer_with_data(bytes, max_byte_length, growable, prototype))
+        self.alloc_shared_array_buffer_with_data(bytes, max_byte_length, growable, prototype)
     }
 
     // ── DataView ──────────────────────────────────────────────────────
@@ -2467,9 +2473,9 @@ impl ObjectHeap {
         byte_offset: usize,
         byte_length: Option<usize>,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::DataView {
+        self.alloc_heap_value(HeapValue::DataView {
             prototype,
             extensible: true,
             shape_id,
@@ -2478,8 +2484,7 @@ impl ObjectHeap {
             viewed_buffer,
             byte_offset,
             byte_length,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// §25.3.4.1 get DataView.prototype.buffer
@@ -2675,10 +2680,10 @@ impl ObjectHeap {
         byte_offset: usize,
         array_length: usize,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
         let byte_length = array_length * kind.element_size();
-        let h = self.heap.alloc(HeapValue::TypedArray {
+        self.alloc_heap_value(HeapValue::TypedArray {
             prototype,
             extensible: true,
             shape_id,
@@ -2689,8 +2694,7 @@ impl ObjectHeap {
             byte_length,
             array_length,
             kind,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Returns the TypedArrayKind for the given typed array handle.
@@ -2898,7 +2902,7 @@ impl ObjectHeap {
                 }
                 _ => unreachable!(),
             };
-            let bigint_handle = self.alloc_bigint(value_str);
+            let bigint_handle = self.alloc_bigint(value_str)?;
             Ok(Some(RegisterValue::from_bigint_handle(bigint_handle.0)))
         } else {
             Ok(Some(RegisterValue::from_number(read_typed_element(
@@ -2973,9 +2977,9 @@ impl ObjectHeap {
         pattern: &str,
         flags: &str,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::RegExp {
+        self.alloc_heap_value(HeapValue::RegExp {
             prototype,
             extensible: true,
             shape_id,
@@ -2983,8 +2987,7 @@ impl ObjectHeap {
             values: Vec::new(),
             pattern: pattern.into(),
             flags: flags.into(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Returns the pattern string of a RegExp object.
@@ -3204,22 +3207,26 @@ impl ObjectHeap {
 
     /// Allocates a WeakMap object.
     /// Spec: <https://tc39.es/ecma262/#sec-weakmap-constructor>
-    pub fn alloc_weakmap(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::WeakMap {
+    pub fn alloc_weakmap(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::WeakMap {
             prototype,
             entries: std::collections::HashMap::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a WeakSet object.
     /// Spec: <https://tc39.es/ecma262/#sec-weakset-constructor>
-    pub fn alloc_weakset(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::WeakSet {
+    pub fn alloc_weakset(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::WeakSet {
             prototype,
             entries: std::collections::HashSet::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// WeakMap.prototype.get(key)
@@ -3338,12 +3345,11 @@ impl ObjectHeap {
         &mut self,
         prototype: Option<ObjectHandle>,
         target: ObjectHandle,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::WeakRef {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::WeakRef {
             prototype,
             target: Some(target.0),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// WeakRef.prototype.deref() — returns the target or undefined.
@@ -3382,13 +3388,12 @@ impl ObjectHeap {
         &mut self,
         prototype: Option<ObjectHandle>,
         cleanup_callback: ObjectHandle,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::FinalizationRegistry {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::FinalizationRegistry {
             prototype,
             cleanup_callback,
             cells: Vec::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// FinalizationRegistry.prototype.register(target, heldValue, unregisterToken)
@@ -3481,8 +3486,8 @@ impl ObjectHeap {
         function_index: FunctionIndex,
         closure_handle: Option<ObjectHandle>,
         arguments: Vec<RegisterValue>,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::Generator {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::Generator {
             prototype,
             state: GeneratorState::SuspendedStart,
             module,
@@ -3493,8 +3498,7 @@ impl ObjectHeap {
             resume_pc: 0,
             resume_register: 0,
             delegation_iterator: None,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Returns the current generator state.
@@ -3645,8 +3649,8 @@ impl ObjectHeap {
         function_index: FunctionIndex,
         closure_handle: Option<ObjectHandle>,
         arguments: Vec<RegisterValue>,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::AsyncGenerator {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::AsyncGenerator {
             prototype,
             state: GeneratorState::SuspendedStart,
             module,
@@ -3658,8 +3662,7 @@ impl ObjectHeap {
             resume_register: 0,
             queue: Vec::new(),
             delegation_iterator: None,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Returns the current async generator state.
@@ -3817,36 +3820,39 @@ impl ObjectHeap {
     ///
     /// The UTF-8 input is converted to WTF-16 (UTF-16 code units) for storage.
     /// For strings that may contain lone surrogates, use [`alloc_js_string`].
-    pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
+    pub fn alloc_string(
+        &mut self,
+        value: impl Into<Box<str>>,
+    ) -> Result<ObjectHandle, ObjectError> {
         let s: Box<str> = value.into();
         let js = JsString::from_str(&s);
-        let h = self.heap.alloc(HeapValue::String {
+        self.alloc_heap_value(HeapValue::String {
             prototype: None,
             value: js,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a string value from a `JsString` (WTF-16).
     ///
     /// Preserves lone surrogates as-is — no validation or replacement.
-    pub fn alloc_js_string(&mut self, value: JsString) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::String {
+    pub fn alloc_js_string(&mut self, value: JsString) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::String {
             prototype: None,
             value,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a heap-stored BigInt value.
     ///
     /// §6.1.6.2 The BigInt Type
     /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
-    pub fn alloc_bigint(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::BigInt {
+    pub fn alloc_bigint(
+        &mut self,
+        value: impl Into<Box<str>>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::BigInt {
             value: value.into(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Returns the decimal string value of a BigInt heap object.
@@ -3864,9 +3870,8 @@ impl ObjectHeap {
     pub fn alloc_error_stack_frames(
         &mut self,
         frames: Vec<crate::stack_frame::StackFrameInfo>,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::ErrorStackFrames { frames });
-        ObjectHandle(h.0)
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::ErrorStackFrames { frames })
     }
 
     /// Returns the captured stack frames stored on an `ErrorStackFrames`
@@ -3882,9 +3887,8 @@ impl ObjectHeap {
     }
 
     /// Allocates a mutable upvalue cell.
-    pub fn alloc_upvalue(&mut self, value: RegisterValue) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::UpvalueCell { value });
-        ObjectHandle(h.0)
+    pub fn alloc_upvalue(&mut self, value: RegisterValue) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::UpvalueCell { value })
     }
 
     /// Allocates a closure object with captured upvalue cells and function kind flags.
@@ -3895,9 +3899,9 @@ impl ObjectHeap {
         upvalues: Vec<ObjectHandle>,
         flags: ClosureFlags,
         realm: crate::realm::RealmId,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::Closure {
+        self.alloc_heap_value(HeapValue::Closure {
             prototype: None,
             extensible: true,
             flags,
@@ -3915,8 +3919,7 @@ impl ObjectHeap {
             lexical_parent_closure: None,
             captured_new_target: None,
             realm,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// §15.3 ArrowFunction — populate the lexical context fields for a
@@ -4043,9 +4046,9 @@ impl ObjectHeap {
         &mut self,
         function: HostFunctionId,
         realm: crate::realm::RealmId,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, ObjectError> {
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::HostFunction {
+        self.alloc_heap_value(HeapValue::HostFunction {
             function,
             prototype: None,
             extensible: true,
@@ -4053,26 +4056,26 @@ impl ObjectHeap {
             keys: Vec::new(),
             values: Vec::new(),
             realm,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a new pending promise with an optional prototype.
-    pub fn alloc_promise(&mut self) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::Promise {
+    pub fn alloc_promise(&mut self) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::Promise {
             prototype: None,
             promise: crate::promise::JsPromise::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a new pending promise with the given prototype.
-    pub fn alloc_promise_with_proto(&mut self, prototype: ObjectHandle) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::Promise {
+    pub fn alloc_promise_with_proto(
+        &mut self,
+        prototype: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::Promise {
             prototype: Some(prototype),
             promise: crate::promise::JsPromise::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Reads a reference to a JsPromise stored in the heap.
@@ -4101,28 +4104,27 @@ impl ObjectHeap {
         &mut self,
         promise: ObjectHandle,
         kind: crate::promise::ReactionKind,
-    ) -> ObjectHandle {
-        let h = self
-            .heap
-            .alloc(HeapValue::PromiseCapabilityFunction { promise, kind });
-        ObjectHandle(h.0)
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::PromiseCapabilityFunction { promise, kind })
     }
 
     /// Creates a full promise capability: promise + resolve function + reject function.
     /// Returns (promise, resolve, reject) triple.
     /// ES2024 §27.2.1.5 NewPromiseCapability
     /// Spec: <https://tc39.es/ecma262/#sec-newpromisecapability>
-    pub fn alloc_promise_capability(&mut self) -> crate::promise::PromiseCapability {
-        let promise = self.alloc_promise();
+    pub fn alloc_promise_capability(
+        &mut self,
+    ) -> Result<crate::promise::PromiseCapability, ObjectError> {
+        let promise = self.alloc_promise()?;
         let resolve =
-            self.alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+            self.alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill)?;
         let reject =
-            self.alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
-        crate::promise::PromiseCapability {
+            self.alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject)?;
+        Ok(crate::promise::PromiseCapability {
             promise,
             resolve,
             reject,
-        }
+        })
     }
 
     /// Allocates a per-element function for Promise.all/allSettled/any combinators.
@@ -4133,16 +4135,15 @@ impl ObjectHeap {
         result_array: ObjectHandle,
         remaining_counter: ObjectHandle,
         result_capability: crate::promise::PromiseCapability,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::PromiseCombinatorElement {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::PromiseCombinatorElement {
             combinator_kind,
             index,
             result_array,
             remaining_counter,
             result_capability,
             already_called: false,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a finally wrapper function.
@@ -4151,13 +4152,12 @@ impl ObjectHeap {
         on_finally: ObjectHandle,
         constructor: ObjectHandle,
         kind: crate::promise::PromiseFinallyKind,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::PromiseFinallyFunction {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::PromiseFinallyFunction {
             on_finally,
             constructor,
             kind,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a value thunk for finally chaining.
@@ -4165,23 +4165,23 @@ impl ObjectHeap {
         &mut self,
         value: crate::value::RegisterValue,
         kind: crate::promise::PromiseFinallyKind,
-    ) -> ObjectHandle {
-        let h = self
-            .heap
-            .alloc(HeapValue::PromiseValueThunk { value, kind });
-        ObjectHandle(h.0)
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::PromiseValueThunk { value, kind })
     }
 
     /// Allocates a new Proxy exotic object.
     /// Spec: <https://tc39.es/ecma262/#sec-proxycreate>
-    pub fn alloc_proxy(&mut self, target: ObjectHandle, handler: ObjectHandle) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::Proxy {
+    pub fn alloc_proxy(
+        &mut self,
+        target: ObjectHandle,
+        handler: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::Proxy {
             target,
             handler,
             revoked: false,
             private_elements: Vec::new(),
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Returns `true` if the handle points to a Proxy exotic object.
@@ -4628,7 +4628,7 @@ impl ObjectHeap {
                 match code_unit {
                     Some(unit) => {
                         let ch_str = JsString::from_utf16(vec![unit]);
-                        let handle = self.alloc_js_string(ch_str);
+                        let handle = self.alloc_js_string(ch_str)?;
                         Ok(Some(RegisterValue::from_object_handle(handle.0)))
                     }
                     None => Ok(None),
@@ -4962,19 +4962,18 @@ impl ObjectHeap {
         // TypedArrays: first copy elements to a plain Array, then iterate that.
         if matches!(self.object(iterable)?, HeapValue::TypedArray { .. }) {
             let len = self.typed_array_length(iterable)?;
-            let arr = self.alloc_array();
+            let arr = self.alloc_array()?;
             for i in 0..len {
                 let val = self.typed_array_get_element(iterable, i)?.unwrap_or(0.0);
                 self.set_index(arr, i, RegisterValue::from_number(val))?;
             }
-            let h = self.heap.alloc(HeapValue::ArrayIterator {
+            return self.alloc_heap_value(HeapValue::ArrayIterator {
                 prototype: None,
                 iterable: arr,
                 next_index: 0,
                 closed: false,
                 kind: ArrayIteratorKind::Values,
             });
-            return Ok(ObjectHandle(h.0));
         }
 
         let iterator = match self.object(iterable)? {
@@ -4994,8 +4993,7 @@ impl ObjectHeap {
             _ => return Err(ObjectError::InvalidKind),
         };
 
-        let h = self.heap.alloc(iterator);
-        Ok(ObjectHandle(h.0))
+        self.alloc_heap_value(iterator)
     }
 
     /// Allocates an Array iterator with explicit kind.
@@ -5004,27 +5002,28 @@ impl ObjectHeap {
         &mut self,
         iterable: ObjectHandle,
         kind: ArrayIteratorKind,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::ArrayIterator {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::ArrayIterator {
             prototype: None,
             iterable,
             next_index: 0,
             closed: false,
             kind,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates a String iterator.
     /// Spec: <https://tc39.es/ecma262/#sec-createstringiterator>
-    pub fn alloc_string_iterator(&mut self, iterable: ObjectHandle) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::StringIterator {
+    pub fn alloc_string_iterator(
+        &mut self,
+        iterable: ObjectHandle,
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::StringIterator {
             prototype: None,
             iterable,
             next_index: 0,
             closed: false,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates an internal Map iterator.
@@ -5032,15 +5031,14 @@ impl ObjectHeap {
         &mut self,
         iterable: ObjectHandle,
         kind: MapIteratorKind,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::MapIterator {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::MapIterator {
             prototype: None,
             iterable,
             next_index: 0,
             closed: false,
             kind,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Allocates an internal Set iterator.
@@ -5048,15 +5046,14 @@ impl ObjectHeap {
         &mut self,
         iterable: ObjectHandle,
         kind: SetIteratorKind,
-    ) -> ObjectHandle {
-        let h = self.heap.alloc(HeapValue::SetIterator {
+    ) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_heap_value(HeapValue::SetIterator {
             prototype: None,
             iterable,
             next_index: 0,
             closed: false,
             kind,
-        });
-        ObjectHandle(h.0)
+        })
     }
 
     /// Advances an internal iterator by one step.
@@ -5121,7 +5118,7 @@ impl ObjectHeap {
                         .unwrap_or((utf16[next_index] as u32, 1));
                     let ch_units = utf16[next_index..next_index + advance].to_vec();
                     let ch_str = JsString::from_utf16(ch_units);
-                    let str_handle = self.alloc_js_string(ch_str);
+                    let str_handle = self.alloc_js_string(ch_str)?;
                     // Store extra advance for the post-step block (advance-1 extra beyond +1)
                     string_extra_advance = advance.saturating_sub(1);
                     IteratorStep::yield_value(RegisterValue::from_object_handle(str_handle.0))
@@ -5320,11 +5317,10 @@ impl ObjectHeap {
     /// and pre-allocates string handles for them.
     /// Creates an empty property iterator (for null/undefined/primitives in for..in).
     pub fn alloc_empty_property_iterator(&mut self) -> Result<ObjectHandle, ObjectError> {
-        let h = self.heap.alloc(HeapValue::PropertyIterator {
+        self.alloc_heap_value(HeapValue::PropertyIterator {
             key_handles: Vec::new(),
             next_index: 0,
-        });
-        Ok(ObjectHandle(h.0))
+        })
     }
 
     /// ES2024 §14.7.5.6 EnumerateObjectProperties — collects enumerable string
@@ -5383,16 +5379,17 @@ impl ObjectHeap {
         }
 
         // Pre-allocate string handles for all collected keys.
-        let key_handles: Vec<ObjectHandle> = name_ids
-            .iter()
-            .filter_map(|id| property_names.get(*id).map(|name| self.alloc_string(name)))
-            .collect();
+        let mut key_handles = Vec::with_capacity(name_ids.len());
+        for id in &name_ids {
+            if let Some(name) = property_names.get(*id) {
+                key_handles.push(self.alloc_string(name)?);
+            }
+        }
 
-        let h = self.heap.alloc(HeapValue::PropertyIterator {
+        self.alloc_heap_value(HeapValue::PropertyIterator {
             key_handles,
             next_index: 0,
-        });
-        Ok(ObjectHandle(h.0))
+        })
     }
 
     /// Advances a property key iterator by one step.
@@ -7039,7 +7036,7 @@ impl ObjectHeap {
     ) -> Result<ObjectHandle, ObjectError> {
         let prototype = self.get_prototype(target)?;
         let shape_id = self.allocate_shape();
-        let h = self.heap.alloc(HeapValue::BoundFunction {
+        self.alloc_heap_value(HeapValue::BoundFunction {
             prototype,
             extensible: true,
             shape_id,
@@ -7049,8 +7046,7 @@ impl ObjectHeap {
             bound_this,
             bound_args,
             realm,
-        });
-        Ok(ObjectHandle(h.0))
+        })
     }
 
     /// Returns the (target, bound_this, bound_args) for a bound function.
@@ -8470,4 +8466,29 @@ fn normalize_zero(v: RegisterValue) -> RegisterValue {
         return RegisterValue::from_number(0.0);
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectError, ObjectHeap};
+    use otter_gc::heap::GcConfig;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn s3_b_object_alloc_returns_oom_without_growing_heap() {
+        let mut heap = ObjectHeap::with_config(GcConfig {
+            max_heap_bytes: Some(1),
+            ..GcConfig::default()
+        });
+
+        let err = heap.alloc_object().unwrap_err();
+
+        assert_eq!(err, ObjectError::OutOfMemory);
+        assert_eq!(
+            heap.tracked_bytes(),
+            0,
+            "failed object-shell allocation must not grow tracked bytes"
+        );
+        assert!(heap.oom_flag().load(Ordering::Relaxed));
+    }
 }

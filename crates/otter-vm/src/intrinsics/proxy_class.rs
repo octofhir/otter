@@ -107,7 +107,7 @@ fn proxy_create(
         "Cannot create proxy with a non-object as handler",
     )?;
 
-    let proxy = runtime.objects_mut().alloc_proxy(target, handler);
+    let proxy = runtime.objects_mut().alloc_proxy(target, handler)?;
     Ok(RegisterValue::from_object_handle(proxy.0))
 }
 
@@ -164,7 +164,9 @@ fn proxy_revocable(
     let revoke_id = runtime.register_native_function(revoke_desc);
     let fn_proto = runtime.intrinsics().function_prototype();
     let realm = runtime.current_realm_id();
-    let revoke_fn = runtime.objects_mut().alloc_host_function(revoke_id, realm);
+    let revoke_fn = runtime
+        .objects_mut()
+        .alloc_host_function(revoke_id, realm)?;
     let _ = runtime
         .objects_mut()
         .set_prototype(revoke_fn, Some(fn_proto));
@@ -184,7 +186,7 @@ fn proxy_revocable(
         .map_err(interp_err)?;
 
     // 3. Return { proxy, revoke }.
-    let result = runtime.alloc_object();
+    let result = runtime.alloc_object()?;
     let proxy_key = runtime.intern_property_name("proxy");
     let revoke_key = runtime.intern_property_name("revoke");
     runtime

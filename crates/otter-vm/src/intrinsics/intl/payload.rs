@@ -494,6 +494,6 @@ pub fn construct_intl(
     payload: IntlPayload,
     prototype: ObjectHandle,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> ObjectHandle {
+) -> Result<ObjectHandle, crate::interpreter::InterpreterError> {
     runtime.alloc_native_object_with_prototype(Some(prototype), payload)
 }

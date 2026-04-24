@@ -10,13 +10,31 @@ use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
 use crate::host::HostFunctionId;
 use crate::module::FunctionIndex;
 use crate::object::{
-    ClosureFlags as ObjectClosureFlags, HeapValueKind, ObjectHandle, PropertyAttributes,
-    PropertyValue,
+    ClosureFlags as ObjectClosureFlags, HeapValueKind, ObjectError, ObjectHandle,
+    PropertyAttributes, PropertyValue,
 };
 use crate::payload::VmTrace;
 use crate::value::RegisterValue;
 
 use super::{InterpreterError, RuntimeState};
+
+fn vm_native_call_error_from_object(error: ObjectError) -> VmNativeCallError {
+    match InterpreterError::from(error) {
+        InterpreterError::OutOfMemory => {
+            VmNativeCallError::Internal("out of memory: heap limit exceeded".into())
+        }
+        error => VmNativeCallError::Internal(format!("{error}").into()),
+    }
+}
+
+fn vm_native_call_error_from_interpreter(error: InterpreterError) -> VmNativeCallError {
+    match error {
+        InterpreterError::OutOfMemory => {
+            VmNativeCallError::Internal("out of memory: heap limit exceeded".into())
+        }
+        error => VmNativeCallError::Internal(format!("{error}").into()),
+    }
+}
 
 impl RuntimeState {
     /// GC safepoint — called at loop back-edges and function call boundaries.
@@ -34,26 +52,29 @@ impl RuntimeState {
     }
 
     /// Allocates one ordinary object with the runtime default prototype.
-    pub fn alloc_object(&mut self) -> ObjectHandle {
+    pub fn alloc_object(&mut self) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().object_prototype();
-        let handle = self.objects.alloc_object();
+        let handle = self.objects.alloc_object()?;
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("ordinary object prototype should exist");
-        handle
+        Ok(handle)
     }
 
     /// Allocates one ordinary object with an explicit prototype.
-    pub fn alloc_object_with_prototype(&mut self, prototype: Option<ObjectHandle>) -> ObjectHandle {
-        let handle = self.objects.alloc_object();
+    pub fn alloc_object_with_prototype(
+        &mut self,
+        prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let handle = self.objects.alloc_object()?;
         self.objects
             .set_prototype(handle, prototype)
             .expect("explicit object prototype should be valid");
-        handle
+        Ok(handle)
     }
 
     /// Allocates one ordinary object that carries a Rust-owned native payload.
-    pub fn alloc_native_object<T>(&mut self, payload: T) -> ObjectHandle
+    pub fn alloc_native_object<T>(&mut self, payload: T) -> Result<ObjectHandle, InterpreterError>
     where
         T: VmTrace + Any,
     {
@@ -66,37 +87,38 @@ impl RuntimeState {
         &mut self,
         prototype: Option<ObjectHandle>,
         payload: T,
-    ) -> ObjectHandle
+    ) -> Result<ObjectHandle, InterpreterError>
     where
         T: VmTrace + Any,
     {
         let payload = self.native_payloads.insert(payload);
-        let handle = self.objects.alloc_native_object(payload);
+        let handle = self.objects.alloc_native_object(payload)?;
         self.objects
             .set_prototype(handle, prototype)
             .expect("explicit native object prototype should be valid");
-        handle
+        Ok(handle)
     }
 
     /// Allocates one dense array with the runtime default prototype.
-    pub fn alloc_array(&mut self) -> ObjectHandle {
+    pub fn alloc_array(&mut self) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().array_prototype();
-        let handle = self.objects.alloc_array();
+        let handle = self.objects.alloc_array()?;
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("array prototype should exist");
-        handle
+        Ok(handle)
     }
 
     /// Allocates an array and populates it with initial elements.
-    pub fn alloc_array_with_elements(&mut self, elements: &[RegisterValue]) -> ObjectHandle {
-        let handle = self.alloc_array();
+    pub fn alloc_array_with_elements(
+        &mut self,
+        elements: &[RegisterValue],
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let handle = self.alloc_array()?;
         for &elem in elements {
-            self.objects
-                .push_element(handle, elem)
-                .expect("array push should succeed");
+            self.objects.push_element(handle, elem)?;
         }
-        handle
+        Ok(handle)
     }
 
     /// Extracts elements from an array handle into a Vec of RegisterValues.
@@ -137,33 +159,41 @@ impl RuntimeState {
     }
 
     /// Allocates one string object with the runtime default prototype.
-    pub fn alloc_string(&mut self, value: impl Into<Box<str>>) -> ObjectHandle {
+    pub fn alloc_string(
+        &mut self,
+        value: impl Into<Box<str>>,
+    ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().string_prototype();
-        let handle = self.objects.alloc_string(value);
+        let handle = self.objects.alloc_string(value)?;
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("string prototype should exist");
-        handle
+        Ok(handle)
     }
 
     /// Allocates a string from a WTF-16 `JsString` with the runtime default prototype.
     ///
     /// Preserves lone surrogates as-is.
-    pub fn alloc_js_string(&mut self, value: crate::js_string::JsString) -> ObjectHandle {
+    pub fn alloc_js_string(
+        &mut self,
+        value: crate::js_string::JsString,
+    ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().string_prototype();
-        let handle = self.objects.alloc_js_string(value);
+        let handle = self.objects.alloc_js_string(value)?;
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("string prototype should exist");
-        handle
+        Ok(handle)
     }
 
     /// Allocates one BigInt heap value (no prototype — BigInt is a primitive type).
     ///
     /// §6.1.6.2 The BigInt Type
     /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
-    pub fn alloc_bigint(&mut self, value: &str) -> ObjectHandle {
-        self.objects.alloc_bigint(value)
+    pub fn alloc_bigint(&mut self, value: &str) -> Result<ObjectHandle, InterpreterError> {
+        self.objects
+            .alloc_bigint(value)
+            .map_err(InterpreterError::from)
     }
 
     /// Allocates a fully-initialized RegExp instance with the spec-mandated
@@ -183,8 +213,8 @@ impl RuntimeState {
         pattern: &str,
         flags: &str,
         prototype: Option<ObjectHandle>,
-    ) -> ObjectHandle {
-        let handle = self.objects.alloc_regexp(pattern, flags, prototype);
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let handle = self.objects.alloc_regexp(pattern, flags, prototype)?;
         let last_index = self.intern_property_name("lastIndex");
         let descriptor = crate::object::PropertyValue::data_with_attrs(
             RegisterValue::from_i32(0),
@@ -193,7 +223,7 @@ impl RuntimeState {
         self.objects
             .define_own_property(handle, last_index, descriptor)
             .ok();
-        handle
+        Ok(handle)
     }
 
     /// Returns the decimal string backing a BigInt handle.
@@ -283,14 +313,17 @@ impl RuntimeState {
 
     /// Allocates one host-callable function with the runtime default prototype.
     /// The function is bound to the runtime's currently-active realm.
-    pub fn alloc_host_function(&mut self, function: HostFunctionId) -> ObjectHandle {
+    pub fn alloc_host_function(
+        &mut self,
+        function: HostFunctionId,
+    ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().function_prototype();
         let realm = self.current_realm;
-        let handle = self.objects.alloc_host_function(function, realm);
+        let handle = self.objects.alloc_host_function(function, realm)?;
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("function prototype should exist");
-        handle
+        Ok(handle)
     }
 
     /// Allocates one host function from descriptor metadata and installs `.name` / `.length`.
@@ -301,7 +334,9 @@ impl RuntimeState {
         let js_name = descriptor.js_name().to_string();
         let length = descriptor.length();
         let host_function = self.register_native_function(descriptor);
-        let handle = self.alloc_host_function(host_function);
+        let handle = self
+            .alloc_host_function(host_function)
+            .map_err(vm_native_call_error_from_interpreter)?;
         self.install_host_function_length_name(handle, length, &js_name)?;
         Ok(handle)
     }
@@ -324,7 +359,9 @@ impl RuntimeState {
             match member {
                 ObjectMemberPlan::Method(function) => {
                     let host_function = self.register_native_function(function.clone());
-                    let handle = self.alloc_host_function(host_function);
+                    let handle = self
+                        .alloc_host_function(host_function)
+                        .map_err(vm_native_call_error_from_interpreter)?;
                     self.install_host_function_length_name(
                         handle,
                         function.length(),
@@ -356,7 +393,8 @@ impl RuntimeState {
                         .cloned()
                         .map(|descriptor| {
                             let function = self.register_native_function(descriptor);
-                            Ok(self.alloc_host_function(function))
+                            self.alloc_host_function(function)
+                                .map_err(vm_native_call_error_from_interpreter)
                         })
                         .transpose()?;
                     let setter = accessor
@@ -364,7 +402,8 @@ impl RuntimeState {
                         .cloned()
                         .map(|descriptor| {
                             let function = self.register_native_function(descriptor);
-                            Ok(self.alloc_host_function(function))
+                            self.alloc_host_function(function)
+                                .map_err(vm_native_call_error_from_interpreter)
                         })
                         .transpose()?;
                     let property = self.intern_property_name(accessor.js_name());
@@ -393,9 +432,9 @@ impl RuntimeState {
     pub fn install_native_global(
         &mut self,
         descriptor: crate::descriptors::NativeFunctionDescriptor,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, InterpreterError> {
         let host_fn = self.native_functions.register(descriptor);
-        let handle = self.alloc_host_function(host_fn);
+        let handle = self.alloc_host_function(host_fn)?;
         let global = self.intrinsics().global_object();
         let prop = self.property_names.intern(
             self.native_functions
@@ -406,7 +445,7 @@ impl RuntimeState {
         self.objects
             .set_property(global, prop, RegisterValue::from_object_handle(handle.0))
             .expect("global property installation should succeed");
-        handle
+        Ok(handle)
     }
 
     /// Installs a value property on the global object.
@@ -441,7 +480,7 @@ impl RuntimeState {
             })?;
 
         let name_prop = self.intern_property_name("name");
-        let name_handle = self.alloc_string(name);
+        let name_handle = self.alloc_string(name)?;
         self.objects
             .define_own_property(
                 handle,
@@ -467,7 +506,7 @@ impl RuntimeState {
         callee: FunctionIndex,
         upvalues: Vec<ObjectHandle>,
         flags: ObjectClosureFlags,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, InterpreterError> {
         // Generator functions should have %GeneratorFunction.prototype%
         // as their [[Prototype]], not %Function.prototype%.
         let prototype = if flags.is_generator() {
@@ -482,7 +521,7 @@ impl RuntimeState {
         let realm = self.current_realm;
         let handle = self
             .objects
-            .alloc_closure(module, callee, upvalues, flags, realm);
+            .alloc_closure(module, callee, upvalues, flags, realm)?;
         self.objects
             .set_prototype(handle, Some(prototype))
             .expect("function prototype should exist");
@@ -511,7 +550,7 @@ impl RuntimeState {
             )
             .expect("closure length should install");
         let name_property = self.intern_property_name("name");
-        let name_handle = self.alloc_string(closure_name);
+        let name_handle = self.alloc_string(closure_name)?;
         self.objects
             .define_own_property(
                 handle,
@@ -528,7 +567,7 @@ impl RuntimeState {
         if flags.is_constructable() || flags.is_generator() {
             let prototype_property = self.intern_property_name("prototype");
             let constructor_property = self.intern_property_name("constructor");
-            let instance_prototype = self.alloc_object();
+            let instance_prototype = self.alloc_object()?;
             self.objects
                 .define_own_property(
                     handle,
@@ -555,7 +594,7 @@ impl RuntimeState {
             }
         }
 
-        handle
+        Ok(handle)
     }
 
     /// ES2024 §7.2.1 Type — returns `true` when the value is an ECMAScript

@@ -84,10 +84,10 @@ fn require_instant(
 fn wrap_instant(
     instant: temporal_rs::Instant,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().temporal_instant_prototype();
-    let handle = construct_temporal(TemporalPayload::Instant(instant), proto, runtime);
-    RegisterValue::from_object_handle(handle.0)
+    let handle = construct_temporal(TemporalPayload::Instant(instant), proto, runtime)?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Extracts an Instant from an argument — accepts Instant objects or ISO strings.
@@ -120,7 +120,7 @@ fn instant_constructor(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ns = to_bigint_i128(args, 0, runtime)?;
     let instant = temporal_rs::Instant::try_new(ns).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_instant(instant, runtime))
+    wrap_instant(instant, runtime)
 }
 
 // ── Static methods ──────────────────────────────────────────────────
@@ -134,7 +134,7 @@ fn instant_from(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let instant = to_instant(val, runtime)?;
-    Ok(wrap_instant(instant, runtime))
+    wrap_instant(instant, runtime)
 }
 
 /// §8.2.2.2 Temporal.Instant.compare ( one, two )
@@ -165,7 +165,7 @@ fn instant_from_epoch_ms(
         .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
     let ns = (ms as i128) * 1_000_000;
     let instant = temporal_rs::Instant::try_new(ns).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_instant(instant, runtime))
+    wrap_instant(instant, runtime)
 }
 
 /// §8.2.2.4 Temporal.Instant.fromEpochNanoseconds ( epochNanoseconds )
@@ -177,7 +177,7 @@ fn instant_from_epoch_ns(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ns = to_bigint_i128(args, 0, runtime)?;
     let instant = temporal_rs::Instant::try_new(ns).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_instant(instant, runtime))
+    wrap_instant(instant, runtime)
 }
 
 // ── Prototype methods ───────────────────────────────────────────────
@@ -204,7 +204,7 @@ fn instant_epoch_ns(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let instant = require_instant(this, runtime)?;
     let ns = instant.epoch_nanoseconds().0;
-    let handle = runtime.alloc_bigint(&ns.to_string());
+    let handle = runtime.alloc_bigint(&ns.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -219,7 +219,7 @@ fn instant_add(
     let dur_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let dur = to_duration(dur_val, runtime)?;
     let result = instant.add(&dur).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_instant(result, runtime))
+    wrap_instant(result, runtime)
 }
 
 /// §8.2.3.6 Temporal.Instant.prototype.subtract ( duration )
@@ -235,7 +235,7 @@ fn instant_subtract(
     let result = instant
         .subtract(&dur)
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_instant(result, runtime))
+    wrap_instant(result, runtime)
 }
 
 /// §8.2.3.10 Temporal.Instant.prototype.equals ( other )
@@ -281,7 +281,7 @@ fn instant_to_string(
         )
         .map_err(|e| temporal_err(e, runtime))?;
 
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -335,7 +335,7 @@ fn instant_to_json(
             tz_provider(),
         )
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

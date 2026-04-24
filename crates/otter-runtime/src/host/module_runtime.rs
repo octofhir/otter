@@ -88,8 +88,9 @@ pub(crate) fn install_module_runtime_session(
     loader_config: ModuleLoaderConfig,
     native_modules: HostedNativeModuleRegistry,
 ) -> ModuleRuntimeSession {
-    let helper =
-        runtime.alloc_native_object(ModuleRuntimePayload::new(loader_config, native_modules));
+    let helper = runtime
+        .alloc_native_object(ModuleRuntimePayload::new(loader_config, native_modules))
+        .expect("module runtime helper allocation should fit during bootstrap");
     install_method(runtime, helper, "import", module_import);
     install_method(runtime, helper, "require", module_require);
     install_method(runtime, helper, "export", module_export);
@@ -201,7 +202,9 @@ fn install_method(
 ) {
     let descriptor = NativeFunctionDescriptor::method(name, 0, callback);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let Ok(function) = runtime.alloc_host_function(id) else {
+        return;
+    };
     let property = runtime.intern_property_name(name);
     let _ = runtime.objects_mut().set_property(
         helper,
@@ -340,7 +343,7 @@ fn module_begin_cjs(
     let helper = helper_handle(this)?;
     let url = arg_string(runtime, args.first(), "beginCjs: missing module url")?;
     let exports = ensure_cjs_exports_object(runtime, helper, &url)?;
-    let module = runtime.alloc_object();
+    let module = runtime.alloc_object()?;
     let exports_prop = runtime.intern_property_name("exports");
     runtime
         .objects_mut()
@@ -462,7 +465,11 @@ fn evaluate_loaded_module(
         record.state = HostedEvaluationState::Evaluating;
         record.namespace.is_none()
     };
-    let allocated_namespace = needs_namespace.then(|| runtime.alloc_object());
+    let allocated_namespace = if needs_namespace {
+        Some(runtime.alloc_object()?)
+    } else {
+        None
+    };
     let needs_exports = {
         let payload = runtime
             .native_payload_mut::<ModuleRuntimePayload>(helper)
@@ -475,7 +482,11 @@ fn evaluate_loaded_module(
         }
         record.module_type == ModuleType::CommonJs && record.cjs_exports.is_none()
     };
-    let allocated_exports = needs_exports.then(|| runtime.alloc_object());
+    let allocated_exports = if needs_exports {
+        Some(runtime.alloc_object()?)
+    } else {
+        None
+    };
     let (module_type, source_type, transformed_source) = {
         let payload = runtime
             .native_payload_mut::<ModuleRuntimePayload>(helper)
@@ -601,7 +612,7 @@ fn json_value_to_register(
             Ok(RegisterValue::from_number(number))
         }
         serde_json::Value::String(value) => {
-            let string = runtime.alloc_string(value.clone());
+            let string = runtime.alloc_string(value.clone())?;
             Ok(RegisterValue::from_object_handle(string.0))
         }
         serde_json::Value::Array(values) => {
@@ -609,11 +620,11 @@ fn json_value_to_register(
             for value in values {
                 elements.push(json_value_to_register(runtime, value)?);
             }
-            let array = runtime.alloc_array_with_elements(&elements);
+            let array = runtime.alloc_array_with_elements(&elements)?;
             Ok(RegisterValue::from_object_handle(array.0))
         }
         serde_json::Value::Object(entries) => {
-            let object = runtime.alloc_object();
+            let object = runtime.alloc_object()?;
             for (key, value) in entries {
                 let property = runtime.intern_property_name(key);
                 let value = json_value_to_register(runtime, value)?;
@@ -668,7 +679,7 @@ fn ensure_namespace_object(
         return Ok(namespace);
     }
     let _ = record;
-    let namespace = runtime.alloc_object();
+    let namespace = runtime.alloc_object()?;
     let payload = runtime
         .native_payload_mut::<ModuleRuntimePayload>(helper)
         .map_err(native_internal)?;
@@ -700,7 +711,7 @@ fn ensure_cjs_exports_object(
         return Ok(exports);
     }
     let _ = record;
-    let exports = runtime.alloc_object();
+    let exports = runtime.alloc_object()?;
     let payload = runtime
         .native_payload_mut::<ModuleRuntimePayload>(helper)
         .map_err(native_internal)?;
@@ -782,7 +793,11 @@ fn commit_cjs_exports(
     record.state = HostedEvaluationState::Evaluated;
     let existing_namespace = record.namespace;
     let _ = record;
-    let allocated_namespace = needs_namespace.then(|| runtime.alloc_object());
+    let allocated_namespace = if needs_namespace {
+        Some(runtime.alloc_object()?)
+    } else {
+        None
+    };
     let payload = runtime
         .native_payload_mut::<ModuleRuntimePayload>(helper)
         .map_err(native_internal)?;

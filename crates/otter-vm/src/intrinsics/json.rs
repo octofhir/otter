@@ -116,13 +116,13 @@ fn json_parse(
 
     // Apply reviver if provided.
     if let Some(reviver_fn) = reviver {
-        let root = runtime.alloc_object();
+        let root = runtime.alloc_object()?;
         let empty_key = runtime.intern_property_name("");
         runtime
             .objects_mut()
             .set_property(root, empty_key, result)
             .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-        let key_str = runtime.alloc_string("");
+        let key_str = runtime.alloc_string("")?;
         walk_reviver(
             root,
             RegisterValue::from_object_handle(key_str.0),
@@ -198,12 +198,12 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<RegisterValue, E> {
-        let handle = self.runtime.alloc_string(v);
+        let handle = self.runtime.alloc_string(v).map_err(de::Error::custom)?;
         Ok(RegisterValue::from_object_handle(handle.0))
     }
 
     fn visit_string<E: de::Error>(self, v: String) -> Result<RegisterValue, E> {
-        let handle = self.runtime.alloc_string(v);
+        let handle = self.runtime.alloc_string(v).map_err(de::Error::custom)?;
         Ok(RegisterValue::from_object_handle(handle.0))
     }
 
@@ -212,7 +212,7 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<RegisterValue, A::Error> {
-        let handle = self.runtime.alloc_array();
+        let handle = self.runtime.alloc_array().map_err(de::Error::custom)?;
         // Pre-allocate if size hint is available.
         if let Some(hint) = seq.size_hint() {
             self.runtime
@@ -238,7 +238,7 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<RegisterValue, A::Error> {
-        let handle = self.runtime.alloc_object();
+        let handle = self.runtime.alloc_object().map_err(de::Error::custom)?;
         let mut index = 0usize;
         while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
             if index.is_multiple_of(JSON_INTERRUPT_POLL_INTERVAL) {
@@ -308,7 +308,7 @@ fn walk_reviver(
                     if i % JSON_INTERRUPT_POLL_INTERVAL == 0 {
                         runtime.check_interrupt()?;
                     }
-                    let idx_str = runtime.alloc_string(i.to_string());
+                    let idx_str = runtime.alloc_string(i.to_string())?;
                     let new_val = walk_reviver(
                         obj_handle,
                         RegisterValue::from_object_handle(idx_str.0),
@@ -338,7 +338,7 @@ fn walk_reviver(
                 for prop_id in keys {
                     runtime.check_interrupt()?;
                     let prop_name = property_names.get(prop_id).unwrap_or("").to_string();
-                    let prop_str = runtime.alloc_string(&*prop_name);
+                    let prop_str = runtime.alloc_string(&*prop_name)?;
                     let new_val = walk_reviver(
                         obj_handle,
                         RegisterValue::from_object_handle(prop_str.0),
@@ -464,7 +464,7 @@ fn json_stringify(
     )?;
 
     if success {
-        let handle = runtime.alloc_string(out);
+        let handle = runtime.alloc_string(out)?;
         Ok(RegisterValue::from_object_handle(handle.0))
     } else {
         Ok(RegisterValue::undefined())
@@ -644,7 +644,7 @@ fn stringify_array(
             .unwrap_or_else(RegisterValue::undefined);
 
         let elem = if let Some(replacer) = replacer_fn {
-            let idx_str = runtime.alloc_string(i.to_string());
+            let idx_str = runtime.alloc_string(i.to_string())?;
             let holder = RegisterValue::from_object_handle(handle.0);
             runtime.call_callable(
                 replacer,
@@ -762,7 +762,7 @@ fn stringify_object(
         runtime.check_interrupt()?;
 
         let val = if let Some(replacer) = replacer_fn {
-            let key_str = runtime.alloc_string(&*prop_name);
+            let key_str = runtime.alloc_string(&*prop_name)?;
             let holder = RegisterValue::from_object_handle(handle.0);
             runtime.call_callable(
                 replacer,
@@ -881,21 +881,7 @@ fn syntax_error(
     runtime: &mut crate::interpreter::RuntimeState,
     message: &str,
 ) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().syntax_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    let name = runtime.alloc_string("SyntaxError");
-    let name_prop = runtime.intern_property_name("name");
-    runtime
-        .objects_mut()
-        .set_property(handle, name_prop, RegisterValue::from_object_handle(name.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.alloc_syntax_error(message)
 }
 
 fn type_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {

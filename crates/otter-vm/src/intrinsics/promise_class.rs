@@ -133,23 +133,25 @@ fn promise_class_descriptor() -> JsClassDescriptor {
 fn alloc_promise_capability_with_proto(
     runtime: &mut RuntimeState,
     proto: ObjectHandle,
-) -> PromiseCapability {
-    let promise = runtime.objects_mut().alloc_promise_with_proto(proto);
+) -> Result<PromiseCapability, VmNativeCallError> {
+    let promise = runtime.objects_mut().alloc_promise_with_proto(proto)?;
     let resolve = runtime
         .objects_mut()
-        .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+        .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill)?;
     let reject = runtime
         .objects_mut()
-        .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
-    PromiseCapability {
+        .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject)?;
+    Ok(PromiseCapability {
         promise,
         resolve,
         reject,
-    }
+    })
 }
 
 /// Allocates a promise capability using the runtime's %Promise.prototype%.
-fn alloc_promise_capability(runtime: &mut RuntimeState) -> PromiseCapability {
+fn alloc_promise_capability(
+    runtime: &mut RuntimeState,
+) -> Result<PromiseCapability, VmNativeCallError> {
     let proto = runtime.intrinsics().promise_prototype();
     alloc_promise_capability_with_proto(runtime, proto)
 }
@@ -193,7 +195,7 @@ fn promise_constructor(
     // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
     let proto =
         runtime.subclass_prototype_or_default(*this, runtime.intrinsics().promise_prototype());
-    let capability = alloc_promise_capability_with_proto(runtime, proto);
+    let capability = alloc_promise_capability_with_proto(runtime, proto)?;
     let resolve_rv = RegisterValue::from_object_handle(capability.resolve.0);
     let reject_rv = RegisterValue::from_object_handle(capability.reject.0);
 
@@ -250,7 +252,7 @@ fn promise_then(
         .and_then(|v| v.as_object_handle().map(ObjectHandle));
 
     // §27.2.5.4 step 5: Create a new promise capability for the result.
-    let capability = alloc_promise_capability(runtime);
+    let capability = alloc_promise_capability(runtime)?;
 
     // §27.2.5.4 step 6: PerformPromiseThen.
     let promise = runtime
@@ -303,12 +305,12 @@ fn promise_finally(
         on_finally_handle,
         constructor,
         PromiseFinallyKind::ThenFinally,
-    );
+    )?;
     let catch_finally = runtime.objects_mut().alloc_promise_finally_function(
         on_finally_handle,
         constructor,
         PromiseFinallyKind::CatchFinally,
-    );
+    )?;
 
     let then_rv = RegisterValue::from_object_handle(then_finally.0);
     let catch_rv = RegisterValue::from_object_handle(catch_finally.0);
@@ -337,7 +339,7 @@ fn promise_static_resolve(
 
     // Create a new promise, immediately fulfilled.
     let proto = runtime.intrinsics().promise_prototype();
-    let handle = runtime.objects_mut().alloc_promise_with_proto(proto);
+    let handle = runtime.objects_mut().alloc_promise_with_proto(proto)?;
     let promise = runtime
         .objects_mut()
         .get_promise_mut(handle)
@@ -362,7 +364,7 @@ fn promise_static_reject(
     let reason = args.first().copied().unwrap_or(RegisterValue::undefined());
 
     let proto = runtime.intrinsics().promise_prototype();
-    let handle = runtime.objects_mut().alloc_promise_with_proto(proto);
+    let handle = runtime.objects_mut().alloc_promise_with_proto(proto)?;
     let promise = runtime
         .objects_mut()
         .get_promise_mut(handle)
@@ -427,10 +429,10 @@ fn promise_static_all(
     use crate::promise::PromiseCombinatorKind;
 
     let promises = collect_promises_from_iterable(args, runtime)?;
-    let result_cap = alloc_promise_capability(runtime);
+    let result_cap = alloc_promise_capability(runtime)?;
 
     if promises.is_empty() {
-        let arr = runtime.objects_mut().alloc_array();
+        let arr = runtime.objects_mut().alloc_array()?;
         let promise = runtime
             .objects_mut()
             .get_promise_mut(result_cap.promise)
@@ -442,7 +444,7 @@ fn promise_static_all(
     let count = promises.len();
 
     // Allocate result array pre-filled with undefined at each index.
-    let result_array = runtime.objects_mut().alloc_array();
+    let result_array = runtime.objects_mut().alloc_array()?;
     for _ in 0..count {
         runtime
             .objects_mut()
@@ -451,7 +453,7 @@ fn promise_static_all(
     }
 
     // Shared mutable counter: 1-element array with initial value = count.
-    let counter = runtime.objects_mut().alloc_array();
+    let counter = runtime.objects_mut().alloc_array()?;
     runtime
         .objects_mut()
         .push_element(counter, RegisterValue::from_i32(count as i32))
@@ -465,7 +467,7 @@ fn promise_static_all(
             result_array,
             counter,
             result_cap,
-        );
+        )?;
 
         // Capability for this element's .then() chain.
         let cap = PromiseCapability {
@@ -500,7 +502,7 @@ fn promise_static_race(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let promises = collect_promises_from_iterable(args, runtime)?;
-    let result_cap = alloc_promise_capability(runtime);
+    let result_cap = alloc_promise_capability(runtime)?;
 
     for input_promise in promises {
         // Register reactions that settle the result promise.
@@ -538,10 +540,10 @@ fn promise_static_all_settled(
     use crate::promise::PromiseCombinatorKind;
 
     let promises = collect_promises_from_iterable(args, runtime)?;
-    let result_cap = alloc_promise_capability(runtime);
+    let result_cap = alloc_promise_capability(runtime)?;
 
     if promises.is_empty() {
-        let arr = runtime.objects_mut().alloc_array();
+        let arr = runtime.objects_mut().alloc_array()?;
         let promise = runtime
             .objects_mut()
             .get_promise_mut(result_cap.promise)
@@ -552,7 +554,7 @@ fn promise_static_all_settled(
 
     let count = promises.len();
 
-    let result_array = runtime.objects_mut().alloc_array();
+    let result_array = runtime.objects_mut().alloc_array()?;
     for _ in 0..count {
         runtime
             .objects_mut()
@@ -560,7 +562,7 @@ fn promise_static_all_settled(
             .ok();
     }
 
-    let counter = runtime.objects_mut().alloc_array();
+    let counter = runtime.objects_mut().alloc_array()?;
     runtime
         .objects_mut()
         .push_element(counter, RegisterValue::from_i32(count as i32))
@@ -574,7 +576,7 @@ fn promise_static_all_settled(
             result_array,
             counter,
             result_cap,
-        );
+        )?;
         // §27.2.4.2.2: Per-element reject function creates { status: "rejected", reason }.
         let reject_element = runtime.objects_mut().alloc_promise_combinator_element(
             PromiseCombinatorKind::AllSettledReject,
@@ -582,7 +584,7 @@ fn promise_static_all_settled(
             result_array,
             counter,
             result_cap,
-        );
+        )?;
 
         let cap = PromiseCapability {
             promise: result_cap.promise,
@@ -618,7 +620,7 @@ fn promise_static_any(
     use crate::promise::PromiseCombinatorKind;
 
     let promises = collect_promises_from_iterable(args, runtime)?;
-    let result_cap = alloc_promise_capability(runtime);
+    let result_cap = alloc_promise_capability(runtime)?;
 
     if promises.is_empty() {
         let err = runtime
@@ -637,7 +639,7 @@ fn promise_static_any(
     let count = promises.len();
 
     // Errors array — collects rejection reasons.
-    let errors_array = runtime.objects_mut().alloc_array();
+    let errors_array = runtime.objects_mut().alloc_array()?;
     for _ in 0..count {
         runtime
             .objects_mut()
@@ -645,7 +647,7 @@ fn promise_static_any(
             .ok();
     }
 
-    let counter = runtime.objects_mut().alloc_array();
+    let counter = runtime.objects_mut().alloc_array()?;
     runtime
         .objects_mut()
         .push_element(counter, RegisterValue::from_i32(count as i32))
@@ -659,7 +661,7 @@ fn promise_static_any(
             errors_array,
             counter,
             result_cap,
-        );
+        )?;
 
         let cap = PromiseCapability {
             promise: result_cap.promise,
@@ -697,11 +699,11 @@ fn promise_with_resolvers(
     _args: &[RegisterValue],
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let cap = alloc_promise_capability(runtime);
+    let cap = alloc_promise_capability(runtime)?;
 
     // Build the result object: { promise, resolve, reject }.
     let obj_proto = runtime.intrinsics().object_prototype();
-    let obj = runtime.alloc_object_with_prototype(Some(obj_proto));
+    let obj = runtime.alloc_object_with_prototype(Some(obj_proto))?;
 
     let promise_prop = runtime.intern_property_name("promise");
     runtime

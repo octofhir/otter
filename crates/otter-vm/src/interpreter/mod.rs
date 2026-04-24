@@ -39,6 +39,7 @@ pub use activation::Activation;
 pub use error::InterpreterError;
 pub use execution_result::ExecutionResult;
 use frame_runtime::FrameRuntimeState;
+pub use runtime_state::NATIVE_LOOP_POLL_INTERVAL;
 pub(crate) use step_outcome::ToPrimitiveHint;
 use step_outcome::{Completion, StepOutcome, TailCallPayload};
 pub use tier_up::{
@@ -409,7 +410,7 @@ impl Interpreter {
                 Vec::new(),
                 crate::object::ClosureFlags::normal(),
                 caller_realm,
-            );
+            )?;
             if caller_class_id != 0 {
                 let _ = runtime
                     .objects
@@ -496,7 +497,7 @@ impl Interpreter {
                             Some(callable),
                             arguments.to_vec(),
                         )
-                    };
+                    }?;
                     return Ok(RegisterValue::from_object_handle(gen_handle.0));
                 }
 
@@ -600,13 +601,13 @@ impl Interpreter {
     ) -> Result<RegisterValue, InterpreterError> {
         // §27.7.5.1 step 2: Let promiseCapability be ! NewPromiseCapability(%Promise%).
         let proto = runtime.intrinsics().promise_prototype();
-        let promise = runtime.objects.alloc_promise_with_proto(proto);
+        let promise = runtime.objects.alloc_promise_with_proto(proto)?;
         let resolve = runtime
             .objects
-            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill)?;
         let reject = runtime
             .objects
-            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject)?;
         let capability = crate::promise::PromiseCapability {
             promise,
             resolve,
@@ -686,7 +687,7 @@ impl Interpreter {
                                 runtime,
                                 promise_handle,
                                 ObjectHandle(h),
-                            );
+                            )?;
                             return Ok(());
                         }
                         let promise = runtime.objects.get_promise_mut(promise_handle).unwrap();
@@ -714,14 +715,14 @@ impl Interpreter {
         runtime: &mut RuntimeState,
         promise: ObjectHandle,
         thenable: ObjectHandle,
-    ) {
+    ) -> Result<(), InterpreterError> {
         // Get or create resolve/reject for the target promise.
         let resolve = runtime
             .objects
-            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill)?;
         let reject = runtime
             .objects
-            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject)?;
 
         let capability = crate::promise::PromiseCapability {
             promise,
@@ -739,6 +740,7 @@ impl Interpreter {
         {
             runtime.microtasks_mut().enqueue_promise_job(immediate_job);
         }
+        Ok(())
     }
 
     /// Invokes a PromiseCombinatorElement (per-element resolve/reject for all/allSettled/any).
@@ -786,7 +788,7 @@ impl Interpreter {
             }
             PromiseCombinatorKind::AllSettledResolve => {
                 // §27.2.4.2.1: Create { status: "fulfilled", value: value }.
-                let obj = runtime.alloc_settled_result_object("fulfilled", "value", value);
+                let obj = runtime.alloc_settled_result_object("fulfilled", "value", value)?;
                 let _ = runtime.objects.set_index(
                     result_array,
                     index as usize,
@@ -803,7 +805,7 @@ impl Interpreter {
             }
             PromiseCombinatorKind::AllSettledReject => {
                 // §27.2.4.2.2: Create { status: "rejected", reason: value }.
-                let obj = runtime.alloc_settled_result_object("rejected", "reason", value);
+                let obj = runtime.alloc_settled_result_object("rejected", "reason", value)?;
                 let _ = runtime.objects.set_index(
                     result_array,
                     index as usize,
@@ -1462,8 +1464,7 @@ impl Interpreter {
                 // `try/catch` sees it instead of the host process
                 // crashing. Mirrors V8/JSC behavior on stack exhaustion.
                 Err(InterpreterError::StackOverflow) => {
-                    let value =
-                        runtime.alloc_range_error_value("Maximum call stack size exceeded");
+                    let value = runtime.alloc_range_error_value("Maximum call stack size exceeded");
                     StepOutcome::Throw(value)
                 }
                 Err(error) => {
@@ -1722,7 +1723,7 @@ impl Interpreter {
                             let resolve = runtime.objects.alloc_promise_capability_function(
                                 result_promise,
                                 crate::promise::ReactionKind::Fulfill,
-                            );
+                            )?;
                             let _ = Self::call_function(
                                 runtime,
                                 module,

@@ -51,7 +51,7 @@ impl IntrinsicInstaller for BigIntIntrinsic {
         let tag_symbol = cx
             .property_names
             .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-        let tag_str = cx.heap.alloc_string("BigInt");
+        let tag_str = cx.heap.alloc_string("BigInt")?;
         cx.heap.define_own_property(
             intrinsics.bigint_prototype,
             tag_symbol,
@@ -132,19 +132,7 @@ fn type_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmNa
 }
 
 fn range_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg_str = runtime.alloc_string(msg);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(
-            handle,
-            msg_prop,
-            RegisterValue::from_object_handle(msg_str.0),
-        )
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error(msg)
 }
 
 /// Extracts a BigInt value string from a register, or throws TypeError.
@@ -189,7 +177,7 @@ fn to_bigint(
     // Boolean → 0n / 1n.
     if let Some(b) = value.as_bool() {
         let val = if b { "1" } else { "0" };
-        let handle = runtime.alloc_bigint(val);
+        let handle = runtime.alloc_bigint(val)?;
         return Ok(RegisterValue::from_bigint_handle(handle.0));
     }
 
@@ -204,7 +192,7 @@ fn to_bigint(
     {
         let s = s.trim().to_string();
         if let Ok(_val) = s.parse::<num_bigint::BigInt>() {
-            let result = runtime.alloc_bigint(&s);
+            let result = runtime.alloc_bigint(&s)?;
             return Ok(RegisterValue::from_bigint_handle(result.0));
         }
         return Err(type_error(
@@ -242,7 +230,7 @@ fn bigint_constructor(
     }
     if value.as_i32().is_some() {
         let n = value.as_i32().unwrap();
-        let handle = runtime.alloc_bigint(&n.to_string());
+        let handle = runtime.alloc_bigint(&n.to_string())?;
         return Ok(RegisterValue::from_bigint_handle(handle.0));
     }
 
@@ -263,7 +251,7 @@ fn number_to_bigint(
         ));
     }
     let val = n as i64;
-    let handle = runtime.alloc_bigint(&val.to_string());
+    let handle = runtime.alloc_bigint(&val.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -308,7 +296,7 @@ fn bigint_to_string(
         bigint_to_radix_string(&parsed, radix)
     };
 
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -335,7 +323,7 @@ fn bigint_to_locale_string(
         value_str
     };
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -388,7 +376,7 @@ fn bigint_as_int_n(
         result
     };
 
-    let handle = runtime.alloc_bigint(&result.to_string());
+    let handle = runtime.alloc_bigint(&result.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -419,7 +407,7 @@ fn bigint_as_uint_n(
         result += &modulus;
     }
 
-    let handle = runtime.alloc_bigint(&result.to_string());
+    let handle = runtime.alloc_bigint(&result.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 

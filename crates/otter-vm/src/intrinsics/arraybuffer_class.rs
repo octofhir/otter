@@ -85,7 +85,7 @@ impl IntrinsicInstaller for ArrayBufferIntrinsic {
         let tag_symbol = cx
             .property_names
             .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-        let tag_str = cx.heap.alloc_string("ArrayBuffer");
+        let tag_str = cx.heap.alloc_string("ArrayBuffer")?;
         cx.heap.define_own_property(
             intrinsics.array_buffer_prototype,
             tag_symbol,
@@ -192,15 +192,7 @@ fn type_error(
 }
 
 fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error(message)
 }
 
 /// §7.1.22 ToIndex ( value )
@@ -684,7 +676,7 @@ fn array_buffer_transfer_impl(
             .alloc_array_buffer_with_data(old_data, prototype)
     };
 
-    Ok(RegisterValue::from_object_handle(new_handle.0))
+    Ok(RegisterValue::from_object_handle(new_handle?.0))
 }
 
 /// §25.1.4.1 ArrayBuffer.isView ( arg )

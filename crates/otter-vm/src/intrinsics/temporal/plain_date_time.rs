@@ -104,10 +104,10 @@ fn require_plain_date_time(
 fn wrap_plain_date_time(
     pdt: temporal_rs::PlainDateTime,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().temporal_plain_date_time_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainDateTime(pdt), proto, runtime);
-    RegisterValue::from_object_handle(handle.0)
+    let handle = construct_temporal(TemporalPayload::PlainDateTime(pdt), proto, runtime)?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Extracts a PlainDateTime from an argument — accepts objects or ISO strings.
@@ -157,7 +157,7 @@ fn pdt_constructor(
         temporal_rs::Calendar::default(),
     )
     .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_date_time(pdt, runtime))
+    wrap_plain_date_time(pdt, runtime)
 }
 
 // ── Static methods ──────────────────────────────────────────────────
@@ -171,7 +171,7 @@ fn pdt_from(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let pdt = to_plain_date_time(val, runtime)?;
-    Ok(wrap_plain_date_time(pdt, runtime))
+    wrap_plain_date_time(pdt, runtime)
 }
 
 /// §12.2.2.2 Temporal.PlainDateTime.compare ( one, two )
@@ -217,7 +217,7 @@ fn pdt_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pdt = require_plain_date_time(this, runtime)?;
     let id = pdt.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string());
+    let handle = runtime.alloc_string(id.to_string())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -233,7 +233,7 @@ fn pdt_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pdt = require_plain_date_time(this, runtime)?;
     let code = pdt.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code);
+    let handle = runtime.alloc_string(code)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -307,7 +307,7 @@ fn pdt_add(
     let dur_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let dur = to_duration(dur_val, runtime)?;
     let result = pdt.add(&dur, None).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_date_time(result, runtime))
+    wrap_plain_date_time(result, runtime)
 }
 
 /// §12.2.3.27 Temporal.PlainDateTime.prototype.subtract ( duration )
@@ -323,7 +323,7 @@ fn pdt_subtract(
     let result = pdt
         .subtract(&dur, None)
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_date_time(result, runtime))
+    wrap_plain_date_time(result, runtime)
 }
 
 /// §12.2.3.31 Temporal.PlainDateTime.prototype.equals ( other )
@@ -355,7 +355,7 @@ fn pdt_to_string(
             temporal_rs::options::DisplayCalendar::Auto,
         )
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -379,7 +379,7 @@ fn pdt_to_plain_date(
     let pdt = require_plain_date_time(this, runtime)?;
     let pd = pdt.to_plain_date();
     let proto = runtime.intrinsics().temporal_plain_date_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainDate(pd), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainDate(pd), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -393,6 +393,6 @@ fn pdt_to_plain_time(
     let pdt = require_plain_date_time(this, runtime)?;
     let pt = pdt.to_plain_time();
     let proto = runtime.intrinsics().temporal_plain_time_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }

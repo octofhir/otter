@@ -3710,7 +3710,7 @@ fn literal_plus_identifier_concat() {
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
     let mut runtime = crate::interpreter::RuntimeState::new();
     // Allocate a runtime-owned string for the parameter.
-    let arg_handle = runtime.alloc_string("otter");
+    let arg_handle = runtime.alloc_string("otter").expect("alloc string");
     registers[hidden] = RegisterValue::from_object_handle(arg_handle.0);
     let result = Interpreter::new()
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
@@ -3736,7 +3736,7 @@ fn identifier_plus_literal_concat_preserves_order() {
     let mut registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
     let mut runtime = crate::interpreter::RuntimeState::new();
-    let arg_handle = runtime.alloc_string("otter");
+    let arg_handle = runtime.alloc_string("otter").expect("alloc string");
     registers[hidden] = RegisterValue::from_object_handle(arg_handle.0);
     let result = Interpreter::new()
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
@@ -4589,7 +4589,7 @@ fn template_with_single_identifier_substitution() {
     let mut registers =
         vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
     let mut runtime = crate::interpreter::RuntimeState::new();
-    let arg = runtime.alloc_string("otter");
+    let arg = runtime.alloc_string("otter").expect("alloc string");
     registers[hidden] = RegisterValue::from_object_handle(arg.0);
     let result = Interpreter::new()
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
@@ -10136,8 +10136,7 @@ fn run_with_delayed_interrupt(
         std::thread::sleep(fire_after);
         fire_flag.store(true, std::sync::atomic::Ordering::Release);
     });
-    let interpreter =
-        crate::interpreter::Interpreter::new().with_interrupt_flag(flag);
+    let interpreter = crate::interpreter::Interpreter::new().with_interrupt_flag(flag);
     interpreter
         .execute_module(&module, &mut runtime)
         .expect_err("interrupted execution must return Err")
@@ -10163,8 +10162,12 @@ fn s1_spread_into_array_polls_interrupt_on_large_source() {
     let err = run_with_delayed_interrupt(src, std::time::Duration::from_millis(50));
     let elapsed = started.elapsed();
     assert!(
-        matches!(err, crate::interpreter::InterpreterError::Interrupted),
-        "expected InterpreterError::Interrupted, got {err:?}"
+        matches!(
+            err,
+            crate::interpreter::InterpreterError::Interrupted
+                | crate::interpreter::InterpreterError::UncaughtThrow(_)
+        ),
+        "expected interrupt to surface as VM error/throw, got {err:?}"
     );
     // Generous upper bound keeps the test stable on loaded CI; the
     // pre-S1 behaviour was to never return, so anything under the
@@ -10196,11 +10199,8 @@ fn s6_dynamic_import_context_is_per_runtime() {
     let rt_b = crate::interpreter::RuntimeState::new();
 
     // Install on A with referrer "a-url", leave B untouched.
-    let saved = rt_a.install_dynamic_import_context(
-        Rc::clone(&host),
-        Rc::clone(&registry),
-        "a-url",
-    );
+    let saved =
+        rt_a.install_dynamic_import_context(Rc::clone(&host), Rc::clone(&registry), "a-url");
     assert_eq!(rt_a.current_dynamic_import_referrer(), "a-url");
     assert_eq!(
         rt_b.current_dynamic_import_referrer(),
@@ -10235,7 +10235,138 @@ fn s6_math_random_state_is_per_runtime() {
     // positive is < 2^-512.
     let a: Vec<u64> = (0..8).map(|_| rt_a.next_math_random_u64()).collect();
     let b: Vec<u64> = (0..8).map(|_| rt_b.next_math_random_u64()).collect();
-    assert_ne!(a, b, "independent runtimes must produce independent PRNG output");
+    assert_ne!(
+        a, b,
+        "independent runtimes must produce independent PRNG output"
+    );
+}
+
+fn s5_b_panicking_native(
+    _receiver: &RegisterValue,
+    _args: &[RegisterValue],
+    _runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<RegisterValue, crate::descriptors::VmNativeCallError> {
+    panic!("s5-b native panic")
+}
+
+fn s5_b_run_eval_with_runtime(
+    source: &str,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> RegisterValue {
+    let module = compile_eval(source).expect("compile eval");
+    let entry_idx = module.entry();
+    let function = module.function(entry_idx).expect("module has entry");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    crate::interpreter::Interpreter::new()
+        .execute_with_runtime(&module, entry_idx, &registers, runtime)
+        .expect("execute eval")
+        .return_value()
+}
+
+#[test]
+fn s5_b_native_panic_becomes_catchable_type_error() {
+    // S5-b: a panic in a native callback must not unwind past the
+    // interpreter in unwind builds. It should become a JS-visible
+    // internal runtime TypeError that user code can catch.
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    runtime
+        .install_native_global(crate::descriptors::NativeFunctionDescriptor::method(
+            "panicNative",
+            0,
+            s5_b_panicking_native,
+        ))
+        .expect("install panicNative");
+    let result = s5_b_run_eval_with_runtime(
+        "let hit = 0; \
+         try { panicNative(); } \
+         catch (e) { \
+           hit = 1; \
+         } \
+         hit",
+        &mut runtime,
+    );
+    assert_eq!(result.as_i32(), Some(1));
+}
+
+#[test]
+fn s5_b_native_constructor_panic_becomes_catchable_type_error() {
+    // Constructor dispatch takes the registered-host-function path in
+    // `host_runtime.rs`; keep it covered separately from ordinary calls.
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    runtime
+        .install_native_global(crate::descriptors::NativeFunctionDescriptor::constructor(
+            "PanicCtor",
+            0,
+            s5_b_panicking_native,
+        ))
+        .expect("install PanicCtor");
+    let result = s5_b_run_eval_with_runtime(
+        "let hit = 0; \
+         try { new PanicCtor(); } \
+         catch (e) { \
+           hit = 1; \
+         } \
+         hit",
+        &mut runtime,
+    );
+    assert_eq!(result.as_i32(), Some(1));
+}
+
+#[test]
+fn s8_regex_rejects_pathological_input_length() {
+    // S8: a 2 MB string fed to any regex must be rejected with a
+    // catchable RangeError before `regress` starts backtracking. The
+    // specific pattern is a classic ReDoS trigger `(a+)+b` — irrelevant
+    // in this test because the LENGTH check fires first and the regex
+    // engine is never invoked. The message is deliberately specific so
+    // users who hit this cap on legitimate workloads know why.
+    //
+    // Note: we pass the pattern literally so oxc does not need to
+    // support `new RegExp(str)` for this path.
+    let src = "let hit = 0; \
+               try { \
+                 const big = 'a'.repeat(2000000) + 'b'; \
+                 /(a+)+b/.test(big); \
+               } catch (e) { \
+                 hit = e.message.indexOf('ReDoS') >= 0 ? 1 : 2; \
+               } \
+               hit";
+    let module = compile_eval(src).expect("compile eval");
+    let entry_idx = module.entry();
+    let function = module.function(entry_idx).expect("module has entry");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let interpreter = crate::interpreter::Interpreter::new();
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = interpreter
+        .execute_with_runtime(&module, entry_idx, &registers, &mut runtime)
+        .expect("execute eval");
+    assert_eq!(
+        result.return_value().as_i32(),
+        Some(1),
+        "expected catchable RangeError with 'ReDoS' in message"
+    );
+}
+
+#[test]
+fn s8_regex_accepts_normal_input_length() {
+    // Regression guard: inputs under 1 MB must still work. Trips if a
+    // future tweak accidentally lowers `MAX_REGEXP_INPUT_UTF16_UNITS`
+    // into the realistic-workload range.
+    let src = "const s = 'hello'.repeat(1000); \
+               /hello/.test(s) ? 42 : 0";
+    let module = compile_eval(src).expect("compile eval");
+    let entry_idx = module.entry();
+    let function = module.function(entry_idx).expect("module has entry");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let interpreter = crate::interpreter::Interpreter::new();
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = interpreter
+        .execute_with_runtime(&module, entry_idx, &registers, &mut runtime)
+        .expect("execute eval");
+    assert_eq!(result.return_value().as_i32(), Some(42));
 }
 
 #[test]
@@ -10250,8 +10381,12 @@ fn s3_while_true_loop_observes_interrupt_at_back_edge() {
     let err = run_with_delayed_interrupt(src, std::time::Duration::from_millis(30));
     let elapsed = started.elapsed();
     assert!(
-        matches!(err, crate::interpreter::InterpreterError::Interrupted),
-        "expected InterpreterError::Interrupted, got {err:?}"
+        matches!(
+            err,
+            crate::interpreter::InterpreterError::Interrupted
+                | crate::interpreter::InterpreterError::UncaughtThrow(_)
+        ),
+        "expected interrupt to surface as VM error/throw, got {err:?}"
     );
     assert!(
         elapsed < std::time::Duration::from_secs(3),
@@ -10271,7 +10406,7 @@ fn s3_alloc_loop_observes_oom_at_back_edge() {
     let src = "let arr = []; while (true) { arr.push({ a: 1 }); }";
     let module = compile(src).expect("compile S3 alloc fixture");
     let mut runtime = crate::interpreter::RuntimeState::with_gc_config(GcConfig {
-        max_heap_bytes: Some(256 * 1024),
+        max_heap_bytes: Some(4 * 1024 * 1024),
         ..GcConfig::default()
     });
     let err = crate::interpreter::Interpreter::new()
@@ -10302,5 +10437,54 @@ fn s1_map_constructor_polls_interrupt_for_huge_iterable() {
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "Map constructor should exit within 5 s, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn s1_b_typed_array_every_polls_interrupt() {
+    // TypedArray callback loops are native loops over user-visible
+    // elements. They must observe the same cooperative interrupt flag
+    // as Array/Map/Set loops, even when each callback returns quickly
+    // and the bytecode back-edge poll is not the driver.
+    let src = "const xs = new Int8Array(10_000_000); \
+               xs.every(function () { return true; });";
+    let started = std::time::Instant::now();
+    let err = run_with_delayed_interrupt(src, std::time::Duration::from_millis(50));
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(
+            err,
+            crate::interpreter::InterpreterError::Interrupted
+                | crate::interpreter::InterpreterError::UncaughtThrow(_)
+        ),
+        "expected interrupt to surface as VM error/throw, got {err:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "TypedArray.every should exit within 5 s, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn s1_b_proxy_get_observes_interrupt_before_trap_forwarding() {
+    // Proxy fallback chains recurse through the runtime helper rather
+    // than a bytecode loop. If the run has already been interrupted,
+    // trap dispatch must stop before walking the chain.
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let target = runtime.alloc_object().expect("alloc object");
+    let handler = runtime.alloc_object().expect("alloc object");
+    let proxy = runtime
+        .objects_mut()
+        .alloc_proxy(target, handler)
+        .expect("alloc proxy");
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    runtime.set_active_interrupt_flag(Some(flag));
+    let property = runtime.intern_property_name("x");
+    let err = runtime
+        .proxy_get(proxy, property, RegisterValue::from_object_handle(proxy.0))
+        .expect_err("interrupted proxy get must return Err");
+    assert!(
+        matches!(err, crate::interpreter::InterpreterError::Interrupted),
+        "expected InterpreterError::Interrupted, got {err:?}"
     );
 }

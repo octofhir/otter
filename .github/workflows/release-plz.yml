@@ -68,6 +68,38 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p otterjs
 
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_P12_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != ''
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD="${MACOS_KEYCHAIN_PASSWORD:-temporary-${GITHUB_RUN_ID}}"
+          KEYCHAIN_PATH="$RUNNER_TEMP/otter-signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/otter-signing.p12"
+
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychain -d user | sed 's/[ "]//g')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Sign macOS binary
+        if: runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_P12_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_CODESIGN_IDENTITY != ''
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+        run: |
+          scripts/sign-macos-release.sh "target/${{ matrix.target }}/release/otter"
+
+      - name: Skip macOS signing
+        if: runner.os == 'macOS' && (secrets.APPLE_CERTIFICATE_P12_BASE64 == '' || secrets.APPLE_CERTIFICATE_PASSWORD == '' || secrets.APPLE_CODESIGN_IDENTITY == '')
+        run: |
+          echo "::warning::Apple Developer ID signing secrets are not configured; packaging unsigned macOS binary."
+          echo "::warning::Unsigned macOS artifacts may show Gatekeeper warnings and do not represent the hardened-runtime JIT release path."
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |

@@ -72,7 +72,7 @@ fn plural_rules_constructor(
     let data = resolve_plural_rules_options(&locale, options_arg, runtime)?;
 
     let prototype = runtime.intrinsics().intl_plural_rules_prototype();
-    let handle = payload::construct_intl(IntlPayload::PluralRules(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::PluralRules(data), prototype, runtime)?;
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -100,7 +100,7 @@ fn plural_rules_select(
         .map_err(|e| VmNativeCallError::Internal(format!("PluralRules.select: {e}").into()))?;
 
     let category = resolve_plural(number, &data);
-    let handle = runtime.alloc_string(plural_category_str(category));
+    let handle = runtime.alloc_string(plural_category_str(category))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -147,7 +147,7 @@ fn plural_rules_select_range(
 
     // Simplified: select the end category (full impl would use PluralRulesWithRanges).
     let category = resolve_plural(end, &data);
-    let handle = runtime.alloc_string(plural_category_str(category));
+    let handle = runtime.alloc_string(plural_category_str(category))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -162,7 +162,7 @@ fn plural_rules_resolved_options(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_plural_rules_data(this, runtime)?.clone();
 
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "type", data.plural_type.as_str());
     set_i32_prop(
@@ -193,9 +193,9 @@ fn plural_rules_resolved_options(
         PluralRulesType::Ordinal => IcuPluralRules::try_new_ordinal((&locale).into()),
     };
     if let Ok(rules) = rules {
-        let cats_arr = runtime.alloc_array();
+        let cats_arr = runtime.alloc_array()?;
         for cat in rules.categories() {
-            let s = runtime.alloc_string(plural_category_str(cat));
+            let s = runtime.alloc_string(plural_category_str(cat))?;
             let _ = runtime
                 .objects_mut()
                 .push_element(cats_arr, RegisterValue::from_object_handle(s.0));
@@ -225,9 +225,9 @@ fn plural_rules_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -381,7 +381,9 @@ fn set_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));

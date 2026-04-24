@@ -15,11 +15,12 @@ impl VmTrace for RuntimeCapabilitiesPayload {
 }
 
 pub(crate) fn install_runtime_capabilities(runtime: &mut RuntimeState, capabilities: Capabilities) {
-    let payload = runtime.alloc_native_object(RuntimeCapabilitiesPayload { capabilities });
-    runtime.install_global_value(
-        HOST_CAPABILITIES_SLOT,
-        otter_vm::value::RegisterValue::from_object_handle(payload.0),
-    );
+    if let Ok(payload) = runtime.alloc_native_object(RuntimeCapabilitiesPayload { capabilities }) {
+        runtime.install_global_value(
+            HOST_CAPABILITIES_SLOT,
+            otter_vm::value::RegisterValue::from_object_handle(payload.0),
+        );
+    }
 }
 
 #[must_use]

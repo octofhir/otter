@@ -120,7 +120,7 @@ impl Interpreter {
                     ))));
                 };
                 // Intern into runtime-owned JsString and box as object.
-                let handle = runtime.alloc_string(s.to_string());
+                let handle = runtime.alloc_string(s.to_string())?;
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
             Opcode::LdaConstF64 => {
@@ -150,7 +150,7 @@ impl Interpreter {
                         "v2 LdaConstBigInt: bigint id {idx} out of range"
                     ))));
                 };
-                let handle = runtime.objects.alloc_bigint(s.to_string());
+                let handle = runtime.objects.alloc_bigint(s.to_string())?;
                 // BigInt primitives use the dedicated `TAG_PTR_BIGINT` tag so
                 // `is_bigint()` discriminators and `bigint_binary_op` decoders
                 // both find the value; tagging as a regular object handle
@@ -177,7 +177,7 @@ impl Interpreter {
                 let prototype = runtime.intrinsics().regexp_prototype();
                 let handle = runtime
                     .objects
-                    .alloc_regexp(&pattern, &flags, Some(prototype));
+                    .alloc_regexp(&pattern, &flags, Some(prototype))?;
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
             Opcode::LdaThis => {
@@ -270,10 +270,10 @@ impl Interpreter {
             // with the single `url` property (other fields, like
             // `import.meta.resolve`, land in later slices).
             Opcode::ImportMeta => {
-                let meta = runtime.alloc_object();
+                let meta = runtime.alloc_object()?;
                 let url_prop = runtime.intern_property_name("url");
                 let referrer = runtime.current_dynamic_import_referrer().to_string();
-                let url_value = runtime.alloc_string(referrer.as_str());
+                let url_value = runtime.alloc_string(referrer.as_str())?;
                 runtime.objects.set_property(
                     meta,
                     url_prop,
@@ -1099,11 +1099,11 @@ impl Interpreter {
 
             // ---- Object / array allocation ----
             Opcode::CreateObject => {
-                let handle = runtime.alloc_object();
+                let handle = runtime.alloc_object()?;
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
             Opcode::CreateArray => {
-                let handle = runtime.alloc_array();
+                let handle = runtime.alloc_array()?;
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
             // §10.4.4 — Rest parameter. Collects `overflow_args`
@@ -1113,7 +1113,7 @@ impl Interpreter {
             // entry for `function f(..., ...rest)`; the trailing
             // `Star r_rest` binds it to the rest local.
             Opcode::CreateRestParameters => {
-                let arr = runtime.alloc_array();
+                let arr = runtime.alloc_array()?;
                 let overflow = std::mem::take(&mut activation.overflow_args);
                 for value in overflow {
                     // `push_element` bumps length + writes into
@@ -1178,7 +1178,8 @@ impl Interpreter {
                     };
                     upvalues.push(handle);
                 }
-                let handle = runtime.alloc_closure(template.callee(), upvalues, template.flags());
+                let handle =
+                    runtime.alloc_closure(template.callee(), upvalues, template.flags())?;
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
 
@@ -1191,7 +1192,7 @@ impl Interpreter {
             Opcode::ToString => {
                 let v = activation.accumulator();
                 let text = runtime.js_to_string(v)?;
-                let handle = runtime.alloc_string(text.into_string());
+                let handle = runtime.alloc_string(text.into_string())?;
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
             Opcode::ToPropertyKey => {
@@ -1204,7 +1205,7 @@ impl Interpreter {
                     activation.set_accumulator(primitive);
                 } else {
                     let text = runtime.js_to_string(primitive)?;
-                    let handle = runtime.alloc_string(text.into_string());
+                    let handle = runtime.alloc_string(text.into_string())?;
                     activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
                 }
             }
@@ -3034,7 +3035,14 @@ impl Interpreter {
                 runtime.alloc_async_generator(module.clone(), callee_idx, None, arguments.to_vec())
             } else {
                 runtime.alloc_generator(module.clone(), callee_idx, None, arguments.to_vec())
-            };
+            }
+            .map_err(|error| match error {
+                InterpreterError::UncaughtThrow(value) => StepOutcome::Throw(value),
+                InterpreterError::OutOfMemory => StepOutcome::Throw(
+                    runtime.alloc_range_error_value("out of memory: heap limit exceeded"),
+                ),
+                _ => StepOutcome::Throw(RegisterValue::undefined()),
+            })?;
             return Ok(RegisterValue::from_object_handle(gen_handle.0));
         }
 
@@ -4335,8 +4343,9 @@ mod tests {
         // argument list.
         let mut runtime = RuntimeState::new();
         let _ = runtime.enter_module(&module);
-        let closure_handle =
-            runtime.alloc_closure(FunctionIndex(1), Vec::new(), ObjClosureFlags::default());
+        let closure_handle = runtime
+            .alloc_closure(FunctionIndex(1), Vec::new(), ObjClosureFlags::default())
+            .expect("alloc closure");
         let preseed = [RegisterValue::from_object_handle(closure_handle.0)];
 
         let interpreter = Interpreter::new();
@@ -4394,7 +4403,7 @@ mod tests {
 
         let mut runtime = RuntimeState::new();
         let _ = runtime.enter_module(&module);
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object().expect("alloc object");
         let a_id = runtime.intern_property_name("a");
         let b_id = runtime.intern_property_name("b");
         runtime
@@ -4441,7 +4450,7 @@ mod tests {
 
         let mut runtime = RuntimeState::new();
         let _ = runtime.enter_module(&module);
-        let arr = runtime.alloc_array();
+        let arr = runtime.alloc_array().expect("alloc array");
         let preseed = [RegisterValue::from_object_handle(arr.0)];
 
         let interpreter = Interpreter::new();
@@ -4495,7 +4504,7 @@ mod tests {
 
         let mut runtime = RuntimeState::new();
         let _ = runtime.enter_module(&module);
-        let arr = runtime.alloc_array();
+        let arr = runtime.alloc_array().expect("alloc array");
         // Populate arr with [100, 200] via `push_element` (the
         // element-aware path; `set_property` would fail because
         // indexed properties on arrays route through the elements vec,
@@ -4563,8 +4572,9 @@ mod tests {
             Module::new(Some("m"), vec![caller, callee], FunctionIndex(0)).expect("module");
         let mut runtime = RuntimeState::new();
         let _ = runtime.enter_module(&module);
-        let closure_handle =
-            runtime.alloc_closure(FunctionIndex(1), Vec::new(), ObjClosureFlags::default());
+        let closure_handle = runtime
+            .alloc_closure(FunctionIndex(1), Vec::new(), ObjClosureFlags::default())
+            .expect("alloc closure");
         let preseed = [RegisterValue::from_object_handle(closure_handle.0)];
 
         let interpreter = Interpreter::new();
@@ -4709,8 +4719,9 @@ mod tests {
 
         let mut runtime = RuntimeState::new();
         let _ = runtime.enter_module(&module);
-        let closure_handle =
-            runtime.alloc_closure(FunctionIndex(1), Vec::new(), ObjClosureFlags::default());
+        let closure_handle = runtime
+            .alloc_closure(FunctionIndex(1), Vec::new(), ObjClosureFlags::default())
+            .expect("alloc closure");
         let preseed = [RegisterValue::from_object_handle(closure_handle.0)];
 
         let interpreter = Interpreter::new();

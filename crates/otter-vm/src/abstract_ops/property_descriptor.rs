@@ -21,7 +21,8 @@ pub(crate) fn from_property_descriptor(
     pv: PropertyValue,
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let desc = runtime.alloc_object_with_prototype(Some(runtime.intrinsics().object_prototype()));
+    let desc =
+        runtime.alloc_object_with_prototype(Some(runtime.intrinsics().object_prototype()))?;
     let attrs = pv.attributes();
 
     match pv {

@@ -85,10 +85,10 @@ fn require_plain_time(
 fn wrap_plain_time(
     pt: temporal_rs::PlainTime,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().temporal_plain_time_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime);
-    RegisterValue::from_object_handle(handle.0)
+    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime)?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Extracts a PlainTime from an argument — accepts PlainTime objects or ISO strings.
@@ -125,7 +125,7 @@ fn plain_time_constructor(
     let pt =
         temporal_rs::PlainTime::new(hour, minute, second, millisecond, microsecond, nanosecond)
             .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_time(pt, runtime))
+    wrap_plain_time(pt, runtime)
 }
 
 // ── Static methods ──────────────────────────────────────────────────
@@ -139,7 +139,7 @@ fn plain_time_from(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let pt = to_plain_time(val, runtime)?;
-    Ok(wrap_plain_time(pt, runtime))
+    wrap_plain_time(pt, runtime)
 }
 
 /// §11.2.2.2 Temporal.PlainTime.compare ( one, two )
@@ -197,7 +197,7 @@ fn pt_add(
     let dur_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let dur = to_duration(dur_val, runtime)?;
     let result = pt.add(&dur).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_time(result, runtime))
+    wrap_plain_time(result, runtime)
 }
 
 /// §11.2.3.9 Temporal.PlainTime.prototype.subtract ( duration )
@@ -211,7 +211,7 @@ fn pt_subtract(
     let dur_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let dur = to_duration(dur_val, runtime)?;
     let result = pt.subtract(&dur).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_time(result, runtime))
+    wrap_plain_time(result, runtime)
 }
 
 /// §11.2.3.14 Temporal.PlainTime.prototype.equals ( other )
@@ -238,7 +238,7 @@ fn pt_to_string(
     let text = pt
         .to_ixdtf_string(temporal_rs::options::ToStringRoundingOptions::default())
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

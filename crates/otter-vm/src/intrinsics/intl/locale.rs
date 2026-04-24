@@ -169,7 +169,7 @@ fn locale_constructor(
     };
 
     let prototype = runtime.intrinsics().intl_locale_prototype();
-    let handle = payload::construct_intl(IntlPayload::Locale(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::Locale(data), prototype, runtime)?;
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -185,7 +185,7 @@ fn locale_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_locale_data(this, runtime)?;
     let locale_str = data.locale.clone();
-    let handle = runtime.alloc_string(locale_str);
+    let handle = runtime.alloc_string(locale_str)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -221,7 +221,7 @@ fn locale_maximize(
     };
 
     let prototype = runtime.intrinsics().intl_locale_prototype();
-    let handle = payload::construct_intl(IntlPayload::Locale(new_data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::Locale(new_data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -256,7 +256,7 @@ fn locale_minimize(
     };
 
     let prototype = runtime.intrinsics().intl_locale_prototype();
-    let handle = payload::construct_intl(IntlPayload::Locale(new_data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::Locale(new_data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -273,7 +273,7 @@ fn locale_language_getter(
     let tag = &data.locale;
     // Language is the first subtag before any '-'.
     let language = tag.split('-').next().unwrap_or(tag).to_string();
-    let handle = runtime.alloc_string(language);
+    let handle = runtime.alloc_string(language)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -286,7 +286,7 @@ fn locale_script_getter(
     let script = extract_subtag_script(&data.locale).map(str::to_string);
     match script {
         Some(s) => {
-            let handle = runtime.alloc_string(s);
+            let handle = runtime.alloc_string(s)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => Ok(RegisterValue::undefined()),
@@ -302,7 +302,7 @@ fn locale_region_getter(
     let region = extract_subtag_region(&data.locale).map(str::to_string);
     match region {
         Some(r) => {
-            let handle = runtime.alloc_string(r);
+            let handle = runtime.alloc_string(r)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => Ok(RegisterValue::undefined()),
@@ -316,7 +316,7 @@ fn locale_base_name_getter(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_locale_data(this, runtime)?;
     let base = extract_base_name(&data.locale).to_string();
-    let handle = runtime.alloc_string(base);
+    let handle = runtime.alloc_string(base)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -329,7 +329,7 @@ fn locale_calendar_getter(
     let calendar = data.calendar.clone();
     match calendar {
         Some(c) => {
-            let handle = runtime.alloc_string(c);
+            let handle = runtime.alloc_string(c)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => Ok(RegisterValue::undefined()),
@@ -345,7 +345,7 @@ fn locale_collation_getter(
     let collation = data.collation.clone();
     match collation {
         Some(c) => {
-            let handle = runtime.alloc_string(c);
+            let handle = runtime.alloc_string(c)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => Ok(RegisterValue::undefined()),
@@ -361,7 +361,7 @@ fn locale_numbering_system_getter(
     let ns = data.numbering_system.clone();
     match ns {
         Some(ns) => {
-            let handle = runtime.alloc_string(ns);
+            let handle = runtime.alloc_string(ns)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => Ok(RegisterValue::undefined()),
@@ -381,7 +381,7 @@ fn locale_hour_cycle_getter(
     let hc = data.hour_cycle.clone();
     match hc {
         Some(h) => {
-            let handle = runtime.alloc_string(h);
+            let handle = runtime.alloc_string(h)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => Ok(RegisterValue::undefined()),
@@ -397,7 +397,7 @@ fn locale_case_first_getter(
     let cf = data.case_first.clone();
     match cf {
         Some(c) => {
-            let handle = runtime.alloc_string(c);
+            let handle = runtime.alloc_string(c)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => Ok(RegisterValue::undefined()),
@@ -526,9 +526,9 @@ fn locale_get_text_info(
         "ltr"
     };
 
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     let prop = runtime.intern_property_name("direction");
-    let s = runtime.alloc_string(direction);
+    let s = runtime.alloc_string(direction)?;
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
@@ -551,7 +551,7 @@ fn locale_get_week_info(
 
     let (first_day, weekend, minimal_days) = locale_utils::week_info_for_region(&region);
 
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
 
     // firstDay: 1=Monday … 7=Sunday
     let prop_first = runtime.intern_property_name("firstDay");
@@ -560,7 +560,7 @@ fn locale_get_week_info(
         .set_property(obj, prop_first, RegisterValue::from_i32(first_day));
 
     // weekend: array of day numbers
-    let weekend_arr = runtime.alloc_array();
+    let weekend_arr = runtime.alloc_array()?;
     for &day in &weekend {
         runtime
             .objects_mut()
@@ -590,9 +590,9 @@ fn alloc_string_array(
     runtime: &mut crate::interpreter::RuntimeState,
     items: &[&str],
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for &item in items {
-        let s = runtime.alloc_string(item);
+        let s = runtime.alloc_string(item)?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -606,9 +606,9 @@ fn alloc_owned_string_array(
     runtime: &mut crate::interpreter::RuntimeState,
     items: &[String],
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for item in items {
-        let s = runtime.alloc_string(item.as_str());
+        let s = runtime.alloc_string(item.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))

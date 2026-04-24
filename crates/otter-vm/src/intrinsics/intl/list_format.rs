@@ -93,7 +93,7 @@ fn list_format_constructor(
     };
 
     let prototype = runtime.intrinsics().intl_list_format_prototype();
-    let handle = payload::construct_intl(IntlPayload::ListFormat(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::ListFormat(data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -115,7 +115,7 @@ fn list_format_format(
     let strings = extract_string_list(list_arg, runtime)?;
     let formatted = perform_list_format(&strings, &data);
 
-    let handle = runtime.alloc_string(formatted);
+    let handle = runtime.alloc_string(formatted)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -140,9 +140,9 @@ fn list_format_format_to_parts(
     // Decompose into parts: identify element vs literal segments.
     let parts = decompose_list_parts(&formatted, &strings);
 
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for (part_type, value) in &parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_string_prop(runtime, obj, "type", part_type);
         set_string_prop(runtime, obj, "value", value);
         runtime
@@ -163,7 +163,7 @@ fn list_format_resolved_options(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_list_format_data(this, runtime)?.clone();
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "type", data.list_type.as_str());
     set_string_prop(runtime, obj, "style", data.style.as_str());
@@ -184,9 +184,9 @@ fn list_format_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -348,7 +348,9 @@ fn set_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));

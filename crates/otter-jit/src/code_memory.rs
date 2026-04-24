@@ -1,10 +1,12 @@
 //! Executable memory management for JIT-compiled code.
 //!
 //! Owns the machine-code buffer produced by the template baseline
-//! emitter, maps it into an executable page with `mmap` + `mprotect`,
-//! and exposes a typed function pointer via [`CompiledFunction`]. The
-//! buffer is released (via `munmap`) when the `CompiledFunction` is
-//! dropped, so compiled code never outlives its wrapper.
+//! emitter, maps it into an executable page, and exposes a typed
+//! function pointer via [`CompiledFunction`]. Unix hosts use `mmap`;
+//! macOS ARM64 uses `MAP_JIT` plus `pthread_jit_write_protect_np` for
+//! hardened-runtime W^X. The buffer is released (via `munmap`) when the
+//! `CompiledFunction` is dropped, so compiled code never outlives its
+//! wrapper.
 
 use std::ptr::NonNull;
 
@@ -44,15 +46,18 @@ impl ExecutableBuffer {
         }
 
         let map_len = round_up_to_page_size(buf.len())?;
-        // SAFETY: Allocating an anonymous private mapping with PROT_READ |
-        // PROT_WRITE. All arguments are valid; we check the return value
-        // against MAP_FAILED and convert null into an explicit error.
+        // SAFETY: Allocating an anonymous private mapping. On macOS
+        // ARM64 this includes MAP_JIT and RWX page permissions, with
+        // per-thread write protection toggled below. Other Unix hosts
+        // start writable and are flipped to read+execute after copy.
+        // All arguments are valid; we check the return value against
+        // MAP_FAILED and convert null into an explicit error.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
+                mmap_protection(),
+                mmap_flags(),
                 -1,
                 0,
             )
@@ -70,24 +75,20 @@ impl ExecutableBuffer {
 
         // SAFETY: `base` is a freshly allocated, writable page-aligned
         // buffer at least `buf.len()` bytes long, and `buf.bytes()` is a
-        // valid slice of that length. After the copy we flush I-cache
-        // (aarch64-apple requirement) before flipping the page to
-        // read+execute. If `mprotect` fails we `munmap` the page
-        // immediately to avoid leaking address space.
+        // valid slice of that length. On macOS ARM64, `JitWriteScope`
+        // disables the thread-local write-protect bit only while copying
+        // and restores executable mode on drop. After the copy we flush
+        // I-cache before finalizing the page protections. If finalization
+        // fails we `munmap` the page immediately to avoid leaking address
+        // space.
         unsafe {
+            let _write_scope = JitWriteScope::enter();
             std::ptr::copy_nonoverlapping(buf.bytes().as_ptr(), base.as_ptr(), buf.len());
             flush_instruction_cache(base.as_ptr(), buf.len());
-            if libc::mprotect(
-                base.as_ptr().cast(),
-                map_len,
-                libc::PROT_READ | libc::PROT_EXEC,
-            ) != 0
-            {
+            if let Err(op) = finalize_executable(base.as_ptr(), map_len) {
                 let err = std::io::Error::last_os_error();
                 libc::munmap(base.as_ptr().cast(), map_len);
-                return Err(JitError::Internal(format!(
-                    "mprotect executable buffer failed: {err}"
-                )));
+                return Err(JitError::Internal(format!("{op} failed: {err}")));
             }
         }
 
@@ -103,6 +104,91 @@ impl ExecutableBuffer {
 
     fn entry(&self) -> *const u8 {
         self.base.as_ptr().cast_const()
+    }
+}
+
+#[cfg(unix)]
+fn mmap_flags() -> libc::c_int {
+    libc::MAP_PRIVATE | libc::MAP_ANON | platform_jit_map_flag()
+}
+
+#[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
+fn platform_jit_map_flag() -> libc::c_int {
+    libc::MAP_JIT
+}
+
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
+fn platform_jit_map_flag() -> libc::c_int {
+    0
+}
+
+#[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
+fn mmap_protection() -> libc::c_int {
+    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC
+}
+
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
+fn mmap_protection() -> libc::c_int {
+    libc::PROT_READ | libc::PROT_WRITE
+}
+
+#[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
+unsafe fn finalize_executable(_base: *mut u8, _map_len: usize) -> Result<(), &'static str> {
+    Ok(())
+}
+
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
+unsafe fn finalize_executable(base: *mut u8, map_len: usize) -> Result<(), &'static str> {
+    // SAFETY: `base..base+map_len` is the mapping created above and is
+    // still uniquely owned here. We remove write permission before the
+    // function pointer becomes observable.
+    let rc = unsafe { libc::mprotect(base.cast(), map_len, libc::PROT_READ | libc::PROT_EXEC) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err("mprotect executable buffer")
+    }
+}
+
+#[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
+struct JitWriteScope;
+
+#[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
+impl JitWriteScope {
+    unsafe fn enter() -> Self {
+        unsafe extern "C" {
+            fn pthread_jit_write_protect_np(enabled: libc::c_int);
+        }
+
+        // SAFETY: Darwin's MAP_JIT contract requires temporarily
+        // disabling this thread's JIT write-protect bit before writing to
+        // a JIT mapping. The guard restores executable mode in Drop.
+        unsafe { pthread_jit_write_protect_np(0) };
+        Self
+    }
+}
+
+#[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
+impl Drop for JitWriteScope {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn pthread_jit_write_protect_np(enabled: libc::c_int);
+        }
+
+        // SAFETY: Re-enables Darwin's per-thread write-protect bit after
+        // the code bytes have been copied and the instruction cache has
+        // been invalidated.
+        unsafe { pthread_jit_write_protect_np(1) };
+    }
+}
+
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
+struct JitWriteScope;
+
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
+impl JitWriteScope {
+    unsafe fn enter() -> Self {
+        Self
     }
 }
 
@@ -224,4 +310,53 @@ pub fn compile_code_buffer(
         osr_entries: Vec::new(),
         _owner: executable,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_byte_buffer() -> CodeBuffer {
+        let mut code = CodeBuffer::new();
+        code.emit(&[0x90]);
+        code
+    }
+
+    #[test]
+    fn s4_empty_code_buffer_is_rejected() {
+        let code = CodeBuffer::new();
+        let err = match compile_code_buffer(&code, CompiledCodeOrigin::TemplateBaseline) {
+            Ok(_) => panic!("empty code buffer must not be mapped"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("empty code buffer"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn s4_non_empty_code_buffer_installs_executable_mapping() {
+        let code = one_byte_buffer();
+        let compiled = compile_code_buffer(&code, CompiledCodeOrigin::TemplateBaseline)
+            .expect("install non-empty code buffer");
+
+        assert_eq!(compiled.size(), 1);
+        assert_eq!(compiled.origin, CompiledCodeOrigin::TemplateBaseline);
+        assert!(!compiled.entry.is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn s4_platform_mapping_flags_match_jit_policy() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            assert_ne!(mmap_flags() & libc::MAP_JIT, 0);
+            assert_ne!(mmap_protection() & libc::PROT_EXEC, 0);
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            assert_eq!(platform_jit_map_flag(), 0);
+            assert_eq!(mmap_protection() & libc::PROT_EXEC, 0);
+        }
+    }
 }

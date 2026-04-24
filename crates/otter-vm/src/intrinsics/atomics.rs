@@ -38,7 +38,7 @@ impl IntrinsicInstaller for AtomicsIntrinsic {
 
         // §25.4 Atomics[@@toStringTag] = "Atomics"
         let tag_prop = cx.property_names.intern("@@toStringTag");
-        let tag_handle = cx.heap.alloc_string("Atomics");
+        let tag_handle = cx.heap.alloc_string("Atomics")?;
         cx.heap.set_property(
             atomics,
             tag_prop,
@@ -440,16 +440,16 @@ fn atomic_value_to_register(
     value: AtomicValue,
     _kind: TypedArrayKind,
     runtime: &mut RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     match value {
-        AtomicValue::F64(n) => RegisterValue::from_number(n),
+        AtomicValue::F64(n) => Ok(RegisterValue::from_number(n)),
         AtomicValue::I64(n) => {
-            let handle = runtime.alloc_bigint(&n.to_string());
-            RegisterValue::from_bigint_handle(handle.0)
+            let handle = runtime.alloc_bigint(&n.to_string())?;
+            Ok(RegisterValue::from_bigint_handle(handle.0))
         }
         AtomicValue::U64(n) => {
-            let handle = runtime.alloc_bigint(&n.to_string());
-            RegisterValue::from_bigint_handle(handle.0)
+            let handle = runtime.alloc_bigint(&n.to_string())?;
+            Ok(RegisterValue::from_bigint_handle(handle.0))
         }
     }
 }
@@ -480,7 +480,7 @@ fn atomic_rmw(
     // 7. Write new value.
     write_atomic(buffer, byte_idx, kind, result, runtime)?;
     // 8. Return old value.
-    Ok(atomic_value_to_register(old_val, kind, runtime))
+    atomic_value_to_register(old_val, kind, runtime)
 }
 
 // ─── RMW operation implementations ──────────────────────────────────────────
@@ -596,7 +596,7 @@ fn atomics_compare_exchange(
         write_atomic(buffer, byte_idx, kind, replacement, runtime)?;
     }
 
-    Ok(atomic_value_to_register(old_val, kind, runtime))
+    atomic_value_to_register(old_val, kind, runtime)
 }
 
 /// Compare two f64 values as if they were stored in the typed array's element type.
@@ -660,7 +660,7 @@ fn atomics_load(
     let byte_idx = validate_atomic_access(args, 1, ta, runtime)?;
     let buffer = get_buffer(ta, runtime)?;
     let value = read_atomic(buffer, byte_idx, kind, runtime)?;
-    Ok(atomic_value_to_register(value, kind, runtime))
+    atomic_value_to_register(value, kind, runtime)
 }
 
 // ─── §25.4.8 Atomics.notify ( typedArray, index, count ) ────────────────────
@@ -719,7 +719,7 @@ fn atomics_store(
     write_atomic(buffer, byte_idx, kind, value, runtime)?;
 
     // §25.4.11 step 8: Return v (the coerced value, not the value read).
-    Ok(atomic_value_to_register(value, kind, runtime))
+    atomic_value_to_register(value, kind, runtime)
 }
 
 // ─── §25.4.12 Atomics.sub ( typedArray, index, value ) ──────────────────────
@@ -787,14 +787,14 @@ fn atomics_wait(
 
     if !equal {
         // §25.4.13 step 14: If they are not equal, return "not-equal".
-        let s = runtime.alloc_string("not-equal");
+        let s = runtime.alloc_string("not-equal")?;
         return Ok(RegisterValue::from_object_handle(s.0));
     }
 
     // Single-threaded: we can never be woken by another thread.
     // If timeout ≤ 0, return "timed-out" immediately.
     // If timeout > 0, we would deadlock — so also return "timed-out".
-    let s = runtime.alloc_string("timed-out");
+    let s = runtime.alloc_string("timed-out")?;
     Ok(RegisterValue::from_object_handle(s.0))
 }
 

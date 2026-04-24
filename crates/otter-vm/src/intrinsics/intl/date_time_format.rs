@@ -97,7 +97,7 @@ fn date_time_format_constructor(
     let data = resolve_date_time_format_options(&locale, options_arg, runtime)?;
 
     let prototype = runtime.intrinsics().intl_date_time_format_prototype();
-    let handle = payload::construct_intl(IntlPayload::DateTimeFormat(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::DateTimeFormat(data), prototype, runtime)?;
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -132,7 +132,7 @@ fn date_time_format_format_getter(
     let fn_id = runtime.register_native_function(desc);
     let fn_proto = runtime.intrinsics().function_prototype();
     let realm = runtime.current_realm_id();
-    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id, realm);
+    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id, realm)?;
     let _ = runtime
         .objects_mut()
         .set_prototype(bound_fn, Some(fn_proto));
@@ -192,7 +192,7 @@ fn bound_dtf_format(
     let timestamp_ms = resolve_date_value(date_val, runtime)?;
 
     let formatted = format_date_time(timestamp_ms, &data)?;
-    let handle = runtime.alloc_string(formatted);
+    let handle = runtime.alloc_string(formatted)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -227,9 +227,9 @@ fn date_time_format_format_to_parts(
     // We use a simplified parse of the formatted string.
     let parts = decompose_formatted_date(&formatted);
 
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for (part_type, part_value) in &parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_string_prop(runtime, obj, "type", part_type);
         set_string_prop(runtime, obj, "value", part_value);
         runtime
@@ -283,7 +283,7 @@ fn date_time_format_format_range(
         format!("{start_str} \u{2013} {end_str}")
     };
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -323,12 +323,12 @@ fn date_time_format_format_range_to_parts(
     let start_str = format_date_time(start_ms, &data)?;
     let end_str = format_date_time(end_ms, &data)?;
 
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
 
     // Start date parts (source: "startRange").
     let start_parts = decompose_date_parts(&start_str);
     for (part_type, part_value) in &start_parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_dtf_string_prop(runtime, obj, "type", part_type);
         set_dtf_string_prop(runtime, obj, "value", part_value);
         set_dtf_string_prop(runtime, obj, "source", "startRange");
@@ -341,7 +341,7 @@ fn date_time_format_format_range_to_parts(
     }
 
     // Literal range separator.
-    let sep_obj = runtime.alloc_object();
+    let sep_obj = runtime.alloc_object()?;
     set_dtf_string_prop(runtime, sep_obj, "type", "literal");
     set_dtf_string_prop(runtime, sep_obj, "value", " \u{2013} ");
     set_dtf_string_prop(runtime, sep_obj, "source", "shared");
@@ -353,7 +353,7 @@ fn date_time_format_format_range_to_parts(
     // End date parts (source: "endRange").
     let end_parts = decompose_date_parts(&end_str);
     for (part_type, part_value) in &end_parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_dtf_string_prop(runtime, obj, "type", part_type);
         set_dtf_string_prop(runtime, obj, "value", part_value);
         set_dtf_string_prop(runtime, obj, "source", "endRange");
@@ -375,7 +375,9 @@ fn set_dtf_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));
@@ -423,7 +425,7 @@ fn date_time_format_resolved_options(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_dtf_data(this, runtime)?.clone();
 
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "calendar", &data.calendar);
     set_string_prop(runtime, obj, "numberingSystem", &data.numbering_system);
@@ -487,9 +489,9 @@ fn date_time_format_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -882,7 +884,9 @@ fn set_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));

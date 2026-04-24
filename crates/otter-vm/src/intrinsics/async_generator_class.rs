@@ -201,7 +201,7 @@ fn async_generator_enqueue_and_resume(
 ) -> Result<RegisterValue, VmNativeCallError> {
     // Step 2: Let promiseCapability be ! NewPromiseCapability(%Promise%).
     let proto = runtime.intrinsics().promise_prototype();
-    let promise = runtime.objects_mut().alloc_promise_with_proto(proto);
+    let promise = runtime.objects_mut().alloc_promise_with_proto(proto)?;
 
     // Step 8: Perform AsyncGeneratorEnqueue(generator, completion, promiseCapability).
     let request = AsyncGeneratorRequest {
@@ -408,7 +408,7 @@ fn install_to_string_tag(
     let sym_tag = cx
         .property_names
         .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string(tag);
+    let tag_str = cx.heap.alloc_string(tag)?;
     cx.heap.define_own_property(
         target,
         sym_tag,

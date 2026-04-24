@@ -226,7 +226,7 @@ fn object_constructor(
             if this.as_object_handle().is_some() {
                 return Ok(*this);
             }
-            let object = runtime.alloc_object();
+            let object = runtime.alloc_object()?;
             return Ok(RegisterValue::from_object_handle(object.0));
         }
 
@@ -257,7 +257,7 @@ fn object_constructor(
         return Ok(*this);
     }
 
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object()?;
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
@@ -324,7 +324,7 @@ fn object_to_string(
             }
         }
     };
-    let string = runtime.alloc_string(format!("[object {tag}]"));
+    let string = runtime.alloc_string(format!("[object {tag}]"))?;
     Ok(RegisterValue::from_object_handle(string.0))
 }
 
@@ -391,7 +391,7 @@ fn object_create(
         }
         Some(handle)
     };
-    let object = runtime.alloc_object_with_prototype(prototype);
+    let object = runtime.alloc_object_with_prototype(prototype)?;
 
     if let Some(properties_arg) = args.get(1).copied()
         && properties_arg != RegisterValue::undefined()
@@ -763,7 +763,7 @@ fn object_get_own_property_descriptors(
             VmNativeCallError::Internal(format!("Object.getOwnPropertyDescriptors: {e:?}").into())
         })?
     };
-    let result = runtime.alloc_object();
+    let result = runtime.alloc_object()?;
 
     for key in keys {
         let descriptor = if runtime.is_proxy(target) {
@@ -989,14 +989,14 @@ fn object_keys(
             .map_err(|e| VmNativeCallError::Internal(format!("Object.keys: {e}").into()))?
     };
 
-    let array = runtime.alloc_array();
+    let array = runtime.alloc_array()?;
     for key_id in &keys {
         let name = runtime
             .property_names()
             .get(*key_id)
             .unwrap_or("")
             .to_string();
-        let str_handle = runtime.alloc_string(name);
+        let str_handle = runtime.alloc_string(name)?;
         runtime
             .objects_mut()
             .push_element(array, RegisterValue::from_object_handle(str_handle.0))
@@ -1029,7 +1029,7 @@ fn object_values(
             .map_err(|e| VmNativeCallError::Internal(format!("Object.values: {e}").into()))?
     };
 
-    let array = runtime.alloc_array();
+    let array = runtime.alloc_array()?;
     for key_id in &keys {
         let value = runtime
             .own_property_value(target, *key_id)
@@ -1063,7 +1063,7 @@ fn object_entries(
             .map_err(|e| VmNativeCallError::Internal(format!("Object.entries: {e}").into()))?
     };
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     for key_id in &keys {
         let value = runtime
             .own_property_value(target, *key_id)
@@ -1073,8 +1073,8 @@ fn object_entries(
             .get(*key_id)
             .unwrap_or("")
             .to_string();
-        let key_str = runtime.alloc_string(name);
-        let pair = runtime.alloc_array();
+        let key_str = runtime.alloc_string(name)?;
+        let pair = runtime.alloc_array()?;
         runtime
             .objects_mut()
             .push_element(pair, RegisterValue::from_object_handle(key_str.0))
@@ -1425,9 +1425,9 @@ fn object_get_own_property_names(
         .map(|k| runtime.property_names().get(*k).unwrap_or("").to_string())
         .collect();
 
-    let array = runtime.alloc_array();
+    let array = runtime.alloc_array()?;
     for name in &key_names {
-        let str_handle = runtime.alloc_string(name.as_str());
+        let str_handle = runtime.alloc_string(name.as_str())?;
         runtime
             .objects_mut()
             .push_element(array, RegisterValue::from_object_handle(str_handle.0))
@@ -1468,7 +1468,7 @@ fn object_get_own_property_symbols(
         .filter_map(|key| runtime.property_names().symbol_id(*key))
         .collect();
 
-    let array = runtime.alloc_array();
+    let array = runtime.alloc_array()?;
     for sid in &symbol_ids {
         runtime
             .objects_mut()
@@ -1559,7 +1559,7 @@ fn object_from_entries(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
 
-    let result = runtime.alloc_object();
+    let result = runtime.alloc_object()?;
 
     let Some(arr_handle) = iterable.as_object_handle().map(ObjectHandle) else {
         return Err(throw_type_error(
@@ -1629,7 +1629,7 @@ fn object_to_locale_string(
         crate::interpreter::InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
         other => VmNativeCallError::Internal(format!("{other}").into()),
     })?;
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1705,7 +1705,7 @@ fn object_group_by(
         .unwrap_or(0);
 
     // Result is a null-prototype object.
-    let result = runtime.objects_mut().alloc_object();
+    let result = runtime.objects_mut().alloc_object()?;
     // null prototype (no inherited properties)
 
     for i in 0..length {
@@ -1739,7 +1739,7 @@ fn object_group_by(
         let group = if let Some(g) = group {
             g
         } else {
-            let g = runtime.alloc_array();
+            let g = runtime.alloc_array()?;
             runtime
                 .objects_mut()
                 .set_property(result, key_prop, RegisterValue::from_object_handle(g.0))

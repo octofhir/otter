@@ -89,10 +89,10 @@ fn require_duration(
 fn wrap_duration(
     dur: temporal_rs::Duration,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().temporal_duration_prototype();
-    let handle = construct_temporal(TemporalPayload::Duration(dur), proto, runtime);
-    RegisterValue::from_object_handle(handle.0)
+    let handle = construct_temporal(TemporalPayload::Duration(dur), proto, runtime)?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Extracts a Duration from an argument — accepts Duration objects or ISO strings.
@@ -144,7 +144,7 @@ fn duration_constructor(
         nanoseconds,
     )
     .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_duration(dur, runtime))
+    wrap_duration(dur, runtime)
 }
 
 // ── Static methods ──────────────────────────────────────────────────
@@ -158,7 +158,7 @@ fn duration_from(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let dur = to_duration(val, runtime)?;
-    Ok(wrap_duration(dur, runtime))
+    wrap_duration(dur, runtime)
 }
 
 /// §7.2.2.2 Temporal.Duration.compare ( one, two )
@@ -249,7 +249,7 @@ fn dur_negated(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let dur = require_duration(this, runtime)?;
-    Ok(wrap_duration(dur.negated(), runtime))
+    wrap_duration(dur.negated(), runtime)
 }
 
 /// §7.2.3.16 Temporal.Duration.prototype.abs ( )
@@ -260,7 +260,7 @@ fn dur_abs(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let dur = require_duration(this, runtime)?;
-    Ok(wrap_duration(dur.abs(), runtime))
+    wrap_duration(dur.abs(), runtime)
 }
 
 /// §7.2.3.17 Temporal.Duration.prototype.add ( other )
@@ -274,7 +274,7 @@ fn dur_add(
     let other_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let other = to_duration(other_val, runtime)?;
     let result = dur.add(&other).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_duration(result, runtime))
+    wrap_duration(result, runtime)
 }
 
 /// §7.2.3.18 Temporal.Duration.prototype.subtract ( other )
@@ -288,7 +288,7 @@ fn dur_subtract(
     let other_val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let other = to_duration(other_val, runtime)?;
     let result = dur.subtract(&other).map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_duration(result, runtime))
+    wrap_duration(result, runtime)
 }
 
 /// §7.2.3.21 Temporal.Duration.prototype.toString ( [ options ] )
@@ -302,7 +302,7 @@ fn dur_to_string(
     let text = dur
         .as_temporal_string(temporal_rs::options::ToStringRoundingOptions::default())
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

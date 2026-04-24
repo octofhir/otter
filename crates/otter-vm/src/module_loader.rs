@@ -116,7 +116,7 @@ pub fn dynamic_import_resolve(
             )?;
         }
     }
-    let ns_value = build_namespace_object(&resolved, &registry.borrow(), runtime);
+    let ns_value = build_namespace_object(&resolved, &registry.borrow(), runtime)?;
     let handle = runtime
         .alloc_resolved_promise(ns_value)
         .map_err(|err| match err {
@@ -520,7 +520,7 @@ fn populate_import_globals(
 
     for (source_url, export_name, local_name) in bindings {
         let value = if export_name == "*" {
-            build_namespace_object(&source_url, registry, runtime)
+            build_namespace_object(&source_url, registry, runtime)?
         } else {
             registry
                 .get_export(&source_url, &export_name)
@@ -537,8 +537,8 @@ fn build_namespace_object(
     source_url: &str,
     registry: &ModuleRegistry,
     runtime: &mut RuntimeState,
-) -> RegisterValue {
-    let ns_object = runtime.alloc_object();
+) -> Result<RegisterValue, InterpreterError> {
+    let ns_object = runtime.alloc_object()?;
     if let Some(loaded) = registry.get(source_url) {
         for (name, value) in &loaded.namespace {
             let prop = runtime.intern_property_name(name);
@@ -548,7 +548,7 @@ fn build_namespace_object(
                 .ok();
         }
     }
-    RegisterValue::from_object_handle(ns_object.0)
+    Ok(RegisterValue::from_object_handle(ns_object.0))
 }
 
 /// Captures export values from the global object into the module namespace.
@@ -628,7 +628,7 @@ fn capture_exports(
                 let resolved = host
                     .resolve(specifier, url)
                     .unwrap_or_else(|_| specifier.to_string());
-                let ns_value = build_namespace_object(&resolved, registry, runtime);
+                let ns_value = build_namespace_object(&resolved, registry, runtime)?;
                 registry
                     .get_mut(url)
                     .unwrap()

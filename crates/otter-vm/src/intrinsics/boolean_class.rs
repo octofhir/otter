@@ -134,7 +134,7 @@ fn boolean_to_string(
         return Err(VmNativeCallError::Internal(BOOLEAN_TO_STRING_ERROR.into()));
     };
 
-    let string = runtime.alloc_string(if value { "true" } else { "false" });
+    let string = runtime.alloc_string(if value { "true" } else { "false" })?;
     Ok(RegisterValue::from_object_handle(string.0))
 }
 
@@ -237,7 +237,7 @@ pub(crate) fn box_boolean_object_with_prototype(
     prototype: ObjectHandle,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let wrapper = runtime.alloc_object_with_prototype(Some(prototype));
+    let wrapper = runtime.alloc_object_with_prototype(Some(prototype))?;
     set_boolean_data(wrapper, primitive, runtime)?;
     Ok(RegisterValue::from_object_handle(wrapper.0))
 }

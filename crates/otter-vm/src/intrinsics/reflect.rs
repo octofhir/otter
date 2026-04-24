@@ -504,9 +504,12 @@ fn reflect_own_keys(
         })
         .collect();
 
-    let array = runtime.alloc_array();
-    for name in &key_names {
-        let str_handle = runtime.alloc_string(name.as_str());
+    let array = runtime.alloc_array()?;
+    for (index, name) in key_names.iter().enumerate() {
+        if index.is_multiple_of(crate::interpreter::NATIVE_LOOP_POLL_INTERVAL) {
+            runtime.check_interrupt()?;
+        }
+        let str_handle = runtime.alloc_string(name.as_str())?;
         runtime
             .objects_mut()
             .push_element(array, RegisterValue::from_object_handle(str_handle.0))

@@ -27,6 +27,28 @@ impl core::fmt::Display for VmNativeCallError {
 
 impl std::error::Error for VmNativeCallError {}
 
+impl From<crate::object::ObjectError> for VmNativeCallError {
+    fn from(error: crate::object::ObjectError) -> Self {
+        match error {
+            crate::object::ObjectError::OutOfMemory => {
+                Self::Internal("out of memory: heap limit exceeded".into())
+            }
+            error => Self::Internal(format!("{error:?}").into()),
+        }
+    }
+}
+
+impl From<crate::interpreter::InterpreterError> for VmNativeCallError {
+    fn from(error: crate::interpreter::InterpreterError) -> Self {
+        match error {
+            crate::interpreter::InterpreterError::OutOfMemory => {
+                Self::Internal("out of memory: heap limit exceeded".into())
+            }
+            error => Self::Internal(format!("{error}").into()),
+        }
+    }
+}
+
 /// Runtime ABI of a native host function exposed through the new VM.
 ///
 /// New-VM descriptors are pure static metadata, so the callback shape stays a

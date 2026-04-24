@@ -41,7 +41,7 @@ fn uri_codec_result(
 ) -> Result<RegisterValue, VmNativeCallError> {
     match result {
         Ok(output) => {
-            let handle = runtime.alloc_string(output);
+            let handle = runtime.alloc_string(output)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         Err(UriCodecError::Uri(message)) => Err(uri_error(runtime, &message)),
@@ -345,15 +345,16 @@ fn leading_ones(byte: u8) -> usize {
 }
 
 fn uri_error(runtime: &mut RuntimeState, message: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().uri_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    match runtime.alloc_syntax_error(message) {
+        VmNativeCallError::Thrown(value) => {
+            let prototype = runtime.intrinsics().uri_error_prototype;
+            if let Some(handle) = value.as_object_handle().map(crate::object::ObjectHandle) {
+                let _ = runtime.objects_mut().set_prototype(handle, Some(prototype));
+            }
+            VmNativeCallError::Thrown(value)
+        }
+        error => error,
+    }
 }
 
 /// Returns the descriptors for the global eval and URI functions.

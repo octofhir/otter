@@ -18,6 +18,39 @@ pub(super) struct RegExpIntrinsic;
 
 const REGEXP_INTERRUPT_POLL_INTERVAL: usize = 4096;
 
+/// S8: per-exec hard cap on the input string's length in UTF-16 code
+/// units. The `regress` engine we embed has no step-counter / timeout
+/// hook (version 0.11.1 API reviewed 2026-04-24 — no `with_step_limit`,
+/// no `MatchAttempter` budget configurability), so the only portable
+/// ReDoS defence at this layer is to refuse inputs longer than a
+/// configurable cap. Catastrophic backtracking patterns need
+/// `input.len() × 2^pattern_depth` steps to blow up; capping the input
+/// kills the DoS vector while leaving realistic workloads untouched.
+///
+/// 1 MB of UTF-16 = 2 MB of RAM. Any input beyond this is either a
+/// server request body (which belongs in a streaming parser, not
+/// regexp) or adversarial. Raise if a legitimate workload needs more;
+/// lower for server embedders under memory pressure.
+const MAX_REGEXP_INPUT_UTF16_UNITS: usize = 1_000_000;
+
+/// S8 guard: throws a catchable `RangeError` if `input` (measured as
+/// UTF-16 code units) exceeds the input cap. Called at the head of
+/// every exec / replace / split path so long inputs are rejected
+/// before `regress` starts backtracking. The error message is
+/// deliberately specific so users whose legitimate workload trips
+/// this cap can raise it without having to guess at the cause.
+fn check_regexp_input_length(
+    input_utf16_len: usize,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<(), VmNativeCallError> {
+    if input_utf16_len > MAX_REGEXP_INPUT_UTF16_UNITS {
+        return Err(VmNativeCallError::Thrown(runtime.alloc_range_error_value(
+            "RegExp input exceeds maximum length (ReDoS protection)",
+        )));
+    }
+    Ok(())
+}
+
 #[inline]
 fn check_interrupt_poll(
     runtime: &crate::interpreter::RuntimeState,
@@ -191,7 +224,7 @@ impl IntrinsicInstaller for RegExpIntrinsic {
         let tag_symbol = cx
             .property_names
             .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-        let tag_str = cx.heap.alloc_string("RegExp");
+        let tag_str = cx.heap.alloc_string("RegExp")?;
         cx.heap.set_property(
             intrinsics.regexp_prototype,
             tag_symbol,
@@ -306,21 +339,7 @@ fn syntax_error(
     runtime: &mut crate::interpreter::RuntimeState,
     message: &str,
 ) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().syntax_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    let name = runtime.alloc_string("SyntaxError");
-    let name_prop = runtime.intern_property_name("name");
-    runtime
-        .objects_mut()
-        .set_property(handle, name_prop, RegisterValue::from_object_handle(name.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.alloc_syntax_error(message)
 }
 
 // ── Receiver helpers ──────────────────────────────────────────────────────────
@@ -424,6 +443,9 @@ fn regexp_builtin_exec(
 
     // Collect UTF-16 code units for index computations.
     let utf16: Vec<u16> = input.encode_utf16().collect();
+    // S8: reject pathological-length inputs before regress starts
+    // backtracking. See `MAX_REGEXP_INPUT_UTF16_UNITS` for rationale.
+    check_regexp_input_length(utf16.len(), runtime)?;
 
     // Determine search start position.
     let start_pos = if global || sticky {
@@ -490,12 +512,12 @@ fn regexp_builtin_exec(
     let match_end_utf16 = m.end();
 
     // Build result array.
-    let result = runtime.objects_mut().alloc_array();
+    let result = runtime.objects_mut().alloc_array()?;
 
     // [0] = full match string
     let full_match_utf16 = &utf16[match_start_utf16..match_end_utf16];
     let full_match_str = String::from_utf16_lossy(full_match_utf16);
-    let full_match_handle = runtime.alloc_string(full_match_str);
+    let full_match_handle = runtime.alloc_string(full_match_str)?;
     runtime
         .objects_mut()
         .set_index(
@@ -514,7 +536,7 @@ fn regexp_builtin_exec(
             Some(range) => {
                 let cap_utf16 = &utf16[range.start..range.end];
                 let cap_str = String::from_utf16_lossy(cap_utf16);
-                let cap_handle = runtime.alloc_string(cap_str);
+                let cap_handle = runtime.alloc_string(cap_str)?;
                 RegisterValue::from_object_handle(cap_handle.0)
             }
             None => RegisterValue::undefined(),
@@ -532,12 +554,12 @@ fn regexp_builtin_exec(
         .collect();
 
     if !named.is_empty() {
-        let groups = runtime.alloc_object();
+        let groups = runtime.alloc_object()?;
         for (name, val) in &named {
             let prop = runtime.intern_property_name(name);
             let v = match val {
                 Some(s) => {
-                    let sh = runtime.alloc_string(s.as_str());
+                    let sh = runtime.alloc_string(s.as_str())?;
                     RegisterValue::from_object_handle(sh.0)
                 }
                 None => RegisterValue::undefined(),
@@ -559,7 +581,7 @@ fn regexp_builtin_exec(
 
     // .input property
     let input_prop = runtime.intern_property_name("input");
-    let input_handle = runtime.alloc_string(input);
+    let input_handle = runtime.alloc_string(input)?;
     runtime
         .set_named_property(
             result,
@@ -579,7 +601,7 @@ fn regexp_builtin_exec(
 
     // .indices property (when 'd' flag is set)
     if has_indices {
-        let indices_arr = build_indices_array(&m, &utf16, result, cap_count, runtime);
+        let indices_arr = build_indices_array(&m, &utf16, result, cap_count, runtime)?;
         let indices_prop = runtime.intern_property_name("indices");
         runtime
             .set_named_property(
@@ -615,10 +637,10 @@ fn build_indices_array(
     _result: ObjectHandle,
     cap_count: usize,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> ObjectHandle {
-    let arr = runtime.objects_mut().alloc_array();
+) -> Result<ObjectHandle, VmNativeCallError> {
+    let arr = runtime.objects_mut().alloc_array()?;
     // [0] = full match indices
-    let pair = make_index_pair(m.start(), m.end(), utf16, runtime);
+    let pair = make_index_pair(m.start(), m.end(), utf16, runtime)?;
     runtime
         .objects_mut()
         .set_index(arr, 0, RegisterValue::from_object_handle(pair.0))
@@ -626,14 +648,14 @@ fn build_indices_array(
     for i in 0..cap_count {
         let val = match &m.captures[i] {
             Some(r) => {
-                let p = make_index_pair(r.start, r.end, utf16, runtime);
+                let p = make_index_pair(r.start, r.end, utf16, runtime)?;
                 RegisterValue::from_object_handle(p.0)
             }
             None => RegisterValue::undefined(),
         };
         runtime.objects_mut().set_index(arr, i + 1, val).ok();
     }
-    arr
+    Ok(arr)
 }
 
 fn make_index_pair(
@@ -641,8 +663,8 @@ fn make_index_pair(
     end: usize,
     _utf16: &[u16],
     runtime: &mut crate::interpreter::RuntimeState,
-) -> ObjectHandle {
-    let pair = runtime.objects_mut().alloc_array();
+) -> Result<ObjectHandle, VmNativeCallError> {
+    let pair = runtime.objects_mut().alloc_array()?;
     runtime
         .objects_mut()
         .set_index(pair, 0, RegisterValue::from_i32(start as i32))
@@ -651,7 +673,7 @@ fn make_index_pair(
         .objects_mut()
         .set_index(pair, 1, RegisterValue::from_i32(end as i32))
         .ok();
-    pair
+    Ok(pair)
 }
 
 // ── §22.2.3 RegExp constructor ────────────────────────────────────────────────
@@ -748,7 +770,7 @@ fn regexp_constructor(
     // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`.
     let prototype =
         runtime.subclass_prototype_or_default(*this, runtime.intrinsics().regexp_prototype);
-    let handle = runtime.alloc_regexp(&pattern, &canonical_flags, Some(prototype));
+    let handle = runtime.alloc_regexp(&pattern, &canonical_flags, Some(prototype))?;
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -829,7 +851,7 @@ fn regexp_to_string(
         escape_pattern(&pattern)
     };
     let result = format!("/{source}/{flags}");
-    let h = runtime.alloc_string(result);
+    let h = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -906,7 +928,7 @@ fn regexp_get_source(
     } else {
         escape_pattern(&pattern)
     };
-    let h = runtime.alloc_string(source);
+    let h = runtime.alloc_string(source)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -919,7 +941,7 @@ fn regexp_get_flags(
     let flags = regexp_flags_str(handle, runtime).to_string();
     // Reconstruct in canonical order.
     let canonical = canonical_flags_str(&flags);
-    let h = runtime.alloc_string(canonical);
+    let h = runtime.alloc_string(canonical)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -988,7 +1010,7 @@ fn regexp_symbol_match(
     } else {
         // Global: collect all matches.
         set_last_index(handle, 0.0, runtime);
-        let result_arr = runtime.objects_mut().alloc_array();
+        let result_arr = runtime.objects_mut().alloc_array()?;
         let mut idx = 0usize;
         loop {
             check_interrupt_poll(runtime, idx)?;
@@ -1057,10 +1079,10 @@ fn regexp_symbol_match_all(
     };
 
     let prototype = runtime.intrinsics().regexp_prototype;
-    let clone_handle = runtime.alloc_regexp(&pattern, &flags_with_g, Some(prototype));
+    let clone_handle = runtime.alloc_regexp(&pattern, &flags_with_g, Some(prototype))?;
 
     // Collect all matches into an array (simplified iterator).
-    let result_arr = runtime.objects_mut().alloc_array();
+    let result_arr = runtime.objects_mut().alloc_array()?;
     let mut idx = 0usize;
     loop {
         check_interrupt_poll(runtime, idx)?;
@@ -1117,6 +1139,8 @@ fn regexp_symbol_replace(
     set_last_index(handle, 0.0, runtime);
 
     let input_utf16: Vec<u16> = input.encode_utf16().collect();
+    // S8: ReDoS cap — same reasoning as the `regexp_builtin_exec` guard.
+    check_regexp_input_length(input_utf16.len(), runtime)?;
     let mut results: Vec<ObjectHandle> = Vec::new();
 
     loop {
@@ -1133,7 +1157,7 @@ fn regexp_symbol_replace(
     }
 
     if results.is_empty() {
-        let h = runtime.alloc_string(input.as_str());
+        let h = runtime.alloc_string(input.as_str())?;
         return Ok(RegisterValue::from_object_handle(h.0));
     }
 
@@ -1191,7 +1215,7 @@ fn regexp_symbol_replace(
                 }
             }
             fn_args.push(RegisterValue::from_i32(match_index as i32));
-            let input_h = runtime.alloc_string(input.as_str());
+            let input_h = runtime.alloc_string(input.as_str())?;
             fn_args.push(RegisterValue::from_object_handle(input_h.0));
             let result = runtime.call_callable(fn_handle, RegisterValue::undefined(), &fn_args)?;
             runtime
@@ -1222,7 +1246,7 @@ fn regexp_symbol_replace(
     let after_utf16 = &input_utf16[last_end_utf16..];
     output.push_str(&String::from_utf16_lossy(after_utf16));
 
-    let h = runtime.alloc_string(output);
+    let h = runtime.alloc_string(output)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -1415,7 +1439,7 @@ fn regexp_symbol_split(
         })
         .unwrap_or(u32::MAX as usize);
 
-    let result = runtime.objects_mut().alloc_array();
+    let result = runtime.objects_mut().alloc_array()?;
     if limit == 0 {
         return Ok(RegisterValue::from_object_handle(result.0));
     }
@@ -1430,9 +1454,11 @@ fn regexp_symbol_split(
     };
 
     let prototype = runtime.intrinsics().regexp_prototype;
-    let splitter = runtime.alloc_regexp(&pattern, &sticky_flags, Some(prototype));
+    let splitter = runtime.alloc_regexp(&pattern, &sticky_flags, Some(prototype))?;
 
     let input_utf16: Vec<u16> = input.encode_utf16().collect();
+    // S8: ReDoS cap for `String.prototype.split(regex)`.
+    check_regexp_input_length(input_utf16.len(), runtime)?;
     let size = input_utf16.len();
 
     if size == 0 {
@@ -1440,7 +1466,7 @@ fn regexp_symbol_split(
         set_last_index(splitter, 0.0, runtime);
         match regexp_builtin_exec(splitter, &input, runtime)? {
             None => {
-                let sh = runtime.alloc_string(input.as_str());
+                let sh = runtime.alloc_string(input.as_str())?;
                 runtime
                     .objects_mut()
                     .set_index(result, 0, RegisterValue::from_object_handle(sh.0))
@@ -1471,7 +1497,7 @@ fn regexp_symbol_split(
                     // Add segment from p to q.
                     let segment_utf16 = &input_utf16[p..q];
                     let segment = String::from_utf16_lossy(segment_utf16);
-                    let sh = runtime.alloc_string(segment);
+                    let sh = runtime.alloc_string(segment)?;
                     runtime
                         .objects_mut()
                         .set_index(result, result_len, RegisterValue::from_object_handle(sh.0))
@@ -1510,7 +1536,7 @@ fn regexp_symbol_split(
     // Add remaining string.
     let segment_utf16 = &input_utf16[p..];
     let segment = String::from_utf16_lossy(segment_utf16);
-    let sh = runtime.alloc_string(segment);
+    let sh = runtime.alloc_string(segment)?;
     runtime
         .objects_mut()
         .set_index(result, result_len, RegisterValue::from_object_handle(sh.0))

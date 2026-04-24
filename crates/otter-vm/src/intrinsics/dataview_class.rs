@@ -78,7 +78,7 @@ impl IntrinsicInstaller for DataViewIntrinsic {
         let tag_symbol = cx
             .property_names
             .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-        let tag_str = cx.heap.alloc_string("DataView");
+        let tag_str = cx.heap.alloc_string("DataView")?;
         cx.heap.define_own_property(
             intrinsics.data_view_prototype,
             tag_symbol,
@@ -185,15 +185,7 @@ fn type_error(
 }
 
 fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error(message)
 }
 
 /// §7.1.22 ToIndex
@@ -395,7 +387,7 @@ fn data_view_constructor(
     let handle = runtime
         .objects_mut()
         .alloc_data_view(buffer, offset, byte_length, prototype);
-    Ok(RegisterValue::from_object_handle(handle.0))
+    Ok(RegisterValue::from_object_handle(handle?.0))
 }
 
 // ── Accessors ────────────────────────────────────────────────────────
@@ -694,7 +686,7 @@ fn data_view_get_big_int64(
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     };
-    let handle = runtime.alloc_bigint(&val.to_string());
+    let handle = runtime.alloc_bigint(&val.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -715,7 +707,7 @@ fn data_view_get_big_uint64(
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     };
-    let handle = runtime.alloc_bigint(&val.to_string());
+    let handle = runtime.alloc_bigint(&val.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 

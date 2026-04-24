@@ -3666,10 +3666,11 @@ mod tests {
     ///
     /// The test does **not** invoke the stencil. Direct invocation from
     /// Rust test harnesses on macOS / Apple Silicon is the documented
-    /// hazard tracked by `stencil_invocation_smoke` above; the production
-    /// `TierUpHook::execute_cached` path handles the `MAP_JIT` /
-    /// `pthread_jit_write_protect_np` ceremony correctly, but that path
-    /// is exercised by integration tests, not here.
+    /// hazard tracked by `stencil_invocation_smoke` above; executable
+    /// memory installation is centralized in `code_memory.rs`, where the
+    /// macOS ARM64 path performs the `MAP_JIT` /
+    /// `pthread_jit_write_protect_np` ceremony before this test ever
+    /// observes a compiled buffer.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn m2_stencil_disassembly_sanity() {
@@ -3853,12 +3854,11 @@ mod tests {
     /// JSC-style tier-up hook only fires on inner `CallClosure` boundaries,
     /// and the v2 source compiler does not yet emit calls (lands at M9).
     /// The remaining option — direct invocation of a compiled stencil
-    /// from a Rust test harness — is the documented macOS / Apple
-    /// Silicon hazard tracked by `stencil_invocation_smoke`. The JIT
-    /// half of the benchmark therefore moves to a later milestone once
-    /// either (a) M9 + M7 give us a JS loop that calls f, or (b) the
-    /// production tier-up path can be exercised from a unit test on
-    /// macOS without UE zombies.
+    /// from a Rust test harness — bypasses the production tier-up shape
+    /// used by the CLI smoke tests. The JIT half of the benchmark
+    /// therefore moves to a later milestone once either (a) M9 + M7 give
+    /// us a JS loop that calls f, or (b) the production tier-up path can
+    /// be exercised from a unit test without UE zombies.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[ignore = "M1 microbenchmark — run manually via `--ignored m1_microbench --nocapture`"]
     #[test]

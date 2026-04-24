@@ -43,9 +43,13 @@ fn install_performance_global(state: &mut RuntimeState) {
     let _ = *EPOCH;
 
     let now_id = state.register_native_function(performance_now_descriptor());
-    let now_fn = state.alloc_host_function(now_id);
+    let Ok(now_fn) = state.alloc_host_function(now_id) else {
+        return;
+    };
 
-    let perf_obj = state.alloc_object();
+    let Ok(perf_obj) = state.alloc_object() else {
+        return;
+    };
     let now_prop = state.intern_property_name("now");
     state
         .objects_mut()

@@ -358,7 +358,7 @@ fn function_bind(
             VmNativeCallError::Internal(format!("bound function length install: {error:?}").into())
         })?;
     let name_prop = runtime.intern_property_name("name");
-    let name_handle = runtime.alloc_string(bound_name);
+    let name_handle = runtime.alloc_string(bound_name)?;
     runtime
         .objects_mut()
         .define_own_property(
@@ -403,6 +403,6 @@ fn function_to_string(
         }
     };
 
-    let string = runtime.alloc_string(text);
+    let string = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(string.0))
 }

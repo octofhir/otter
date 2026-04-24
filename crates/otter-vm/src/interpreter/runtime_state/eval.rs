@@ -61,13 +61,22 @@ impl RuntimeState {
     /// Spec: <https://tc39.es/ecma262/#sec-nativeerror-message>
     pub fn alloc_syntax_error(&mut self, message: &str) -> VmNativeCallError {
         let prototype = self.intrinsics().syntax_error_prototype;
-        let handle = self.alloc_object_with_prototype(Some(prototype));
-        let msg = self.alloc_string(message);
+        let handle = match self.alloc_object_with_prototype(Some(prototype)) {
+            Ok(handle) => handle,
+            Err(error) => return VmNativeCallError::from(error),
+        };
+        let msg = match self.alloc_string(message) {
+            Ok(handle) => handle,
+            Err(error) => return VmNativeCallError::from(error),
+        };
         let msg_prop = self.intern_property_name("message");
         self.objects
             .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
             .ok();
-        let name = self.alloc_string("SyntaxError");
+        let name = match self.alloc_string("SyntaxError") {
+            Ok(handle) => handle,
+            Err(error) => return VmNativeCallError::from(error),
+        };
         let name_prop = self.intern_property_name("name");
         self.objects
             .set_property(handle, name_prop, RegisterValue::from_object_handle(name.0))

@@ -348,7 +348,7 @@ fn install_to_string_tag(
     let sym_tag = cx
         .property_names
         .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string(tag);
+    let tag_str = cx.heap.alloc_string(tag)?;
     cx.heap.define_own_property(
         target,
         sym_tag,
@@ -371,7 +371,7 @@ pub(crate) fn create_iter_result_object(
     done: bool,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     let value_prop = runtime.intern_property_name("value");
     let done_prop = runtime.intern_property_name("done");
     runtime
@@ -485,8 +485,8 @@ fn array_iterator_next(
             create_iter_result_object(RegisterValue::from_i32(index as i32), false, runtime)
         }
         ArrayIteratorKind::Entries => {
-            let pair =
-                runtime.alloc_array_with_elements(&[RegisterValue::from_i32(index as i32), elem]);
+            let pair = runtime
+                .alloc_array_with_elements(&[RegisterValue::from_i32(index as i32), elem])?;
             create_iter_result_object(RegisterValue::from_object_handle(pair.0), false, runtime)
         }
     }
@@ -581,7 +581,7 @@ fn map_iterator_next(
                 MapIteratorKind::Keys => key,
                 MapIteratorKind::Values => value,
                 MapIteratorKind::Entries => {
-                    let pair = runtime.alloc_array_with_elements(&[key, value]);
+                    let pair = runtime.alloc_array_with_elements(&[key, value])?;
                     RegisterValue::from_object_handle(pair.0)
                 }
             };
@@ -652,7 +652,7 @@ fn set_iterator_next(
             let result_value = match kind {
                 SetIteratorKind::Values => value,
                 SetIteratorKind::Entries => {
-                    let pair = runtime.alloc_array_with_elements(&[value, value]);
+                    let pair = runtime.alloc_array_with_elements(&[value, value])?;
                     RegisterValue::from_object_handle(pair.0)
                 }
             };
@@ -819,7 +819,7 @@ fn create_wrapper_iterator(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().iterator_prototype();
-    let wrapper = runtime.alloc_object_with_prototype(Some(proto));
+    let wrapper = runtime.alloc_object_with_prototype(Some(proto))?;
 
     // Store internal state as properties.
     let src_prop = runtime.intern_property_name(SLOT_SOURCE_ITER);
@@ -853,7 +853,7 @@ fn create_wrapper_iterator(
     // Install .next() method
     let next_desc = NativeFunctionDescriptor::method("next", 0, wrapper_iterator_next);
     let next_id = runtime.register_native_function(next_desc);
-    let next_handle = runtime.alloc_host_function(next_id);
+    let next_handle = runtime.alloc_host_function(next_id)?;
     let next_prop = runtime.intern_property_name("next");
     runtime
         .objects_mut()
@@ -1121,7 +1121,7 @@ fn iterator_to_array(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = require_this_iterator(this, "Iterator.prototype.toArray")?;
-    let array = runtime.alloc_array();
+    let array = runtime.alloc_array()?;
     loop {
         runtime.check_interrupt()?;
         let (value, done) = iter_step(handle, runtime)?;

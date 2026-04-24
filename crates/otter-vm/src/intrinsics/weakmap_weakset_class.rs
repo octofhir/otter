@@ -117,7 +117,7 @@ fn install_weakmap(
     let sym_tag = cx
         .property_names
         .intern_symbol(super::WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string("WeakMap");
+    let tag_str = cx.heap.alloc_string("WeakMap")?;
     cx.heap.define_own_property(
         weakmap_proto,
         sym_tag,
@@ -139,7 +139,7 @@ fn weakmap_constructor(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype =
         runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakmap_prototype);
-    let handle = runtime.objects_mut().alloc_weakmap(Some(prototype));
+    let handle = runtime.objects_mut().alloc_weakmap(Some(prototype))?;
 
     // If iterable argument provided, add entries.
     if let Some(iterable) = args.first().copied()
@@ -318,7 +318,7 @@ fn install_weakset(
     let sym_tag = cx
         .property_names
         .intern_symbol(super::WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string("WeakSet");
+    let tag_str = cx.heap.alloc_string("WeakSet")?;
     cx.heap.define_own_property(
         weakset_proto,
         sym_tag,
@@ -340,7 +340,7 @@ fn weakset_constructor(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype =
         runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakset_prototype);
-    let handle = runtime.objects_mut().alloc_weakset(Some(prototype));
+    let handle = runtime.objects_mut().alloc_weakset(Some(prototype))?;
 
     if let Some(iterable) = args.first().copied()
         && iterable != RegisterValue::undefined()

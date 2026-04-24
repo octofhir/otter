@@ -26,14 +26,12 @@ pub(super) static TYPED_ARRAY_INTRINSIC: TypedArrayIntrinsic = TypedArrayIntrins
 
 pub(super) struct TypedArrayIntrinsic;
 
-const TYPED_ARRAY_INTERRUPT_POLL_INTERVAL: usize = 4096;
-
 #[inline]
 fn check_interrupt_poll(
     runtime: &crate::interpreter::RuntimeState,
     index: usize,
 ) -> Result<(), VmNativeCallError> {
-    if index.is_multiple_of(TYPED_ARRAY_INTERRUPT_POLL_INTERVAL) {
+    if index.is_multiple_of(crate::interpreter::NATIVE_LOOP_POLL_INTERVAL) {
         runtime.check_interrupt()?;
     }
     Ok(())
@@ -215,7 +213,7 @@ impl IntrinsicInstaller for TypedArrayIntrinsic {
 
             // constructor.name = kind.constructor_name()
             let name_prop = cx.property_names.intern("name");
-            let name_str = cx.heap.alloc_string(kind.constructor_name());
+            let name_str = cx.heap.alloc_string(kind.constructor_name())?;
             cx.heap.define_own_property(
                 new_ctor,
                 name_prop,
@@ -303,15 +301,7 @@ fn type_error(
 }
 
 fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error(message)
 }
 
 fn install_getter(
@@ -708,11 +698,11 @@ fn allocate_typed_array_from_length(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
     let handle = runtime
         .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, length, Some(proto));
+        .alloc_typed_array(kind, buffer, 0, length, Some(proto))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -799,7 +789,7 @@ fn typed_array_from_buffer(
         byte_offset,
         array_length,
         Some(proto),
-    );
+    )?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -834,11 +824,12 @@ fn typed_array_from_typed_array(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
-    let handle = runtime
-        .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, src_length, Some(proto));
+    let handle =
+        runtime
+            .objects_mut()
+            .alloc_typed_array(kind, buffer, 0, src_length, Some(proto))?;
 
     // Write elements
     for (i, val) in elements.into_iter().enumerate() {
@@ -874,11 +865,11 @@ fn typed_array_from_array_like(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
     let handle = runtime
         .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, length, Some(proto));
+        .alloc_typed_array(kind, buffer, 0, length, Some(proto))?;
 
     // Copy elements via get_index
     for i in 0..length {
@@ -977,7 +968,7 @@ fn typed_array_get_to_string_tag(
         .objects()
         .typed_array_kind(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let name = runtime.alloc_string(kind.constructor_name());
+    let name = runtime.alloc_string(kind.constructor_name())?;
     Ok(RegisterValue::from_object_handle(name.0))
 }
 
@@ -1023,7 +1014,7 @@ fn typed_array_to_plain_array(
         .objects()
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for i in 0..len {
         check_interrupt_poll(runtime, i)?;
         let val = runtime
@@ -1164,7 +1155,7 @@ fn typed_array_entries(
     let arr = typed_array_to_plain_array(handle, runtime)?;
     let iter = runtime
         .objects_mut()
-        .alloc_array_iterator(arr, crate::object::ArrayIteratorKind::Entries);
+        .alloc_array_iterator(arr, crate::object::ArrayIteratorKind::Entries)?;
     let proto = runtime.intrinsics().array_iterator_prototype();
     runtime
         .objects_mut()
@@ -1194,6 +1185,7 @@ fn typed_array_every(
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1316,11 +1308,12 @@ fn typed_array_filter(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
-    let result = runtime
-        .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, kept.len(), Some(proto));
+    let result =
+        runtime
+            .objects_mut()
+            .alloc_typed_array(kind, buffer, 0, kept.len(), Some(proto))?;
     for (i, val) in kept.into_iter().enumerate() {
         runtime
             .objects_mut()
@@ -1351,6 +1344,7 @@ fn typed_array_find(
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1394,6 +1388,7 @@ fn typed_array_find_index(
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1437,6 +1432,7 @@ fn typed_array_find_last(
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for i in (0..len).rev() {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1480,6 +1476,7 @@ fn typed_array_find_last_index(
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for i in (0..len).rev() {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1523,6 +1520,7 @@ fn typed_array_for_each(
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1620,6 +1618,7 @@ fn typed_array_index_of(
         (len + from).max(0)
     } as usize;
     for i in k..len as usize {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1667,7 +1666,7 @@ fn typed_array_join(
             .unwrap_or(0.0);
         result.push_str(&format_number(val));
     }
-    let s = runtime.alloc_string(result);
+    let s = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(s.0))
 }
 
@@ -1682,7 +1681,7 @@ fn typed_array_keys(
     let arr = typed_array_to_plain_array(handle, runtime)?;
     let iter = runtime
         .objects_mut()
-        .alloc_array_iterator(arr, crate::object::ArrayIteratorKind::Keys);
+        .alloc_array_iterator(arr, crate::object::ArrayIteratorKind::Keys)?;
     let proto = runtime.intrinsics().array_iterator_prototype();
     runtime
         .objects_mut()
@@ -1723,6 +1722,7 @@ fn typed_array_last_index_of(
         len + from
     } as i64;
     for i in (0..=k).rev() {
+        check_interrupt_poll(runtime, i as usize)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i as usize)
@@ -1765,13 +1765,14 @@ fn typed_array_map(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
     let result = runtime
         .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, len, Some(proto));
+        .alloc_typed_array(kind, buffer, 0, len, Some(proto))?;
 
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1831,6 +1832,7 @@ fn typed_array_reduce(
         RegisterValue::from_number(val)
     };
     for i in k..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -1886,6 +1888,7 @@ fn typed_array_reduce_right(
         RegisterValue::from_number(val)
     };
     for i in (0..k).rev() {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -2068,11 +2071,11 @@ fn typed_array_slice(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
     let result = runtime
         .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, count, Some(proto));
+        .alloc_typed_array(kind, buffer, 0, count, Some(proto))?;
 
     for i in 0..count {
         check_interrupt_poll(runtime, i)?;
@@ -2110,6 +2113,7 @@ fn typed_array_some(
         .typed_array_length(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     for i in 0..len {
+        check_interrupt_poll(runtime, i)?;
         let val = runtime
             .objects()
             .typed_array_get_element(handle, i)
@@ -2153,9 +2157,11 @@ fn typed_array_sort(
         // Use comparefn — we need a simple sort that calls the callback
         // Insertion sort to avoid complex error handling in Rust closures
         for i in 1..elements.len() {
+            check_interrupt_poll(runtime, i)?;
             let key = elements[i];
             let mut j = i;
             while j > 0 {
+                check_interrupt_poll(runtime, j)?;
                 let cmp_result = call_js(
                     runtime,
                     comparefn,
@@ -2249,7 +2255,7 @@ fn typed_array_subarray(
         new_byte_offset,
         new_length,
         Some(proto),
-    );
+    )?;
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
@@ -2264,7 +2270,7 @@ fn typed_array_values(
     let arr = typed_array_to_plain_array(handle, runtime)?;
     let iter = runtime
         .objects_mut()
-        .alloc_array_iterator(arr, crate::object::ArrayIteratorKind::Values);
+        .alloc_array_iterator(arr, crate::object::ArrayIteratorKind::Values)?;
     let proto = runtime.intrinsics().array_iterator_prototype();
     runtime
         .objects_mut()
@@ -2346,11 +2352,11 @@ fn typed_array_from(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
     let result = runtime
         .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, len, Some(proto));
+        .alloc_typed_array(kind, buffer, 0, len, Some(proto))?;
 
     for i in 0..len {
         check_interrupt_poll(runtime, i)?;
@@ -2399,11 +2405,11 @@ fn typed_array_of(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
     let result = runtime
         .objects_mut()
-        .alloc_typed_array(kind, buffer, 0, len, Some(proto));
+        .alloc_typed_array(kind, buffer, 0, len, Some(proto))?;
 
     for (i, arg) in args.iter().enumerate() {
         let num = to_num(runtime, *arg)?;
@@ -2516,9 +2522,11 @@ fn typed_array_to_sorted(
     } else {
         // Insertion sort with user comparefn.
         for i in 1..elements.len() {
+            check_interrupt_poll(runtime, i)?;
             let key = elements[i];
             let mut j = i;
             while j > 0 {
+                check_interrupt_poll(runtime, j)?;
                 let cmp_result = call_js(
                     runtime,
                     comparefn,
@@ -2649,12 +2657,12 @@ fn alloc_typed_array_from_elements(
     let ab_proto = Some(runtime.intrinsics().array_buffer_prototype);
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, ab_proto);
+        .alloc_array_buffer_with_data(data, ab_proto)?;
     let (_, proto) = runtime.intrinsics().typed_array_constructor_prototype(kind);
     let result =
         runtime
             .objects_mut()
-            .alloc_typed_array(kind, buffer, 0, elements.len(), Some(proto));
+            .alloc_typed_array(kind, buffer, 0, elements.len(), Some(proto))?;
     for (i, &val) in elements.iter().enumerate() {
         check_interrupt_poll(runtime, i)?;
         runtime
@@ -2679,6 +2687,7 @@ fn numeric_sort_elements(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .is_gt()
         {
+            check_interrupt_poll(runtime, j)?;
             elements[j] = elements[j - 1];
             j -= 1;
         }

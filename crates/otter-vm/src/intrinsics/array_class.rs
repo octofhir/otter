@@ -63,7 +63,7 @@ impl IntrinsicInstaller for ArrayIntrinsic {
 
         // §23.1.3.38 Array.prototype[@@unscopables]
         // Spec: <https://tc39.es/ecma262/#sec-array.prototype-%symbol.unscopables%>
-        let unscopables_obj = cx.heap.alloc_object(); // null prototype per spec
+        let unscopables_obj = cx.heap.alloc_object()?; // null prototype per spec
         let true_val = RegisterValue::from_bool(true);
         for name in [
             "at",
@@ -298,7 +298,7 @@ fn array_constructor(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let array = runtime.alloc_array();
+    let array = runtime.alloc_array()?;
     // §10.1.13 OrdinaryCreateFromConstructor — honour `newTarget.prototype`
     // so `class X extends Array {}` + `new X()` produces an instance with
     // `Object.getPrototypeOf(inst) === X.prototype`.
@@ -470,7 +470,7 @@ fn array_join(
     }
 
     let result = parts.join(&separator);
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -596,7 +596,7 @@ fn array_concat(
     }
 
     // ---- Pass 2: allocate + copy. ----
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     // Pre-size the result once — this is the single `Vec::resize` call. If
     // the heap cap is exceeded, surface the OOM as a catchable RangeError.
     if let Err(err) = runtime.objects_mut().set_array_length(result, total) {
@@ -717,7 +717,7 @@ fn array_slice(
         raw_end.min(len) as usize
     };
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     let count = end.saturating_sub(start);
     runtime.objects_mut().set_array_length(result, count).ok();
     for (offset, index) in (start..end).enumerate() {
@@ -936,19 +936,7 @@ fn array_set_length_value(
 }
 
 fn invalid_array_length_error(runtime: &mut crate::interpreter::RuntimeState) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let message = runtime.alloc_string("Invalid array length");
-    let message_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(
-            handle,
-            message_prop,
-            RegisterValue::from_object_handle(message.0),
-        )
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error("Invalid array length")
 }
 
 fn is_valid_array_length(length: f64) -> bool {
@@ -995,7 +983,7 @@ fn array_map(
     let length = array_length(receiver, runtime, "Array.prototype.map")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.map")?;
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     runtime.objects_mut().set_array_length(result, length).ok();
 
     for index in 0..length {
@@ -1027,7 +1015,7 @@ fn array_filter(
     let length = array_length(receiver, runtime, "Array.prototype.filter")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.filter")?;
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     let mut to = 0usize;
 
     for index in 0..length {
@@ -1548,7 +1536,7 @@ fn array_splice(
     let items = if args.len() > 2 { &args[2..] } else { &[] };
 
     // Build deleted elements array.
-    let deleted = runtime.alloc_array();
+    let deleted = runtime.alloc_array()?;
     for offset in 0..delete_count {
         if offset % OOM_POLL_INTERVAL == 0 {
             check_native_loop(runtime)?;
@@ -1701,7 +1689,8 @@ fn array_from(
         .unwrap_or_else(RegisterValue::undefined);
 
     let Some(source_handle) = items.as_object_handle().map(ObjectHandle) else {
-        return Ok(RegisterValue::from_object_handle(runtime.alloc_array().0));
+        let array = runtime.alloc_array()?;
+        return Ok(RegisterValue::from_object_handle(array.0));
     };
 
     if matches!(
@@ -1709,7 +1698,7 @@ fn array_from(
         Ok(HeapValueKind::Array)
     ) {
         let length = array_length(source_handle, runtime, "Array.from")?;
-        let result = runtime.alloc_array();
+        let result = runtime.alloc_array()?;
         runtime.objects_mut().set_array_length(result, length).ok();
         for index in 0..length {
             if index.is_multiple_of(OOM_POLL_INTERVAL) {
@@ -1738,7 +1727,7 @@ fn array_from(
         .unwrap_or_else(|_| RegisterValue::from_i32(0));
     let length = len_val.as_i32().unwrap_or(0).max(0) as usize;
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     runtime.objects_mut().set_array_length(result, length).ok();
     for index in 0..length {
         if index.is_multiple_of(OOM_POLL_INTERVAL) {
@@ -1768,7 +1757,7 @@ fn array_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     for (index, value) in args.iter().copied().enumerate() {
         runtime.objects_mut().set_index(result, index, value).ok();
     }
@@ -1816,7 +1805,7 @@ fn create_array_iterator(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let handle = to_object_receiver(*this, runtime, "Array iterator")?;
-    let iterator = runtime.objects_mut().alloc_array_iterator(handle, kind);
+    let iterator = runtime.objects_mut().alloc_array_iterator(handle, kind)?;
     // Set prototype to %ArrayIteratorPrototype%.
     let proto = runtime.intrinsics().array_iterator_prototype();
     runtime
@@ -2095,7 +2084,7 @@ fn array_flat(
         .unwrap_or(1)
         .max(0) as usize;
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     flatten_into_array(receiver, result, depth, runtime)?;
     Ok(RegisterValue::from_object_handle(result.0))
 }
@@ -2160,7 +2149,7 @@ fn array_flat_map(
     let length = array_length(receiver, runtime, "Array.prototype.flatMap")?;
     let (callback, this_arg) = callback_and_this_arg(args, runtime, "Array.prototype.flatMap")?;
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     for index in 0..length {
         if index.is_multiple_of(OOM_POLL_INTERVAL) {
             check_native_loop(runtime)?;
@@ -2226,7 +2215,7 @@ fn array_to_locale_string(
     }
 
     let joined = parts.join(",");
-    let handle = runtime.alloc_string(joined);
+    let handle = runtime.alloc_string(joined)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -2344,7 +2333,7 @@ fn array_to_reversed(
             .unwrap_or_else(RegisterValue::undefined);
         elements.push(val);
     }
-    let result = runtime.alloc_array_with_elements(&elements);
+    let result = runtime.alloc_array_with_elements(&elements)?;
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
@@ -2399,7 +2388,7 @@ fn array_to_sorted(
         items[j] = key;
     }
 
-    let result = runtime.alloc_array_with_elements(&items);
+    let result = runtime.alloc_array_with_elements(&items)?;
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
@@ -2472,7 +2461,7 @@ fn array_to_spliced(
         elements.push(val);
     }
 
-    let result = runtime.alloc_array_with_elements(&elements);
+    let result = runtime.alloc_array_with_elements(&elements)?;
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
@@ -2528,7 +2517,7 @@ fn array_with(
         }
     }
 
-    let result = runtime.alloc_array_with_elements(&elements);
+    let result = runtime.alloc_array_with_elements(&elements)?;
     Ok(RegisterValue::from_object_handle(result.0))
 }
 

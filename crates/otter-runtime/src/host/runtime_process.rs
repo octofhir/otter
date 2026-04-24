@@ -48,11 +48,12 @@ pub(crate) fn install_runtime_process(
     process: HostProcessConfig,
     env_store: Arc<IsolatedEnvStore>,
 ) {
-    let payload = runtime.alloc_native_object(RuntimeProcessPayload { process, env_store });
-    runtime.install_global_value(
-        HOST_PROCESS_SLOT,
-        otter_vm::value::RegisterValue::from_object_handle(payload.0),
-    );
+    if let Ok(payload) = runtime.alloc_native_object(RuntimeProcessPayload { process, env_store }) {
+        runtime.install_global_value(
+            HOST_PROCESS_SLOT,
+            otter_vm::value::RegisterValue::from_object_handle(payload.0),
+        );
+    }
 }
 
 #[must_use]

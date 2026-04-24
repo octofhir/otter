@@ -114,10 +114,10 @@ fn require_zoned_date_time(
 fn wrap_zoned_date_time(
     zdt: temporal_rs::ZonedDateTime,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().temporal_zoned_date_time_prototype();
-    let handle = construct_temporal(TemporalPayload::ZonedDateTime(zdt), proto, runtime);
-    RegisterValue::from_object_handle(handle.0)
+    let handle = construct_temporal(TemporalPayload::ZonedDateTime(zdt), proto, runtime)?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Extracts a ZonedDateTime from an argument — accepts objects or ISO strings.
@@ -156,7 +156,7 @@ fn zdt_constructor(
         .map_err(|e| temporal_err(e, runtime))?;
     let zdt = temporal_rs::ZonedDateTime::try_new_iso_with_provider(ns, tz, tz_provider())
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_zoned_date_time(zdt, runtime))
+    wrap_zoned_date_time(zdt, runtime)
 }
 
 // ── Static methods ──────────────────────────────────────────────────
@@ -170,7 +170,7 @@ fn zdt_from(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let zdt = to_zoned_date_time(val, runtime)?;
-    Ok(wrap_zoned_date_time(zdt, runtime))
+    wrap_zoned_date_time(zdt, runtime)
 }
 
 /// §6.2.2.2 Temporal.ZonedDateTime.compare ( one, two )
@@ -216,7 +216,7 @@ fn zdt_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let id = zdt.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string());
+    let handle = runtime.alloc_string(id.to_string())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -232,7 +232,7 @@ fn zdt_time_zone_id(
         .time_zone()
         .identifier_with_provider(tz_provider())
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(id);
+    let handle = runtime.alloc_string(id)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -248,7 +248,7 @@ fn zdt_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let code = zdt.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code);
+    let handle = runtime.alloc_string(code)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -280,7 +280,7 @@ fn zdt_epoch_ns(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let ns = zdt.epoch_nanoseconds().0;
-    let handle = runtime.alloc_bigint(&ns.to_string());
+    let handle = runtime.alloc_bigint(&ns.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -340,7 +340,7 @@ fn zdt_offset(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let offset = zdt.offset();
-    let handle = runtime.alloc_string(offset);
+    let handle = runtime.alloc_string(offset)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -370,7 +370,7 @@ fn zdt_add(
     let result = zdt
         .add_with_provider(&dur, None, tz_provider())
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_zoned_date_time(result, runtime))
+    wrap_zoned_date_time(result, runtime)
 }
 
 /// §6.2.3.35 Temporal.ZonedDateTime.prototype.subtract ( duration )
@@ -386,7 +386,7 @@ fn zdt_subtract(
     let result = zdt
         .subtract_with_provider(&dur, None, tz_provider())
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_zoned_date_time(result, runtime))
+    wrap_zoned_date_time(result, runtime)
 }
 
 /// §6.2.3.42 Temporal.ZonedDateTime.prototype.equals ( other )
@@ -422,7 +422,7 @@ fn zdt_to_string(
             tz_provider(),
         )
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -446,7 +446,7 @@ fn zdt_to_instant(
     let zdt = require_zoned_date_time(this, runtime)?;
     let instant = zdt.to_instant();
     let proto = runtime.intrinsics().temporal_instant_prototype();
-    let handle = construct_temporal(TemporalPayload::Instant(instant), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::Instant(instant), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -460,7 +460,7 @@ fn zdt_to_plain_date(
     let zdt = require_zoned_date_time(this, runtime)?;
     let pd = zdt.to_plain_date();
     let proto = runtime.intrinsics().temporal_plain_date_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainDate(pd), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainDate(pd), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -474,7 +474,7 @@ fn zdt_to_plain_time(
     let zdt = require_zoned_date_time(this, runtime)?;
     let pt = zdt.to_plain_time();
     let proto = runtime.intrinsics().temporal_plain_time_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -488,6 +488,6 @@ fn zdt_to_plain_date_time(
     let zdt = require_zoned_date_time(this, runtime)?;
     let pdt = zdt.to_plain_date_time();
     let proto = runtime.intrinsics().temporal_plain_date_time_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainDateTime(pdt), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainDateTime(pdt), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }

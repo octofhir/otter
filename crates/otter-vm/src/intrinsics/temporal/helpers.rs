@@ -54,19 +54,7 @@ pub fn type_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> 
 
 /// Allocates a RangeError and returns it as a throwable error.
 pub fn range_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg_str = runtime.alloc_string(msg);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(
-            handle,
-            msg_prop,
-            RegisterValue::from_object_handle(msg_str.0),
-        )
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error(msg)
 }
 
 // ── Argument extraction ─────────────────────────────────────────────

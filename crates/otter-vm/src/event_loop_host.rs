@@ -40,6 +40,22 @@ pub enum CompletedEvent {
 /// - After each callback execution, the caller (event loop driver) drains
 ///   the microtask queue.
 /// - Timer scheduling follows HTML5 §8.6: nesting level > 5 → min 4ms interval.
+///
+/// # Embedding inside an outer async runtime (S7)
+///
+/// `poll_next` blocks the calling thread. The default `TokioEventLoop`
+/// uses `std::thread::park_timeout` when constructed via
+/// [`TokioEventLoop::from_current`] — this respects the `RunInterrupt`
+/// unpark protocol, so SIGINT / timeout / `signal_shutdown` wake the
+/// wait promptly, but the thread is still blocked for up to the timer
+/// deadline.
+///
+/// If you embed OtterJS in an outer async runtime (Axum, Tower, tonic),
+/// **wrap each `run_*` call in `tokio::task::spawn_blocking`** so the
+/// block happens on a blocking-pool worker, not a reactor worker.
+/// Failing to do so will deadlock a `current_thread` runtime and will
+/// starve one worker of a `multi_thread` runtime during every timer
+/// wait. A fully async `poll_next_async` variant is tracked as S7-b.
 pub trait EventLoopHost {
     /// Schedules a one-shot timer. Returns a timer ID for cancellation.
     fn set_timeout(

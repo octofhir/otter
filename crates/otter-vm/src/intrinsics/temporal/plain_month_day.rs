@@ -76,10 +76,10 @@ fn require_plain_month_day(
 fn wrap_plain_month_day(
     pmd: temporal_rs::PlainMonthDay,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().temporal_plain_month_day_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainMonthDay(pmd), proto, runtime);
-    RegisterValue::from_object_handle(handle.0)
+    let handle = construct_temporal(TemporalPayload::PlainMonthDay(pmd), proto, runtime)?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Extracts a PlainMonthDay from an argument — accepts objects or ISO strings.
@@ -122,7 +122,7 @@ fn pmd_constructor(
         Some(ref_year),
     )
     .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_month_day(pmd, runtime))
+    wrap_plain_month_day(pmd, runtime)
 }
 
 // ── Static methods ──────────────────────────────────────────────────
@@ -136,7 +136,7 @@ fn pmd_from(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let pmd = to_plain_month_day(val, runtime)?;
-    Ok(wrap_plain_month_day(pmd, runtime))
+    wrap_plain_month_day(pmd, runtime)
 }
 
 // ── Getters ─────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ fn pmd_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pmd = require_plain_month_day(this, runtime)?;
     let id = pmd.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string());
+    let handle = runtime.alloc_string(id.to_string())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -163,7 +163,7 @@ fn pmd_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pmd = require_plain_month_day(this, runtime)?;
     let code = pmd.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code);
+    let handle = runtime.alloc_string(code)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -206,7 +206,7 @@ fn pmd_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pmd = require_plain_month_day(this, runtime)?;
     let text = pmd.to_ixdtf_string(temporal_rs::options::DisplayCalendar::Auto);
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

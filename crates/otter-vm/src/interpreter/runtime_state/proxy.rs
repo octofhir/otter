@@ -97,7 +97,7 @@ impl RuntimeState {
             .get(property)
             .ok_or_else(|| InterpreterError::NativeCall("property name not found".into()))?
             .to_string();
-        let handle = self.alloc_string(name);
+        let handle = self.alloc_string(name)?;
         Ok(RegisterValue::from_object_handle(handle.0))
     }
 
@@ -113,6 +113,7 @@ impl RuntimeState {
         property: PropertyNameId,
         receiver: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "get")?;
         match trap {
@@ -154,6 +155,7 @@ impl RuntimeState {
         value: RegisterValue,
         receiver: RegisterValue,
     ) -> Result<bool, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "set")?;
         match trap {
@@ -187,6 +189,7 @@ impl RuntimeState {
         proxy: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<bool, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "deleteProperty")?;
         match trap {
@@ -220,6 +223,7 @@ impl RuntimeState {
         proxy: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<bool, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "has")?;
         match trap {
@@ -254,13 +258,14 @@ impl RuntimeState {
         this_arg: RegisterValue,
         arguments: &[RegisterValue],
     ) -> Result<RegisterValue, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "apply")?;
         match trap {
             Some(trap_fn) => {
                 let target_val = RegisterValue::from_object_handle(target.0);
                 let handler_val = RegisterValue::from_object_handle(handler.0);
-                let args_array = self.alloc_array_with_elements(arguments);
+                let args_array = self.alloc_array_with_elements(arguments)?;
                 let args_val = RegisterValue::from_object_handle(args_array.0);
                 self.call_callable_for_accessor(
                     Some(trap_fn),
@@ -283,6 +288,7 @@ impl RuntimeState {
         arguments: &[RegisterValue],
         new_target: ObjectHandle,
     ) -> Result<RegisterValue, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "construct")?;
         match trap {
@@ -290,7 +296,7 @@ impl RuntimeState {
                 let target_val = RegisterValue::from_object_handle(target.0);
                 let handler_val = RegisterValue::from_object_handle(handler.0);
                 let new_target_val = RegisterValue::from_object_handle(new_target.0);
-                let args_array = self.alloc_array_with_elements(arguments);
+                let args_array = self.alloc_array_with_elements(arguments)?;
                 let args_val = RegisterValue::from_object_handle(args_array.0);
                 let result = self.call_callable_for_accessor(
                     Some(trap_fn),
@@ -328,6 +334,7 @@ impl RuntimeState {
         &mut self,
         proxy: ObjectHandle,
     ) -> Result<Option<ObjectHandle>, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "getPrototypeOf")?;
         match trap {
@@ -402,6 +409,7 @@ impl RuntimeState {
         proxy: ObjectHandle,
         prototype: Option<ObjectHandle>,
     ) -> Result<bool, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "setPrototypeOf")?;
         match trap {
@@ -457,6 +465,7 @@ impl RuntimeState {
     // Spec: <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-isextensible>
     // -----------------------------------------------------------------------
     pub fn proxy_is_extensible(&mut self, proxy: ObjectHandle) -> Result<bool, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "isExtensible")?;
         match trap {
@@ -499,6 +508,7 @@ impl RuntimeState {
         &mut self,
         proxy: ObjectHandle,
     ) -> Result<bool, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "preventExtensions")?;
         match trap {
@@ -544,6 +554,7 @@ impl RuntimeState {
         proxy: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<Option<PropertyValue>, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "getOwnPropertyDescriptor")?;
         match trap {
@@ -619,6 +630,7 @@ impl RuntimeState {
         property: PropertyNameId,
         desc_value: RegisterValue,
     ) -> Result<bool, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "defineProperty")?;
         match trap {
@@ -685,6 +697,7 @@ impl RuntimeState {
         &mut self,
         proxy: ObjectHandle,
     ) -> Result<Vec<PropertyNameId>, InterpreterError> {
+        self.check_interrupt_interp()?;
         let (target, handler) = self.proxy_check_revoked(proxy)?;
         let trap = self.proxy_get_trap(handler, "ownKeys")?;
         match trap {
@@ -707,6 +720,9 @@ impl RuntimeState {
                 let length = length_val.as_number().map(|n| n as usize).unwrap_or(0);
                 let mut keys = Vec::with_capacity(length);
                 for i in 0..length {
+                    if i.is_multiple_of(super::NATIVE_LOOP_POLL_INTERVAL) {
+                        self.check_interrupt_interp()?;
+                    }
                     let index_key = self.intern_property_name(&i.to_string());
                     let elem = self
                         .own_property_value(arr_handle, index_key)

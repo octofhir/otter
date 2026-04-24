@@ -235,7 +235,7 @@ fn structured_clone_inner(
                 .flatten()
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            let cloned = runtime.alloc_string(s.as_str());
+            let cloned = runtime.alloc_string(s.as_str())?;
             Ok(RegisterValue::from_object_handle(cloned.0))
         }
 
@@ -247,7 +247,7 @@ fn structured_clone_inner(
                 .ok()
                 .flatten()
                 .unwrap_or(0);
-            let arr = runtime.alloc_array();
+            let arr = runtime.alloc_array()?;
             for i in 0..len {
                 let elem = runtime
                     .objects_mut()
@@ -278,7 +278,7 @@ fn structured_clone_inner(
                 if let Some(ms) = date_ms {
                     // Clone the Date: create new object with same prototype and date slot.
                     let proto = runtime.intrinsics().date_prototype();
-                    let clone = runtime.alloc_object_with_prototype(Some(proto));
+                    let clone = runtime.alloc_object_with_prototype(Some(proto))?;
                     runtime
                         .objects_mut()
                         .set_property(clone, date_prop, RegisterValue::from_number(ms))
@@ -293,7 +293,7 @@ fn structured_clone_inner(
                 && let PropertyValue::Data { value: v, .. } = lookup.value()
             {
                 let proto = runtime.intrinsics().boolean_prototype();
-                let clone = runtime.alloc_object_with_prototype(Some(proto));
+                let clone = runtime.alloc_object_with_prototype(Some(proto))?;
                 runtime.objects_mut().set_property(clone, bool_prop, v).ok();
                 return Ok(RegisterValue::from_object_handle(clone.0));
             }
@@ -302,7 +302,7 @@ fn structured_clone_inner(
                 && let PropertyValue::Data { value: v, .. } = lookup.value()
             {
                 let proto = runtime.intrinsics().number_prototype();
-                let clone = runtime.alloc_object_with_prototype(Some(proto));
+                let clone = runtime.alloc_object_with_prototype(Some(proto))?;
                 runtime.objects_mut().set_property(clone, num_prop, v).ok();
                 return Ok(RegisterValue::from_object_handle(clone.0));
             }
@@ -311,13 +311,13 @@ fn structured_clone_inner(
                 && let PropertyValue::Data { value: v, .. } = lookup.value()
             {
                 let proto = runtime.intrinsics().string_prototype();
-                let clone = runtime.alloc_object_with_prototype(Some(proto));
+                let clone = runtime.alloc_object_with_prototype(Some(proto))?;
                 runtime.objects_mut().set_property(clone, str_prop, v).ok();
                 return Ok(RegisterValue::from_object_handle(clone.0));
             }
 
             // Plain object — deep clone own data properties.
-            let clone = runtime.alloc_object();
+            let clone = runtime.alloc_object()?;
             clone_own_data_properties(handle, clone, runtime, depth)?;
             Ok(RegisterValue::from_object_handle(clone.0))
         }
@@ -338,7 +338,7 @@ fn structured_clone_inner(
             // §22.2.3.1 — use the runtime helper so `lastIndex` is installed
             // with the spec-mandated attributes before we overwrite its
             // value from the source RegExp.
-            let clone = runtime.alloc_regexp(&pattern, &flags, Some(proto));
+            let clone = runtime.alloc_regexp(&pattern, &flags, Some(proto))?;
             // Clone lastIndex value; attributes are already correct.
             let li_prop = runtime.intern_property_name("lastIndex");
             if let Ok(Some(lookup)) = runtime.property_lookup(handle, li_prop)
@@ -361,7 +361,7 @@ fn structured_clone_inner(
             let proto = runtime.intrinsics().array_buffer_prototype;
             let clone = runtime
                 .objects_mut()
-                .alloc_array_buffer_with_data(data, Some(proto));
+                .alloc_array_buffer_with_data(data, Some(proto))?;
             Ok(RegisterValue::from_object_handle(clone.0))
         }
 
@@ -399,10 +399,10 @@ fn structured_clone_inner(
             let ab_proto = runtime.intrinsics().array_buffer_prototype;
             let cloned_buf = runtime
                 .objects_mut()
-                .alloc_array_buffer_with_data(buf_data, Some(ab_proto));
+                .alloc_array_buffer_with_data(buf_data, Some(ab_proto))?;
             let clone = runtime
                 .objects_mut()
-                .alloc_typed_array(ta_kind, cloned_buf, offset, length, None);
+                .alloc_typed_array(ta_kind, cloned_buf, offset, length, None)?;
             Ok(RegisterValue::from_object_handle(clone.0))
         }
 
@@ -424,14 +424,14 @@ fn structured_clone_inner(
             let ab_proto = runtime.intrinsics().array_buffer_prototype;
             let cloned_buf = runtime
                 .objects_mut()
-                .alloc_array_buffer_with_data(buf_data, Some(ab_proto));
+                .alloc_array_buffer_with_data(buf_data, Some(ab_proto))?;
             let dv_proto = runtime.intrinsics().data_view_prototype;
             let clone = runtime.objects_mut().alloc_data_view(
                 cloned_buf,
                 offset,
                 Some(length),
                 Some(dv_proto),
-            );
+            )?;
             Ok(RegisterValue::from_object_handle(clone.0))
         }
 
@@ -446,7 +446,7 @@ fn structured_clone_inner(
                 .filter_map(|e| e.as_ref().map(|(k, v)| (*k, *v)))
                 .collect();
             let proto = runtime.intrinsics().map_prototype;
-            let clone = runtime.objects_mut().alloc_map(Some(proto));
+            let clone = runtime.objects_mut().alloc_map(Some(proto))?;
             for (key, val) in live_entries {
                 let cloned_key = structured_clone_inner(key, runtime, depth + 1)?;
                 let cloned_val = structured_clone_inner(val, runtime, depth + 1)?;
@@ -466,7 +466,7 @@ fn structured_clone_inner(
                 .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
             let live_entries: Vec<RegisterValue> = entries.iter().filter_map(|e| *e).collect();
             let proto = runtime.intrinsics().set_prototype;
-            let clone = runtime.objects_mut().alloc_set(Some(proto));
+            let clone = runtime.objects_mut().alloc_set(Some(proto))?;
             for val in live_entries {
                 let cloned_val = structured_clone_inner(val, runtime, depth + 1)?;
                 runtime.objects_mut().set_add(clone, cloned_val).ok();

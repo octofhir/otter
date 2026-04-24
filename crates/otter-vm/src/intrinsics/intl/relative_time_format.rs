@@ -93,7 +93,8 @@ fn rtf_constructor(
     };
 
     let prototype = runtime.intrinsics().intl_relative_time_format_prototype();
-    let handle = payload::construct_intl(IntlPayload::RelativeTimeFormat(data), prototype, runtime);
+    let handle =
+        payload::construct_intl(IntlPayload::RelativeTimeFormat(data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -127,7 +128,7 @@ fn rtf_format(
         .ok_or_else(|| range_error(runtime, &format!("Invalid unit: {unit_str}")))?;
 
     let formatted = perform_relative_time_format(value, unit, &data);
-    let handle = runtime.alloc_string(formatted);
+    let handle = runtime.alloc_string(formatted)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -164,9 +165,9 @@ fn rtf_format_to_parts(
 
     // Simple decomposition: split into integer + literal parts.
     let parts = decompose_relative_time(&formatted, value, &unit_str);
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for (part_type, part_value, part_unit) in &parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_string_prop(runtime, obj, "type", part_type);
         set_string_prop(runtime, obj, "value", part_value);
         if !part_unit.is_empty() {
@@ -190,7 +191,7 @@ fn rtf_resolved_options(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_rtf_data(this, runtime)?.clone();
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "style", data.style.as_str());
     set_string_prop(runtime, obj, "numeric", data.numeric.as_str());
@@ -212,9 +213,9 @@ fn rtf_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -435,7 +436,9 @@ fn set_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));

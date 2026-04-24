@@ -22,6 +22,9 @@ mod eval;
 mod iterators;
 mod proxy;
 
+/// Shared cooperative polling tempo for native loops over user-reachable data.
+pub const NATIVE_LOOP_POLL_INTERVAL: usize = 4096;
+
 // Aliases so child submodules (coercion.rs etc.) can import via plain `super::*`
 // instead of the unergonomic `super::super::` syntax. Children of `runtime_state`
 // can see these private items via descendant visibility rules.
@@ -132,9 +135,7 @@ impl RuntimeState {
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0xDEAD_BEEF_CAFE_BABE);
                 buf[..8].copy_from_slice(&ts.to_le_bytes());
-                buf[8..16].copy_from_slice(
-                    &ts.wrapping_mul(6364136223846793005).to_le_bytes(),
-                );
+                buf[8..16].copy_from_slice(&ts.wrapping_mul(6364136223846793005).to_le_bytes());
             }
             let a = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             let b = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -417,8 +418,12 @@ impl RuntimeState {
     /// `invalid_array_length_error` in `intrinsics::array_class`.
     pub fn alloc_range_error_value(&mut self, message: &str) -> RegisterValue {
         let prototype = self.intrinsics().range_error_prototype;
-        let handle = self.alloc_object_with_prototype(Some(prototype));
-        let message_string = self.alloc_string(message);
+        let Ok(handle) = self.alloc_object_with_prototype(Some(prototype)) else {
+            return RegisterValue::undefined();
+        };
+        let Ok(message_string) = self.alloc_string(message) else {
+            return RegisterValue::undefined();
+        };
         let message_prop = self.intern_property_name("message");
         self.objects_mut()
             .set_property(
@@ -1173,7 +1178,7 @@ impl RuntimeState {
                     let (_, advance) = js_str.code_point_at(idx).unwrap_or((utf16[idx] as u32, 1));
                     let ch_units = utf16[idx..idx + advance].to_vec();
                     let ch_str = crate::js_string::JsString::from_utf16(ch_units);
-                    let str_handle = self.objects.alloc_js_string(ch_str);
+                    let str_handle = self.objects.alloc_js_string(ch_str)?;
                     // Set prototype for the new string.
                     let proto = self.intrinsics().string_prototype();
                     self.objects.set_prototype(str_handle, Some(proto)).ok();
@@ -1269,7 +1274,11 @@ impl RuntimeState {
             return Ok(None);
         };
 
-        let character = self.alloc_js_string(crate::js_string::JsString::from_utf16(vec![unit]));
+        let character = self
+            .objects
+            .alloc_js_string(crate::js_string::JsString::from_utf16(vec![unit]))?;
+        let proto = self.intrinsics().string_prototype();
+        self.objects.set_prototype(character, Some(proto)).ok();
         Ok(Some(PropertyValue::data_with_attrs(
             RegisterValue::from_object_handle(character.0),
             PropertyAttributes::from_flags(false, true, false),

@@ -74,7 +74,7 @@ fn collator_constructor(
     let data = resolve_collator_options(&locale, options_arg, runtime)?;
 
     let prototype = runtime.intrinsics().intl_collator_prototype();
-    let handle = payload::construct_intl(IntlPayload::Collator(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::Collator(data), prototype, runtime)?;
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -112,7 +112,7 @@ fn collator_compare_getter(
     let fn_id = runtime.register_native_function(desc);
     let fn_proto = runtime.intrinsics().function_prototype();
     let realm = runtime.current_realm_id();
-    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id, realm);
+    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id, realm)?;
     let _ = runtime
         .objects_mut()
         .set_prototype(bound_fn, Some(fn_proto));
@@ -249,7 +249,7 @@ fn collator_resolved_options(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_collator_data(this, runtime)?.clone();
 
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "usage", data.usage.as_str());
     set_string_prop(runtime, obj, "sensitivity", data.sensitivity.as_str());
@@ -275,9 +275,9 @@ fn collator_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -420,7 +420,9 @@ fn set_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));

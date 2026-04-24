@@ -127,7 +127,7 @@ impl IntrinsicInstaller for MathIntrinsic {
 
         // Install @@toStringTag = "Math" (via plain property for now).
         let tag_prop = cx.property_names.intern("@@toStringTag");
-        let tag_handle = cx.heap.alloc_string("Math");
+        let tag_handle = cx.heap.alloc_string("Math")?;
         cx.heap.set_property(
             math_namespace,
             tag_prop,

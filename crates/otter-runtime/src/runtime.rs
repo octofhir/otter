@@ -143,8 +143,9 @@ impl RunInterrupt {
 // when its `Arc<RunInterrupt>` goes out of scope.
 // ---------------------------------------------------------------------------
 
-static ACTIVE_INTERRUPTS: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Weak<RunInterrupt>>>> =
-    std::sync::OnceLock::new();
+static ACTIVE_INTERRUPTS: std::sync::OnceLock<
+    std::sync::Mutex<Vec<std::sync::Weak<RunInterrupt>>>,
+> = std::sync::OnceLock::new();
 
 fn active_interrupts() -> &'static std::sync::Mutex<Vec<std::sync::Weak<RunInterrupt>>> {
     ACTIVE_INTERRUPTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -607,18 +608,20 @@ impl OtterRuntime {
                     match call_result {
                         Ok(handler_result) => {
                             // Resolve result_promise with the handler's return value.
-                            let resolve =
+                            if let Ok(resolve) =
                                 self.state.objects_mut().alloc_promise_capability_function(
                                     result_promise,
                                     otter_vm::promise::ReactionKind::Fulfill,
+                                )
+                            {
+                                let _ = Interpreter::call_function(
+                                    &mut self.state,
+                                    module,
+                                    resolve,
+                                    otter_vm::value::RegisterValue::undefined(),
+                                    &[handler_result],
                                 );
-                            let _ = Interpreter::call_function(
-                                &mut self.state,
-                                module,
-                                resolve,
-                                otter_vm::value::RegisterValue::undefined(),
-                                &[handler_result],
-                            );
+                            }
                         }
                         Err(err) => {
                             // Handler threw — reject result_promise with the error.
@@ -893,9 +896,18 @@ fn timeout_watchdog_loop(watchdog: &'static TimeoutWatchdog) {
 #[cfg(test)]
 mod s5_tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn shutdown_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("shutdown test mutex poisoned")
+    }
 
     #[test]
     fn signal_shutdown_with_no_runs_reports_zero() {
+        let _guard = shutdown_test_lock();
         // With no active runs, `signal_shutdown()` must be a no-op that
         // reports zero fired interrupts. Required so CLIs can install a
         // signal handler eagerly at startup without worrying about
@@ -906,6 +918,7 @@ mod s5_tests {
 
     #[test]
     fn register_and_unregister_roundtrip_keeps_list_clean() {
+        let _guard = shutdown_test_lock();
         // Registering then unregistering must leave the weak list free
         // of the entry we pushed (after the opportunistic purge).
         let interrupt = Arc::new(RunInterrupt::new());
@@ -934,6 +947,7 @@ mod s5_tests {
 
     #[test]
     fn signal_shutdown_fires_active_interrupt() {
+        let _guard = shutdown_test_lock();
         // Simulate a run in flight: register a RunInterrupt, call
         // `signal_shutdown()`, confirm the flag is set. Mirrors the
         // exact flow a SIGINT handler takes in the CLI.
@@ -951,6 +965,7 @@ mod s5_tests {
 
     #[test]
     fn drop_of_weak_entry_is_purged_on_next_register() {
+        let _guard = shutdown_test_lock();
         // Registering a fresh interrupt must opportunistically purge
         // dead weak entries, so long-running processes that cycle many
         // `OtterRuntime` instances do not grow the list unboundedly.

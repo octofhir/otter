@@ -369,11 +369,28 @@ impl EventLoopHost for TokioEventLoop {
         if let Some(rt) = &self.owned_runtime {
             rt.block_on(block_fn());
         } else {
-            // When using from_current(), we can't block_on.
-            // Instead, do a spin with yield to avoid blocking the runtime.
-            // In production, this path is used from `run_until_complete`
-            // which is already async.
-            std::thread::sleep(sleep_duration);
+            // S7: in `from_current()` mode we cannot call `block_on` (the
+            // outer tokio runtime is already driving this thread). The
+            // previous implementation used `std::thread::sleep`, which
+            // deadlocked a shared-thread tokio reactor (Axum, Tower,
+            // current_thread harnesses) for the full `sleep_duration`.
+            //
+            // `park_timeout` is a drop-in replacement that respects the
+            // interrupt protocol: `RunInterrupt::fire()` in
+            // `otter-runtime/src/runtime.rs` calls `vm_thread.unpark()`
+            // after setting the flag, so a SIGINT / timeout / embedder
+            // `signal_shutdown()` cuts the wait short. This is still
+            // not fully async — the calling thread remains blocked for
+            // up to `sleep_duration` — but embedders who cannot afford
+            // that MUST wrap the runtime in `tokio::task::spawn_blocking`
+            // (documented in the crate-level README), and the blocked
+            // thread is then a dedicated blocking-pool worker rather
+            // than a reactor worker.
+            //
+            // A fully async driver (`poll_next_async` on
+            // `EventLoopHost`) is tracked as **S7-b** in
+            // `PRODUCTION_READINESS_PLAN.md`.
+            std::thread::park_timeout(sleep_duration);
         }
 
         self.timers
@@ -611,5 +628,84 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(callbacks_executed, 1);
+    }
+
+    // ---- S7: park_timeout in from_current path ----------------------------
+
+    /// Regression for S7: when embedded via `from_current()` the event
+    /// loop must use `park_timeout`, not `thread::sleep`, so the VM
+    /// thread can be woken early via `unpark()` (the mechanism used by
+    /// `RunInterrupt::fire()` on SIGINT / timeout / `signal_shutdown`).
+    ///
+    /// This test spawns a worker that schedules a 2-second timer and
+    /// calls `poll_next`. From the main thread we `unpark()` the worker
+    /// after ~30 ms. The worker must observe the unpark and return from
+    /// `poll_next` with an empty event vec (timer not yet fired) well
+    /// before the 2-second deadline.
+    #[test]
+    fn s7_from_current_poll_next_is_unpark_aware() {
+        // Use current_thread runtime + `spawn_blocking`. The blocking
+        // task runs on a dedicated blocking-pool thread, which is
+        // exactly the embedding pattern the new contract requires.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current_thread runtime");
+
+        let (worker_thread_tx, worker_thread_rx) =
+            std::sync::mpsc::channel::<std::thread::Thread>();
+
+        // Unparker: a second OS thread that waits for the worker's
+        // Thread handle, then unparks it after ~30 ms. This stands in
+        // for a `signal_shutdown` / `RunInterrupt::fire()` on the main
+        // thread of a real embedder.
+        let unparker = std::thread::spawn(move || {
+            let worker = worker_thread_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker thread handle");
+            std::thread::sleep(Duration::from_millis(30));
+            worker.unpark();
+        });
+
+        let (event_count, elapsed) = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                // Publish this worker's thread handle so the unparker
+                // can wake us.
+                worker_thread_tx
+                    .send(std::thread::current())
+                    .expect("send thread handle");
+
+                // Enter a tokio context so `from_current()` succeeds.
+                let handle = tokio::runtime::Handle::current();
+                let _enter = handle.enter();
+                let mut el = TokioEventLoop::from_current();
+                el.set_timeout(
+                    ObjectHandle(42),
+                    RegisterValue::undefined(),
+                    Duration::from_secs(2),
+                );
+
+                let started = std::time::Instant::now();
+                let events = el.poll_next();
+                let elapsed = started.elapsed();
+
+                (events.len(), elapsed)
+            })
+            .await
+            .expect("spawn_blocking")
+        });
+
+        unparker.join().expect("unparker joined");
+
+        // The unpark fired well before the 2-second timer deadline, so
+        // poll_next returned early with zero fired events.
+        assert_eq!(
+            event_count, 0,
+            "timer should not have fired yet (unpark is early)"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "poll_next must return within ~30 ms of unpark, took {elapsed:?}"
+        );
     }
 }

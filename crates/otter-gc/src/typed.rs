@@ -215,6 +215,7 @@ impl TypedHeap {
     /// and raises the OOM flag when the reservation would exceed the cap.
     /// Callers must pair a successful reservation with [`release_bytes`]
     /// when the memory is freed.
+    #[must_use = "allocation reservations must handle possible heap-limit failures"]
     pub fn reserve_bytes(&mut self, bytes: usize) -> Result<(), OutOfMemory> {
         if self.would_exceed_limit(bytes) {
             self.oom_flag.store(true, Ordering::Relaxed);
@@ -230,15 +231,14 @@ impl TypedHeap {
     }
 
     /// Allocates a new object, returning its handle.
-    pub fn alloc<T: Traceable>(&mut self, value: T) -> Handle {
+    ///
+    /// Returns `Err(OutOfMemory)` and raises the shared OOM flag before
+    /// allocating when the configured hard cap would be exceeded.
+    pub fn alloc<T: Traceable>(&mut self, value: T) -> Result<Handle, OutOfMemory> {
         let size = std::mem::size_of::<T>();
-        // Shell accounting: if a hard cap is configured and we would cross
-        // it, raise the OOM flag but still return a handle so callers can
-        // decide when to fail (interpreter polls the flag at the next GC
-        // safepoint). Failing inside `alloc` would require every call site
-        // to handle the `Option<Handle>` contract, a much larger refactor.
         if self.would_exceed_limit(size) {
             self.oom_flag.store(true, Ordering::Relaxed);
+            return Err(OutOfMemory);
         }
         self.tracked_bytes = self.tracked_bytes.saturating_add(size);
 
@@ -258,7 +258,7 @@ impl TypedHeap {
             idx
         };
 
-        Handle(index)
+        Ok(Handle(index))
     }
 
     /// Reads a reference to the object behind a handle.
@@ -458,14 +458,14 @@ mod tests {
     #[test]
     fn alloc_and_read() {
         let mut heap = TypedHeap::new();
-        let h = heap.alloc(Leaf(42));
+        let h = heap.alloc(Leaf(42)).expect("alloc should fit");
         assert_eq!(heap.get::<Leaf>(h), Some(&Leaf(42)));
     }
 
     #[test]
     fn alloc_and_mutate() {
         let mut heap = TypedHeap::new();
-        let h = heap.alloc(Leaf(0));
+        let h = heap.alloc(Leaf(0)).expect("alloc should fit");
         heap.get_mut::<Leaf>(h).unwrap().0 = 99;
         assert_eq!(heap.get::<Leaf>(h), Some(&Leaf(99)));
     }
@@ -473,8 +473,8 @@ mod tests {
     #[test]
     fn collect_frees_unreachable() {
         let mut heap = TypedHeap::new();
-        let alive = heap.alloc(Leaf(1));
-        let dead = heap.alloc(Leaf(2));
+        let alive = heap.alloc(Leaf(1)).expect("alloc alive");
+        let dead = heap.alloc(Leaf(2)).expect("alloc dead");
 
         heap.collect(&[alive]);
 
@@ -486,29 +486,31 @@ mod tests {
     #[test]
     fn collect_follows_references() {
         let mut heap = TypedHeap::new();
-        let leaf = heap.alloc(Leaf(10));
-        let node = heap.alloc(Node {
-            value: 1,
-            child: Some(leaf),
-        });
-        let _orphan = heap.alloc(Leaf(99));
+        let leaf = heap.alloc(Leaf(10)).expect("alloc leaf");
+        let node = heap
+            .alloc(Node {
+                value: 1,
+                child: Some(leaf),
+            })
+            .expect("alloc node");
+        let orphan = heap.alloc(Leaf(99)).expect("alloc orphan");
 
         heap.collect(&[node]);
 
         assert!(heap.is_live(node));
         assert!(heap.is_live(leaf)); // Kept alive transitively
-        assert!(!heap.is_live(_orphan));
+        assert!(!heap.is_live(orphan));
     }
 
     #[test]
     fn handle_reuse_after_collect() {
         let mut heap = TypedHeap::new();
-        let h1 = heap.alloc(Leaf(1));
-        let _h2 = heap.alloc(Leaf(2));
+        let h1 = heap.alloc(Leaf(1)).expect("alloc h1");
+        let _h2 = heap.alloc(Leaf(2)).expect("alloc h2");
 
         heap.collect(&[h1]); // h2 freed
 
-        let h3 = heap.alloc(Leaf(3)); // Should reuse h2's slot
+        let h3 = heap.alloc(Leaf(3)).expect("alloc h3"); // Should reuse h2's slot
         assert!(heap.is_live(h3));
         assert_eq!(heap.get::<Leaf>(h3), Some(&Leaf(3)));
     }
@@ -518,14 +520,14 @@ mod tests {
         let mut heap = TypedHeap::new();
 
         for i in 0..100 {
-            let _ = heap.alloc(Leaf(i));
+            let _ = heap.alloc(Leaf(i)).expect("alloc garbage");
         }
         heap.collect(&[]);
         assert_eq!(heap.live_count(), 0);
 
-        let keep = heap.alloc(Leaf(999));
+        let keep = heap.alloc(Leaf(999)).expect("alloc keep");
         for i in 0..50 {
-            let _ = heap.alloc(Leaf(i));
+            let _ = heap.alloc(Leaf(i)).expect("alloc second-cycle garbage");
         }
         heap.collect(&[keep]);
         assert_eq!(heap.live_count(), 1);
@@ -536,19 +538,19 @@ mod tests {
     fn tracked_bytes_grows_with_alloc() {
         let mut heap = TypedHeap::new();
         assert_eq!(heap.tracked_bytes(), 0);
-        heap.alloc(Leaf(1));
+        heap.alloc(Leaf(1)).expect("alloc first");
         let first = heap.tracked_bytes();
         assert!(first >= std::mem::size_of::<Leaf>());
-        heap.alloc(Leaf(2));
+        heap.alloc(Leaf(2)).expect("alloc second");
         assert!(heap.tracked_bytes() > first);
     }
 
     #[test]
     fn tracked_bytes_shrinks_after_sweep() {
         let mut heap = TypedHeap::new();
-        let keep = heap.alloc(Leaf(1));
-        heap.alloc(Leaf(2)); // unreachable
-        heap.alloc(Leaf(3)); // unreachable
+        let keep = heap.alloc(Leaf(1)).expect("alloc keep");
+        heap.alloc(Leaf(2)).expect("alloc unreachable"); // unreachable
+        heap.alloc(Leaf(3)).expect("alloc unreachable"); // unreachable
         let before = heap.tracked_bytes();
         heap.collect(&[keep]);
         assert!(
@@ -575,19 +577,25 @@ mod tests {
     }
 
     #[test]
-    fn alloc_sets_oom_flag_when_shell_exhausts_cap() {
+    fn s3_b_alloc_returns_oom_and_sets_flag_when_shell_exhausts_cap() {
         // Cap below size_of<Leaf> so the very first alloc trips the flag.
         let tiny = std::mem::size_of::<Leaf>() / 2;
         let mut heap = TypedHeap::with_max_heap_bytes(tiny);
-        heap.alloc(Leaf(1));
+        let err = heap.alloc(Leaf(1)).unwrap_err();
+        assert_eq!(err, OutOfMemory);
         assert!(heap.oom_flag().load(Ordering::Relaxed));
+        assert_eq!(
+            heap.tracked_bytes(),
+            0,
+            "failed alloc must not grow tracked bytes"
+        );
     }
 
     #[test]
     fn unlimited_heap_does_not_set_oom_flag() {
         let mut heap = TypedHeap::new();
         for i in 0..4_096 {
-            heap.alloc(Leaf(i));
+            heap.alloc(Leaf(i)).expect("unlimited alloc should fit");
         }
         assert!(!heap.oom_flag().load(Ordering::Relaxed));
     }
@@ -606,23 +614,29 @@ mod tests {
         let mut heap = TypedHeap::new();
 
         // Build a chain: root → n1 → n2 → n3 → leaf
-        let leaf = heap.alloc(Leaf(42));
-        let n3 = heap.alloc(Node {
-            value: 3,
-            child: Some(leaf),
-        });
-        let n2 = heap.alloc(Node {
-            value: 2,
-            child: Some(n3),
-        });
-        let n1 = heap.alloc(Node {
-            value: 1,
-            child: Some(n2),
-        });
+        let leaf = heap.alloc(Leaf(42)).expect("alloc leaf");
+        let n3 = heap
+            .alloc(Node {
+                value: 3,
+                child: Some(leaf),
+            })
+            .expect("alloc n3");
+        let n2 = heap
+            .alloc(Node {
+                value: 2,
+                child: Some(n3),
+            })
+            .expect("alloc n2");
+        let n1 = heap
+            .alloc(Node {
+                value: 1,
+                child: Some(n2),
+            })
+            .expect("alloc n1");
 
         // Also some garbage.
-        let _g1 = heap.alloc(Leaf(0));
-        let _g2 = heap.alloc(Leaf(0));
+        let g1 = heap.alloc(Leaf(0)).expect("alloc g1");
+        let g2 = heap.alloc(Leaf(0)).expect("alloc g2");
 
         heap.collect(&[n1]);
 
@@ -630,8 +644,8 @@ mod tests {
         assert!(heap.is_live(n2));
         assert!(heap.is_live(n3));
         assert!(heap.is_live(leaf));
-        assert!(!heap.is_live(_g1));
-        assert!(!heap.is_live(_g2));
+        assert!(!heap.is_live(g1));
+        assert!(!heap.is_live(g2));
         assert_eq!(heap.live_count(), 4);
     }
 }

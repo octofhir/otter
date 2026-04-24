@@ -112,7 +112,7 @@ impl IntrinsicInstaller for TemporalIntrinsic {
         let tag_symbol = cx
             .property_names
             .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-        let tag_str = cx.heap.alloc_string("Temporal");
+        let tag_str = cx.heap.alloc_string("Temporal")?;
         cx.heap.define_own_property(
             intrinsics.temporal_namespace,
             tag_symbol,

@@ -390,7 +390,7 @@ fn install_to_string_tag(
     let sym_tag = cx
         .property_names
         .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string(tag);
+    let tag_str = cx.heap.alloc_string(tag)?;
     cx.heap.define_own_property(
         target,
         sym_tag,

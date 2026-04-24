@@ -600,15 +600,7 @@ fn type_error(
 }
 
 fn range_error(runtime: &mut RuntimeState, message: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error(message)
 }
 
 /// Helper: get optional f64 arg at index, applying ToNumber.
@@ -672,7 +664,7 @@ impl IntrinsicInstaller for DateIntrinsic {
         let to_string_tag = cx
             .property_names
             .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-        let tag = cx.heap.alloc_string("Date");
+        let tag = cx.heap.alloc_string("Date")?;
         cx.heap.define_own_property(
             intrinsics.date_prototype(),
             to_string_tag,
@@ -727,7 +719,7 @@ fn install_symbol_method(
     let handle = cx.alloc_intrinsic_host_function(host_id, intrinsics.function_prototype())?;
     // Set .name and .length on the function object.
     let name_prop = cx.property_names.intern("name");
-    let name_val = cx.heap.alloc_string(name);
+    let name_val = cx.heap.alloc_string(name)?;
     cx.heap.define_own_property(
         handle,
         name_prop,
@@ -979,7 +971,7 @@ fn date_constructor(
     if !runtime.is_current_native_construct_call() {
         let now = chrono::Local::now();
         let text = now.format("%a %b %d %Y %H:%M:%S GMT%z").to_string();
-        let handle = runtime.alloc_string(text);
+        let handle = runtime.alloc_string(text)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
 
@@ -1733,11 +1725,11 @@ fn date_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     };
     let local: DateTime<Local> = dt.into();
@@ -1758,7 +1750,7 @@ fn date_to_string(
         abs_offset / 3600,
         (abs_offset % 3600) / 60,
     );
-    let h = runtime.alloc_string(s);
+    let h = runtime.alloc_string(s)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -1770,11 +1762,11 @@ fn date_to_date_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     };
     let local: DateTime<Local> = dt.into();
@@ -1785,7 +1777,7 @@ fn date_to_date_string(
         local.day(),
         format_year(local.year()),
     );
-    let h = runtime.alloc_string(s);
+    let h = runtime.alloc_string(s)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -1797,11 +1789,11 @@ fn date_to_time_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     };
     let local: DateTime<Local> = dt.into();
@@ -1817,7 +1809,7 @@ fn date_to_time_string(
         abs_offset / 3600,
         (abs_offset % 3600) / 60,
     );
-    let h = runtime.alloc_string(s);
+    let h = runtime.alloc_string(s)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -1853,7 +1845,7 @@ fn date_to_iso_string(
         sec as u32,
         ms_val as u32,
     );
-    let h = runtime.alloc_string(s);
+    let h = runtime.alloc_string(s)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
@@ -1865,11 +1857,11 @@ fn date_to_utc_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date");
+        let h = runtime.alloc_string("Invalid Date")?;
         return Ok(RegisterValue::from_object_handle(h.0));
     };
     let year_str = if dt.year() < 0 {
@@ -1887,7 +1879,7 @@ fn date_to_utc_string(
         dt.minute(),
         dt.second(),
     );
-    let h = runtime.alloc_string(s);
+    let h = runtime.alloc_string(s)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 

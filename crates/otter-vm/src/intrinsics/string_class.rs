@@ -189,7 +189,7 @@ fn string_constructor(
     } else {
         coerce_to_string(args[0], runtime)?
     };
-    let primitive = runtime.alloc_string(coerced);
+    let primitive = runtime.alloc_string(coerced)?;
 
     if let Some(receiver) = this.as_object_handle().map(ObjectHandle) {
         set_string_data(receiver, primitive, runtime)?;
@@ -231,7 +231,7 @@ fn string_concat(
             .map_err(|error| map_interpreter_error(error, runtime))?;
         text.push_str(&next);
     }
-    let result = runtime.alloc_string(text);
+    let result = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(result.0))
 }
 
@@ -309,7 +309,7 @@ fn initialize_string_prototype(
     intrinsics: &VmIntrinsics,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
-    let primitive = cx.heap.alloc_string("");
+    let primitive = cx.heap.alloc_string("")?;
     cx.heap
         .set_prototype(primitive, Some(intrinsics.string_prototype()))?;
     let backing = cx.property_names.intern(STRING_DATA_SLOT);
@@ -375,7 +375,7 @@ pub(super) fn box_string_object(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let wrapper =
-        runtime.alloc_object_with_prototype(Some(runtime.intrinsics().string_prototype()));
+        runtime.alloc_object_with_prototype(Some(runtime.intrinsics().string_prototype()))?;
     set_string_data(wrapper, primitive, runtime)?;
     Ok(RegisterValue::from_object_handle(wrapper.0))
 }
@@ -429,7 +429,7 @@ fn string_at(
         return Ok(RegisterValue::undefined());
     }
     let ch = chars[actual as usize];
-    let handle = runtime.alloc_string(ch.to_string());
+    let handle = runtime.alloc_string(ch.to_string())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -443,16 +443,16 @@ fn string_char_at(
     let s = this_string_value(this, runtime)?;
     let pos = int_arg(args, 0, 0);
     if pos < 0 {
-        let handle = runtime.alloc_string("");
+        let handle = runtime.alloc_string("")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     match s.chars().nth(pos as usize) {
         Some(ch) => {
-            let handle = runtime.alloc_string(ch.to_string());
+            let handle = runtime.alloc_string(ch.to_string())?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => {
-            let handle = runtime.alloc_string("");
+            let handle = runtime.alloc_string("")?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
     }
@@ -705,11 +705,11 @@ fn string_slice(
         relative_index(int_arg(args, 1, len as i32), len)
     };
     if start >= end {
-        let handle = runtime.alloc_string("");
+        let handle = runtime.alloc_string("")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let result = String::from_utf16_lossy(&s_units[start..end]);
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -736,7 +736,7 @@ fn string_substring(
         (raw_end, raw_start)
     };
     let result = String::from_utf16_lossy(&s_units[from..to]);
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -748,7 +748,7 @@ fn string_to_upper_case(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.to_uppercase());
+    let handle = runtime.alloc_string(s.to_uppercase())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -760,7 +760,7 @@ fn string_to_lower_case(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.to_lowercase());
+    let handle = runtime.alloc_string(s.to_lowercase())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -772,7 +772,7 @@ fn string_trim(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.trim());
+    let handle = runtime.alloc_string(s.trim())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -782,7 +782,7 @@ fn string_trim_start(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.trim_start());
+    let handle = runtime.alloc_string(s.trim_start())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -792,7 +792,7 @@ fn string_trim_end(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.trim_end());
+    let handle = runtime.alloc_string(s.trim_end())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -824,20 +824,12 @@ fn string_repeat(
         check_interrupt_poll(runtime, i)?;
         result.push_str(&s);
     }
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
-    let prototype = runtime.intrinsics().range_error_prototype;
-    let handle = runtime.alloc_object_with_prototype(Some(prototype));
-    let msg = runtime.alloc_string(message);
-    let msg_prop = runtime.intern_property_name("message");
-    runtime
-        .objects_mut()
-        .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-        .ok();
-    VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
+    runtime.throw_range_error(message)
 }
 
 // ── §22.1.3.14 String.prototype.padStart(maxLength [, fillString]) ─────────
@@ -857,7 +849,7 @@ fn string_pad_start(
     }
     let s_units: Vec<u16> = s.encode_utf16().collect();
     if s_units.len() >= max_len {
-        let handle = runtime.alloc_string(&*s);
+        let handle = runtime.alloc_string(&*s)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let fill = args
@@ -873,7 +865,7 @@ fn string_pad_start(
         .unwrap_or_else(|| " ".into());
     let fill_units: Vec<u16> = fill.encode_utf16().collect();
     if fill_units.is_empty() {
-        let handle = runtime.alloc_string(&*s);
+        let handle = runtime.alloc_string(&*s)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let pad_needed = max_len - s_units.len();
@@ -884,7 +876,7 @@ fn string_pad_start(
     }
     padded.extend_from_slice(&s_units);
     let result = String::from_utf16_lossy(&padded);
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -905,7 +897,7 @@ fn string_pad_end(
     }
     let s_units: Vec<u16> = s.encode_utf16().collect();
     if s_units.len() >= max_len {
-        let handle = runtime.alloc_string(&*s);
+        let handle = runtime.alloc_string(&*s)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let fill = args
@@ -921,7 +913,7 @@ fn string_pad_end(
         .unwrap_or_else(|| " ".into());
     let fill_units: Vec<u16> = fill.encode_utf16().collect();
     if fill_units.is_empty() {
-        let handle = runtime.alloc_string(&*s);
+        let handle = runtime.alloc_string(&*s)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let pad_needed = max_len - s_units.len();
@@ -932,7 +924,7 @@ fn string_pad_end(
         padded.push(fill_units[i % fill_units.len()]);
     }
     let result = String::from_utf16_lossy(&padded);
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -989,7 +981,7 @@ fn string_match(
         .js_to_string(regexp_arg)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     let prototype = runtime.intrinsics().regexp_prototype;
-    let re = runtime.alloc_regexp(&search_str, "", Some(prototype));
+    let re = runtime.alloc_regexp(&search_str, "", Some(prototype))?;
     let re_val = RegisterValue::from_object_handle(re.0);
     if let Some(result) = try_symbol_dispatch(WellKnownSymbol::Match, re_val, this, &[], runtime)? {
         return Ok(result);
@@ -1043,7 +1035,7 @@ fn string_match_all(
             .to_string()
     };
     let prototype = runtime.intrinsics().regexp_prototype;
-    let re = runtime.alloc_regexp(&pattern, "g", Some(prototype));
+    let re = runtime.alloc_regexp(&pattern, "g", Some(prototype))?;
     let re_val = RegisterValue::from_object_handle(re.0);
     if let Some(result) =
         try_symbol_dispatch(WellKnownSymbol::MatchAll, re_val, this, &[], runtime)?
@@ -1077,7 +1069,7 @@ fn string_search(
         .js_to_string(regexp_arg)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     let prototype = runtime.intrinsics().regexp_prototype;
-    let re = runtime.alloc_regexp(&search_str, "", Some(prototype));
+    let re = runtime.alloc_regexp(&search_str, "", Some(prototype))?;
     let re_val = RegisterValue::from_object_handle(re.0);
     if let Some(result) = try_symbol_dispatch(WellKnownSymbol::Search, re_val, this, &[], runtime)?
     {
@@ -1132,8 +1124,8 @@ fn string_split(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     if separator == RegisterValue::undefined() {
-        let result = runtime.alloc_array();
-        let handle = runtime.alloc_string(&*s);
+        let result = runtime.alloc_array()?;
+        let handle = runtime.alloc_string(&*s)?;
         runtime
             .objects_mut()
             .set_index(result, 0, RegisterValue::from_object_handle(handle.0))
@@ -1144,7 +1136,7 @@ fn string_split(
         .js_to_string(separator)
         .map_err(|e| map_interpreter_error(e, runtime))?;
 
-    let result = runtime.alloc_array();
+    let result = runtime.alloc_array()?;
     if limit == 0 {
         return Ok(RegisterValue::from_object_handle(result.0));
     }
@@ -1157,7 +1149,7 @@ fn string_split(
             if i >= limit {
                 break;
             }
-            let handle = runtime.alloc_string(ch.to_string());
+            let handle = runtime.alloc_string(ch.to_string())?;
             runtime
                 .objects_mut()
                 .set_index(result, i, RegisterValue::from_object_handle(handle.0))
@@ -1178,7 +1170,7 @@ fn string_split(
         {
             Some(pos) => {
                 let piece = &s[start..start + pos];
-                let handle = runtime.alloc_string(piece);
+                let handle = runtime.alloc_string(piece)?;
                 runtime
                     .objects_mut()
                     .set_index(result, count, RegisterValue::from_object_handle(handle.0))
@@ -1193,7 +1185,7 @@ fn string_split(
     }
     if count < limit {
         let piece = &s[start..];
-        let handle = runtime.alloc_string(piece);
+        let handle = runtime.alloc_string(piece)?;
         runtime
             .objects_mut()
             .set_index(result, count, RegisterValue::from_object_handle(handle.0))
@@ -1247,7 +1239,7 @@ fn string_replace(
     if let Some(pos) = s.find(&*search) {
         let replacement = if is_fn {
             let callback = replace_arg.as_object_handle().map(ObjectHandle).unwrap();
-            let match_str = runtime.alloc_string(&*search);
+            let match_str = runtime.alloc_string(&*search)?;
             let result = runtime.call_callable(
                 callback,
                 RegisterValue::undefined(),
@@ -1269,10 +1261,10 @@ fn string_replace(
         result.push_str(&s[..pos]);
         result.push_str(&replacement);
         result.push_str(&s[pos + search.len()..]);
-        let handle = runtime.alloc_string(result);
+        let handle = runtime.alloc_string(result)?;
         Ok(RegisterValue::from_object_handle(handle.0))
     } else {
-        let handle = runtime.alloc_string(&*s);
+        let handle = runtime.alloc_string(&*s)?;
         Ok(RegisterValue::from_object_handle(handle.0))
     }
 }
@@ -1314,12 +1306,12 @@ fn string_replace_all(
             result.push(*ch);
             result.push_str(&replace_str);
         }
-        let handle = runtime.alloc_string(result);
+        let handle = runtime.alloc_string(result)?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
 
     let result = s.replace(&*search, &replace_str);
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1332,7 +1324,7 @@ fn string_normalize(
 ) -> Result<RegisterValue, VmNativeCallError> {
     // Minimal: return as-is (NFC is identity for ASCII/Latin-1).
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(&*s);
+    let handle = runtime.alloc_string(&*s)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1382,7 +1374,7 @@ fn string_to_well_formed(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let js = this_js_string_value(this, runtime)?;
     let result = js.to_well_formed();
-    let handle = runtime.alloc_js_string(result);
+    let handle = runtime.alloc_js_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1479,7 +1471,7 @@ fn string_to_locale_lower_case(
         s.to_lowercase()
     };
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1521,7 +1513,7 @@ fn string_to_locale_upper_case(
         s.to_uppercase()
     };
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1550,7 +1542,7 @@ fn string_from_char_code(
         buf.push(code_unit);
     }
     let result = String::from_utf16_lossy(&buf);
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1583,7 +1575,7 @@ fn string_from_code_point(
             return Err(range_error(runtime, &format!("Invalid code point {cp}")));
         }
     }
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1638,7 +1630,7 @@ fn string_raw(
 
     // Step 5: If literalSegments == 0, return "".
     if literal_segments == 0 {
-        let handle = runtime.alloc_string("");
+        let handle = runtime.alloc_string("")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
 
@@ -1669,7 +1661,7 @@ fn string_raw(
         }
     }
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1721,8 +1713,8 @@ fn string_iterator(
     let text = runtime
         .js_to_string(*this)
         .map_err(|error| map_interpreter_error(error, runtime))?;
-    let str_handle = runtime.alloc_string(text);
-    let iterator = runtime.objects_mut().alloc_string_iterator(str_handle);
+    let str_handle = runtime.alloc_string(text)?;
+    let iterator = runtime.objects_mut().alloc_string_iterator(str_handle)?;
     // Set prototype to %StringIteratorPrototype%.
     let proto = runtime.intrinsics().string_iterator_prototype();
     runtime

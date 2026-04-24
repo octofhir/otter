@@ -177,7 +177,7 @@ impl IntrinsicInstaller for SymbolIntrinsic {
         let to_string_tag_property = cx
             .property_names
             .intern_symbol(super::WellKnownSymbol::ToStringTag.stable_id());
-        let tag_value = cx.heap.alloc_string("Symbol");
+        let tag_value = cx.heap.alloc_string("Symbol")?;
         cx.heap.define_own_property(
             intrinsics.symbol_prototype(),
             to_string_tag_property,
@@ -269,7 +269,7 @@ fn symbol_key_for(
     let Some(key) = runtime.symbol_registry_key(value).map(str::to_owned) else {
         return Ok(RegisterValue::undefined());
     };
-    let key = runtime.alloc_string(key);
+    let key = runtime.alloc_string(key)?;
     Ok(RegisterValue::from_object_handle(key.0))
 }
 
@@ -288,7 +288,7 @@ fn symbol_prototype_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let symbol = this_symbol_value(*this, runtime)?;
     let text = symbol_descriptive_string(symbol, runtime);
-    let text = runtime.alloc_string(text);
+    let text = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(text.0))
 }
 
@@ -309,7 +309,7 @@ fn symbol_prototype_description_getter(
     let Some(description) = runtime.symbol_description(symbol).map(str::to_owned) else {
         return Ok(RegisterValue::undefined());
     };
-    let description = runtime.alloc_string(description);
+    let description = runtime.alloc_string(description)?;
     Ok(RegisterValue::from_object_handle(description.0))
 }
 
@@ -340,7 +340,7 @@ pub(crate) fn box_symbol_object(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let wrapper =
-        runtime.alloc_object_with_prototype(Some(runtime.intrinsics().symbol_prototype()));
+        runtime.alloc_object_with_prototype(Some(runtime.intrinsics().symbol_prototype()))?;
     set_symbol_data(wrapper, primitive, runtime)?;
     Ok(RegisterValue::from_object_handle(wrapper.0))
 }

@@ -18,7 +18,7 @@ pub fn install_temporal_now(
     intrinsics: &mut VmIntrinsics,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
-    let now_obj = cx.heap.alloc_object();
+    let now_obj = cx.heap.alloc_object()?;
     cx.heap
         .set_prototype(now_obj, Some(intrinsics.object_prototype()))?;
 
@@ -33,7 +33,7 @@ pub fn install_temporal_now(
     for &(name, arity, func) in methods {
         let desc = NativeFunctionDescriptor::method(name, arity, func);
         let host_id = cx.native_functions.register(desc);
-        let fn_handle = cx.heap.alloc_host_function(host_id, cx.realm);
+        let fn_handle = cx.heap.alloc_host_function(host_id, cx.realm)?;
         cx.heap
             .set_prototype(fn_handle, Some(intrinsics.function_prototype()))?;
         let prop = cx.property_names.intern(name);
@@ -64,7 +64,7 @@ fn now_instant(
         .instant()
         .map_err(|e| temporal_err(e, runtime))?;
     let proto = runtime.intrinsics().temporal_instant_prototype();
-    let handle = construct_temporal(TemporalPayload::Instant(instant), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::Instant(instant), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -79,7 +79,7 @@ fn now_time_zone_id(
         .time_zone()
         .map_err(|e| temporal_err(e, runtime))?;
     let id = tz.identifier().map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(id);
+    let handle = runtime.alloc_string(id)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -94,7 +94,7 @@ fn now_plain_date_time_iso(
         .plain_date_time_iso(None)
         .map_err(|e| temporal_err(e, runtime))?;
     let proto = runtime.intrinsics().temporal_plain_date_time_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainDateTime(pdt), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainDateTime(pdt), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -109,7 +109,7 @@ fn now_plain_date_iso(
         .plain_date_iso(None)
         .map_err(|e| temporal_err(e, runtime))?;
     let proto = runtime.intrinsics().temporal_plain_date_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainDate(pd), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainDate(pd), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -124,6 +124,6 @@ fn now_plain_time_iso(
         .plain_time_iso(None)
         .map_err(|e| temporal_err(e, runtime))?;
     let proto = runtime.intrinsics().temporal_plain_time_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime);
+    let handle = construct_temporal(TemporalPayload::PlainTime(pt), proto, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }

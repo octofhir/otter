@@ -44,7 +44,7 @@ impl IntrinsicInstaller for IntlIntrinsic {
         let tag_symbol = cx
             .property_names
             .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-        let tag_str = cx.heap.alloc_string("Intl");
+        let tag_str = cx.heap.alloc_string("Intl")?;
         cx.heap.define_own_property(
             intrinsics.intl_namespace,
             tag_symbol,
@@ -335,7 +335,7 @@ fn install_to_string_tag(
     let tag_symbol = cx
         .property_names
         .intern_symbol(WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string(tag);
+    let tag_str = cx.heap.alloc_string(tag)?;
     cx.heap.define_own_property(
         prototype,
         tag_symbol,
@@ -441,9 +441,9 @@ fn intl_get_canonical_locales(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_strings = canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_strings {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -495,9 +495,9 @@ fn intl_supported_values_of(
     values.sort_unstable();
     values.dedup();
 
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for value in &values {
-        let s = runtime.alloc_string(*value);
+        let s = runtime.alloc_string(*value)?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))

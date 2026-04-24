@@ -427,7 +427,7 @@ impl Activation {
         }
 
         let value = self.register(index)?;
-        let upvalue = runtime.objects.alloc_upvalue(value);
+        let upvalue = runtime.objects.alloc_upvalue(value)?;
         let slot = self
             .open_upvalues
             .get_mut(usize::from(index))

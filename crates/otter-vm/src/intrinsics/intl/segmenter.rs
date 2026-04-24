@@ -99,7 +99,7 @@ fn segmenter_constructor(
     };
 
     let prototype = runtime.intrinsics().intl_segmenter_prototype();
-    let handle = payload::construct_intl(IntlPayload::Segmenter(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::Segmenter(data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -129,7 +129,7 @@ fn segmenter_segment(
     };
 
     let prototype = runtime.intrinsics().intl_segments_prototype();
-    let handle = payload::construct_intl(IntlPayload::Segments(segments_data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::Segments(segments_data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -198,7 +198,7 @@ pub fn segments_symbol_iterator(
 
     let prototype = runtime.intrinsics().intl_segment_iterator_prototype();
     let handle =
-        payload::construct_intl(IntlPayload::SegmentIterator(iter_data), prototype, runtime);
+        payload::construct_intl(IntlPayload::SegmentIterator(iter_data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -239,7 +239,7 @@ fn segment_iterator_next(
 
     if position >= breakpoints_len {
         // Done — return { value: undefined, done: true }
-        let result = runtime.alloc_object();
+        let result = runtime.alloc_object()?;
         let prop_value = runtime.intern_property_name("value");
         let _ = runtime
             .objects_mut()
@@ -269,7 +269,7 @@ fn segment_iterator_next(
     let seg_obj = build_segment_data_object(&segment, start, &input, is_word_like, runtime)?;
 
     // Return { value: segObj, done: false }
-    let result = runtime.alloc_object();
+    let result = runtime.alloc_object()?;
     let prop_value = runtime.intern_property_name("value");
     let _ = runtime
         .objects_mut()
@@ -291,10 +291,10 @@ fn segmenter_resolved_options(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_segmenter_data(this, runtime)?.clone();
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
 
     let prop_locale = runtime.intern_property_name("locale");
-    let s = runtime.alloc_string(data.locale.as_str());
+    let s = runtime.alloc_string(data.locale.as_str())?;
     let _ = runtime.objects_mut().set_property(
         obj,
         prop_locale,
@@ -302,7 +302,7 @@ fn segmenter_resolved_options(
     );
 
     let prop_gran = runtime.intern_property_name("granularity");
-    let s = runtime.alloc_string(data.granularity.as_str());
+    let s = runtime.alloc_string(data.granularity.as_str())?;
     let _ =
         runtime
             .objects_mut()
@@ -325,9 +325,9 @@ fn segmenter_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -406,10 +406,10 @@ fn build_segment_data_object(
     is_word_like: Option<bool>,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
 
     let prop_segment = runtime.intern_property_name("segment");
-    let s = runtime.alloc_string(segment);
+    let s = runtime.alloc_string(segment)?;
     let _ = runtime.objects_mut().set_property(
         obj,
         prop_segment,
@@ -423,7 +423,7 @@ fn build_segment_data_object(
             .set_property(obj, prop_index, RegisterValue::from_i32(index as i32));
 
     let prop_input = runtime.intern_property_name("input");
-    let s_input = runtime.alloc_string(input);
+    let s_input = runtime.alloc_string(input)?;
     let _ = runtime.objects_mut().set_property(
         obj,
         prop_input,

@@ -100,7 +100,7 @@ impl Interpreter {
             .as_object_handle()
             .map(ObjectHandle)
             .unwrap_or_else(|| runtime.intrinsics().get(intrinsic_default));
-        Ok(runtime.alloc_object_with_prototype(Some(proto)))
+        runtime.alloc_object_with_prototype(Some(proto))
     }
 
     /// Resolve which intrinsic a native constructor uses as the default

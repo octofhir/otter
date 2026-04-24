@@ -87,10 +87,10 @@ fn require_plain_year_month(
 fn wrap_plain_year_month(
     pym: temporal_rs::PlainYearMonth,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> RegisterValue {
+) -> Result<RegisterValue, VmNativeCallError> {
     let proto = runtime.intrinsics().temporal_plain_year_month_prototype();
-    let handle = construct_temporal(TemporalPayload::PlainYearMonth(pym), proto, runtime);
-    RegisterValue::from_object_handle(handle.0)
+    let handle = construct_temporal(TemporalPayload::PlainYearMonth(pym), proto, runtime)?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 /// Extracts a PlainYearMonth from an argument — accepts objects or ISO strings.
@@ -127,7 +127,7 @@ fn pym_constructor(
 
     let pym = temporal_rs::PlainYearMonth::new_iso(year, month, ref_day)
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_year_month(pym, runtime))
+    wrap_plain_year_month(pym, runtime)
 }
 
 // ── Static methods ──────────────────────────────────────────────────
@@ -141,7 +141,7 @@ fn pym_from(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let val = args.first().copied().unwrap_or(RegisterValue::undefined());
     let pym = to_plain_year_month(val, runtime)?;
-    Ok(wrap_plain_year_month(pym, runtime))
+    wrap_plain_year_month(pym, runtime)
 }
 
 /// §13.2.2.2 Temporal.PlainYearMonth.compare ( one, two )
@@ -187,7 +187,7 @@ fn pym_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pym = require_plain_year_month(this, runtime)?;
     let id = pym.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string());
+    let handle = runtime.alloc_string(id.to_string())?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -203,7 +203,7 @@ fn pym_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pym = require_plain_year_month(this, runtime)?;
     let code = pym.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code);
+    let handle = runtime.alloc_string(code)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -237,7 +237,7 @@ fn pym_add(
     let result = pym
         .add(&dur, temporal_rs::options::Overflow::default())
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_year_month(result, runtime))
+    wrap_plain_year_month(result, runtime)
 }
 
 /// §13.2.3.12 Temporal.PlainYearMonth.prototype.subtract ( duration )
@@ -253,7 +253,7 @@ fn pym_subtract(
     let result = pym
         .subtract(&dur, temporal_rs::options::Overflow::default())
         .map_err(|e| temporal_err(e, runtime))?;
-    Ok(wrap_plain_year_month(result, runtime))
+    wrap_plain_year_month(result, runtime)
 }
 
 /// §13.2.3.15 Temporal.PlainYearMonth.prototype.equals ( other )
@@ -280,7 +280,7 @@ fn pym_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pym = require_plain_year_month(this, runtime)?;
     let text = pym.to_ixdtf_string(temporal_rs::options::DisplayCalendar::Auto);
-    let handle = runtime.alloc_string(text);
+    let handle = runtime.alloc_string(text)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

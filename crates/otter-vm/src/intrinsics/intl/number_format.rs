@@ -102,7 +102,7 @@ fn number_format_constructor(
 
     // Construct the object with native payload.
     let prototype = runtime.intrinsics().intl_number_format_prototype();
-    let handle = payload::construct_intl(IntlPayload::NumberFormat(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::NumberFormat(data), prototype, runtime)?;
 
     Ok(RegisterValue::from_object_handle(handle.0))
 }
@@ -137,7 +137,7 @@ fn number_format_format_getter(
     let fn_id = runtime.register_native_function(desc);
     let fn_proto = runtime.intrinsics().function_prototype();
     let realm = runtime.current_realm_id();
-    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id, realm);
+    let bound_fn = runtime.objects_mut().alloc_host_function(fn_id, realm)?;
     let _ = runtime
         .objects_mut()
         .set_prototype(bound_fn, Some(fn_proto));
@@ -198,7 +198,7 @@ fn bound_number_format_format(
         .map_err(|e| VmNativeCallError::Internal(format!("NumberFormat.format: {e}").into()))?;
 
     let formatted = format_number(number, &data);
-    let handle = runtime.alloc_string(formatted);
+    let handle = runtime.alloc_string(formatted)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -230,9 +230,9 @@ fn number_format_format_to_parts(
     let formatted = format_number(number, &data);
     let parts = decompose_formatted_number(&formatted, number, &data);
 
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for (part_type, part_value) in &parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_string_prop(runtime, obj, "type", part_type);
         set_string_prop(runtime, obj, "value", part_value);
         runtime
@@ -438,7 +438,7 @@ fn number_format_format_range(
         format!("{start_str}\u{2013}{end_str}")
     };
 
-    let handle = runtime.alloc_string(result);
+    let handle = runtime.alloc_string(result)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -486,12 +486,12 @@ fn number_format_format_range_to_parts(
     let start_formatted = format_number(start, &data);
     let end_formatted = format_number(end, &data);
 
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
 
     // Start number parts (source: "startRange").
     let start_parts = decompose_formatted_number(&start_formatted, start, &data);
     for (part_type, part_value) in &start_parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_string_prop(runtime, obj, "type", part_type);
         set_string_prop(runtime, obj, "value", part_value);
         set_string_prop(runtime, obj, "source", "startRange");
@@ -504,7 +504,7 @@ fn number_format_format_range_to_parts(
     }
 
     // Literal separator.
-    let sep_obj = runtime.alloc_object();
+    let sep_obj = runtime.alloc_object()?;
     set_string_prop(runtime, sep_obj, "type", "literal");
     set_string_prop(runtime, sep_obj, "value", "\u{2013}");
     set_string_prop(runtime, sep_obj, "source", "shared");
@@ -516,7 +516,7 @@ fn number_format_format_range_to_parts(
     // End number parts (source: "endRange").
     let end_parts = decompose_formatted_number(&end_formatted, end, &data);
     for (part_type, part_value) in &end_parts {
-        let obj = runtime.alloc_object();
+        let obj = runtime.alloc_object()?;
         set_string_prop(runtime, obj, "type", part_type);
         set_string_prop(runtime, obj, "value", part_value);
         set_string_prop(runtime, obj, "source", "endRange");
@@ -545,7 +545,7 @@ fn number_format_resolved_options(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_number_format_data(this, runtime)?.clone();
 
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "numberingSystem", &data.numbering_system);
     set_string_prop(runtime, obj, "style", data.style.as_str());
@@ -634,9 +634,9 @@ fn number_format_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -1302,7 +1302,9 @@ fn set_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));

@@ -125,7 +125,7 @@ fn install_weakref(
     let sym_tag = cx
         .property_names
         .intern_symbol(super::WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string("WeakRef");
+    let tag_str = cx.heap.alloc_string("WeakRef")?;
     cx.heap.define_own_property(
         weakref_proto,
         sym_tag,
@@ -168,7 +168,7 @@ fn weakref_constructor(
         Some(runtime.subclass_prototype_or_default(*this, runtime.intrinsics().weakref_prototype));
     let handle = runtime
         .objects_mut()
-        .alloc_weakref(prototype, target_handle);
+        .alloc_weakref(prototype, target_handle)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -249,7 +249,7 @@ fn install_finalization_registry(
     let sym_tag = cx
         .property_names
         .intern_symbol(super::WellKnownSymbol::ToStringTag.stable_id());
-    let tag_str = cx.heap.alloc_string("FinalizationRegistry");
+    let tag_str = cx.heap.alloc_string("FinalizationRegistry")?;
     cx.heap.define_own_property(
         fr_proto,
         sym_tag,
@@ -302,7 +302,7 @@ fn finalization_registry_constructor(
     let prototype = Some(runtime.intrinsics().finalization_registry_prototype);
     let handle = runtime
         .objects_mut()
-        .alloc_finalization_registry(prototype, callback_handle);
+        .alloc_finalization_registry(prototype, callback_handle)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

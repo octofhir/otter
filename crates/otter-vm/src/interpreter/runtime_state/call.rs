@@ -3,6 +3,9 @@
 //! `call_host_function`, `delete_named_property`, and the VmPromise
 //! allocator helpers.
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use crate::descriptors::VmNativeCallError;
 use crate::frame::{FrameFlags, FrameMetadata, RegisterIndex};
 use crate::object::{HeapValueKind, ObjectHandle};
@@ -122,8 +125,13 @@ impl RuntimeState {
             })?;
 
         self.native_callee_stack.push(callable);
-        let result = (descriptor.callback())(&receiver, arguments, self);
+        let callback = *descriptor.callback();
+        let result = catch_unwind(AssertUnwindSafe(|| callback(&receiver, arguments, self)));
         self.native_callee_stack.pop();
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => return Err(self.native_panic_error(payload)),
+        };
         self.check_interrupt()?;
         match result {
             Ok(value) => Ok(value),
@@ -132,27 +140,44 @@ impl RuntimeState {
         }
     }
 
+    fn native_panic_error(&mut self, payload: Box<dyn Any + Send>) -> VmNativeCallError {
+        let panic_message = panic_payload_message(payload.as_ref());
+        let message = if panic_message.is_empty() {
+            "internal runtime error: native function panicked".to_string()
+        } else {
+            format!("internal runtime error: native function panicked: {panic_message}")
+        };
+        match self.alloc_type_error(&message) {
+            Ok(handle) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0)),
+            Err(error) => VmNativeCallError::Internal(
+                format!("native panic TypeError allocation failed: {error}; {message}").into(),
+            ),
+        }
+    }
+
     /// Allocates a reusable VM promise backed by the runtime's intrinsic Promise prototype.
-    pub fn alloc_vm_promise(&mut self) -> crate::promise::VmPromise {
+    pub fn alloc_vm_promise(&mut self) -> Result<crate::promise::VmPromise, VmNativeCallError> {
         let promise_prototype = self.intrinsics().promise_prototype();
         let promise = self
             .objects_mut()
-            .alloc_promise_with_proto(promise_prototype);
+            .alloc_promise_with_proto(promise_prototype)?;
         let resolve = self
             .objects_mut()
-            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill);
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Fulfill)?;
         let reject = self
             .objects_mut()
-            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject);
+            .alloc_promise_capability_function(promise, crate::promise::ReactionKind::Reject)?;
         if let Some(js_promise) = self.objects_mut().get_promise_mut(promise) {
             js_promise.resolve_function = Some(resolve);
             js_promise.reject_function = Some(reject);
         }
-        crate::promise::VmPromise::new(crate::promise::PromiseCapability {
-            promise,
-            resolve,
-            reject,
-        })
+        Ok(crate::promise::VmPromise::new(
+            crate::promise::PromiseCapability {
+                promise,
+                resolve,
+                reject,
+            },
+        ))
     }
 
     /// Settles one reusable VM promise through its resolve capability function.
@@ -188,7 +213,7 @@ impl RuntimeState {
         &mut self,
         value: RegisterValue,
     ) -> Result<crate::promise::VmPromise, VmNativeCallError> {
-        let promise = self.alloc_vm_promise();
+        let promise = self.alloc_vm_promise()?;
         self.fulfill_vm_promise(promise, value)?;
         Ok(promise)
     }
@@ -198,7 +223,7 @@ impl RuntimeState {
         &mut self,
         reason: RegisterValue,
     ) -> Result<crate::promise::VmPromise, VmNativeCallError> {
-        let promise = self.alloc_vm_promise();
+        let promise = self.alloc_vm_promise()?;
         self.reject_vm_promise(promise, reason)?;
         Ok(promise)
     }
@@ -496,9 +521,7 @@ impl RuntimeState {
                         InterpreterError::StackOverflow => {
                             // S2: catchable RangeError on stack exhaustion.
                             VmNativeCallError::Thrown(
-                                self.alloc_range_error_value(
-                                    "Maximum call stack size exceeded",
-                                ),
+                                self.alloc_range_error_value("Maximum call stack size exceeded"),
                             )
                         }
                         InterpreterError::NativeCall(message)
@@ -604,5 +627,15 @@ impl RuntimeState {
         self.objects
             .delete_property_with_registry(target, property, &self.property_names)
             .map_err(Into::into)
+    }
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        String::new()
     }
 }

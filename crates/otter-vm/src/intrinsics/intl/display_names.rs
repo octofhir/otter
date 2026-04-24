@@ -99,7 +99,7 @@ fn display_names_constructor(
     };
 
     let prototype = runtime.intrinsics().intl_display_names_prototype();
-    let handle = payload::construct_intl(IntlPayload::DisplayNames(data), prototype, runtime);
+    let handle = payload::construct_intl(IntlPayload::DisplayNames(data), prototype, runtime)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -125,12 +125,12 @@ fn display_names_of(
 
     match name {
         Some(n) => {
-            let handle = runtime.alloc_string(n);
+            let handle = runtime.alloc_string(n)?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => match data.fallback {
             DisplayNamesFallback::Code => {
-                let handle = runtime.alloc_string(&*code);
+                let handle = runtime.alloc_string(&*code)?;
                 Ok(RegisterValue::from_object_handle(handle.0))
             }
             DisplayNamesFallback::None => Ok(RegisterValue::undefined()),
@@ -148,7 +148,7 @@ fn display_names_resolved_options(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_display_names_data(this, runtime)?.clone();
-    let obj = runtime.alloc_object();
+    let obj = runtime.alloc_object()?;
     set_string_prop(runtime, obj, "locale", &data.locale);
     set_string_prop(runtime, obj, "type", data.display_type.as_str());
     set_string_prop(runtime, obj, "style", data.style.as_str());
@@ -170,9 +170,9 @@ fn display_names_supported_locales_of(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let locale_list = super::canonicalize_locale_list_from_value(locales_arg, runtime)?;
-    let arr = runtime.alloc_array();
+    let arr = runtime.alloc_array()?;
     for locale in &locale_list {
-        let s = runtime.alloc_string(locale.as_str());
+        let s = runtime.alloc_string(locale.as_str())?;
         runtime
             .objects_mut()
             .push_element(arr, RegisterValue::from_object_handle(s.0))
@@ -514,7 +514,9 @@ fn set_string_prop(
     value: &str,
 ) {
     let prop = runtime.intern_property_name(name);
-    let s = runtime.alloc_string(value);
+    let Ok(s) = runtime.alloc_string(value) else {
+        return;
+    };
     let _ = runtime
         .objects_mut()
         .set_property(obj, prop, RegisterValue::from_object_handle(s.0));

@@ -19,16 +19,13 @@ impl RuntimeState {
         &mut self,
         value: RegisterValue,
         done: bool,
-    ) -> Result<ObjectHandle, VmNativeCallError> {
-        let obj = self.alloc_object();
+    ) -> Result<ObjectHandle, InterpreterError> {
+        let obj = self.alloc_object()?;
         let value_prop = self.intern_property_name("value");
         let done_prop = self.intern_property_name("done");
+        self.objects.set_property(obj, value_prop, value)?;
         self.objects
-            .set_property(obj, value_prop, value)
-            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-        self.objects
-            .set_property(obj, done_prop, RegisterValue::from_bool(done))
-            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+            .set_property(obj, done_prop, RegisterValue::from_bool(done))?;
         Ok(obj)
     }
 
@@ -42,15 +39,15 @@ impl RuntimeState {
         function_index: FunctionIndex,
         closure_handle: Option<ObjectHandle>,
         arguments: Vec<RegisterValue>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().generator_prototype();
-        self.objects.alloc_generator(
+        Ok(self.objects.alloc_generator(
             Some(prototype),
             module,
             function_index,
             closure_handle,
             arguments,
-        )
+        )?)
     }
 
     /// Resumes a suspended generator. Called by the native `.next()`, `.return()`,
@@ -78,15 +75,15 @@ impl RuntimeState {
         function_index: FunctionIndex,
         closure_handle: Option<ObjectHandle>,
         arguments: Vec<RegisterValue>,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().async_generator_prototype();
-        self.objects.alloc_async_generator(
+        Ok(self.objects.alloc_async_generator(
             Some(prototype),
             module,
             function_index,
             closure_handle,
             arguments,
-        )
+        )?)
     }
 
     /// Resumes a suspended async generator. Dequeues the front request
@@ -112,6 +109,7 @@ impl RuntimeState {
         iterator: ObjectHandle,
         value: RegisterValue,
     ) -> Result<(bool, RegisterValue), InterpreterError> {
+        self.check_interrupt_interp()?;
         // Fast path: internal array/string iterators (ignores sent value,
         // which is correct per spec — arrays/strings don't use it).
         match self.iterator_next(iterator) {
@@ -158,6 +156,7 @@ impl RuntimeState {
         iterator: ObjectHandle,
         value: RegisterValue,
     ) -> Result<Option<(bool, RegisterValue)>, InterpreterError> {
+        self.check_interrupt_interp()?;
         // Internal array/string iterators have no .throw() method.
         if self.is_internal_fast_path_iterator(iterator) {
             return Ok(None);
@@ -199,6 +198,7 @@ impl RuntimeState {
         iterator: ObjectHandle,
         value: RegisterValue,
     ) -> Result<Option<(bool, RegisterValue)>, InterpreterError> {
+        self.check_interrupt_interp()?;
         // Internal array/string iterators have no .return() method.
         if self.is_internal_fast_path_iterator(iterator) {
             return Ok(None);

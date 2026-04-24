@@ -10488,3 +10488,225 @@ fn s1_b_proxy_get_observes_interrupt_before_trap_forwarding() {
         "expected InterpreterError::Interrupted, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// C4 — Feedback vector wiring tests
+// ---------------------------------------------------------------------------
+//
+// Before C4 only Arithmetic and Property(load) feedback slots were
+// ever populated. The tests below pin down that Comparison / Branch /
+// Call / Property(store) slots are now both allocated at compile time
+// and recorded by the dispatcher at runtime. They lock the
+// interpreter-side IC pipeline in place so tier-2 (A2) can trust it.
+
+/// Compile `source`, execute its entry function once, and return the
+/// owning `(Module, RuntimeState)` so the caller can inspect the
+/// persisted feedback vector of any function in the module.
+fn run_and_return_state(
+    source: &str,
+) -> (crate::module::Module, crate::interpreter::RuntimeState) {
+    let module = compile(source).expect("compile");
+    let entry_idx = module.entry();
+    let function = module.function(entry_idx).expect("module entry function");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let interpreter = Interpreter::new();
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    interpreter
+        .execute_with_runtime(&module, entry_idx, &registers, &mut runtime)
+        .expect("execute_with_runtime");
+    (module, runtime)
+}
+
+fn function_index_by_name(
+    module: &crate::module::Module,
+    name: &str,
+) -> Option<FunctionIndex> {
+    module.functions().iter().enumerate().find_map(|(i, f)| {
+        if f.name() == Some(name) {
+            u32::try_from(i).ok().map(FunctionIndex)
+        } else {
+            None
+        }
+    })
+}
+
+#[test]
+fn c4_comparison_feedback_is_populated_by_less_than() {
+    let (module, runtime) = run_and_return_state(
+        "function main() { let a = 1; let b = 2; return a < b; } main();",
+    );
+    let main_idx =
+        function_index_by_name(&module, "main").expect("main function must exist");
+    let fv = runtime
+        .feedback_vector(main_idx)
+        .expect("main must have a persisted feedback vector after execution");
+    let has_int32_comparison =
+        fv.slots()
+            .iter()
+            .any(|s| matches!(s, crate::feedback::FeedbackSlotData::Comparison(
+                crate::feedback::ComparisonFeedback::Int32
+            )));
+    assert!(
+        has_int32_comparison,
+        "expected at least one Comparison slot recorded Int32 after `a < b`; got {:?}",
+        fv.slots()
+    );
+}
+
+#[test]
+fn c4_branch_feedback_records_taken_and_not_taken() {
+    // Two loop iterations take the `if`, one doesn't — the branch
+    // slot for the `if` must carry both directions.
+    let (module, runtime) = run_and_return_state(
+        r#"
+        function main() {
+            let total = 0;
+            for (let i = 0; i < 3; i = i + 1) {
+                if (i > 0) { total = total + 1; }
+            }
+            return total;
+        }
+        main();
+        "#,
+    );
+    let main_idx =
+        function_index_by_name(&module, "main").expect("main function must exist");
+    let fv = runtime
+        .feedback_vector(main_idx)
+        .expect("main must have a persisted feedback vector after execution");
+    let mut any_taken = false;
+    let mut any_not_taken = false;
+    for slot in fv.slots() {
+        if let crate::feedback::FeedbackSlotData::Branch(b) = slot {
+            if b.taken > 0 {
+                any_taken = true;
+            }
+            if b.not_taken > 0 {
+                any_not_taken = true;
+            }
+        }
+    }
+    assert!(
+        any_taken && any_not_taken,
+        "expected at least one Branch slot with taken>0 and one with not_taken>0; got {:?}",
+        fv.slots()
+    );
+}
+
+#[test]
+fn c4_call_feedback_monomorphic_same_target() {
+    let (module, runtime) = run_and_return_state(
+        r#"
+        function inner() { return 7; }
+        function main() {
+            inner();
+            inner();
+            return inner();
+        }
+        main();
+        "#,
+    );
+    let main_idx =
+        function_index_by_name(&module, "main").expect("main function must exist");
+    let inner_idx = function_index_by_name(&module, "inner")
+        .expect("inner function must exist");
+    let fv = runtime
+        .feedback_vector(main_idx)
+        .expect("main must have a persisted feedback vector after execution");
+    let mut monomorphic_on_inner = false;
+    for slot in fv.slots() {
+        if let crate::feedback::FeedbackSlotData::Call(
+            crate::feedback::CallFeedback::Monomorphic(target),
+        ) = slot
+            && *target == inner_idx.0
+        {
+            monomorphic_on_inner = true;
+        }
+    }
+    assert!(
+        monomorphic_on_inner,
+        "expected a Call slot monomorphised on inner's function index ({}); got {:?}",
+        inner_idx.0,
+        fv.slots()
+    );
+}
+
+#[test]
+fn c4_property_store_feedback_records_shape() {
+    let (module, runtime) = run_and_return_state(
+        r#"
+        function main() {
+            const o = {};
+            o.x = 1;
+            o.x = 2;
+            return 0;
+        }
+        main();
+        "#,
+    );
+    let main_idx =
+        function_index_by_name(&module, "main").expect("main function must exist");
+    let fv = runtime
+        .feedback_vector(main_idx)
+        .expect("main must have a persisted feedback vector after execution");
+    // There is at least one Property slot that moved past
+    // Uninitialized — in this case it should be Monomorphic after two
+    // consecutive stores to the same newly-allocated object.
+    let any_property_populated = fv.slots().iter().any(|s| match s {
+        crate::feedback::FeedbackSlotData::Property(p) => !matches!(
+            p,
+            crate::feedback::PropertyFeedback::Uninitialized
+        ),
+        _ => false,
+    });
+    assert!(
+        any_property_populated,
+        "expected at least one Property slot with a recorded shape after `o.x = ...`; got {:?}",
+        fv.slots()
+    );
+}
+
+#[test]
+fn c4_layout_has_all_four_new_slot_kinds() {
+    // Static (compile-time) check: the feedback-table layout emitted
+    // by the compiler contains at least one slot for each new
+    // FeedbackKind — Comparison / Branch / Call / Property — so the
+    // corresponding `record_*` paths have somewhere to land.
+    let module = compile(
+        r#"
+        function inner() { return 0; }
+        function main() {
+            const o = {};
+            o.y = 1;
+            if (o.y > 0) { return inner(); }
+            return 0;
+        }
+        main();
+        "#,
+    )
+    .expect("compile");
+    let main_idx =
+        function_index_by_name(&module, "main").expect("main function must exist");
+    let layout = module
+        .function(main_idx)
+        .expect("main function must exist")
+        .feedback();
+    let mut saw_comparison = false;
+    let mut saw_branch = false;
+    let mut saw_call = false;
+    let mut saw_property = false;
+    for slot in layout.slots() {
+        match slot.kind() {
+            crate::feedback::FeedbackKind::Comparison => saw_comparison = true,
+            crate::feedback::FeedbackKind::Branch => saw_branch = true,
+            crate::feedback::FeedbackKind::Call => saw_call = true,
+            crate::feedback::FeedbackKind::Property => saw_property = true,
+            crate::feedback::FeedbackKind::Arithmetic => {}
+        }
+    }
+    assert!(
+        saw_comparison && saw_branch && saw_call && saw_property,
+        "expected layout to cover all 4 new kinds; got comparison={saw_comparison} branch={saw_branch} call={saw_call} property={saw_property}"
+    );
+}

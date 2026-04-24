@@ -182,7 +182,7 @@ fn lower_static_member_update(
                 SourceLoweringError::Internal(format!("encode LdaNamedProperty (update): {err:?}"))
             })?;
         apply_update_to_loaded_value(builder, ctx, expr, |builder| {
-            builder
+            let pc = builder
                 .emit(
                     Opcode::StaNamedProperty,
                     &[Operand::Reg(u32::from(base.reg)), Operand::Idx(idx)],
@@ -192,6 +192,7 @@ fn lower_static_member_update(
                         "encode StaNamedProperty (update): {err:?}"
                     ))
                 })?;
+            ctx.attach_property_store_feedback(builder, pc);
             Ok(())
         })
     })();

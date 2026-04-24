@@ -42,7 +42,7 @@ pub(super) fn lower_expression_direct_call<'a>(
                 ))
             })?;
         lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
-        builder
+        let call_pc = builder
             .emit(
                 Opcode::CallUndefinedReceiver,
                 &[
@@ -58,6 +58,7 @@ pub(super) fn lower_expression_direct_call<'a>(
                     "encode CallUndefinedReceiver (expression direct): {err:?}"
                 ))
             })?;
+        ctx.attach_call_feedback(builder, call_pc);
         Ok(())
     })();
 
@@ -100,7 +101,7 @@ fn lower_expression_direct_call_with_spread<'a>(
                 ))
             })?;
         emit_spread_call_arguments_array(builder, ctx, call, args_base)?;
-        builder
+        let call_pc = builder
             .emit(
                 Opcode::CallSpread,
                 &[
@@ -117,6 +118,7 @@ fn lower_expression_direct_call_with_spread<'a>(
                     "encode CallSpread (expression direct): {err:?}"
                 ))
             })?;
+        ctx.attach_call_feedback(builder, call_pc);
         Ok(())
     })();
 

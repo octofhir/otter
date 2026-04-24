@@ -33,7 +33,7 @@
 
 use oxc_ast::ast::AssignmentOperator;
 
-use super::SourceLoweringError;
+use super::{LoweringContext, SourceLoweringError};
 use crate::bytecode::{BytecodeBuilder, Label, Opcode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,29 +62,32 @@ pub(super) fn classify(op: AssignmentOperator) -> Option<LogicalAssignmentKind> 
 /// through (caller proceeds to lower RHS + store).
 pub(super) fn emit_short_circuit_jump(
     builder: &mut BytecodeBuilder,
+    ctx: &LoweringContext<'_>,
     kind: LogicalAssignmentKind,
     end_label: Label,
 ) -> Result<(), SourceLoweringError> {
     match kind {
         LogicalAssignmentKind::Or => {
             // `||=`: skip assign when acc is truthy.
-            builder
+            let pc = builder
                 .emit_jump_to(Opcode::JumpIfToBooleanTrue, end_label)
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!(
                         "encode JumpIfToBooleanTrue (||=): {err:?}"
                     ))
                 })?;
+            ctx.attach_branch_feedback(builder, pc);
         }
         LogicalAssignmentKind::And => {
             // `&&=`: skip assign when acc is falsy.
-            builder
+            let pc = builder
                 .emit_jump_to(Opcode::JumpIfToBooleanFalse, end_label)
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!(
                         "encode JumpIfToBooleanFalse (&&=): {err:?}"
                     ))
                 })?;
+            ctx.attach_branch_feedback(builder, pc);
         }
         LogicalAssignmentKind::Coalesce => {
             // `??=`: skip assign only when acc is neither null nor
@@ -94,11 +97,12 @@ pub(super) fn emit_short_circuit_jump(
             // fall-through path.
             let check_undefined = builder.new_label();
             let do_assign = builder.new_label();
-            builder
+            let pc = builder
                 .emit_jump_to(Opcode::JumpIfNotNull, check_undefined)
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!("encode JumpIfNotNull (??=): {err:?}"))
                 })?;
+            ctx.attach_branch_feedback(builder, pc);
             // acc == null: fall through to the assign path.
             builder
                 .emit_jump_to(Opcode::Jump, do_assign)
@@ -112,13 +116,14 @@ pub(super) fn emit_short_circuit_jump(
             })?;
             // Not null — check undefined. If not undefined either,
             // short-circuit to end_label with acc = original LHS.
-            builder
+            let pc = builder
                 .emit_jump_to(Opcode::JumpIfNotUndefined, end_label)
                 .map_err(|err| {
                     SourceLoweringError::Internal(format!(
                         "encode JumpIfNotUndefined (??=): {err:?}"
                     ))
                 })?;
+            ctx.attach_branch_feedback(builder, pc);
             builder.bind_label(do_assign).map_err(|err| {
                 SourceLoweringError::Internal(format!("bind ??= do_assign: {err:?}"))
             })?;

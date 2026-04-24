@@ -20,7 +20,7 @@
 //!   from the byte *after* the jump operand.
 
 use crate::bytecode::{InstructionIter, Opcode, Operand};
-use crate::feedback::ArithmeticFeedback;
+use crate::feedback::{ArithmeticFeedback, ComparisonFeedback};
 use crate::frame::RegisterIndex;
 use crate::module::{Function, Module};
 use crate::value::RegisterValue;
@@ -618,28 +618,29 @@ impl Interpreter {
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l < r));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                // C4: Comparison slot for the JIT / tier-2 IC.
+                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
             }
             Opcode::TestGreaterThan => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l > r));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
             }
             Opcode::TestLessThanOrEqual => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l <= r));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
             }
             Opcode::TestGreaterThanOrEqual => {
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let l = i32_of(activation.accumulator())?;
                 let r = i32_of(rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(l >= r));
-                frame_runtime.record_arithmetic(function, pc, ArithmeticFeedback::Int32);
+                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
             }
             Opcode::TestEqualStrict => {
                 // §7.2.16 IsStrictlyEqual. Raw bit comparison covers
@@ -685,12 +686,11 @@ impl Interpreter {
                     false
                 };
                 activation.set_accumulator(RegisterValue::from_bool(result));
-                let observation = if lhs.as_i32().is_some() && rhs.as_i32().is_some() {
-                    ArithmeticFeedback::Int32
-                } else {
-                    ArithmeticFeedback::Any
-                };
-                frame_runtime.record_arithmetic(function, pc, observation);
+                // C4: observe operand types on the Comparison
+                // lattice. TestEqualStrict is polymorphic at the ISA
+                // level — inspect the actual NaN-box tags.
+                let observation = classify_comparison_operands(lhs, rhs, &runtime.objects);
+                frame_runtime.record_comparison(function, pc, observation);
             }
             Opcode::TestEqual => {
                 // Loose equality (§7.2.15 IsLooselyEqual). Delegate to
@@ -700,18 +700,25 @@ impl Interpreter {
                 let lhs = activation.accumulator();
                 let result = runtime.js_loose_eq(lhs, rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(result));
+                let observation = classify_comparison_operands(lhs, rhs, &runtime.objects);
+                frame_runtime.record_comparison(function, pc, observation);
             }
             Opcode::TestInstanceOf => {
                 let lhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let rhs = activation.accumulator();
                 let result = runtime.js_instance_of(lhs, rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(result));
+                // `in` and `instanceof` carry no useful numeric-type
+                // signal; record Any so the slot is no longer
+                // Uninitialized.
+                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Any);
             }
             Opcode::TestIn => {
                 let lhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let rhs = activation.accumulator();
                 let result = runtime.js_has_property(lhs, rhs)?;
                 activation.set_accumulator(RegisterValue::from_bool(result));
+                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Any);
             }
             Opcode::TestNull => {
                 let b = activation.accumulator() == RegisterValue::null();
@@ -741,56 +748,72 @@ impl Interpreter {
                 // BigInt (0n/non-zero) must dispatch through the
                 // runtime-aware helper, not `is_truthy()` which
                 // defaults object-tagged values to truthy.
-                if runtime.js_to_boolean(activation.accumulator())? {
+                let taken = runtime.js_to_boolean(activation.accumulator())?;
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfToBooleanFalse => {
                 let off = jump_off(&instr.operands, 0)?;
-                if !runtime.js_to_boolean(activation.accumulator())? {
+                let taken = !runtime.js_to_boolean(activation.accumulator())?;
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfTrue => {
                 let off = jump_off(&instr.operands, 0)?;
-                if activation.accumulator().as_bool() == Some(true) {
+                let taken = activation.accumulator().as_bool() == Some(true);
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfFalse => {
                 let off = jump_off(&instr.operands, 0)?;
-                if activation.accumulator().as_bool() == Some(false) {
+                let taken = activation.accumulator().as_bool() == Some(false);
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfNull => {
                 let off = jump_off(&instr.operands, 0)?;
-                if activation.accumulator() == RegisterValue::null() {
+                let taken = activation.accumulator() == RegisterValue::null();
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfNotNull => {
                 let off = jump_off(&instr.operands, 0)?;
-                if activation.accumulator() != RegisterValue::null() {
+                let taken = activation.accumulator() != RegisterValue::null();
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfUndefined => {
                 let off = jump_off(&instr.operands, 0)?;
-                if activation.accumulator() == RegisterValue::undefined() {
+                let taken = activation.accumulator() == RegisterValue::undefined();
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
             }
             Opcode::JumpIfNotUndefined => {
                 let off = jump_off(&instr.operands, 0)?;
-                if activation.accumulator() != RegisterValue::undefined() {
+                let taken = activation.accumulator() != RegisterValue::undefined();
+                frame_runtime.record_branch(function, pc, taken);
+                if taken {
                     activation.set_pc(jump_target(next_pc, off));
                     return Ok(StepOutcome::Continue);
                 }
@@ -1042,19 +1065,39 @@ impl Interpreter {
                     )));
                 };
                 let value = activation.accumulator();
+                let receiver_handle = crate::object::ObjectHandle(handle);
                 // M29: use `ordinary_set` so accessor setters fire
                 // when the target is part of an accessor chain.
                 // Data-property paths still share
                 // `set_named_property`'s cache-aware storage via
                 // `ordinary_set`'s `ordinary_set_on_receiver`.
                 runtime
-                    .ordinary_set(crate::object::ObjectHandle(handle), property, target, value)
+                    .ordinary_set(receiver_handle, property, target, value)
                     .map_err(|err| match err {
                         crate::VmNativeCallError::Thrown(v) => InterpreterError::UncaughtThrow(v),
                         crate::VmNativeCallError::Internal(msg) => {
                             InterpreterError::NativeCall(msg)
                         }
                     })?;
+                // C4: record the post-store shape + slot so tier-2
+                // can specialize the store IC. Skip accessor
+                // properties and prototype-chain stores — neither
+                // should harden into a trust-shape IC.
+                if let Ok(Some(lookup)) = runtime.property_lookup(receiver_handle, property)
+                    && lookup.owner() == receiver_handle
+                    && let Some(cache) = lookup.cache()
+                    && matches!(
+                        lookup.value(),
+                        crate::object::PropertyValue::Data { .. }
+                    )
+                {
+                    frame_runtime.record_property(
+                        function,
+                        pc,
+                        cache.shape_id(),
+                        cache.slot_index(),
+                    );
+                }
             }
 
             // ---- Keyed property access ----
@@ -1243,6 +1286,14 @@ impl Interpreter {
                     let err = runtime.alloc_type_error("Value is not callable")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                 };
+                // C4: record the callee's function index on the
+                // Call-kind feedback slot so tier-2 can monomorphise.
+                if let Some(callee) = runtime
+                    .objects
+                    .closure_function_index(crate::object::ObjectHandle(handle))
+                {
+                    frame_runtime.record_call(function, pc, callee.0);
+                }
                 match self.call_callable_bytecode(
                     runtime,
                     crate::object::ObjectHandle(handle),
@@ -1266,6 +1317,12 @@ impl Interpreter {
                     let err = runtime.alloc_type_error("Value is not callable")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                 };
+                if let Some(callee) = runtime
+                    .objects
+                    .closure_function_index(crate::object::ObjectHandle(handle))
+                {
+                    frame_runtime.record_call(function, pc, callee.0);
+                }
                 match self.call_callable_bytecode(
                     runtime,
                     crate::object::ObjectHandle(handle),
@@ -1285,6 +1342,9 @@ impl Interpreter {
                 let (base, count) = reg_list(&instr.operands, 1)?;
                 let args = read_reg_list(activation, function, base, count)?;
                 let callee_idx = crate::module::FunctionIndex(fn_index_raw);
+                // C4: CallDirect always dispatches to a static
+                // function index — record that directly.
+                frame_runtime.record_call(function, pc, callee_idx.0);
                 match self.call_direct_bytecode(runtime, _module, callee_idx, &args) {
                     Ok(value) => {
                         activation.refresh_open_upvalues_from_cells(runtime)?;
@@ -1346,6 +1406,12 @@ impl Interpreter {
                     let err = runtime.alloc_type_error("Value is not callable")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                 };
+                if let Some(callee) = runtime
+                    .objects
+                    .closure_function_index(crate::object::ObjectHandle(callable))
+                {
+                    frame_runtime.record_call(function, pc, callee.0);
+                }
                 match self.call_callable_bytecode(
                     runtime,
                     crate::object::ObjectHandle(callable),
@@ -3805,6 +3871,43 @@ fn i32_of(v: RegisterValue) -> Result<i32, InterpreterError> {
     v.as_i32().ok_or_else(|| {
         InterpreterError::TypeError(Box::from("operand expected int32 in v2 dispatch"))
     })
+}
+
+/// C4: classify `(lhs, rhs)` on the Comparison lattice for
+/// `TestEqual`/`TestEqualStrict`. Only returns Int32 when both
+/// operands are int32-tagged; both-string → String; both finite
+/// number → Number; anything else → Any (coerces away from
+/// monomorphic speculation).
+fn classify_comparison_operands(
+    lhs: RegisterValue,
+    rhs: RegisterValue,
+    objects: &crate::object::ObjectHeap,
+) -> ComparisonFeedback {
+    if lhs.as_i32().is_some() && rhs.as_i32().is_some() {
+        return ComparisonFeedback::Int32;
+    }
+    if lhs.as_number().is_some() && rhs.as_number().is_some() {
+        return ComparisonFeedback::Number;
+    }
+    // Heap strings round-trip through the ObjectHeap.
+    let (Some(lh), Some(rh)) = (lhs.as_object_handle(), rhs.as_object_handle()) else {
+        return ComparisonFeedback::Any;
+    };
+    let lhs_is_string = objects
+        .string_value(crate::object::ObjectHandle(lh))
+        .ok()
+        .flatten()
+        .is_some();
+    let rhs_is_string = objects
+        .string_value(crate::object::ObjectHandle(rh))
+        .ok()
+        .flatten()
+        .is_some();
+    if lhs_is_string && rhs_is_string {
+        ComparisonFeedback::String
+    } else {
+        ComparisonFeedback::Any
+    }
 }
 
 /// §7.1.6 ToInt32 — fast int32 pass-through, slow path falls back to

@@ -12,7 +12,6 @@ use crate::module::Function;
 use crate::object::{ObjectShapeId, PropertyInlineCache};
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // New feedback methods wired incrementally in dispatch.
 pub(super) struct FrameRuntimeState {
     /// Legacy per-instruction property IC (used by existing JIT path).
     pub(super) property_feedback: Box<[Option<PropertyInlineCache>]>,
@@ -64,7 +63,6 @@ impl FrameRuntimeState {
 
     /// Record arithmetic feedback for the instruction at `pc`.
     /// Only records if the slot at this PC is an Arithmetic kind.
-    #[allow(dead_code)]
     pub(super) fn record_arithmetic(
         &mut self,
         function: &Function,
@@ -77,7 +75,6 @@ impl FrameRuntimeState {
     }
 
     /// Record comparison feedback.
-    #[allow(dead_code)]
     pub(super) fn record_comparison(
         &mut self,
         function: &Function,
@@ -90,7 +87,6 @@ impl FrameRuntimeState {
     }
 
     /// Record branch taken/not-taken feedback.
-    #[allow(dead_code)]
     pub(super) fn record_branch(&mut self, function: &Function, pc: ProgramCounter, taken: bool) {
         if let Some(slot) = Self::feedback_slot_of_kind(function, pc, FeedbackKind::Branch) {
             self.feedback_vector.record_branch(slot, taken);
@@ -98,7 +94,6 @@ impl FrameRuntimeState {
     }
 
     /// Record property access feedback (shape + slot).
-    #[allow(dead_code)]
     pub(super) fn record_property(
         &mut self,
         function: &Function,
@@ -113,7 +108,6 @@ impl FrameRuntimeState {
     }
 
     /// Record call target feedback.
-    #[allow(dead_code)]
     pub(super) fn record_call(&mut self, function: &Function, pc: ProgramCounter, target: u32) {
         if let Some(slot) = Self::feedback_slot_of_kind(function, pc, FeedbackKind::Call) {
             self.feedback_vector.record_call(slot, target);
@@ -138,7 +132,6 @@ impl FrameRuntimeState {
     }
 
     /// Get a reference to the full feedback vector (for JIT consumption).
-    #[allow(dead_code)]
     pub(super) fn feedback(&self) -> &FeedbackVector {
         &self.feedback_vector
     }

@@ -178,14 +178,18 @@ pub struct RuntimeState {
 /// Empirically each `run_completion_with_runtime` activation consumes
 /// 60–100 KB of native Rust stack in debug builds (register box, shadow
 /// stack push, frame-runtime state, dispatch locals without inlining).
-/// 24 × 100 KB ≈ 2.4 MB is already on the edge, so this limit is the
-/// ceiling a test thread can sustain without `SIGSEGV`.
+/// 24 × 100 KB ≈ 2.4 MB was already on the edge in the debug test
+/// thread; after C4 wired record_branch/record_comparison/record_call
+/// into every dispatch iteration the per-activation frame grew a
+/// little more, so the cap dropped to 20 (≈ 2.0 MB) to keep
+/// `s2_unbounded_recursion_surfaces_as_range_error` reaching the
+/// RangeError before the Rust thread stack itself overflows.
 ///
 /// This is intentionally far lower than V8's ~12 000 default — raising
 /// it requires task **C6** (per-call allocation elimination and frame
 /// slimming) to shrink per-activation native stack usage. See
 /// `PRODUCTION_READINESS_PLAN.md` §8 [C6].
-pub const MAX_JS_STACK_DEPTH: u32 = 24;
+pub const MAX_JS_STACK_DEPTH: u32 = 20;
 
 /// Minimal interpreter shell for the new VM backend.
 #[derive(Debug, Clone)]

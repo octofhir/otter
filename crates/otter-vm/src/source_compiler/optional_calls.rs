@@ -87,7 +87,7 @@ pub(super) fn lower_optional_call<'a>(
                             ))
                         })?;
                     if member.optional {
-                        emit_optional_nullish_short_circuit(builder, receiver_temp, short_circuit)?;
+                        emit_optional_nullish_short_circuit(builder, ctx, receiver_temp, short_circuit)?;
                     }
                     let pc = builder
                         .emit(
@@ -109,7 +109,7 @@ pub(super) fn lower_optional_call<'a>(
                             "encode Star (optional callee): {err:?}"
                         ))
                     })?;
-                emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+                emit_optional_nullish_short_circuit(builder, ctx, callee_temp, short_circuit)?;
                 emit_call_args_and_invoke(
                     builder,
                     ctx,
@@ -167,7 +167,7 @@ pub(super) fn lower_optional_call<'a>(
                             ))
                         })?;
                     if member.optional {
-                        emit_optional_nullish_short_circuit(builder, receiver_temp, short_circuit)?;
+                        emit_optional_nullish_short_circuit(builder, ctx, receiver_temp, short_circuit)?;
                     }
                 }
                 lower_return_expression(builder, ctx, &member.expression)?;
@@ -218,7 +218,7 @@ pub(super) fn lower_optional_call<'a>(
                             "encode Star (optional callee[k]): {err:?}"
                         ))
                     })?;
-                emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+                emit_optional_nullish_short_circuit(builder, ctx, callee_temp, short_circuit)?;
                 emit_call_args_and_invoke(
                     builder,
                     ctx,
@@ -260,7 +260,7 @@ pub(super) fn lower_optional_call<'a>(
                         "encode Star (optional direct callee): {err:?}"
                     ))
                 })?;
-            emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+            emit_optional_nullish_short_circuit(builder, ctx, callee_temp, short_circuit)?;
             builder.emit(Opcode::LdaUndefined, &[]).map_err(|err| {
                 SourceLoweringError::Internal(format!(
                     "encode LdaUndefined (optional spread recv): {err:?}"
@@ -274,7 +274,7 @@ pub(super) fn lower_optional_call<'a>(
                     ))
                 })?;
             emit_spread_call_arguments_array(builder, ctx, call, args_base)?;
-            builder
+            let call_pc = builder
                 .emit(
                     Opcode::CallSpread,
                     &[
@@ -291,6 +291,7 @@ pub(super) fn lower_optional_call<'a>(
                         "encode CallSpread (optional direct): {err:?}"
                     ))
                 })?;
+            ctx.attach_call_feedback(builder, call_pc);
             Ok(())
         })();
         ctx.release_temps(3);
@@ -311,9 +312,9 @@ pub(super) fn lower_optional_call<'a>(
                     "encode Star (optional direct callee): {err:?}"
                 ))
             })?;
-        emit_optional_nullish_short_circuit(builder, callee_temp, short_circuit)?;
+        emit_optional_nullish_short_circuit(builder, ctx, callee_temp, short_circuit)?;
         lower_call_arguments_into_temps(builder, ctx, call, args_base)?;
-        builder
+        let call_pc = builder
             .emit(
                 Opcode::CallUndefinedReceiver,
                 &[
@@ -329,6 +330,7 @@ pub(super) fn lower_optional_call<'a>(
                     "encode CallUndefinedReceiver (optional direct): {err:?}"
                 ))
             })?;
+        ctx.attach_call_feedback(builder, call_pc);
         Ok(())
     })();
     if argc > 0 {

@@ -3966,6 +3966,19 @@ impl ObjectHeap {
         }
     }
 
+    /// C4: returns the `FunctionIndex` for a Closure-kind handle, or
+    /// `None` if the handle does not point to a `HeapValue::Closure`
+    /// (e.g. bound function, native/host callable, proxy). Used by
+    /// the interpreter's call-site feedback to populate the
+    /// monomorphic/polymorphic call-target IC.
+    #[must_use]
+    pub fn closure_function_index(&self, handle: ObjectHandle) -> Option<FunctionIndex> {
+        match self.object(handle).ok()? {
+            HeapValue::Closure { callee, .. } => Some(*callee),
+            _ => None,
+        }
+    }
+
     /// Walks the arrow-chain of lexical parent closures until a non-arrow
     /// closure is reached, returning that non-arrow ancestor (or `None`
     /// when the starting handle is not a closure).

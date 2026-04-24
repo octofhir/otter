@@ -98,13 +98,14 @@ fn lower_classic_for_after_using_init<'a>(
             SourceLoweringError::Internal(format!("encode LdaTrue (for using): {err:?}"))
         })?;
     }
-    builder
+    let jump_pc = builder
         .emit_jump_to(Opcode::JumpIfToBooleanFalse, loop_exit)
         .map_err(|err| {
             SourceLoweringError::Internal(format!(
                 "encode JumpIfToBooleanFalse (for using): {err:?}"
             ))
         })?;
+    ctx.attach_branch_feedback(builder, jump_pc);
 
     ctx.enter_loop(LoopLabels {
         break_label: loop_exit,

@@ -50,7 +50,7 @@ fn install_url(runtime: &mut RuntimeState) -> Result<(), String> {
     if has_global(runtime, "URL") {
         return Ok(());
     }
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, callback, arity, context) in [
         ("toString", url_to_string as _, 0, "URL.prototype.toString"),
         ("toJSON", url_to_json as _, 0, "URL.prototype.toJSON"),
@@ -141,7 +141,7 @@ fn install_url(runtime: &mut RuntimeState) -> Result<(), String> {
         install_accessor(runtime, prototype, name, getter, setter, context)?;
     }
 
-    let constructor = alloc_constructor(runtime, "URL", 1, url_constructor);
+    let constructor = alloc_constructor(runtime, "URL", 1, url_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     // W1: URL.canParse — §4.3 static method. Returns true iff the
     // supplied string parses without throwing.
@@ -161,7 +161,7 @@ fn install_url_search_params(runtime: &mut RuntimeState) -> Result<(), String> {
     if has_global(runtime, "URLSearchParams") {
         return Ok(());
     }
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, callback, arity, context) in [
         (
             "append",
@@ -224,7 +224,7 @@ fn install_url_search_params(runtime: &mut RuntimeState) -> Result<(), String> {
     )?;
 
     let constructor =
-        alloc_constructor(runtime, "URLSearchParams", 1, url_search_params_constructor);
+        alloc_constructor(runtime, "URLSearchParams", 1, url_search_params_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value(
         "URLSearchParams",
@@ -241,15 +241,17 @@ fn url_constructor(
     let input = string_arg(runtime, args.first(), "URL: missing input")?;
     let parsed = parse_url_arg(runtime, &input, args.get(1))?;
     let prototype = class_prototype(runtime, "URL")?;
-    let instance = runtime.alloc_native_object_with_prototype(
-        Some(prototype),
-        UrlPayload {
-            shared: Arc::new(Mutex::new(UrlState {
-                url: parsed,
-                search_params_object: None,
-            })),
-        },
-    );
+    let instance = runtime
+        .alloc_native_object_with_prototype(
+            Some(prototype),
+            UrlPayload {
+                shared: Arc::new(Mutex::new(UrlState {
+                    url: parsed,
+                    search_params_object: None,
+                })),
+            },
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -449,12 +451,14 @@ fn url_get_search_params(
     }
 
     let prototype = class_prototype(runtime, "URLSearchParams")?;
-    let object = runtime.alloc_native_object_with_prototype(
-        Some(prototype),
-        UrlSearchParamsPayload {
-            backing: UrlSearchParamsBacking::Linked(shared.clone()),
-        },
-    );
+    let object = runtime
+        .alloc_native_object_with_prototype(
+            Some(prototype),
+            UrlSearchParamsPayload {
+                backing: UrlSearchParamsBacking::Linked(shared.clone()),
+            },
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     {
         let mut state = shared
             .lock()
@@ -690,12 +694,14 @@ fn url_search_params_constructor(
         .unwrap_or_else(RegisterValue::undefined);
     let params = parse_search_params_init(runtime, init)?;
     let prototype = class_prototype(runtime, "URLSearchParams")?;
-    let object = runtime.alloc_native_object_with_prototype(
-        Some(prototype),
-        UrlSearchParamsPayload {
-            backing: UrlSearchParamsBacking::Standalone(Arc::new(Mutex::new(params))),
-        },
-    );
+    let object = runtime
+        .alloc_native_object_with_prototype(
+            Some(prototype),
+            UrlSearchParamsPayload {
+                backing: UrlSearchParamsBacking::Standalone(Arc::new(Mutex::new(params))),
+            },
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
@@ -763,7 +769,7 @@ fn url_search_params_get_all(
         .into_iter()
         .filter_map(|(key, value)| (key == name).then_some(string_value(runtime, value)))
         .collect();
-    let array = runtime.alloc_array_with_elements(&values);
+    let array = runtime.alloc_array_with_elements(&values).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(array.0))
 }
 
@@ -1126,7 +1132,10 @@ fn string_arg(
 }
 
 fn string_value(runtime: &mut RuntimeState, value: impl Into<Box<str>>) -> RegisterValue {
-    RegisterValue::from_object_handle(runtime.alloc_string(value).0)
+    match runtime.alloc_string(value) {
+        Ok(handle) => RegisterValue::from_object_handle(handle.0),
+        Err(_) => RegisterValue::undefined(),
+    }
 }
 
 fn has_global(runtime: &mut RuntimeState, name: &str) -> bool {
@@ -1198,10 +1207,12 @@ fn alloc_constructor(
         &[RegisterValue],
         &mut RuntimeState,
     ) -> Result<RegisterValue, VmNativeCallError>,
-) -> ObjectHandle {
+) -> Result<ObjectHandle, String> {
     let descriptor = NativeFunctionDescriptor::constructor(name, arity, callback);
     let id = runtime.register_native_function(descriptor);
-    runtime.alloc_host_function(id)
+    runtime
+        .alloc_host_function(id)
+        .map_err(|e| format!("failed to allocate constructor {name}: {e:?}"))
 }
 
 fn install_method(
@@ -1218,7 +1229,9 @@ fn install_method(
 ) -> Result<(), String> {
     let descriptor = NativeFunctionDescriptor::method(name, arity, callback);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime
+        .alloc_host_function(id)
+        .map_err(|e| format!("failed to allocate method {context}: {e:?}"))?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()
@@ -1262,12 +1275,19 @@ fn install_accessor(
 ) -> Result<(), String> {
     let getter_desc = NativeFunctionDescriptor::getter(name, getter);
     let getter_id = runtime.register_native_function(getter_desc);
-    let getter_handle = runtime.alloc_host_function(getter_id);
-    let setter_handle = setter.map(|cb| {
-        let desc = NativeFunctionDescriptor::setter(name, cb);
-        let id = runtime.register_native_function(desc);
-        runtime.alloc_host_function(id)
-    });
+    let getter_handle = runtime.alloc_host_function(getter_id).map_err(|e| format!("{e:?}"))?;
+    let setter_handle = match setter {
+        Some(cb) => {
+            let desc = NativeFunctionDescriptor::setter(name, cb);
+            let id = runtime.register_native_function(desc);
+            Some(
+                runtime
+                    .alloc_host_function(id)
+                    .map_err(|e| format!("failed to allocate setter {name}: {e:?}"))?,
+            )
+        }
+        None => None,
+    };
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()
@@ -1294,7 +1314,9 @@ fn install_static_method(
 ) -> Result<(), String> {
     let descriptor = NativeFunctionDescriptor::method(name, arity, callback);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime
+        .alloc_host_function(id)
+        .map_err(|e| format!("failed to allocate static method {context}: {e:?}"))?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()

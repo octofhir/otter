@@ -78,7 +78,7 @@ fn ensure_process_object(runtime: &mut RuntimeState) -> Result<ObjectHandle, Str
         return Ok(handle);
     }
 
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     let members = burrow! {
         fns = [
             process_cwd,
@@ -147,7 +147,7 @@ fn ensure_process_object(runtime: &mut RuntimeState) -> Result<ObjectHandle, Str
         cwd: process.cwd.clone(),
         umask: 0o022,
         listeners: Vec::new(),
-    });
+    }).map_err(|e| format!("{e:?}"))?;
     install_readonly_value(
         runtime,
         object,
@@ -502,7 +502,7 @@ fn env_value(
     capabilities: &otter_runtime::Capabilities,
     env_store: &otter_runtime::IsolatedEnvStore,
 ) -> Result<RegisterValue, String> {
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     let mut entries: Vec<_> = env_store
         .to_hash_map()
         .into_iter()
@@ -519,7 +519,7 @@ fn env_value(
 }
 
 fn versions_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> {
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     let node = string_value(runtime, OTTER_VERSION);
     let otter = string_value(runtime, OTTER_VERSION);
     install_readonly_value(runtime, object, "node", node)?;
@@ -528,14 +528,14 @@ fn versions_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> {
 }
 
 fn release_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> {
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     let name = string_value(runtime, "node");
     install_readonly_value(runtime, object, "name", name)?;
     Ok(RegisterValue::from_object_handle(object.0))
 }
 
 fn features_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> {
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, value) in [
         ("inspector", false),
         ("debug", false),
@@ -557,8 +557,8 @@ fn features_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> {
 }
 
 fn config_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> {
-    let config = runtime.alloc_object();
-    let variables = runtime.alloc_object();
+    let config = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
+    let variables = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_readonly_value(
         runtime,
         variables,
@@ -569,15 +569,19 @@ fn config_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> {
     install_readonly_value(runtime, variables, "asan", RegisterValue::from_i32(0))?;
     let napi_build_version = string_value(runtime, "9");
     install_readonly_value(runtime, variables, "napi_build_version", napi_build_version)?;
-    let builtin_shareables =
-        RegisterValue::from_object_handle(runtime.alloc_array_with_elements(&[]).0);
+    let builtin_shareables = RegisterValue::from_object_handle(
+        runtime
+            .alloc_array_with_elements(&[])
+            .map_err(|e| format!("{e:?}"))?
+            .0,
+    );
     install_readonly_value(
         runtime,
         variables,
         "node_builtin_shareable_builtins",
         builtin_shareables,
     )?;
-    let target_defaults = runtime.alloc_object();
+    let target_defaults = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     let default_configuration = string_value(runtime, "Release");
     install_readonly_value(
         runtime,
@@ -605,7 +609,7 @@ fn stream_value(
     name: &str,
     is_tty: bool,
 ) -> Result<RegisterValue, String> {
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_readonly_value(runtime, object, "isTTY", RegisterValue::from_bool(is_tty))?;
     let callback = match name {
         "stdout" => process_stdout_write,
@@ -703,7 +707,10 @@ fn string_array_value(runtime: &mut RuntimeState, values: &[String]) -> Register
         .iter()
         .map(|value| string_value(runtime, value))
         .collect();
-    RegisterValue::from_object_handle(runtime.alloc_array_with_elements(&values).0)
+    match runtime.alloc_array_with_elements(&values) {
+        Ok(handle) => RegisterValue::from_object_handle(handle.0),
+        Err(_) => RegisterValue::undefined(),
+    }
 }
 
 fn node_platform() -> &'static str {

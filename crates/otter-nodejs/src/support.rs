@@ -3,7 +3,13 @@ use otter_vm::descriptors::NativeFunctionDescriptor;
 use otter_vm::object::PropertyDescriptor;
 
 pub(crate) fn string_value(runtime: &mut RuntimeState, value: impl AsRef<str>) -> RegisterValue {
-    RegisterValue::from_object_handle(runtime.alloc_string(value.as_ref()).0)
+    // S3-b: `alloc_string` is fallible. For parked-crate bootstrap,
+    // fall back to `undefined` so the installer emits a visibly-wrong
+    // result rather than panicking.
+    match runtime.alloc_string(value.as_ref()) {
+        Ok(handle) => RegisterValue::from_object_handle(handle.0),
+        Err(_) => RegisterValue::undefined(),
+    }
 }
 
 pub(crate) fn install_value(
@@ -53,7 +59,9 @@ pub(crate) fn install_method(
 ) -> Result<(), String> {
     let descriptor = NativeFunctionDescriptor::method(name, arity, callback);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime
+        .alloc_host_function(id)
+        .map_err(|error| format!("failed to allocate host function for {context}: {error:?}"))?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()

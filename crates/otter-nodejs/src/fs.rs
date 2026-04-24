@@ -46,13 +46,15 @@ fn fs_export_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> 
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
-    let payload = runtime.alloc_native_object(FsPayload {
-        shared: Arc::new(Mutex::new(FsState {
-            next_fd: START_FD,
-            files: BTreeMap::new(),
-        })),
-    });
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
+    let payload = runtime
+        .alloc_native_object(FsPayload {
+            shared: Arc::new(Mutex::new(FsState {
+                next_fd: START_FD,
+                files: BTreeMap::new(),
+            })),
+        })
+        .map_err(|e| format!("{e:?}"))?;
 
     for (name, arity, callback) in [
         ("existsSync", 1, fs_exists_sync as _),
@@ -82,7 +84,7 @@ fn fs_export_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> 
         RegisterValue::from_object_handle(payload.0),
     )?;
 
-    let constants = runtime.alloc_object();
+    let constants = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_readonly_value(runtime, constants, "NOATIME", RegisterValue::from_i32(0))?;
     install_readonly_value(
         runtime,
@@ -119,7 +121,7 @@ fn fs_read_file_sync(
         return Ok(string_value(runtime, String::from_utf8_lossy(&bytes)));
     }
     Ok(RegisterValue::from_object_handle(
-        alloc_uint8_array(runtime, bytes).0,
+        alloc_uint8_array(runtime, bytes)?.0,
     ))
 }
 
@@ -263,9 +265,10 @@ fn fs_readdir_sync(
         })?;
         names.push(string_value(runtime, entry.file_name().to_string_lossy()));
     }
-    Ok(RegisterValue::from_object_handle(
-        runtime.alloc_array_with_elements(&names).0,
-    ))
+    let handle = runtime
+        .alloc_array_with_elements(&names)
+        .map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 fn fs_statfs_sync(
@@ -274,7 +277,7 @@ fn fs_statfs_sync(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let path = path_arg(runtime, args.first().copied())?;
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -371,10 +374,14 @@ fn encoding_arg(runtime: &mut RuntimeState, value: Option<RegisterValue>) -> Opt
     })
 }
 
-fn alloc_uint8_array(runtime: &mut RuntimeState, bytes: Vec<u8>) -> ObjectHandle {
+fn alloc_uint8_array(
+    runtime: &mut RuntimeState,
+    bytes: Vec<u8>,
+) -> Result<ObjectHandle, VmNativeCallError> {
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(bytes, None);
+        .alloc_array_buffer_with_data(bytes, None)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let (_, prototype) = runtime
         .intrinsics()
         .typed_array_constructor_prototype(TypedArrayKind::Uint8);
@@ -382,13 +389,16 @@ fn alloc_uint8_array(runtime: &mut RuntimeState, bytes: Vec<u8>) -> ObjectHandle
         .objects()
         .array_buffer_byte_length(buffer)
         .unwrap_or_default();
-    runtime.objects_mut().alloc_typed_array(
-        TypedArrayKind::Uint8,
-        buffer,
-        0,
-        byte_length,
-        Some(prototype),
-    )
+    runtime
+        .objects_mut()
+        .alloc_typed_array(
+            TypedArrayKind::Uint8,
+            buffer,
+            0,
+            byte_length,
+            Some(prototype),
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))
 }
 
 fn write_buffer(

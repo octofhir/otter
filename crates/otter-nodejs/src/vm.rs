@@ -18,7 +18,7 @@ fn vm_export_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String> 
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_method(
         runtime,
         export,
@@ -52,11 +52,17 @@ fn vm_create_context(
     args: &[RegisterValue],
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    Ok(args
+    if let Some(existing) = args
         .first()
         .copied()
         .filter(|value| value.as_object_handle().is_some())
-        .unwrap_or_else(|| RegisterValue::from_object_handle(runtime.alloc_object().0)))
+    {
+        return Ok(existing);
+    }
+    let handle = runtime
+        .alloc_object()
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 fn vm_run_in_context(

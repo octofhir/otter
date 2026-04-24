@@ -743,7 +743,7 @@ fn expand_lodge_module(input: LodgeInput) -> TokenStream {
 
     let default_setup = match default.clone() {
         Some(LodgeDefault::Object) => quote! {
-            let default_object = Some(runtime.alloc_object());
+            let default_object = Some(runtime.alloc_object().map_err(|err| format!("{err:?}"))?);
             let default_value: Option<::otter_runtime::RegisterValue> = None;
         },
         Some(LodgeDefault::Function(function)) => {
@@ -878,7 +878,7 @@ fn expand_lodge_module(input: LodgeInput) -> TokenStream {
                 &self,
                 runtime: &mut ::otter_runtime::RuntimeState,
             ) -> Result<::otter_runtime::HostedNativeModule, String> {
-                let namespace = runtime.alloc_object();
+                let namespace = runtime.alloc_object().map_err(|err| format!("{err:?}"))?;
                 #default_setup
                 #(#function_exports)*
                 #(#value_exports)*

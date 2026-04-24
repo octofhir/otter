@@ -21,7 +21,7 @@ fn url_export_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String>
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     let global = runtime.intrinsics().global_object();
     for name in ["URL", "URLSearchParams"] {
         let property = runtime.intern_property_name(name);

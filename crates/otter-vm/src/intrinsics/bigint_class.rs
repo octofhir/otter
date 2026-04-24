@@ -250,8 +250,33 @@ fn number_to_bigint(
             &format!("The number {n} cannot be converted to a BigInt because it is not an integer"),
         ));
     }
-    let val = n as i64;
-    let handle = runtime.alloc_bigint(&val.to_string())?;
+    // C12: Bit-exact IEEE754 → BigInt so values outside i64 range (e.g. 2**60,
+    // 9.223e18) don't truncate. Reconstruct (mantissa | implicit 1) << exponent
+    // from the raw bits; the `fract() == 0.0` precondition guarantees the
+    // adjusted exponent is ≥ -52 in magnitude once mantissa shift is absorbed.
+    let bits = n.to_bits();
+    let sign_bit = bits >> 63;
+    let exponent_raw = ((bits >> 52) & 0x7FF) as i32;
+    let mantissa_raw = bits & ((1u64 << 52) - 1);
+
+    let big = if exponent_raw == 0 && mantissa_raw == 0 {
+        // ±0.
+        num_bigint::BigInt::from(0)
+    } else {
+        let mantissa = mantissa_raw | (1u64 << 52);
+        let exponent = exponent_raw - 1023 - 52;
+        let mut value = num_bigint::BigInt::from(mantissa);
+        if exponent > 0 {
+            value <<= exponent as usize;
+        } else if exponent < 0 {
+            // Safe: `n.fract() == 0.0` implies the low (-exponent) bits of
+            // `mantissa` are zero, so this right shift is lossless.
+            value >>= (-exponent) as usize;
+        }
+        if sign_bit == 1 { -value } else { value }
+    };
+
+    let handle = runtime.alloc_bigint(&big.to_string())?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 

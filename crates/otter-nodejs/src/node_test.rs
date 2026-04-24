@@ -17,7 +17,7 @@ fn node_test_export_value(runtime: &mut RuntimeState) -> Result<RegisterValue, S
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for name in ["test", "it", "describe", "suite"] {
         install_method(
             runtime,

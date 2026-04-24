@@ -305,7 +305,12 @@ lodge!(
     values = [
         (
             "suffix",
-            RegisterValue::from_object_handle(runtime.alloc_string(platform_suffix()).0)
+            RegisterValue::from_object_handle(
+                runtime
+                    .alloc_string(platform_suffix())
+                    .map_err(|e| format!("{e:?}"))?
+                    .0
+            )
         ),
         (
             "read",
@@ -339,8 +344,8 @@ fn ffi_dlopen(
     let object = runtime.alloc_native_object(FfiLibraryPayload {
         path: path.clone().into_boxed_str(),
         state: shared.clone(),
-    });
-    let symbols = runtime.alloc_object();
+    }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    let symbols = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
 
     let mut symbol_names: Vec<_> = signatures.keys().cloned().collect();
     symbol_names.sort();
@@ -348,8 +353,9 @@ fn ffi_dlopen(
         let symbol = runtime.alloc_native_object(FfiSymbolPayload {
             name: name.clone().into_boxed_str(),
             state: shared.clone(),
-        });
-        let target = alloc_named_function(runtime, &name, 0, ffi_symbol_call);
+        }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        let target = alloc_named_function(runtime, &name, 0, ffi_symbol_call)
+            .map_err(|e| VmNativeCallError::Internal(e.into()))?;
         let target_realm = runtime.get_function_realm(target);
         let bound = runtime
             .objects_mut()
@@ -474,7 +480,7 @@ fn ffi_library_path(
         payload.path.clone()
     };
     Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string(path).0,
+        runtime.alloc_string(path).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
     ))
 }
 
@@ -695,7 +701,7 @@ fn ffi_read_cstring(
     }
     .map_err(|error| ffi_error(runtime, error))?;
     Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string(value).0,
+        runtime.alloc_string(value).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
     ))
 }
 
@@ -815,7 +821,8 @@ fn ffi_to_array_buffer(
     let prototype = Some(runtime.intrinsics().array_buffer_prototype());
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(data, prototype);
+        .alloc_array_buffer_with_data(data, prototype)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(buffer.0))
 }
 
@@ -857,7 +864,7 @@ fn ffi_link_symbols(
         args.first(),
         "ffi.linkSymbols: symbol declarations must be an object",
     )?;
-    let symbols = runtime.alloc_object();
+    let symbols = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let mut entries = Vec::new();
     for key in runtime.enumerable_own_property_keys(declarations)? {
         runtime.check_interrupt()?;
@@ -898,7 +905,7 @@ fn ffi_link_symbols(
             })?;
     }
 
-    let library = runtime.alloc_object();
+    let library = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let symbols_property = runtime.intern_property_name("symbols");
     runtime
         .objects_mut()
@@ -1033,7 +1040,7 @@ fn ffi_js_callback(
         callback,
         closure: callback_state,
         code_ptr,
-    });
+    }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let ptr_property = runtime.intern_property_name("ptr");
     runtime
         .objects_mut()
@@ -1158,13 +1165,14 @@ fn build_direct_callable(
         name: name.to_string().into_boxed_str(),
         fn_ptr,
         signature: signature.clone(),
-    });
+    }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let target = alloc_named_function(
         runtime,
         name,
         u16::try_from(signature.args.len()).unwrap_or(u16::MAX),
         ffi_bound_callable_call,
-    );
+    )
+    .map_err(|e| VmNativeCallError::Internal(e.into()))?;
     let target_realm = runtime.get_function_realm(target);
     runtime
         .objects_mut()
@@ -1396,7 +1404,7 @@ fn marshal_raw_to_value(
                 .to_string_lossy()
                 .into_owned();
             Ok(RegisterValue::from_object_handle(
-                runtime.alloc_string(string).0,
+                runtime.alloc_string(string).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
             ))
         }
     }
@@ -1529,7 +1537,7 @@ fn platform_suffix() -> &'static str {
 }
 
 fn build_read_namespace(runtime: &mut RuntimeState) -> Result<ObjectHandle, String> {
-    let namespace = runtime.alloc_object();
+    let namespace = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_function(namespace, runtime, "u8", 2, ffi_read_u8)?;
     install_function(namespace, runtime, "i8", 2, ffi_read_i8)?;
     install_function(namespace, runtime, "u16", 2, ffi_read_u16)?;
@@ -1547,7 +1555,7 @@ fn build_read_namespace(runtime: &mut RuntimeState) -> Result<ObjectHandle, Stri
 }
 
 fn build_ffi_type_object(runtime: &mut RuntimeState) -> Result<ObjectHandle, String> {
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for ty in [
         FFIType::Char,
         FFIType::I8,
@@ -1588,7 +1596,7 @@ fn install_function(
         &mut RuntimeState,
     ) -> Result<RegisterValue, VmNativeCallError>,
 ) -> Result<(), String> {
-    let function = alloc_named_function(runtime, name, arity, callback);
+    let function = alloc_named_function(runtime, name, arity, callback)?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()
@@ -1612,7 +1620,8 @@ fn install_method(
         &mut RuntimeState,
     ) -> Result<RegisterValue, VmNativeCallError>,
 ) -> Result<(), VmNativeCallError> {
-    let function = alloc_named_function(runtime, name, arity, callback);
+    let function = alloc_named_function(runtime, name, arity, callback)
+        .map_err(|e| VmNativeCallError::Internal(e.into()))?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()
@@ -1641,7 +1650,7 @@ fn install_getter(
 ) -> Result<(), VmNativeCallError> {
     let descriptor = NativeFunctionDescriptor::getter(name, callback);
     let getter_id = runtime.register_native_function(descriptor);
-    let getter = runtime.alloc_host_function(getter_id);
+    let getter = runtime.alloc_host_function(getter_id).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()
@@ -1663,10 +1672,12 @@ fn alloc_named_function(
         &[RegisterValue],
         &mut RuntimeState,
     ) -> Result<RegisterValue, VmNativeCallError>,
-) -> ObjectHandle {
+) -> Result<ObjectHandle, String> {
     let descriptor = NativeFunctionDescriptor::method(name, arity, callback);
     let function = runtime.register_native_function(descriptor);
-    runtime.alloc_host_function(function)
+    runtime
+        .alloc_host_function(function)
+        .map_err(|e| format!("failed to allocate ffi function {name}: {e:?}"))
 }
 
 fn required_string_arg(

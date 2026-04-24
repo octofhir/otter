@@ -465,14 +465,18 @@ fn string_char_code_at(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
+    // C13: read WTF-16 code units directly so lone surrogates survive
+    // round-trip. Previously went through `js_to_string` → UTF-8 which
+    // replaced unpaired surrogates with U+FFFD.
+    let js = this_js_string_value(this, runtime)?;
     let pos = int_arg(args, 0, 0);
-    // ES uses UTF-16 code units; approximate with chars for BMP.
-    let code_units: Vec<u16> = s.encode_utf16().collect();
-    if pos < 0 || (pos as usize) >= code_units.len() {
+    if pos < 0 {
         return Ok(RegisterValue::from_number(f64::NAN));
     }
-    Ok(RegisterValue::from_i32(code_units[pos as usize] as i32))
+    match js.code_unit_at(pos as usize) {
+        Some(unit) => Ok(RegisterValue::from_i32(unit as i32)),
+        None => Ok(RegisterValue::from_number(f64::NAN)),
+    }
 }
 
 // ── §22.1.3.4 String.prototype.codePointAt(pos) ────────────────────────────
@@ -1319,12 +1323,41 @@ fn string_replace_all(
 
 fn string_normalize(
     this: &RegisterValue,
-    _args: &[RegisterValue],
+    args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    // Minimal: return as-is (NFC is identity for ASCII/Latin-1).
+    // §22.1.3.13 String.prototype.normalize([form])
+    // <https://tc39.es/ecma262/#sec-string.prototype.normalize>
+    use unicode_normalization::UnicodeNormalization;
+
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(&*s)?;
+
+    // C10: step 4 — coerce `form` to string (default "NFC"), reject
+    // anything else with a RangeError. Previously returned input unchanged.
+    let form_arg = args.first().copied().unwrap_or(RegisterValue::undefined());
+    let form: String = if form_arg == RegisterValue::undefined() {
+        "NFC".to_string()
+    } else {
+        runtime
+            .js_to_string(form_arg)
+            .map_err(|error| map_interpreter_error(error, runtime))?
+            .into_string()
+    };
+
+    let normalized: String = match form.as_str() {
+        "NFC" => s.nfc().collect(),
+        "NFD" => s.nfd().collect(),
+        "NFKC" => s.nfkc().collect(),
+        "NFKD" => s.nfkd().collect(),
+        _ => {
+            return Err(range_error(
+                runtime,
+                "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
+            ));
+        }
+    };
+
+    let handle = runtime.alloc_string(normalized)?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -1541,8 +1574,12 @@ fn string_from_char_code(
         let code_unit = f64_to_uint16(n);
         buf.push(code_unit);
     }
-    let result = String::from_utf16_lossy(&buf);
-    let handle = runtime.alloc_string(result)?;
+    // C13: preserve WTF-16 so `String.fromCharCode(0xD800)` actually
+    // returns a string containing the lone high surrogate rather than
+    // U+FFFD. Going through `String::from_utf16_lossy` → `alloc_string`
+    // would round-trip lone surrogates through UTF-8 and silently
+    // replace each one with the Unicode replacement character.
+    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16_vec(buf))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

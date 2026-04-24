@@ -258,7 +258,7 @@ fn sql_open(
         is_memory,
         in_transaction: false,
         last_insert_row_id: None,
-    });
+    }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
 
     let members = burrow! {
         fns = [
@@ -327,7 +327,7 @@ fn sql_execute_meta(
         payload.last_insert_row_id = meta.last_insert_row_id;
         Ok(meta)
     })?;
-    let object = runtime.alloc_object();
+    let object = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let rows_affected = runtime.intern_property_name("rowsAffected");
     let last_insert_row_id = runtime.intern_property_name("lastInsertRowId");
     runtime
@@ -477,7 +477,7 @@ fn sql_adapter(
         payload.adapter
     };
     Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string(adapter).0,
+        runtime.alloc_string(adapter).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
     ))
 }
 
@@ -500,7 +500,7 @@ fn sql_path(
         payload.path.clone()
     };
     Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string(path).0,
+        runtime.alloc_string(path).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
     ))
 }
 
@@ -771,7 +771,7 @@ fn json_array_to_js(
         values.push(json_to_register(&row, runtime, 0)?);
     }
     Ok(RegisterValue::from_object_handle(
-        runtime.alloc_array_with_elements(&values).0,
+        runtime.alloc_array_with_elements(&values).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
     ))
 }
 
@@ -875,7 +875,7 @@ fn json_to_register(
             )?))
         }
         JsonValue::String(string) => Ok(RegisterValue::from_object_handle(
-            runtime.alloc_string(string.clone()).0,
+            runtime.alloc_string(string.clone()).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
         )),
         JsonValue::Array(values) => {
             let mut elements = Vec::with_capacity(values.len());
@@ -884,11 +884,11 @@ fn json_to_register(
                 elements.push(json_to_register(value, runtime, depth + 1)?);
             }
             Ok(RegisterValue::from_object_handle(
-                runtime.alloc_array_with_elements(&elements).0,
+                runtime.alloc_array_with_elements(&elements).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
             ))
         }
         JsonValue::Object(entries) => {
-            let object = runtime.alloc_object();
+            let object = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
             for (index, (key, value)) in entries.iter().enumerate() {
                 check_json_interrupt(runtime, index)?;
                 let property = runtime.intern_property_name(key);

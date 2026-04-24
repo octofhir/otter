@@ -132,7 +132,7 @@ fn install_readable_stream(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_method(
         runtime,
         prototype,
@@ -166,7 +166,7 @@ fn install_readable_stream(runtime: &mut RuntimeState) -> Result<(), String> {
         "ReadableStream.prototype[Symbol.asyncIterator]",
     )?;
 
-    let constructor = alloc_constructor(runtime, "ReadableStream", 0, readable_stream_constructor);
+    let constructor = alloc_constructor(runtime, "ReadableStream", 0, readable_stream_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value(
         "ReadableStream",
@@ -180,7 +180,7 @@ fn install_readable_stream_default_reader(runtime: &mut RuntimeState) -> Result<
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_method(
         runtime,
         prototype,
@@ -211,7 +211,7 @@ fn install_readable_stream_default_reader(runtime: &mut RuntimeState) -> Result<
         "ReadableStreamDefaultReader",
         1,
         readable_stream_default_reader_constructor,
-    );
+    )?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value(
         "ReadableStreamDefaultReader",
@@ -225,7 +225,7 @@ fn install_request(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, callback, arity, context) in [
         (
             "arrayBuffer",
@@ -277,7 +277,7 @@ fn install_request(runtime: &mut RuntimeState) -> Result<(), String> {
         install_getter(runtime, prototype, name, callback, context)?;
     }
 
-    let constructor = alloc_constructor(runtime, "Request", 1, request_constructor);
+    let constructor = alloc_constructor(runtime, "Request", 1, request_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value("Request", RegisterValue::from_object_handle(constructor.0));
     Ok(())
@@ -290,7 +290,7 @@ fn install_fetch(runtime: &mut RuntimeState) -> Result<(), String> {
 
     let descriptor = otter_vm::NativeFunctionDescriptor::method("fetch", 1, fetch_global);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime.alloc_host_function(id).map_err(|e| format!("{e:?}"))?;
     runtime.install_global_value("fetch", RegisterValue::from_object_handle(function.0));
     Ok(())
 }
@@ -300,7 +300,7 @@ fn install_response(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, callback, arity, context) in [
         (
             "arrayBuffer",
@@ -364,7 +364,7 @@ fn install_response(runtime: &mut RuntimeState) -> Result<(), String> {
         install_getter(runtime, prototype, name, callback, context)?;
     }
 
-    let constructor = alloc_constructor(runtime, "Response", 0, response_constructor);
+    let constructor = alloc_constructor(runtime, "Response", 0, response_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     install_method(
         runtime,
@@ -573,7 +573,7 @@ fn request_constructor(
 
     let payload = build_request_payload(runtime, input, init)?;
     let prototype = class_prototype(runtime, "Request")?;
-    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), payload);
+    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), payload).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -658,7 +658,7 @@ fn request_clone(
         body: clone_body_state(&payload.body)?,
     };
     let prototype = class_prototype(runtime, "Request")?;
-    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), cloned);
+    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), cloned).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -842,7 +842,7 @@ fn fetch_global(
         return rejected_promise_value(runtime, reason);
     }
 
-    let promise = runtime.alloc_vm_promise();
+    let promise = runtime.alloc_vm_promise().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let reservation = runtime.host_callback_sender().reserve();
     let request = FetchRequestState {
         method: request.method,
@@ -932,7 +932,7 @@ fn request_or_response_array_buffer(
         Err(BodyReadError::Rejected(reason)) => return rejected_promise_value(runtime, reason),
         Err(BodyReadError::Thrown(error)) => return Err(error),
     };
-    let buffer = alloc_array_buffer(runtime, consumed);
+    let buffer = alloc_array_buffer(runtime, consumed)?;
     fulfilled_promise_value(runtime, RegisterValue::from_object_handle(buffer.0))
 }
 
@@ -1133,7 +1133,7 @@ fn alloc_response_instance(
     payload: ResponsePayload,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype = class_prototype(runtime, "Response")?;
-    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), payload);
+    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), payload).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -1447,7 +1447,7 @@ fn alloc_body_stream_instance(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype = class_prototype(runtime, "ReadableStream")?;
     let instance =
-        runtime.alloc_native_object_with_prototype(Some(prototype), ReadableStreamPayload { body });
+        runtime.alloc_native_object_with_prototype(Some(prototype), ReadableStreamPayload { body }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -1459,7 +1459,7 @@ fn alloc_readable_stream_default_reader(
     let instance = runtime.alloc_native_object_with_prototype(
         Some(prototype),
         ReadableStreamDefaultReaderPayload { state },
-    );
+    ).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -1467,7 +1467,7 @@ fn alloc_readable_stream_async_iterator(
     runtime: &mut RuntimeState,
     state: StreamReaderState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     install_method(
         runtime,
         prototype,
@@ -1499,7 +1499,7 @@ fn alloc_readable_stream_async_iterator(
     let instance = runtime.alloc_native_object_with_prototype(
         Some(prototype),
         ReadableStreamAsyncIteratorPayload { state },
-    );
+    ).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -1601,7 +1601,7 @@ fn read_from_reader_state(
         next
     };
     let result = if let Some(bytes) = next_chunk {
-        let value = RegisterValue::from_object_handle(alloc_uint8_array(runtime, bytes).0);
+        let value = RegisterValue::from_object_handle(alloc_uint8_array(runtime, bytes)?.0);
         runtime.alloc_iter_result_object(value, false)?
     } else {
         runtime.alloc_iter_result_object(RegisterValue::undefined(), true)?
@@ -1820,5 +1820,8 @@ fn is_token_byte(byte: u8) -> bool {
 }
 
 fn string_value(runtime: &mut RuntimeState, value: impl Into<Box<str>>) -> RegisterValue {
-    RegisterValue::from_object_handle(runtime.alloc_string(value).0)
+    match runtime.alloc_string(value) {
+        Ok(handle) => RegisterValue::from_object_handle(handle.0),
+        Err(_) => RegisterValue::undefined(),
+    }
 }

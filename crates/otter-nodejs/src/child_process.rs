@@ -17,7 +17,7 @@ fn child_process_export_value(runtime: &mut RuntimeState) -> Result<RegisterValu
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_method(
         runtime,
         export,
@@ -38,9 +38,9 @@ fn child_process_spawn_sync(
     _args: &[RegisterValue],
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let result = runtime.alloc_object();
-    let empty_stdout = RegisterValue::from_object_handle(runtime.alloc_string("").0);
-    let empty_stderr = RegisterValue::from_object_handle(runtime.alloc_string("").0);
+    let result = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    let empty_stdout = RegisterValue::from_object_handle(runtime.alloc_string("").map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0);
+    let empty_stderr = RegisterValue::from_object_handle(runtime.alloc_string("").map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0);
     install_readonly_value(runtime, result, "status", RegisterValue::from_i32(0))
         .map_err(|error| VmNativeCallError::Internal(error.into()))?;
     install_readonly_value(runtime, result, "signal", RegisterValue::null())

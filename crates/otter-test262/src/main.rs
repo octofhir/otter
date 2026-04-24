@@ -174,7 +174,9 @@ fn test262_create_realm(
 
     // The wrapper object lives in the *caller*'s realm; only `.global` is
     // cross-realm. test262 harness uses `other = $262.createRealm().global`.
-    let realm = runtime.alloc_object();
+    let realm = runtime
+        .alloc_object()
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let global_property = runtime.intern_property_name("global");
     runtime
         .objects_mut()
@@ -333,8 +335,12 @@ impl NewVmRunner {
             0,
             test262_create_realm,
         ));
-        let create_realm = state.alloc_host_function(create_realm);
-        let test262 = state.alloc_object();
+        let create_realm = state
+            .alloc_host_function(create_realm)
+            .expect("$262.createRealm host function should allocate");
+        let test262 = state
+            .alloc_object()
+            .expect("$262 container object should allocate");
         let global = state.intrinsics().global_object();
         let global_property = state.intern_property_name("global");
         state

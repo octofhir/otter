@@ -515,9 +515,12 @@ fn regexp_builtin_exec(
     let result = runtime.objects_mut().alloc_array()?;
 
     // [0] = full match string
+    // C13: preserve lone surrogates (WTF-16). `String::from_utf16_lossy`
+    // would replace each unpaired surrogate with U+FFFD, silently
+    // corrupting captures over WTF-16 inputs.
     let full_match_utf16 = &utf16[match_start_utf16..match_end_utf16];
-    let full_match_str = String::from_utf16_lossy(full_match_utf16);
-    let full_match_handle = runtime.alloc_string(full_match_str)?;
+    let full_match_handle = runtime
+        .alloc_js_string(crate::js_string::JsString::from_utf16(full_match_utf16.to_vec()))?;
     runtime
         .objects_mut()
         .set_index(
@@ -531,12 +534,13 @@ fn regexp_builtin_exec(
     let cap_count = m.captures.len();
     let mut groups_obj: Option<ObjectHandle> = None;
 
+    // C13: preserve lone surrogates — build captures directly from `&[u16]`.
     for i in 0..cap_count {
         let cap_val = match &m.captures[i] {
             Some(range) => {
                 let cap_utf16 = &utf16[range.start..range.end];
-                let cap_str = String::from_utf16_lossy(cap_utf16);
-                let cap_handle = runtime.alloc_string(cap_str)?;
+                let cap_handle = runtime
+                    .alloc_js_string(crate::js_string::JsString::from_utf16(cap_utf16.to_vec()))?;
                 RegisterValue::from_object_handle(cap_handle.0)
             }
             None => RegisterValue::undefined(),
@@ -545,10 +549,11 @@ fn regexp_builtin_exec(
     }
 
     // Named capture groups → .groups object
-    let named: Vec<(String, Option<String>)> = m
+    // C13: preserve WTF-16 captures (no lossy conversion).
+    let named: Vec<(String, Option<Vec<u16>>)> = m
         .named_groups()
         .map(|(name, range)| {
-            let val = range.map(|r| String::from_utf16_lossy(&utf16[r.start..r.end]).to_string());
+            let val = range.map(|r| utf16[r.start..r.end].to_vec());
             (name.to_string(), val)
         })
         .collect();
@@ -558,8 +563,10 @@ fn regexp_builtin_exec(
         for (name, val) in &named {
             let prop = runtime.intern_property_name(name);
             let v = match val {
-                Some(s) => {
-                    let sh = runtime.alloc_string(s.as_str())?;
+                Some(units) => {
+                    let sh = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(
+                        units.clone(),
+                    ))?;
                     RegisterValue::from_object_handle(sh.0)
                 }
                 None => RegisterValue::undefined(),

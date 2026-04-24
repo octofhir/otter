@@ -406,6 +406,12 @@ fn number_to_decimal_string(number: f64) -> String {
 }
 
 /// Formats a number as a string in the given radix (2..=36).
+///
+/// §6.1.6.1.20 Number::toString with a non-10 radix. Ported from
+/// V8's `DoubleToRadixCString` (src/numbers/conversions.cc). Handles
+/// integer values past 2^53 (previously truncated through `as u64`)
+/// and fractional values (previously returned decimal / exponential
+/// notation instead of the binary/hex/etc. expansion).
 fn number_to_radix_string(number: f64, radix: u32) -> String {
     if number.is_nan() {
         return "NaN".to_string();
@@ -421,24 +427,143 @@ fn number_to_radix_string(number: f64, radix: u32) -> String {
         return "0".to_string();
     }
 
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    // Cap per V8 — guards against pathological delta underflow loops.
+    const MAX_FRACTION_DIGITS: usize = 1024;
+
     let negative = number < 0.0;
-    let mut n = number.abs() as u64;
-    if n == 0 {
-        // Sub-integer magnitude — fall back to decimal.
-        return number.to_string();
+    let value = number.abs();
+    let radix_f = radix as f64;
+
+    let mut integer_part = value.floor();
+    let mut fraction_part = value - integer_part;
+
+    // C11: integer extraction via f64 repeated division — works past
+    // 2^53 with the usual Number precision tradeoff (per spec).
+    let mut integer_digits: Vec<u8> = Vec::new();
+    if integer_part == 0.0 {
+        integer_digits.push(b'0');
+    } else {
+        while integer_part > 0.0 && integer_digits.len() < MAX_FRACTION_DIGITS {
+            let q = (integer_part / radix_f).floor();
+            // Clamp to guard against off-by-one from f64 rounding at
+            // extreme magnitudes (e.g. `(radix^n).toString(radix)`).
+            let digit = ((integer_part - q * radix_f) as i64).clamp(0, radix as i64 - 1) as usize;
+            integer_digits.push(DIGITS[digit]);
+            integer_part = q;
+        }
+        integer_digits.reverse();
     }
 
-    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut buf = Vec::new();
-    while n > 0 {
-        buf.push(DIGITS[(n % radix as u64) as usize]);
-        n /= radix as u64;
+    // Fraction: delta-bounded repeated multiplication. `delta` is half
+    // the gap to the next representable f64; once `fraction < delta`,
+    // further digits can't distinguish between two adjacent doubles.
+    let mut delta = 0.5 * (next_representable_up(value) - value);
+    if delta <= 0.0 {
+        delta = f64::from_bits(1); // smallest positive subnormal
     }
+
+    let mut fraction_digits: Vec<u8> = Vec::new();
+    if fraction_part >= delta {
+        fraction_digits.push(b'.');
+        while fraction_part >= delta && fraction_digits.len() < MAX_FRACTION_DIGITS + 1 {
+            delta *= radix_f;
+            fraction_part *= radix_f;
+            let mut digit = fraction_part as u32;
+            if digit >= radix {
+                digit = radix - 1;
+            }
+            fraction_digits.push(DIGITS[digit as usize]);
+            fraction_part -= digit as f64;
+
+            // Round-up condition from V8: if remaining fraction + delta
+            // would spill over into the next digit, carry instead of
+            // continuing.
+            if (fraction_part > 0.5 || (fraction_part == 0.5 && (digit & 1) == 1))
+                && fraction_part + delta > 1.0
+            {
+                round_up_radix_digits(&mut integer_digits, &mut fraction_digits, radix);
+                break;
+            }
+        }
+    }
+
+    let mut buf =
+        Vec::with_capacity(integer_digits.len() + fraction_digits.len() + usize::from(negative));
     if negative {
         buf.push(b'-');
     }
-    buf.reverse();
+    buf.extend_from_slice(&integer_digits);
+    buf.extend_from_slice(&fraction_digits);
     String::from_utf8(buf).unwrap_or_else(|_| number.to_string())
+}
+
+/// Propagate a round-up through the fractional digits, then into the
+/// integer digits if the fraction is all radix-1. Drops fraction on
+/// full carry (matches V8).
+fn round_up_radix_digits(
+    integer_digits: &mut Vec<u8>,
+    fraction_digits: &mut Vec<u8>,
+    radix: u32,
+) {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    // Scan fractional from the right.
+    while let Some(&last) = fraction_digits.last() {
+        if last == b'.' {
+            // Carry into integer part.
+            fraction_digits.pop(); // drop '.'
+            let mut i = integer_digits.len();
+            let mut carry = true;
+            while i > 0 && carry {
+                i -= 1;
+                let d = radix_digit_index(integer_digits[i]);
+                if d + 1 < radix as usize {
+                    integer_digits[i] = DIGITS[d + 1];
+                    carry = false;
+                } else {
+                    integer_digits[i] = b'0';
+                }
+            }
+            if carry {
+                integer_digits.insert(0, b'1');
+            }
+            return;
+        }
+        let d = radix_digit_index(last);
+        if d + 1 < radix as usize {
+            *fraction_digits.last_mut().unwrap() = DIGITS[d + 1];
+            return;
+        }
+        // All-max digit rolls over: drop and propagate.
+        fraction_digits.pop();
+    }
+}
+
+fn radix_digit_index(byte: u8) -> usize {
+    match byte {
+        b'0'..=b'9' => (byte - b'0') as usize,
+        b'a'..=b'z' => (byte - b'a') as usize + 10,
+        _ => 0,
+    }
+}
+
+/// Portable `f64::next_up` (stabilised in Rust 1.86 — kept local so the
+/// MSRV doesn't have to move for this one call site). Returns the
+/// smallest representable value strictly greater than `x`.
+fn next_representable_up(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = x.to_bits();
+    let next_bits = if x.is_sign_positive() {
+        bits + 1
+    } else {
+        bits - 1
+    };
+    f64::from_bits(next_bits)
 }
 
 fn coerce_to_number(

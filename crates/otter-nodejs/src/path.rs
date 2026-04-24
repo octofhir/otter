@@ -20,7 +20,7 @@ fn path_export_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, arity, callback) in [
         ("resolve", 1, path_resolve as _),
         ("join", 2, path_join as _),

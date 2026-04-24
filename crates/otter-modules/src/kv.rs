@@ -279,7 +279,7 @@ fn kv_open(
         store: Some(store),
         path: path_value,
         is_memory,
-    });
+    }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
 
     let members = burrow! {
         fns = [
@@ -359,13 +359,17 @@ fn kv_keys(
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let keys = with_store_mut(runtime, this, |store| store.keys())?;
-    let elements = keys
-        .into_iter()
-        .map(|key| RegisterValue::from_object_handle(runtime.alloc_string(key).0))
-        .collect::<Vec<_>>();
-    Ok(RegisterValue::from_object_handle(
-        runtime.alloc_array_with_elements(&elements).0,
-    ))
+    let mut elements = Vec::with_capacity(keys.len());
+    for key in keys {
+        let handle = runtime
+            .alloc_string(key)
+            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+        elements.push(RegisterValue::from_object_handle(handle.0));
+    }
+    let array = runtime
+        .alloc_array_with_elements(&elements)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    Ok(RegisterValue::from_object_handle(array.0))
 }
 
 #[dive(name = "clear", length = 0)]
@@ -426,7 +430,7 @@ fn kv_path(
         payload.path.clone()
     };
     Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string(path).0,
+        runtime.alloc_string(path).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
     ))
 }
 
@@ -579,7 +583,7 @@ fn json_to_register(
             Ok(RegisterValue::from_number(as_f64))
         }
         JsonValue::String(string) => Ok(RegisterValue::from_object_handle(
-            runtime.alloc_string(string.clone()).0,
+            runtime.alloc_string(string.clone()).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
         )),
         JsonValue::Array(values) => {
             let mut elements = Vec::with_capacity(values.len());
@@ -588,11 +592,11 @@ fn json_to_register(
                 elements.push(json_to_register(value, runtime, depth + 1)?);
             }
             Ok(RegisterValue::from_object_handle(
-                runtime.alloc_array_with_elements(&elements).0,
+                runtime.alloc_array_with_elements(&elements).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
             ))
         }
         JsonValue::Object(entries) => {
-            let object = runtime.alloc_object();
+            let object = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
             for (index, (key, value)) in entries.iter().enumerate() {
                 check_json_interrupt(runtime, index)?;
                 let property = runtime.intern_property_name(key);

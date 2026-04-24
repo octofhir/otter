@@ -17,7 +17,7 @@ fn worker_threads_export_value(runtime: &mut RuntimeState) -> Result<RegisterVal
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_readonly_value(
         runtime,
         export,
@@ -28,7 +28,7 @@ fn worker_threads_export_value(runtime: &mut RuntimeState) -> Result<RegisterVal
     install_readonly_value(runtime, export, "parentPort", RegisterValue::null())?;
     install_readonly_value(runtime, export, "workerData", RegisterValue::undefined())?;
 
-    let constructor = runtime.alloc_object();
+    let constructor = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_value(
         runtime,
         export,
@@ -39,7 +39,7 @@ fn worker_threads_export_value(runtime: &mut RuntimeState) -> Result<RegisterVal
     let descriptor =
         otter_vm::descriptors::NativeFunctionDescriptor::method("Worker", 1, worker_constructor);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime.alloc_host_function(id).map_err(|e| format!("{e:?}"))?;
     let property = runtime.intern_property_name("Worker");
     runtime
         .objects_mut()

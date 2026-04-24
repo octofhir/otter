@@ -10710,3 +10710,318 @@ fn c4_layout_has_all_four_new_slot_kinds() {
         "expected layout to cover all 4 new kinds; got comparison={saw_comparison} branch={saw_branch} call={saw_call} property={saw_property}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// C10 — String.prototype.normalize actually normalizes per form
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c10_nfc_composes_latin_capital_a_with_ring() {
+    // U+0041 U+030A (A + combining ring) should compose to U+00C5 (Å).
+    let result = run_string_function(
+        r#"function main() {
+            const s = "\u{0041}\u{030A}";
+            const n = s.normalize("NFC");
+            return n + "|" + String(n.length) + "|" + String(n.charCodeAt(0));
+        }"#,
+        &[],
+    );
+    assert_eq!(result, "\u{00C5}|1|197");
+}
+
+#[test]
+fn c10_nfd_decomposes_a_ring() {
+    // U+00C5 → U+0041 U+030A when decomposed.
+    let result = run_string_function(
+        r#"function main() {
+            const n = "\u{00C5}".normalize("NFD");
+            return String(n.length) + ":" + String(n.charCodeAt(0)) + "," + String(n.charCodeAt(1));
+        }"#,
+        &[],
+    );
+    assert_eq!(result, "2:65,778");
+}
+
+#[test]
+fn c10_invalid_form_throws_range_error() {
+    // Spec: RangeError for any form other than NFC/NFD/NFKC/NFKD.
+    let err = run_string_function_catching(
+        r#"function main() {
+            try { "a".normalize("NFX"); return "no throw"; }
+            catch (e) { return e.constructor.name + ":" + e.message; }
+        }"#,
+        &[],
+    )
+    .expect("should return");
+    assert!(
+        err.contains("RangeError")
+            && err.contains("NFC")
+            && err.contains("NFD")
+            && err.contains("NFKC")
+            && err.contains("NFKD"),
+        "unexpected error shape: {err}"
+    );
+}
+
+#[test]
+fn c10_default_form_is_nfc() {
+    // No argument → NFC (§22.1.3.13 step 3).
+    let result = run_string_function(
+        r#"function main() {
+            const n = "\u{0041}\u{030A}".normalize();
+            return String(n.length) + ":" + String(n.charCodeAt(0));
+        }"#,
+        &[],
+    );
+    assert_eq!(result, "1:197");
+}
+
+// ---------------------------------------------------------------------------
+// C11 — Number.prototype.toString(radix) for large / fractional N
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c11_large_integer_in_binary_has_no_exponential_notation() {
+    // Pre-fix: `(1e20).toString(2)` returned "1e+20" because the
+    // `as u64` cast truncated, then fell through to decimal.
+    let result = run_string_function(
+        r#"function main() {
+            const s = (1e20).toString(2);
+            return s.indexOf("e") + ":" + s.indexOf(".") + ":" + String(s.length);
+        }"#,
+        &[],
+    );
+    // No "e" (not exponential), no "." (integer), and long enough to
+    // be a real binary expansion (~67 bits).
+    assert_eq!(result, "-1:-1:67");
+}
+
+#[test]
+fn c11_pow_of_two_in_binary_is_one_followed_by_zeros() {
+    let result = run_string_function(
+        r#"function main() {
+            return (Math.pow(2, 60)).toString(2);
+        }"#,
+        &[],
+    );
+    // 2^60 in binary = 1 followed by 60 zeros.
+    assert_eq!(result.len(), 61);
+    assert!(result.starts_with('1'));
+    assert!(result[1..].chars().all(|c| c == '0'));
+}
+
+#[test]
+fn c11_fractional_tenth_in_binary_is_periodic() {
+    // (0.1).toString(2) must produce a fractional expansion — V8:
+    // "0.0001100110011001100110011001100110011001100110011001101"
+    let result = run_string_function(
+        r#"function main() {
+            const s = (0.1).toString(2);
+            return String(s.startsWith("0.")) + ":" + String(s.length > 10);
+        }"#,
+        &[],
+    );
+    assert_eq!(result, "true:true");
+}
+
+#[test]
+fn c11_negative_large_int_in_hex() {
+    let result = run_string_function(
+        r#"function main() {
+            return (-256).toString(16);
+        }"#,
+        &[],
+    );
+    assert_eq!(result, "-100");
+}
+
+#[test]
+fn c11_non_finite_values_still_work() {
+    let result = run_string_function(
+        r#"function main() {
+            return NaN.toString(2) + "|" + Infinity.toString(16) + "|" + (-Infinity).toString(8);
+        }"#,
+        &[],
+    );
+    assert_eq!(result, "NaN|Infinity|-Infinity");
+}
+
+// ---------------------------------------------------------------------------
+// C12 — BigInt(Number) bit-exact conversion (no i64 truncation)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c12_bigint_of_pow2_60_is_exact() {
+    // 2^60 is exactly representable as f64 and should round-trip
+    // through BigInt without loss. Pre-fix: no loss here (fits in i64)
+    // but this nails down the happy path.
+    let result = run_string_function(
+        r#"function main() { return BigInt(Math.pow(2, 60)).toString(); }"#,
+        &[],
+    );
+    assert_eq!(result, "1152921504606846976");
+}
+
+#[test]
+fn c12_bigint_of_pow2_62_is_exact_via_mantissa_path() {
+    // 2^62 sits at the upper edge of i64 (pre-fix `as i64` cast used to
+    // produce the wrong value for anything up to the sign bit — this
+    // covers the mantissa/exponent reconstruction path explicitly).
+    let result = run_string_function(
+        r#"function main() { return BigInt(Math.pow(2, 62)).toString(); }"#,
+        &[],
+    );
+    assert_eq!(result, "4611686018427387904");
+}
+
+#[test]
+fn c12_bigint_of_pow2_70_does_not_truncate() {
+    // 2^70 is out of i64 range — pre-fix: `as i64` saturated to
+    // i64::MAX. Post-fix: exact 22-digit BigInt.
+    let result = run_string_function(
+        r#"function main() { return BigInt(Math.pow(2, 70)).toString(); }"#,
+        &[],
+    );
+    assert_eq!(result, "1180591620717411303424");
+}
+
+#[test]
+fn c12_bigint_of_fractional_throws() {
+    let err = run_string_function_catching(
+        r#"function main() {
+            try { BigInt(2.5); return "no throw"; }
+            catch (e) { return e.constructor.name; }
+        }"#,
+        &[],
+    )
+    .expect("should return");
+    assert_eq!(err, "RangeError");
+}
+
+#[test]
+fn c12_bigint_of_nan_throws() {
+    let err = run_string_function_catching(
+        r#"function main() {
+            try { BigInt(NaN); return "no throw"; }
+            catch (e) { return e.constructor.name; }
+        }"#,
+        &[],
+    )
+    .expect("should return");
+    assert_eq!(err, "RangeError");
+}
+
+#[test]
+fn c12_bigint_of_negative_zero_is_zero() {
+    let result = run_string_function(
+        r#"function main() { return BigInt(-0).toString(); }"#,
+        &[],
+    );
+    assert_eq!(result, "0");
+}
+
+// ---------------------------------------------------------------------------
+// C13 — RegExp capture groups preserve lone surrogates (WTF-16)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c13_regex_capture_returns_js_string_not_box_str() {
+    // The core C13 fix: captures now use `alloc_js_string` (WTF-16
+    // preserving) instead of `alloc_string` (goes through
+    // String::from_utf16_lossy). We verify by direct heap inspection:
+    // capture output is a `HeapValue::String` whose `JsString` storage
+    // matches the source WTF-16 units exactly for multi-BMP inputs.
+    let module = compile(
+        r#"function main() {
+            const s = String.fromCharCode(0x41, 0x42, 0x43);  // "ABC"
+            return s.match(/(B)/)[1];
+        }"#,
+    )
+    .expect("compile");
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
+    let function = module.function(entry).expect("module has entry function");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    let handle = result
+        .return_value()
+        .as_object_handle()
+        .map(crate::object::ObjectHandle)
+        .expect("capture must be an object handle");
+    let js = runtime
+        .objects()
+        .string_value(handle)
+        .expect("string_value ok")
+        .expect("capture has JsString storage")
+        .clone();
+    assert_eq!(js.as_utf16(), &[0x42u16]);
+}
+
+#[test]
+fn c13_regex_named_capture_returns_js_string() {
+    let module = compile(
+        r#"function main() {
+            const s = String.fromCharCode(0x31, 0x32, 0x33);  // "123"
+            const m = s.match(/(?<mid>.)3/);
+            return m.groups.mid;
+        }"#,
+    )
+    .expect("compile");
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
+    let function = module.function(entry).expect("module has entry function");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    let handle = result
+        .return_value()
+        .as_object_handle()
+        .map(crate::object::ObjectHandle)
+        .expect("named capture must be a string object handle");
+    let js = runtime
+        .objects()
+        .string_value(handle)
+        .expect("string_value ok")
+        .expect("named capture has JsString storage")
+        .clone();
+    assert_eq!(js.as_utf16(), &[0x32u16]);
+}
+
+#[test]
+fn c13_from_char_code_preserves_lone_surrogate_units() {
+    // Adjacent C13 correctness: String.fromCharCode no longer
+    // round-trips through `String::from_utf16_lossy`. Verified by
+    // direct heap inspection — the stored WTF-16 matches input
+    // code units exactly.
+    let module = compile(
+        r#"function main() {
+            return String.fromCharCode(0xD800, 0x41, 0xDC00);
+        }"#,
+    )
+    .expect("compile");
+    let (entry, _) = pick_last_named_function(&module).expect("named fn");
+    let function = module.function(entry).expect("module has entry function");
+    let registers =
+        vec![RegisterValue::undefined(); usize::from(function.frame_layout().register_count())];
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let result = Interpreter::new()
+        .execute_with_runtime(&module, entry, &registers, &mut runtime)
+        .expect("execute");
+    let handle = result
+        .return_value()
+        .as_object_handle()
+        .map(crate::object::ObjectHandle)
+        .expect("fromCharCode must return an object handle");
+    let js = runtime
+        .objects()
+        .string_value(handle)
+        .expect("string_value ok")
+        .expect("fromCharCode returns JsString")
+        .clone();
+    assert_eq!(js.as_utf16(), &[0xD800, 0x41, 0xDC00]);
+}

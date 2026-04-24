@@ -76,7 +76,7 @@ impl TextEncoderClass {
     ) -> Result<RegisterValue, VmNativeCallError> {
         let prototype = class_prototype(runtime, "TextEncoder")?;
         let instance =
-            runtime.alloc_native_object_with_prototype(Some(prototype), TextEncoderPayload);
+            runtime.alloc_native_object_with_prototype(Some(prototype), TextEncoderPayload).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
         Ok(RegisterValue::from_object_handle(instance.0))
     }
 
@@ -99,7 +99,7 @@ impl TextEncoderClass {
                 .into_string()
                 .into_bytes()
         };
-        let value = alloc_uint8_array(runtime, bytes);
+        let value = alloc_uint8_array(runtime, bytes)?;
         Ok(RegisterValue::from_object_handle(value.0))
     }
 
@@ -111,7 +111,7 @@ impl TextEncoderClass {
     ) -> Result<RegisterValue, VmNativeCallError> {
         require_text_encoder(runtime, this)?;
         Ok(RegisterValue::from_object_handle(
-            runtime.alloc_string("utf-8").0,
+            runtime.alloc_string("utf-8").map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
         ))
     }
 }
@@ -142,7 +142,7 @@ impl TextDecoderClass {
         let instance = runtime.alloc_native_object_with_prototype(
             Some(prototype),
             TextDecoderPayload { fatal, ignore_bom },
-        );
+        ).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
         Ok(RegisterValue::from_object_handle(instance.0))
     }
 
@@ -172,7 +172,7 @@ impl TextDecoderClass {
         };
 
         Ok(RegisterValue::from_object_handle(
-            runtime.alloc_string(decoded).0,
+            runtime.alloc_string(decoded).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
         ))
     }
 
@@ -184,7 +184,7 @@ impl TextDecoderClass {
     ) -> Result<RegisterValue, VmNativeCallError> {
         require_text_decoder(runtime, this)?;
         Ok(RegisterValue::from_object_handle(
-            runtime.alloc_string("utf-8").0,
+            runtime.alloc_string("utf-8").map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
         ))
     }
 
@@ -351,21 +351,28 @@ pub(crate) fn bytes_from_buffer_source(
     }
 }
 
-pub(crate) fn alloc_uint8_array(runtime: &mut RuntimeState, bytes: Vec<u8>) -> ObjectHandle {
+pub(crate) fn alloc_uint8_array(
+    runtime: &mut RuntimeState,
+    bytes: Vec<u8>,
+) -> Result<ObjectHandle, VmNativeCallError> {
     let buffer_proto = Some(runtime.intrinsics().array_buffer_prototype());
     let buffer = runtime
         .objects_mut()
-        .alloc_array_buffer_with_data(bytes.clone(), buffer_proto);
+        .alloc_array_buffer_with_data(bytes.clone(), buffer_proto)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     let (_, uint8_proto) = runtime
         .intrinsics()
         .typed_array_constructor_prototype(TypedArrayKind::Uint8);
-    runtime.objects_mut().alloc_typed_array(
-        TypedArrayKind::Uint8,
-        buffer,
-        0,
-        bytes.len(),
-        Some(uint8_proto),
-    )
+    runtime
+        .objects_mut()
+        .alloc_typed_array(
+            TypedArrayKind::Uint8,
+            buffer,
+            0,
+            bytes.len(),
+            Some(uint8_proto),
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))
 }
 
 pub(crate) fn class_prototype(
@@ -448,8 +455,8 @@ fn install_js_class(
         .cloned()
         .ok_or_else(|| format!("{class_name} class descriptor is missing constructor metadata"))?;
     let constructor_id = runtime.register_native_function(constructor_descriptor);
-    let constructor = runtime.alloc_host_function(constructor_id);
-    let prototype = runtime.alloc_object();
+    let constructor = runtime.alloc_host_function(constructor_id).map_err(|e| format!("{e:?}"))?;
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
 
     install_class_members(
         runtime,
@@ -484,7 +491,7 @@ fn install_class_members(
         match member {
             ClassMemberPlan::Method(descriptor) => {
                 let id = runtime.register_native_function(descriptor.clone());
-                let function = runtime.alloc_host_function(id);
+                let function = runtime.alloc_host_function(id).map_err(|e| format!("{e:?}"))?;
                 let property = runtime.intern_property_name(descriptor.js_name());
                 runtime
                     .objects_mut()
@@ -501,14 +508,20 @@ fn install_class_members(
                     })?;
             }
             ClassMemberPlan::Accessor(accessor) => {
-                let getter = accessor.getter().cloned().map(|descriptor| {
-                    let id = runtime.register_native_function(descriptor);
-                    runtime.alloc_host_function(id)
-                });
-                let setter = accessor.setter().cloned().map(|descriptor| {
-                    let id = runtime.register_native_function(descriptor);
-                    runtime.alloc_host_function(id)
-                });
+                let getter = match accessor.getter().cloned() {
+                    Some(descriptor) => {
+                        let id = runtime.register_native_function(descriptor);
+                        Some(runtime.alloc_host_function(id).map_err(|e| format!("{e:?}"))?)
+                    }
+                    None => None,
+                };
+                let setter = match accessor.setter().cloned() {
+                    Some(descriptor) => {
+                        let id = runtime.register_native_function(descriptor);
+                        Some(runtime.alloc_host_function(id).map_err(|e| format!("{e:?}"))?)
+                    }
+                    None => None,
+                };
                 let property = runtime.intern_property_name(accessor.js_name());
                 runtime
                     .objects_mut()
@@ -590,10 +603,12 @@ pub(crate) fn alloc_constructor(
         &[RegisterValue],
         &mut RuntimeState,
     ) -> Result<RegisterValue, VmNativeCallError>,
-) -> ObjectHandle {
+) -> Result<ObjectHandle, String> {
     let descriptor = NativeFunctionDescriptor::constructor(name, arity, callback);
     let id = runtime.register_native_function(descriptor);
-    runtime.alloc_host_function(id)
+    runtime
+        .alloc_host_function(id)
+        .map_err(|e| format!("failed to allocate constructor {name}: {e:?}"))
 }
 
 pub(crate) fn install_method(
@@ -610,7 +625,9 @@ pub(crate) fn install_method(
 ) -> Result<(), String> {
     let descriptor = NativeFunctionDescriptor::method(name, arity, callback);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime
+        .alloc_host_function(id)
+        .map_err(|e| format!("failed to allocate method {context}: {e:?}"))?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()
@@ -638,7 +655,9 @@ pub(crate) fn install_symbol_method(
 ) -> Result<(), String> {
     let descriptor = NativeFunctionDescriptor::method(js_name, arity, callback);
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime
+        .alloc_host_function(id)
+        .map_err(|e| format!("failed to allocate symbol method {context}: {e:?}"))?;
     let property = runtime.intern_symbol_property_name(symbol.stable_id());
     runtime
         .objects_mut()
@@ -664,7 +683,9 @@ pub(crate) fn install_getter(
 ) -> Result<(), String> {
     let descriptor = NativeFunctionDescriptor::getter(name, callback);
     let id = runtime.register_native_function(descriptor);
-    let getter = runtime.alloc_host_function(id);
+    let getter = runtime
+        .alloc_host_function(id)
+        .map_err(|e| format!("failed to allocate getter {context}: {e:?}"))?;
     let property = runtime.intern_property_name(name);
     runtime
         .objects_mut()

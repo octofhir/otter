@@ -35,12 +35,14 @@ fn net_export_value(runtime: &mut RuntimeState) -> Result<RegisterValue, String>
         return Ok(value);
     }
 
-    let export = runtime.alloc_object();
-    let payload = runtime.alloc_native_object(NetPayload {
-        shared: Arc::new(Mutex::new(NetState {
-            timeout_ms: DEFAULT_AUTO_SELECT_TIMEOUT_MS,
-        })),
-    });
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
+    let payload = runtime
+        .alloc_native_object(NetPayload {
+            shared: Arc::new(Mutex::new(NetState {
+                timeout_ms: DEFAULT_AUTO_SELECT_TIMEOUT_MS,
+            })),
+        })
+        .map_err(|e| format!("{e:?}"))?;
 
     install_method(
         runtime,

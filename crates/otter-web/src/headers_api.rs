@@ -17,7 +17,7 @@ pub(crate) fn install(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, callback, arity, context) in [
         ("append", headers_append as _, 2, "Headers.prototype.append"),
         ("delete", headers_delete as _, 1, "Headers.prototype.delete"),
@@ -34,7 +34,7 @@ pub(crate) fn install(runtime: &mut RuntimeState) -> Result<(), String> {
         install_method(runtime, prototype, name, arity, callback, context)?;
     }
 
-    let constructor = alloc_constructor(runtime, "Headers", 1, headers_constructor);
+    let constructor = alloc_constructor(runtime, "Headers", 1, headers_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value("Headers", RegisterValue::from_object_handle(constructor.0));
     Ok(())
@@ -107,7 +107,7 @@ fn headers_get_set_cookie(
         .into_iter()
         .filter_map(|(name, value)| (name == "set-cookie").then_some(string_value(runtime, value)))
         .collect();
-    let array = runtime.alloc_array_with_elements(&values);
+    let array = runtime.alloc_array_with_elements(&values).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(array.0))
 }
 
@@ -281,12 +281,14 @@ pub(crate) fn alloc_headers_instance(
     entries: Vec<(String, String)>,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype = class_prototype(runtime, "Headers")?;
-    let instance = runtime.alloc_native_object_with_prototype(
-        Some(prototype),
-        HeadersPayload {
-            entries: Arc::new(Mutex::new(entries)),
-        },
-    );
+    let instance = runtime
+        .alloc_native_object_with_prototype(
+            Some(prototype),
+            HeadersPayload {
+                entries: Arc::new(Mutex::new(entries)),
+            },
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -381,5 +383,8 @@ fn is_header_name_byte(byte: u8) -> bool {
 }
 
 fn string_value(runtime: &mut RuntimeState, value: impl Into<Box<str>>) -> RegisterValue {
-    RegisterValue::from_object_handle(runtime.alloc_string(value).0)
+    match runtime.alloc_string(value) {
+        Ok(handle) => RegisterValue::from_object_handle(handle.0),
+        Err(_) => RegisterValue::undefined(),
+    }
 }

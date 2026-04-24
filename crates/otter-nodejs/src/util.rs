@@ -33,7 +33,7 @@ fn ensure_util_exports(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let types = runtime.alloc_object();
+    let types = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_method(
         runtime,
         types,
@@ -149,7 +149,7 @@ fn ensure_util_exports(runtime: &mut RuntimeState) -> Result<(), String> {
         "util.types.isUint8Array",
     )?;
 
-    let export = runtime.alloc_object();
+    let export = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     install_method(runtime, export, "inspect", 1, util_inspect, "util.inspect")?;
     install_method(runtime, export, "format", 1, util_format, "util.format")?;
     install_method(
@@ -261,7 +261,7 @@ fn util_debuglog(
         util_debuglog_logger,
     );
     let id = runtime.register_native_function(descriptor);
-    let function = runtime.alloc_host_function(id);
+    let function = runtime.alloc_host_function(id).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(function.0))
 }
 
@@ -278,9 +278,10 @@ fn util_get_call_sites(
     _args: &[RegisterValue],
     runtime: &mut RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    Ok(RegisterValue::from_object_handle(
-        runtime.alloc_array_with_elements(&[]).0,
-    ))
+    let handle = runtime
+        .alloc_array_with_elements(&[])
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
+    Ok(RegisterValue::from_object_handle(handle.0))
 }
 
 fn util_is_any_array_buffer(

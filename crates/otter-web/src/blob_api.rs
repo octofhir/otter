@@ -61,7 +61,7 @@ fn install_blob(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, callback, arity, context) in [
         (
             "arrayBuffer",
@@ -81,7 +81,7 @@ fn install_blob(runtime: &mut RuntimeState) -> Result<(), String> {
         install_getter(runtime, prototype, name, callback, context)?;
     }
 
-    let constructor = alloc_constructor(runtime, "Blob", 0, blob_constructor);
+    let constructor = alloc_constructor(runtime, "Blob", 0, blob_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value("Blob", RegisterValue::from_object_handle(constructor.0));
     Ok(())
@@ -92,7 +92,7 @@ fn install_file(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     let blob_prototype = class_prototype(runtime, "Blob")
         .map_err(|error| format!("failed to resolve Blob.prototype: {error:?}"))?;
     let linked = runtime
@@ -119,7 +119,7 @@ fn install_file(runtime: &mut RuntimeState) -> Result<(), String> {
         install_getter(runtime, prototype, name, callback, context)?;
     }
 
-    let constructor = alloc_constructor(runtime, "File", 2, file_constructor);
+    let constructor = alloc_constructor(runtime, "File", 2, file_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value("File", RegisterValue::from_object_handle(constructor.0));
     Ok(())
@@ -130,7 +130,7 @@ fn install_form_data(runtime: &mut RuntimeState) -> Result<(), String> {
         return Ok(());
     }
 
-    let prototype = runtime.alloc_object();
+    let prototype = runtime.alloc_object().map_err(|e| format!("{e:?}"))?;
     for (name, callback, arity, context) in [
         (
             "append",
@@ -157,7 +157,7 @@ fn install_form_data(runtime: &mut RuntimeState) -> Result<(), String> {
         install_method(runtime, prototype, name, arity, callback, context)?;
     }
 
-    let constructor = alloc_constructor(runtime, "FormData", 0, form_data_constructor);
+    let constructor = alloc_constructor(runtime, "FormData", 0, form_data_constructor)?;
     link_constructor_and_prototype(runtime, constructor, prototype)?;
     runtime.install_global_value("FormData", RegisterValue::from_object_handle(constructor.0));
     Ok(())
@@ -229,12 +229,14 @@ fn form_data_constructor(
     }
 
     let prototype = class_prototype(runtime, "FormData")?;
-    let instance = runtime.alloc_native_object_with_prototype(
-        Some(prototype),
-        FormDataPayload {
-            entries: Arc::new(Mutex::new(Vec::new())),
-        },
-    );
+    let instance = runtime
+        .alloc_native_object_with_prototype(
+            Some(prototype),
+            FormDataPayload {
+                entries: Arc::new(Mutex::new(Vec::new())),
+            },
+        )
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -279,7 +281,7 @@ fn blob_array_buffer(
         this,
         "Blob.arrayBuffer called on incompatible receiver",
     )?;
-    let buffer = alloc_array_buffer(runtime, payload.bytes);
+    let buffer = alloc_array_buffer(runtime, payload.bytes)?;
     resolved_promise_value(runtime, RegisterValue::from_object_handle(buffer.0))
 }
 
@@ -395,7 +397,7 @@ fn form_data_get_all(
         .filter(|entry| entry.name == name)
         .map(|entry| materialize_form_data_value(runtime, &entry))
         .collect::<Result<Vec<_>, _>>()?;
-    let array = runtime.alloc_array_with_elements(&values);
+    let array = runtime.alloc_array_with_elements(&values).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(array.0))
 }
 
@@ -518,7 +520,7 @@ pub(crate) fn alloc_blob_instance(
     payload: BlobPayload,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let prototype = class_prototype(runtime, class_name)?;
-    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), payload);
+    let instance = runtime.alloc_native_object_with_prototype(Some(prototype), payload).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
     Ok(RegisterValue::from_object_handle(instance.0))
 }
 
@@ -724,11 +726,15 @@ fn with_form_data_entries(
     Ok(())
 }
 
-pub(crate) fn alloc_array_buffer(runtime: &mut RuntimeState, bytes: Vec<u8>) -> ObjectHandle {
+pub(crate) fn alloc_array_buffer(
+    runtime: &mut RuntimeState,
+    bytes: Vec<u8>,
+) -> Result<ObjectHandle, VmNativeCallError> {
     let prototype = Some(runtime.intrinsics().array_buffer_prototype());
     runtime
         .objects_mut()
         .alloc_array_buffer_with_data(bytes, prototype)
+        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))
 }
 
 pub(crate) fn resolved_promise_value(
@@ -763,7 +769,10 @@ fn string_arg(
 }
 
 fn string_value(runtime: &mut RuntimeState, value: impl Into<Box<str>>) -> RegisterValue {
-    RegisterValue::from_object_handle(runtime.alloc_string(value).0)
+    match runtime.alloc_string(value) {
+        Ok(handle) => RegisterValue::from_object_handle(handle.0),
+        Err(_) => RegisterValue::undefined(),
+    }
 }
 
 fn current_time_millis() -> f64 {

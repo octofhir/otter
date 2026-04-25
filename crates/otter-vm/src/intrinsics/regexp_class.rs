@@ -18,20 +18,29 @@ pub(super) struct RegExpIntrinsic;
 
 const REGEXP_INTERRUPT_POLL_INTERVAL: usize = 4096;
 
-/// S8: per-exec hard cap on the input string's length in UTF-16 code
-/// units. The `regress` engine we embed has no step-counter / timeout
-/// hook (version 0.11.1 API reviewed 2026-04-24 — no `with_step_limit`,
-/// no `MatchAttempter` budget configurability), so the only portable
-/// ReDoS defence at this layer is to refuse inputs longer than a
-/// configurable cap. Catastrophic backtracking patterns need
-/// `input.len() × 2^pattern_depth` steps to blow up; capping the input
-/// kills the DoS vector while leaving realistic workloads untouched.
+/// S8-a: per-exec hard cap on the input string's length in UTF-16 code
+/// units. This is the coarse outer defence: catastrophic backtracking
+/// patterns need `input.len() × 2^pattern_depth` steps to blow up, so
+/// capping the input kills the DoS vector at the cheapest layer.
 ///
 /// 1 MB of UTF-16 = 2 MB of RAM. Any input beyond this is either a
 /// server request body (which belongs in a streaming parser, not
 /// regexp) or adversarial. Raise if a legitimate workload needs more;
 /// lower for server embedders under memory pressure.
 const MAX_REGEXP_INPUT_UTF16_UNITS: usize = 1_000_000;
+
+/// S8-b: per-exec backtracking step budget enforced by our regress fork
+/// (see `regress::ExecConfig::backtrack_limit`). Cuts pathological
+/// patterns whose step count grows super-linearly in input size even
+/// when the input is well under `MAX_REGEXP_INPUT_UTF16_UNITS`.
+///
+/// 10 M is V8's ballpark (`--regexp-backtrack-limit` default is 1M in
+/// hardened mode, 10M in standard mode). Realistic patterns on
+/// realistic inputs finish in thousands to low millions of steps;
+/// 10 M leaves a generous headroom while cutting `(a+)+b`-class
+/// catastrophes within milliseconds. Raise if a legitimate workload
+/// trips it; there is no spec-mandated value.
+const MAX_REGEXP_BACKTRACK_STEPS: u64 = 10_000_000;
 
 /// S8 guard: throws a catchable `RangeError` if `input` (measured as
 /// UTF-16 code units) exceeds the input cap. Called at the head of
@@ -467,21 +476,40 @@ fn regexp_builtin_exec(
         return Ok(None);
     }
 
-    // Execute the regex against UTF-16 input.
-    let m = if unicode {
-        compiled.find_from_utf16(&utf16, start_pos).next()
+    // Execute the regex against UTF-16 input, bounded by a backtrack
+    // step budget so catastrophic patterns (ReDoS) fail fast with a
+    // catchable RangeError instead of hanging the interpreter.
+    // See `MAX_REGEXP_BACKTRACK_STEPS` for the budget rationale.
+    let exec_config = regress::ExecConfig {
+        backtrack_limit: Some(MAX_REGEXP_BACKTRACK_STEPS),
+    };
+    let next_result = if unicode {
+        compiled
+            .find_from_utf16_with_config(&utf16, start_pos, exec_config)
+            .next()
     } else {
-        compiled.find_from_ucs2(&utf16, start_pos).next()
+        compiled
+            .find_from_ucs2_with_config(&utf16, start_pos, exec_config)
+            .next()
     };
 
-    let m = match m {
-        Some(m) => {
+    let m = match next_result {
+        Some(Ok(m)) => {
             // Sticky: match must start at exactly start_pos.
             if sticky && m.start() != start_pos {
                 set_last_index(handle, 0.0, runtime);
                 return Ok(None);
             }
             m
+        }
+        Some(Err(_)) => {
+            // Any `ExecError` from regress is treated as a ReDoS-style
+            // abort. Only `StepLimitExceeded` exists today; the enum is
+            // `non_exhaustive` so new variants automatically funnel here
+            // rather than silently succeeding.
+            return Err(VmNativeCallError::Thrown(runtime.alloc_range_error_value(
+                "RegExp execution exceeded backtracking step limit (ReDoS protection)",
+            )));
         }
         None => {
             if global || sticky {

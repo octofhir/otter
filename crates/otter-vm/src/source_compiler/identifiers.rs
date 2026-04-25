@@ -500,6 +500,18 @@ pub(super) fn lower_return_expression<'a>(
         Expression::RegExpLiteral(lit) => {
             let pattern = lit.regex.pattern.text.as_str();
             let flags = lit.regex.flags.to_string();
+            // §22.2 early error: invalid RegExp pattern/flags must throw
+            // a parse-phase SyntaxError (not a runtime error when the
+            // literal is evaluated). Without this check, patterns such
+            // as `\p{ASCII=T}` or `\u{FFFF}` with invalid flag combos
+            // are only rejected at first `exec` / `test` call — test262
+            // harness detects the late throw and fails.
+            if let Err(err) = regress::Regex::with_flags(pattern, flags.as_str()) {
+                return Err(SourceLoweringError::Parse {
+                    message: format!("Invalid regular expression: {err}"),
+                    span: lit.span,
+                });
+            }
             let idx = ctx.push_regexp_literal(pattern, &flags)?;
             builder
                 .emit(Opcode::CreateRegExp, &[Operand::Idx(idx)])

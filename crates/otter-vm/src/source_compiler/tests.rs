@@ -10370,6 +10370,100 @@ fn s8_regex_accepts_normal_input_length() {
 }
 
 #[test]
+fn s8_b_redos_pattern_throws_range_error_within_step_limit() {
+    // S8-b: before the step-limit wiring, `(a+)+b` against ~100 `a`s
+    // would spin at 100 % CPU for seconds even though the input is
+    // well under `MAX_REGEXP_INPUT_UTF16_UNITS`. The 10 M step budget
+    // must surface a catchable RangeError with the "ReDoS" marker.
+    let src = "let hit = 0; \
+               try { \
+                 const s = 'a'.repeat(100) + 'c'; \
+                 /(a+)+b/.exec(s); \
+               } catch (e) { \
+                 hit = e.constructor.name === 'RangeError' \
+                   && e.message.indexOf('ReDoS') >= 0 ? 1 : 2; \
+               } \
+               hit";
+    let started = std::time::Instant::now();
+    let result = run_eval_value(src);
+    assert_eq!(
+        result.as_i32(),
+        Some(1),
+        "expected catchable RangeError with 'ReDoS' in message"
+    );
+    // Sanity check: the 10M step budget should fire in milliseconds,
+    // not seconds. Leave generous headroom for debug-build CI machines
+    // but catch regressions if the budget is ever miswired.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "S8-b step limit must kill ReDoS quickly, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn s8_b_normal_regex_still_works_within_step_limit() {
+    // Regression: ordinary patterns against ordinary inputs must stay
+    // under 10 M steps — trips if the budget gets accidentally lowered
+    // into realistic-workload territory.
+    let src = "const r = /^[a-z]+$/; \
+               (r.test('hello') ? 1 : 0) * 10 + (r.test('abc123') ? 1 : 0)";
+    let result = run_eval_value(src);
+    assert_eq!(
+        result.as_i32(),
+        Some(10),
+        "expected 'hello' match true and 'abc123' match false → 10"
+    );
+}
+
+#[test]
+fn s8_b_invalid_regex_literal_is_parse_phase_syntax_error() {
+    // Regression for the otter-side correctness gap discovered while
+    // diagnosing test262 RegExp `property-escapes` failures
+    // (2026-04-25): patterns like `\p{ASCII=T}` MUST throw
+    // `SyntaxError` at PARSE time, not at first `.test()` / `.exec()`.
+    // Without eager validation, a `negative: phase: parse` test262
+    // case that does `$DONOTEVALUATE();/\p{ASCII=T}/u;` runs the
+    // `$DONOTEVALUATE()` body and aborts — wrong outcome for the
+    // harness. Net effect of the fix on the test262 RegExp suite:
+    // 56.2 % → 68.7 % pass.
+    let src = "$DONOTEVALUATE();/\\p{ASCII=T}/u;";
+    let err = compile_eval(src).expect_err("must surface parse-phase SyntaxError");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("SyntaxError"),
+        "expected parse-phase SyntaxError, got {msg}"
+    );
+    assert!(
+        msg.contains("Invalid regular expression"),
+        "expected 'Invalid regular expression' marker, got {msg}"
+    );
+}
+
+#[test]
+fn s8_b_input_length_cap_still_enforced() {
+    // The two defences are independent and stack: a 2 MB input trips
+    // `MAX_REGEXP_INPUT_UTF16_UNITS` (S8-a) BEFORE regress is entered,
+    // so the step-limit path never runs. The error message must still
+    // contain "ReDoS".
+    let src = "let hit = 0; \
+               try { \
+                 const big = 'a'.repeat(2000000) + 'b'; \
+                 /a+/.test(big); \
+               } catch (e) { \
+                 hit = e.constructor.name === 'RangeError' \
+                   && e.message.indexOf('ReDoS') >= 0 ? 1 : 2; \
+               } \
+               hit";
+    let result = run_eval_value(src);
+    assert_eq!(
+        result.as_i32(),
+        Some(1),
+        "S8-a input cap must still fire for 2 MB input"
+    );
+}
+
+#[test]
 fn s3_while_true_loop_observes_interrupt_at_back_edge() {
     // A tight `while(true){}` never enters native intrinsic code, so it
     // used to hang forever even with the interrupt flag fired — Jump

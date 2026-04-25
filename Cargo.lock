@@ -2444,6 +2444,7 @@ dependencies = [
  "oxc_semantic",
  "oxc_sourcemap",
  "oxc_span",
+ "oxc_syntax",
  "oxc_transformer",
  "regress",
  "ryu",

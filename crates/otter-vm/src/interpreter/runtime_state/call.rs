@@ -486,6 +486,8 @@ impl RuntimeState {
                 if arguments.len() > param_count as usize {
                     activation.overflow_args = arguments[param_count as usize..].to_vec();
                 }
+                // C-args: capture the actual argc for `arguments.length`.
+                activation.argc = u16::try_from(arguments.len()).unwrap_or(u16::MAX);
 
                 // §7.3.33 InitializeInstanceElements — for base
                 // classes we install private methods + accessors

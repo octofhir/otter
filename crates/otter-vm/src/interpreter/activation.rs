@@ -71,6 +71,14 @@ pub struct Activation {
     /// Stored separately from the register file to avoid polluting the frame layout.
     /// Used by `CreateArguments` to populate the arguments exotic object.
     pub(super) overflow_args: Vec<RegisterValue>,
+    /// C-args: count of arguments actually passed by the caller, before any
+    /// default-initializer fills in `undefined` for missing formal params.
+    /// Distinct from `frame_layout().parameter_count()` — that's the FORMAL
+    /// param count from the function definition. We need the call-site count
+    /// for `arguments.length`, since `function f(a, b)` invoked as `f(1)`
+    /// must produce `arguments.length === 1` per §10.4.4.7 step 5.
+    /// Set by every Activation-producing call dispatch path.
+    pub(super) argc: u16,
     /// V8 Ignition-style implicit accumulator for the v2 bytecode
     /// dispatch. Holds the transient expression value that most v2
     /// arithmetic / comparison / property ops read and write. Unused by
@@ -141,6 +149,7 @@ impl Activation {
             open_upvalues: vec![None; usize::from(register_count)].into_boxed_slice(),
             written_registers: Vec::new(),
             overflow_args: Vec::new(),
+            argc: 0,
             accumulator: RegisterValue::undefined(),
             secondary_result: RegisterValue::undefined(),
             current_class_id: 0,

@@ -339,6 +339,129 @@ fn emit_rest_parameter<'a>(
     Ok(())
 }
 
+/// C-args: AST visitor that detects whether `arguments` is read
+/// anywhere in a function body. Mirrors V8/JSC's "argumentsObjectNeeded"
+/// elision pass — only allocate the exotic object when the body (or a
+/// nested arrow that lexically inherits `arguments`) actually
+/// references it. Skipping the allocation for functions that don't use
+/// `arguments` keeps the JIT analyzer's supported-opcode set unchanged
+/// for the common case and is critical for matching V8's perf profile.
+///
+/// Recursion rules:
+/// - Descends into arrow function/method bodies because their
+///   `arguments` reference resolves to the enclosing non-arrow.
+/// - Skips into nested non-arrow function bodies and method
+///   definitions — those have their own `arguments` scope, so an
+///   inner `arguments` does NOT make us need one.
+struct ArgumentsUseScanner {
+    seen: bool,
+}
+
+impl<'a> oxc_ast_visit::Visit<'a> for ArgumentsUseScanner {
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        if it.name == "arguments" {
+            self.seen = true;
+        }
+    }
+
+    // Stop at nested non-arrow function boundaries — they own their
+    // own `arguments` binding and don't propagate the need upward.
+    fn visit_function(&mut self, _it: &oxc_ast::ast::Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        // Intentionally do not recurse.
+    }
+
+    // Class method bodies are non-arrow regular functions per §15.7;
+    // their inner `arguments` belongs to the method.
+    fn visit_method_definition(&mut self, _it: &oxc_ast::ast::MethodDefinition<'a>) {
+        // Intentionally do not recurse.
+    }
+}
+
+/// Returns `true` when the function body (or a nested arrow inside it)
+/// reads the `arguments` identifier and therefore needs the exotic
+/// object materialised at function entry.
+fn function_body_uses_arguments<'a>(body: &'a FunctionBody<'a>) -> bool {
+    use oxc_ast_visit::Visit;
+    let mut scanner = ArgumentsUseScanner { seen: false };
+    for stmt in body.statements.iter() {
+        scanner.visit_statement(stmt);
+        if scanner.seen {
+            return true;
+        }
+    }
+    false
+}
+
+/// C-args: ES2024 §10.4.4 — non-arrow functions get an `arguments`
+/// exotic-object binding at function entry. Allocates a function-scope
+/// var-style local named `"arguments"`, emits `CreateArguments` to
+/// build the unmapped variant in the accumulator, and `Star`s it into
+/// that local. Arrow functions inherit `arguments` lexically from the
+/// enclosing non-arrow scope (no own binding) — the existing capture
+/// resolution path picks up the parent's local automatically.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
+/// Spec: <https://tc39.es/ecma262/#sec-arguments-exotic-objects>
+///
+/// Allocation skipped when:
+/// - The function is an arrow (lexical `arguments`).
+/// - A formal or rest parameter is named `arguments` (the parameter
+///   wins per FunctionDeclarationInstantiation step 17.b — `argumentsObjectNeeded` is false).
+/// - The body (and any nested arrows that share its `arguments`)
+///   doesn't reference `arguments` — V8/JSC do this elision so the
+///   common case keeps the JIT analyzer's supported-opcode set
+///   unchanged.
+///
+/// `var arguments = ...` inside the body is honoured by reusing the
+/// auto-allocated slot via `allocate_var_local`'s var-redeclare path
+/// (matches the spec's "var doesn't shadow the auto-binding" semantics
+/// for sloppy mode). `let arguments = ...` will surface as
+/// `duplicate_binding` — strict-mode early error per §15.2.1.1.
+fn emit_arguments_object<'a>(
+    builder: &mut BytecodeBuilder,
+    ctx: &mut LoweringContext<'a>,
+    layout: &ParamsLayout<'a>,
+    body: &'a FunctionBody<'a>,
+    is_arrow: bool,
+) -> Result<(), SourceLoweringError> {
+    if is_arrow {
+        return Ok(());
+    }
+    if layout.names.contains(&"arguments") || layout.rest_name == Some("arguments") {
+        return Ok(());
+    }
+    if !function_body_uses_arguments(body) {
+        return Ok(());
+    }
+
+    // Allocate as `is_var=true` so a downstream `var arguments`
+    // declaration in the body redeclaration-reuses this same slot
+    // instead of being rejected as a duplicate binding (matches
+    // V8/JSC behaviour for sloppy `var arguments = ...`).
+    let slot = ctx.allocate_local_with_mode(
+        "arguments",
+        /* is_const */ false,
+        /* runtime_tdz */ false,
+        /* is_var */ true,
+        Span::default(),
+    )?;
+    // CreateArguments imm = 0 → unmapped variant. Mapped variant
+    // (sloppy + simple params, with UpvalueCell aliasing) reserves
+    // imm = 1 for a follow-up implementation.
+    builder
+        .emit(Opcode::CreateArguments, &[Operand::Imm(0)])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode CreateArguments: {err:?}"))
+        })?;
+    builder
+        .emit(Opcode::Star, &[Operand::Reg(u32::from(slot))])
+        .map_err(|err| {
+            SourceLoweringError::Internal(format!("encode Star (arguments): {err:?}"))
+        })?;
+    ctx.mark_initialized("arguments")?;
+    Ok(())
+}
+
 pub(super) fn lower_function_body<'a>(
     body: &'a FunctionBody<'a>,
     params: &'a FormalParameters<'a>,
@@ -346,6 +469,8 @@ pub(super) fn lower_function_body<'a>(
     function_names: &'a [&'a str],
     module_functions: std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
 ) -> Result<FunctionBodyOutput, SourceLoweringError> {
+    // C-args: top-level function declarations and module-init lowering
+    // are always non-arrow. Arrows go through `lower_inner_callable`.
     lower_function_body_with_parent(
         body,
         params,
@@ -355,6 +480,7 @@ pub(super) fn lower_function_body<'a>(
         None,
         None,
         None,
+        false,
     )
     .map(|(out, _captures)| out)
 }
@@ -369,6 +495,7 @@ pub(super) fn lower_function_body_with_parent<'a>(
     parent: Option<&'a LoweringContext<'a>>,
     class_super_binding: Option<ClassSuperBinding>,
     class_private_names: Option<std::rc::Rc<[String]>>,
+    is_arrow: bool,
 ) -> Result<(FunctionBodyOutput, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
     // §14.1.1 Directive prologues — `"use strict"` is already the
     // default for ES modules, and classes / methods are strict
@@ -397,6 +524,7 @@ pub(super) fn lower_function_body_with_parent<'a>(
     emit_default_initializers(&mut builder, &mut ctx, layout)?;
     emit_param_destructuring(&mut builder, &mut ctx, layout)?;
     emit_rest_parameter(&mut builder, &mut ctx, layout)?;
+    emit_arguments_object(&mut builder, &mut ctx, layout, body, is_arrow)?;
 
     // Empty function body — synthesise `LdaUndefined; Return` so
     // the function exits per §15.2.1 FunctionBody evaluation
@@ -645,7 +773,8 @@ pub(super) fn lower_arrow_function_expression<'a>(
     // regular FunctionBody. Either case flows through
     // `lower_inner_callable` unchanged — no special-casing of
     // `arrow.expression` needed.
-    let (inner_idx, captures) = lower_inner_callable(ctx, &arrow.params, &arrow.body, None)?;
+    let (inner_idx, captures) =
+        lower_inner_callable(ctx, &arrow.params, &arrow.body, None, /* is_arrow */ true)?;
     if arrow.r#async {
         let mut fns = ctx.module_functions.borrow_mut();
         fns[inner_idx as usize].set_async(true);
@@ -928,7 +1057,9 @@ fn lower_inner_function_with_captures<'a>(
         .as_ref()
         .ok_or_else(|| SourceLoweringError::unsupported("declared_only_function", func.span))?;
     let name = func.id.as_ref().map(|ident| ident.name.as_str().to_owned());
-    lower_inner_callable(outer, &func.params, body, name)
+    // Nested `function` expressions / declarations are never arrows;
+    // arrow lowering goes through `lower_arrow_function_expression`.
+    lower_inner_callable(outer, &func.params, body, name, /* is_arrow */ false)
 }
 
 /// Shared core for lowering a nested callable (FunctionExpression,
@@ -946,8 +1077,9 @@ fn lower_inner_callable<'a>(
     params: &'a FormalParameters<'a>,
     body: &'a FunctionBody<'a>,
     name: Option<String>,
+    is_arrow: bool,
 ) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
-    lower_inner_callable_with_super(outer, params, body, name, None, None)
+    lower_inner_callable_with_super(outer, params, body, name, None, None, is_arrow)
 }
 
 /// M28/M29 variant of [`lower_inner_callable`] that threads
@@ -963,6 +1095,7 @@ pub(super) fn lower_inner_callable_with_super<'a>(
     name: Option<String>,
     class_super_binding: Option<ClassSuperBinding>,
     class_private_names: Option<std::rc::Rc<[String]>>,
+    is_arrow: bool,
 ) -> Result<(u32, Vec<crate::closure::CaptureDescriptor>), SourceLoweringError> {
     let params_layout = analyze_params(params)?;
     let param_count = params_layout.param_slot_count();
@@ -976,6 +1109,7 @@ pub(super) fn lower_inner_callable_with_super<'a>(
         Some(outer),
         class_super_binding,
         class_private_names,
+        is_arrow,
     )?;
 
     let layout = FrameLayout::new(1, param_count, body_out.local_count, body_out.temp_count)

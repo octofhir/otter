@@ -539,6 +539,8 @@ impl Interpreter {
                 // Store actual argument count in metadata.
                 activation.metadata =
                     FrameMetadata::new(arguments.len() as RegisterIndex, FrameFlags::default());
+                // C-args: capture the call-site argc for `arguments.length`.
+                activation.argc = u16::try_from(arguments.len()).unwrap_or(u16::MAX);
 
                 if is_async {
                     // §27.7.5.1 AsyncFunctionStart — create a result promise,

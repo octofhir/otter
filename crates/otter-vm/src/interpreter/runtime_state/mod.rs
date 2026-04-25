@@ -1144,6 +1144,16 @@ impl RuntimeState {
         }
 
         let step = if cursor.is_array() {
+            // C-args: the array fast path applies only when the
+            // iterable is a true HeapValue::Array. For arguments
+            // objects, generic array-likes, or any plain Object the
+            // ArrayIterator wraps, defer to the protocol path so
+            // `%ArrayIteratorPrototype%.next` reads via
+            // LengthOfArrayLike + OrdinaryGet.
+            match self.objects.kind(cursor.iterable()) {
+                Ok(crate::object::HeapValueKind::Array) => {}
+                _ => return Err(InterpreterError::InvalidHeapValueKind),
+            }
             match self.objects.array_length(cursor.iterable())? {
                 Some(length) if cursor.next_index() < length => {
                     let value =

@@ -479,6 +479,7 @@ fn lower_class_body_core<'a>(
                     Some(class_name.to_owned()),
                     Some(ctor_super),
                     Some(std::rc::Rc::clone(&class_private_names)),
+                    /* is_arrow */ false,
                 )?;
                 if is_derived {
                     let mut fns = ctx.module_functions.borrow_mut();
@@ -621,6 +622,7 @@ fn lower_class_body_core<'a>(
                 Some(method.name.to_owned()),
                 Some(method_super),
                 Some(std::rc::Rc::clone(&class_private_names)),
+                /* is_arrow */ false,
             )?;
             let pc = builder.pc();
             let template = crate::closure::ClosureTemplate::with_flags(

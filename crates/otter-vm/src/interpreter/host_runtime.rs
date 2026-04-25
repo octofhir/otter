@@ -233,6 +233,10 @@ impl Interpreter {
             FrameMetadata::new(arguments.len() as u16, FrameFlags::default()),
             closure_handle,
         );
+        // C-args: generator resume reuses this Activation as the per-resume
+        // frame. The original argument vector at construction time is what
+        // `arguments.length` should reflect.
+        activation.argc = u16::try_from(arguments.len()).unwrap_or(u16::MAX);
 
         if let Some(saved) = saved_registers {
             activation

@@ -1285,7 +1285,10 @@ fn comparison_in_return_position() {
     let module = compile("function f(n) { return n < 5; }").expect("M6 compiles");
     let function = module.function(FunctionIndex(0)).expect("module has entry");
     let frame = function.frame_layout();
-    // FrameLayout is `[hidden | n]` — 1 + 1 = 2 slots.
+    // FrameLayout is `[hidden | n]` — 1 hidden + 1 param = 2 slots.
+    // C-args: the auto-allocated `arguments` local is elided when the
+    // body doesn't reference `arguments`, keeping the JIT analyzer's
+    // supported-opcode set unchanged for arithmetic-only functions.
     assert_eq!(frame.parameter_count(), 1);
     assert_eq!(frame.local_count(), 0);
 }
@@ -11118,4 +11121,209 @@ fn c13_from_char_code_preserves_lone_surrogate_units() {
         .expect("fromCharCode returns JsString")
         .clone();
     assert_eq!(js.as_utf16(), &[0xD800, 0x41, 0xDC00]);
+}
+
+// ─── C-args: ES2024 §10.4.4 unmapped Arguments exotic object ────────────────
+// Spec: <https://tc39.es/ecma262/#sec-arguments-exotic-objects>
+
+/// Helper: run an entry-module that exports `main(...)` and return its int32
+/// return value. Goes through `runtime.call_callable`, which is the same
+/// dispatch path the dispatcher uses — so `activation.argc` is wired and
+/// `arguments.length` reports the call-site count.
+fn c_args_run_main_returning_int32(source: &str, args: &[i32]) -> i32 {
+    run_module_graph_int32("entry", &[("entry", source)], "main", args)
+}
+
+#[test]
+fn c_args_arguments_length_matches_call_site_argc() {
+    // §10.4.4.7 step 5: arguments.length is the count of values the
+    // caller passed, not the formal-param count. Without this, default-
+    // initialised missing params would inflate `arguments.length`.
+    let src = "export function main(a, b, c) { return arguments.length; }";
+    assert_eq!(c_args_run_main_returning_int32(src, &[10, 20, 30, 40]), 4);
+    assert_eq!(c_args_run_main_returning_int32(src, &[10, 20]), 2);
+    assert_eq!(c_args_run_main_returning_int32(src, &[]), 0);
+}
+
+#[test]
+fn c_args_arguments_indexed_access_returns_passed_values() {
+    // §10.4.4.7 step 6: arguments[i] for 0 ≤ i < argc returns the
+    // exact value the caller supplied; for i ≥ argc returns
+    // undefined (not the formal-param default fill).
+    // Use a digit-encoding trick to verify all 3 indexed reads at once
+    // through a single i32 return: encode arguments[0..2] as decimal
+    // digits with sentinel `9` for `undefined`.
+    let src = "export function main(a, b) { \
+        var d0 = arguments[0] === undefined ? 9 : arguments[0]; \
+        var d1 = arguments[1] === undefined ? 9 : arguments[1]; \
+        var d2 = arguments[2] === undefined ? 9 : arguments[2]; \
+        return d0 * 100 + d1 * 10 + d2; \
+    }";
+    // [1, 2] → arguments[0]=1, [1]=2, [2]=undefined → 1*100 + 2*10 + 9 = 129
+    assert_eq!(c_args_run_main_returning_int32(src, &[1, 2]), 129);
+    // [1, 2, 3] → 123
+    assert_eq!(c_args_run_main_returning_int32(src, &[1, 2, 3]), 123);
+    // [] → 9*100 + 9*10 + 9 = 999
+    assert_eq!(c_args_run_main_returning_int32(src, &[]), 999);
+}
+
+#[test]
+fn c_args_spread_into_array_uses_iterator_protocol() {
+    // `[...arguments]` exercises Symbol.iterator on the arguments
+    // object via the protocol fallback in SpreadIntoArray. Without
+    // C-args, this either fails ("not iterable") or yields an empty
+    // array because the Array fast-path can't iterate non-Array iterables.
+    let src = "export function main(a, b, c, d) { \
+        var arr = [...arguments]; \
+        return arr.length; \
+    }";
+    assert_eq!(c_args_run_main_returning_int32(src, &[1, 2, 3, 4]), 4);
+}
+
+#[test]
+fn c_args_arrow_inherits_arguments_from_enclosing_function() {
+    // §10.4.4 + §15.3.4: arrows have lexical `arguments` — they must
+    // resolve to the enclosing non-arrow function's binding. The
+    // capture system handles this naturally because the auto-allocated
+    // local is named `"arguments"` and the parent-scope walk picks it up.
+    let src = "export function main() { return (() => arguments.length)(); }";
+    assert_eq!(c_args_run_main_returning_int32(src, &[1, 2, 3, 4, 5]), 5);
+}
+
+#[test]
+fn c_args_for_of_iterates_arguments_in_order() {
+    // For-of uses the iterator protocol against the arguments object.
+    // Confirms that `%ArrayIteratorPrototype%.next` falls back to
+    // LengthOfArrayLike + OrdinaryGet when iterable isn't a true Array,
+    // making non-Array array-likes (arguments, plain objects with length)
+    // iterate end-to-end.
+    let src = "export function main() { \
+        var sum = 0; \
+        for (var x of arguments) sum = sum + x; \
+        return sum; \
+    }";
+    assert_eq!(c_args_run_main_returning_int32(src, &[1, 2, 3]), 6);
+    assert_eq!(c_args_run_main_returning_int32(src, &[10, 20, 30, 40]), 100);
+}
+
+// ─── C9: WTF-16-preserving string indexing (no UTF-8 round-trip) ────────────
+// Spec: §22.1.3 — String.prototype methods index by UTF-16 code unit.
+
+/// Helper for C9: invoke a module-exported `main` and read back the
+/// returned JsString via direct heap inspection so the UTF-16 backing
+/// store is observable bypassing `js_to_string`'s lossy UTF-8 path.
+fn c9_main_returning_utf16(source: &str, args: &[i32]) -> Vec<u16> {
+    use crate::module_loader::{InMemoryModuleHost, ModuleRegistry, execute_module_graph};
+    let mut host = InMemoryModuleHost::new();
+    host.add_module("entry", source);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let mut registry = ModuleRegistry::new();
+    execute_module_graph("entry", &host, &mut runtime, &mut registry).expect("execute");
+    let value = registry
+        .get_export("entry", "main")
+        .expect("entry exports main");
+    let mut arg_regs: Vec<RegisterValue> =
+        args.iter().map(|&a| RegisterValue::from_i32(a)).collect();
+    let handle = crate::object::ObjectHandle(
+        value
+            .as_object_handle()
+            .expect("exported main must be an object handle"),
+    );
+    let result = runtime
+        .call_callable(handle, RegisterValue::undefined(), arg_regs.as_mut_slice())
+        .expect("call_callable");
+    let str_handle = crate::object::ObjectHandle(
+        result
+            .as_object_handle()
+            .expect("main must return a JsString handle"),
+    );
+    runtime
+        .objects()
+        .string_value(str_handle)
+        .expect("string_value")
+        .expect("must be a JsString")
+        .as_utf16()
+        .to_vec()
+}
+
+#[test]
+fn c9_char_at_indexes_by_utf16_code_unit_not_codepoint() {
+    // §22.1.3.2: `"😀".charAt(0)` returns the high surrogate 0xD83D
+    // (NOT the whole emoji). The previous implementation iterated
+    // `.chars()` and returned the full code point.
+    let units = c9_main_returning_utf16(
+        "export function main() { return String.fromCharCode(0xD83D, 0xDE00, 0x41).charAt(0); }",
+        &[],
+    );
+    assert_eq!(units, &[0xD83D]);
+}
+
+#[test]
+fn c9_at_indexes_by_utf16_code_unit() {
+    // §22.1.3.1: `at(2)` on a length-3 surrogate-pair string returns
+    // the third UTF-16 code unit, not the third Unicode code point.
+    let units = c9_main_returning_utf16(
+        "export function main() { return String.fromCharCode(0xD83D, 0xDE00, 0x41).at(2); }",
+        &[],
+    );
+    assert_eq!(units, &[0x41]);
+}
+
+#[test]
+fn c9_slice_preserves_lone_surrogates() {
+    // Previously slice went through `String::from_utf16_lossy`, replacing
+    // unpaired surrogates with U+FFFD. Spec allows them to survive
+    // unchanged.
+    let units = c9_main_returning_utf16(
+        "export function main() { return String.fromCharCode(0xD800, 0x41, 0xDC00).slice(0, 2); }",
+        &[],
+    );
+    assert_eq!(units, &[0xD800, 0x41]);
+}
+
+#[test]
+fn c9_substring_preserves_lone_surrogates() {
+    let units = c9_main_returning_utf16(
+        "export function main() { return String.fromCharCode(0xD800, 0x41, 0xDC00).substring(0, 2); }",
+        &[],
+    );
+    assert_eq!(units, &[0xD800, 0x41]);
+}
+
+#[test]
+fn c9_index_of_finds_lone_surrogate_needle() {
+    // `indexOf` previously re-encoded both haystack and needle through
+    // UTF-8, mangling lone surrogates. Now reads WTF-16 directly.
+    let src = "export function main() { \
+        var s = String.fromCharCode(0x41, 0xD800, 0x42); \
+        var needle = String.fromCharCode(0xD800); \
+        return s.indexOf(needle); \
+    }";
+    assert_eq!(run_module_graph_int32("entry", &[("entry", src)], "main", &[]), 1);
+}
+
+#[test]
+fn c9_pad_start_preserves_lone_surrogate_fill() {
+    // padStart fill argument went through UTF-8 round-trip — lone
+    // surrogates in the fill string came out as U+FFFD. C9 reads the
+    // fill via WTF-16-preserving coercion.
+    let units = c9_main_returning_utf16(
+        "export function main() { \
+            return String.fromCharCode(0x58).padStart(3, String.fromCharCode(0xD800)); \
+        }",
+        &[],
+    );
+    assert_eq!(units, &[0xD800, 0xD800, 0x58]);
+}
+
+#[test]
+fn c_args_param_named_arguments_shadows_auto_allocation() {
+    // §15.2.1.1 / §10.2.11 step 17.b: when a formal parameter is
+    // named "arguments", argumentsObjectNeeded is false — the
+    // parameter binding wins and no auto-allocation happens. Otter's
+    // emit_arguments_object must skip the slot allocation in this
+    // case (otherwise allocate_local_with_mode would reject the
+    // duplicate binding).
+    let src = "export function main(arguments) { return arguments + 1; }";
+    assert_eq!(c_args_run_main_returning_int32(src, &[41]), 42);
 }

@@ -1449,7 +1449,7 @@ impl<'a> LoweringContext<'a> {
         Ok(slot)
     }
 
-    fn allocate_local_with_mode(
+    pub(super) fn allocate_local_with_mode(
         &mut self,
         name: &'a str,
         is_const: bool,

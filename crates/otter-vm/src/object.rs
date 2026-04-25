@@ -5099,6 +5099,19 @@ impl ObjectHeap {
             }
             _ => return Err(ObjectError::InvalidKind),
         };
+        // C-args: the Array fast path can only short-circuit when the
+        // iterable is a true HeapValue::Array. For arguments objects,
+        // generic array-likes, and any other ordinary Object, defer
+        // to the protocol path (`%ArrayIteratorPrototype%.next`) by
+        // returning InvalidKind here. Without this, the `_ => done()`
+        // branch below would silently terminate iteration on anything
+        // that isn't HeapValue::Array — making `[...arguments]`,
+        // `Array.from(arrayLike)`, etc. produce an empty result.
+        if matches!(kind, IteratorKind::Array)
+            && !matches!(self.kind(iterable), Ok(HeapValueKind::Array))
+        {
+            return Err(ObjectError::InvalidKind);
+        }
 
         if closed {
             return Ok(IteratorStep::done());

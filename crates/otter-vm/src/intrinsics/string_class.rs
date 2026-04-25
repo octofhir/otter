@@ -390,6 +390,31 @@ fn this_string_value(
         .map_err(|error| map_interpreter_error(error, runtime))
 }
 
+/// C9: WTF-16-preserving coercion for argument values. Mirrors
+/// `this_js_string_value` but operates on an arbitrary `RegisterValue`
+/// (search needles, fill strings, etc.) so methods like `indexOf`,
+/// `padStart`, `startsWith` can work on lone-surrogate inputs without
+/// the UTF-8 round-trip dropping `0xD800–0xDFFF` to U+FFFD.
+///
+/// Fast path: when the value is already a primitive string handle,
+/// reads the WTF-16 backing store directly. Slow path: falls back to
+/// `js_to_string` → `JsString::from_str` for non-strings (numbers,
+/// booleans, etc.) — those have no lone surrogates by construction.
+fn arg_js_string_value(
+    value: RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<crate::js_string::JsString, VmNativeCallError> {
+    if let Some(handle) = value.as_object_handle().map(crate::object::ObjectHandle)
+        && let Ok(Some(js)) = runtime.objects().string_value(handle)
+    {
+        return Ok(js.clone());
+    }
+    let s = runtime
+        .js_to_string(value)
+        .map_err(|error| map_interpreter_error(error, runtime))?;
+    Ok(crate::js_string::JsString::from_str(&s))
+}
+
 /// Resolve an integer argument, defaulting to `default` if undefined/absent.
 fn int_arg(args: &[RegisterValue], index: usize, default: i32) -> i32 {
     args.get(index)
@@ -420,16 +445,22 @@ fn string_at(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len() as i32;
+    // C9: index by UTF-16 code units (spec §22.1.3.1 — `String.prototype.at`
+    // uses LengthOfArrayLike on the string, where the string's length IS
+    // its UTF-16 code unit count). Previously iterated `s.chars()` which
+    // counts Unicode code points → off-by-one for any string containing
+    // a supplementary character.
+    let js = this_js_string_value(this, runtime)?;
+    let units = js.as_utf16();
+    let len = units.len() as i32;
     let index = int_arg(args, 0, 0);
     let actual = if index < 0 { len + index } else { index };
     if actual < 0 || actual >= len {
         return Ok(RegisterValue::undefined());
     }
-    let ch = chars[actual as usize];
-    let handle = runtime.alloc_string(ch.to_string())?;
+    let unit = units[actual as usize];
+    let handle = runtime
+        .alloc_js_string(crate::js_string::JsString::from_utf16(vec![unit]))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -440,15 +471,20 @@ fn string_char_at(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
+    // C9: §22.1.3.2 specifies UTF-16 code-unit indexing. `chars().nth()`
+    // is wrong (iterates code points, not units). For a string like
+    // `"😀".charAt(0)` the spec returns the high surrogate
+    // `"\uD83D"`; the old code returned the whole emoji.
+    let js = this_js_string_value(this, runtime)?;
     let pos = int_arg(args, 0, 0);
     if pos < 0 {
         let handle = runtime.alloc_string("")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
-    match s.chars().nth(pos as usize) {
-        Some(ch) => {
-            let handle = runtime.alloc_string(ch.to_string())?;
+    match js.code_unit_at(pos as usize) {
+        Some(unit) => {
+            let handle = runtime
+                .alloc_js_string(crate::js_string::JsString::from_utf16(vec![unit]))?;
             Ok(RegisterValue::from_object_handle(handle.0))
         }
         None => {
@@ -486,16 +522,20 @@ fn string_code_point_at(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
+    // C9: read WTF-16 backing store directly. The previous
+    // `js_to_string` → `encode_utf16` round-trip mangled lone surrogates
+    // (a string built via `String.fromCharCode(0xD800)` came out as
+    // `"�"`) and re-encoded the entire string per call.
+    let js = this_js_string_value(this, runtime)?;
     let pos = int_arg(args, 0, 0);
-    let code_units: Vec<u16> = s.encode_utf16().collect();
-    if pos < 0 || (pos as usize) >= code_units.len() {
+    let units = js.as_utf16();
+    if pos < 0 || (pos as usize) >= units.len() {
         return Ok(RegisterValue::undefined());
     }
     let i = pos as usize;
-    let first = code_units[i];
-    if (0xD800..=0xDBFF).contains(&first) && i + 1 < code_units.len() {
-        let second = code_units[i + 1];
+    let first = units[i];
+    if (0xD800..=0xDBFF).contains(&first) && i + 1 < units.len() {
+        let second = units[i + 1];
         if (0xDC00..=0xDFFF).contains(&second) {
             let cp = 0x10000 + ((first as u32 - 0xD800) << 10) + (second as u32 - 0xDC00);
             return Ok(RegisterValue::from_i32(cp as i32));
@@ -511,26 +551,22 @@ fn string_index_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let search = args
-        .first()
-        .copied()
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| "undefined".into());
+    // C9: index by UTF-16 units read directly from the JsString
+    // backing store. Avoids the per-call `js_to_string` →
+    // `encode_utf16` round-trip and preserves lone surrogates.
+    let js = this_js_string_value(this, runtime)?;
+    let search_js = match args.first().copied() {
+        Some(v) => arg_js_string_value(v, runtime)?,
+        None => crate::js_string::JsString::from_str("undefined"),
+    };
     let pos = int_arg(args, 1, 0).max(0) as usize;
-    // UTF-16 based positions for spec compliance.
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let search_units: Vec<u16> = search.encode_utf16().collect();
+    let s_units = js.as_utf16();
+    let search_units = search_js.as_utf16();
     if search_units.is_empty() {
         return Ok(RegisterValue::from_i32(pos.min(s_units.len()) as i32));
     }
     for i in pos..s_units.len() {
-        if s_units[i..].starts_with(&search_units) {
+        if s_units[i..].starts_with(search_units) {
             return Ok(RegisterValue::from_i32(i as i32));
         }
     }
@@ -544,19 +580,13 @@ fn string_last_index_of(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let search = args
-        .first()
-        .copied()
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| "undefined".into());
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let search_units: Vec<u16> = search.encode_utf16().collect();
+    let js = this_js_string_value(this, runtime)?;
+    let search_js = match args.first().copied() {
+        Some(v) => arg_js_string_value(v, runtime)?,
+        None => crate::js_string::JsString::from_str("undefined"),
+    };
+    let s_units = js.as_utf16();
+    let search_units = search_js.as_utf16();
     let pos = args
         .get(1)
         .copied()
@@ -581,7 +611,7 @@ fn string_last_index_of(
     }
     let limit = pos.min(s_units.len().saturating_sub(search_units.len()));
     for i in (0..=limit).rev() {
-        if s_units[i..].starts_with(&search_units) {
+        if s_units[i..].starts_with(search_units) {
             return Ok(RegisterValue::from_i32(i as i32));
         }
     }
@@ -595,26 +625,19 @@ fn string_includes(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let search = args
-        .first()
-        .copied()
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| "undefined".into());
+    let js = this_js_string_value(this, runtime)?;
+    let search_js = match args.first().copied() {
+        Some(v) => arg_js_string_value(v, runtime)?,
+        None => crate::js_string::JsString::from_str("undefined"),
+    };
     let pos = int_arg(args, 1, 0).max(0) as usize;
-    // Work in UTF-16 positions.
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let search_units: Vec<u16> = search.encode_utf16().collect();
+    let s_units = js.as_utf16();
+    let search_units = search_js.as_utf16();
     if search_units.is_empty() {
         return Ok(RegisterValue::from_bool(true));
     }
     for i in pos..s_units.len() {
-        if s_units[i..].starts_with(&search_units) {
+        if s_units[i..].starts_with(search_units) {
             return Ok(RegisterValue::from_bool(true));
         }
     }
@@ -628,25 +651,19 @@ fn string_starts_with(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let search = args
-        .first()
-        .copied()
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| "undefined".into());
+    let js = this_js_string_value(this, runtime)?;
+    let search_js = match args.first().copied() {
+        Some(v) => arg_js_string_value(v, runtime)?,
+        None => crate::js_string::JsString::from_str("undefined"),
+    };
     let pos = int_arg(args, 1, 0).max(0) as usize;
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let search_units: Vec<u16> = search.encode_utf16().collect();
+    let s_units = js.as_utf16();
+    let search_units = search_js.as_utf16();
     if pos + search_units.len() > s_units.len() {
         return Ok(RegisterValue::from_bool(false));
     }
     Ok(RegisterValue::from_bool(
-        s_units[pos..].starts_with(&search_units),
+        s_units[pos..].starts_with(search_units),
     ))
 }
 
@@ -657,19 +674,13 @@ fn string_ends_with(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let search = args
-        .first()
-        .copied()
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| "undefined".into());
-    let s_units: Vec<u16> = s.encode_utf16().collect();
-    let search_units: Vec<u16> = search.encode_utf16().collect();
+    let js = this_js_string_value(this, runtime)?;
+    let search_js = match args.first().copied() {
+        Some(v) => arg_js_string_value(v, runtime)?,
+        None => crate::js_string::JsString::from_str("undefined"),
+    };
+    let s_units = js.as_utf16();
+    let search_units = search_js.as_utf16();
     let end_pos = args
         .get(1)
         .copied()
@@ -688,7 +699,7 @@ fn string_ends_with(
     }
     let start = end_pos - search_units.len();
     Ok(RegisterValue::from_bool(
-        s_units[start..end_pos] == search_units[..],
+        &s_units[start..end_pos] == search_units,
     ))
 }
 
@@ -699,8 +710,12 @@ fn string_slice(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let s_units: Vec<u16> = s.encode_utf16().collect();
+    // C9: slice over UTF-16 storage, build the result via
+    // `JsString::from_utf16` so lone surrogates survive end-to-end.
+    // The previous `String::from_utf16_lossy` path replaced unpaired
+    // surrogates with U+FFFD, breaking spec equivalence with V8/JSC.
+    let js = this_js_string_value(this, runtime)?;
+    let s_units = js.as_utf16();
     let len = s_units.len();
     let start = relative_index(int_arg(args, 0, 0), len);
     let end = if args.get(1).copied() == Some(RegisterValue::undefined()) || args.get(1).is_none() {
@@ -712,8 +727,9 @@ fn string_slice(
         let handle = runtime.alloc_string("")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
-    let result = String::from_utf16_lossy(&s_units[start..end]);
-    let handle = runtime.alloc_string(result)?;
+    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(
+        s_units[start..end].to_vec(),
+    ))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -724,8 +740,8 @@ fn string_substring(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
-    let s_units: Vec<u16> = s.encode_utf16().collect();
+    let js = this_js_string_value(this, runtime)?;
+    let s_units = js.as_utf16();
     let len = s_units.len() as i32;
     let raw_start = int_arg(args, 0, 0).clamp(0, len) as usize;
     let raw_end =
@@ -739,8 +755,9 @@ fn string_substring(
     } else {
         (raw_end, raw_start)
     };
-    let result = String::from_utf16_lossy(&s_units[from..to]);
-    let handle = runtime.alloc_string(result)?;
+    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(
+        s_units[from..to].to_vec(),
+    ))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -843,7 +860,7 @@ fn string_pad_start(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
+    let js = this_js_string_value(this, runtime)?;
     let max_len = int_arg(args, 0, 0).max(0) as usize;
     if max_len > MAX_INTRINSIC_STRING_BYTES {
         return Err(range_error(
@@ -851,25 +868,21 @@ fn string_pad_start(
             "Invalid string length: padded string is too large",
         ));
     }
-    let s_units: Vec<u16> = s.encode_utf16().collect();
+    let s_units = js.as_utf16();
     if s_units.len() >= max_len {
-        let handle = runtime.alloc_string(&*s)?;
+        let handle = runtime
+            .alloc_js_string(crate::js_string::JsString::from_utf16(s_units.to_vec()))?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
-    let fill = args
-        .get(1)
-        .copied()
-        .filter(|v| *v != RegisterValue::undefined())
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| " ".into());
-    let fill_units: Vec<u16> = fill.encode_utf16().collect();
+    // C9: read fill string via WTF-16-preserving coercion.
+    let fill_js = match args.get(1).copied().filter(|v| *v != RegisterValue::undefined()) {
+        Some(v) => arg_js_string_value(v, runtime)?,
+        None => crate::js_string::JsString::from_str(" "),
+    };
+    let fill_units = fill_js.as_utf16();
     if fill_units.is_empty() {
-        let handle = runtime.alloc_string(&*s)?;
+        let handle = runtime
+            .alloc_js_string(crate::js_string::JsString::from_utf16(s_units.to_vec()))?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let pad_needed = max_len - s_units.len();
@@ -878,9 +891,8 @@ fn string_pad_start(
         check_interrupt_poll(runtime, i)?;
         padded.push(fill_units[i % fill_units.len()]);
     }
-    padded.extend_from_slice(&s_units);
-    let result = String::from_utf16_lossy(&padded);
-    let handle = runtime.alloc_string(result)?;
+    padded.extend_from_slice(s_units);
+    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(padded))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -891,7 +903,7 @@ fn string_pad_end(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let s = this_string_value(this, runtime)?;
+    let js = this_js_string_value(this, runtime)?;
     let max_len = int_arg(args, 0, 0).max(0) as usize;
     if max_len > MAX_INTRINSIC_STRING_BYTES {
         return Err(range_error(
@@ -899,36 +911,30 @@ fn string_pad_end(
             "Invalid string length: padded string is too large",
         ));
     }
-    let s_units: Vec<u16> = s.encode_utf16().collect();
+    let s_units = js.as_utf16();
     if s_units.len() >= max_len {
-        let handle = runtime.alloc_string(&*s)?;
+        let handle = runtime
+            .alloc_js_string(crate::js_string::JsString::from_utf16(s_units.to_vec()))?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
-    let fill = args
-        .get(1)
-        .copied()
-        .filter(|v| *v != RegisterValue::undefined())
-        .map(|v| {
-            runtime
-                .js_to_string(v)
-                .map_err(|e| map_interpreter_error(e, runtime))
-        })
-        .transpose()?
-        .unwrap_or_else(|| " ".into());
-    let fill_units: Vec<u16> = fill.encode_utf16().collect();
+    let fill_js = match args.get(1).copied().filter(|v| *v != RegisterValue::undefined()) {
+        Some(v) => arg_js_string_value(v, runtime)?,
+        None => crate::js_string::JsString::from_str(" "),
+    };
+    let fill_units = fill_js.as_utf16();
     if fill_units.is_empty() {
-        let handle = runtime.alloc_string(&*s)?;
+        let handle = runtime
+            .alloc_js_string(crate::js_string::JsString::from_utf16(s_units.to_vec()))?;
         return Ok(RegisterValue::from_object_handle(handle.0));
     }
     let pad_needed = max_len - s_units.len();
     let mut padded: Vec<u16> = Vec::with_capacity(max_len);
-    padded.extend_from_slice(&s_units);
+    padded.extend_from_slice(s_units);
     for i in 0..pad_needed {
         check_interrupt_poll(runtime, i)?;
         padded.push(fill_units[i % fill_units.len()]);
     }
-    let result = String::from_utf16_lossy(&padded);
-    let handle = runtime.alloc_string(result)?;
+    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(padded))?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 

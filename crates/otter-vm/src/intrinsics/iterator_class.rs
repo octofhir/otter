@@ -9,6 +9,7 @@
 //! - CreateIterResultObject:    <https://tc39.es/ecma262/#sec-createiterresultobject>
 
 use crate::descriptors::{NativeFunctionDescriptor, VmNativeCallError};
+use crate::interpreter::InterpreterError;
 use crate::object::{
     ArrayIteratorKind, HeapValueKind, MapIteratorKind, ObjectHandle, PropertyAttributes,
     PropertyValue, SetIteratorKind,
@@ -450,12 +451,49 @@ fn array_iterator_next(
     let iterable = cursor.iterable();
     let index = cursor.next_index();
 
-    // Check array bounds.
-    let length = runtime
+    // §23.1.5.1 ArrayIteratorPrototype.next — works on any
+    // array-like object (Array, arguments, plain Object with
+    // `length` etc.). Try the Array fast path first; if the
+    // iterable is not a true Array, fall back to LengthOfArrayLike
+    // / OrdinaryGet so generic objects iterate correctly.
+    //
+    // C-args: this generic branch is what makes `[...arguments]`,
+    // `for (const v of arguments)`, and `Array.from(arrayLike)`
+    // produce the same values V8/JSC do.
+    let length = match runtime
         .objects()
         .array_length(iterable)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
-        .unwrap_or(0);
+    {
+        Some(len) => len,
+        None => {
+            // §7.3.18 LengthOfArrayLike(obj) =
+            //   ToLength(? Get(obj, "length")).
+            let len_prop = runtime.intern_property_name("length");
+            let recv = RegisterValue::from_object_handle(iterable.0);
+            let len_val = runtime.ordinary_get(iterable, len_prop, recv)?;
+            // Fast path for already-numeric. Slow path coerces via ToNumber
+            // (handles `{length: "3"}`-style array-likes per §7.1.4).
+            let n = if let Some(i) = len_val.as_i32() {
+                i.max(0) as f64
+            } else if let Some(num) = len_val.as_number() {
+                num
+            } else {
+                runtime.js_to_number(len_val).map_err(|err| match err {
+                    InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
+                    _ => VmNativeCallError::Internal(format!("{err}").into()),
+                })?
+            };
+            // §7.1.20 ToLength clamp: NaN/≤0 → 0; +∞ → 2^53-1; else trunc.
+            if n.is_nan() || n <= 0.0 {
+                0
+            } else if !n.is_finite() {
+                ((1u64 << 53) - 1) as usize
+            } else {
+                n.trunc().min(((1u64 << 53) - 1) as f64) as usize
+            }
+        }
+    };
 
     if index >= length {
         // Close the iterator.
@@ -467,11 +505,22 @@ fn array_iterator_next(
     }
 
     // Read the element value (needed for values and entries kinds).
-    let elem = runtime
-        .objects_mut()
-        .get_index(iterable, index)
-        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?
-        .unwrap_or(RegisterValue::undefined());
+    // For Array iterables `get_index` returns the dense element;
+    // for non-Array iterables (arguments, plain objects with
+    // indexed data properties) we fall back to OrdinaryGet by the
+    // stringified index, matching the spec's
+    // `Get(O, ToString(F(index)))`.
+    let elem = match runtime.objects_mut().get_index(iterable, index) {
+        Ok(Some(v)) => v,
+        Ok(None) | Err(crate::object::ObjectError::InvalidKind) => {
+            // §23.1.5.1 falls back to Get(O, ToString(F(index))) for
+            // non-Array iterables.
+            let key = runtime.intern_property_name(&index.to_string());
+            let recv = RegisterValue::from_object_handle(iterable.0);
+            runtime.ordinary_get(iterable, key, recv)?
+        }
+        Err(e) => return Err(VmNativeCallError::Internal(format!("{e:?}").into())),
+    };
 
     // Advance cursor (increments next_index by 1).
     runtime

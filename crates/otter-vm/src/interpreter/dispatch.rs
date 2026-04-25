@@ -1169,6 +1169,157 @@ impl Interpreter {
                 }
                 activation.set_accumulator(RegisterValue::from_object_handle(arr.0));
             }
+            // C-args: §10.4.4 CreateUnmappedArgumentsObject — non-arrow
+            // functions need an `arguments` exotic object exposing the
+            // caller-supplied argument vector. Imm operand reserved for
+            // future mapped/unmapped split (mapped path = sloppy + simple
+            // params with UpvalueCell aliasing); the current dispatch
+            // always builds the unmapped variant so strict-mode and
+            // non-simple-param functions are spec-correct out of the gate.
+            // Mapped variant tracked for follow-up because it requires the
+            // formal-param register slots to be aliased through upvalue
+            // cells — a separate refactor.
+            Opcode::CreateArguments => {
+                let _kind = imm(&instr.operands, 0)?;
+
+                // Snapshot the actually-passed args into a single vector.
+                // Spec semantics (§10.4.4.7 step 5): `arguments.length`
+                // mirrors the call-site argc, NOT the formal param count.
+                // For `function f(a,b){…} f(1)` we materialise length=1
+                // even though slot `b` got default-initialised to undefined.
+                //
+                // Source: first `min(argc, formal_param_count)` values come
+                // from the formal-param registers (they hold the caller-
+                // supplied values, which CreateArguments runs BEFORE any
+                // body assignment can mutate them). The remaining values
+                // beyond formal_param_count came in via `overflow_args`.
+                let layout = function.frame_layout();
+                let argc = usize::from(activation.argc);
+                let formal_count = usize::from(layout.parameter_count());
+                let from_formals = argc.min(formal_count);
+                let mut args: Vec<RegisterValue> =
+                    Vec::with_capacity(argc);
+                for i in 0..from_formals {
+                    let user = match RegisterIndex::try_from(i) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    if let Some(abs) = layout.resolve_user_visible(user) {
+                        args.push(activation.register(abs).unwrap_or_default());
+                    }
+                }
+                // Anything beyond formal_count came through overflow_args.
+                // We take all of overflow_args even if argc > formal_count —
+                // call dispatch only stashes overflow when args.len() exceeds
+                // formal_count, so overflow_args.len() == argc - formal_count
+                // by construction. Defensive cap kept for safety.
+                let overflow_take = argc.saturating_sub(formal_count);
+                args.extend(
+                    activation
+                        .overflow_args
+                        .iter()
+                        .take(overflow_take)
+                        .copied(),
+                );
+
+                // Build the exotic-shape object. Its prototype is
+                // %Object.prototype% (§10.4.4.7 step 2).
+                let obj = runtime.alloc_object()?;
+
+                // §10.4.4.7 step 5: define `length` as a data property
+                // { value: argCount, writable: true, enumerable: false,
+                //   configurable: true }.
+                {
+                    let len_prop = runtime.intern_property_name("length");
+                    let attrs =
+                        crate::object::PropertyAttributes::from_flags(true, false, true);
+                    let desc = crate::object::PropertyValue::data_with_attrs(
+                        RegisterValue::from_i32(args.len() as i32),
+                        attrs,
+                    );
+                    if runtime
+                        .objects_mut()
+                        .define_own_property(obj, len_prop, desc)
+                        .is_err()
+                    {
+                        let err = runtime
+                            .alloc_type_error("CreateArguments: define length failed")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+
+                // §10.4.4.7 step 6: define indexed data properties
+                // 0..n-1 { value: arg[i], writable, enumerable,
+                // configurable }.
+                let data_attrs = crate::object::PropertyAttributes::data();
+                for (i, value) in args.iter().enumerate() {
+                    let key = runtime.intern_property_name(&i.to_string());
+                    let desc =
+                        crate::object::PropertyValue::data_with_attrs(*value, data_attrs);
+                    if runtime
+                        .objects_mut()
+                        .define_own_property(obj, key, desc)
+                        .is_err()
+                    {
+                        let err = runtime
+                            .alloc_type_error("CreateArguments: define index failed")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+
+                // §10.4.4.7 step 7: define `Symbol.iterator` as
+                // %Array.prototype.values% { writable, !enumerable,
+                // configurable }.
+                {
+                    let array_proto = runtime.intrinsics().array_prototype();
+                    let values_prop = runtime.intern_property_name("values");
+                    let values_fn = runtime
+                        .objects()
+                        .get_property(array_proto, values_prop)
+                        .ok()
+                        .flatten()
+                        .and_then(|lookup| match lookup.value() {
+                            crate::object::PropertyValue::Data { value, .. } => Some(value),
+                            _ => None,
+                        })
+                        .unwrap_or_else(RegisterValue::undefined);
+                    let sym_iter = runtime.intern_symbol_property_name(
+                        crate::intrinsics::WellKnownSymbol::Iterator.stable_id(),
+                    );
+                    let attrs =
+                        crate::object::PropertyAttributes::from_flags(true, false, true);
+                    let desc =
+                        crate::object::PropertyValue::data_with_attrs(values_fn, attrs);
+                    if runtime
+                        .objects_mut()
+                        .define_own_property(obj, sym_iter, desc)
+                        .is_err()
+                    {
+                        let err = runtime
+                            .alloc_type_error("CreateArguments: define @@iterator failed")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+
+                // §10.4.4.7 step 8: define `callee` as accessor
+                // pair { Get: %ThrowTypeError%, Set: %ThrowTypeError%,
+                // !enumerable, configurable }. Skip when the
+                // intrinsic isn't installed yet (bootstrap path).
+                if let Some(thrower) = runtime.intrinsics().throw_type_error_function() {
+                    let callee_prop = runtime.intern_property_name("callee");
+                    if runtime
+                        .objects_mut()
+                        .define_accessor(obj, callee_prop, Some(thrower), Some(thrower))
+                        .is_err()
+                    {
+                        let err = runtime
+                            .alloc_type_error("CreateArguments: define callee failed")?;
+                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                    }
+                }
+
+                activation.set_accumulator(RegisterValue::from_object_handle(obj.0));
+            }
 
             // `CreateClosure idx, flags` — M25. Builds a fresh
             // closure object bound to the `ClosureTemplate`
@@ -1482,6 +1633,11 @@ impl Interpreter {
                     if args.len() > param_count as usize {
                         callee_activation.overflow_args = args[param_count as usize..].to_vec();
                     }
+                    // C-args: capture the call-site argc so CreateArguments
+                    // can produce `arguments.length` independent of the
+                    // formal-param-default fill.
+                    callee_activation.argc =
+                        u16::try_from(args.len()).unwrap_or(u16::MAX);
                     // Receiver goes into hidden slot 0 iff the callee has one.
                     if callee.frame_layout().receiver_slot().is_some() {
                         callee_activation.set_receiver(callee, receiver)?;
@@ -1800,11 +1956,24 @@ impl Interpreter {
                     let err = runtime.alloc_type_error("Spread argument is not iterable")?;
                     return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
                 };
-                let iter = match runtime.objects.alloc_iterator(source_handle) {
-                    Ok(h) => h,
+                // C-args / generic spread: prefer the Array/String
+                // fast-path iterator, but fall back to the iterator
+                // protocol (`Symbol.iterator`) for any other iterable
+                // — arguments, Map, Set, generators, user-defined
+                // iterables. This matches V8/JSC where `[...x]` works
+                // for any object exposing `@@iterator`.
+                let (iter, use_protocol) = match runtime.objects.alloc_iterator(source_handle) {
+                    Ok(h) => (h, false),
                     Err(_) => {
-                        let err = runtime.alloc_type_error("Spread argument is not iterable")?;
-                        return Ok(StepOutcome::Throw(RegisterValue::from_object_handle(err.0)));
+                        let opened = runtime.iterator_open(source).map_err(|err| match err {
+                            crate::descriptors::VmNativeCallError::Thrown(v) => {
+                                InterpreterError::UncaughtThrow(v)
+                            }
+                            crate::descriptors::VmNativeCallError::Internal(msg) => {
+                                InterpreterError::NativeCall(msg)
+                            }
+                        })?;
+                        (opened, true)
                     }
                 };
                 // S1 watchdog tick: spreading an attacker-controlled
@@ -1814,7 +1983,18 @@ impl Interpreter {
                 // (timeout, ^C, signal_shutdown) can unwind the VM.
                 loop {
                     runtime.check_interrupt_interp()?;
-                    let step = runtime.iterator_next(iter)?;
+                    let step = if use_protocol {
+                        runtime.iterator_step_protocol(iter).map_err(|err| match err {
+                            crate::descriptors::VmNativeCallError::Thrown(v) => {
+                                InterpreterError::UncaughtThrow(v)
+                            }
+                            crate::descriptors::VmNativeCallError::Internal(msg) => {
+                                InterpreterError::NativeCall(msg)
+                            }
+                        })?
+                    } else {
+                        runtime.iterator_next(iter)?
+                    };
                     if step.is_done() {
                         break;
                     }
@@ -3072,6 +3252,10 @@ impl Interpreter {
         if arguments.len() > param_count as usize {
             activation.overflow_args = arguments[param_count as usize..].to_vec();
         }
+        // C-args: capture the call-site argc so CreateArguments can
+        // produce `arguments.length` independent of the formal-param-
+        // default fill (e.g. `function f(a,b){…} f(1)` → argc=1, not 2).
+        activation.argc = argc;
 
         // M33: §27.7.5.1 AsyncFunctionStart — direct calls to
         // `async function` declarations also need to route

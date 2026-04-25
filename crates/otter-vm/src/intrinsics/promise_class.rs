@@ -432,7 +432,7 @@ fn promise_static_all(
     let result_cap = alloc_promise_capability(runtime)?;
 
     if promises.is_empty() {
-        let arr = runtime.objects_mut().alloc_array()?;
+        let arr = runtime.alloc_array()?;
         let promise = runtime
             .objects_mut()
             .get_promise_mut(result_cap.promise)
@@ -444,7 +444,7 @@ fn promise_static_all(
     let count = promises.len();
 
     // Allocate result array pre-filled with undefined at each index.
-    let result_array = runtime.objects_mut().alloc_array()?;
+    let result_array = runtime.alloc_array()?;
     for _ in 0..count {
         runtime
             .objects_mut()
@@ -453,7 +453,7 @@ fn promise_static_all(
     }
 
     // Shared mutable counter: 1-element array with initial value = count.
-    let counter = runtime.objects_mut().alloc_array()?;
+    let counter = runtime.alloc_array()?;
     runtime
         .objects_mut()
         .push_element(counter, RegisterValue::from_i32(count as i32))
@@ -543,7 +543,7 @@ fn promise_static_all_settled(
     let result_cap = alloc_promise_capability(runtime)?;
 
     if promises.is_empty() {
-        let arr = runtime.objects_mut().alloc_array()?;
+        let arr = runtime.alloc_array()?;
         let promise = runtime
             .objects_mut()
             .get_promise_mut(result_cap.promise)
@@ -554,7 +554,7 @@ fn promise_static_all_settled(
 
     let count = promises.len();
 
-    let result_array = runtime.objects_mut().alloc_array()?;
+    let result_array = runtime.alloc_array()?;
     for _ in 0..count {
         runtime
             .objects_mut()
@@ -562,7 +562,7 @@ fn promise_static_all_settled(
             .ok();
     }
 
-    let counter = runtime.objects_mut().alloc_array()?;
+    let counter = runtime.alloc_array()?;
     runtime
         .objects_mut()
         .push_element(counter, RegisterValue::from_i32(count as i32))
@@ -639,7 +639,7 @@ fn promise_static_any(
     let count = promises.len();
 
     // Errors array — collects rejection reasons.
-    let errors_array = runtime.objects_mut().alloc_array()?;
+    let errors_array = runtime.alloc_array()?;
     for _ in 0..count {
         runtime
             .objects_mut()
@@ -647,7 +647,7 @@ fn promise_static_any(
             .ok();
     }
 
-    let counter = runtime.objects_mut().alloc_array()?;
+    let counter = runtime.alloc_array()?;
     runtime
         .objects_mut()
         .push_element(counter, RegisterValue::from_i32(count as i32))

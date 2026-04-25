@@ -114,13 +114,19 @@ impl Interpreter {
             Opcode::LdaConstStr => {
                 let idx = idx_operand(&instr.operands, 0)?;
                 use crate::string::StringId;
-                let Some(s) = function.string_literals().get(StringId(idx as u16)) else {
+                // C2: read the table's `JsString` directly so any
+                // lone-surrogate content (oxc-encoded as `\u{FFFD}xxxx`,
+                // already decoded at intern time via `from_oxc_encoded`)
+                // survives. Going through `s.to_string()` + `alloc_string`
+                // would round-trip through UTF-8 and replace lone
+                // surrogates with U+FFFD.
+                let Some(js) = function.string_literals().get_js(StringId(idx as u16)) else {
                     return Err(InterpreterError::NativeCall(Box::from(format!(
                         "v2 LdaConstStr: string id {idx} out of range"
                     ))));
                 };
-                // Intern into runtime-owned JsString and box as object.
-                let handle = runtime.alloc_string(s.to_string())?;
+                let cloned = js.clone();
+                let handle = runtime.alloc_js_string(cloned)?;
                 activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
             }
             Opcode::LdaConstF64 => {
@@ -253,9 +259,18 @@ impl Interpreter {
                         "dynamic import: specifier must be a string",
                     )));
                 };
+                let h = crate::object::ObjectHandle(spec_handle);
+                if runtime.objects.string_value(h)?.is_none() {
+                    return Err(InterpreterError::TypeError(Box::from(
+                        "dynamic import: specifier must be a string",
+                    )));
+                }
+                // C2: flatten Cons / Sliced / Thin so the read returns the
+                // actual specifier instead of a debug placeholder.
+                runtime.objects.flatten_string(h)?;
                 let spec_str = runtime
                     .objects
-                    .string_value(crate::object::ObjectHandle(spec_handle))?
+                    .string_value(h)?
                     .map(|s| s.to_string())
                     .ok_or_else(|| {
                         InterpreterError::TypeError(Box::from(
@@ -660,11 +675,16 @@ impl Interpreter {
                 {
                     let lh = crate::object::ObjectHandle(lh);
                     let rh = crate::object::ObjectHandle(rh);
-                    let lstr = runtime.objects.string_value(lh).ok().flatten();
-                    let rstr = runtime.objects.string_value(rh).ok().flatten();
-                    match (lstr, rstr) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => false,
+                    // C2: route through `strings_equal` which flattens both
+                    // sides before comparing — handles Cons / Sliced / Thin.
+                    let lhs_is_string =
+                        matches!(runtime.objects.string_value(lh), Ok(Some(_)));
+                    let rhs_is_string =
+                        matches!(runtime.objects.string_value(rh), Ok(Some(_)));
+                    if lhs_is_string && rhs_is_string {
+                        runtime.objects.strings_equal(lh, rh).unwrap_or(false)
+                    } else {
+                        false
                     }
                 } else if let (Some(lb), Some(rb)) =
                     (lhs.as_bigint_handle(), rhs.as_bigint_handle())
@@ -4006,14 +4026,18 @@ fn key_to_property_name(
         return Ok(runtime.intern_symbol_property_name(symbol_id));
     }
     // String fast path: key is already a string object — pull
-    // its text out.
-    if let Some(handle) = key.as_object_handle()
-        && let Some(s) = runtime
-            .objects
-            .string_value(crate::object::ObjectHandle(handle))?
-    {
-        let owned = s.to_string();
-        return Ok(runtime.intern_property_name(&owned));
+    // its text out. C2: flatten Cons / Sliced / Thin first so
+    // `to_string()` reads the actual content instead of a debug
+    // placeholder.
+    if let Some(handle) = key.as_object_handle() {
+        let h = crate::object::ObjectHandle(handle);
+        if runtime.objects.string_value(h)?.is_some() {
+            runtime.objects.flatten_string(h)?;
+            if let Some(s) = runtime.objects.string_value(h)? {
+                let owned = s.to_string();
+                return Ok(runtime.intern_property_name(&owned));
+            }
+        }
     }
     // Fallback: stringify via the runtime's existing ToString.
     let text = runtime.js_to_string(key)?;

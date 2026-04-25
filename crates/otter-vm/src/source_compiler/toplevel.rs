@@ -44,6 +44,12 @@ pub(super) fn lower_program(
     let mut imports: Vec<ImportRecord> = Vec::new();
     let mut exports: Vec<ExportRecord> = Vec::new();
     let mut module_globals: Vec<String> = Vec::new();
+    // §15.1.11 Script Records / §10.2.11 FunctionDeclarationInstantiation —
+    // `var` bindings are hoisted to the script scope and pre-initialized
+    // to `undefined` BEFORE the script body executes. We collect every
+    // var name (top-level + nested in blocks / if / switch / try / etc.)
+    // and emit `LdaUndefined; StaGlobal name` in the preamble.
+    let mut top_level_vars: Vec<String> = Vec::new();
     // Per-source-URL flag: this program uses ES-module syntax
     // (static `import` / `export` / dynamic `import()`). An empty
     // set of records with no `import()` expressions means the
@@ -382,10 +388,19 @@ pub(super) fn lower_program(
                 // the global object instead. `function circleArea
                 // () { return PI * r * r }` after `const PI = …`
                 // resolves `PI` via `LdaGlobal` at call time.
+                let is_var =
+                    matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
                 for declarator in decl.declarations.iter() {
                     if let oxc_ast::ast::BindingPattern::BindingIdentifier(bi) = &declarator.id {
                         let name = bi.name.as_str().to_string();
                         module_globals.push(name.clone());
+                        if is_var {
+                            // §13.3.2.1 — `var` is hoisted to script scope
+                            // with initial value undefined. The actual
+                            // assignment (if any) still runs at the
+                            // declaration site.
+                            top_level_vars.push(name.clone());
+                        }
                         exported_const_vars.push(name);
                     }
                 }
@@ -396,6 +411,9 @@ pub(super) fn lower_program(
                 // `if (...) { ... }`, etc. Collect into
                 // `script_body` and synthesise a top-level entry
                 // function that runs them on module evaluation.
+                // Recursively walk for nested `var` declarations
+                // (`if (cond) { var x; }` still hoists to script).
+                collect_nested_var_names(other, &mut top_level_vars, &mut module_globals);
                 script_body.push(other);
             }
         }
@@ -473,6 +491,7 @@ pub(super) fn lower_program(
         &module_functions,
         &names,
         &module_globals,
+        &top_level_vars,
         &script_body,
         &exported_const_vars,
         completion,
@@ -524,6 +543,126 @@ fn record_function_declaration<'a>(
     names.push(name);
     declarations.push(func);
     Ok(name)
+}
+
+/// §13.3.2.1 var-hoist collector for the script-body classifier.
+///
+/// Walks an arbitrary top-level `Statement` and pushes every nested
+/// `var` binding name onto `top_level_vars` + `module_globals`. The
+/// preamble in `synthesise_top_level_entry` then pre-initialises each
+/// to `undefined` so a use that precedes the textual declaration
+/// (`console.log(x); var x;`) reads `undefined` instead of throwing
+/// ReferenceError.
+///
+/// Spec: VarScopedDeclarations / VarDeclaredNames
+/// <https://tc39.es/ecma262/#sec-static-semantics-vardeclarednames>
+fn collect_nested_var_names<'a>(
+    stmt: &'a Statement<'a>,
+    top_level_vars: &mut Vec<String>,
+    module_globals: &mut Vec<String>,
+) {
+    use oxc_ast::ast::Statement as S;
+    match stmt {
+        S::BlockStatement(block) => {
+            for s in &block.body {
+                collect_nested_var_names(s, top_level_vars, module_globals);
+            }
+        }
+        S::IfStatement(stmt) => {
+            collect_nested_var_names(&stmt.consequent, top_level_vars, module_globals);
+            if let Some(alt) = stmt.alternate.as_ref() {
+                collect_nested_var_names(alt, top_level_vars, module_globals);
+            }
+        }
+        S::ForStatement(stmt) => {
+            if let Some(init) = stmt.init.as_ref()
+                && let oxc_ast::ast::ForStatementInit::VariableDeclaration(decl) = init
+                && matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            {
+                push_var_names(decl, top_level_vars, module_globals);
+            }
+            collect_nested_var_names(&stmt.body, top_level_vars, module_globals);
+        }
+        S::ForInStatement(stmt) => {
+            if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(decl) = &stmt.left
+                && matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            {
+                push_var_names(decl, top_level_vars, module_globals);
+            }
+            collect_nested_var_names(&stmt.body, top_level_vars, module_globals);
+        }
+        S::ForOfStatement(stmt) => {
+            if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(decl) = &stmt.left
+                && matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            {
+                push_var_names(decl, top_level_vars, module_globals);
+            }
+            collect_nested_var_names(&stmt.body, top_level_vars, module_globals);
+        }
+        S::WhileStatement(stmt) => {
+            collect_nested_var_names(&stmt.body, top_level_vars, module_globals);
+        }
+        S::DoWhileStatement(stmt) => {
+            collect_nested_var_names(&stmt.body, top_level_vars, module_globals);
+        }
+        S::SwitchStatement(stmt) => {
+            for case in &stmt.cases {
+                for s in &case.consequent {
+                    collect_nested_var_names(s, top_level_vars, module_globals);
+                }
+            }
+        }
+        S::TryStatement(stmt) => {
+            for s in &stmt.block.body {
+                collect_nested_var_names(s, top_level_vars, module_globals);
+            }
+            if let Some(handler) = stmt.handler.as_deref() {
+                for s in &handler.body.body {
+                    collect_nested_var_names(s, top_level_vars, module_globals);
+                }
+            }
+            if let Some(finalizer) = stmt.finalizer.as_deref() {
+                for s in &finalizer.body {
+                    collect_nested_var_names(s, top_level_vars, module_globals);
+                }
+            }
+        }
+        S::WithStatement(stmt) => {
+            collect_nested_var_names(&stmt.body, top_level_vars, module_globals);
+        }
+        S::LabeledStatement(stmt) => {
+            collect_nested_var_names(&stmt.body, top_level_vars, module_globals);
+        }
+        S::VariableDeclaration(decl)
+            if matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var) =>
+        {
+            push_var_names(decl, top_level_vars, module_globals);
+        }
+        // Expression statements / break / continue / return / throw /
+        // FunctionDeclaration (already handled by the classifier) /
+        // class / let / const / import / export — no var content to
+        // hoist.
+        _ => {}
+    }
+}
+
+fn push_var_names<'a>(
+    decl: &'a oxc_ast::ast::VariableDeclaration<'a>,
+    top_level_vars: &mut Vec<String>,
+    module_globals: &mut Vec<String>,
+) {
+    for declarator in decl.declarations.iter() {
+        let mut names: Vec<String> = Vec::new();
+        let _ = collect_pattern_identifier_names(&declarator.id, &mut names);
+        for name in names {
+            if !top_level_vars.contains(&name) {
+                top_level_vars.push(name.clone());
+            }
+            if !module_globals.contains(&name) {
+                module_globals.push(name);
+            }
+        }
+    }
 }
 
 /// Recursively walks a `BindingPattern` and pushes every
@@ -605,6 +744,7 @@ fn synthesise_top_level_entry<'a>(
     module_functions: &std::rc::Rc<std::cell::RefCell<Vec<VmFunction>>>,
     names: &[&str],
     module_globals: &[String],
+    top_level_vars: &[String],
     script_body: &[&'a Statement<'a>],
     exported_const_vars: &[String],
     completion: TopLevelCompletion,
@@ -643,6 +783,34 @@ fn synthesise_top_level_entry<'a>(
     // `globalThis.NAME` at its binding site so a nested function
     // called mid-body reads the value via `LdaGlobal`.
     ctx.enable_top_level_global_mirroring();
+
+    // §15.1.11 var hoisting — pre-declare each top-level `var` name on
+    // the global object as `undefined` BEFORE any user statement runs.
+    // Without this, `console.log(x); var x;` raises ReferenceError.
+    // Idempotent: if a function declaration with the same name lands
+    // later, its closure overrides the undefined here.
+    let mut declared_var_global: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for name in top_level_vars {
+        if !declared_var_global.insert(name.as_str()) {
+            continue;
+        }
+        builder
+            .emit(Opcode::LdaUndefined, &[])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "top-level var hoist LdaUndefined: {err:?}"
+                ))
+            })?;
+        let prop_idx = ctx.intern_property_name(name)?;
+        builder
+            .emit(Opcode::StaGlobal, &[Operand::Idx(prop_idx)])
+            .map_err(|err| {
+                SourceLoweringError::Internal(format!(
+                    "top-level var hoist StaGlobal: {err:?}"
+                ))
+            })?;
+    }
 
     // Preamble: install each module-global binding on the global
     // object so ESM `capture_exports` finds them. For classic

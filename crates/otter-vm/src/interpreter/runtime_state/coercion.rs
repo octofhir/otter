@@ -39,6 +39,54 @@ impl RuntimeState {
         InterpreterError::UncaughtThrow(RegisterValue::from_object_handle(handle.0))
     }
 
+    /// §6.1.4 — RangeError("Invalid string length"). Thrown by the C2 lazy
+    /// `+` / `concat` / `repeat` when the result would exceed
+    /// [`crate::js_string::MAX_STRING_LENGTH`].
+    pub(crate) fn invalid_string_length_error(&mut self) -> InterpreterError {
+        let prototype = self.intrinsics().range_error_prototype;
+        let Ok(handle) = self.alloc_object_with_prototype(Some(prototype)) else {
+            return InterpreterError::OutOfMemory;
+        };
+        let Ok(message) = self.alloc_string("Invalid string length") else {
+            return InterpreterError::OutOfMemory;
+        };
+        let message_prop = self.intern_property_name("message");
+        self.objects
+            .set_property(
+                handle,
+                message_prop,
+                RegisterValue::from_object_handle(message.0),
+            )
+            .ok();
+        InterpreterError::UncaughtThrow(RegisterValue::from_object_handle(handle.0))
+    }
+
+    /// C2 helper: returns an `ObjectHandle` to a *primitive* string for any
+    /// value, allocating a fresh `SeqTwoByte` from the UTF-8 ToString
+    /// conversion when the input is not already a string.
+    ///
+    /// Used by the lazy `+` path in `js_add` to avoid re-allocating strings
+    /// that already live in the heap.
+    pub(crate) fn coerce_to_string_handle(
+        &mut self,
+        value: RegisterValue,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            if self.objects.string_value(handle)?.is_some() {
+                return Ok(handle);
+            }
+            // String wrapper object → unwrap to the inner primitive handle.
+            if let Some(inner) = self.string_wrapper_data(handle)?
+                && self.objects.string_value(inner)?.is_some()
+            {
+                return Ok(inner);
+            }
+        }
+        let s = self.js_to_string(value)?;
+        let handle = self.alloc_string(s.into_string())?;
+        Ok(handle)
+    }
+
     fn own_data_property(
         &mut self,
         handle: ObjectHandle,
@@ -220,9 +268,13 @@ impl RuntimeState {
             }
         } else if let Some(handle) = key.as_object_handle().map(ObjectHandle) {
             // String heap values (WTF-16). Fall back to stringifying whatever
-            // the runtime considers the property key form.
+            // the runtime considers the property key form. C2: walk Cons /
+            // Sliced / Thin via the heap-aware helper (read-only).
             match self.objects.string_value(handle) {
-                Ok(Some(js_string)) => js_string.to_string(),
+                Ok(Some(_)) => self
+                    .objects
+                    .js_string_to_rust_string(handle)
+                    .unwrap_or_default(),
                 _ => {
                     // Non-string object keys should have been coerced upstream
                     // by ToPropertyKey; treat them as empty to stay defensive.
@@ -532,8 +584,14 @@ impl RuntimeState {
             return Ok(text.into_boxed_str());
         }
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
-            if let Some(string) = self.objects.string_value(handle)? {
-                return Ok(string.to_string().into_boxed_str());
+            if self.objects.string_value(handle)?.is_some() {
+                // C2: flatten Cons / Sliced / Thin before reading the
+                // contents — otherwise `to_string` produces a debug
+                // placeholder.
+                self.objects.flatten_string(handle)?;
+                if let Some(string) = self.objects.string_value(handle)? {
+                    return Ok(string.to_string().into_boxed_str());
+                }
             }
             let primitive = self.js_to_primitive_with_hint(value, ToPrimitiveHint::String)?;
             if primitive != value {
@@ -577,8 +635,12 @@ impl RuntimeState {
             return Ok(number);
         }
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
-            if let Some(string) = self.objects.string_value(handle)? {
-                return Ok(parse_string_to_number(&string.to_rust_string()));
+            if self.objects.string_value(handle)?.is_some() {
+                // C2: flatten before reading content (Cons / Sliced / Thin).
+                self.objects.flatten_string(handle)?;
+                if let Some(string) = self.objects.string_value(handle)? {
+                    return Ok(parse_string_to_number(&string.to_rust_string()));
+                }
             }
             let primitive = self.js_to_primitive_with_hint(value, ToPrimitiveHint::Number)?;
             if primitive != value {
@@ -1028,11 +1090,10 @@ impl RuntimeState {
     /// Spec: <https://tc39.es/ecma262/#sec-eval-x>
     pub fn value_as_string(&self, value: RegisterValue) -> Option<String> {
         let handle = value.as_object_handle().map(ObjectHandle)?;
-        self.objects
-            .string_value(handle)
-            .ok()
-            .flatten()
-            .map(|s| s.to_string())
+        // C2: Cons / Sliced / Thin require walking. `js_string_to_rust_string`
+        // does that via `&self` (no mutation).
+        self.objects.string_value(handle).ok().flatten()?;
+        self.objects.js_string_to_rust_string(handle).ok()
     }
 
     /// Checks whether a value is a string type (heap string or string wrapper).
@@ -1182,10 +1243,20 @@ impl RuntimeState {
         let lhs_is_string = self.value_is_string(lprim)?;
         let rhs_is_string = self.value_is_string(rprim)?;
         if lhs_is_string || rhs_is_string {
-            let mut text = self.js_to_string(lprim)?.into_string();
-            text.push_str(&self.js_to_string(rprim)?);
-            let value = self.alloc_string(text)?;
-            return Ok(RegisterValue::from_object_handle(value.0));
+            // C2: lazy `+` — produce a Cons handle for non-trivial inputs
+            // instead of eagerly UTF-8 round-tripping. This is the
+            // O(n²) → O(n log n) win for `s += piece` loops.
+            let lhandle = self.coerce_to_string_handle(lprim)?;
+            let rhandle = self.coerce_to_string_handle(rprim)?;
+            let proto = Some(self.intrinsics().string_prototype());
+            match self.objects.concat_strings(lhandle, rhandle, proto) {
+                Ok(result) => return Ok(RegisterValue::from_object_handle(result.0)),
+                Err(crate::object::ObjectError::InvalidArrayLength) => {
+                    // §6.1.4 + V8 cap: RangeError("Invalid string length").
+                    return Err(self.invalid_string_length_error());
+                }
+                Err(other) => return Err(other.into()),
+            }
         }
 
         // §6.1.6.2.7 BigInt::add — both operands BigInt.

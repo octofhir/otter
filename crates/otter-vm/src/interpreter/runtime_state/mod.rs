@@ -1180,7 +1180,16 @@ impl RuntimeState {
             // Surrogate pairs yield a single 2-unit string.
             let iterable = cursor.iterable();
             let idx = cursor.next_index();
-            if let Ok(Some(js_str)) = self.objects.string_value(iterable).map(|o| o.cloned()) {
+            if self.objects.string_value(iterable).ok().flatten().is_some() {
+                // C2: flatten Cons / Sliced / Thin and upcast SeqOneByte
+                // so the legacy as_utf16() returns &[u16] borrowed.
+                self.objects.flatten_string(iterable)?;
+                let mut js_str = self
+                    .objects
+                    .string_value(iterable)?
+                    .expect("string_value present after flatten")
+                    .clone();
+                js_str.ensure_two_byte();
                 let utf16 = js_str.as_utf16();
                 if idx >= utf16.len() {
                     crate::object::IteratorStep::done()
@@ -1263,16 +1272,19 @@ impl RuntimeState {
         let Some(string_handle) = self.string_exotic_value_handle(object)? else {
             return Ok(None);
         };
-        let Some(string) = self.objects.string_value(string_handle)? else {
+        if self.objects.string_value(string_handle)?.is_none() {
             return Ok(None);
-        };
+        }
         let Some(property_name) = self.property_names.get(property) else {
             return Ok(None);
         };
 
+        // O(1) length read; works on Cons / Sliced / Thin without flatten.
+        let length = self.objects.string_length(string_handle)? as usize;
+
         if property_name == "length" {
             return Ok(Some(PropertyValue::data_with_attrs(
-                RegisterValue::from_i32(i32::try_from(string.len()).unwrap_or(i32::MAX)),
+                RegisterValue::from_i32(i32::try_from(length).unwrap_or(i32::MAX)),
                 PropertyAttributes::from_flags(false, false, false),
             )));
         }
@@ -1280,6 +1292,16 @@ impl RuntimeState {
         let Some(index) = canonical_string_exotic_index(property_name) else {
             return Ok(None);
         };
+        if index >= length {
+            return Ok(None);
+        }
+        // C2: flatten before reading the unit. `code_unit_at` works on both
+        // SeqOneByte (upcasts to u16) and SeqTwoByte transparently.
+        self.objects.flatten_string(string_handle)?;
+        let string = self
+            .objects
+            .string_value(string_handle)?
+            .expect("string_value present after flatten");
         let Some(unit) = string.code_unit_at(index) else {
             return Ok(None);
         };

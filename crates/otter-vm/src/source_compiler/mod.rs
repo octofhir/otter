@@ -934,8 +934,18 @@ impl<'a> LoweringContext<'a> {
     }
 
     /// Finalise the string-literal interner into an immutable table.
+    ///
+    /// C2 follow-up: route every literal through
+    /// [`crate::js_string::JsString::from_oxc_encoded`] so lone-surrogate
+    /// escapes (`"\uD800"` produced by oxc as `"\u{FFFD}d800"`) survive
+    /// to runtime as raw WTF-16. Plain ASCII inputs remain identical.
     fn take_string_literals(&self) -> crate::string::StringTable {
-        crate::string::StringTable::new(self.string_literals.borrow().clone())
+        let owned = self.string_literals.borrow().clone();
+        let js_values: Vec<crate::js_string::JsString> = owned
+            .into_iter()
+            .map(|s| crate::js_string::JsString::from_oxc_encoded(&s))
+            .collect();
+        crate::string::StringTable::new_js(js_values)
     }
 
     /// Intern a BigInt literal's decimal-string representation

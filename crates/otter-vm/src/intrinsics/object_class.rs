@@ -936,7 +936,7 @@ fn object_is(
         .copied()
         .unwrap_or_else(RegisterValue::undefined);
     let same = runtime
-        .objects()
+        .objects_mut()
         .same_value(lhs, rhs)
         .map_err(|error| VmNativeCallError::Internal(format!("Object.is: {error:?}").into()))?;
     Ok(RegisterValue::from_bool(same))

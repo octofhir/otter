@@ -11054,7 +11054,9 @@ fn c13_regex_capture_returns_js_string_not_box_str() {
         .expect("string_value ok")
         .expect("capture has JsString storage")
         .clone();
-    assert_eq!(js.as_utf16(), &[0x42u16]);
+    // C2 Phase 4: 1-byte ASCII strings store as SeqOneByte; use the
+    // upcasting accessor to compare against u16 units.
+    assert_eq!(js.as_utf16_cow().as_ref(), &[0x42u16][..]);
 }
 
 #[test]
@@ -11086,7 +11088,8 @@ fn c13_regex_named_capture_returns_js_string() {
         .expect("string_value ok")
         .expect("named capture has JsString storage")
         .clone();
-    assert_eq!(js.as_utf16(), &[0x32u16]);
+    // C2 Phase 4: ASCII captures store as SeqOneByte.
+    assert_eq!(js.as_utf16_cow().as_ref(), &[0x32u16][..]);
 }
 
 #[test]
@@ -11237,12 +11240,12 @@ fn c9_main_returning_utf16(source: &str, args: &[i32]) -> Vec<u16> {
             .as_object_handle()
             .expect("main must return a JsString handle"),
     );
+    // C2: lazy slice / concat may produce Sliced / Cons handles. Flatten
+    // before reading the UTF-16 units.
     runtime
-        .objects()
-        .string_value(str_handle)
-        .expect("string_value")
-        .expect("must be a JsString")
-        .as_utf16()
+        .objects_mut()
+        .js_string_units(str_handle)
+        .expect("js_string_units")
         .to_vec()
 }
 
@@ -11326,4 +11329,209 @@ fn c_args_param_named_arguments_shadows_auto_allocation() {
     // duplicate binding).
     let src = "export function main(arguments) { return arguments + 1; }";
     assert_eq!(c_args_run_main_returning_int32(src, &[41]), 42);
+}
+
+// ─── C2: lazy string hierarchy (Cons / Sliced / Thin / flatten) ────────────
+
+#[test]
+fn c2_concat_long_string_round_trips_through_lazy_path() {
+    // §22.1.3.1 / §13.15.3 — `+=` builds a Cons tree internally; reading
+    // `.length` and equality forces flatten. Result must match eager
+    // string concatenation.
+    let src = "export function main() { \
+        var s = ''; \
+        for (var i = 0; i < 50; i++) s = s + 'abcdefgh'; \
+        return s.length; \
+    }";
+    assert_eq!(
+        run_module_graph_int32("entry", &[("entry", src)], "main", &[]),
+        50 * 8
+    );
+}
+
+#[test]
+fn c2_concat_observable_through_charcodeat() {
+    // After Cons construction, `charCodeAt` forces a transparent flatten.
+    // Each iteration's running concat builds a Cons tree; `charCodeAt(0)`
+    // walks back to the very first byte.
+    let src = "export function main() { \
+        var s = 'A'; \
+        for (var i = 0; i < 30; i++) s = s + 'B'; \
+        return s.charCodeAt(0); \
+    }";
+    assert_eq!(
+        run_module_graph_int32("entry", &[("entry", src)], "main", &[]),
+        b'A' as i32
+    );
+}
+
+#[test]
+fn c2_slice_of_concat_yields_correct_content() {
+    // `slice` over a Cons-backed parent triggers cons flatten before
+    // building the Sliced view. The yielded string must be a proper window.
+    let units = c9_main_returning_utf16(
+        "export function main() { \
+            var s = 'A' + 'B' + 'C' + 'D' + 'E' + 'F' + 'G' + 'H' + 'I'; \
+            return s.slice(2, 5); \
+        }",
+        &[],
+    );
+    assert_eq!(units, &[b'C' as u16, b'D' as u16, b'E' as u16]);
+}
+
+#[test]
+fn c2_sliced_of_sliced_collapses_and_reads_correctly() {
+    // `s.slice(a, b).slice(c, d)` collapses the second Sliced into the
+    // grandparent — but the observable content must match the spec.
+    let units = c9_main_returning_utf16(
+        "export function main() { \
+            var s = 'abcdefghijk'; \
+            return s.slice(2, 9).slice(1, 5); \
+        }",
+        &[],
+    );
+    assert_eq!(
+        units,
+        &['d' as u16, 'e' as u16, 'f' as u16, 'g' as u16]
+    );
+}
+
+#[test]
+fn c2_concat_preserves_lone_surrogates() {
+    // `+`-concatenating a string carrying a lone surrogate must not
+    // U+FFFD-replace it (that bug existed in the eager UTF-8 round-trip
+    // path). The Cons → flatten round trip preserves the WTF-16 code
+    // unit verbatim.
+    let units = c9_main_returning_utf16(
+        "export function main() { \
+            return String.fromCharCode(0xD800) + 'X' + String.fromCharCode(0xDC00); \
+        }",
+        &[],
+    );
+    assert_eq!(units, &[0xD800, b'X' as u16, 0xDC00]);
+}
+
+#[test]
+fn c2_deep_concat_chain_flattens_without_stack_overflow() {
+    // Builds a 1000-deep `+=` chain that hits the eager-flatten depth
+    // bound (MAX_CONS_DEPTH=32). The bound forces incremental flattens so
+    // no Rust-stack-overflowing tree is built.
+    let src = "export function main() { \
+        var s = ''; \
+        for (var i = 0; i < 1000; i++) s = s + 'x'; \
+        return s.length; \
+    }";
+    assert_eq!(
+        run_module_graph_int32("entry", &[("entry", src)], "main", &[]),
+        1000
+    );
+}
+
+#[test]
+fn c2_short_concat_short_circuits_to_flat() {
+    // Total length below MIN_CONS_LENGTH (=13) builds a flat string
+    // directly. Verify by reading content via `.length` + observable
+    // identity (still a proper string).
+    let src = "export function main() { \
+        return ('hi' + ', ' + 'world').length; \
+    }";
+    // 'hi' (2) + ', ' (2) + 'world' (5) = 9.
+    assert_eq!(
+        run_module_graph_int32("entry", &[("entry", src)], "main", &[]),
+        9
+    );
+}
+
+#[test]
+fn c2_concat_strict_eq_both_cons() {
+    // Two structurally-different Cons trees with the same content must
+    // compare strict-equal under §7.2.14. The C2 strict-eq path flattens
+    // via `strings_equal` which performs byte compare after flatten.
+    let src = "export function main() { \
+        var a = ''; \
+        for (var i = 0; i < 20; i++) a = a + 'q'; \
+        var b = ''; \
+        for (var j = 0; j < 20; j++) b = b + 'q'; \
+        return (a === b) ? 1 : 0; \
+    }";
+    assert_eq!(
+        run_module_graph_int32("entry", &[("entry", src)], "main", &[]),
+        1
+    );
+}
+
+#[test]
+fn c2_substring_returns_correct_window() {
+    // §22.1.3.23 — substring with swapped args is normalized.
+    let units = c9_main_returning_utf16(
+        "export function main() { \
+            var s = 'abcdefghij'; \
+            return s.substring(7, 3); \
+        }",
+        &[],
+    );
+    assert_eq!(
+        units,
+        &['d' as u16, 'e' as u16, 'f' as u16, 'g' as u16]
+    );
+}
+
+#[test]
+fn c2_hash_stable_across_repr() {
+    // C2 Phase 5: same content must hash identically regardless of repr.
+    // ASCII strings store as SeqOneByte; the same content built via
+    // String.fromCharCode (which goes through alloc_js_string ⇒ SeqOneByte
+    // when units fit Latin-1, or via Cons after `+`) must produce the same
+    // hash. We test indirectly by verifying that a hash-prefixed equality
+    // (strings_equal) handles structurally different sources.
+    use crate::module_loader::{InMemoryModuleHost, ModuleRegistry, execute_module_graph};
+    let src = "export function main() { \
+        var a = 'hello'; \
+        var b = String.fromCharCode(104, 101, 108, 108, 111); \
+        return (a === b) ? 1 : 0; \
+    }";
+    let mut host = InMemoryModuleHost::new();
+    host.add_module("entry", src);
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let mut registry = ModuleRegistry::new();
+    execute_module_graph("entry", &host, &mut runtime, &mut registry).expect("execute");
+    let value = registry.get_export("entry", "main").expect("export");
+    let handle = crate::object::ObjectHandle(value.as_object_handle().expect("handle"));
+    let mut args: Vec<RegisterValue> = Vec::new();
+    let result = runtime
+        .call_callable(handle, RegisterValue::undefined(), args.as_mut_slice())
+        .expect("call");
+    assert_eq!(result.as_i32(), Some(1));
+}
+
+#[test]
+fn c2_string_hash_is_cached_and_deterministic() {
+    // Direct heap-level test: compute the hash twice, must match. Then
+    // build an identical string and verify their hashes match.
+    let mut runtime = crate::interpreter::RuntimeState::new();
+    let h1 = runtime.alloc_string("propName").expect("alloc");
+    let h2 = runtime.alloc_string("propName").expect("alloc");
+    let hash1 = runtime.objects_mut().string_hash(h1).expect("hash1");
+    let hash1_again = runtime.objects_mut().string_hash(h1).expect("hash1 cached");
+    assert_eq!(hash1, hash1_again);
+    let hash2 = runtime.objects_mut().string_hash(h2).expect("hash2");
+    assert_eq!(hash1, hash2);
+    // Hash 0 is reserved as sentinel. Bit 0 must be clear (reserved for
+    // integer-index tag).
+    assert_ne!(hash1, 0);
+    assert_eq!(hash1 & 1, 0);
+}
+
+#[test]
+fn c2_slice_preserves_lone_surrogates_through_lazy_view() {
+    // The slice of a string containing a lone surrogate must yield the
+    // surrogate verbatim. C2 builds a `Sliced` view; reading the units
+    // flattens through the parent and copies the raw u16.
+    let units = c9_main_returning_utf16(
+        "export function main() { \
+            return String.fromCharCode(0xD800, 0x41, 0xDC00, 0x42).slice(0, 3); \
+        }",
+        &[],
+    );
+    assert_eq!(units, &[0xD800, 0x41, 0xDC00]);
 }

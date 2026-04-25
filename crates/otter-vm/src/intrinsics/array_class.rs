@@ -544,7 +544,7 @@ fn array_index_of(
         else {
             continue;
         };
-        let equal = crate::abstract_ops::is_strictly_equal(runtime.objects(), elem, search)
+        let equal = crate::abstract_ops::is_strictly_equal(runtime.objects_mut(), elem, search)
             .map_err(|e| {
                 VmNativeCallError::Internal(format!("indexOf compare failed: {e:?}").into())
             })?;
@@ -1305,7 +1305,7 @@ fn array_includes(
         let value = array_index_value(receiver, index, runtime, "Array.prototype.includes")?
             .unwrap_or_else(RegisterValue::undefined);
         // SameValueZero comparison.
-        let equal = crate::abstract_ops::same_value_zero(runtime.objects(), value, search)
+        let equal = crate::abstract_ops::same_value_zero(runtime.objects_mut(), value, search)
             .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
         if equal {
             return Ok(RegisterValue::from_bool(true));
@@ -1648,7 +1648,7 @@ fn array_last_index_of(
         }
         if let Some(elem) = array_index_value(receiver, i, runtime, "Array.prototype.lastIndexOf")?
         {
-            let equal = crate::abstract_ops::is_strictly_equal(runtime.objects(), elem, search)
+            let equal = crate::abstract_ops::is_strictly_equal(runtime.objects_mut(), elem, search)
                 .map_err(|e| {
                     VmNativeCallError::Internal(format!("lastIndexOf compare failed: {e:?}").into())
                 })?;

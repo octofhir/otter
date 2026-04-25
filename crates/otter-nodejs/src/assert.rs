@@ -373,7 +373,7 @@ fn assert_strict_equal_impl(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let actual = arg(args, 0);
     let expected = arg(args, 1);
-    let equal = same_value(runtime.objects(), actual, expected).unwrap_or(false);
+    let equal = same_value(runtime.objects_mut(), actual, expected).unwrap_or(false);
     if !equal {
         let message = if args.len() > 2 && arg(args, 2) != RegisterValue::undefined() {
             value_to_string(runtime, arg(args, 2))
@@ -396,7 +396,7 @@ fn assert_not_strict_equal_impl(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let actual = arg(args, 0);
     let expected = arg(args, 1);
-    let equal = same_value(runtime.objects(), actual, expected).unwrap_or(false);
+    let equal = same_value(runtime.objects_mut(), actual, expected).unwrap_or(false);
     if equal {
         let message = if args.len() > 2 && arg(args, 2) != RegisterValue::undefined() {
             value_to_string(runtime, arg(args, 2))
@@ -424,7 +424,7 @@ fn assert_loose_equal_impl(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let actual = arg(args, 0);
     let expected = arg(args, 1);
-    let equal = is_strictly_equal(runtime.objects(), actual, expected).unwrap_or(false);
+    let equal = is_strictly_equal(runtime.objects_mut(), actual, expected).unwrap_or(false);
     if !equal {
         let message = if args.len() > 2 && arg(args, 2) != RegisterValue::undefined() {
             value_to_string(runtime, arg(args, 2))
@@ -447,7 +447,7 @@ fn assert_loose_not_equal_impl(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let actual = arg(args, 0);
     let expected = arg(args, 1);
-    let equal = is_strictly_equal(runtime.objects(), actual, expected).unwrap_or(false);
+    let equal = is_strictly_equal(runtime.objects_mut(), actual, expected).unwrap_or(false);
     if equal {
         let message = if args.len() > 2 && arg(args, 2) != RegisterValue::undefined() {
             value_to_string(runtime, arg(args, 2))
@@ -477,7 +477,7 @@ fn deep_strict_equal(
     }
 
     // Primitive SameValue check first.
-    if same_value(runtime.objects(), actual, expected).unwrap_or(false) {
+    if same_value(runtime.objects_mut(), actual, expected).unwrap_or(false) {
         return true;
     }
 

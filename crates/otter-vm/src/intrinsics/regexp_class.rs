@@ -540,7 +540,7 @@ fn regexp_builtin_exec(
     let match_end_utf16 = m.end();
 
     // Build result array.
-    let result = runtime.objects_mut().alloc_array()?;
+    let result = runtime.alloc_array()?;
 
     // [0] = full match string
     // C13: preserve lone surrogates (WTF-16). `String::from_utf16_lossy`
@@ -673,7 +673,7 @@ fn build_indices_array(
     cap_count: usize,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<ObjectHandle, VmNativeCallError> {
-    let arr = runtime.objects_mut().alloc_array()?;
+    let arr = runtime.alloc_array()?;
     // [0] = full match indices
     let pair = make_index_pair(m.start(), m.end(), utf16, runtime)?;
     runtime
@@ -699,7 +699,7 @@ fn make_index_pair(
     _utf16: &[u16],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<ObjectHandle, VmNativeCallError> {
-    let pair = runtime.objects_mut().alloc_array()?;
+    let pair = runtime.alloc_array()?;
     runtime
         .objects_mut()
         .set_index(pair, 0, RegisterValue::from_i32(start as i32))
@@ -1045,7 +1045,7 @@ fn regexp_symbol_match(
     } else {
         // Global: collect all matches.
         set_last_index(handle, 0.0, runtime);
-        let result_arr = runtime.objects_mut().alloc_array()?;
+        let result_arr = runtime.alloc_array()?;
         let mut idx = 0usize;
         loop {
             check_interrupt_poll(runtime, idx)?;
@@ -1117,7 +1117,7 @@ fn regexp_symbol_match_all(
     let clone_handle = runtime.alloc_regexp(&pattern, &flags_with_g, Some(prototype))?;
 
     // Collect all matches into an array (simplified iterator).
-    let result_arr = runtime.objects_mut().alloc_array()?;
+    let result_arr = runtime.alloc_array()?;
     let mut idx = 0usize;
     loop {
         check_interrupt_poll(runtime, idx)?;
@@ -1474,7 +1474,7 @@ fn regexp_symbol_split(
         })
         .unwrap_or(u32::MAX as usize);
 
-    let result = runtime.objects_mut().alloc_array()?;
+    let result = runtime.alloc_array()?;
     if limit == 0 {
         return Ok(RegisterValue::from_object_handle(result.0));
     }

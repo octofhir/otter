@@ -1584,9 +1584,25 @@ impl Traceable for HeapValue {
                     trace_register_value(*elem, visitor);
                 }
             }
-            HeapValue::String { prototype, .. } => {
+            HeapValue::String { prototype, value } => {
                 if let Some(p) = prototype {
                     trace_handle(*p, visitor);
+                }
+                // C2: Cons / Sliced / Thin reference other heap-resident
+                // strings by handle. Visit them here so they survive GC.
+                match value.repr() {
+                    crate::js_string::JsStringRepr::SeqOneByte(_)
+                    | crate::js_string::JsStringRepr::SeqTwoByte(_) => {}
+                    crate::js_string::JsStringRepr::Cons { left, right, .. } => {
+                        trace_handle(*left, visitor);
+                        trace_handle(*right, visitor);
+                    }
+                    crate::js_string::JsStringRepr::Sliced { parent, .. } => {
+                        trace_handle(*parent, visitor);
+                    }
+                    crate::js_string::JsStringRepr::Thin { forward } => {
+                        trace_handle(*forward, visitor);
+                    }
                 }
             }
             HeapValue::BoundFunction {
@@ -4591,18 +4607,29 @@ impl ObjectHeap {
     }
 
     /// Compares two register values with the current strict-equality semantics.
-    pub fn strict_eq(&self, lhs: RegisterValue, rhs: RegisterValue) -> Result<bool, ObjectError> {
+    ///
+    /// Takes `&mut self` because string equality may need to flatten Cons /
+    /// Sliced / Thin handles (C2).
+    pub fn strict_eq(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<bool, ObjectError> {
         crate::abstract_ops::is_strictly_equal(self, lhs, rhs)
     }
 
     /// ES2024 §7.2.9 SameValue(x, y).
-    pub fn same_value(&self, lhs: RegisterValue, rhs: RegisterValue) -> Result<bool, ObjectError> {
+    pub fn same_value(
+        &mut self,
+        lhs: RegisterValue,
+        rhs: RegisterValue,
+    ) -> Result<bool, ObjectError> {
         crate::abstract_ops::same_value(self, lhs, rhs)
     }
 
     /// ES2024 §7.2.10 SameValueZero(x, y).
     pub fn same_value_zero(
-        &self,
+        &mut self,
         lhs: RegisterValue,
         rhs: RegisterValue,
     ) -> Result<bool, ObjectError> {
@@ -5132,9 +5159,18 @@ impl ObjectHeap {
                 // §22.1.5.2.1 %StringIteratorPrototype%.next() — yield code points,
                 // not individual code units. Surrogate pairs yield a single 2-unit string.
                 // Spec: <https://tc39.es/ecma262/#sec-%stringiteratorprototype%.next>
-                let Some(js_str) = self.string_value(iterable)?.cloned() else {
+                if self.string_value(iterable)?.is_none() {
                     return Ok(IteratorStep::done());
-                };
+                }
+                // C2: flatten + upcast to SeqTwoByte so as_utf16 returns a
+                // borrowed slice. Cons / Sliced / SeqOneByte iterables flow
+                // through here uniformly.
+                self.flatten_string(iterable)?;
+                let mut js_str = self
+                    .string_value(iterable)?
+                    .expect("string_value present after flatten")
+                    .clone();
+                js_str.ensure_two_byte();
                 let utf16 = js_str.as_utf16();
                 if next_index >= utf16.len() {
                     IteratorStep::done()
@@ -5927,6 +5963,592 @@ impl ObjectHeap {
             | HeapValue::BigInt { .. }
             | HeapValue::ErrorStackFrames { .. } => Ok(None),
         }
+    }
+
+    // ── C2: lazy string operations (Cons / Sliced / Thin / flatten) ─────
+
+    /// Returns the length in UTF-16 code units of a string heap value. O(1).
+    pub fn string_length(&self, handle: ObjectHandle) -> Result<u32, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => Ok(value.len() as u32),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns `true` if the string fits in Latin-1. O(1).
+    pub fn string_is_one_byte(&self, handle: ObjectHandle) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => Ok(value.is_one_byte()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns `true` if the string contains an unpaired surrogate. O(1).
+    pub fn string_contains_lone_surrogate(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<bool, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => Ok(value.contains_lone_surrogate()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Forces `handle` into a flat `Seq*` representation, rewriting the slot
+    /// in place. Idempotent. After this call, the slot is guaranteed
+    /// `SeqOneByte` or `SeqTwoByte` (Thin pointers are followed and folded
+    /// into the original slot).
+    ///
+    /// Cons / Sliced trees are walked iteratively (no recursion — defends
+    /// against malicious left-heavy chains).
+    pub fn flatten_string(&mut self, handle: ObjectHandle) -> Result<(), ObjectError> {
+        // Probe — short-circuit on Seq*. Thin / Cons / Sliced fall through.
+        let needs_flatten = match self.object(handle)? {
+            HeapValue::String { value, .. } => !matches!(
+                value.repr(),
+                crate::js_string::JsStringRepr::SeqOneByte(_)
+                    | crate::js_string::JsStringRepr::SeqTwoByte(_)
+            ),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if !needs_flatten {
+            return Ok(());
+        }
+
+        // Resolve length / kind via the header (O(1)).
+        let length = self.string_length(handle)?;
+        let one_byte = self.string_is_one_byte(handle)?;
+
+        if one_byte {
+            let mut buf = vec![0u8; length as usize];
+            self.fill_one_byte_into(&mut buf, handle, 0, length)?;
+            match self.object_mut(handle)? {
+                HeapValue::String { value, .. } => {
+                    value.become_seq_one_byte(buf.into_boxed_slice());
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            }
+        } else {
+            let mut buf = vec![0u16; length as usize];
+            self.fill_two_byte_into(&mut buf, handle, 0, length)?;
+            match self.object_mut(handle)? {
+                HeapValue::String { value, .. } => {
+                    value.become_seq_two_byte(buf.into_boxed_slice());
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            }
+        }
+        Ok(())
+    }
+
+    /// Iterative DFS that copies a possibly-Cons/Sliced/Thin string into a
+    /// 2-byte buffer. Each stack frame is `(handle, src_off, dst_off, span)`
+    /// describing the sub-window to copy out of `handle` into
+    /// `dst[dst_off..dst_off+span]`.
+    fn fill_two_byte_into(
+        &self,
+        dst: &mut [u16],
+        root: ObjectHandle,
+        dst_off: u32,
+        span: u32,
+    ) -> Result<(), ObjectError> {
+        let mut stack: Vec<(ObjectHandle, u32, u32, u32)> = Vec::with_capacity(32);
+        stack.push((root, 0, dst_off, span));
+
+        while let Some((h, src_off, dst_off, span)) = stack.pop() {
+            let value = match self.object(h)? {
+                HeapValue::String { value, .. } => value,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            match value.repr() {
+                crate::js_string::JsStringRepr::SeqTwoByte(units) => {
+                    let src = &units[src_off as usize..(src_off + span) as usize];
+                    dst[dst_off as usize..(dst_off + span) as usize].copy_from_slice(src);
+                }
+                crate::js_string::JsStringRepr::SeqOneByte(bytes) => {
+                    let src = &bytes[src_off as usize..(src_off + span) as usize];
+                    let out = &mut dst[dst_off as usize..(dst_off + span) as usize];
+                    for (slot, byte) in out.iter_mut().zip(src.iter()) {
+                        *slot = u16::from(*byte);
+                    }
+                }
+                crate::js_string::JsStringRepr::Cons { left, right, .. } => {
+                    let left_handle = *left;
+                    let right_handle = *right;
+                    let left_len = match self.object(left_handle)? {
+                        HeapValue::String { value, .. } => value.len() as u32,
+                        _ => return Err(ObjectError::InvalidKind),
+                    };
+                    let abs_start = src_off;
+                    let abs_end = src_off + span;
+                    if abs_end <= left_len {
+                        stack.push((left_handle, abs_start, dst_off, span));
+                    } else if abs_start >= left_len {
+                        stack.push((right_handle, abs_start - left_len, dst_off, span));
+                    } else {
+                        let left_span = left_len - abs_start;
+                        let right_span = span - left_span;
+                        // Push right first so left fills first (LIFO).
+                        stack.push((right_handle, 0, dst_off + left_span, right_span));
+                        stack.push((left_handle, abs_start, dst_off, left_span));
+                    }
+                }
+                crate::js_string::JsStringRepr::Sliced { parent, offset } => {
+                    stack.push((*parent, src_off + *offset, dst_off, span));
+                }
+                crate::js_string::JsStringRepr::Thin { forward } => {
+                    stack.push((*forward, src_off, dst_off, span));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 1-byte-target variant of `fill_two_byte_into`. Returns
+    /// `InvalidKind` if any 2-byte leg contains a code unit > 0xFF — which
+    /// would only happen if `is_one_byte` propagation is buggy.
+    fn fill_one_byte_into(
+        &self,
+        dst: &mut [u8],
+        root: ObjectHandle,
+        dst_off: u32,
+        span: u32,
+    ) -> Result<(), ObjectError> {
+        let mut stack: Vec<(ObjectHandle, u32, u32, u32)> = Vec::with_capacity(32);
+        stack.push((root, 0, dst_off, span));
+
+        while let Some((h, src_off, dst_off, span)) = stack.pop() {
+            let value = match self.object(h)? {
+                HeapValue::String { value, .. } => value,
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            match value.repr() {
+                crate::js_string::JsStringRepr::SeqOneByte(bytes) => {
+                    let src = &bytes[src_off as usize..(src_off + span) as usize];
+                    dst[dst_off as usize..(dst_off + span) as usize].copy_from_slice(src);
+                }
+                crate::js_string::JsStringRepr::SeqTwoByte(units) => {
+                    let src = &units[src_off as usize..(src_off + span) as usize];
+                    let out = &mut dst[dst_off as usize..(dst_off + span) as usize];
+                    for (slot, unit) in out.iter_mut().zip(src.iter()) {
+                        if *unit > 0xFF {
+                            // is_one_byte propagation invariant violated.
+                            return Err(ObjectError::InvalidKind);
+                        }
+                        *slot = *unit as u8;
+                    }
+                }
+                crate::js_string::JsStringRepr::Cons { left, right, .. } => {
+                    let left_handle = *left;
+                    let right_handle = *right;
+                    let left_len = match self.object(left_handle)? {
+                        HeapValue::String { value, .. } => value.len() as u32,
+                        _ => return Err(ObjectError::InvalidKind),
+                    };
+                    let abs_start = src_off;
+                    let abs_end = src_off + span;
+                    if abs_end <= left_len {
+                        stack.push((left_handle, abs_start, dst_off, span));
+                    } else if abs_start >= left_len {
+                        stack.push((right_handle, abs_start - left_len, dst_off, span));
+                    } else {
+                        let left_span = left_len - abs_start;
+                        let right_span = span - left_span;
+                        stack.push((right_handle, 0, dst_off + left_span, right_span));
+                        stack.push((left_handle, abs_start, dst_off, left_span));
+                    }
+                }
+                crate::js_string::JsStringRepr::Sliced { parent, offset } => {
+                    stack.push((*parent, src_off + *offset, dst_off, span));
+                }
+                crate::js_string::JsStringRepr::Thin { forward } => {
+                    stack.push((*forward, src_off, dst_off, span));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the WTF-16 code units of `handle`, flattening if necessary.
+    /// After this call the slot is guaranteed `SeqOneByte` or `SeqTwoByte`;
+    /// 1-byte strings are upcast through a fresh allocation in flatten so
+    /// the returned `&[u16]` always reflects 16-bit storage. (Phase 4 will
+    /// add a `js_string_one_byte` accessor that avoids the upcast.)
+    pub fn js_string_units(&mut self, handle: ObjectHandle) -> Result<&[u16], ObjectError> {
+        // Ensure flat. If the existing flat is `SeqOneByte`, force a 2-byte
+        // re-flatten so the returned slice is `&[u16]`.
+        self.flatten_string(handle)?;
+        let need_upcast = matches!(
+            self.object(handle)?,
+            HeapValue::String { value, .. }
+                if matches!(value.repr(), crate::js_string::JsStringRepr::SeqOneByte(_))
+        );
+        if need_upcast {
+            let length = self.string_length(handle)?;
+            let mut buf = vec![0u16; length as usize];
+            // Read the 1-byte bytes and upcast.
+            let bytes = match self.object(handle)? {
+                HeapValue::String { value, .. } => match value.repr() {
+                    crate::js_string::JsStringRepr::SeqOneByte(b) => b.clone(),
+                    _ => return Err(ObjectError::InvalidKind),
+                },
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            for (i, byte) in bytes.iter().enumerate() {
+                buf[i] = u16::from(*byte);
+            }
+            match self.object_mut(handle)? {
+                HeapValue::String { value, .. } => {
+                    value.become_seq_two_byte(buf.into_boxed_slice());
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            }
+        }
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => match value.repr() {
+                crate::js_string::JsStringRepr::SeqTwoByte(u) => Ok(u),
+                _ => Err(ObjectError::InvalidKind),
+            },
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns the Latin-1 bytes of `handle` if it's `SeqOneByte`, flattening
+    /// first. Returns `Ok(None)` when the string is `SeqTwoByte` and contains
+    /// at least one code unit > 0xFF (the caller should fall back to
+    /// `js_string_units`).
+    pub fn js_string_one_byte(
+        &mut self,
+        handle: ObjectHandle,
+    ) -> Result<Option<&[u8]>, ObjectError> {
+        self.flatten_string(handle)?;
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => match value.repr() {
+                crate::js_string::JsStringRepr::SeqOneByte(b) => Ok(Some(b)),
+                crate::js_string::JsStringRepr::SeqTwoByte(_) => Ok(None),
+                _ => Err(ObjectError::InvalidKind),
+            },
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Returns a clone of the string's flat `JsString` value. Flattens if
+    /// needed. Use when callers expect the legacy by-value `JsString` —
+    /// e.g. helpers that take `JsString` and call methods like `as_utf16`.
+    pub fn js_string_clone(&mut self, handle: ObjectHandle) -> Result<JsString, ObjectError> {
+        self.flatten_string(handle)?;
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => Ok(value.clone()),
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Concatenates two strings per §22.1.3.1 / §13.15.3 step 5.
+    ///
+    /// * Empty elision: empty operand → returns the other unchanged.
+    /// * Length cap: throws (`InvalidArrayLength` reused as length-cap
+    ///   marker) when total > [`crate::js_string::MAX_STRING_LENGTH`].
+    /// * Short-circuit flat: total ≤
+    ///   [`crate::js_string::MIN_CONS_LENGTH`] allocates flat directly.
+    /// * Otherwise: builds a `Cons` node with O(1) bookkeeping. If the
+    ///   resulting depth > [`crate::js_string::MAX_CONS_DEPTH`] the node
+    ///   is eagerly flattened before return.
+    ///
+    /// `string_prototype` (when `Some`) is installed on the resulting
+    /// string slot so `s.charCodeAt`, `s.slice`, etc. resolve via the
+    /// prototype chain. The caller normally passes
+    /// `intrinsics().string_prototype()`.
+    pub fn concat_strings(
+        &mut self,
+        left: ObjectHandle,
+        right: ObjectHandle,
+        string_prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        // Header reads — O(1).
+        let lhs_len = self.string_length(left)?;
+        let rhs_len = self.string_length(right)?;
+        if lhs_len == 0 {
+            return Ok(right);
+        }
+        if rhs_len == 0 {
+            return Ok(left);
+        }
+        let total = lhs_len.checked_add(rhs_len).ok_or(ObjectError::InvalidArrayLength)?;
+        if total > crate::js_string::MAX_STRING_LENGTH {
+            return Err(ObjectError::InvalidArrayLength);
+        }
+
+        // Short-circuit flat for tiny results.
+        if total <= crate::js_string::MIN_CONS_LENGTH {
+            return self.concat_strings_flat(left, right, total, string_prototype);
+        }
+
+        // Cons construction.
+        let lhs_one_byte = self.string_is_one_byte(left)?;
+        let rhs_one_byte = self.string_is_one_byte(right)?;
+        let is_one_byte = lhs_one_byte && rhs_one_byte;
+        let lhs_lone = self.string_contains_lone_surrogate(left)?;
+        let rhs_lone = self.string_contains_lone_surrogate(right)?;
+        let contains_lone = lhs_lone || rhs_lone;
+        let lhs_depth = self.string_cons_depth(left)?;
+        let rhs_depth = self.string_cons_depth(right)?;
+        let depth = lhs_depth.max(rhs_depth).saturating_add(1);
+
+        let cons = JsString::cons(left, right, total, depth, is_one_byte, contains_lone);
+        let new_handle = self.alloc_heap_value(HeapValue::String {
+            prototype: string_prototype,
+            value: cons,
+        })?;
+
+        if depth > crate::js_string::MAX_CONS_DEPTH {
+            self.flatten_string(new_handle)?;
+        }
+        Ok(new_handle)
+    }
+
+    /// Force-flat concat: allocate a fresh `Seq*` of the right kind and
+    /// memcpy both legs in. `total` is the precomputed sum.
+    fn concat_strings_flat(
+        &mut self,
+        left: ObjectHandle,
+        right: ObjectHandle,
+        total: u32,
+        string_prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        let lhs_len = self.string_length(left)?;
+        let rhs_len = self.string_length(right)?;
+        let lhs_one_byte = self.string_is_one_byte(left)?;
+        let rhs_one_byte = self.string_is_one_byte(right)?;
+        if lhs_one_byte && rhs_one_byte {
+            let mut buf = vec![0u8; total as usize];
+            self.fill_one_byte_into(&mut buf, left, 0, lhs_len)?;
+            self.fill_one_byte_into(&mut buf, right, lhs_len, rhs_len)?;
+            self.alloc_heap_value(HeapValue::String {
+                prototype: string_prototype,
+                value: JsString::from_one_byte(buf.into_boxed_slice()),
+            })
+        } else {
+            let mut buf = vec![0u16; total as usize];
+            self.fill_two_byte_into(&mut buf, left, 0, lhs_len)?;
+            self.fill_two_byte_into(&mut buf, right, lhs_len, rhs_len)?;
+            self.alloc_heap_value(HeapValue::String {
+                prototype: string_prototype,
+                value: JsString::from_utf16(buf.into_boxed_slice()),
+            })
+        }
+    }
+
+    /// Returns the cons-depth of a string. Seq* / Sliced / Thin = 0; Cons
+    /// reports its stored depth.
+    fn string_cons_depth(&self, handle: ObjectHandle) -> Result<u8, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => match value.repr() {
+                crate::js_string::JsStringRepr::Cons { depth, .. } => Ok(*depth),
+                _ => Ok(0),
+            },
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
+    /// Slices `parent[start..end]` lazily.
+    ///
+    /// Per §22.1.3.27/§22.1.3.28 + V8 rules:
+    /// * Empty / out-of-bounds → returns a fresh empty string.
+    /// * Whole range → returns parent unchanged.
+    /// * Sliced-of-Sliced → collapses to one node over the grandparent.
+    /// * Sliced-of-Cons → flattens the Cons first (read-after-slice is
+    ///   pervasive; V8 does the same).
+    /// * Otherwise → allocates a `Sliced` view.
+    pub fn slice_string(
+        &mut self,
+        parent: ObjectHandle,
+        start: u32,
+        end: u32,
+        string_prototype: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle, ObjectError> {
+        let length = self.string_length(parent)?;
+        let start = start.min(length);
+        let end = end.min(length);
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let span = end - start;
+        if span == 0 {
+            // Fresh empty (callers may have a singleton; for now allocate).
+            return self.alloc_heap_value(HeapValue::String {
+                prototype: string_prototype,
+                value: JsString::empty(),
+            });
+        }
+        if start == 0 && end == length {
+            return Ok(parent);
+        }
+
+        // If parent is Cons, flatten first (V8 behavior).
+        let is_cons = matches!(
+            self.object(parent)?,
+            HeapValue::String { value, .. }
+                if matches!(value.repr(), crate::js_string::JsStringRepr::Cons { .. })
+        );
+        if is_cons {
+            self.flatten_string(parent)?;
+        }
+
+        // Sliced-of-Sliced collapse.
+        let collapsed = match self.object(parent)? {
+            HeapValue::String { value, .. } => match value.repr() {
+                crate::js_string::JsStringRepr::Sliced { parent: gp, offset } => {
+                    Some((*gp, *offset))
+                }
+                _ => None,
+            },
+            _ => return Err(ObjectError::InvalidKind),
+        };
+
+        let (effective_parent, effective_offset) = if let Some((gp, gp_off)) = collapsed {
+            (gp, gp_off + start)
+        } else {
+            (parent, start)
+        };
+
+        // Inherit one-byte / lone-surrogate flags from the effective parent.
+        // (Conservatively keep the lone-surrogate flag — rare false positives
+        // are fine; flatten clears them.)
+        let one_byte = self.string_is_one_byte(effective_parent)?;
+        let contains_lone = self.string_contains_lone_surrogate(effective_parent)?;
+
+        let sliced = JsString::sliced(
+            effective_parent,
+            effective_offset,
+            span,
+            one_byte,
+            contains_lone,
+        );
+        self.alloc_heap_value(HeapValue::String {
+            prototype: string_prototype,
+            value: sliced,
+        })
+    }
+
+    /// Read-only conversion of a string handle to a Rust `String`,
+    /// walking Cons / Sliced / Thin without mutating the heap. For consumers
+    /// that hold only `&ObjectHeap` (e.g. console formatters) and cannot
+    /// flatten in place. Lossy: lone surrogates become U+FFFD because Rust
+    /// `String` is UTF-8.
+    pub fn js_string_to_rust_string(&self, handle: ObjectHandle) -> Result<String, ObjectError> {
+        let length = self.string_length(handle)?;
+        let mut buf = vec![0u16; length as usize];
+        self.fill_two_byte_into(&mut buf, handle, 0, length)?;
+        Ok(String::from_utf16_lossy(&buf))
+    }
+
+    /// String equality, hash-prefixed where possible. Flattens both sides if
+    /// either is non-flat, then byte-compares.
+    ///
+    /// C2 Phase 5: when either side has a cached hash, mismatched hashes
+    /// short-circuit to `false` without byte compare.
+    pub fn strings_equal(
+        &mut self,
+        a: ObjectHandle,
+        b: ObjectHandle,
+    ) -> Result<bool, ObjectError> {
+        if a == b {
+            return Ok(true);
+        }
+        if self.string_length(a)? != self.string_length(b)? {
+            return Ok(false);
+        }
+        self.flatten_string(a)?;
+        self.flatten_string(b)?;
+
+        // Hash short-circuit: if both already have a cached hash and they
+        // differ, short-circuit to false without scanning bytes. We do
+        // *not* force computation here — that would defeat the optimization
+        // for ad-hoc compares.
+        let cached_a = match self.object(a)? {
+            HeapValue::String { value, .. } => value.cached_hash(),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let cached_b = match self.object(b)? {
+            HeapValue::String { value, .. } => value.cached_hash(),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if cached_a != 0 && cached_b != 0 && cached_a != cached_b {
+            return Ok(false);
+        }
+
+        let a_one = self.string_is_one_byte(a)?;
+        let b_one = self.string_is_one_byte(b)?;
+        if a_one && b_one {
+            let bytes_a = match self.object(a)? {
+                HeapValue::String { value, .. } => match value.repr() {
+                    crate::js_string::JsStringRepr::SeqOneByte(b) => b.clone(),
+                    _ => return Err(ObjectError::InvalidKind),
+                },
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            let bytes_b = match self.object(b)? {
+                HeapValue::String { value, .. } => match value.repr() {
+                    crate::js_string::JsStringRepr::SeqOneByte(b) => b.clone(),
+                    _ => return Err(ObjectError::InvalidKind),
+                },
+                _ => return Err(ObjectError::InvalidKind),
+            };
+            return Ok(bytes_a == bytes_b);
+        }
+        // Heterogeneous or both 2-byte: compare via 2-byte units.
+        let units_a = self.js_string_units(a)?.to_vec();
+        let units_b = self.js_string_units(b)?.to_vec();
+        Ok(units_a == units_b)
+    }
+
+    /// Computes (and caches) the FNV-1a hash over the string's WTF-16 code
+    /// units. Forces flatten if needed. The same content always hashes
+    /// identically regardless of repr (`SeqOneByte` vs `SeqTwoByte`).
+    ///
+    /// `0` is reserved as the "not yet computed" sentinel; `1` is
+    /// substituted on the rare collision. Bit 0 is cleared (V8 reserves it
+    /// for the "is integer index" tag — ignored for v1).
+    pub fn string_hash(&mut self, handle: ObjectHandle) -> Result<u32, ObjectError> {
+        // Fast path — cached.
+        let cached = match self.object(handle)? {
+            HeapValue::String { value, .. } => value.cached_hash(),
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        if cached != 0 {
+            return Ok(cached);
+        }
+
+        // Slow path: flatten + walk. FNV-1a over u16 units (so 1-byte and
+        // 2-byte same-content strings hash identically).
+        self.flatten_string(handle)?;
+        let mut h: u32 = 0x811c9dc5;
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => match value.repr() {
+                crate::js_string::JsStringRepr::SeqOneByte(b) => {
+                    for byte in b.iter() {
+                        h ^= u32::from(*byte);
+                        h = h.wrapping_mul(0x01000193);
+                    }
+                }
+                crate::js_string::JsStringRepr::SeqTwoByte(u) => {
+                    for unit in u.iter() {
+                        h ^= u32::from(*unit);
+                        h = h.wrapping_mul(0x01000193);
+                    }
+                }
+                _ => return Err(ObjectError::InvalidKind),
+            },
+            _ => return Err(ObjectError::InvalidKind),
+        }
+        if h == 0 {
+            h = 1; // 0 is sentinel.
+        }
+        h &= !1; // Bit 0 reserved for "is integer index".
+
+        match self.object(handle)? {
+            HeapValue::String { value, .. } => value.set_cached_hash(h),
+            _ => return Err(ObjectError::InvalidKind),
+        }
+        Ok(h)
     }
 
     /// Returns the captured upvalue handle for a closure slot.
@@ -7436,7 +8058,7 @@ impl ObjectHeap {
     }
 
     fn apply_property_descriptor(
-        &self,
+        &mut self,
         current: PropertyValue,
         desc: PropertyDescriptor,
     ) -> Result<Option<PropertyValue>, ObjectError> {
@@ -7459,7 +8081,7 @@ impl ObjectHeap {
     }
 
     fn apply_data_property_descriptor(
-        &self,
+        &mut self,
         current_value: RegisterValue,
         current_attributes: PropertyAttributes,
         desc: PropertyDescriptor,

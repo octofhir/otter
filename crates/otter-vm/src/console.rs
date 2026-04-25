@@ -205,9 +205,14 @@ pub fn format_value(value: RegisterValue, runtime: &RuntimeState) -> String {
     }
     if let Some(handle_id) = value.as_object_handle() {
         let handle = ObjectHandle(handle_id);
-        // Try string value.
-        if let Ok(Some(s)) = runtime.objects().string_value(handle) {
-            return s.to_string();
+        // Try string value. Goes through `js_string_to_rust_string` so
+        // Cons / Sliced / Thin handles render their content correctly
+        // without mutating the heap.
+        if runtime.objects().string_value(handle).ok().flatten().is_some() {
+            if let Ok(s) = runtime.objects().js_string_to_rust_string(handle) {
+                return s;
+            }
+            return String::new();
         }
         // Array — show length since element access requires &mut.
         if let Ok(HeapValueKind::Array) = runtime.objects().kind(handle)

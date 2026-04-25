@@ -221,18 +221,32 @@ fn string_concat(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let mut text = runtime
-        .js_to_string(*this)
-        .map_err(|error| map_interpreter_error(error, runtime))?
-        .into_string();
+    require_object_coercible(this, runtime, "concat")?;
+    // C2: lazy concat — fold the receiver and each argument through the
+    // heap-level `concat_strings`, building a Cons tree (or short-circuit
+    // flat below MIN_CONS_LENGTH). Avoids the eager UTF-8 round-trip.
+    let mut acc = runtime
+        .coerce_to_string_handle(*this)
+        .map_err(|error| map_interpreter_error(error, runtime))?;
+    let proto = Some(runtime.intrinsics().string_prototype());
     for arg in args {
-        let next = runtime
-            .js_to_string(*arg)
+        let rhs = runtime
+            .coerce_to_string_handle(*arg)
             .map_err(|error| map_interpreter_error(error, runtime))?;
-        text.push_str(&next);
+        acc = match runtime.objects_mut().concat_strings(acc, rhs, proto) {
+            Ok(handle) => handle,
+            Err(crate::object::ObjectError::InvalidArrayLength) => {
+                let err = runtime.invalid_string_length_error();
+                return Err(map_interpreter_error(err, runtime));
+            }
+            Err(other) => {
+                return Err(VmNativeCallError::Internal(
+                    format!("string concat failed: {other:?}").into(),
+                ));
+            }
+        };
     }
-    let result = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(result.0))
+    Ok(RegisterValue::from_object_handle(acc.0))
 }
 
 fn coerce_to_string(
@@ -380,11 +394,30 @@ pub(super) fn box_string_object(
     Ok(RegisterValue::from_object_handle(wrapper.0))
 }
 
+/// §7.2.1 RequireObjectCoercible — throws TypeError when `this` is
+/// `undefined` or `null`. Step 1 of every `String.prototype.*` method.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-requireobjectcoercible>
+fn require_object_coercible(
+    this: &RegisterValue,
+    runtime: &mut crate::interpreter::RuntimeState,
+    method_name: &str,
+) -> Result<(), VmNativeCallError> {
+    if this.is_undefined() || this.is_null() {
+        let message = format!(
+            "String.prototype.{method_name} called on null or undefined"
+        );
+        return Err(type_error(runtime, &message)?);
+    }
+    Ok(())
+}
+
 /// Extract the string content from `this` (primitive string handle or wrapper object).
 fn this_string_value(
     this: &RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<Box<str>, VmNativeCallError> {
+    require_object_coercible(this, runtime, "<method>")?;
     runtime
         .js_to_string(*this)
         .map_err(|error| map_interpreter_error(error, runtime))
@@ -405,28 +438,96 @@ fn arg_js_string_value(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<crate::js_string::JsString, VmNativeCallError> {
     if let Some(handle) = value.as_object_handle().map(crate::object::ObjectHandle)
-        && let Ok(Some(js)) = runtime.objects().string_value(handle)
+        && runtime.objects().string_value(handle).ok().flatten().is_some()
     {
-        return Ok(js.clone());
+        // C2: flatten before clone so the returned `JsString` is always Seq*.
+        // Then upcast to SeqTwoByte so legacy `as_utf16()` callers see &[u16].
+        runtime.objects_mut().flatten_string(handle).map_err(|e| {
+            VmNativeCallError::Internal(format!("flatten_string failed: {e:?}").into())
+        })?;
+        if let Ok(Some(js)) = runtime.objects().string_value(handle) {
+            let mut clone = js.clone();
+            clone.ensure_two_byte();
+            return Ok(clone);
+        }
     }
     let s = runtime
         .js_to_string(value)
         .map_err(|error| map_interpreter_error(error, runtime))?;
-    Ok(crate::js_string::JsString::from_str(&s))
+    let mut js = crate::js_string::JsString::from_str(&s);
+    js.ensure_two_byte();
+    Ok(js)
 }
 
 /// Resolve an integer argument, defaulting to `default` if undefined/absent.
+/// Best-effort: doesn't propagate ToNumber errors (Symbol, valueOf throw).
+/// New code should prefer [`to_integer_arg`] which is spec-correct.
 fn int_arg(args: &[RegisterValue], index: usize, default: i32) -> i32 {
     args.get(index)
         .copied()
         .and_then(|v| {
             if v == RegisterValue::undefined() {
                 None
+            } else if let Some(b) = v.as_bool() {
+                // Boolean coerces to 0/1 via ToNumber, then ToInteger.
+                Some(if b { 1 } else { 0 })
             } else {
                 v.as_i32().or_else(|| v.as_number().map(|n| n as i32))
             }
         })
         .unwrap_or(default)
+}
+
+/// §7.1.5 ToIntegerOrInfinity for an optional positional argument.
+///
+/// * Absent / undefined → returns `default`.
+/// * Symbol → throws TypeError (propagated from `js_to_number`).
+/// * Object whose `valueOf`/`toString` throws → propagated.
+/// * NaN → 0 (per spec step 2).
+/// * Boolean → 0/1, BigInt → TypeError, etc.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-tointegerorinfinity>
+fn to_integer_arg(
+    args: &[RegisterValue],
+    index: usize,
+    default: i64,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<i64, VmNativeCallError> {
+    let Some(value) = args.get(index).copied() else {
+        return Ok(default);
+    };
+    if value.is_undefined() {
+        return Ok(default);
+    }
+    let number = runtime
+        .js_to_number(value)
+        .map_err(|error| map_interpreter_error(error, runtime))?;
+    if number.is_nan() {
+        return Ok(0);
+    }
+    if number.is_infinite() {
+        // Caller is expected to clamp to length; return saturating bounds
+        // as i64 so subsequent arithmetic stays in range.
+        return Ok(if number.is_sign_positive() {
+            i64::MAX
+        } else {
+            i64::MIN
+        });
+    }
+    let integer = number.trunc() as i64;
+    Ok(integer)
+}
+
+/// Like `to_integer_arg` but clamps to `i32::MIN..=i32::MAX` so existing
+/// `int`-typed callers can swap in without changing their arithmetic.
+fn to_integer_arg_i32(
+    args: &[RegisterValue],
+    index: usize,
+    default: i32,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<i32, VmNativeCallError> {
+    let n = to_integer_arg(args, index, i64::from(default), runtime)?;
+    Ok(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
 }
 
 /// Clamp a relative index per ES spec (negative = from end).
@@ -451,9 +552,10 @@ fn string_at(
     // counts Unicode code points → off-by-one for any string containing
     // a supplementary character.
     let js = this_js_string_value(this, runtime)?;
+    // §22.1.3.1 step 2: Let relativeIndex be ? ToIntegerOrInfinity(index).
+    let index = to_integer_arg_i32(args, 0, 0, runtime)?;
     let units = js.as_utf16();
     let len = units.len() as i32;
-    let index = int_arg(args, 0, 0);
     let actual = if index < 0 { len + index } else { index };
     if actual < 0 || actual >= len {
         return Ok(RegisterValue::undefined());
@@ -476,7 +578,8 @@ fn string_char_at(
     // `"😀".charAt(0)` the spec returns the high surrogate
     // `"\uD83D"`; the old code returned the whole emoji.
     let js = this_js_string_value(this, runtime)?;
-    let pos = int_arg(args, 0, 0);
+    // §22.1.3.2 step 2: Let position be ? ToIntegerOrInfinity(pos).
+    let pos = to_integer_arg_i32(args, 0, 0, runtime)?;
     if pos < 0 {
         let handle = runtime.alloc_string("")?;
         return Ok(RegisterValue::from_object_handle(handle.0));
@@ -505,7 +608,8 @@ fn string_char_code_at(
     // round-trip. Previously went through `js_to_string` → UTF-8 which
     // replaced unpaired surrogates with U+FFFD.
     let js = this_js_string_value(this, runtime)?;
-    let pos = int_arg(args, 0, 0);
+    // §22.1.3.3 step 2: Let position be ? ToIntegerOrInfinity(pos).
+    let pos = to_integer_arg_i32(args, 0, 0, runtime)?;
     if pos < 0 {
         return Ok(RegisterValue::from_number(f64::NAN));
     }
@@ -527,7 +631,8 @@ fn string_code_point_at(
     // (a string built via `String.fromCharCode(0xD800)` came out as
     // `"�"`) and re-encoded the entire string per call.
     let js = this_js_string_value(this, runtime)?;
-    let pos = int_arg(args, 0, 0);
+    // §22.1.3.4 step 2: Let position be ? ToIntegerOrInfinity(pos).
+    let pos = to_integer_arg_i32(args, 0, 0, runtime)?;
     let units = js.as_utf16();
     if pos < 0 || (pos as usize) >= units.len() {
         return Ok(RegisterValue::undefined());
@@ -557,9 +662,14 @@ fn string_index_of(
     let js = this_js_string_value(this, runtime)?;
     let search_js = match args.first().copied() {
         Some(v) => arg_js_string_value(v, runtime)?,
-        None => crate::js_string::JsString::from_str("undefined"),
+        None => {
+            let mut s = crate::js_string::JsString::from_str("undefined");
+            s.ensure_two_byte();
+            s
+        }
     };
-    let pos = int_arg(args, 1, 0).max(0) as usize;
+    // §22.1.3.9 step 4: Let pos be ? ToIntegerOrInfinity(position).
+    let pos = to_integer_arg_i32(args, 1, 0, runtime)?.max(0) as usize;
     let s_units = js.as_utf16();
     let search_units = search_js.as_utf16();
     if search_units.is_empty() {
@@ -583,7 +693,11 @@ fn string_last_index_of(
     let js = this_js_string_value(this, runtime)?;
     let search_js = match args.first().copied() {
         Some(v) => arg_js_string_value(v, runtime)?,
-        None => crate::js_string::JsString::from_str("undefined"),
+        None => {
+            let mut s = crate::js_string::JsString::from_str("undefined");
+            s.ensure_two_byte();
+            s
+        }
     };
     let s_units = js.as_utf16();
     let search_units = search_js.as_utf16();
@@ -628,9 +742,14 @@ fn string_includes(
     let js = this_js_string_value(this, runtime)?;
     let search_js = match args.first().copied() {
         Some(v) => arg_js_string_value(v, runtime)?,
-        None => crate::js_string::JsString::from_str("undefined"),
+        None => {
+            let mut s = crate::js_string::JsString::from_str("undefined");
+            s.ensure_two_byte();
+            s
+        }
     };
-    let pos = int_arg(args, 1, 0).max(0) as usize;
+    // §22.1.3.7 step 4: Let pos be ? ToIntegerOrInfinity(position).
+    let pos = to_integer_arg_i32(args, 1, 0, runtime)?.max(0) as usize;
     let s_units = js.as_utf16();
     let search_units = search_js.as_utf16();
     if search_units.is_empty() {
@@ -654,9 +773,14 @@ fn string_starts_with(
     let js = this_js_string_value(this, runtime)?;
     let search_js = match args.first().copied() {
         Some(v) => arg_js_string_value(v, runtime)?,
-        None => crate::js_string::JsString::from_str("undefined"),
+        None => {
+            let mut s = crate::js_string::JsString::from_str("undefined");
+            s.ensure_two_byte();
+            s
+        }
     };
-    let pos = int_arg(args, 1, 0).max(0) as usize;
+    // §22.1.3.22 step 4: Let pos be ? ToIntegerOrInfinity(position).
+    let pos = to_integer_arg_i32(args, 1, 0, runtime)?.max(0) as usize;
     let s_units = js.as_utf16();
     let search_units = search_js.as_utf16();
     if pos + search_units.len() > s_units.len() {
@@ -677,7 +801,11 @@ fn string_ends_with(
     let js = this_js_string_value(this, runtime)?;
     let search_js = match args.first().copied() {
         Some(v) => arg_js_string_value(v, runtime)?,
-        None => crate::js_string::JsString::from_str("undefined"),
+        None => {
+            let mut s = crate::js_string::JsString::from_str("undefined");
+            s.ensure_two_byte();
+            s
+        }
     };
     let s_units = js.as_utf16();
     let search_units = search_js.as_utf16();
@@ -710,26 +838,29 @@ fn string_slice(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    // C9: slice over UTF-16 storage, build the result via
-    // `JsString::from_utf16` so lone surrogates survive end-to-end.
-    // The previous `String::from_utf16_lossy` path replaced unpaired
-    // surrogates with U+FFFD, breaking spec equivalence with V8/JSC.
-    let js = this_js_string_value(this, runtime)?;
-    let s_units = js.as_utf16();
-    let len = s_units.len();
-    let start = relative_index(int_arg(args, 0, 0), len);
+    require_object_coercible(this, runtime, "slice")?;
+    // C2: lazy slice — produce a `Sliced` view of the parent. Lone
+    // surrogates survive end-to-end because the parent is unmodified.
+    let parent = runtime
+        .coerce_to_string_handle(*this)
+        .map_err(|error| map_interpreter_error(error, runtime))?;
+    let len = runtime.objects().string_length(parent).map_err(|error| {
+        VmNativeCallError::Internal(format!("slice: string_length failed: {error:?}").into())
+    })? as usize;
+    // §22.1.3.21 step 3-6: ToIntegerOrInfinity for both start and end.
+    let start = relative_index(to_integer_arg_i32(args, 0, 0, runtime)?, len);
     let end = if args.get(1).copied() == Some(RegisterValue::undefined()) || args.get(1).is_none() {
         len
     } else {
-        relative_index(int_arg(args, 1, len as i32), len)
+        relative_index(to_integer_arg_i32(args, 1, len as i32, runtime)?, len)
     };
-    if start >= end {
-        let handle = runtime.alloc_string("")?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
-    }
-    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(
-        s_units[start..end].to_vec(),
-    ))?;
+    let proto = Some(runtime.intrinsics().string_prototype());
+    let handle = runtime
+        .objects_mut()
+        .slice_string(parent, start as u32, end as u32, proto)
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("slice_string failed: {error:?}").into())
+        })?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -740,24 +871,38 @@ fn string_substring(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let js = this_js_string_value(this, runtime)?;
-    let s_units = js.as_utf16();
-    let len = s_units.len() as i32;
-    let raw_start = int_arg(args, 0, 0).clamp(0, len) as usize;
+    require_object_coercible(this, runtime, "substring")?;
+    // C2: lazy substring — same lazy `Sliced` path as `slice`. The §22.1.3.23
+    // semantics differ from §22.1.3.21 only in clamp behavior (no negative
+    // indices), so we resolve the indices here and delegate to slice_string
+    // which handles the empty / whole / sliced-of-sliced collapse.
+    let parent = runtime
+        .coerce_to_string_handle(*this)
+        .map_err(|error| map_interpreter_error(error, runtime))?;
+    let len = runtime.objects().string_length(parent).map_err(|error| {
+        VmNativeCallError::Internal(format!("substring: string_length failed: {error:?}").into())
+    })?;
+    let len_i = len as i32;
+    // §22.1.3.23 step 3-6: ToIntegerOrInfinity for both indices.
+    let raw_start = to_integer_arg_i32(args, 0, 0, runtime)?.clamp(0, len_i) as u32;
     let raw_end =
         if args.get(1).copied() == Some(RegisterValue::undefined()) || args.get(1).is_none() {
-            s_units.len()
+            len
         } else {
-            int_arg(args, 1, len).clamp(0, len) as usize
+            to_integer_arg_i32(args, 1, len_i, runtime)?.clamp(0, len_i) as u32
         };
     let (from, to) = if raw_start <= raw_end {
         (raw_start, raw_end)
     } else {
         (raw_end, raw_start)
     };
-    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(
-        s_units[from..to].to_vec(),
-    ))?;
+    let proto = Some(runtime.intrinsics().string_prototype());
+    let handle = runtime
+        .objects_mut()
+        .slice_string(parent, from, to, proto)
+        .map_err(|error| {
+            VmNativeCallError::Internal(format!("slice_string failed: {error:?}").into())
+        })?;
     Ok(RegisterValue::from_object_handle(handle.0))
 }
 
@@ -825,10 +970,13 @@ fn string_repeat(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let count = int_arg(args, 0, 0);
-    if count < 0 {
+    // §22.1.3.16 step 2: Let n be ? ToIntegerOrInfinity(count).
+    let count_i64 = to_integer_arg(args, 0, 0, runtime)?;
+    if count_i64 < 0 || count_i64 == i64::MAX {
+        // §22.1.3.16 step 3: If n < 0 or n is +∞, throw RangeError.
         return Err(range_error(runtime, "Invalid count value"));
     }
+    let count = count_i64.min(i64::from(i32::MAX)) as i32;
     let repeat_count = count as usize;
     let result_len = s
         .len()
@@ -861,7 +1009,8 @@ fn string_pad_start(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let js = this_js_string_value(this, runtime)?;
-    let max_len = int_arg(args, 0, 0).max(0) as usize;
+    // padStart/padEnd: ToIntegerOrInfinity for maxLength.
+    let max_len = to_integer_arg_i32(args, 0, 0, runtime)?.max(0) as usize;
     if max_len > MAX_INTRINSIC_STRING_BYTES {
         return Err(range_error(
             runtime,
@@ -877,7 +1026,11 @@ fn string_pad_start(
     // C9: read fill string via WTF-16-preserving coercion.
     let fill_js = match args.get(1).copied().filter(|v| *v != RegisterValue::undefined()) {
         Some(v) => arg_js_string_value(v, runtime)?,
-        None => crate::js_string::JsString::from_str(" "),
+        None => {
+            let mut s = crate::js_string::JsString::from_str(" ");
+            s.ensure_two_byte();
+            s
+        }
     };
     let fill_units = fill_js.as_utf16();
     if fill_units.is_empty() {
@@ -904,7 +1057,8 @@ fn string_pad_end(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let js = this_js_string_value(this, runtime)?;
-    let max_len = int_arg(args, 0, 0).max(0) as usize;
+    // padStart/padEnd: ToIntegerOrInfinity for maxLength.
+    let max_len = to_integer_arg_i32(args, 0, 0, runtime)?.max(0) as usize;
     if max_len > MAX_INTRINSIC_STRING_BYTES {
         return Err(range_error(
             runtime,
@@ -919,7 +1073,11 @@ fn string_pad_end(
     }
     let fill_js = match args.get(1).copied().filter(|v| *v != RegisterValue::undefined()) {
         Some(v) => arg_js_string_value(v, runtime)?,
-        None => crate::js_string::JsString::from_str(" "),
+        None => {
+            let mut s = crate::js_string::JsString::from_str(" ");
+            s.ensure_two_byte();
+            s
+        }
     };
     let fill_units = fill_js.as_utf16();
     if fill_units.is_empty() {
@@ -951,6 +1109,20 @@ fn try_symbol_dispatch(
         Some(h) => h,
         None => return Ok(None),
     };
+    // ES2024 §22.1.3.13/.14/.16/.18/.20 — for primitive `regexp` (string,
+    // null, undefined), the spec skips the @@match / @@matchAll / @@search
+    // / @@replace / @@split dispatch entirely. We surface "primitive"
+    // here as: heap-resident string. (`undefined` and `null` are already
+    // filtered by the `as_object_handle` check above.)
+    if runtime
+        .objects()
+        .string_value(handle)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Ok(None);
+    }
     let sym_prop = runtime.intern_symbol_property_name(symbol.stable_id());
     let method_val = runtime.ordinary_get(handle, sym_prop, arg)?;
     if method_val == RegisterValue::undefined() || method_val == RegisterValue::null() {
@@ -974,6 +1146,7 @@ fn string_match(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    require_object_coercible(this, runtime, "match")?;
     let regexp_arg = args
         .first()
         .copied()
@@ -1009,6 +1182,7 @@ fn string_match_all(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    require_object_coercible(this, runtime, "matchAll")?;
     let regexp_arg = args
         .first()
         .copied()
@@ -1062,6 +1236,7 @@ fn string_search(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    require_object_coercible(this, runtime, "search")?;
     let regexp_arg = args
         .first()
         .copied()
@@ -1095,6 +1270,7 @@ fn string_split(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    require_object_coercible(this, runtime, "split")?;
     // Step 2: If separator has Symbol.split, delegate.
     let separator_arg = args
         .first()
@@ -1212,6 +1388,7 @@ fn string_replace(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    require_object_coercible(this, runtime, "replace")?;
     // Step 2: If searchValue has Symbol.replace, delegate.
     let search_arg = args
         .first()
@@ -1372,23 +1549,49 @@ fn this_js_string_value(
     this: &RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<crate::js_string::JsString, VmNativeCallError> {
+    require_object_coercible(this, runtime, "<method>")?;
+    // C2: flatten before clone so the returned `JsString` is always Seq*.
+    // Cons / Sliced / Thin shapes leak from the lazy `+` and `slice`
+    // constructors; the legacy callers (`as_utf16`, etc.) expect flat data.
     if let Some(handle) = this.as_object_handle().map(crate::object::ObjectHandle) {
-        if let Ok(Some(js)) = runtime.objects().string_value(handle) {
-            return Ok(js.clone());
+        if runtime.objects().string_value(handle).ok().flatten().is_some() {
+            runtime.objects_mut().flatten_string(handle).map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("flatten_string on `this` failed: {e:?}").into(),
+                )
+            })?;
+            if let Ok(Some(js)) = runtime.objects().string_value(handle) {
+                // C2: upcast SeqOneByte → SeqTwoByte so legacy as_utf16()
+                // callers see borrowed &[u16].
+                let mut clone = js.clone();
+                clone.ensure_two_byte();
+                return Ok(clone);
+            }
         }
         // Check for String wrapper object (__otter_string_data__ slot).
         let str_prop = runtime.intern_property_name("__otter_string_data__");
         if let Ok(Some(lookup)) = runtime.property_lookup(handle, str_prop)
             && let crate::object::PropertyValue::Data { value: v, .. } = lookup.value()
             && let Some(inner_h) = v.as_object_handle().map(crate::object::ObjectHandle)
-            && let Ok(Some(js)) = runtime.objects().string_value(inner_h)
+            && runtime.objects().string_value(inner_h).ok().flatten().is_some()
         {
-            return Ok(js.clone());
+            runtime.objects_mut().flatten_string(inner_h).map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("flatten_string on String wrapper data failed: {e:?}").into(),
+                )
+            })?;
+            if let Ok(Some(js)) = runtime.objects().string_value(inner_h) {
+                let mut clone = js.clone();
+                clone.ensure_two_byte();
+                return Ok(clone);
+            }
         }
     }
     // Fallback: coerce via js_to_string (lossy for lone surrogates)
     let s = this_string_value(this, runtime)?;
-    Ok(crate::js_string::JsString::from_str(&s))
+    let mut js = crate::js_string::JsString::from_str(&s);
+    js.ensure_two_byte();
+    Ok(js)
 }
 
 // ── §22.1.3.9 String.prototype.isWellFormed() ───────────────────────────────
@@ -1753,6 +1956,7 @@ fn string_iterator(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    require_object_coercible(this, runtime, "[Symbol.iterator]")?;
     let text = runtime
         .js_to_string(*this)
         .map_err(|error| map_interpreter_error(error, runtime))?;

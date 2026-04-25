@@ -19,7 +19,7 @@ pub(crate) use property_descriptor::{
 /// ES2024 §7.2.14 IsStrictlyEqual(x, y).
 /// <https://tc39.es/ecma262/#sec-isstrictlyequal>
 pub fn is_strictly_equal(
-    heap: &ObjectHeap,
+    heap: &mut ObjectHeap,
     lhs: RegisterValue,
     rhs: RegisterValue,
 ) -> Result<bool, ObjectError> {
@@ -45,7 +45,7 @@ pub fn is_strictly_equal(
 /// ES2024 §7.2.9 SameValue(x, y).
 /// <https://tc39.es/ecma262/#sec-samevalue>
 pub fn same_value(
-    heap: &ObjectHeap,
+    heap: &mut ObjectHeap,
     lhs: RegisterValue,
     rhs: RegisterValue,
 ) -> Result<bool, ObjectError> {
@@ -67,7 +67,7 @@ pub fn same_value(
 /// ES2024 §7.2.10 SameValueZero(x, y).
 /// <https://tc39.es/ecma262/#sec-samevaluezero>
 pub fn same_value_zero(
-    heap: &ObjectHeap,
+    heap: &mut ObjectHeap,
     lhs: RegisterValue,
     rhs: RegisterValue,
 ) -> Result<bool, ObjectError> {
@@ -164,7 +164,7 @@ fn compare_bigint_primitives(
 }
 
 fn compare_string_primitives(
-    heap: &ObjectHeap,
+    heap: &mut ObjectHeap,
     lhs: RegisterValue,
     rhs: RegisterValue,
 ) -> Result<Option<bool>, ObjectError> {
@@ -175,14 +175,17 @@ fn compare_string_primitives(
         return Ok(None);
     };
 
-    let Some(lhs_string) = heap.string_value(lhs_handle)? else {
+    if heap.string_value(lhs_handle)?.is_none() {
         return Ok(None);
-    };
-    let Some(rhs_string) = heap.string_value(rhs_handle)? else {
+    }
+    if heap.string_value(rhs_handle)?.is_none() {
         return Ok(None);
-    };
+    }
 
-    Ok(Some(lhs_string == rhs_string))
+    // C2: Cons / Sliced / Thin can leak from the lazy `+` and `slice` paths.
+    // Route through the heap-aware equality helper that flattens both sides
+    // first.
+    Ok(Some(heap.strings_equal(lhs_handle, rhs_handle)?))
 }
 
 fn number_same_value(lhs: f64, rhs: f64) -> bool {
@@ -350,10 +353,10 @@ mod tests {
 
     #[test]
     fn same_value_treats_nan_as_equal() {
-        let heap = ObjectHeap::new();
+        let mut heap = ObjectHeap::new();
         assert_eq!(
             same_value(
-                &heap,
+                &mut heap,
                 RegisterValue::from_number(f64::NAN),
                 RegisterValue::from_number(f64::NAN),
             ),
@@ -363,10 +366,10 @@ mod tests {
 
     #[test]
     fn same_value_distinguishes_signed_zero() {
-        let heap = ObjectHeap::new();
+        let mut heap = ObjectHeap::new();
         assert_eq!(
             same_value(
-                &heap,
+                &mut heap,
                 RegisterValue::from_number(0.0),
                 RegisterValue::from_number(-0.0),
             ),
@@ -376,10 +379,10 @@ mod tests {
 
     #[test]
     fn same_value_zero_merges_signed_zero() {
-        let heap = ObjectHeap::new();
+        let mut heap = ObjectHeap::new();
         assert_eq!(
             same_value_zero(
-                &heap,
+                &mut heap,
                 RegisterValue::from_number(0.0),
                 RegisterValue::from_number(-0.0),
             ),
@@ -397,16 +400,16 @@ mod tests {
         let other =
             RegisterValue::from_object_handle(heap.alloc_string("vm").expect("alloc string").0);
 
-        assert_eq!(same_value(&heap, lhs, rhs), Ok(true));
-        assert_eq!(same_value(&heap, lhs, other), Ok(false));
+        assert_eq!(same_value(&mut heap, lhs, rhs), Ok(true));
+        assert_eq!(same_value(&mut heap, lhs, other), Ok(false));
     }
 
     #[test]
     fn strict_equality_keeps_nan_unequal() {
-        let heap = ObjectHeap::new();
+        let mut heap = ObjectHeap::new();
         assert_eq!(
             is_strictly_equal(
-                &heap,
+                &mut heap,
                 RegisterValue::from_number(f64::NAN),
                 RegisterValue::from_number(f64::NAN),
             ),

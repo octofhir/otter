@@ -72,10 +72,13 @@ impl IntrinsicInstaller for StringIntrinsic {
         )?;
         initialize_string_prototype(intrinsics, cx)?;
 
-        // Install String.prototype[Symbol.iterator].
+        // Install String.prototype[Symbol.iterator]. ES2024 §10.2.8/§10.2.9
+        // require .name = "[Symbol.iterator]" and .length = 0 with the
+        // built-in attributes, otherwise verifyProperty(...) tests fail.
         let iter_desc = NativeFunctionDescriptor::method("[Symbol.iterator]", 0, string_iterator);
         let iter_id = cx.native_functions.register(iter_desc);
         let iter_fn = cx.alloc_intrinsic_host_function(iter_id, intrinsics.function_prototype())?;
+        super::install::install_function_length_name(iter_fn, 0, "[Symbol.iterator]", cx)?;
         let sym_iterator = cx
             .property_names
             .intern_symbol(super::WellKnownSymbol::Iterator.stable_id());
@@ -701,24 +704,23 @@ fn string_last_index_of(
     };
     let s_units = js.as_utf16();
     let search_units = search_js.as_utf16();
-    let pos = args
-        .get(1)
-        .copied()
-        .and_then(|v| {
-            if v == RegisterValue::undefined() {
-                None
-            } else {
-                v.as_number()
-            }
-        })
-        .map(|n| {
-            if n.is_nan() {
+    // §22.1.3.10 steps 4–5: ToNumber(position); NaN → +∞ (clamp to len).
+    let pos = match args.get(1).copied() {
+        None => s_units.len(),
+        Some(v) if v == RegisterValue::undefined() => s_units.len(),
+        Some(v) => {
+            let n = runtime
+                .js_to_number(v)
+                .map_err(|error| map_interpreter_error(error, runtime))?;
+            if n.is_nan() || (n.is_infinite() && n.is_sign_positive()) {
                 s_units.len()
+            } else if n <= 0.0 {
+                0
             } else {
-                n.max(0.0) as usize
+                (n.trunc() as i64).max(0) as usize
             }
-        })
-        .unwrap_or(s_units.len());
+        }
+    };
 
     if search_units.is_empty() {
         return Ok(RegisterValue::from_i32(pos.min(s_units.len()) as i32));
@@ -1291,19 +1293,25 @@ fn string_split(
     }
 
     let s = this_string_value(this, runtime)?;
-    let limit = args
-        .get(1)
-        .copied()
-        .and_then(|v| {
-            if v == RegisterValue::undefined() {
-                None
+    // §22.1.3.21 step 6: lim = (limit === undefined) ? 2^32-1 : ToUint32(limit).
+    // ToUint32 may throw via valueOf/toString and must run before ToString(separator).
+    let limit = match args.get(1).copied() {
+        None => u32::MAX as usize,
+        Some(v) if v == RegisterValue::undefined() => u32::MAX as usize,
+        Some(v) => {
+            let n = runtime
+                .js_to_number(v)
+                .map_err(|error| map_interpreter_error(error, runtime))?;
+            // ToUint32: NaN/±Inf → 0, else trunc and modulo 2^32.
+            if !n.is_finite() {
+                0
             } else {
-                v.as_i32()
-                    .map(|n| n.max(0) as usize)
-                    .or_else(|| v.as_number().map(|n| n.max(0.0) as usize))
+                let int = n.trunc();
+                let modulo = int.rem_euclid(4_294_967_296.0);
+                modulo as u32 as usize
             }
-        })
-        .unwrap_or(u32::MAX as usize);
+        }
+    };
 
     let separator = args
         .first()
@@ -1423,6 +1431,19 @@ fn string_replace(
         .map(|h| runtime.objects().is_callable(h))
         .unwrap_or(false);
 
+    // §22.1.3.17 step 6: if functionalReplace is false, ToString(replaceValue)
+    // is performed *before* searching the string, so a throwing toString on
+    // an unmatched needle still propagates and the side effect is observed.
+    let replace_str_pre = if !is_fn {
+        Some(
+            runtime
+                .js_to_string(replace_arg)
+                .map_err(|e| map_interpreter_error(e, runtime))?,
+        )
+    } else {
+        None
+    };
+
     if let Some(pos) = s.find(&*search) {
         let replacement = if is_fn {
             let callback = replace_arg.as_object_handle().map(ObjectHandle).unwrap();
@@ -1440,9 +1461,7 @@ fn string_replace(
                 .js_to_string(result)
                 .map_err(|e| map_interpreter_error(e, runtime))?
         } else {
-            runtime
-                .js_to_string(replace_arg)
-                .map_err(|e| map_interpreter_error(e, runtime))?
+            replace_str_pre.expect("non-functional replace pre-coerced")
         };
         let mut result = String::with_capacity(s.len());
         result.push_str(&s[..pos]);

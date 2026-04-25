@@ -566,22 +566,7 @@ impl RuntimeState {
             return Ok(str_val.to_string().into_boxed_str());
         }
         if let Some(number) = value.as_number() {
-            let text = if number.is_nan() {
-                "NaN".to_string()
-            } else if number.is_infinite() {
-                if number.is_sign_positive() {
-                    "Infinity".to_string()
-                } else {
-                    "-Infinity".to_string()
-                }
-            } else if number == 0.0 {
-                "0".to_string()
-            } else if number.fract() == 0.0 {
-                format!("{number:.0}")
-            } else {
-                number.to_string()
-            };
-            return Ok(text.into_boxed_str());
+            return Ok(crate::abstract_ops::ecma_number_to_string(number).into_boxed_str());
         }
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             if self.objects.string_value(handle)?.is_some() {

@@ -273,6 +273,8 @@ fn install_getter(
     let getter_id = cx.native_functions.register(getter_desc);
     let getter_handle =
         cx.alloc_intrinsic_host_function(getter_id, intrinsics.function_prototype)?;
+    // ES2024 §10.2.8/§10.2.9: getter functions need .name = "get <name>" / .length = 0.
+    super::install::install_function_length_name(getter_handle, 0, &format!("get {name}"), cx)?;
     let property = cx.property_names.intern(name);
     cx.heap
         .define_accessor(target, property, Some(getter_handle), None)?;
@@ -297,6 +299,10 @@ fn install_symbol_method(
     let desc = NativeFunctionDescriptor::method(name, length, callback);
     let id = cx.native_functions.register(desc);
     let handle = cx.alloc_intrinsic_host_function(id, intrinsics.function_prototype)?;
+    // ES2024 §10.2.8/§10.2.9: built-in functions expose their `name` and
+    // `length` as own data properties; bypassing this leaves the function
+    // looking unnamed to `verifyProperty(...)` tests.
+    super::install::install_function_length_name(handle, length, name, cx)?;
     let sym_prop = cx.property_names.intern_symbol(symbol.stable_id());
     cx.heap.set_property(
         target,
@@ -951,12 +957,30 @@ fn regexp_compile(
 
 // ── Getter accessors ──────────────────────────────────────────────────────────
 
+/// §22.2.6.10 get RegExp.prototype.source. Per spec, when receiver lacks
+/// [[OriginalSource]] but equals %RegExp.prototype%, return "(?:)" instead
+/// of throwing.
 fn regexp_get_source(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = require_regexp_this(this, "get RegExp.prototype.source", runtime)?;
+    let Some(handle) = this.as_object_handle().map(ObjectHandle) else {
+        return Err(type_error(
+            runtime,
+            "get RegExp.prototype.source: receiver is not an Object",
+        ));
+    };
+    if !matches!(runtime.objects().kind(handle), Ok(HeapValueKind::RegExp)) {
+        if handle == runtime.intrinsics().regexp_prototype {
+            let h = runtime.alloc_string("(?:)")?;
+            return Ok(RegisterValue::from_object_handle(h.0));
+        }
+        return Err(type_error(
+            runtime,
+            "get RegExp.prototype.source: receiver is not a RegExp",
+        ));
+    }
     let pattern = regexp_pattern(handle, runtime).to_string();
     let source = if pattern.is_empty() {
         "(?:)".to_string()
@@ -967,19 +991,51 @@ fn regexp_get_source(
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
+/// §22.2.6.4 get RegExp.prototype.flags. Reads flag properties via [[Get]]
+/// from any Object receiver — does NOT require an internal [[OriginalFlags]]
+/// slot (test262 uses this getter on plain objects).
 fn regexp_get_flags(
     this: &RegisterValue,
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let handle = require_regexp_this(this, "get RegExp.prototype.flags", runtime)?;
-    let flags = regexp_flags_str(handle, runtime).to_string();
-    // Reconstruct in canonical order.
-    let canonical = canonical_flags_str(&flags);
-    let h = runtime.alloc_string(canonical)?;
+    let handle = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
+        type_error(runtime, "get RegExp.prototype.flags called on non-object")
+    })?;
+    // Spec order: d, g, i, m, s, u, v, y.
+    const ORDER: &[(&str, char)] = &[
+        ("hasIndices", 'd'),
+        ("global", 'g'),
+        ("ignoreCase", 'i'),
+        ("multiline", 'm'),
+        ("dotAll", 's'),
+        ("unicode", 'u'),
+        ("unicodeSets", 'v'),
+        ("sticky", 'y'),
+    ];
+    let mut out = String::with_capacity(8);
+    for (name, ch) in ORDER {
+        let prop = runtime.intern_property_name(name);
+        let val = runtime.ordinary_get(handle, prop, *this)?;
+        let truthy = match runtime.js_to_boolean(val) {
+            Ok(b) => b,
+            Err(crate::interpreter::InterpreterError::UncaughtThrow(value)) => {
+                return Err(VmNativeCallError::Thrown(value));
+            }
+            Err(e) => return Err(VmNativeCallError::Internal(format!("{e}").into())),
+        };
+        if truthy {
+            out.push(*ch);
+        }
+    }
+    let h = runtime.alloc_string(out)?;
     Ok(RegisterValue::from_object_handle(h.0))
 }
 
+/// §22.2.6.5–.13 RegExp.prototype.{global,ignoreCase,multiline,dotAll,unicode,
+/// unicodeSets,sticky,hasIndices} getters. Per spec: if `this` lacks the
+/// internal [[OriginalFlags]] slot but is %RegExp.prototype% itself, return
+/// `undefined`; otherwise throw TypeError.
 macro_rules! flag_getter {
     ($fn_name:ident, $flag_char:literal, $method_name:literal) => {
         fn $fn_name(
@@ -987,8 +1043,21 @@ macro_rules! flag_getter {
             _args: &[RegisterValue],
             runtime: &mut crate::interpreter::RuntimeState,
         ) -> Result<RegisterValue, VmNativeCallError> {
-            // Special: if this === %RegExp.prototype%, return undefined per spec.
-            let handle = require_regexp_this(this, $method_name, runtime)?;
+            let Some(handle) = this.as_object_handle().map(ObjectHandle) else {
+                return Err(type_error(
+                    runtime,
+                    &format!("{}: receiver is not an Object", $method_name),
+                ));
+            };
+            if !matches!(runtime.objects().kind(handle), Ok(HeapValueKind::RegExp)) {
+                if handle == runtime.intrinsics().regexp_prototype {
+                    return Ok(RegisterValue::undefined());
+                }
+                return Err(type_error(
+                    runtime,
+                    &format!("{}: receiver is not a RegExp", $method_name),
+                ));
+            }
             let flags = regexp_flags_str(handle, runtime).to_string();
             Ok(RegisterValue::from_bool(flags.contains($flag_char)))
         }

@@ -79,8 +79,8 @@ fn now_time_zone_id(
         .time_zone()
         .map_err(|e| temporal_err(e, runtime))?;
     let id = tz.identifier().map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(id)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(id).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §2.2.3 Temporal.Now.plainDateTimeISO ( [ timeZone ] )

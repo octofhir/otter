@@ -163,8 +163,8 @@ fn pmd_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pmd = require_plain_month_day(this, runtime)?;
     let code = pmd.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(code).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §14.2.3.4 get Temporal.PlainMonthDay.prototype.day
@@ -206,8 +206,8 @@ fn pmd_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pmd = require_plain_month_day(this, runtime)?;
     let text = pmd.to_ixdtf_string(temporal_rs::options::DisplayCalendar::Auto);
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(text).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §14.2.3.9 Temporal.PlainMonthDay.prototype.toJSON ( )

@@ -128,8 +128,8 @@ fn rtf_format(
         .ok_or_else(|| range_error(runtime, &format!("Invalid unit: {unit_str}")))?;
 
     let formatted = perform_relative_time_format(value, unit, &data);
-    let handle = runtime.alloc_string(formatted)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(formatted).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ═══════════════════════════════════════════════════════════════════

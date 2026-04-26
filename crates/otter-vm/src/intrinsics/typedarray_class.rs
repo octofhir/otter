@@ -968,8 +968,11 @@ fn typed_array_get_to_string_tag(
         .objects()
         .typed_array_kind(handle)
         .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    let name = runtime.alloc_string(kind.constructor_name())?;
-    Ok(RegisterValue::from_object_handle(name.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(kind.constructor_name())
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §23.2.2.4 get %TypedArray% [ @@species ]

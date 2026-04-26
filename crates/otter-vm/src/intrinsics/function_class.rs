@@ -358,14 +358,17 @@ fn function_bind(
             VmNativeCallError::Internal(format!("bound function length install: {error:?}").into())
         })?;
     let name_prop = runtime.intern_property_name("name");
-    let name_handle = runtime.alloc_string(bound_name)?;
+    // Strategy B: TAG_PTR_STRING.
+    let name_value = runtime
+        .alloc_string_value(&bound_name)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
     runtime
         .objects_mut()
         .define_own_property(
             bound,
             name_prop,
             PropertyValue::data_with_attrs(
-                RegisterValue::from_object_handle(name_handle.0),
+                name_value,
                 PropertyAttributes::function_length(),
             ),
         )

@@ -125,13 +125,13 @@ fn display_names_of(
 
     match name {
         Some(n) => {
-            let handle = runtime.alloc_string(n)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(n).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => match data.fallback {
             DisplayNamesFallback::Code => {
-                let handle = runtime.alloc_string(&*code)?;
-                Ok(RegisterValue::from_object_handle(handle.0))
+                let value = runtime.alloc_string_value(&code).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+                Ok(value)
             }
             DisplayNamesFallback::None => Ok(RegisterValue::undefined()),
         },

@@ -1493,15 +1493,14 @@ fn string_replace(
     if let Some(pos) = s.find(&*search) {
         let replacement = if is_fn {
             let callback = replace_arg.as_object_handle().map(ObjectHandle).unwrap();
-            let match_str = runtime.alloc_string(&*search)?;
+            // Strategy B: pass the matched substring as TAG_PTR_STRING.
+            let match_value = runtime
+                .alloc_string_value(&search)
+                .map_err(|e| map_interpreter_error(e, runtime))?;
             let result = runtime.call_callable(
                 callback,
                 RegisterValue::undefined(),
-                &[
-                    RegisterValue::from_object_handle(match_str.0),
-                    RegisterValue::from_i32(pos as i32),
-                    *this,
-                ],
+                &[match_value, RegisterValue::from_i32(pos as i32), *this],
             )?;
             runtime
                 .js_to_string(result)

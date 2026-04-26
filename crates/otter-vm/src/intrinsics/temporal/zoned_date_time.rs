@@ -232,8 +232,8 @@ fn zdt_time_zone_id(
         .time_zone()
         .identifier_with_provider(tz_provider())
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(id)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(id).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 zdt_getter_num!(zdt_year, year);
@@ -248,8 +248,8 @@ fn zdt_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let code = zdt.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(code).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 zdt_getter_num!(zdt_day, day);
@@ -342,8 +342,8 @@ fn zdt_offset(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let offset = zdt.offset();
-    let handle = runtime.alloc_string(offset)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(offset).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §6.2.3.25 get Temporal.ZonedDateTime.prototype.offsetNanoseconds
@@ -424,8 +424,8 @@ fn zdt_to_string(
             tz_provider(),
         )
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(text).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §6.2.3.46 Temporal.ZonedDateTime.prototype.toJSON ( )

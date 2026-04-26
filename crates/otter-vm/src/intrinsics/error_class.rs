@@ -387,13 +387,11 @@ pub(crate) fn alloc_suppressed_error_value(
         let msg = runtime
             .js_to_string(message)
             .map_err(|err| map_interpreter_error(err, runtime))?;
-        let msg_handle = runtime.alloc_string(msg)?;
-        define_non_enumerable_data_property(
-            runtime,
-            handle,
-            "message",
-            RegisterValue::from_object_handle(msg_handle.0),
-        )?;
+        // Strategy B: TAG_PTR_STRING.
+        let msg_value = runtime
+            .alloc_string_value(&msg)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        define_non_enumerable_data_property(runtime, handle, "message", msg_value)?;
     }
     define_non_enumerable_data_property(runtime, handle, "error", error)?;
     define_non_enumerable_data_property(runtime, handle, "suppressed", suppressed)?;

@@ -185,8 +185,8 @@ fn locale_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_locale_data(this, runtime)?;
     let locale_str = data.locale.clone();
-    let handle = runtime.alloc_string(locale_str)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(locale_str).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -273,8 +273,8 @@ fn locale_language_getter(
     let tag = &data.locale;
     // Language is the first subtag before any '-'.
     let language = tag.split('-').next().unwrap_or(tag).to_string();
-    let handle = runtime.alloc_string(language)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(language).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn locale_script_getter(
@@ -286,8 +286,8 @@ fn locale_script_getter(
     let script = extract_subtag_script(&data.locale).map(str::to_string);
     match script {
         Some(s) => {
-            let handle = runtime.alloc_string(s)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(s).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => Ok(RegisterValue::undefined()),
     }
@@ -302,8 +302,8 @@ fn locale_region_getter(
     let region = extract_subtag_region(&data.locale).map(str::to_string);
     match region {
         Some(r) => {
-            let handle = runtime.alloc_string(r)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(r).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => Ok(RegisterValue::undefined()),
     }
@@ -316,8 +316,8 @@ fn locale_base_name_getter(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let data = require_locale_data(this, runtime)?;
     let base = extract_base_name(&data.locale).to_string();
-    let handle = runtime.alloc_string(base)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(base).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn locale_calendar_getter(
@@ -329,8 +329,8 @@ fn locale_calendar_getter(
     let calendar = data.calendar.clone();
     match calendar {
         Some(c) => {
-            let handle = runtime.alloc_string(c)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(c).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => Ok(RegisterValue::undefined()),
     }
@@ -345,8 +345,8 @@ fn locale_collation_getter(
     let collation = data.collation.clone();
     match collation {
         Some(c) => {
-            let handle = runtime.alloc_string(c)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(c).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => Ok(RegisterValue::undefined()),
     }
@@ -361,8 +361,8 @@ fn locale_numbering_system_getter(
     let ns = data.numbering_system.clone();
     match ns {
         Some(ns) => {
-            let handle = runtime.alloc_string(ns)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(ns).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => Ok(RegisterValue::undefined()),
     }
@@ -381,8 +381,8 @@ fn locale_hour_cycle_getter(
     let hc = data.hour_cycle.clone();
     match hc {
         Some(h) => {
-            let handle = runtime.alloc_string(h)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(h).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => Ok(RegisterValue::undefined()),
     }
@@ -397,8 +397,8 @@ fn locale_case_first_getter(
     let cf = data.case_first.clone();
     match cf {
         Some(c) => {
-            let handle = runtime.alloc_string(c)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime.alloc_string_value(&(c).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => Ok(RegisterValue::undefined()),
     }

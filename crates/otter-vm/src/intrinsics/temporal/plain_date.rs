@@ -205,8 +205,8 @@ fn pd_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pd = require_plain_date(this, runtime)?;
     let code = pd.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(code).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 pd_getter_num!(pd_day, day);
@@ -313,8 +313,8 @@ fn pd_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pd = require_plain_date(this, runtime)?;
     let text = pd.to_ixdtf_string(temporal_rs::options::DisplayCalendar::Auto);
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(text).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §10.2.3.22 Temporal.PlainDate.prototype.toJSON ( )

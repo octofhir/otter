@@ -284,8 +284,8 @@ fn instant_to_string(
         )
         .map_err(|e| temporal_err(e, runtime))?;
 
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(text).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Extracts an optional `timeZone` string from an options bag argument.
@@ -338,8 +338,8 @@ fn instant_to_json(
             tz_provider(),
         )
         .map_err(|e| temporal_err(e, runtime))?;
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(text).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── Duration extraction helper ──────────────────────────────────────

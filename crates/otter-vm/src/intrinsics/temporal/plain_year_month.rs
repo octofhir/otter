@@ -203,8 +203,8 @@ fn pym_month_code(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pym = require_plain_year_month(this, runtime)?;
     let code = pym.month_code().as_str().to_string();
-    let handle = runtime.alloc_string(code)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(code).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 pym_getter_num!(pym_days_in_month, days_in_month);
@@ -280,8 +280,8 @@ fn pym_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pym = require_plain_year_month(this, runtime)?;
     let text = pym.to_ixdtf_string(temporal_rs::options::DisplayCalendar::Auto);
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(text).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §13.2.3.17 Temporal.PlainYearMonth.prototype.toJSON ( )

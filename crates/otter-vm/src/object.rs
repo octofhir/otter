@@ -1901,6 +1901,11 @@ pub struct ObjectHeap {
     /// C8: bumped on every `set_prototype` mutation. Cached lookups stash
     /// the generation at write-time and revalidate on read.
     prototype_generation: u64,
+    /// Strategy B: tracks whether per-type GC trace functions have been
+    /// installed on the underlying [`otter_gc::heap::GcHeap`]. The
+    /// trace table panics on double registration, so we register once
+    /// lazily on first GC-managed allocation.
+    gc_traces_registered: bool,
 }
 
 /// C8: cached resolution of a prototype-chain property lookup. Valid only
@@ -1963,6 +1968,7 @@ impl ObjectHeap {
             shape_transitions: std::collections::HashMap::default(),
             proto_lookup_cache: std::cell::RefCell::new(std::collections::HashMap::default()),
             prototype_generation: 0,
+            gc_traces_registered: false,
         }
     }
 
@@ -1974,6 +1980,7 @@ impl ObjectHeap {
     pub fn with_config(config: GcConfig) -> Self {
         Self {
             heap: TypedHeap::with_config(config),
+            gc_traces_registered: false,
             next_shape_id: 1,
             shape_transitions: std::collections::HashMap::default(),
             proto_lookup_cache: std::cell::RefCell::new(std::collections::HashMap::default()),
@@ -1986,6 +1993,28 @@ impl ObjectHeap {
     /// `RangeError` when the hard heap cap has been exceeded.
     pub fn oom_flag(&self) -> Arc<AtomicBool> {
         self.heap.oom_flag()
+    }
+
+    /// Mutable access to the underlying [`otter_gc::heap::GcHeap`] used
+    /// by Strategy B per-type allocations (`JsStringGc`, etc.). Strategy
+    /// B per-type GC structs allocate via `gc_heap_mut().alloc_typed`
+    /// rather than the legacy `TypedHeap` slot table.
+    ///
+    /// The first call ensures every Strategy B trace function is
+    /// registered on this heap. Idempotent across multiple calls.
+    pub fn gc_heap_mut(&mut self) -> &mut otter_gc::heap::GcHeap {
+        self.ensure_gc_traces_registered();
+        self.heap.gc_heap_mut()
+    }
+
+    /// Registers Strategy B trace functions on the underlying GcHeap if
+    /// not already registered. Tracked via a flag stored alongside the
+    /// heap to avoid double registration (which would panic).
+    fn ensure_gc_traces_registered(&mut self) {
+        if !self.gc_traces_registered {
+            otter_gc::types::register_all(self.heap.gc_heap_mut());
+            self.gc_traces_registered = true;
+        }
     }
 
     /// Clears the OOM signal flag.

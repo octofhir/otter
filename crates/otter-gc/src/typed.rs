@@ -429,6 +429,112 @@ impl Default for TypedHeap {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HeapBackend impl
+// ---------------------------------------------------------------------------
+
+impl crate::backend::HeapBackend for TypedHeap {
+    #[inline]
+    fn alloc<T: Traceable>(&mut self, value: T) -> Result<Handle, OutOfMemory> {
+        TypedHeap::alloc(self, value)
+    }
+
+    #[inline]
+    fn get<T: Traceable>(&self, handle: Handle) -> Option<&T> {
+        TypedHeap::get(self, handle)
+    }
+
+    #[inline]
+    fn get_mut<T: Traceable>(&mut self, handle: Handle) -> Option<&mut T> {
+        TypedHeap::get_mut(self, handle)
+    }
+
+    #[inline]
+    fn is_live(&self, handle: Handle) -> bool {
+        TypedHeap::is_live(self, handle)
+    }
+
+    #[inline]
+    fn live_count(&self) -> usize {
+        TypedHeap::live_count(self)
+    }
+
+    #[inline]
+    fn for_each(&self, visitor: &mut dyn FnMut(u32, &dyn Any)) {
+        TypedHeap::for_each(self, |idx, any| visitor(idx, any));
+    }
+
+    #[inline]
+    fn collect(&mut self, roots: &[Handle]) {
+        TypedHeap::collect(self, roots);
+    }
+
+    #[inline]
+    fn run_mark_phase(&mut self, roots: &[Handle]) {
+        TypedHeap::run_mark_phase(self, roots);
+    }
+
+    #[inline]
+    fn run_mark_additional(&mut self, handles: &[Handle]) {
+        TypedHeap::run_mark_additional(self, handles);
+    }
+
+    #[inline]
+    fn run_sweep_phase(&mut self) {
+        TypedHeap::run_sweep_phase(self);
+    }
+
+    #[inline]
+    fn is_marked(&self, handle: Handle) -> bool {
+        TypedHeap::is_marked(self, handle)
+    }
+
+    #[inline]
+    fn marks(&self) -> &[bool] {
+        TypedHeap::marks(self)
+    }
+
+    #[inline]
+    fn maybe_collect(&mut self, roots: &[Handle]) {
+        TypedHeap::maybe_collect(self, roots);
+    }
+
+    #[inline]
+    fn reserve_bytes(&mut self, bytes: usize) -> Result<(), OutOfMemory> {
+        TypedHeap::reserve_bytes(self, bytes)
+    }
+
+    #[inline]
+    fn release_bytes(&mut self, bytes: usize) {
+        TypedHeap::release_bytes(self, bytes);
+    }
+
+    #[inline]
+    fn would_exceed_limit(&self, additional: usize) -> bool {
+        TypedHeap::would_exceed_limit(self, additional)
+    }
+
+    #[inline]
+    fn tracked_bytes(&self) -> usize {
+        TypedHeap::tracked_bytes(self)
+    }
+
+    #[inline]
+    fn max_heap_bytes(&self) -> Option<usize> {
+        TypedHeap::max_heap_bytes(self)
+    }
+
+    #[inline]
+    fn oom_flag(&self) -> Arc<AtomicBool> {
+        TypedHeap::oom_flag(self)
+    }
+
+    #[inline]
+    fn clear_oom_flag(&self) {
+        TypedHeap::clear_oom_flag(self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -740,6 +740,46 @@ impl Interpreter {
                 let lhs = activation.accumulator();
                 let result = if lhs == rhs {
                     true
+                } else if lhs.is_string_ref() && rhs.is_string_ref() {
+                    // Strategy B fast path: both sides are TAG_PTR_STRING.
+                    // Pointer-equality short-circuited above; here we
+                    // compare content via the new reader.
+                    match (lhs.as_string_ref(), rhs.as_string_ref()) {
+                        (Some(l), Some(r)) => crate::js_string_gc::equals(l, r),
+                        _ => false,
+                    }
+                } else if let (Some(gc_ref), Some(rh)) =
+                    (lhs.as_string_ref(), rhs.as_object_handle())
+                {
+                    // Cross-tag: TAG_PTR_STRING vs legacy string handle.
+                    let rh = crate::object::ObjectHandle(rh);
+                    if matches!(runtime.objects.string_value(rh), Ok(Some(_))) {
+                        runtime.objects.flatten_string(rh).ok();
+                        if let Ok(Some(rs)) = runtime.objects.string_value(rh) {
+                            let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+                            cow.as_ref() == rs.as_utf16()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else if let (Some(lh), Some(gc_ref)) =
+                    (lhs.as_object_handle(), rhs.as_string_ref())
+                {
+                    // Mirror of the previous branch with sides swapped.
+                    let lh = crate::object::ObjectHandle(lh);
+                    if matches!(runtime.objects.string_value(lh), Ok(Some(_))) {
+                        runtime.objects.flatten_string(lh).ok();
+                        if let Ok(Some(ls)) = runtime.objects.string_value(lh) {
+                            let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+                            ls.as_utf16() == cow.as_ref()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 } else if let (Some(lh), Some(rh)) =
                     (lhs.as_object_handle(), rhs.as_object_handle())
                 {

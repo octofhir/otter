@@ -43,6 +43,7 @@ pub(crate) use boolean_class::box_boolean_object;
 pub(crate) use generator_class::GeneratorResumeKind;
 pub(crate) use iterator_class::create_iter_result_object;
 pub(crate) use number_class::box_number_object;
+pub(crate) use string_class::box_string_object;
 pub(crate) use symbol_class::{box_symbol_object, symbol_descriptive_string};
 
 use crate::host::NativeFunctionRegistry;

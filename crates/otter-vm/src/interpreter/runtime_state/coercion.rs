@@ -6,7 +6,7 @@
 
 use crate::descriptors::VmNativeCallError;
 use crate::intrinsics::{
-    WellKnownSymbol, box_boolean_object, box_number_object, box_symbol_object,
+    WellKnownSymbol, box_boolean_object, box_number_object, box_string_object, box_symbol_object,
 };
 use crate::object::{HeapValueKind, ObjectError, ObjectHandle, PropertyValue};
 use crate::property::PropertyNameId;
@@ -79,6 +79,17 @@ impl RuntimeState {
             {
                 return Ok(inner);
             }
+        }
+        // Strategy B: read WTF-16 content via the new path (lossless,
+        // preserves lone surrogates), then materialise a legacy
+        // `HeapValue::String` handle. This is the bridge consumers of
+        // `coerce_to_string_handle` need until they migrate. Once
+        // every consumer accepts `RegisterValue` directly, this branch
+        // collapses with the rest of the migration in step 2.8.
+        if let Some(gc_ref) = value.as_string_ref() {
+            let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+            let js = crate::js_string::JsString::from_utf16_vec(cow.into_owned());
+            return self.alloc_js_string(js);
         }
         let s = self.js_to_string(value)?;
         let handle = self.alloc_string(s.into_string())?;
@@ -330,6 +341,28 @@ impl RuntimeState {
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             return Ok(handle);
         }
+        // Strategy B: GC-managed string ref. Materialise a legacy
+        // primitive string handle via WTF-16 round-trip (lossless), then
+        // box it into a `String` wrapper so the standard prototype-chain
+        // property lookup path applies. Once allocators all switch to
+        // TAG_PTR_STRING and the dispatch table understands TAG_PTR_STRING
+        // natively, this branch can route directly to String.prototype.
+        if let Some(gc_ref) = value.as_string_ref() {
+            let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+            let js = crate::js_string::JsString::from_utf16_vec(cow.into_owned());
+            let primitive = self.alloc_js_string(js)?;
+            let wrapper = box_string_object(primitive, self).map_err(|error| match error {
+                VmNativeCallError::Thrown(_) => {
+                    InterpreterError::TypeError("string boxing threw".into())
+                }
+                VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),
+            })?;
+            return Ok(ObjectHandle(
+                wrapper
+                    .as_object_handle()
+                    .expect("boxed string should return object handle"),
+            ));
+        }
         if let Some(boolean) = value.as_bool() {
             let object =
                 box_boolean_object(RegisterValue::from_bool(boolean), self).map_err(|error| {
@@ -568,6 +601,13 @@ impl RuntimeState {
                 .unwrap_or_else(|| "0".to_string());
             return Ok(text.into_boxed_str());
         }
+        // Strategy B: GC-managed string ref. Uses the new `js_string_gc`
+        // reader API which handles Latin-1 / UTF-16 / lone surrogates.
+        // Cons / Sliced / Thin variants would need flatten before this
+        // call, but the migration only allocates flat reprs so far.
+        if let Some(gc_ref) = value.as_string_ref() {
+            return Ok(crate::js_string_gc::to_rust_string(gc_ref).into_boxed_str());
+        }
         if let Some(number) = value.as_number() {
             return Ok(crate::abstract_ops::ecma_number_to_string(number).into_boxed_str());
         }
@@ -618,6 +658,12 @@ impl RuntimeState {
             return Err(InterpreterError::TypeError(
                 "Cannot convert a BigInt value to a number".into(),
             ));
+        }
+        // Strategy B: GC-managed string ref. §7.1.4 step 1.f: ToNumber on
+        // a string parses it via StringToNumber (`parse_string_to_number`).
+        if let Some(gc_ref) = value.as_string_ref() {
+            let s = crate::js_string_gc::to_rust_string(gc_ref);
+            return Ok(parse_string_to_number(&s));
         }
         if let Some(number) = value.as_number() {
             return Ok(number);
@@ -1080,6 +1126,11 @@ impl RuntimeState {
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-eval-x>
     pub fn value_as_string(&self, value: RegisterValue) -> Option<String> {
+        // Strategy B path: native GC-managed string ref.
+        if let Some(gc_ref) = value.as_string_ref() {
+            return Some(crate::js_string_gc::to_rust_string(gc_ref));
+        }
+        // Legacy path: HeapValue::String behind an ObjectHandle.
         let handle = value.as_object_handle().map(ObjectHandle)?;
         // C2: Cons / Sliced / Thin require walking. `js_string_to_rust_string`
         // does that via `&self` (no mutation).
@@ -1089,6 +1140,10 @@ impl RuntimeState {
 
     /// Checks whether a value is a string type (heap string or string wrapper).
     fn value_is_string(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
+        // Strategy B path.
+        if value.is_string_ref() {
+            return Ok(true);
+        }
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
             return Ok(false);
         };
@@ -1106,6 +1161,10 @@ impl RuntimeState {
     /// Checks for ECMAScript Type(String). String wrappers are Object values
     /// and must not match this in loose equality dispatch.
     fn value_is_primitive_string(&self, value: RegisterValue) -> Result<bool, InterpreterError> {
+        // Strategy B: TAG_PTR_STRING is always a primitive string.
+        if value.is_string_ref() {
+            return Ok(true);
+        }
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
             return Ok(false);
         };

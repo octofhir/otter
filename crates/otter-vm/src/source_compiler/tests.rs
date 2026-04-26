@@ -11631,18 +11631,15 @@ fn c13_from_char_code_preserves_lone_surrogate_units() {
     let result = Interpreter::new()
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
         .expect("execute");
-    let handle = result
-        .return_value()
-        .as_object_handle()
-        .map(crate::object::ObjectHandle)
-        .expect("fromCharCode must return an object handle");
-    let js = runtime
-        .objects()
-        .string_value(handle)
-        .expect("string_value ok")
-        .expect("fromCharCode returns JsString")
-        .clone();
-    assert_eq!(js.as_utf16(), &[0xD800, 0x41, 0xDC00]);
+    // Strategy B: fromCharCode now returns TAG_PTR_STRING (a GC-managed
+    // string ref). Read WTF-16 directly via the new path — no legacy
+    // ObjectHandle / `string_value` lookup required.
+    let return_value = result.return_value();
+    let gc_ref = return_value
+        .as_string_ref()
+        .expect("fromCharCode must return a GC-managed string");
+    let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+    assert_eq!(cow.as_ref(), &[0xD800, 0x41, 0xDC00]);
 }
 
 // ─── C-args: ES2024 §10.4.4 unmapped Arguments exotic object ────────────────
@@ -11754,10 +11751,17 @@ fn c9_main_returning_utf16(source: &str, args: &[i32]) -> Vec<u16> {
     let result = runtime
         .call_callable(handle, RegisterValue::undefined(), arg_regs.as_mut_slice())
         .expect("call_callable");
+    // Strategy B path: TAG_PTR_STRING returns the WTF-16 units directly
+    // via the new reader API. Legacy path: flatten via ObjectHeap and
+    // borrow the WTF-16 backing slice.
+    if let Some(gc_ref) = result.as_string_ref() {
+        let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+        return cow.into_owned();
+    }
     let str_handle = crate::object::ObjectHandle(
         result
             .as_object_handle()
-            .expect("main must return a JsString handle"),
+            .expect("main must return a JsString handle or TAG_PTR_STRING"),
     );
     // C2: lazy slice / concat may produce Sliced / Cons handles. Flatten
     // before reading the UTF-16 units.

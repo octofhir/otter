@@ -207,6 +207,11 @@ fn string_value_of(
     _args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
+    // Strategy B: TAG_PTR_STRING is already a string primitive. Same
+    // §22.1.3.30 ToString-on-string semantics — return as-is.
+    if this.is_string_ref() {
+        return Ok(*this);
+    }
     if let Some(handle) = this.as_object_handle().map(ObjectHandle) {
         if matches!(runtime.objects().kind(handle), Ok(HeapValueKind::String)) {
             return Ok(*this);
@@ -304,7 +309,7 @@ fn coerce_to_string(
     Ok(String::new().into_boxed_str())
 }
 
-fn map_interpreter_error(
+pub(crate) fn map_interpreter_error(
     error: crate::interpreter::InterpreterError,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> VmNativeCallError {
@@ -387,7 +392,7 @@ fn string_data(
     Ok(value.as_object_handle().map(ObjectHandle))
 }
 
-pub(super) fn box_string_object(
+pub(crate) fn box_string_object(
     primitive: ObjectHandle,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
@@ -440,6 +445,15 @@ fn arg_js_string_value(
     value: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<crate::js_string::JsString, VmNativeCallError> {
+    // Strategy B: TAG_PTR_STRING. Read WTF-16 directly via the new
+    // path so lone surrogates survive (the legacy `js_to_string` path
+    // would round-trip through UTF-8 and lose them).
+    if let Some(gc_ref) = value.as_string_ref() {
+        let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+        let mut js = crate::js_string::JsString::from_utf16_vec(cow.into_owned());
+        js.ensure_two_byte();
+        return Ok(js);
+    }
     if let Some(handle) = value.as_object_handle().map(crate::object::ObjectHandle)
         && runtime.objects().string_value(handle).ok().flatten().is_some()
     {
@@ -1569,6 +1583,14 @@ fn this_js_string_value(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<crate::js_string::JsString, VmNativeCallError> {
     require_object_coercible(this, runtime, "<method>")?;
+    // Strategy B: TAG_PTR_STRING reads WTF-16 directly, preserving lone
+    // surrogates that the legacy UTF-8 round-trip would lose.
+    if let Some(gc_ref) = this.as_string_ref() {
+        let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+        let mut js = crate::js_string::JsString::from_utf16_vec(cow.into_owned());
+        js.ensure_two_byte();
+        return Ok(js);
+    }
     // C2: flatten before clone so the returned `JsString` is always Seq*.
     // Cons / Sliced / Thin shapes leak from the lazy `+` and `slice`
     // constructors; the legacy callers (`as_utf16`, etc.) expect flat data.
@@ -1804,11 +1826,13 @@ fn string_from_char_code(
     }
     // C13: preserve WTF-16 so `String.fromCharCode(0xD800)` actually
     // returns a string containing the lone high surrogate rather than
-    // U+FFFD. Going through `String::from_utf16_lossy` → `alloc_string`
-    // would round-trip lone surrogates through UTF-8 and silently
-    // replace each one with the Unicode replacement character.
-    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16_vec(buf))?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    // U+FFFD. Strategy B: allocate via the GC-managed string path so
+    // the result is a `TAG_PTR_STRING` value, removing the legacy
+    // wrapper-object indirection.
+    let value = runtime
+        .alloc_string_gc_value_from_utf16(&buf)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// `String.fromCodePoint(...codePoints)` — §22.1.2.2
@@ -1840,8 +1864,11 @@ fn string_from_code_point(
             return Err(range_error(runtime, &format!("Invalid code point {cp}")));
         }
     }
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    // Strategy B: return a GC-managed `TAG_PTR_STRING` value.
+    let value = runtime
+        .alloc_string_gc_value(&result)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// `String.raw(template, ...substitutions)` — §22.1.2.4

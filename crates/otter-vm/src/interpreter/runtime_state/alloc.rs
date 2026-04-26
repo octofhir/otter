@@ -230,6 +230,61 @@ impl RuntimeState {
         Ok(handle)
     }
 
+    /// Strategy B: allocates a GC-managed string and returns a
+    /// [`RegisterValue`] tagged with [`crate::value::TAG_PTR_STRING`].
+    ///
+    /// The allocation goes through the page-based
+    /// [`otter_gc::heap::GcHeap`] (not the legacy `TypedHeap` slot
+    /// table) and the resulting `GcRef<JsStringGc>` is packed into the
+    /// returned `RegisterValue`'s NaN-box payload.
+    ///
+    /// # Rooting contract
+    ///
+    /// While Phase 4–5 GC features (incremental marking, scavenger)
+    /// are not yet enabled, the only GC trigger is the explicit
+    /// `gc_safepoint` at back-edge polling. Callers may safely return
+    /// the resulting `RegisterValue` to the bytecode interpreter,
+    /// which immediately stores it into a register or pushes it onto
+    /// the operand stack — both of which are GC roots once they
+    /// receive the value. The window between this call returning and
+    /// the caller writing the value into a root is not a safepoint,
+    /// so the `GcRef` cannot be reclaimed in that window.
+    ///
+    /// Once Phase 4 lands, a permanent rootset on `RuntimeState` will
+    /// hold every freshly allocated `GcRef<JsStringGc>` until the
+    /// next clean safepoint, removing this transient rooting concern.
+    pub fn alloc_string_gc_value(
+        &mut self,
+        value: &str,
+    ) -> Result<RegisterValue, InterpreterError> {
+        use otter_gc::local::HandleScope;
+
+        let gc_heap = self.objects.gc_heap_mut();
+        let mut scope = HandleScope::new(gc_heap);
+        let local = crate::js_string_gc::from_str(&mut scope, value)
+            .map_err(|_| InterpreterError::OutOfMemory)?;
+        let gc_ref = local.as_ref();
+        // The scope drops here. The pointer remains valid until the
+        // next GC safepoint (see rooting contract above).
+        Ok(RegisterValue::from_string_ref(gc_ref))
+    }
+
+    /// Strategy B: allocates a GC-managed string from raw WTF-16 code
+    /// units and returns a tagged [`RegisterValue`]. Same rooting
+    /// contract as [`alloc_string_gc_value`].
+    pub fn alloc_string_gc_value_from_utf16(
+        &mut self,
+        units: &[u16],
+    ) -> Result<RegisterValue, InterpreterError> {
+        use otter_gc::local::HandleScope;
+
+        let gc_heap = self.objects.gc_heap_mut();
+        let mut scope = HandleScope::new(gc_heap);
+        let local = crate::js_string_gc::from_utf16_vec(&mut scope, units.to_vec())
+            .map_err(|_| InterpreterError::OutOfMemory)?;
+        Ok(RegisterValue::from_string_ref(local.as_ref()))
+    }
+
     /// Allocates one BigInt heap value from a [`BigIntPayload`].
     /// (No prototype — BigInt is a primitive type.)
     ///
@@ -711,5 +766,131 @@ impl RuntimeState {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod gc_string_bridge_tests {
+    use crate::interpreter::RuntimeState;
+
+    #[test]
+    fn alloc_string_gc_value_returns_tagged_string_ref() {
+        let mut state = RuntimeState::new();
+        let value = state.alloc_string_gc_value("hello").expect("alloc");
+
+        assert!(value.is_string_ref());
+        assert!(!value.is_undefined());
+
+        let r = value.as_string_ref().expect("string ref");
+        assert_eq!(r.payload().len(), 5);
+        // Verify content via the new `js_string_gc` reader.
+        assert_eq!(crate::js_string_gc::to_rust_string(r), "hello");
+    }
+
+    #[test]
+    fn alloc_string_gc_value_is_truthy_unless_empty() {
+        let mut state = RuntimeState::new();
+        let empty = state.alloc_string_gc_value("").expect("empty");
+        let non_empty = state.alloc_string_gc_value("x").expect("non-empty");
+
+        assert!(!empty.is_truthy());
+        assert!(non_empty.is_truthy());
+    }
+
+    #[test]
+    fn alloc_string_gc_value_from_utf16_handles_surrogate_pair() {
+        let mut state = RuntimeState::new();
+        // U+1F600 "😀" = D83D DE00 surrogate pair.
+        let value = state
+            .alloc_string_gc_value_from_utf16(&[0xD83D, 0xDE00])
+            .expect("alloc");
+        let r = value.as_string_ref().expect("string ref");
+        assert_eq!(r.payload().len(), 2);
+        assert_eq!(crate::js_string_gc::code_unit_at(r, 0), Some(0xD83D));
+        assert_eq!(crate::js_string_gc::code_unit_at(r, 1), Some(0xDE00));
+        assert_eq!(crate::js_string_gc::code_point_at(r, 0), Some((0x1F600, 2)));
+    }
+
+    #[test]
+    fn alloc_string_gc_value_round_trips_via_register_value() {
+        let mut state = RuntimeState::new();
+        // Allocate two strings — they must occupy distinct heap addresses
+        // and round-trip independently through RegisterValue tagging.
+        let v1 = state.alloc_string_gc_value("alpha").expect("a");
+        let v2 = state.alloc_string_gc_value("alpha").expect("b");
+        assert!(v1.is_string_ref() && v2.is_string_ref());
+        // Different allocations → different pointer payloads → different bits.
+        assert_ne!(v1.raw_bits(), v2.raw_bits());
+        // But the content compares equal via js_string_gc::equals.
+        let r1 = v1.as_string_ref().unwrap();
+        let r2 = v2.as_string_ref().unwrap();
+        assert!(crate::js_string_gc::equals(r1, r2));
+    }
+
+    #[test]
+    fn js_to_string_handles_tag_ptr_string() {
+        // §7.1.17 ToString on a `TAG_PTR_STRING` value must read the
+        // payload directly via the Strategy B reader — not fall through
+        // to `[object Object]`.
+        let mut state = RuntimeState::new();
+        let value = state.alloc_string_gc_value("alpha").expect("alloc");
+        let coerced = state.js_to_string(value).expect("coerce");
+        assert_eq!(&*coerced, "alpha");
+    }
+
+    #[test]
+    fn js_to_number_handles_tag_ptr_string() {
+        // §7.1.4 ToNumber on a `TAG_PTR_STRING` value parses the string
+        // via StringToNumber.
+        let mut state = RuntimeState::new();
+        let numeric = state.alloc_string_gc_value("42").expect("a");
+        let result = state.js_to_number(numeric).expect("coerce");
+        assert_eq!(result, 42.0);
+
+        let leading_zero = state.alloc_string_gc_value("0007").expect("b");
+        let result = state.js_to_number(leading_zero).expect("coerce");
+        assert_eq!(result, 7.0);
+
+        let nan_str = state.alloc_string_gc_value("not-a-number").expect("c");
+        let result = state.js_to_number(nan_str).expect("coerce");
+        assert!(result.is_nan());
+
+        let empty = state.alloc_string_gc_value("").expect("d");
+        let result = state.js_to_number(empty).expect("coerce");
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn value_as_string_handles_tag_ptr_string() {
+        // §19.2.1 — `eval` and `Function.prototype.bind` use this path
+        // to peek a string primitive without coercing.
+        let mut state = RuntimeState::new();
+        let value = state.alloc_string_gc_value("source-text").expect("alloc");
+        let extracted = state.value_as_string(value).expect("string value");
+        assert_eq!(extracted, "source-text");
+
+        // Non-string values must still return `None`.
+        let number = crate::value::RegisterValue::from_i32(42);
+        assert!(state.value_as_string(number).is_none());
+    }
+
+    #[test]
+    fn coerce_to_string_handle_bridges_to_legacy_handle() {
+        // The lazy `+` path in `js_add` and `String.prototype.concat`
+        // both call `coerce_to_string_handle`. When given a Strategy B
+        // `TAG_PTR_STRING`, the helper materialises a legacy
+        // `HeapValue::String` so existing concat / IC / proto chain code
+        // keeps working until step 2.8 retires the legacy path.
+        let mut state = RuntimeState::new();
+        let value = state.alloc_string_gc_value("hello").expect("alloc");
+        let legacy_handle =
+            state.coerce_to_string_handle(value).expect("legacy bridge");
+
+        // Reading the legacy handle should yield the same content.
+        let legacy_str = state
+            .objects()
+            .js_string_to_rust_string(legacy_handle)
+            .expect("legacy read");
+        assert_eq!(legacy_str, "hello");
     }
 }

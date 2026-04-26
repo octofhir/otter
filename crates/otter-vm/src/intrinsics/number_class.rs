@@ -9,6 +9,7 @@ use crate::value::RegisterValue;
 use super::{
     IntrinsicsError, VmIntrinsics,
     install::{IntrinsicInstallContext, IntrinsicInstaller, install_class_plan},
+    string_class::map_interpreter_error,
 };
 
 pub(super) static NUMBER_INTRINSIC: NumberIntrinsic = NumberIntrinsic;
@@ -126,8 +127,10 @@ fn number_to_fixed(
         )?);
     }
     if number.is_nan() {
-        let handle = runtime.alloc_string("NaN")?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_gc_value("NaN")
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     if number.is_infinite() {
         let s = if number > 0.0 {
@@ -135,12 +138,16 @@ fn number_to_fixed(
         } else {
             "-Infinity"
         };
-        let handle = runtime.alloc_string(s)?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_gc_value(s)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     let text = format!("{number:.prec$}", prec = digits as usize);
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_gc_value(&text)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// ES2024 §21.1.3.5 Number.prototype.toPrecision(precision)
@@ -156,8 +163,10 @@ fn number_to_precision(
         .unwrap_or_else(RegisterValue::undefined);
     if precision == RegisterValue::undefined() {
         let text = number_to_decimal_string(number);
-        let handle = runtime.alloc_string(text)?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_gc_value(&text)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     let p = precision
         .as_i32()
@@ -171,8 +180,10 @@ fn number_to_precision(
     }
     if number.is_nan() || number.is_infinite() {
         let text = number_to_decimal_string(number);
-        let handle = runtime.alloc_string(text)?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_gc_value(&text)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     let text = format!("{number:.prec$e}", prec = (p as usize).saturating_sub(1));
     // Rust uses `e1` for positive exponents; ES requires `e+1`.
@@ -197,8 +208,10 @@ fn number_to_precision(
                 (p as usize).saturating_sub(1 + (number.abs().log10().floor().max(0.0) as usize))
         )
     };
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_gc_value(&text)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// ES2024 §21.1.3.2 Number.prototype.toExponential(fractionDigits)
@@ -210,8 +223,10 @@ fn number_to_exponential(
     let number = this_number_value(*this, runtime)?;
     if number.is_nan() || number.is_infinite() {
         let text = number_to_decimal_string(number);
-        let handle = runtime.alloc_string(text)?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_gc_value(&text)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     let frac = args.first().copied().and_then(|v| {
         if v == RegisterValue::undefined() {
@@ -243,8 +258,10 @@ fn number_to_exponential(
     } else {
         text
     };
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_gc_value(&text)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn number_constructor(
@@ -306,8 +323,10 @@ fn number_to_locale_string(
     let number = this_number_value(*this, runtime)?;
 
     if number.is_nan() {
-        let handle = runtime.alloc_string("NaN")?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_gc_value("NaN")
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     if number.is_infinite() {
         let s = if number.is_sign_negative() {
@@ -315,8 +334,10 @@ fn number_to_locale_string(
         } else {
             "Infinity"
         };
-        let handle = runtime.alloc_string(s)?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_gc_value(s)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
 
     // Use ICU4X DecimalFormatter for locale-aware number formatting.
@@ -330,8 +351,10 @@ fn number_to_locale_string(
         ryu::Buffer::new().format(number).to_string()
     };
 
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_gc_value(&result)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn number_to_string(
@@ -372,8 +395,10 @@ fn number_to_string(
         number_to_radix_string(number, radix_mv)
     };
 
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_gc_value(&text)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// ES2024 §21.1.3.6 step 1 — thisNumberValue(value).

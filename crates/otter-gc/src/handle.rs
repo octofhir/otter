@@ -229,6 +229,7 @@ unsafe impl Send for GlobalHandleTable {}
 /// ```
 ///
 /// In practice, the `GcHeap` wraps this pattern in ergonomic scope methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandleScopeLevel(u32);
 
 impl HandleScopeLevel {

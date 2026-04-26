@@ -16,16 +16,21 @@
 //!   on every pointer store.
 //! - **Handle-based rooting**: `HandleScope`/`Local<T>` like V8, RAII-based.
 
+pub mod backend;
 pub mod barrier;
+pub mod gc_ref;
 pub mod handle;
 pub mod header;
 pub mod heap;
+pub mod local;
 pub mod marking;
 pub mod page;
 pub mod scavenger;
 pub mod space;
 pub mod trace;
 pub mod typed;
+pub mod types;
+pub mod value_bridge;
 
 /// Minimum object alignment (8 bytes, matching NaN-boxed value size).
 pub const OBJECT_ALIGNMENT: usize = 8;

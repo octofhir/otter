@@ -327,8 +327,10 @@ fn bigint_to_string(
         }
     };
 
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_gc_value(&text)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §21.2.3.1 BigInt.prototype.toLocaleString([locales [, options]])
@@ -354,8 +356,10 @@ fn bigint_to_locale_string(
         value_str
     };
 
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_gc_value(&result)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §21.2.3.3 BigInt.prototype.valueOf()

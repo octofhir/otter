@@ -290,6 +290,123 @@ impl GcHeap {
     }
 
     // -----------------------------------------------------------------------
+    // Typed allocation — V8-style one-call alloc + header write + payload move
+    // -----------------------------------------------------------------------
+
+    /// Allocates a fresh young-gen object of type `T`, writes the GC
+    /// header with `type_tag`, moves `value` into the payload area, and
+    /// returns a typed [`crate::gc_ref::GcRef<T>`] pointing at it.
+    ///
+    /// This is the V8-style single-call entrypoint for typed allocation.
+    /// Callers do not touch raw pointers.
+    ///
+    /// Returns `None` if the allocation would cross the configured
+    /// `max_heap_bytes` cap even after an emergency GC. The shared OOM
+    /// flag is raised before returning.
+    ///
+    /// # Layout requirements
+    ///
+    /// * `align_of::<T>() <= 8` — payload is placed immediately after
+    ///   the 8-byte header. Stricter-aligned types are not supported
+    ///   yet because we never need them in the migrated VM types.
+    /// * `size_of::<T>()` must be `> 0`.
+    ///
+    /// # Type tag
+    ///
+    /// `type_tag` must match the tag the caller has registered with
+    /// [`GcHeap::register_trace_fn`] for `T`. Marking and scavenging
+    /// use the tag to dispatch the correct trace function.
+    pub fn alloc_typed<T>(
+        &mut self,
+        type_tag: u8,
+        value: T,
+    ) -> Option<crate::gc_ref::GcRef<T>> {
+        const {
+            assert!(
+                std::mem::align_of::<T>() <= 8,
+                "GcHeap::alloc_typed requires align_of::<T>() <= 8 (matching GcHeader's 8-byte alignment)",
+            );
+            assert!(
+                std::mem::size_of::<T>() > 0,
+                "GcHeap::alloc_typed requires a non-zero-sized payload",
+            );
+        }
+
+        let total = HEADER_SIZE + std::mem::size_of::<T>();
+        let raw = self.alloc_young(total)?;
+
+        // SAFETY: `alloc_young` returned a NonNull pointer to a region
+        // of at least `total` bytes (after CELL_SIZE alignment). We
+        // write the header at the start, then move `value` into the
+        // payload area immediately after. Both writes use `ptr::write`
+        // which does not drop the existing (uninitialised) contents.
+        unsafe {
+            let header_ptr = raw.as_ptr() as *mut GcHeader;
+            header_ptr.write(GcHeader::new_young(type_tag, total as u32));
+
+            let payload_ptr = raw.as_ptr().add(HEADER_SIZE) as *mut T;
+            payload_ptr.write(value);
+
+            Some(crate::gc_ref::GcRef::<T>::from_raw_unchecked(
+                NonNull::new_unchecked(header_ptr),
+            ))
+        }
+    }
+
+    /// Variable-payload-size variant of [`alloc_typed`].
+    ///
+    /// Reserves `HEADER_SIZE + payload_bytes` bytes in young space,
+    /// writes the header, and invokes `init` with a raw pointer to the
+    /// payload area so the caller can fill in inline trailing data
+    /// (e.g. UTF-16 code units, Vec<u64> bigint limbs spilled into the
+    /// page). Returns a typed `GcRef<T>` whose payload is `T` followed
+    /// by `payload_bytes - size_of::<T>()` bytes of trailing storage.
+    ///
+    /// # Safety
+    ///
+    /// `init` must fully initialise the payload area. After `init`
+    /// returns, the entire `[GcHeader | T | trailing_bytes]` region must
+    /// be valid for the registered trace function to read.
+    ///
+    /// # Constraints
+    ///
+    /// * `payload_bytes >= size_of::<T>()`
+    /// * `align_of::<T>() <= 8`
+    pub unsafe fn alloc_typed_var<T, F>(
+        &mut self,
+        type_tag: u8,
+        payload_bytes: usize,
+        init: F,
+    ) -> Option<crate::gc_ref::GcRef<T>>
+    where
+        F: FnOnce(*mut u8),
+    {
+        debug_assert!(
+            payload_bytes >= std::mem::size_of::<T>(),
+            "payload_bytes must accommodate the head T",
+        );
+        debug_assert!(
+            std::mem::align_of::<T>() <= 8,
+            "alloc_typed_var requires align_of::<T>() <= 8",
+        );
+
+        let total = HEADER_SIZE + payload_bytes;
+        let raw = self.alloc_young(total)?;
+
+        unsafe {
+            let header_ptr = raw.as_ptr() as *mut GcHeader;
+            header_ptr.write(GcHeader::new_young(type_tag, total as u32));
+
+            let payload_ptr = raw.as_ptr().add(HEADER_SIZE);
+            init(payload_ptr);
+
+            Some(crate::gc_ref::GcRef::<T>::from_raw_unchecked(
+                NonNull::new_unchecked(header_ptr),
+            ))
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Handle stack (rooting)
     // -----------------------------------------------------------------------
 
@@ -720,5 +837,96 @@ mod tests {
     fn with_max_heap_bytes_constructor() {
         let heap = GcHeap::with_max_heap_bytes(64 * 1024);
         assert_eq!(heap.max_heap_bytes(), Some(64 * 1024));
+    }
+
+    // -----------------------------------------------------------------------
+    // alloc_typed / alloc_typed_var (Strategy B Phase 2 entrypoints)
+    // -----------------------------------------------------------------------
+
+    /// Standalone payload for `alloc_typed` tests. Not the same as the
+    /// `Leaf` above which embeds a `GcHeader`: these typed-alloc helpers
+    /// add the header automatically.
+    #[repr(C)]
+    struct StringPayload {
+        len: u32,
+        flags: u32,
+    }
+
+    const TAG_TEST_STRING: u8 = 30;
+
+    #[test]
+    fn alloc_typed_writes_header_and_returns_gc_ref() {
+        let mut heap = setup_heap();
+        let r = heap
+            .alloc_typed(TAG_TEST_STRING, StringPayload { len: 7, flags: 0xAA })
+            .expect("typed alloc fits");
+
+        // Header is correctly populated by the alloc routine.
+        let h = r.header();
+        assert_eq!(h.type_tag(), TAG_TEST_STRING);
+        assert!(h.is_young());
+        let expected_size = HEADER_SIZE + std::mem::size_of::<StringPayload>();
+        // Size in header may be aligned up to CELL_SIZE — just assert
+        // it covers the whole block.
+        assert!(h.size_bytes() as usize >= expected_size);
+
+        // Payload is exactly what we passed in.
+        let p = r.payload();
+        assert_eq!(p.len, 7);
+        assert_eq!(p.flags, 0xAA);
+    }
+
+    #[test]
+    fn alloc_typed_returns_distinct_pointers() {
+        let mut heap = setup_heap();
+        let a = heap
+            .alloc_typed(TAG_TEST_STRING, StringPayload { len: 0, flags: 0 })
+            .expect("a");
+        let b = heap
+            .alloc_typed(TAG_TEST_STRING, StringPayload { len: 0, flags: 0 })
+            .expect("b");
+        assert!(!a.ptr_eq(&b));
+    }
+
+    #[test]
+    fn alloc_typed_var_initialises_trailing_bytes() {
+        let mut heap = setup_heap();
+        let trailing = 24usize;
+        let total = std::mem::size_of::<StringPayload>() + trailing;
+
+        let r = unsafe {
+            heap.alloc_typed_var::<StringPayload, _>(TAG_TEST_STRING, total, |raw| {
+                let head = raw as *mut StringPayload;
+                head.write(StringPayload { len: 12, flags: 0xBB });
+                let tail = raw.add(std::mem::size_of::<StringPayload>());
+                // Fill trailing bytes with a known marker.
+                std::ptr::write_bytes(tail, 0xAB, trailing);
+            })
+            .expect("var typed alloc")
+        };
+
+        assert_eq!(r.payload().len, 12);
+        assert_eq!(r.payload().flags, 0xBB);
+
+        // Verify trailing bytes via the raw payload pointer.
+        unsafe {
+            let tail = (r.payload_ptr() as *mut u8).add(std::mem::size_of::<StringPayload>());
+            for i in 0..trailing {
+                assert_eq!(*tail.add(i), 0xAB);
+            }
+        }
+    }
+
+    #[test]
+    fn alloc_typed_respects_heap_cap_and_signals_oom() {
+        // HEADER_SIZE(8) + size_of::<StringPayload>(8) = 16 byte alloc.
+        // Cap = 8 is strictly smaller, so even after emergency GC the
+        // allocation cannot fit and the OOM flag must be raised.
+        let cap = 8;
+        let mut heap = GcHeap::with_max_heap_bytes(cap);
+
+        let res = heap.alloc_typed(TAG_TEST_STRING, StringPayload { len: 0, flags: 0 });
+        assert!(res.is_none());
+        assert!(heap.oom_flag().load(std::sync::atomic::Ordering::Relaxed));
     }
 }

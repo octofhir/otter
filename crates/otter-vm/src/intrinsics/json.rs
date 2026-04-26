@@ -464,8 +464,19 @@ fn json_stringify(
     )?;
 
     if success {
-        let handle = runtime.alloc_string(out)?;
-        Ok(RegisterValue::from_object_handle(handle.0))
+        // Strategy B: return as TAG_PTR_STRING so consumers can work
+        // with the GC-managed path. The legacy `alloc_string` would
+        // also work — strict equality and coercion both bridge — but
+        // skipping the wrapper-object allocation removes one
+        // indirection on the public JSON.stringify result.
+        let value = runtime
+            .alloc_string_gc_value(&out)
+            .map_err(|e| {
+                VmNativeCallError::Internal(
+                    format!("JSON.stringify result alloc failed: {e:?}").into(),
+                )
+            })?;
+        Ok(value)
     } else {
         Ok(RegisterValue::undefined())
     }

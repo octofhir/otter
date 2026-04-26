@@ -69,8 +69,11 @@ pub mod interpreter;
 pub mod intrinsics;
 /// JIT-facing ABI surface.
 pub mod jit_abi;
-/// §6.1.4 — WTF-16 JavaScript string type.
+/// §6.1.4 — WTF-16 JavaScript string type (legacy, by-value).
 pub mod js_string;
+/// §6.1.4 — GC-managed string API (Strategy B Phase 2 step 4).
+/// Operates on `GcRef<JsStringGc>` / `Local<'gc, JsStringGc>`.
+pub mod js_string_gc;
 /// VM-internal microtask queue (promise jobs, nextTick, queueMicrotask).
 pub mod microtask;
 /// Executable module and function containers.

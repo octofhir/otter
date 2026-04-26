@@ -42,6 +42,15 @@ pub const TAG_PTR_OBJECT: u64 = 0x7FFC_0000_0000_0000;
 /// NaN-box pointer tag for heap-allocated BigInt values (§21.2).
 /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
 pub const TAG_PTR_BIGINT: u64 = 0x7FFD_0000_0000_0000;
+/// NaN-box pointer tag for GC-managed strings (Strategy B).
+///
+/// Payload is a 48-bit raw pointer (`GcRef<JsStringGc>`), packed via
+/// [`otter_gc::value_bridge::gc_ref_to_payload`]. `as_string_ref`
+/// recovers the typed reference. The migration runs in parallel with
+/// the legacy [`crate::object::HeapValue::String`] path stored under
+/// `TAG_PTR_OBJECT`; once every callsite is migrated (Phase 2 step 7)
+/// the legacy path is retired.
+pub const TAG_PTR_STRING: u64 = 0x7FFE_0000_0000_0000;
 
 /// Shared register value cell for the new VM.
 ///
@@ -70,6 +79,9 @@ impl RegisterValue {
             return Some(Self(bits));
         }
         if (bits & OBJECT_TAG_MASK) == TAG_PTR_BIGINT {
+            return Some(Self(bits));
+        }
+        if (bits & OBJECT_TAG_MASK) == TAG_PTR_STRING {
             return Some(Self(bits));
         }
 
@@ -168,6 +180,42 @@ impl RegisterValue {
     #[must_use]
     pub const fn from_bigint_handle(handle: u32) -> Self {
         Self(TAG_PTR_BIGINT | handle as u64)
+    }
+
+    /// Encodes a GC-managed string reference (Strategy B).
+    ///
+    /// Packs the 48-bit pointer of `r` into the NaN-box payload under
+    /// [`TAG_PTR_STRING`]. The caller must keep `r` rooted across any
+    /// allocation safepoint that may run between this call and the
+    /// next [`as_string_ref`] read — the same rooting discipline as
+    /// for any other [`otter_gc::gc_ref::GcRef`].
+    #[must_use]
+    pub fn from_string_ref(
+        r: otter_gc::gc_ref::GcRef<otter_gc::types::string::JsStringGc>,
+    ) -> Self {
+        Self(TAG_PTR_STRING | otter_gc::value_bridge::gc_ref_to_payload(r))
+    }
+
+    /// Decodes the value as a GC-managed string reference.
+    ///
+    /// Returns `None` for any value not tagged [`TAG_PTR_STRING`]. The
+    /// returned reference shares the same rooting contract as the one
+    /// originally encoded via [`from_string_ref`].
+    #[must_use]
+    pub fn as_string_ref(
+        self,
+    ) -> Option<otter_gc::gc_ref::GcRef<otter_gc::types::string::JsStringGc>> {
+        if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_STRING {
+            otter_gc::value_bridge::payload_to_gc_ref(self.0)
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether the value is a GC-managed string reference.
+    #[must_use]
+    pub const fn is_string_ref(self) -> bool {
+        (self.0 & OBJECT_TAG_MASK) == TAG_PTR_STRING
     }
 
     /// Returns the raw NaN-boxed bits.
@@ -275,6 +323,14 @@ impl RegisterValue {
             _ if (self.0 & INT32_TAG_MASK) == TAG_INT32 => self.as_i32().unwrap_or(0) != 0,
             // BigInt: 0n is falsy, all others truthy (§7.1.2 step 7)
             _ if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_BIGINT => true, // caller must check "0" case via heap
+            // String ref: empty string is falsy, all others truthy (§7.1.2 step 6).
+            // We can read the GC payload directly — the rooting contract on
+            // `from_string_ref` guarantees the underlying `JsStringGc` is alive.
+            _ if (self.0 & OBJECT_TAG_MASK) == TAG_PTR_STRING => {
+                self.as_string_ref()
+                    .map(|r| r.payload().length != 0)
+                    .unwrap_or(false)
+            }
             _ if !self.is_nan_boxed() => {
                 let number = f64::from_bits(self.0);
                 !number.is_nan() && number != 0.0
@@ -564,5 +620,68 @@ mod tests {
         let bits = TAG_PTR_BIGINT | 0x1234;
         let value = RegisterValue::from_raw_bits(bits).expect("bigint handle should decode");
         assert_eq!(value.as_bigint_handle(), Some(0x1234));
+    }
+
+    // ── Strategy B: GcRef<JsStringGc> in NaN-box ────────────────────────────
+
+    use otter_gc::heap::{GcConfig, GcHeap};
+    use otter_gc::local::HandleScope;
+
+    fn fresh_heap_for_string_tests() -> GcHeap {
+        let mut heap = GcHeap::new(GcConfig {
+            young_gen_size: 1024 * 1024,
+            old_gen_threshold: 512 * 1024,
+            ..GcConfig::default()
+        });
+        otter_gc::types::register_all(&mut heap);
+        heap
+    }
+
+    #[test]
+    fn string_ref_round_trips_through_value() {
+        let mut heap = fresh_heap_for_string_tests();
+        let mut scope = HandleScope::new(&mut heap);
+        let local =
+            crate::js_string_gc::from_str(&mut scope, "hello").expect("alloc");
+        let r = local.as_ref();
+        let value = RegisterValue::from_string_ref(r);
+
+        assert!(value.is_string_ref());
+        assert_eq!(value.as_string_ref(), Some(r));
+        assert_eq!(value.as_object_handle(), None);
+        assert_eq!(value.as_bigint_handle(), None);
+    }
+
+    #[test]
+    fn empty_string_ref_is_falsy() {
+        let mut heap = fresh_heap_for_string_tests();
+        let mut scope = HandleScope::new(&mut heap);
+        let empty = crate::js_string_gc::empty(&mut scope).expect("empty");
+        let value = RegisterValue::from_string_ref(empty.as_ref());
+        assert!(!value.is_truthy());
+    }
+
+    #[test]
+    fn non_empty_string_ref_is_truthy() {
+        let mut heap = fresh_heap_for_string_tests();
+        let mut scope = HandleScope::new(&mut heap);
+        let non_empty =
+            crate::js_string_gc::from_str(&mut scope, "x").expect("non-empty");
+        let value = RegisterValue::from_string_ref(non_empty.as_ref());
+        assert!(value.is_truthy());
+    }
+
+    #[test]
+    fn string_ref_from_raw_bits_accepted() {
+        let mut heap = fresh_heap_for_string_tests();
+        let mut scope = HandleScope::new(&mut heap);
+        let local =
+            crate::js_string_gc::from_str(&mut scope, "abc").expect("alloc");
+        let r = local.as_ref();
+        let original = RegisterValue::from_string_ref(r);
+        let bits = original.raw_bits();
+        let recovered =
+            RegisterValue::from_raw_bits(bits).expect("string ref should decode");
+        assert_eq!(recovered.as_string_ref(), Some(r));
     }
 }

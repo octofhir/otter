@@ -171,7 +171,57 @@ Proceed to [`09-string-core-slice.md`](./09-string-core-slice.md).
 
 ## Status
 
-- not started
-- last update: —
-- artifacts: TS frontend module, erasure pass, `tests/engine/typescript/`
-  fixtures
+- **done**
+- last update: 2026-04-26
+- artifacts:
+  - **otter-compiler** rewritten with full foundation TS erasure:
+    `is_erased_ts_statement` (interface, type alias, declare-*,
+    `import type`, `export type`, `import-equals`,
+    `declare namespace/module`); `rejected_ts_statement` (enum,
+    runtime namespace, decorators); `unwrap_ts_expr` (`as`,
+    `satisfies`, non-null `!`, type assertion, instantiation, plus
+    parentheses).
+  - New `CompileError::TypeScriptUnsupported { node, span }` variant
+    distinct from generic `Unsupported`. Mapped to
+    `Diagnostic::ts_unsupported` in `otter-runtime` (code
+    `TS_UNSUPPORTED`); generic unsupported maps to new
+    `Diagnostic::unsupported` (code `FEATURE_NOT_IN_SLICE`).
+  - 9 fixtures under `tests/engine/typescript/`: `erases-interface`,
+    `erases-type-alias`, `erases-declare`, `erases-import-type`,
+    `erases-as-expression`, `erases-satisfies`, `erases-non-null`,
+    `rejects-enum`, `rejects-namespace`.
+- verification:
+  - `cargo test --workspace` — 41 unit tests pass (otter-compiler
+    has 13, otter-runtime 17 incl. erasure round-trips and enum
+    rejection, otter-bytecode 3, otter-vm 4, otter-syntax 2,
+    otter-test 2).
+  - `cargo run -p otter-cli -- test --suite engine` — **11/11
+    fixtures pass** (2 smoke + 9 typescript).
+  - `cargo run -p otter-cli -- check
+     tests/engine/typescript/rejects-enum.ts` — exit 1, structured
+    diagnostic emitted.
+  - `cargo run -p otter-cli -- --json check
+     tests/engine/typescript/rejects-enum.ts` — emits
+    `{"error_schema_version":1,"error":{"kind":"compile",
+    "diagnostics":[{"kind":"syntax","code":"TS_UNSUPPORTED",
+    "message":"...","span":[91,122],...}]}}` — span points into the
+    original `.ts` file.
+  - `cargo clippy --workspace --all-targets --all-features
+     -- -D warnings` — green.
+  - `cargo fmt --all -- --check` — clean.
+- design highlights:
+  - Erasure is in-place AST walking, never re-parses.
+  - Source spans on every emitted instruction come from the original
+    `.ts` source, including for diagnostics on rejected TS nodes.
+  - Recursive `unwrap_ts_expr` collapses `(((x as A) satisfies B)!)`
+    in one pass.
+  - The diagnostic codes are stable (`TS_UNSUPPORTED`,
+    `FEATURE_NOT_IN_SLICE`) for fixture metadata that asserts on
+    `expect.throws`.
+- deferred to later slices:
+  - `let x: number = undefined;` (needs slice `12` for variables).
+  - `import type` from a module loader (needs slice with module
+    semantics).
+  - Erasing parameter type annotations / class field types — the
+    erasure functions exist but no AST node carrying these is yet
+    accepted by the compiler; tested only at the helper level.

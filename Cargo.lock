@@ -483,6 +483,7 @@ version = "0.1.0"
 dependencies = [
  "otter-bytecode",
  "otter-syntax",
+ "oxc_allocator",
  "oxc_ast",
  "oxc_span",
  "serde",
@@ -533,6 +534,7 @@ dependencies = [
  "otter-bytecode",
  "serde",
  "smallvec",
+ "thiserror",
 ]
 
 [[package]]

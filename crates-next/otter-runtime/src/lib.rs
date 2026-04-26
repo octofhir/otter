@@ -848,6 +848,19 @@ impl Diagnostic {
             cause: None,
         }
     }
+
+    /// Construct a generic "feature not in this slice" diagnostic.
+    #[must_use]
+    pub fn unsupported(message: impl Into<String>, span: (u32, u32)) -> Self {
+        Self {
+            kind: DiagnosticKind::Syntax,
+            code: "FEATURE_NOT_IN_SLICE".to_string(),
+            message: message.into(),
+            span: Some(span),
+            frames: Vec::new(),
+            cause: None,
+        }
+    }
 }
 
 /// Diagnostic category.
@@ -891,8 +904,14 @@ fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
             diagnostics: vec![Diagnostic::syntax(messages.join("; "))],
         },
         CompileError::Unsupported { node, span } => OtterError::Compile {
-            diagnostics: vec![Diagnostic::ts_unsupported(
+            diagnostics: vec![Diagnostic::unsupported(
                 format!("unsupported AST node: {node}"),
+                span,
+            )],
+        },
+        CompileError::TypeScriptUnsupported { node, span } => OtterError::Compile {
+            diagnostics: vec![Diagnostic::ts_unsupported(
+                format!("typescript {node} is not supported in foundation"),
                 span,
             )],
         },
@@ -908,6 +927,43 @@ fn map_vm_error(err: otter_vm::VmError) -> OtterError {
     let display = err.to_string();
     match err {
         VmError::Interrupted => OtterError::Interrupted,
+        VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => OtterError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+        VmError::TypeMismatch => OtterError::Runtime {
+            diagnostic: Diagnostic {
+                kind: DiagnosticKind::Type,
+                code: "TYPE_MISMATCH".to_string(),
+                message: display,
+                span: None,
+                frames: Vec::new(),
+                cause: None,
+            },
+        },
+        VmError::UnknownIntrinsic { name } => OtterError::Runtime {
+            diagnostic: Diagnostic {
+                kind: DiagnosticKind::Type,
+                code: "UNKNOWN_METHOD".to_string(),
+                message: format!("unknown method `{name}`"),
+                span: None,
+                frames: Vec::new(),
+                cause: None,
+            },
+        },
+        VmError::TemporalDeadZone { local_index } => OtterError::Runtime {
+            diagnostic: Diagnostic {
+                kind: DiagnosticKind::Reference,
+                code: "TDZ".to_string(),
+                message: format!("cannot access local {local_index} before initialization"),
+                span: None,
+                frames: Vec::new(),
+                cause: None,
+            },
+        },
         VmError::MissingReturn | VmError::InvalidOperand => OtterError::Internal {
             code: "VM_BYTECODE_INVARIANT".to_string(),
             message: display,
@@ -938,9 +994,26 @@ mod tests {
     }
 
     #[test]
-    fn otter_rejects_unsupported() {
+    fn otter_rejects_unsupported_js_feature() {
+        // `if` is plain JS that the harness slice does not yet
+        // implement; expect the generic "feature not in slice"
+        // diagnostic, not `TS_UNSUPPORTED`.
         let mut otter = Otter::new();
         let err = otter.run_typescript("if (true) {}").unwrap_err();
+        match err {
+            OtterError::Compile { diagnostics } => {
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics[0].code, "FEATURE_NOT_IN_SLICE");
+            }
+            other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otter_rejects_typescript_enum() {
+        // `enum` is intentionally rejected by ADR-0002 §4.
+        let mut otter = Otter::new();
+        let err = otter.run_typescript("enum E { A }").unwrap_err();
         match err {
             OtterError::Compile { diagnostics } => {
                 assert_eq!(diagnostics.len(), 1);
@@ -948,6 +1021,15 @@ mod tests {
             }
             other => panic!("expected Compile, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn otter_erases_interface() {
+        let mut otter = Otter::new();
+        let result = otter
+            .run_typescript("interface I { x: number; } undefined;")
+            .unwrap();
+        assert_eq!(result.completion_string(), "undefined");
     }
 
     #[test]

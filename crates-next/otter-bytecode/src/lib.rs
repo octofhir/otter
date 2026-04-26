@@ -54,6 +54,88 @@ pub enum Op {
     /// Return from the current function with `r<src>` as the
     /// completion value.
     Return,
+    /// `r<dst> = constants[k<idx>]` (string constant).
+    LoadString,
+    /// `r<dst> = constants[k<idx>]` (number constant).
+    LoadNumber,
+    /// `r<dst> = imm:i32` (small-integer immediate via
+    /// `Operand::ConstIndex` — the constant pool holds the literal).
+    LoadInt32,
+    /// `r<dst> = true`.
+    LoadTrue,
+    /// `r<dst> = false`.
+    LoadFalse,
+    /// `r<dst> = r<src>.length` (string operand). Returns Number.
+    LoadLength,
+    /// `r<dst> = r<recv>[r<idx>]` for string operand. Out-of-range
+    /// yields the empty string.
+    GetStringIndex,
+    /// Variadic method call dispatched through the
+    /// `String.prototype` intrinsic table. Operands:
+    /// `dst, recv, name_const, argc, args...`.
+    CallStringMethod,
+
+    // Polymorphic binary operators. Operands: `dst, lhs, rhs`.
+    // Handle Number+Number and String+String operand pairs;
+    // mixed types raise `TypeMismatch` until later slices add
+    // coercion.
+    /// `r<dst> = r<lhs> + r<rhs>` (Number+Number or String+String).
+    Add,
+    /// `r<dst> = r<lhs> - r<rhs>` (Number+Number).
+    Sub,
+    /// `r<dst> = r<lhs> * r<rhs>` (Number+Number).
+    Mul,
+    /// `r<dst> = r<lhs> / r<rhs>` (Number+Number).
+    Div,
+    /// `r<dst> = r<lhs> % r<rhs>` (Number+Number).
+    Rem,
+    /// `r<dst> = -r<src>` (Number).
+    Neg,
+    /// `r<dst> = ToNumber(r<src>)` (foundation subset).
+    ToNumber,
+    /// `r<dst> = (r<lhs> === r<rhs>)`. Returns Boolean.
+    Equal,
+    /// `r<dst> = (r<lhs> !== r<rhs>)`. Returns Boolean.
+    NotEqual,
+    /// `r<dst> = (r<lhs> < r<rhs>)`. Number+Number or String+String.
+    LessThan,
+    /// `r<dst> = (r<lhs> <= r<rhs>)`.
+    LessEq,
+    /// `r<dst> = (r<lhs> > r<rhs>)`.
+    GreaterThan,
+    /// `r<dst> = (r<lhs> >= r<rhs>)`.
+    GreaterEq,
+
+    /// `r<dst> = null`.
+    LoadNull,
+    /// `r<dst> = !ToBoolean(r<src>)`.
+    LogicalNot,
+    /// `r<dst> = ToBoolean(r<src>)` — explicit coercion used by
+    /// branch operands the compiler cannot statically prove are
+    /// boolean.
+    ToBoolean,
+    /// Unconditional relative branch: `pc += imm32(rel)`.
+    /// Operand: `Imm32(signed_offset)`. Offset is relative to the
+    /// **next** instruction.
+    Jump,
+    /// Branch when `ToBoolean(r<cond>)` is true. Operands:
+    /// `Imm32(signed_offset), Register(cond)`.
+    JumpIfTrue,
+    /// Branch when `ToBoolean(r<cond>)` is false.
+    JumpIfFalse,
+    /// Branch when `r<cond>` is `null` or `undefined`. Used for
+    /// nullish coalescing `??`.
+    JumpIfNullish,
+    /// `r<dst> = locals[idx]`. Operands:
+    /// `Register(dst), Imm32(local_index)`.
+    LoadLocal,
+    /// `locals[idx] = r<src>`. Operands:
+    /// `Register(src), Imm32(local_index)`.
+    StoreLocal,
+    /// Throw a `ReferenceError` for a TDZ-violating local read.
+    /// Operand: `Imm32(local_index)`. Used until full lexical
+    /// environments arrive.
+    TdzError,
 }
 
 impl Op {
@@ -64,17 +146,95 @@ impl Op {
             Op::Nop => "NOP",
             Op::LoadUndefined => "LOAD_UNDEFINED",
             Op::Return => "RETURN",
+            Op::LoadString => "LOAD_STRING",
+            Op::LoadNumber => "LOAD_NUMBER",
+            Op::LoadInt32 => "LOAD_INT32",
+            Op::LoadTrue => "LOAD_TRUE",
+            Op::LoadFalse => "LOAD_FALSE",
+            Op::LoadLength => "LOAD_LENGTH",
+            Op::GetStringIndex => "GET_STRING_INDEX",
+            Op::CallStringMethod => "CALL_STRING_METHOD",
+            Op::Add => "ADD",
+            Op::Sub => "SUB",
+            Op::Mul => "MUL",
+            Op::Div => "DIV",
+            Op::Rem => "REM",
+            Op::Neg => "NEG",
+            Op::ToNumber => "TO_NUMBER",
+            Op::Equal => "EQ",
+            Op::NotEqual => "NEQ",
+            Op::LessThan => "LT",
+            Op::LessEq => "LE",
+            Op::GreaterThan => "GT",
+            Op::GreaterEq => "GE",
+            Op::LoadNull => "LOAD_NULL",
+            Op::LogicalNot => "NOT",
+            Op::ToBoolean => "TO_BOOLEAN",
+            Op::Jump => "JUMP",
+            Op::JumpIfTrue => "JUMP_IF_TRUE",
+            Op::JumpIfFalse => "JUMP_IF_FALSE",
+            Op::JumpIfNullish => "JUMP_IF_NULLISH",
+            Op::LoadLocal => "LOAD_LOCAL",
+            Op::StoreLocal => "STORE_LOCAL",
+            Op::TdzError => "TDZ_ERROR",
         }
     }
 
-    /// Number of u16 operands the opcode reads after the opcode byte.
+    /// Declared operand arity. `CallStringMethod` is variadic; the
+    /// instruction stream stores `dst, recv, name_const, argc`
+    /// followed by `argc` register operands, so the actual operand
+    /// count is `4 + argc`. `operand_count` returns the **prefix**
+    /// length; consumers walk the variadic tail by reading `argc`.
     #[must_use]
     pub const fn operand_count(self) -> usize {
         match self {
             Op::Nop => 0,
-            Op::LoadUndefined => 1, // dst
-            Op::Return => 1,        // src
+            Op::LoadUndefined
+            | Op::LoadNull
+            | Op::LoadTrue
+            | Op::LoadFalse
+            | Op::Return
+            | Op::Jump
+            | Op::TdzError => 1,
+            Op::LoadString
+            | Op::LoadNumber
+            | Op::LoadInt32
+            | Op::LoadLength
+            | Op::Neg
+            | Op::ToNumber
+            | Op::LogicalNot
+            | Op::ToBoolean
+            | Op::JumpIfTrue
+            | Op::JumpIfFalse
+            | Op::JumpIfNullish
+            | Op::LoadLocal
+            | Op::StoreLocal => 2,
+            Op::GetStringIndex
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::Equal
+            | Op::NotEqual
+            | Op::LessThan
+            | Op::LessEq
+            | Op::GreaterThan
+            | Op::GreaterEq => 3,
+            Op::CallStringMethod => 4, // dst, recv, name_const, argc
         }
+    }
+
+    /// Whether the opcode performs a control-flow transfer. The
+    /// dispatcher uses this to advance `pc` by 1 only for non-jump
+    /// opcodes; jumps mutate `pc` themselves (and the back-edge
+    /// hook polls the interrupt flag).
+    #[must_use]
+    pub const fn is_branch(self) -> bool {
+        matches!(
+            self,
+            Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish | Op::Return
+        )
     }
 }
 
@@ -95,6 +255,10 @@ pub struct Instruction {
 pub enum Operand {
     /// Register index (locals + scratch live in one register window).
     Register(u16),
+    /// Index into [`BytecodeModule::constants`].
+    ConstIndex(u32),
+    /// Inline signed 32-bit immediate (used by `LoadInt32`).
+    Imm32(i32),
 }
 
 /// One source-span entry attached to a `pc`.
@@ -135,6 +299,24 @@ pub enum SourceKind {
     TypeScript,
 }
 
+/// Constant-pool entry referenced by [`Operand::ConstIndex`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum Constant {
+    /// String constant. Stored as WTF-16 code units to round-trip
+    /// surrogates losslessly through the JSON dump.
+    String {
+        /// WTF-16 code units.
+        utf16: Vec<u16>,
+    },
+    /// Numeric constant stored as raw IEEE-754 bits to round-trip
+    /// `NaN`, `±Infinity`, and `-0.0` losslessly through JSON.
+    Number {
+        /// `f64::to_bits` representation.
+        bits: u64,
+    },
+}
+
 /// Top-level bytecode container produced by the compiler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BytecodeModule {
@@ -144,6 +326,9 @@ pub struct BytecodeModule {
     pub source_kind: SourceKind,
     /// Function table; index 0 is `<main>`.
     pub functions: Vec<Function>,
+    /// Module-wide constant pool.
+    #[serde(default)]
+    pub constants: Vec<Constant>,
 }
 
 impl BytecodeModule {

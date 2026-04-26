@@ -72,6 +72,7 @@ mod tests {
                     span: (0, 0),
                 }],
             }],
+            constants: vec![],
         };
         let json = to_json_pretty(&module).unwrap();
         assert!(json.contains("\"otterBytecodeDumpVersion\": 1"));

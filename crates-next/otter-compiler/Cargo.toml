@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 otter-bytecode = { workspace = true }
 otter-syntax = { workspace = true }
+oxc_allocator = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_span = { workspace = true }
 serde = { workspace = true }

@@ -61,6 +61,12 @@ fn write_function(out: &mut String, f: &Function) {
                     Operand::Register(r) => {
                         let _ = write!(line, "r{r}");
                     }
+                    Operand::ConstIndex(k) => {
+                        let _ = write!(line, "k[{k}]");
+                    }
+                    Operand::Imm32(v) => {
+                        let _ = write!(line, "i32:{v}");
+                    }
                 }
             }
         }
@@ -98,6 +104,7 @@ mod tests {
                     span: (0, 0),
                 }],
             }],
+            constants: vec![],
         };
         let text = disassemble(&module);
         assert!(text.contains("; otter bytecode dump v1"));

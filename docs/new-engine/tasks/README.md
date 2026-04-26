@@ -67,11 +67,11 @@ Implementation slices (M1–M7), strictly in this order:
 | #  | File | Slice | Status |
 |----|------|-------|--------|
 | 07 | [07-vm-harness-minimal-interpreter.md](./07-vm-harness-minimal-interpreter.md) | VM harness skeleton | **done** (2026-04-26) |
-| 08 | [08-typescript-frontend-skeleton.md](./08-typescript-frontend-skeleton.md) | TS frontend skeleton | not started |
-| 09 | [09-string-core-slice.md](./09-string-core-slice.md) | String core | not started |
-| 10 | [10-string-methods-slice.md](./10-string-methods-slice.md) | String methods | not started |
-| 11 | [11-number-core-slice.md](./11-number-core-slice.md) | Number core | not started |
-| 12 | [12-boolean-nullish-control-flow-slice.md](./12-boolean-nullish-control-flow-slice.md) | Booleans / control flow | not started |
+| 08 | [08-typescript-frontend-skeleton.md](./08-typescript-frontend-skeleton.md) | TS frontend skeleton | **done** (2026-04-26) |
+| 09 | [09-string-core-slice.md](./09-string-core-slice.md) | String core | **done** (2026-04-26) |
+| 10 | [10-string-methods-slice.md](./10-string-methods-slice.md) | String methods | **done** (2026-04-26) |
+| 11 | [11-number-core-slice.md](./11-number-core-slice.md) | Number core | **done** (2026-04-26) |
+| 12 | [12-boolean-nullish-control-flow-slice.md](./12-boolean-nullish-control-flow-slice.md) | Booleans / control flow | **done** (2026-04-26) |
 | 13 | [13-calls-frames-slice.md](./13-calls-frames-slice.md) | Calls and frames | not started |
 
 Tasks for objects/shapes, arrays, builtins, and conformance ratchets are

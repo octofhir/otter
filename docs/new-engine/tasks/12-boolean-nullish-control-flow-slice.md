@@ -176,7 +176,88 @@ Proceed to [`13-calls-frames-slice.md`](./13-calls-frames-slice.md).
 
 ## Status
 
-- not started
-- last update: —
-- artifacts: control-flow opcodes, compiler lowering for branches /
-  loops, fixtures, benchmarks
+- **done** (foundation subset; bench targets and explicit
+  interrupt-from-thread fixture deferred to slice 13 / perf pass)
+- last update: 2026-04-26
+- artifacts:
+  - `Value::Null` variant; `Value::to_boolean` (foundation
+    [`ToBoolean`](https://tc39.es/ecma262/#sec-toboolean));
+    `Value::is_nullish`.
+  - New opcodes: `LoadNull`, `LogicalNot`, `ToBoolean`, `Jump`,
+    `JumpIfTrue`, `JumpIfFalse`, `JumpIfNullish`, `LoadLocal`,
+    `StoreLocal`, `TdzError`. `Op::is_branch()` helper for
+    dispatcher classification.
+  - VM dispatch: `apply_branch` helper polls
+    `InterruptFlag` on **every back-edge** (negative offset);
+    nullish-coalescing matches `Value::is_nullish`. New
+    `VmError::TemporalDeadZone { local_index }`; runtime maps it
+    to a structured `Diagnostic` with `code = "TDZ"`,
+    `kind = Reference`.
+  - Compiler:
+    - per-function lexical-scope stack (`FunctionContext::scopes`)
+      with shadowing, const-flag tracking, redeclaration
+      diagnostics;
+    - `LoopFrame` stack with patch-list machinery for `break`/
+      `continue`;
+    - `emit_branch_placeholder` + `patch_branch_to_here` /
+      `patch_branch` for forward branches;
+    - lowering for `let`/`const` (rejecting `var`),
+      `if`/`else`, `while`, `do-while`, `for(let init; test;
+      update)`, `break`, `continue`, `BlockStatement`,
+      `LogicalExpression` (`&&`/`||`/`??` short-circuiting via
+      JumpIfTrue/False/Nullish), `ConditionalExpression`,
+      `AssignmentExpression` (plain `=` only; rejects compound and
+      member-target),
+      `Identifier` resolution with NaN/Infinity pseudo-globals
+      and clear "unresolved identifier" diagnostics,
+      `UnaryOperator::LogicalNot` → `LogicalNot`.
+  - 7 фикстур под `tests/engine/control-flow/`:
+    `if-else`, `while-loop`, `for-loop`, `break-continue`,
+    `do-while`, `logical-ops`, `conditional-expr`.
+- verification:
+  - `cargo build/test/clippy/fmt` — все зелёные.
+  - **35/35** engine fixtures PASS (7 control-flow + 4 numbers +
+    7 string methods + 6 strings + 9 typescript + 2 smoke).
+  - End-to-end `-p`:
+    - `5 > 3 ? "yes" : "no"` → `yes`
+    - `null ?? "fallback"` → `fallback`
+    - `true && "hi"` → `hi`
+    - `false || 7` → `7`
+    - `!false` → `true`
+  - Comprehensive smoke runs of all 7 control-flow fixtures →
+    `exit=0`.
+  - LLM-friendly `//!` headers — все `.rs` файлы.
+- design highlights:
+  - **Idiomatic Rust**: `enter_scope`/`exit_scope`/
+    `declare_binding`/`lookup_binding` keep AST-walking code
+    succinct; placeholder/patch helpers eliminate manual offset
+    arithmetic in compile_expr.
+  - Branch encoding: `Operand::Imm32(offset)` is
+    relative-to-next-instruction. Negative offsets (`<0`) are
+    back-edges and trigger interrupt-flag polling in
+    `apply_branch` — meets the "every native loop polls every
+    4096 iterations" rule (ours polls **every** back-edge).
+  - Logical operators reuse `JumpIfTrue/False/Nullish` so short-
+    circuiting compiles to one branch per operator.
+  - `var` is intentionally rejected with a "foundation rejects
+    var" diagnostic so the well-tested path is just
+    `let`/`const`. Lifts when full hoisting / function-scope
+    semantics arrive.
+  - Conditional expression and `??` use a small `StoreLocal` /
+    `LoadLocal` pair to materialize the result rather than
+    threading a phi through the compiler — keeps the lowering
+    independent of the (future) SSA pass.
+- deferred:
+  - Labeled `break` / `continue` — rejected with explicit
+    diagnostic.
+  - Real TDZ semantics (currently any `let` reads its register,
+    which is `undefined` until store; spec says ReferenceError).
+    `TdzError` opcode is reserved for the future, not yet
+    emitted.
+  - `switch` / `try`/`catch`/`finally` / `throw` — separate
+    slices.
+  - Bench targets (`if_branch_1m`, `while_loop_1m_int_sum`,
+    `for_loop_1m_with_break`) — paired with calls slice (13) so
+    we benchmark realistic shapes including function calls.
+  - `infinite-loop-interrupt.ts` fixture (требует thread-spawn в
+    test harness) — отложен до бенч-рантайма slice 13.

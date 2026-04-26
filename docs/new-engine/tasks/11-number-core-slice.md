@@ -175,7 +175,91 @@ Proceed to [`12-boolean-nullish-control-flow-slice.md`](./12-boolean-nullish-con
 
 ## Status
 
-- not started
-- last update: —
-- artifacts: numeric variants of `Value`, numeric opcodes,
-  `tests/engine/numbers/`, numeric benchmarks
+- **done** (foundation subset; bench targets and bitwise ops
+  deferred to a perf pass; full `StringNumericLiteral` parsing
+  intentionally omitted per slice scope)
+- last update: 2026-04-26
+- artifacts:
+  - `crates-next/otter-vm/src/number.rs` — `NumberValue` two-state
+    representation (`Smi(i32)` + `Double(f64)`), canonicalization,
+    arithmetic with `checked_*` overflow → demote semantics,
+    spec-style comparison via `NumericOrdering`,
+    `to_number_from_string` foundation subset (decimal int/float +
+    `NaN`/`±Infinity`).
+  - `Value` extended with `Boolean(bool)` and `Number(NumberValue)`.
+    Equality routes Numbers through `number::equals` (so `NaN !==
+    NaN`).
+  - Bytecode: 14 new / generalized opcodes —
+    `LoadNumber` (uses `Constant::Number { bits }`),
+    `LoadInt32` (inline `Operand::Imm32(i32)`),
+    `LoadTrue`, `LoadFalse`,
+    `Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg`/`ToNumber`,
+    `Equal`/`NotEqual`/`LessThan`/`LessEq`/`GreaterThan`/`GreaterEq`.
+    String-only `StringConcat`/`StringEq`/`String*` опкоды
+    удалены — `Add`/`Equal`/comparisons теперь полиморфны
+    (Number+Number или String+String). Disasm печатает `i32:<v>`
+    для `Imm32`.
+  - Compiler lowering: `NumericLiteral` → `LoadInt32` (для смите-
+    влезающих интов) или `LoadNumber` через интернированный
+    `Constant::Number`; `BooleanLiteral` → `LoadTrue/False`;
+    идентификаторы `NaN`/`Infinity` → `LoadNumber`;
+    `UnaryExpression` (`-`/`+`) → `Neg`/`ToNumber`; полный набор
+    binary арифметических / сравнительных операторов.
+  - `string_prototype` ретиро суррогаты — `length`/`indexOf`/
+    `charCodeAt` возвращают `Value::Number`, `startsWith`/
+    `endsWith` возвращают `Value::Boolean`. `arg_u32_or` теперь
+    принимает `Value::Number` напрямую.
+  - VM dispatch: helper-методы `Interpreter::run_add`,
+    `run_numeric`, `run_compare`, `binop_regs` — каждая ветка
+    короткая и идиоматичная; `run_numeric` параметризован
+    pointer-функцией над `NumberValue`.
+  - 4 новые фикстуры под `tests/engine/numbers/`:
+    `integer-arith`, `division-by-zero`, `comparisons`,
+    `unary-and-coercion`. String-method фикстуры обновлены, чтобы
+    использовать настоящие числовые литералы (`slice(1, 4)` вместо
+    `slice("1", "4")`).
+- verification:
+  - `cargo build/test/clippy/fmt` — все зелёные.
+  - **85+ unit-тестов** в workspace: vm 34 (number: 9, string: 13,
+    string_prototype: 8, intrinsics: 3, dispatch: 3-4),
+    compiler 23, runtime 17, bytecode 4, syntax 4, test 2.
+  - `cargo run -p otter-cli -- test --suite engine` — **28/28
+    PASS** (4 numbers + 2 smoke + 6 strings + 7 string methods +
+    9 typescript).
+  - End-to-end через `-p`:
+    - `1 + 2 * 3` → `7`
+    - `1 / 0` → `Infinity`
+    - `NaN` → `NaN`
+    - `Infinity - Infinity` → `NaN`
+    - `+"42"` → `42`, `+"foo"` → `NaN`
+    - `"hello".length` → `5`
+    - `"hello".charCodeAt(0)` → `104`
+    - `"hello".indexOf("ll")` → `2`
+    - `"hello".startsWith("he")` → `true`
+    - `1 === 1` → `true`, `3 !== 4` → `true`
+  - LLM-friendly `//!` headers — все `.rs` файлы.
+- design highlights:
+  - Idiomatic Rust: `checked_add/sub/mul`, fn-pointer
+    `run_numeric(op: fn(NumberValue, NumberValue) -> NumberValue)`,
+    `?`-style propagation everywhere, нет `unwrap()` на горячих
+    путях.
+  - `-0.0` round-trips через `Double(-0.0)` и сравнивается ===
+    `+0` (spec).
+  - `NaN` через `Double(f64::NAN)` всегда; `equals` early-return на
+    NaN; `compare` возвращает `NumericOrdering::Unordered`.
+  - Constant pool хранит `f64::to_bits` чтобы NaN payload и `-0`
+    round-trip через JSON dump были bit-exact.
+  - `Operand::Imm32(i32)` для inline smi-литералов уменьшает
+    давление на constant pool.
+- deferred (явно не блокирует закрытие задачи):
+  - Bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `>>>`, `~`) —
+    отдельный slice.
+  - `BigInt`, `Number.prototype.*` методы (`toString`, `toFixed`,
+    `parseInt` family) — последующие slices.
+  - Full ECMA-262 `StringNumericLiteral` parsing
+    (hex/binary/octal strings, exponent forms) — расширение
+    `to_number_from_string` в perf pass'е.
+  - Criterion bench targets (`int_loop_sum_1m`,
+    `double_loop_sum_1m`, `mixed_compare_branch_1m`) — отложено
+    до слайса 12 рядом с `s += piece` циклом, чтобы бенчмарки
+    отражали реалистичные JS shapes.

@@ -233,7 +233,70 @@ Proceed to [`10-string-methods-slice.md`](./10-string-methods-slice.md).
 
 ## Status
 
-- not started
-- last update: —
-- artifacts: `JsString`, string opcodes, `tests/engine/strings/` fixtures,
-  string benchmark target
+- **done** (foundation subset; benchmarks + advanced surrogate
+  fixtures deferred to slice 10)
+- last update: 2026-04-26
+- artifacts:
+  - `crates-next/otter-vm/src/string.rs` — full `JsString` model:
+    `Flat(Arc<[u16]>)`, `Cons { left, right, len, depth }`,
+    `Sliced { parent, start, len }`, reserved `Thin(Arc<[u8]>)` (not
+    constructed). `MAX_ROPE_DEPTH = 64`. Iterative DFS walker for
+    `flatten`, `equals`, `to_lossy_string`, `char_code_at`. Auto-
+    flatten on `concat` when depth budget would overflow. `slice`
+    over `Cons` flattens once; over `Sliced` collapses.
+    `StringHeap` with atomic CAS-loop reservation; OOM never mutates
+    the counter.
+  - `crates-next/otter-vm/src/intrinsics.rs` — declarative caркас
+    для primitive-receiver методов: `IntrinsicReceiver`,
+    `IntrinsicArgs`, `IntrinsicEntry`, `IntrinsicTable`,
+    `IntrinsicError`, плюс макрос `intrinsics!` для табличных
+    регистраций. Используется slice 10+; в текущем slice — только
+    типы и unit-тесты.
+  - `Value` теперь enum `{ Undefined, String(JsString) }`; больше не
+    `Copy`. `Value::PartialEq` сравнивает строки через
+    `JsString::equals`.
+  - `otter-bytecode`: новые опкоды `LoadString`, `StringConcat`,
+    `StringEq`, `LoadLength` + `Operand::ConstIndex(u32)` +
+    модульная константная таблица `BytecodeModule.constants`
+    (`Constant::String { utf16 }`). Disasm печатает `k[idx]`.
+  - `otter-compiler`: `FunctionContext` со scratch-аллокатором и
+    interning constant pool. `compile_expr` для `StringLiteral`,
+    template literal без интерполяции, `+`/`===` (string-only),
+    `.length`, parens. TS-erasure из task 08 сохранён.
+  - `otter-vm` dispatch loop добавляет соответствующие arm'ы;
+    интерпретатор владеет `Arc<StringHeap>`. `VmError` расширен
+    `TypeMismatch` и `OutOfMemory`.
+  - 6 фикстур под `tests/engine/strings/`: `literal-load`,
+    `literal-eq`, `concat-binary`, `length-on-literal`,
+    `template-no-interpolation`, `concat-loop-stays-linear`.
+- verification:
+  - `cargo build/test/clippy/fmt` — все зелёные.
+  - **53 unit-теста** в workspace (compiler 19, vm 18, runtime 17,
+    bytecode 4, syntax 4, test 2). string subsystem unit-тестов:
+    13 (включая surrogate round-trip, OOM-без-мутации,
+    deep-rope flatten, slice-of-slice collapse).
+  - `cargo run -p otter-cli -- test --suite engine` — **17/17
+    PASS** (2 smoke + 6 strings + 9 typescript).
+  - `otter -p '"hello".length'` → `5`.
+  - `otter -p '"a" + "b" + "c"'` → `abc`.
+  - `otter --dump-bytecode tests/engine/strings/concat-binary.ts` —
+    эмитит LOAD_STRING / STRING_CONCAT / RETURN с корректными span.
+  - LLM-friendly `//!` headers — все `.rs` файлы.
+- design highlights:
+  - `+` в этом slice — **только строка-строка**; компилятор смешивает
+    их через `StringConcat`, который требует обоих string-операндов
+    на runtime (TypeMismatch если нет). Полноценный `+` с
+    coercion прибудет в slice 11/12.
+  - `===` тоже string-only сейчас. Boolean заводится в slice 12;
+    сейчас результат материализуется временно как строка `"true"` /
+    `"false"` чтобы тесты могли видеть значение через `-p`.
+  - `.length` пока возвращает строку с десятичным числом по той же
+    причине; slice 11 заменит на реальный `Number`.
+- deferred (попадут в slice 10 / позже):
+  - benchmark target `crates-next/otter-vm/benches/strings.rs` —
+    Criterion suite (`literal_load`, `equality_eq_short`,
+    `concat_loop_1k`, `flatten_balanced`, `length_after_concat`)
+    запланирован в slice 10 рядом с реальными методами.
+  - `s += piece` loop fixture — нужны переменные (slice 12).
+  - explicit `lone surrogate` fixture в `tests/engine/strings/` —
+    нужен escape-литерал в `.ts` (отложено).

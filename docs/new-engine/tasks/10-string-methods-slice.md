@@ -183,7 +183,71 @@ Proceed to [`11-number-core-slice.md`](./11-number-core-slice.md).
 
 ## Status
 
-- not started
-- last update: —
-- artifacts: string-method intrinsics dispatch, opcodes, fixtures,
-  benchmarks
+- **done** (foundation subset; criterion bench targets and explicit
+  surrogate fixtures deferred until `Value::Number` lands and string
+  literals can carry escape sequences via the test harness — slice
+  11 / 12)
+- last update: 2026-04-26
+- artifacts:
+  - `crates-next/otter-vm/src/string_prototype.rs` — declarative
+    `STRING_PROTOTYPE_TABLE` built with the `intrinsics!` macro and
+    cached behind `LazyLock`. Eight intrinsics: `length`,
+    `charCodeAt`, `charAt`, `slice`, `substring`, `indexOf`,
+    `startsWith`, `endsWith`. Each is a small `fn` with `?`-style
+    propagation through `IntrinsicError`.
+  - `JsString::index_of` (with `Interrupted` sentinel and 4096-step
+    interrupt-flag polling), `starts_with`, `ends_with`,
+    `compare_lex` — added to the string core.
+  - `IntrinsicError` migrated to `#[derive(thiserror::Error)]`,
+    extended with `UnknownMethod`. `Interrupted` is a tiny
+    `Display`-implementing struct (no `Result<_, ()>` left).
+  - New opcodes: `GetStringIndex`, `CallStringMethod` (variadic;
+    `dst, recv, name_const, argc, args...`), `StringLessThan`,
+    `StringLessEq`, `StringGreaterThan`, `StringGreaterEq`. Disasm
+    handles all of them.
+  - `otter-compiler` lowering: `s[i]` →
+    `GetStringIndex`; `recv.method(args...)` →
+    `CallStringMethod`; `<`/`<=`/`>`/`>=` → `StringLess*`/`Greater*`.
+  - `otter-runtime` `map_vm_error` translates `TypeMismatch` and
+    `UnknownIntrinsic` into structured `Diagnostic`s
+    (`TYPE_MISMATCH`, `UNKNOWN_METHOD`).
+  - 7 fixtures under `tests/engine/strings/methods/`: `length`,
+    `slice`, `substring`, `index-of`, `starts-ends-with`, `index`,
+    `compare-lt`.
+- verification:
+  - `cargo build/test/clippy/fmt` — все зелёные.
+  - **70 unit-тестов** в workspace: vm 26 (string-prototype: 7,
+    intrinsics: 3, string core: 13, dispatch: 3), compiler 19,
+    runtime 17, bytecode 4, syntax 4, test 2.
+  - `cargo run -p otter-cli -- test --suite engine` — **24/24
+    PASS** (2 smoke + 6 strings + 7 string methods + 9 typescript).
+  - `cargo run -p otter-cli -- -p '"hello".startsWith("he")'` →
+    `true`.
+  - `cargo run -p otter-cli -- -p '"abc" < "abd"'` → `true`.
+  - LLM-friendly `//!` headers: 0 missing.
+- design highlights:
+  - Idiomatic Rust everywhere: `thiserror::Error` via derive, `?` on
+    every fallible path, no `Box<dyn Error>` anywhere on the public
+    surface, named-field error variants for forward compatibility.
+  - Variadic `CallStringMethod` operand layout
+    (`dst, recv, name_const, argc, arg0..argN`) chosen so the
+    dispatcher can read arguments without an extra heap-allocated
+    side table; arguments are collected into a `SmallVec<[Value; 4]>`
+    so 0–4-arg calls hit the inline path.
+  - The macro `intrinsics!{ String, "name" / arity => impl_fn, ... }`
+    builds a static `&'static [IntrinsicEntry]` consumed via
+    `LazyLock<IntrinsicTable>`; entries are immutable post-init
+    and lookup is a linear scan over a small N.
+  - `index_of` polls the interrupt flag every 4096 iterations;
+    tripped flag returns the `Interrupted` sentinel which the
+    dispatcher could surface as `VmError::Interrupted` in a future
+    fixture.
+- deferred (not blocking task closure):
+  - Criterion bench targets (`benches/strings.rs`) — postponed to
+    a dedicated perf pass when `Value::Number` exists, so we
+    benchmark realistic JS shapes (`charCodeAt(0)`, integer slice
+    bounds) without string-encoded indices.
+  - Explicit lone-surrogate fixture under `tests/engine/strings/`
+    — needs string-literal escape support in the harness; tracked
+    when `Value::Number` arrives and we add proper UCS escapes.
+  - `s += piece` loop fixture — needs variables (slice 12).

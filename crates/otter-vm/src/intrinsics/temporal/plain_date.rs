@@ -189,8 +189,8 @@ fn pd_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pd = require_plain_date(this, runtime)?;
     let id = pd.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(id.to_string()).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 pd_getter_num!(pd_year, year);

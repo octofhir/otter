@@ -506,6 +506,107 @@ impl GcHeap {
         result
     }
 
+    /// Phase 5: two-phase scavenge entry point — runs the copy phase but
+    /// **does not** flip from-space. Forwarding pointers in from-space
+    /// objects remain readable so callers can run a fixup pass over
+    /// external pointer locations (NaN-box copies of `GcRef<T>` stored
+    /// outside the GC heap, embedded inside the legacy slot heap, etc.)
+    /// before the from-space pages are reclaimed.
+    ///
+    /// Call [`Self::flip_after_scavenge_fixup`] once fixup is complete
+    /// to drop from-space and finalise the cycle. Failing to call the
+    /// flip leaks from-space until the next scavenge or full GC.
+    pub fn collect_young_no_flip(&mut self) -> ScavengeResult {
+        let mut root_slots = self.handle_stack.root_slots();
+        root_slots.extend(self.global_handles.root_slots());
+        root_slots.extend_from_slice(self.write_barrier.remembered_set.slots());
+
+        let result = unsafe {
+            crate::scavenger::scavenge_no_flip(
+                &mut self.new_space,
+                &mut self.old_space,
+                &self.trace_table,
+                &root_slots,
+            )
+        };
+
+        self.write_barrier.remembered_set.clear();
+
+        self.stats.scavenges += 1;
+        self.stats.total_scavenged_bytes += result.copied_bytes;
+        self.stats.total_promoted_bytes += result.promoted_bytes;
+        self.update_stats();
+
+        result
+    }
+
+    /// Looks up the post-scavenge forwarding address for `header_ptr`.
+    /// Returns `Some(new_ptr)` when the object was moved (forwarding
+    /// flag set), `None` when it was promoted in place / never moved
+    /// or the pointer is null.
+    ///
+    /// Valid only between [`Self::collect_young_no_flip`] and
+    /// [`Self::flip_after_scavenge_fixup`]. Outside that window the
+    /// from-space pages are freed and the result is meaningless.
+    ///
+    /// The function signature is intentionally safe so VM code that
+    /// forbids `unsafe` can call it; misuse (calling outside the
+    /// fixup window or with a stale pointer) is undefined behaviour
+    /// the moment the returned pointer is dereferenced — the same
+    /// contract as [`crate::value_bridge::payload_to_gc_ref`].
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn forwarding_address_for(
+        &self,
+        header_ptr: *const GcHeader,
+    ) -> Option<*const GcHeader> {
+        if header_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: Caller guarantees the pointer is to a still-live
+        // (pre-flip) header. Reading `is_forwarded()` and the
+        // forwarding pointer is well-defined while from-space is
+        // alive.
+        let header = unsafe { &*header_ptr };
+        if header.is_forwarded() {
+            Some(unsafe { header.forwarding_address() })
+        } else {
+            None
+        }
+    }
+
+    /// Phase 5: drop from-space pages after the caller has finished
+    /// fixing up external pointers. Pairs with
+    /// [`Self::collect_young_no_flip`].
+    pub fn flip_after_scavenge_fixup(&mut self) {
+        self.new_space.flip();
+        self.update_stats();
+    }
+
+    /// Phase 5: iterates every from-space object that was forwarded
+    /// during the most recent [`Self::collect_young_no_flip`] cycle,
+    /// invoking `visitor(old_ptr, new_ptr)` for each. Used by external
+    /// fixup passes to build a forwarding map without needing a back
+    /// reference to the heap during the fixup walk.
+    ///
+    /// Valid only between [`Self::collect_young_no_flip`] and
+    /// [`Self::flip_after_scavenge_fixup`].
+    pub fn walk_forwarded_objects(&self, mut visitor: impl FnMut(*const GcHeader, *const GcHeader)) {
+        for page in self.new_space.from_pages() {
+            // SAFETY: from_pages() returns the live from-space pages
+            // owned by this `NewSpace`; their object layout is
+            // GcHeader-prefixed by construction, and we are holding
+            // `&self` which prevents concurrent mutation.
+            unsafe {
+                page.for_each_object(|header_ptr, _offset| {
+                    let header = &*header_ptr;
+                    if header.is_forwarded() {
+                        visitor(header_ptr as *const GcHeader, header.forwarding_address());
+                    }
+                });
+            }
+        }
+    }
+
     /// Triggers a full (mark-sweep) collection of old generation.
     pub fn collect_full(&mut self) -> SweepResult {
         // Phase 1: Mark.

@@ -316,31 +316,41 @@ impl RuntimeState {
     // tri-color shading; Phase 5 wires the remembered set.
     // -------------------------------------------------------------------------
 
-    /// Phase 5 stub: minor (young-generation) GC scavenge.
+    /// Phase 5: minor (young-generation) GC cycle for the GC-managed
+    /// string heap.
     ///
-    /// **Currently unsafe to call from production code.** Cheney
-    /// scavenge moves survivors from from-space to to-space and
-    /// installs forwarding pointers; that breaks every
-    /// `TAG_PTR_STRING` value stored in NaN-box bits inside
-    /// `RegisterValue`s on the legacy heap (object property values,
-    /// array elements, etc.). The handle-stack roots get rewritten
-    /// in place by the scavenger, but the embedded NaN-box copies
-    /// don't.
+    /// Three-phase pipeline:
     ///
-    /// Safe wiring requires a post-scavenge fixup pass that walks
-    /// every `RegisterValue` location reachable from the legacy
-    /// heap, looks up the forwarding pointer for any
-    /// `TAG_PTR_STRING` whose target moved, and rewrites the value
-    /// in place. That fixup is the next deliverable in the GC
-    /// migration; until it lands the public allocator path stays on
-    /// [`gc_collect_strings_full`] (mark-sweep, no move).
+    /// 1. **Root collection** — every `TAG_PTR_STRING` reachable
+    ///    from the active register window or embedded inside live
+    ///    legacy heap objects gets pushed onto the GcHeap handle
+    ///    stack so the scavenger treats it as a root and rewrites
+    ///    its slot in place.
+    /// 2. **Two-phase scavenge** —
+    ///    [`otter_gc::heap::GcHeap::collect_young_no_flip`] runs
+    ///    the Cheney copy phase but leaves from-space alive so
+    ///    forwarding pointers remain readable.
+    /// 3. **External fixup** — every `RegisterValue` slot embedded
+    ///    in a live legacy heap object is walked one more time;
+    ///    when it carries a `TAG_PTR_STRING` whose target was
+    ///    forwarded by the scavenger, the NaN-box bits are
+    ///    rewritten in place to point at the new address. Then
+    ///    [`otter_gc::heap::GcHeap::flip_after_scavenge_fixup`]
+    ///    drops from-space.
     ///
-    /// The method is exposed for the in-tree stress harness to
-    /// exercise the scavenger plumbing without committing the
-    /// runtime to call it implicitly.
-    pub fn gc_collect_strings_minor_unchecked(&mut self, current_window: &[RegisterValue]) {
+    /// The active register window passed to this call is **not**
+    /// fixed up — callers must reload `TAG_PTR_STRING` values from
+    /// the register window through the heap's handle-stack roots
+    /// (which the scavenger updates in place). The intended caller
+    /// is the explicit GC safepoint, where the interpreter knows
+    /// which register slots hold heap pointers and can re-read them
+    /// after this call returns.
+    pub fn gc_collect_strings_minor(&mut self, current_window: &[RegisterValue]) {
         use otter_gc::header::GcHeader;
+        use std::collections::HashMap;
 
+        // Step 1: gather roots — register-window TAG_PTR_STRING +
+        // every embedded TAG_PTR_STRING in live legacy heap state.
         let mut raw_ptrs: Vec<*const GcHeader> = Vec::new();
         for &rv in current_window {
             if let Some(gc_ref) = rv.as_string_ref() {
@@ -353,13 +363,33 @@ impl RuntimeState {
             }
         });
 
-        let gc_heap = self.objects.gc_heap_mut();
-        let scope = gc_heap.enter_scope();
-        for ptr in &raw_ptrs {
-            gc_heap.root(*ptr);
-        }
-        gc_heap.collect_young();
-        gc_heap.exit_scope(scope);
+        // Step 2: push roots, run no-flip scavenge, snapshot the
+        // post-scavenge forwarding map. Once we have the map, the
+        // GcHeap mutable borrow is released so the fixup pass can
+        // grab `&mut self.objects` exclusively.
+        let forward_map: HashMap<*const GcHeader, *const GcHeader> = {
+            let gc_heap = self.objects.gc_heap_mut();
+            let scope = gc_heap.enter_scope();
+            for ptr in &raw_ptrs {
+                gc_heap.root(*ptr);
+            }
+            let _result = gc_heap.collect_young_no_flip();
+            gc_heap.exit_scope(scope);
+
+            let mut map = HashMap::new();
+            gc_heap.walk_forwarded_objects(|old_ptr, new_ptr| {
+                map.insert(old_ptr, new_ptr);
+            });
+            map
+        };
+
+        // Step 3: external fixup pass — rewrite every embedded
+        // TAG_PTR_STRING whose target moved.
+        self.objects
+            .fixup_string_refs_after_scavenge(|old_ptr| forward_map.get(&old_ptr).copied());
+
+        // Step 4: drop from-space pages.
+        self.objects.gc_heap_mut().flip_after_scavenge_fixup();
     }
 
     /// Phase 4: full STW GC cycle for the GC-managed string heap
@@ -1047,26 +1077,39 @@ mod gc_string_bridge_tests {
     }
 
     #[test]
-    fn gc_collect_strings_minor_unchecked_drives_scavenger_machinery() {
-        // Phase 5 plumbing test (NOT a correctness test). The
-        // scavenger machinery is wired up — root scanning + handle
-        // stack push + collect_young — but the post-move fixup that
-        // would update embedded `TAG_PTR_STRING` NaN-box bits in
-        // legacy heap storage is not yet in place. The Local copy
-        // we read after the call still resolves because the
-        // from-space page is not freed yet (single-threaded GC,
-        // page lifetime tied to a Drop call we control). Once
-        // Phase 5 fixup lands, this test becomes a real correctness
-        // check.
+    fn gc_collect_strings_minor_preserves_strings_inside_objects() {
+        // Phase 5 correctness test: a TAG_PTR_STRING stored in an
+        // object property survives a minor GC, and reading the
+        // updated property after the cycle yields the new
+        // (forwarded) address. The fixup pass rewrites the NaN-box
+        // bits in place so subsequent reads do not see a
+        // dangling pointer.
         let mut state = RuntimeState::new();
-        let value = state.alloc_string_value("young").expect("alloc");
-        let window = [value];
-        state.gc_collect_strings_minor_unchecked(&window);
-        // The handle stack root and the still-live from-space page
-        // mean the original pointer is still readable for the
-        // duration of the test.
-        let gc_ref = value.as_string_ref().expect("string ref");
-        assert_eq!(crate::js_string_gc::to_rust_string(gc_ref), "young");
+        let str_value = state.alloc_string_value("survivor").expect("alloc");
+        let obj = state.alloc_object().expect("obj");
+        let prop = state.intern_property_name("data");
+        state
+            .objects_mut()
+            .set_property(obj, prop, str_value)
+            .expect("set property");
+        // No locals hold the string — only the object property.
+        let window: [crate::value::RegisterValue; 0] = [];
+        state.gc_collect_strings_minor(&window);
+        // Read back the property — should resolve to the new
+        // (forwarded) address. Content must match.
+        let lookup = state
+            .objects()
+            .get_property(obj, prop)
+            .expect("lookup")
+            .expect("present");
+        let stored = match lookup.value() {
+            crate::object::PropertyValue::Data { value, .. } => value,
+            _ => panic!("expected data property"),
+        };
+        let gc_ref = stored
+            .as_string_ref()
+            .expect("rooted via fixup pass");
+        assert_eq!(crate::js_string_gc::to_rust_string(gc_ref), "survivor");
     }
 
     #[test]

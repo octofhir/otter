@@ -192,8 +192,8 @@ fn bound_dtf_format(
     let timestamp_ms = resolve_date_value(date_val, runtime)?;
 
     let formatted = format_date_time(timestamp_ms, &data)?;
-    let handle = runtime.alloc_string(formatted)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(formatted).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn dtf_interp_err(e: impl std::fmt::Debug) -> VmNativeCallError {
@@ -283,8 +283,8 @@ fn date_time_format_format_range(
         format!("{start_str} \u{2013} {end_str}")
     };
 
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(result).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ═══════════════════════════════════════════════════════════════════

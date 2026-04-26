@@ -308,14 +308,15 @@ impl RuntimeState {
 
         // 3. Define the "name" own property. The slot installed by
         //    `alloc_closure` is configurable, so re-defining it is legal.
+        // Strategy B: store .name as TAG_PTR_STRING.
         let name_property = self.intern_property_name("name");
-        let name_value = self.alloc_string(full_name)?;
+        let name_value = self.alloc_string_value(&full_name)?;
         self.objects
             .define_own_property(
                 closure,
                 name_property,
                 crate::object::PropertyValue::data_with_attrs(
-                    RegisterValue::from_object_handle(name_value.0),
+                    name_value,
                     crate::object::PropertyAttributes::function_length(),
                 ),
             )
@@ -532,17 +533,14 @@ impl RuntimeState {
                 ));
             }
 
+            // Strategy B: pass the hint as TAG_PTR_STRING.
             let hint_value = match hint {
-                ToPrimitiveHint::Default => self.alloc_string("default")?,
-                ToPrimitiveHint::String => self.alloc_string("string")?,
-                ToPrimitiveHint::Number => self.alloc_string("number")?,
+                ToPrimitiveHint::Default => self.alloc_string_value("default")?,
+                ToPrimitiveHint::String => self.alloc_string_value("string")?,
+                ToPrimitiveHint::Number => self.alloc_string_value("number")?,
             };
             let result = self
-                .call_callable(
-                    callable,
-                    value,
-                    &[RegisterValue::from_object_handle(hint_value.0)],
-                )
+                .call_callable(callable, value, &[hint_value])
                 .map_err(|error| match error {
                     VmNativeCallError::Thrown(value) => InterpreterError::UncaughtThrow(value),
                     VmNativeCallError::Internal(message) => InterpreterError::NativeCall(message),

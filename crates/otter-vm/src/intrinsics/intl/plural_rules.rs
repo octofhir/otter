@@ -100,8 +100,8 @@ fn plural_rules_select(
         .map_err(|e| VmNativeCallError::Internal(format!("PluralRules.select: {e}").into()))?;
 
     let category = resolve_plural(number, &data);
-    let handle = runtime.alloc_string(plural_category_str(category))?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(plural_category_str(category)).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -147,8 +147,8 @@ fn plural_rules_select_range(
 
     // Simplified: select the end category (full impl would use PluralRulesWithRanges).
     let category = resolve_plural(end, &data);
-    let handle = runtime.alloc_string(plural_category_str(category))?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(plural_category_str(category)).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ═══════════════════════════════════════════════════════════════════

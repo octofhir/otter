@@ -150,8 +150,8 @@ fn pmd_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pmd = require_plain_month_day(this, runtime)?;
     let id = pmd.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(id.to_string()).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §14.2.3.3 get Temporal.PlainMonthDay.prototype.monthCode

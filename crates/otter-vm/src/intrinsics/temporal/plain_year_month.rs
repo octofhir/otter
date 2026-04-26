@@ -187,8 +187,8 @@ fn pym_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pym = require_plain_year_month(this, runtime)?;
     let id = pym.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(id.to_string()).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 pym_getter_num!(pym_year, year);

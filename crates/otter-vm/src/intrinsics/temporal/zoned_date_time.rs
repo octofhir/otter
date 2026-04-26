@@ -216,8 +216,8 @@ fn zdt_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let id = zdt.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(id.to_string()).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §6.2.3.3 get Temporal.ZonedDateTime.prototype.timeZoneId

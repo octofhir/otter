@@ -2166,6 +2166,32 @@ impl ObjectHeap {
         });
     }
 
+    /// Phase 5 post-scavenge fixup: walks every `RegisterValue`
+    /// stored inside live legacy heap objects and rewrites in place
+    /// any `TAG_PTR_STRING` whose underlying allocation moved during
+    /// the scavenge. `forward` is the caller-supplied forwarding
+    /// lookup — typically [`otter_gc::heap::GcHeap::forwarding_address_for`]
+    /// captured between `collect_young_no_flip` and
+    /// `flip_after_scavenge_fixup`.
+    ///
+    /// The fixup pass uses `for_each_mut` to obtain mutable access
+    /// to each `HeapValue`, then walks every embedded
+    /// `RegisterValue` location. When a TAG_PTR_STRING points at a
+    /// forwarded header, the value is replaced with a freshly
+    /// constructed `Value::from_string_ref(new_ptr)` whose NaN-box
+    /// payload reflects the new address.
+    pub fn fixup_string_refs_after_scavenge<F>(&mut self, mut forward: F)
+    where
+        F: FnMut(*const otter_gc::header::GcHeader) -> Option<*const otter_gc::header::GcHeader>,
+    {
+        self.heap.for_each_mut(|_, any| {
+            let Some(value) = any.downcast_mut::<HeapValue>() else {
+                return;
+            };
+            fixup_heap_value_register_values(value, &mut forward);
+        });
+    }
+
     /// Allocates a plain empty object.
     ///
     /// C7: starts at the canonical [`EMPTY_SHAPE_ID`] so two literals built
@@ -9526,6 +9552,71 @@ fn visit_heap_value_register_values(value: &HeapValue, visitor: &mut impl FnMut(
         // payloads (BigInt, JsString, ArrayBuffer, RegExp) or store
         // them only inside fields that already participate in the
         // legacy Traceable graph (NativeObject, Closure captures).
+        _ => {}
+    }
+}
+
+/// Phase 5 fixup helper: rewrites every TAG_PTR_STRING-bearing
+/// `RegisterValue` slot in `value` whose underlying allocation has
+/// been forwarded by a scavenge cycle. Mirrors
+/// [`visit_heap_value_register_values`] — same set of locations
+/// covered, but uses `&mut` access and an `in_place_fixup` closure
+/// per location so we can rewrite the NaN-box bits without copying
+/// the rest of the property descriptor.
+fn fixup_heap_value_register_values<F>(value: &mut HeapValue, forward: &mut F)
+where
+    F: FnMut(*const otter_gc::header::GcHeader) -> Option<*const otter_gc::header::GcHeader>,
+{
+    let mut fixup = |slot: &mut RegisterValue| {
+        if let Some(gc_ref) = slot.as_string_ref() {
+            let old_ptr = gc_ref.as_ptr().as_ptr() as *const otter_gc::header::GcHeader;
+            if let Some(new_ptr) = forward(old_ptr)
+                && let Some(new_gc_ref) =
+                    otter_gc::value_bridge::forwarded_gc_ref::<
+                        otter_gc::types::string::JsStringGc,
+                    >(new_ptr)
+            {
+                *slot = RegisterValue::from_string_ref(new_gc_ref);
+            }
+        }
+    };
+
+    match value {
+        HeapValue::Object(obj) => {
+            for prop in obj.values.iter_mut() {
+                if let PropertyValue::Data { value, .. } = prop {
+                    fixup(value);
+                }
+            }
+        }
+        HeapValue::Array {
+            elements,
+            indexed_properties,
+            ..
+        } => {
+            for elem in elements.iter_mut() {
+                fixup(elem);
+            }
+            for prop in indexed_properties.values_mut() {
+                if let PropertyValue::Data { value, .. } = prop {
+                    fixup(value);
+                }
+            }
+        }
+        HeapValue::UpvalueCell { value } => {
+            fixup(value);
+        }
+        HeapValue::Map { entries, .. } => {
+            for entry in entries.iter_mut().flatten() {
+                fixup(&mut entry.0);
+                fixup(&mut entry.1);
+            }
+        }
+        HeapValue::Set { entries, .. } => {
+            for entry in entries.iter_mut().flatten() {
+                fixup(entry);
+            }
+        }
         _ => {}
     }
 }

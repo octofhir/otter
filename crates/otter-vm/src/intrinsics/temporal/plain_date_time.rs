@@ -217,8 +217,8 @@ fn pdt_calendar_id(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let pdt = require_plain_date_time(this, runtime)?;
     let id = pdt.calendar().identifier();
-    let handle = runtime.alloc_string(id.to_string())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(id.to_string()).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 pdt_getter_num!(pdt_year, year);

@@ -87,6 +87,24 @@ pub fn payload_to_gc_ref<T>(payload: u64) -> Option<GcRef<T>> {
     Some(unsafe { GcRef::<T>::from_raw_unchecked(ptr) })
 }
 
+/// Reconstructs a [`GcRef<T>`] from a freshly-forwarded `*const GcHeader`
+/// returned by [`crate::heap::GcHeap::forwarding_address_for`]. Used by
+/// post-scavenge fixup passes that rewrite embedded NaN-box pointers
+/// in legacy heap storage.
+///
+/// # Contract
+///
+/// `new_ptr` must be a forwarding address produced by the scavenger
+/// for a `GcRef<T>` whose underlying allocation is still alive
+/// (i.e. before the post-scavenge flip drops from-space). Same
+/// safety story as [`payload_to_gc_ref`].
+#[inline]
+pub fn forwarded_gc_ref<T>(new_ptr: *const GcHeader) -> Option<GcRef<T>> {
+    let ptr = NonNull::new(new_ptr as *mut GcHeader)?;
+    // SAFETY: per contract, `new_ptr` is a live forwarded header.
+    Some(unsafe { GcRef::<T>::from_raw_unchecked(ptr) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

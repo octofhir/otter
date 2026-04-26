@@ -115,8 +115,8 @@ fn list_format_format(
     let strings = extract_string_list(list_arg, runtime)?;
     let formatted = perform_list_format(&strings, &data);
 
-    let handle = runtime.alloc_string(formatted)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime.alloc_string_value(&(formatted).to_string()).map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ═══════════════════════════════════════════════════════════════════

@@ -78,6 +78,28 @@ pub unsafe fn scavenge(
     trace_table: &TraceTable,
     root_slots: &[*mut *const GcHeader],
 ) -> ScavengeResult {
+    let result = unsafe { scavenge_no_flip(new_space, old_space, trace_table, root_slots) };
+    new_space.flip();
+    result
+}
+
+/// Two-phase scavenge: runs the copy phase (root evacuation + Cheney scan)
+/// and leaves the from-space alive. Use [`NewSpace::flip`] (or
+/// [`crate::heap::GcHeap::flip_after_scavenge_fixup`]) once external
+/// pointer fixup is done. Forwarding pointers in from-space objects are
+/// readable until the flip drops the pages.
+///
+/// # Safety
+///
+/// Same contract as [`scavenge`] — root slots must be valid, the trace
+/// table must cover every type tag, and no other thread may access the
+/// heap during the copy phase.
+pub unsafe fn scavenge_no_flip(
+    new_space: &mut NewSpace,
+    old_space: &mut OldSpace,
+    trace_table: &TraceTable,
+    root_slots: &[*mut *const GcHeader],
+) -> ScavengeResult {
     let mut state = ScavengeState {
         result: ScavengeResult {
             copied_count: 0,
@@ -107,9 +129,6 @@ pub unsafe fn scavenge(
     // This is handled by the cheney scan above for to-space. For promoted
     // objects, we'd need a separate scan. For now, the trace_table visit in
     // phase 1/2 handles child evacuation during copy.
-
-    // Phase 4: Flip — from-space becomes garbage, to-space becomes from-space.
-    new_space.flip();
 
     state.result
 }

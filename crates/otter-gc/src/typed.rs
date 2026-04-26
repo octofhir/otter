@@ -412,6 +412,19 @@ impl TypedHeap {
         }
     }
 
+    /// Mutable iterator over live slots. Used by post-scavenge fixup
+    /// passes that rewrite embedded GC pointers in place.
+    pub fn for_each_mut<F>(&mut self, mut visitor: F)
+    where
+        F: FnMut(u32, &mut dyn Any),
+    {
+        for (idx, slot_opt) in self.slots.iter_mut().enumerate() {
+            if let Some(slot) = slot_opt {
+                visitor(idx as u32, slot.object.as_any_mut());
+            }
+        }
+    }
+
     /// Access to the underlying page-based GcHeap (for direct page operations).
     pub fn gc_heap(&self) -> &GcHeap {
         &self.gc

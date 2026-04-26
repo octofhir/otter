@@ -658,13 +658,11 @@ fn error_constructor(
         let msg = runtime
             .js_to_string(*msg_arg)
             .map_err(|error| map_interpreter_error(error, runtime))?;
-        let msg_handle = runtime.alloc_string(msg)?;
-        define_non_enumerable_data_property(
-            runtime,
-            handle,
-            "message",
-            RegisterValue::from_object_handle(msg_handle.0),
-        )?;
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let msg_value = runtime
+            .alloc_string_value(&msg)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        define_non_enumerable_data_property(runtime, handle, "message", msg_value)?;
     }
 
     // §20.5.1.1 step 5: InstallErrorCause(O, options)

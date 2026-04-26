@@ -470,7 +470,7 @@ fn json_stringify(
         // skipping the wrapper-object allocation removes one
         // indirection on the public JSON.stringify result.
         let value = runtime
-            .alloc_string_gc_value(&out)
+            .alloc_string_value(&out)
             .map_err(|e| {
                 VmNativeCallError::Internal(
                     format!("JSON.stringify result alloc failed: {e:?}").into(),

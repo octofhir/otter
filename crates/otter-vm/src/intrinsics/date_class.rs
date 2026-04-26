@@ -971,8 +971,10 @@ fn date_constructor(
     if !runtime.is_current_native_construct_call() {
         let now = chrono::Local::now();
         let text = now.format("%a %b %d %Y %H:%M:%S GMT%z").to_string();
-        let handle = runtime.alloc_string(text)?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime.alloc_string_value(&text).map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(value);
     }
 
     let receiver = this.as_object_handle().map(ObjectHandle).ok_or_else(|| {
@@ -1725,12 +1727,16 @@ fn date_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     };
     let local: DateTime<Local> = dt.into();
     let year_str = format_year(local.year());
@@ -1750,8 +1756,10 @@ fn date_to_string(
         abs_offset / 3600,
         (abs_offset % 3600) / 60,
     );
-    let h = runtime.alloc_string(s)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let h = runtime.alloc_string_value(&s).map_err(|e| {
+        crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+    })?;
+    Ok(h)
 }
 
 /// §21.4.4.35 toDateString
@@ -1762,12 +1770,16 @@ fn date_to_date_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     };
     let local: DateTime<Local> = dt.into();
     let s = format!(
@@ -1777,8 +1789,10 @@ fn date_to_date_string(
         local.day(),
         format_year(local.year()),
     );
-    let h = runtime.alloc_string(s)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let h = runtime.alloc_string_value(&s).map_err(|e| {
+        crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+    })?;
+    Ok(h)
 }
 
 /// §21.4.4.40 toTimeString
@@ -1789,12 +1803,16 @@ fn date_to_time_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     };
     let local: DateTime<Local> = dt.into();
     let offset_secs = local.offset().local_minus_utc();
@@ -1809,8 +1827,10 @@ fn date_to_time_string(
         abs_offset / 3600,
         (abs_offset % 3600) / 60,
     );
-    let h = runtime.alloc_string(s)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let h = runtime.alloc_string_value(&s).map_err(|e| {
+        crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+    })?;
+    Ok(h)
 }
 
 /// §21.4.4.36 toISOString
@@ -1845,8 +1865,10 @@ fn date_to_iso_string(
         sec as u32,
         ms_val as u32,
     );
-    let h = runtime.alloc_string(s)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let h = runtime.alloc_string_value(&s).map_err(|e| {
+        crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+    })?;
+    Ok(h)
 }
 
 /// §21.4.4.43 toUTCString
@@ -1857,12 +1879,16 @@ fn date_to_utc_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let ts = date_data(*this, runtime)?;
     if ts.is_nan() {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     }
     let Some(dt) = ts_to_utc(ts) else {
-        let h = runtime.alloc_string("Invalid Date")?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let h = runtime.alloc_string_value("Invalid Date").map_err(|e| {
+            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+        })?;
+        return Ok(h);
     };
     let year_str = if dt.year() < 0 {
         format!("-{:04}", dt.year().abs())
@@ -1879,8 +1905,10 @@ fn date_to_utc_string(
         dt.minute(),
         dt.second(),
     );
-    let h = runtime.alloc_string(s)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let h = runtime.alloc_string_value(&s).map_err(|e| {
+        crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+    })?;
+    Ok(h)
 }
 
 /// §21.4.4.37 toJSON

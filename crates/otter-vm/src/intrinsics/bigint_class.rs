@@ -328,7 +328,7 @@ fn bigint_to_string(
     };
 
     let value = runtime
-        .alloc_string_gc_value(&text)
+        .alloc_string_value(&text)
         .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
     Ok(value)
 }
@@ -357,7 +357,7 @@ fn bigint_to_locale_string(
     };
 
     let value = runtime
-        .alloc_string_gc_value(&result)
+        .alloc_string_value(&result)
         .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
     Ok(value)
 }

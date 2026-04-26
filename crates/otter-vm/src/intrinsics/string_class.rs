@@ -930,8 +930,10 @@ fn string_to_upper_case(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.to_uppercase())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&s.to_uppercase())
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.26 String.prototype.toLowerCase() ──────────────────────────────
@@ -942,8 +944,10 @@ fn string_to_lower_case(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.to_lowercase())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&s.to_lowercase())
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.29 String.prototype.trim() ─────────────────────────────────────
@@ -954,8 +958,10 @@ fn string_trim(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.trim())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(s.trim())
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn string_trim_start(
@@ -964,8 +970,10 @@ fn string_trim_start(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.trim_start())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(s.trim_start())
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn string_trim_end(
@@ -974,8 +982,10 @@ fn string_trim_end(
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let s = this_string_value(this, runtime)?;
-    let handle = runtime.alloc_string(s.trim_end())?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(s.trim_end())
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.16 String.prototype.repeat(count) ─────────────────────────────
@@ -1009,8 +1019,10 @@ fn string_repeat(
         check_interrupt_poll(runtime, i)?;
         result.push_str(&s);
     }
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn range_error(runtime: &mut crate::interpreter::RuntimeState, message: &str) -> VmNativeCallError {
@@ -1050,9 +1062,10 @@ fn string_pad_start(
     };
     let fill_units = fill_js.as_utf16();
     if fill_units.is_empty() {
-        let handle = runtime
-            .alloc_js_string(crate::js_string::JsString::from_utf16(s_units.to_vec()))?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_value_from_utf16(s_units)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     let pad_needed = max_len - s_units.len();
     let mut padded: Vec<u16> = Vec::with_capacity(max_len);
@@ -1061,8 +1074,10 @@ fn string_pad_start(
         padded.push(fill_units[i % fill_units.len()]);
     }
     padded.extend_from_slice(s_units);
-    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(padded))?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value_from_utf16(&padded)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.13 String.prototype.padEnd(maxLength [, fillString]) ───────────
@@ -1097,9 +1112,10 @@ fn string_pad_end(
     };
     let fill_units = fill_js.as_utf16();
     if fill_units.is_empty() {
-        let handle = runtime
-            .alloc_js_string(crate::js_string::JsString::from_utf16(s_units.to_vec()))?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        let value = runtime
+            .alloc_string_value_from_utf16(s_units)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     let pad_needed = max_len - s_units.len();
     let mut padded: Vec<u16> = Vec::with_capacity(max_len);
@@ -1108,8 +1124,10 @@ fn string_pad_end(
         check_interrupt_poll(runtime, i)?;
         padded.push(fill_units[i % fill_units.len()]);
     }
-    let handle = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(padded))?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value_from_utf16(&padded)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Try to call `arg[symbolKey](this, ...extra_args)`.
@@ -1531,8 +1549,10 @@ fn string_replace_all(
     }
 
     let result = s.replace(&*search, &replace_str);
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.12 String.prototype.normalize([form]) ──────────────────────────
@@ -1573,8 +1593,10 @@ fn string_normalize(
         }
     };
 
-    let handle = runtime.alloc_string(normalized)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&normalized)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Get the raw `JsString` from `this` — preserves lone surrogates.
@@ -1754,8 +1776,10 @@ fn string_to_locale_lower_case(
         s.to_lowercase()
     };
 
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.23 String.prototype.toLocaleUpperCase([locale]) ──────────────
@@ -1796,8 +1820,10 @@ fn string_to_locale_upper_case(
         s.to_uppercase()
     };
 
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1830,7 +1856,7 @@ fn string_from_char_code(
     // the result is a `TAG_PTR_STRING` value, removing the legacy
     // wrapper-object indirection.
     let value = runtime
-        .alloc_string_gc_value_from_utf16(&buf)
+        .alloc_string_value_from_utf16(&buf)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     Ok(value)
 }
@@ -1866,7 +1892,7 @@ fn string_from_code_point(
     }
     // Strategy B: return a GC-managed `TAG_PTR_STRING` value.
     let value = runtime
-        .alloc_string_gc_value(&result)
+        .alloc_string_value(&result)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     Ok(value)
 }
@@ -1953,8 +1979,10 @@ fn string_raw(
         }
     }
 
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Read a named data property from an object, returning `undefined` if absent.

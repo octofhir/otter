@@ -581,19 +581,18 @@ fn regexp_builtin_exec(
     let result = runtime.alloc_array()?;
 
     // [0] = full match string
-    // C13: preserve lone surrogates (WTF-16). `String::from_utf16_lossy`
-    // would replace each unpaired surrogate with U+FFFD, silently
-    // corrupting captures over WTF-16 inputs.
+    // C13: preserve lone surrogates (WTF-16). Strategy B: allocate via
+    // the GC-managed string path so capture values live in `GcHeap`
+    // pages with TAG_PTR_STRING. `String::from_utf16_lossy` would
+    // replace each unpaired surrogate with U+FFFD; the new path
+    // preserves them verbatim.
     let full_match_utf16 = &utf16[match_start_utf16..match_end_utf16];
-    let full_match_handle = runtime
-        .alloc_js_string(crate::js_string::JsString::from_utf16(full_match_utf16.to_vec()))?;
+    let full_match_value = runtime
+        .alloc_string_value_from_utf16(full_match_utf16)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
     runtime
         .objects_mut()
-        .set_index(
-            result,
-            0,
-            RegisterValue::from_object_handle(full_match_handle.0),
-        )
+        .set_index(result, 0, full_match_value)
         .ok();
 
     // [1..n] = capture groups
@@ -605,9 +604,9 @@ fn regexp_builtin_exec(
         let cap_val = match &m.captures[i] {
             Some(range) => {
                 let cap_utf16 = &utf16[range.start..range.end];
-                let cap_handle = runtime
-                    .alloc_js_string(crate::js_string::JsString::from_utf16(cap_utf16.to_vec()))?;
-                RegisterValue::from_object_handle(cap_handle.0)
+                runtime
+                    .alloc_string_value_from_utf16(cap_utf16)
+                    .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?
             }
             None => RegisterValue::undefined(),
         };
@@ -629,12 +628,11 @@ fn regexp_builtin_exec(
         for (name, val) in &named {
             let prop = runtime.intern_property_name(name);
             let v = match val {
-                Some(units) => {
-                    let sh = runtime.alloc_js_string(crate::js_string::JsString::from_utf16(
-                        units.clone(),
-                    ))?;
-                    RegisterValue::from_object_handle(sh.0)
-                }
+                Some(units) => runtime
+                    .alloc_string_value_from_utf16(units)
+                    .map_err(|e| {
+                        crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+                    })?,
                 None => RegisterValue::undefined(),
             };
             runtime.objects_mut().set_property(groups, prop, v).ok();
@@ -652,15 +650,13 @@ fn regexp_builtin_exec(
         )
         .ok();
 
-    // .input property
+    // .input property — Strategy B TAG_PTR_STRING.
     let input_prop = runtime.intern_property_name("input");
-    let input_handle = runtime.alloc_string(input)?;
+    let input_value = runtime
+        .alloc_string_value(input)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
     runtime
-        .set_named_property(
-            result,
-            input_prop,
-            RegisterValue::from_object_handle(input_handle.0),
-        )
+        .set_named_property(result, input_prop, input_value)
         .ok();
 
     // .groups property
@@ -924,8 +920,11 @@ fn regexp_to_string(
         escape_pattern(&pattern)
     };
     let result = format!("/{source}/{flags}");
-    let h = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    // Strategy B: TAG_PTR_STRING return for RegExp.prototype.toString.
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Escape special characters in the pattern for source representation.
@@ -1005,8 +1004,10 @@ fn regexp_get_source(
     };
     if !matches!(runtime.objects().kind(handle), Ok(HeapValueKind::RegExp)) {
         if handle == runtime.intrinsics().regexp_prototype {
-            let h = runtime.alloc_string("(?:)")?;
-            return Ok(RegisterValue::from_object_handle(h.0));
+            let value = runtime
+                .alloc_string_value("(?:)")
+                .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            return Ok(value);
         }
         return Err(type_error(
             runtime,
@@ -1019,8 +1020,10 @@ fn regexp_get_source(
     } else {
         escape_pattern(&pattern)
     };
-    let h = runtime.alloc_string(source)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let value = runtime
+        .alloc_string_value(&source)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §22.2.6.4 get RegExp.prototype.flags. Reads flag properties via [[Get]]
@@ -1060,8 +1063,10 @@ fn regexp_get_flags(
             out.push(*ch);
         }
     }
-    let h = runtime.alloc_string(out)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let value = runtime
+        .alloc_string_value(&out)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §22.2.6.5–.13 RegExp.prototype.{global,ignoreCase,multiline,dotAll,unicode,
@@ -1293,8 +1298,10 @@ fn regexp_symbol_replace(
     }
 
     if results.is_empty() {
-        let h = runtime.alloc_string(input.as_str())?;
-        return Ok(RegisterValue::from_object_handle(h.0));
+        let value = runtime
+            .alloc_string_value(input.as_str())
+            .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
 
     let mut output = String::new();
@@ -1351,8 +1358,10 @@ fn regexp_symbol_replace(
                 }
             }
             fn_args.push(RegisterValue::from_i32(match_index as i32));
-            let input_h = runtime.alloc_string(input.as_str())?;
-            fn_args.push(RegisterValue::from_object_handle(input_h.0));
+            let input_value = runtime
+                .alloc_string_value(input.as_str())
+                .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            fn_args.push(input_value);
             let result = runtime.call_callable(fn_handle, RegisterValue::undefined(), &fn_args)?;
             runtime
                 .js_to_string(result)
@@ -1382,8 +1391,10 @@ fn regexp_symbol_replace(
     let after_utf16 = &input_utf16[last_end_utf16..];
     output.push_str(&String::from_utf16_lossy(after_utf16));
 
-    let h = runtime.alloc_string(output)?;
-    Ok(RegisterValue::from_object_handle(h.0))
+    let value = runtime
+        .alloc_string_value(&output)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Implements §22.1.3.17.1 GetSubstitution — replacement string templates.
@@ -1602,11 +1613,12 @@ fn regexp_symbol_split(
         set_last_index(splitter, 0.0, runtime);
         match regexp_builtin_exec(splitter, &input, runtime)? {
             None => {
-                let sh = runtime.alloc_string(input.as_str())?;
-                runtime
-                    .objects_mut()
-                    .set_index(result, 0, RegisterValue::from_object_handle(sh.0))
-                    .ok();
+                let sv = runtime
+                    .alloc_string_value(input.as_str())
+                    .map_err(|e| {
+                        crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+                    })?;
+                runtime.objects_mut().set_index(result, 0, sv).ok();
             }
             Some(_) => { /* empty */ }
         }
@@ -1632,12 +1644,12 @@ fn regexp_symbol_split(
                 } else {
                     // Add segment from p to q.
                     let segment_utf16 = &input_utf16[p..q];
-                    let segment = String::from_utf16_lossy(segment_utf16);
-                    let sh = runtime.alloc_string(segment)?;
-                    runtime
-                        .objects_mut()
-                        .set_index(result, result_len, RegisterValue::from_object_handle(sh.0))
-                        .ok();
+                    let sv = runtime
+                        .alloc_string_value_from_utf16(segment_utf16)
+                        .map_err(|e| {
+                            crate::intrinsics::string_class::map_interpreter_error(e, runtime)
+                        })?;
+                    runtime.objects_mut().set_index(result, result_len, sv).ok();
                     result_len += 1;
                     if result_len >= limit {
                         return Ok(RegisterValue::from_object_handle(result.0));
@@ -1671,12 +1683,10 @@ fn regexp_symbol_split(
 
     // Add remaining string.
     let segment_utf16 = &input_utf16[p..];
-    let segment = String::from_utf16_lossy(segment_utf16);
-    let sh = runtime.alloc_string(segment)?;
-    runtime
-        .objects_mut()
-        .set_index(result, result_len, RegisterValue::from_object_handle(sh.0))
-        .ok();
+    let sv = runtime
+        .alloc_string_value_from_utf16(segment_utf16)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    runtime.objects_mut().set_index(result, result_len, sv).ok();
 
     Ok(RegisterValue::from_object_handle(result.0))
 }

@@ -324,8 +324,10 @@ fn object_to_string(
             }
         }
     };
-    let string = runtime.alloc_string(format!("[object {tag}]"))?;
-    Ok(RegisterValue::from_object_handle(string.0))
+    let value = runtime
+        .alloc_string_value(&format!("[object {tag}]"))
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn object_is_prototype_of(
@@ -1629,8 +1631,10 @@ fn object_to_locale_string(
         crate::interpreter::InterpreterError::UncaughtThrow(v) => VmNativeCallError::Thrown(v),
         other => VmNativeCallError::Internal(format!("{other}").into()),
     })?;
-    let handle = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    let value = runtime
+        .alloc_string_value(&text)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Returns enumerable own string keys for a proxy target, using proxy traps.

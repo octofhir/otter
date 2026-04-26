@@ -128,7 +128,7 @@ fn number_to_fixed(
     }
     if number.is_nan() {
         let value = runtime
-            .alloc_string_gc_value("NaN")
+            .alloc_string_value("NaN")
             .map_err(|e| map_interpreter_error(e, runtime))?;
         return Ok(value);
     }
@@ -139,13 +139,13 @@ fn number_to_fixed(
             "-Infinity"
         };
         let value = runtime
-            .alloc_string_gc_value(s)
+            .alloc_string_value(s)
             .map_err(|e| map_interpreter_error(e, runtime))?;
         return Ok(value);
     }
     let text = format!("{number:.prec$}", prec = digits as usize);
     let value = runtime
-        .alloc_string_gc_value(&text)
+        .alloc_string_value(&text)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     Ok(value)
 }
@@ -164,7 +164,7 @@ fn number_to_precision(
     if precision == RegisterValue::undefined() {
         let text = number_to_decimal_string(number);
         let value = runtime
-            .alloc_string_gc_value(&text)
+            .alloc_string_value(&text)
             .map_err(|e| map_interpreter_error(e, runtime))?;
         return Ok(value);
     }
@@ -181,7 +181,7 @@ fn number_to_precision(
     if number.is_nan() || number.is_infinite() {
         let text = number_to_decimal_string(number);
         let value = runtime
-            .alloc_string_gc_value(&text)
+            .alloc_string_value(&text)
             .map_err(|e| map_interpreter_error(e, runtime))?;
         return Ok(value);
     }
@@ -209,7 +209,7 @@ fn number_to_precision(
         )
     };
     let value = runtime
-        .alloc_string_gc_value(&text)
+        .alloc_string_value(&text)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     Ok(value)
 }
@@ -224,7 +224,7 @@ fn number_to_exponential(
     if number.is_nan() || number.is_infinite() {
         let text = number_to_decimal_string(number);
         let value = runtime
-            .alloc_string_gc_value(&text)
+            .alloc_string_value(&text)
             .map_err(|e| map_interpreter_error(e, runtime))?;
         return Ok(value);
     }
@@ -259,7 +259,7 @@ fn number_to_exponential(
         text
     };
     let value = runtime
-        .alloc_string_gc_value(&text)
+        .alloc_string_value(&text)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     Ok(value)
 }
@@ -324,7 +324,7 @@ fn number_to_locale_string(
 
     if number.is_nan() {
         let value = runtime
-            .alloc_string_gc_value("NaN")
+            .alloc_string_value("NaN")
             .map_err(|e| map_interpreter_error(e, runtime))?;
         return Ok(value);
     }
@@ -335,7 +335,7 @@ fn number_to_locale_string(
             "Infinity"
         };
         let value = runtime
-            .alloc_string_gc_value(s)
+            .alloc_string_value(s)
             .map_err(|e| map_interpreter_error(e, runtime))?;
         return Ok(value);
     }
@@ -352,7 +352,7 @@ fn number_to_locale_string(
     };
 
     let value = runtime
-        .alloc_string_gc_value(&result)
+        .alloc_string_value(&result)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     Ok(value)
 }
@@ -396,7 +396,7 @@ fn number_to_string(
     };
 
     let value = runtime
-        .alloc_string_gc_value(&text)
+        .alloc_string_value(&text)
         .map_err(|e| map_interpreter_error(e, runtime))?;
     Ok(value)
 }

@@ -1516,9 +1516,17 @@ impl Interpreter {
             }
             Opcode::ToString => {
                 let v = activation.accumulator();
-                let text = runtime.js_to_string(v)?;
-                let handle = runtime.alloc_string(text.into_string())?;
-                activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
+                // Strategy B fast path: TAG_PTR_STRING is already a
+                // string primitive — skip the round-trip through
+                // `js_to_string` (which would coerce via UTF-8 lossy)
+                // and reuse the existing GC-managed reference.
+                if v.is_string_ref() {
+                    activation.set_accumulator(v);
+                } else {
+                    let text = runtime.js_to_string(v)?;
+                    let value = runtime.alloc_string_value(&text)?;
+                    activation.set_accumulator(value);
+                }
             }
             Opcode::ToPropertyKey => {
                 // §7.1.19 ToPropertyKey — keep Symbols as-is, coerce
@@ -1528,10 +1536,13 @@ impl Interpreter {
                     runtime.js_to_primitive_with_hint(v, super::ToPrimitiveHint::String)?;
                 if primitive.as_symbol_id().is_some() {
                     activation.set_accumulator(primitive);
+                } else if primitive.is_string_ref() {
+                    // Strategy B fast path — already a string ref.
+                    activation.set_accumulator(primitive);
                 } else {
                     let text = runtime.js_to_string(primitive)?;
-                    let handle = runtime.alloc_string(text.into_string())?;
-                    activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
+                    let value = runtime.alloc_string_value(&text)?;
+                    activation.set_accumulator(value);
                 }
             }
 

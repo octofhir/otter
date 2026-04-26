@@ -269,8 +269,11 @@ fn symbol_key_for(
     let Some(key) = runtime.symbol_registry_key(value).map(str::to_owned) else {
         return Ok(RegisterValue::undefined());
     };
-    let key = runtime.alloc_string(key)?;
-    Ok(RegisterValue::from_object_handle(key.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&key)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn symbol_prototype_value_of(
@@ -288,8 +291,11 @@ fn symbol_prototype_to_string(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let symbol = this_symbol_value(*this, runtime)?;
     let text = symbol_descriptive_string(symbol, runtime);
-    let text = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(text.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&text)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn symbol_prototype_to_primitive(
@@ -309,8 +315,11 @@ fn symbol_prototype_description_getter(
     let Some(description) = runtime.symbol_description(symbol).map(str::to_owned) else {
         return Ok(RegisterValue::undefined());
     };
-    let description = runtime.alloc_string(description)?;
-    Ok(RegisterValue::from_object_handle(description.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&description)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn this_symbol_value(

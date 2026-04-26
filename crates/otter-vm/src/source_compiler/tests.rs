@@ -11562,20 +11562,14 @@ fn c13_regex_capture_returns_js_string_not_box_str() {
     let result = Interpreter::new()
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
         .expect("execute");
-    let handle = result
-        .return_value()
-        .as_object_handle()
-        .map(crate::object::ObjectHandle)
-        .expect("capture must be an object handle");
-    let js = runtime
-        .objects()
-        .string_value(handle)
-        .expect("string_value ok")
-        .expect("capture has JsString storage")
-        .clone();
-    // C2 Phase 4: 1-byte ASCII strings store as SeqOneByte; use the
-    // upcasting accessor to compare against u16 units.
-    assert_eq!(js.as_utf16_cow().as_ref(), &[0x42u16][..]);
+    // Strategy B: capture is now TAG_PTR_STRING. Read WTF-16 directly
+    // via the new path.
+    let return_value = result.return_value();
+    let gc_ref = return_value
+        .as_string_ref()
+        .expect("capture must be a GC-managed string");
+    let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+    assert_eq!(cow.as_ref(), &[0x42u16][..]);
 }
 
 #[test]
@@ -11596,19 +11590,13 @@ fn c13_regex_named_capture_returns_js_string() {
     let result = Interpreter::new()
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
         .expect("execute");
-    let handle = result
-        .return_value()
-        .as_object_handle()
-        .map(crate::object::ObjectHandle)
-        .expect("named capture must be a string object handle");
-    let js = runtime
-        .objects()
-        .string_value(handle)
-        .expect("string_value ok")
-        .expect("named capture has JsString storage")
-        .clone();
-    // C2 Phase 4: ASCII captures store as SeqOneByte.
-    assert_eq!(js.as_utf16_cow().as_ref(), &[0x32u16][..]);
+    // Strategy B: named capture is now TAG_PTR_STRING.
+    let return_value = result.return_value();
+    let gc_ref = return_value
+        .as_string_ref()
+        .expect("named capture must be a GC-managed string");
+    let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+    assert_eq!(cow.as_ref(), &[0x32u16][..]);
 }
 
 #[test]

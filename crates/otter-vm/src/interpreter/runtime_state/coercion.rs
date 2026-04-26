@@ -1075,13 +1075,10 @@ impl RuntimeState {
     pub fn alloc_type_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().type_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype))?;
-        let msg_handle = self.objects.alloc_string(message)?;
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let msg_value = self.alloc_string_value(message)?;
         let msg_prop = self.intern_property_name("message");
-        self.objects.set_property(
-            handle,
-            msg_prop,
-            RegisterValue::from_object_handle(msg_handle.0),
-        )?;
+        self.objects.set_property(handle, msg_prop, msg_value)?;
         Ok(handle)
     }
 
@@ -1089,13 +1086,10 @@ impl RuntimeState {
     pub fn alloc_range_error(&mut self, message: &str) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().range_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype))?;
-        let msg_handle = self.objects.alloc_string(message)?;
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let msg_value = self.alloc_string_value(message)?;
         let msg_prop = self.intern_property_name("message");
-        self.objects.set_property(
-            handle,
-            msg_prop,
-            RegisterValue::from_object_handle(msg_handle.0),
-        )?;
+        self.objects.set_property(handle, msg_prop, msg_value)?;
         Ok(handle)
     }
 

@@ -470,8 +470,11 @@ fn array_join(
     }
 
     let result = parts.join(&separator);
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Upper bound for a single `Vec::with_capacity(n)` call inside array
@@ -2215,8 +2218,11 @@ fn array_to_locale_string(
     }
 
     let joined = parts.join(",");
-    let handle = runtime.alloc_string(joined)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&joined)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Helper: call `.toLocaleString()` on a value.

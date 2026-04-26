@@ -40,7 +40,9 @@
 //!     ../../../docs/new-engine/adr/0002-oxc-frontend.md
 //!   )
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use otter_bytecode::{
     BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind as BytecodeSourceKind,
@@ -67,7 +69,18 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
         messages: e.messages,
     })?;
 
-    let mut cx = FunctionContext::default();
+    let module = Rc::new(RefCell::new(ModuleBuilder::default()));
+    // Reserve slot 0 for `<main>` so nested function compilation
+    // can pre-register their ids deterministically (slice 13 only
+    // needs the immediate id, but the slot reservation keeps the
+    // table densely populated).
+    module.borrow_mut().functions.push(Function {
+        id: 0,
+        name: "<main>".to_string(),
+        span: (program.span.start, program.span.end),
+        ..Default::default()
+    });
+    let mut cx = FunctionContext::new(Rc::clone(&module));
     cx.enter_scope();
     let mut last_value_reg: Option<u16> = None;
 
@@ -96,25 +109,48 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
     let span = (program.span.start, program.span.end);
     cx.emit(Op::Return, vec![Operand::Register(return_reg)], span);
 
+    // Finalize `<main>` into the module's function table, then
+    // drop `cx` so the module Rc has a single owner before
+    // `try_unwrap`.
+    {
+        let mut m = module.borrow_mut();
+        m.functions[0].locals = 0;
+        m.functions[0].scratch = cx.scratch;
+        m.functions[0].code = std::mem::take(&mut cx.code);
+        m.functions[0].spans = std::mem::take(&mut cx.spans);
+    }
+    drop(cx);
+
     let kind = match parsed.kind {
         SyntaxSourceKind::JavaScript => BytecodeSourceKind::JavaScript,
         SyntaxSourceKind::TypeScript => BytecodeSourceKind::TypeScript,
     };
 
+    let ModuleBuilder {
+        functions,
+        constants,
+    } = Rc::try_unwrap(module)
+        .expect("module builder should be uniquely owned at finalize")
+        .into_inner();
+
     Ok(BytecodeModule {
         module: module_specifier.to_string(),
         source_kind: kind,
-        functions: vec![Function {
-            id: 0,
-            name: "<main>".to_string(),
-            span: (program.span.start, program.span.end),
-            locals: 0,
-            scratch: cx.scratch,
-            code: cx.code,
-            spans: cx.spans,
-        }],
-        constants: cx.constants,
+        functions,
+        constants,
     })
+}
+
+/// Module-level mutable state shared across nested function
+/// compilations. Threaded as `Rc<RefCell<ModuleBuilder>>` so the
+/// `<main>` context and any nested function context can intern
+/// constants into the same pool and register their `Function`
+/// records into the same table without contorting the borrow
+/// checker.
+#[derive(Debug, Default)]
+struct ModuleBuilder {
+    functions: Vec<Function>,
+    constants: Vec<Constant>,
 }
 
 /// One lexical scope's binding table. The compiler keeps a stack
@@ -133,6 +169,11 @@ struct BindingInfo {
     reg: u16,
     /// `true` for `const` declarations.
     is_const: bool,
+    /// Whether the binding has been definitely initialized at the
+    /// current compile point. `let x;` and `let x = init` start at
+    /// `false` and flip to `true` after the initializer's
+    /// `StoreLocal`. Reads before that emit `Op::TdzError`.
+    initialized: bool,
 }
 
 /// One pending loop label so `break` / `continue` can patch their
@@ -149,11 +190,11 @@ struct LoopFrame {
 }
 
 /// Per-function compilation context.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FunctionContext {
+    module: Rc<RefCell<ModuleBuilder>>,
     code: Vec<Instruction>,
     spans: Vec<SpanEntry>,
-    constants: Vec<Constant>,
     next_pc: u32,
     scratch: u16,
     /// Stack of lexical scopes. Index 0 is the function-body
@@ -164,6 +205,18 @@ struct FunctionContext {
 }
 
 impl FunctionContext {
+    fn new(module: Rc<RefCell<ModuleBuilder>>) -> Self {
+        Self {
+            module,
+            code: Vec::new(),
+            spans: Vec::new(),
+            next_pc: 0,
+            scratch: 0,
+            scopes: Vec::new(),
+            loops: Vec::new(),
+        }
+    }
+
     fn alloc_scratch(&mut self) -> u16 {
         let r = self.scratch;
         self.scratch = self.scratch.checked_add(1).expect("register overflow");
@@ -196,9 +249,14 @@ impl FunctionContext {
         }
         let reg = self.scratch;
         self.scratch = self.scratch.checked_add(1).expect("register overflow");
-        scope
-            .bindings
-            .insert(name.to_string(), BindingInfo { reg, is_const });
+        scope.bindings.insert(
+            name.to_string(),
+            BindingInfo {
+                reg,
+                is_const,
+                initialized: false,
+            },
+        );
         Ok(reg)
     }
 
@@ -209,6 +267,21 @@ impl FunctionContext {
             }
         }
         None
+    }
+
+    /// Flip a binding's `initialized` flag to `true` once we've
+    /// emitted its initializer's store. The compiler is intentionally
+    /// conservative: we never flip back to `false` and we never
+    /// "merge" branch states — task 14 ships the simple definite-
+    /// assignment rule and leaves branch-aware refinement for a
+    /// future slice.
+    fn mark_initialized(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(info) = scope.bindings.get_mut(name) {
+                info.initialized = true;
+                return;
+            }
+        }
     }
 
     /// Emit a placeholder branch and return its instruction index
@@ -250,31 +323,46 @@ impl FunctionContext {
     }
 
     fn intern_string_constant(&mut self, value: &str) -> u32 {
-        // Linear scan — fine for the harness slice; replace with a
-        // hashmap once constant tables grow.
         let utf16: Vec<u16> = value.encode_utf16().collect();
-        for (i, c) in self.constants.iter().enumerate() {
+        let mut module = self.module.borrow_mut();
+        for (i, c) in module.constants.iter().enumerate() {
             if let Constant::String { utf16: existing } = c
                 && existing == &utf16
             {
                 return i as u32;
             }
         }
-        self.constants.push(Constant::String { utf16 });
-        (self.constants.len() - 1) as u32
+        module.constants.push(Constant::String { utf16 });
+        (module.constants.len() - 1) as u32
     }
 
     fn intern_number_constant(&mut self, value: f64) -> u32 {
         let bits = value.to_bits();
-        for (i, c) in self.constants.iter().enumerate() {
+        let mut module = self.module.borrow_mut();
+        for (i, c) in module.constants.iter().enumerate() {
             if let Constant::Number { bits: existing } = c
                 && *existing == bits
             {
                 return i as u32;
             }
         }
-        self.constants.push(Constant::Number { bits });
-        (self.constants.len() - 1) as u32
+        module.constants.push(Constant::Number { bits });
+        (module.constants.len() - 1) as u32
+    }
+
+    fn intern_function_id(&mut self, function_id: u32) -> u32 {
+        let mut module = self.module.borrow_mut();
+        for (i, c) in module.constants.iter().enumerate() {
+            if let Constant::FunctionId { index } = c
+                && *index == function_id
+            {
+                return i as u32;
+            }
+        }
+        module
+            .constants
+            .push(Constant::FunctionId { index: function_id });
+        (module.constants.len() - 1) as u32
     }
 
     fn emit(&mut self, op: Op, operands: Vec<Operand>, span: (u32, u32)) {
@@ -347,10 +435,14 @@ fn compile_statement(
                     }
                 };
                 let reg = cx.declare_binding(&name, is_const, span)?;
+                // The initializer expression sees the binding in
+                // its TDZ: `let x = x + 1;` should throw because
+                // the right-hand `x` reads before initialization.
                 let init_reg = match &declarator.init {
                     Some(init) => compile_expr(cx, init, span)?,
                     None => {
-                        // No initializer → undefined.
+                        // No initializer → spec rule:
+                        // `let x;` completes with `x = undefined`.
                         let dst = cx.alloc_scratch();
                         cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
                         dst
@@ -361,6 +453,7 @@ fn compile_statement(
                     vec![Operand::Register(init_reg), Operand::Imm32(reg as i32)],
                     span,
                 );
+                cx.mark_initialized(&name);
             }
             Ok(None)
         }
@@ -493,6 +586,53 @@ fn compile_statement(
             Ok(None)
         }
 
+        Statement::FunctionDeclaration(f) => {
+            let span = (f.span.start, f.span.end);
+            let name =
+                f.id.as_ref()
+                    .ok_or(CompileError::Unsupported {
+                        node: "FunctionDeclaration without name".to_string(),
+                        span,
+                    })?
+                    .name
+                    .as_str()
+                    .to_string();
+            let function_id = compile_function(cx, &name, &f.params, &f.body, span)?;
+            // Bind the name in the current scope to a register
+            // holding the function value. Foundation slice doesn't
+            // hoist; declarations are evaluated at their lexical
+            // position.
+            let reg = cx.declare_binding(&name, false, span)?;
+            let const_idx = cx.intern_function_id(function_id);
+            let tmp = cx.alloc_scratch();
+            cx.emit(
+                Op::MakeFunction,
+                vec![Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+                span,
+            );
+            cx.emit(
+                Op::StoreLocal,
+                vec![Operand::Register(tmp), Operand::Imm32(reg as i32)],
+                span,
+            );
+            cx.mark_initialized(&name);
+            Ok(None)
+        }
+
+        Statement::ReturnStatement(r) => {
+            let span = (r.span.start, r.span.end);
+            match &r.argument {
+                Some(arg) => {
+                    let reg = compile_expr(cx, arg, span)?;
+                    cx.emit(Op::ReturnValue, vec![Operand::Register(reg)], span);
+                }
+                None => {
+                    cx.emit(Op::ReturnUndefined, vec![], span);
+                }
+            }
+            Ok(None)
+        }
+
         Statement::ContinueStatement(s) => {
             let span = (s.span.start, s.span.end);
             if s.label.is_some() {
@@ -564,8 +704,226 @@ fn compile_for_init_decl(
             vec![Operand::Register(init_reg), Operand::Imm32(reg as i32)],
             span,
         );
+        cx.mark_initialized(&name);
     }
     Ok(())
+}
+
+/// Compile a function body into a fresh `Function` record and
+/// return its id. Parameters are bound as locals at registers
+/// `0..param_count`. Foundation subset rejects rest / default /
+/// destructuring parameters.
+fn compile_function(
+    parent: &mut FunctionContext,
+    name: &str,
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
+    span: (u32, u32),
+) -> Result<u32, CompileError> {
+    if params.rest.is_some() {
+        return Err(CompileError::Unsupported {
+            node: "FunctionDeclaration: rest parameter".to_string(),
+            span,
+        });
+    }
+    let mut cx = FunctionContext::new(Rc::clone(&parent.module));
+    cx.enter_scope();
+    let mut param_count: u16 = 0;
+    for param in &params.items {
+        if param.pattern.kind_initializer().is_some() {
+            return Err(CompileError::Unsupported {
+                node: "FunctionDeclaration: default parameter".to_string(),
+                span,
+            });
+        }
+        let name = match &param.pattern {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+            _ => {
+                return Err(CompileError::Unsupported {
+                    node: "FunctionDeclaration: destructuring parameter".to_string(),
+                    span,
+                });
+            }
+        };
+        // Parameter binding lives at register index = param ordinal
+        // and is initialized by the caller's argument-binding step,
+        // so the body can read it without TDZ.
+        cx.declare_binding(&name, false, span)?;
+        cx.mark_initialized(&name);
+        param_count = param_count.checked_add(1).expect("too many parameters");
+    }
+
+    // Reserve the function's id ahead of compilation so the body
+    // can reference its own name (recursion). This mirrors the
+    // "function declaration is bound in its own scope" semantics
+    // without needing a real closure model — slice 13 keeps
+    // upvalues out.
+    let function_id = parent.module.borrow().functions.len() as u32;
+    parent.module.borrow_mut().functions.push(Function {
+        id: function_id,
+        name: name.to_string(),
+        span,
+        ..Default::default()
+    });
+    let self_reg = cx.declare_binding(name, false, span)?;
+    let const_idx = cx.intern_function_id(function_id);
+    let tmp = cx.alloc_scratch();
+    cx.emit(
+        Op::MakeFunction,
+        vec![Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+        span,
+    );
+    cx.emit(
+        Op::StoreLocal,
+        vec![Operand::Register(tmp), Operand::Imm32(self_reg as i32)],
+        span,
+    );
+    cx.mark_initialized(name);
+
+    if let Some(body) = body {
+        for stmt in &body.statements {
+            compile_statement(&mut cx, stmt)?;
+        }
+    }
+    cx.exit_scope();
+    // Implicit `return undefined;` at the function tail.
+    cx.emit(Op::ReturnUndefined, vec![], span);
+
+    let mut module = parent.module.borrow_mut();
+    let slot = module
+        .functions
+        .get_mut(function_id as usize)
+        .expect("reserved function slot");
+    slot.locals = 0;
+    slot.scratch = cx.scratch;
+    slot.param_count = param_count;
+    slot.code = cx.code;
+    slot.spans = cx.spans;
+    Ok(function_id)
+}
+
+/// Compile an arrow function. Two body shapes share the same
+/// lowering:
+///
+/// - `() => expr` (expression body): one synthetic
+///   `ReturnValue(expr)`.
+/// - `() => { ... }` (block body): existing function-body
+///   compilation, with an implicit `ReturnUndefined` tail.
+///
+/// Captured-environment access (`this`, outer-scope variables) is
+/// **not** supported in this slice — the compiler creates a fresh
+/// `FunctionContext` so a body that references an outer-scope
+/// binding fails fast with a clear `unresolved identifier`
+/// diagnostic.
+fn compile_arrow_function(
+    parent: &mut FunctionContext,
+    arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
+    span: (u32, u32),
+) -> Result<u32, CompileError> {
+    if arrow.params.rest.is_some() {
+        return Err(CompileError::Unsupported {
+            node: "ArrowFunction: rest parameter".to_string(),
+            span,
+        });
+    }
+    if arrow.r#async {
+        return Err(CompileError::Unsupported {
+            node: "ArrowFunction: async".to_string(),
+            span,
+        });
+    }
+    let mut cx = FunctionContext::new(Rc::clone(&parent.module));
+    cx.enter_scope();
+
+    let mut param_count: u16 = 0;
+    for param in &arrow.params.items {
+        if param.pattern.kind_initializer().is_some() {
+            return Err(CompileError::Unsupported {
+                node: "ArrowFunction: default parameter".to_string(),
+                span,
+            });
+        }
+        let name = match &param.pattern {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+            _ => {
+                return Err(CompileError::Unsupported {
+                    node: "ArrowFunction: destructuring parameter".to_string(),
+                    span,
+                });
+            }
+        };
+        cx.declare_binding(&name, false, span)?;
+        cx.mark_initialized(&name);
+        param_count = param_count.checked_add(1).expect("too many parameters");
+    }
+
+    // Reserve the function record up front so we can emit
+    // `MakeFunction` for the result later.
+    let function_id = parent.module.borrow().functions.len() as u32;
+    parent.module.borrow_mut().functions.push(Function {
+        id: function_id,
+        name: "<arrow>".to_string(),
+        span,
+        ..Default::default()
+    });
+
+    if arrow.expression {
+        // `() => expr` — body is a single ExpressionStatement
+        // whose expression is the implicit return value.
+        let stmt = arrow
+            .body
+            .statements
+            .first()
+            .ok_or(CompileError::Unsupported {
+                node: "ArrowFunction: empty expression body".to_string(),
+                span,
+            })?;
+        let Statement::ExpressionStatement(es) = stmt else {
+            return Err(CompileError::Unsupported {
+                node: "ArrowFunction: malformed expression body".to_string(),
+                span,
+            });
+        };
+        let inner_span = (es.span.start, es.span.end);
+        let reg = compile_expr(&mut cx, &es.expression, inner_span)?;
+        cx.emit(Op::ReturnValue, vec![Operand::Register(reg)], inner_span);
+    } else {
+        for stmt in &arrow.body.statements {
+            compile_statement(&mut cx, stmt)?;
+        }
+        cx.emit(Op::ReturnUndefined, vec![], span);
+    }
+    cx.exit_scope();
+
+    let mut module = parent.module.borrow_mut();
+    let slot = module
+        .functions
+        .get_mut(function_id as usize)
+        .expect("reserved function slot");
+    slot.locals = 0;
+    slot.scratch = cx.scratch;
+    slot.param_count = param_count;
+    slot.code = cx.code;
+    slot.spans = cx.spans;
+    Ok(function_id)
+}
+
+/// Tiny helper: detect whether a `BindingPattern` carries a
+/// default-value initializer. OXC's `BindingPattern` is a flat enum
+/// which doesn't directly expose the initializer; the foundation
+/// subset uses this only as a guard so we can return a clean
+/// diagnostic instead of silently dropping the default.
+trait BindingPatternExt {
+    fn kind_initializer(&self) -> Option<()>;
+}
+
+impl BindingPatternExt for oxc_ast::ast::BindingPattern<'_> {
+    fn kind_initializer(&self) -> Option<()> {
+        match self {
+            oxc_ast::ast::BindingPattern::AssignmentPattern(_) => Some(()),
+            _ => None,
+        }
+    }
 }
 
 /// Adapter for the `for(...; ...; ...)` initializer's
@@ -635,11 +993,19 @@ fn compile_expr(
             match cx.lookup_binding(id.name.as_str()) {
                 Some(info) => {
                     let dst = cx.alloc_scratch();
-                    cx.emit(
-                        Op::LoadLocal,
-                        vec![Operand::Register(dst), Operand::Imm32(info.reg as i32)],
-                        span,
-                    );
+                    if info.initialized {
+                        cx.emit(
+                            Op::LoadLocal,
+                            vec![Operand::Register(dst), Operand::Imm32(info.reg as i32)],
+                            span,
+                        );
+                    } else {
+                        // Reading a `let` / `const` binding before
+                        // its initializer ran — the runtime will
+                        // raise a `ReferenceError`-equivalent
+                        // diagnostic via `Op::TdzError`.
+                        cx.emit(Op::TdzError, vec![Operand::Imm32(info.reg as i32)], span);
+                    }
                     Ok(dst)
                 }
                 None => Err(CompileError::Unsupported {
@@ -748,15 +1114,45 @@ fn compile_expr(
 
         Expression::AssignmentExpression(a) => {
             let span = (a.span.start, a.span.end);
-            // Foundation subset: only plain `=` to a bound
-            // identifier. Compound assignments (`+=`, `||=`, …)
-            // and member-target assignments are deferred.
             if !matches!(a.operator, AssignmentOperator::Assign) {
                 return Err(CompileError::Unsupported {
                     node: format!("AssignmentExpression ({:?})", a.operator),
                     span,
                 });
             }
+            // `obj.prop = value` — emit StoreProperty.
+            if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
+                let obj_reg = compile_expr(cx, &member.object, span)?;
+                let value = compile_expr(cx, &a.right, span)?;
+                let name_idx = cx.intern_string_constant(member.property.name.as_str());
+                cx.emit(
+                    Op::StoreProperty,
+                    vec![
+                        Operand::Register(obj_reg),
+                        Operand::ConstIndex(name_idx),
+                        Operand::Register(value),
+                    ],
+                    span,
+                );
+                return Ok(value);
+            }
+            // `arr[i] = value` — emit StoreElement.
+            if let AssignmentTarget::ComputedMemberExpression(member) = &a.left {
+                let arr_reg = compile_expr(cx, &member.object, span)?;
+                let idx_reg = compile_expr(cx, &member.expression, span)?;
+                let value = compile_expr(cx, &a.right, span)?;
+                cx.emit(
+                    Op::StoreElement,
+                    vec![
+                        Operand::Register(arr_reg),
+                        Operand::Register(idx_reg),
+                        Operand::Register(value),
+                    ],
+                    span,
+                );
+                return Ok(value);
+            }
+            // `name = value` — local binding store.
             let name = match &a.left {
                 AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str().to_string(),
                 _ => {
@@ -782,6 +1178,13 @@ fn compile_expr(
                 vec![Operand::Register(value), Operand::Imm32(info.reg as i32)],
                 span,
             );
+            // An explicit assignment counts as initialization for
+            // TDZ purposes, so subsequent reads stop emitting
+            // `TdzError`. (Note: per spec, an `x = 1` that
+            // *precedes* the `let x` declaration is itself a TDZ
+            // ReferenceError; that case requires hoisting and is
+            // tracked as a separate task.)
+            cx.mark_initialized(&name);
             Ok(value)
         }
 
@@ -838,6 +1241,29 @@ fn compile_expr(
 
         Expression::UnaryExpression(u) => {
             let span = (u.span.start, u.span.end);
+            // `delete obj.prop` is special: the operand isn't a
+            // value-producing expression, it's a member reference.
+            if matches!(u.operator, UnaryOperator::Delete) {
+                if let Expression::StaticMemberExpression(member) = &u.argument {
+                    let obj_reg = compile_expr(cx, &member.object, span)?;
+                    let name_idx = cx.intern_string_constant(member.property.name.as_str());
+                    let dst = cx.alloc_scratch();
+                    cx.emit(
+                        Op::DeleteProperty,
+                        vec![
+                            Operand::Register(dst),
+                            Operand::Register(obj_reg),
+                            Operand::ConstIndex(name_idx),
+                        ],
+                        span,
+                    );
+                    return Ok(dst);
+                }
+                return Err(CompileError::Unsupported {
+                    node: "delete on non-member expression".to_string(),
+                    span,
+                });
+            }
             let inner = compile_expr(cx, &u.argument, span)?;
             let dst = cx.alloc_scratch();
             let op = match u.operator {
@@ -888,6 +1314,7 @@ fn compile_expr(
                 BinaryOperator::LessEqualThan => Op::LessEq,
                 BinaryOperator::GreaterThan => Op::GreaterThan,
                 BinaryOperator::GreaterEqualThan => Op::GreaterEq,
+                BinaryOperator::Instanceof => Op::Instanceof,
                 other => {
                     return Err(CompileError::Unsupported {
                         node: format!("BinaryExpression ({other:?})"),
@@ -908,18 +1335,21 @@ fn compile_expr(
             Ok(dst)
         }
 
-        Expression::StaticMemberExpression(m) if m.property.name.as_str() == "length" => {
-            // Only string-typed receivers (literal / nested
-            // expressions whose static type the compiler trusts) at
-            // this slice. We just compile the receiver and emit
-            // LOAD_LENGTH; the VM raises TypeMismatch if the
-            // receiver isn't a string at run time.
+        Expression::StaticMemberExpression(m) => {
+            // General named member access. The runtime resolves
+            // `string.length` as the special-case length getter and
+            // walks `JsObject` properties for objects.
             let span = (m.span.start, m.span.end);
             let receiver = compile_expr(cx, &m.object, span)?;
+            let name_idx = cx.intern_string_constant(m.property.name.as_str());
             let dst = cx.alloc_scratch();
             cx.emit(
-                Op::LoadLength,
-                vec![Operand::Register(dst), Operand::Register(receiver)],
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(receiver),
+                    Operand::ConstIndex(name_idx),
+                ],
                 span,
             );
             Ok(dst)
@@ -932,7 +1362,7 @@ fn compile_expr(
             let idx = compile_expr(cx, &m.expression, span)?;
             let dst = cx.alloc_scratch();
             cx.emit(
-                Op::GetStringIndex,
+                Op::LoadElement,
                 vec![
                     Operand::Register(dst),
                     Operand::Register(recv),
@@ -951,6 +1381,123 @@ fn compile_expr(
             compile_expr(cx, &p.expression, (p.span.start, p.span.end))
         }
 
+        Expression::ArrayExpression(arr) => {
+            let span = (arr.span.start, arr.span.end);
+            let mut element_regs: Vec<u16> = Vec::with_capacity(arr.elements.len());
+            for el in &arr.elements {
+                match el {
+                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(s) => {
+                        return Err(CompileError::Unsupported {
+                            node: "ArrayExpression: spread element".to_string(),
+                            span: (s.span.start, s.span.end),
+                        });
+                    }
+                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                        // Hole: foundation slice fills with `undefined`.
+                        let r = cx.alloc_scratch();
+                        cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                        element_regs.push(r);
+                    }
+                    other => {
+                        let expr = other.to_expression();
+                        element_regs.push(compile_expr(cx, expr, span)?);
+                    }
+                }
+            }
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(2 + element_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(element_regs.len() as u32));
+            operands.extend(element_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::NewArray, operands, span);
+            Ok(dst)
+        }
+
+        Expression::ObjectExpression(obj) => {
+            let span = (obj.span.start, obj.span.end);
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::NewObject, vec![Operand::Register(dst)], span);
+            for prop in &obj.properties {
+                match prop {
+                    oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) => {
+                        let key_span = (p.span.start, p.span.end);
+                        if p.computed {
+                            return Err(CompileError::Unsupported {
+                                node: "ObjectExpression: computed key".to_string(),
+                                span: key_span,
+                            });
+                        }
+                        if !matches!(p.kind, oxc_ast::ast::PropertyKind::Init) {
+                            return Err(CompileError::Unsupported {
+                                node: "ObjectExpression: getter/setter".to_string(),
+                                span: key_span,
+                            });
+                        }
+                        let key_str = match &p.key {
+                            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
+                                id.name.as_str().to_string()
+                            }
+                            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                            _ => {
+                                return Err(CompileError::Unsupported {
+                                    node: "ObjectExpression: non-string property key".to_string(),
+                                    span: key_span,
+                                });
+                            }
+                        };
+                        let value_reg = compile_expr(cx, &p.value, key_span)?;
+                        let const_idx = cx.intern_string_constant(&key_str);
+                        cx.emit(
+                            Op::StoreProperty,
+                            vec![
+                                Operand::Register(dst),
+                                Operand::ConstIndex(const_idx),
+                                Operand::Register(value_reg),
+                            ],
+                            key_span,
+                        );
+                    }
+                    oxc_ast::ast::ObjectPropertyKind::SpreadProperty(s) => {
+                        return Err(CompileError::Unsupported {
+                            node: "ObjectExpression: spread element".to_string(),
+                            span: (s.span.start, s.span.end),
+                        });
+                    }
+                }
+            }
+            Ok(dst)
+        }
+
+        Expression::FunctionExpression(f) => {
+            let span = (f.span.start, f.span.end);
+            let name =
+                f.id.as_ref()
+                    .map(|id| id.name.as_str().to_string())
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+            let function_id = compile_function(cx, &name, &f.params, &f.body, span)?;
+            let dst = cx.alloc_scratch();
+            let const_idx = cx.intern_function_id(function_id);
+            cx.emit(
+                Op::MakeFunction,
+                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                span,
+            );
+            Ok(dst)
+        }
+
+        Expression::ArrowFunctionExpression(a) => {
+            let span = (a.span.start, a.span.end);
+            let function_id = compile_arrow_function(cx, a, span)?;
+            let dst = cx.alloc_scratch();
+            let const_idx = cx.intern_function_id(function_id);
+            cx.emit(
+                Op::MakeFunction,
+                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                span,
+            );
+            Ok(dst)
+        }
+
         other => Err(CompileError::Unsupported {
             node: format!("Expression ({})", expr_kind_name(other)),
             span: expr_span(other),
@@ -958,31 +1505,117 @@ fn compile_expr(
     }
 }
 
-/// Lower `receiver.method(args...)` where `method` is a static
-/// member access. The runtime resolves the method via the
-/// `String.prototype` intrinsic table; non-string receivers raise
-/// `TypeMismatch`. Other call shapes (free calls, computed-method
-/// access, `new`, spread) are deferred to later slices.
+/// Lower a call expression. Two forms are supported:
+///
+/// - `receiver.method(args...)` — dispatched through the
+///   `String.prototype` intrinsic table at run time.
+/// - `callee(args...)` (free call) — emits `Op::Call`. Callee must
+///   evaluate to a `Value::Function` at run time; otherwise the VM
+///   raises `NotCallable`.
+///
+/// Computed-method access, `new`, and spread arguments are
+/// deferred.
 fn compile_method_call(
     cx: &mut FunctionContext,
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Result<u16, CompileError> {
     let span = (call.span.start, call.span.end);
     let callee = unwrap_ts_expr(&call.callee);
-    let Expression::StaticMemberExpression(member) = callee else {
-        return Err(CompileError::Unsupported {
-            node: "CallExpression (non-method call)".to_string(),
+    if let Expression::StaticMemberExpression(member) = callee {
+        // Foundation built-ins on the global `Object`: lower a few
+        // canonical forms directly to dedicated opcodes so the
+        // runtime does not need a host-callable bridge yet.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Object"
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            return compile_object_builtin(cx, method, &arg_regs, span);
+        }
+        let receiver_reg = compile_expr(cx, &member.object, span)?;
+        let name = member.property.name.as_str();
+        let name_idx = cx.intern_string_constant(name);
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(receiver_reg));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallStringMethod, operands, span);
+        return Ok(dst);
+    }
+    // Free call: `callee(args...)`.
+    let callee_reg = compile_expr(cx, callee, span)?;
+    let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+    let dst = cx.alloc_scratch();
+    let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+    operands.push(Operand::Register(dst));
+    operands.push(Operand::Register(callee_reg));
+    operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+    operands.extend(arg_regs.into_iter().map(Operand::Register));
+    cx.emit(Op::Call, operands, span);
+    Ok(dst)
+}
+
+/// Lower a recognised `Object.<method>(args...)` call site to its
+/// dedicated opcode. Foundation slice 19 covers `create`,
+/// `getPrototypeOf`, and `setPrototypeOf`.
+fn compile_object_builtin(
+    cx: &mut FunctionContext,
+    method: &str,
+    arg_regs: &[u16],
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    match (method, arg_regs.len()) {
+        ("create", 1) => {
+            let proto_reg = arg_regs[0];
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::NewObject, vec![Operand::Register(dst)], span);
+            cx.emit(
+                Op::SetPrototype,
+                vec![Operand::Register(dst), Operand::Register(proto_reg)],
+                span,
+            );
+            Ok(dst)
+        }
+        ("getPrototypeOf", 1) => {
+            let obj_reg = arg_regs[0];
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::GetPrototype,
+                vec![Operand::Register(dst), Operand::Register(obj_reg)],
+                span,
+            );
+            Ok(dst)
+        }
+        ("setPrototypeOf", 2) => {
+            let obj_reg = arg_regs[0];
+            let proto_reg = arg_regs[1];
+            cx.emit(
+                Op::SetPrototype,
+                vec![Operand::Register(obj_reg), Operand::Register(proto_reg)],
+                span,
+            );
+            // Spec says `setPrototypeOf` returns `obj`; foundation
+            // mirrors that.
+            Ok(obj_reg)
+        }
+        _ => Err(CompileError::Unsupported {
+            node: format!("Object.{method}/{}", arg_regs.len()),
             span,
-        });
-    };
+        }),
+    }
+}
 
-    let receiver_reg = compile_expr(cx, &member.object, span)?;
-    let name = member.property.name.as_str();
-    let name_idx = cx.intern_string_constant(name);
-
-    // Compile each argument and collect register handles.
-    let mut arg_regs: Vec<u16> = Vec::with_capacity(call.arguments.len());
-    for arg in &call.arguments {
+fn compile_call_args(
+    cx: &mut FunctionContext,
+    args: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<Vec<u16>, CompileError> {
+    let mut regs: Vec<u16> = Vec::with_capacity(args.len());
+    for arg in args {
         match arg {
             oxc_ast::ast::Argument::SpreadElement(s) => {
                 return Err(CompileError::Unsupported {
@@ -991,24 +1624,12 @@ fn compile_method_call(
                 });
             }
             other => {
-                // The Argument enum covers every Expression variant;
-                // map it back through the Expression view.
                 let expr = other.to_expression();
-                let reg = compile_expr(cx, expr, span)?;
-                arg_regs.push(reg);
+                regs.push(compile_expr(cx, expr, span)?);
             }
         }
     }
-
-    let dst = cx.alloc_scratch();
-    let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
-    operands.push(Operand::Register(dst));
-    operands.push(Operand::Register(receiver_reg));
-    operands.push(Operand::ConstIndex(name_idx));
-    operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-    operands.extend(arg_regs.into_iter().map(Operand::Register));
-    cx.emit(Op::CallStringMethod, operands, span);
-    Ok(dst)
+    Ok(regs)
 }
 
 fn expr_kind_name(expr: &Expression<'_>) -> &'static str {
@@ -1194,14 +1815,12 @@ mod tests {
 
     #[test]
     fn unsupported_statement_rejects() {
-        let parsed = parse("if (true) {}", SyntaxSourceKind::TypeScript).unwrap();
+        // `try`/`catch` is not yet supported in the foundation
+        // subset; expect the Unsupported diagnostic with any
+        // descriptive node name.
+        let parsed = parse("try {} catch (e) {}", SyntaxSourceKind::TypeScript).unwrap();
         let err = compile(&parsed, "test.ts").unwrap_err();
-        match err {
-            CompileError::Unsupported { node, .. } => {
-                assert_eq!(node, "IfStatement");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        assert!(matches!(err, CompileError::Unsupported { .. }));
     }
 
     #[test]
@@ -1375,10 +1994,14 @@ mod tests {
     }
 
     #[test]
-    fn dot_length_compiles_to_load_length() {
+    fn dot_length_compiles_to_load_property() {
+        // Slice 17 generalised `.length` into the same
+        // `LoadProperty` opcode used for object property access;
+        // the runtime keeps the string-length fast path inside
+        // the dispatcher.
         let parsed = parse("\"abc\".length;", SyntaxSourceKind::TypeScript).unwrap();
         let module = compile(&parsed, "test.ts").unwrap();
-        assert!(module.main().code.iter().any(|i| i.op == Op::LoadLength));
+        assert!(module.main().code.iter().any(|i| i.op == Op::LoadProperty));
     }
 
     #[test]

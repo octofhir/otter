@@ -136,6 +136,65 @@ pub enum Op {
     /// Operand: `Imm32(local_index)`. Used until full lexical
     /// environments arrive.
     TdzError,
+
+    /// `r<dst> = function-value(constants[k<idx>])`. The constant
+    /// is a [`Constant::FunctionId`] referencing
+    /// [`BytecodeModule::functions`].
+    MakeFunction,
+    /// Variadic call. Operands: `dst, callee, argc, args...`. The
+    /// callee must be a function value at this slice.
+    Call,
+    /// Return `r<src>` from the current function. Reuses
+    /// [`Op::Return`] semantics in `<main>`; in nested calls the
+    /// dispatcher pops the frame and writes the value into the
+    /// caller's `return_register`.
+    ReturnValue,
+    /// Return `undefined` from the current function. Convenience
+    /// emitted at fall-through end of function bodies.
+    ReturnUndefined,
+
+    /// `r<dst> = new JsObject()`. Operand: `dst`.
+    NewObject,
+    /// `r<dst> = r<obj>.<name>`. Operands: `dst, obj, name_const`.
+    /// Missing property reads as `undefined`. Non-object receivers
+    /// raise `TypeMismatch`.
+    LoadProperty,
+    /// `r<obj>.<name> = r<src>`. Operands: `obj, name_const, src`.
+    StoreProperty,
+    /// `r<dst> = delete r<obj>.<name>` (boolean result).
+    /// Operands: `dst, obj, name_const`.
+    DeleteProperty,
+    /// `r<dst> = Object.getPrototypeOf(r<obj>)`. Operands:
+    /// `dst, obj`. Returns `null` when no prototype is set;
+    /// raises `TypeMismatch` for non-object receivers.
+    GetPrototype,
+    /// `Object.setPrototypeOf(r<obj>, r<proto>)`. Operands:
+    /// `obj, proto`. `proto` may be a `Value::Object` or
+    /// `Value::Null`. Other types raise `TypeMismatch`.
+    SetPrototype,
+    /// Build a fresh dense array from `elem_count` register
+    /// operands. Operands: `dst, count, elem0, elem1, …`.
+    NewArray,
+    /// `r<dst> = r<arr>[r<idx>]`. Operands: `dst, arr, idx`.
+    /// `arr` must be `Value::Array`; `idx` must be `Value::Number`
+    /// in `[0, u32::MAX]` (truncates to `u32`).
+    LoadElement,
+    /// `r<arr>[r<idx>] = r<src>`. Operands: `arr, idx, src`.
+    StoreElement,
+    /// `r<dst> = r<arr>.length`. Operands: `dst, arr`.
+    ArrayLength,
+    /// `r<dst> = (r<lhs> instanceof r<rhs>)`. Operands:
+    /// `dst, lhs, rhs`. Foundation slice 19 semantics:
+    ///
+    /// - `rhs` carries a `prototype` property (set later by class
+    ///   lowering): the runtime walks `lhs`'s prototype chain
+    ///   looking for `rhs.prototype`.
+    /// - When `rhs` is itself a plain object, the runtime treats
+    ///   it as the "prototype to find" and walks `lhs`'s chain
+    ///   looking for it directly. This keeps the opcode useful
+    ///   before classes land.
+    /// - Anything else returns `false`.
+    Instanceof,
 }
 
 impl Op {
@@ -177,6 +236,21 @@ impl Op {
             Op::LoadLocal => "LOAD_LOCAL",
             Op::StoreLocal => "STORE_LOCAL",
             Op::TdzError => "TDZ_ERROR",
+            Op::MakeFunction => "MAKE_FUNCTION",
+            Op::Call => "CALL",
+            Op::ReturnValue => "RETURN_VALUE",
+            Op::ReturnUndefined => "RETURN_UNDEFINED",
+            Op::NewObject => "NEW_OBJECT",
+            Op::LoadProperty => "LOAD_PROPERTY",
+            Op::StoreProperty => "STORE_PROPERTY",
+            Op::DeleteProperty => "DELETE_PROPERTY",
+            Op::GetPrototype => "GET_PROTOTYPE",
+            Op::SetPrototype => "SET_PROTOTYPE",
+            Op::NewArray => "NEW_ARRAY",
+            Op::LoadElement => "LOAD_ELEMENT",
+            Op::StoreElement => "STORE_ELEMENT",
+            Op::ArrayLength => "ARRAY_LENGTH",
+            Op::Instanceof => "INSTANCEOF",
         }
     }
 
@@ -188,14 +262,16 @@ impl Op {
     #[must_use]
     pub const fn operand_count(self) -> usize {
         match self {
-            Op::Nop => 0,
+            Op::Nop | Op::ReturnUndefined => 0,
             Op::LoadUndefined
             | Op::LoadNull
             | Op::LoadTrue
             | Op::LoadFalse
             | Op::Return
+            | Op::ReturnValue
             | Op::Jump
-            | Op::TdzError => 1,
+            | Op::TdzError
+            | Op::NewObject => 1,
             Op::LoadString
             | Op::LoadNumber
             | Op::LoadInt32
@@ -208,7 +284,8 @@ impl Op {
             | Op::JumpIfFalse
             | Op::JumpIfNullish
             | Op::LoadLocal
-            | Op::StoreLocal => 2,
+            | Op::StoreLocal
+            | Op::MakeFunction => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -220,8 +297,19 @@ impl Op {
             | Op::LessThan
             | Op::LessEq
             | Op::GreaterThan
-            | Op::GreaterEq => 3,
+            | Op::GreaterEq
+            | Op::LoadProperty
+            | Op::StoreProperty
+            | Op::DeleteProperty
+            | Op::Instanceof => 3,
+            Op::GetPrototype | Op::SetPrototype | Op::ArrayLength => 2,
+            // `NewArray` is variadic: `dst, count, elems...`. The
+            // dispatcher reads the count and walks the trailing
+            // operands.
+            Op::NewArray => 2,
+            Op::LoadElement | Op::StoreElement => 3,
             Op::CallStringMethod => 4, // dst, recv, name_const, argc
+            Op::Call => 3,             // dst, callee, argc — args follow
         }
     }
 
@@ -233,7 +321,13 @@ impl Op {
     pub const fn is_branch(self) -> bool {
         matches!(
             self,
-            Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish | Op::Return
+            Op::Jump
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::JumpIfNullish
+                | Op::Return
+                | Op::ReturnValue
+                | Op::ReturnUndefined
         )
     }
 }
@@ -283,6 +377,10 @@ pub struct Function {
     pub locals: u16,
     /// Number of scratch registers above the locals.
     pub scratch: u16,
+    /// Number of declared parameters. The first `param_count`
+    /// register slots are reserved for parameter binding.
+    #[serde(default)]
+    pub param_count: u16,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.
@@ -314,6 +412,12 @@ pub enum Constant {
     Number {
         /// `f64::to_bits` representation.
         bits: u64,
+    },
+    /// Reference to [`BytecodeModule::functions`] — a function
+    /// declaration / expression captured at compile time.
+    FunctionId {
+        /// Index into `BytecodeModule::functions`.
+        index: u32,
     },
 }
 

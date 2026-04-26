@@ -94,6 +94,7 @@ mod tests {
                 span: (0, 0),
                 locals: 0,
                 scratch: 0,
+                param_count: 0,
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::Return,

@@ -531,6 +531,7 @@ name = "otter-vm"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "indexmap",
  "otter-bytecode",
  "serde",
  "smallvec",

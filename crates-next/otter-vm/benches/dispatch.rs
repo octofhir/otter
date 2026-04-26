@@ -39,6 +39,7 @@ fn bench_dispatch(c: &mut Criterion) {
             span: (0, 0),
             locals: 0,
             scratch: 1,
+            param_count: 0,
             code,
             spans,
         }],

@@ -605,8 +605,10 @@ impl RuntimeBuilder {
                 },
             });
         }
+        let mut interp = Interpreter::new();
+        interp.set_max_stack_depth(self.config.max_stack_depth);
         Ok(Runtime {
-            interp: Interpreter::new(),
+            interp,
             config: self.config,
         })
     }
@@ -922,10 +924,31 @@ fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
     }
 }
 
-fn map_vm_error(err: otter_vm::VmError) -> OtterError {
+fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
     use otter_vm::VmError;
-    let display = err.to_string();
-    match err {
+    let otter_vm::RunError { error, frames } = run_err;
+    let stack_frames: Vec<StackFrame> = frames
+        .into_iter()
+        .map(|f| StackFrame {
+            function: f.function_name,
+            module: f.module,
+            span: Some(f.span),
+        })
+        .collect();
+    let top_span = stack_frames.first().and_then(|f| f.span);
+    let display = error.to_string();
+    let runtime_diagnostic =
+        |kind: DiagnosticKind, code: &str, message: String| OtterError::Runtime {
+            diagnostic: Diagnostic {
+                kind,
+                code: code.to_string(),
+                message,
+                span: top_span,
+                frames: stack_frames.clone(),
+                cause: None,
+            },
+        };
+    match error {
         VmError::Interrupted => OtterError::Interrupted,
         VmError::OutOfMemory {
             requested_bytes,
@@ -934,36 +957,27 @@ fn map_vm_error(err: otter_vm::VmError) -> OtterError {
             requested_bytes,
             heap_limit_bytes,
         },
-        VmError::TypeMismatch => OtterError::Runtime {
-            diagnostic: Diagnostic {
-                kind: DiagnosticKind::Type,
-                code: "TYPE_MISMATCH".to_string(),
-                message: display,
-                span: None,
-                frames: Vec::new(),
-                cause: None,
-            },
-        },
-        VmError::UnknownIntrinsic { name } => OtterError::Runtime {
-            diagnostic: Diagnostic {
-                kind: DiagnosticKind::Type,
-                code: "UNKNOWN_METHOD".to_string(),
-                message: format!("unknown method `{name}`"),
-                span: None,
-                frames: Vec::new(),
-                cause: None,
-            },
-        },
-        VmError::TemporalDeadZone { local_index } => OtterError::Runtime {
-            diagnostic: Diagnostic {
-                kind: DiagnosticKind::Reference,
-                code: "TDZ".to_string(),
-                message: format!("cannot access local {local_index} before initialization"),
-                span: None,
-                frames: Vec::new(),
-                cause: None,
-            },
-        },
+        VmError::TypeMismatch => runtime_diagnostic(DiagnosticKind::Type, "TYPE_MISMATCH", display),
+        VmError::UnknownIntrinsic { name } => runtime_diagnostic(
+            DiagnosticKind::Type,
+            "UNKNOWN_METHOD",
+            format!("unknown method `{name}`"),
+        ),
+        VmError::TemporalDeadZone { local_index } => runtime_diagnostic(
+            DiagnosticKind::Reference,
+            "TDZ",
+            format!("cannot access local {local_index} before initialization"),
+        ),
+        VmError::StackOverflow { limit } => runtime_diagnostic(
+            DiagnosticKind::Range,
+            "STACK_OVERFLOW",
+            format!("maximum call stack size exceeded (limit {limit})"),
+        ),
+        VmError::NotCallable => runtime_diagnostic(
+            DiagnosticKind::Type,
+            "NOT_CALLABLE",
+            "value is not a function".to_string(),
+        ),
         VmError::MissingReturn | VmError::InvalidOperand => OtterError::Internal {
             code: "VM_BYTECODE_INVARIANT".to_string(),
             message: display,
@@ -995,11 +1009,11 @@ mod tests {
 
     #[test]
     fn otter_rejects_unsupported_js_feature() {
-        // `if` is plain JS that the harness slice does not yet
-        // implement; expect the generic "feature not in slice"
-        // diagnostic, not `TS_UNSUPPORTED`.
+        // `try`/`catch` is intentionally not in the foundation
+        // subset (slice 13 ships function calls; exception handling
+        // is a separate, later slice).
         let mut otter = Otter::new();
-        let err = otter.run_typescript("if (true) {}").unwrap_err();
+        let err = otter.run_typescript("try {} catch (e) {}").unwrap_err();
         match err {
             OtterError::Compile { diagnostics } => {
                 assert_eq!(diagnostics.len(), 1);

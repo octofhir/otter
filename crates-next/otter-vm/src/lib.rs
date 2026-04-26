@@ -29,8 +29,10 @@
 //!     ../../../docs/new-engine/specs/bytecode-dump-disasm-trace.md
 //!   )
 
+pub mod array;
 pub mod intrinsics;
 pub mod number;
+pub mod object;
 pub mod string;
 pub mod string_prototype;
 
@@ -43,7 +45,9 @@ use smallvec::SmallVec;
 
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 
+pub use array::JsArray;
 pub use number::{NumberValue, NumericOrdering};
+pub use object::JsObject;
 pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
 
 /// Foundation runtime value.
@@ -65,6 +69,17 @@ pub enum Value {
     /// JS string. Storage is WTF-16 with cons / sliced ropes; see
     /// [`JsString`].
     String(JsString),
+    /// JS function. Foundation slice 13: a closure-less reference
+    /// to a [`otter_bytecode::Function`] in the loaded module.
+    /// Real closures (captured upvalues) arrive in a later slice.
+    Function {
+        /// Index into [`otter_bytecode::BytecodeModule::functions`].
+        function_id: u32,
+    },
+    /// JS object — heap-shared, mutable. See [`JsObject`].
+    Object(JsObject),
+    /// JS array — dense, heap-shared. See [`JsArray`].
+    Array(JsArray),
 }
 
 impl Value {
@@ -84,6 +99,13 @@ impl Value {
             Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
             Value::Number(n) => n.to_display_string(),
             Value::String(s) => s.to_lossy_string(),
+            Value::Function { function_id } => format!("[Function #{function_id}]"),
+            Value::Object(_) => "[object Object]".to_string(),
+            Value::Array(a) => {
+                let body = a.borrow_body();
+                let parts: Vec<String> = body.iter().map(Value::display_string).collect();
+                parts.join(",")
+            }
         }
     }
 
@@ -102,6 +124,9 @@ impl Value {
                 }
             }
             Value::String(s) => !s.is_empty(),
+            Value::Function { .. } => true,
+            Value::Object(_) => true,
+            Value::Array(_) => true,
         }
     }
 
@@ -156,6 +181,9 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Number(a), Value::Number(b)) => number::equals(*a, *b),
             (Value::String(a), Value::String(b)) => a.equals(b),
+            (Value::Object(a), Value::Object(b)) => a.ptr_eq(b),
+            (Value::Array(a), Value::Array(b)) => a.ptr_eq(b),
+            (Value::Function { function_id: a }, Value::Function { function_id: b }) => a == b,
             _ => false,
         }
     }
@@ -195,9 +223,10 @@ impl InterruptFlag {
     }
 }
 
-/// One call frame. Compact and cache-conscious per foundation plan
-/// §M7. The harness slice does not yet allocate frames per call —
-/// there is exactly one frame for `<main>`.
+/// One call frame. Compact and cache-conscious per foundation
+/// plan §M7. Slice 13 promotes the interpreter to a real frame
+/// stack (`SmallVec<[Frame; 8]>` inside the dispatcher) so
+/// function calls push and pop without per-call `Vec` allocation.
 #[derive(Debug, Clone)]
 pub struct Frame {
     /// Index into the bytecode container's function table.
@@ -206,20 +235,37 @@ pub struct Frame {
     pub pc: u32,
     /// Register window for this frame.
     pub registers: SmallVec<[Value; 8]>,
+    /// When `Some(reg)`, returning from this frame writes the
+    /// completion value into the **caller's** register `reg` and
+    /// resumes at the caller's next pc. `<main>` carries `None`
+    /// and propagates the value out as the script's completion.
+    pub return_register: Option<u16>,
 }
 
 impl Frame {
     /// Allocate a frame for `function`. Registers are pre-filled
-    /// with `Value::Undefined`.
+    /// with `Value::Undefined`. Used for `<main>` (return register
+    /// = `None`).
     #[must_use]
     pub fn for_function(function: &Function) -> Self {
-        let total = (function.locals + function.scratch) as usize;
+        Self::with_return(function, None)
+    }
+
+    /// Allocate a frame whose return value should land in the
+    /// caller's register `return_register`.
+    #[must_use]
+    pub fn with_return(function: &Function, return_register: Option<u16>) -> Self {
+        let total = function
+            .param_count
+            .saturating_add(function.locals)
+            .saturating_add(function.scratch) as usize;
         let mut registers: SmallVec<[Value; 8]> = SmallVec::with_capacity(total);
         registers.resize(total, Value::Undefined);
         Self {
             function_id: function.id,
             pc: 0,
             registers,
+            return_register,
         }
     }
 }
@@ -259,6 +305,15 @@ pub enum VmError {
         /// Compiler-assigned local index.
         local_index: u32,
     },
+    /// JS call-stack depth exceeded the configured limit. Catchable
+    /// per foundation plan §M7 ("stack-depth limit returns a
+    /// catchable JS error").
+    StackOverflow {
+        /// Maximum depth that was about to be exceeded.
+        limit: u32,
+    },
+    /// Tried to call a value that is not callable.
+    NotCallable,
 }
 
 impl std::fmt::Display for VmError {
@@ -279,6 +334,10 @@ impl std::fmt::Display for VmError {
             VmError::TemporalDeadZone { local_index } => {
                 write!(f, "cannot access local {local_index} before initialization")
             }
+            VmError::StackOverflow { limit } => {
+                write!(f, "maximum call stack size exceeded (limit {limit})")
+            }
+            VmError::NotCallable => write!(f, "value is not a function"),
         }
     }
 }
@@ -299,6 +358,57 @@ impl From<StringError> for VmError {
     }
 }
 
+/// Default JS call-stack depth limit. Catchable via
+/// [`VmError::StackOverflow`].
+pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
+
+/// One stack-frame snapshot captured at the moment an error is
+/// raised. Foundation slice 16 ships this — task 24 (exceptions)
+/// reuses it for catchable error frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackFrameSnapshot {
+    /// Function name; `<main>` for the script entry,
+    /// `<arrow>`/`<anonymous>` for function expressions.
+    pub function_name: String,
+    /// Module specifier the function was compiled from.
+    pub module: String,
+    /// Source span of the failing instruction (byte offsets).
+    pub span: (u32, u32),
+}
+
+/// Result type returned by [`Interpreter::run`] on failure: the
+/// underlying [`VmError`] plus a snapshot of the live frame stack
+/// at the moment the error was raised. Caller-level translation
+/// (e.g., `otter-runtime::map_vm_error`) propagates `frames` into
+/// `Diagnostic.frames`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunError {
+    /// Underlying error.
+    pub error: VmError,
+    /// Top-of-stack first; element zero is the failing function.
+    pub frames: Vec<StackFrameSnapshot>,
+}
+
+impl RunError {
+    /// Convenience constructor for the no-frames case (e.g., setup
+    /// errors before any frame exists).
+    #[must_use]
+    pub fn bare(error: VmError) -> Self {
+        Self {
+            error,
+            frames: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for RunError {}
+
 /// Match-based dispatch loop. The harness baseline; slice tasks may
 /// later switch to threaded dispatch after benchmark-driven review
 /// (foundation plan §"Interpreter requirements").
@@ -306,16 +416,18 @@ impl From<StringError> for VmError {
 pub struct Interpreter {
     interrupt: InterruptFlag,
     string_heap: Arc<StringHeap>,
+    max_stack_depth: u32,
 }
 
 impl Interpreter {
-    /// Construct a fresh interpreter with its own interrupt flag
-    /// and a no-cap string heap.
+    /// Construct a fresh interpreter with its own interrupt flag,
+    /// a no-cap string heap, and the default stack-depth limit.
     #[must_use]
     pub fn new() -> Self {
         Self {
             interrupt: InterruptFlag::new(),
             string_heap: Arc::new(StringHeap::default()),
+            max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
         }
     }
 
@@ -326,7 +438,20 @@ impl Interpreter {
         Self {
             interrupt: InterruptFlag::new(),
             string_heap: Arc::new(StringHeap::with_cap(cap_bytes)),
+            max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
         }
+    }
+
+    /// Override the stack-depth limit. `0` is treated as the
+    /// configured default (foundation slice rejects an explicit
+    /// `0` limit at the `RuntimeBuilder` boundary, so this
+    /// fall-through is defensive).
+    pub fn set_max_stack_depth(&mut self, depth: u32) {
+        self.max_stack_depth = if depth == 0 {
+            DEFAULT_MAX_STACK_DEPTH
+        } else {
+            depth
+        };
     }
 
     /// Cloneable handle for cooperative cancellation.
@@ -345,216 +470,458 @@ impl Interpreter {
     /// Execute `<main>` of `module` and return its completion value.
     ///
     /// # Errors
-    /// Returns [`VmError`] on bytecode malformation, type mismatch,
-    /// OOM, or interrupt.
-    pub fn run(&self, module: &BytecodeModule) -> Result<Value, VmError> {
-        let main = module.main();
-        let mut frame = Frame::for_function(main);
+    /// Returns [`RunError`] (a `VmError` plus a stack-frame
+    /// snapshot) on bytecode malformation, type mismatch, OOM,
+    /// interrupt, or stack overflow.
+    pub fn run(&self, module: &BytecodeModule) -> Result<Value, RunError> {
+        match self.run_inner(module) {
+            Ok(v) => Ok(v),
+            Err((error, frames)) => Err(RunError { error, frames }),
+        }
+    }
 
+    /// Internal driver. Pulls the snapshot capture out of the
+    /// dispatch loop so the hot path remains allocation-free; the
+    /// snapshot is built only when a `VmError` actually escapes.
+    fn run_inner(
+        &self,
+        module: &BytecodeModule,
+    ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
+        let main = module.main();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(main));
+
+        match self.dispatch_loop(module, &mut stack) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let frames = snapshot_frames(module, &stack);
+                Err((err, frames))
+            }
+        }
+    }
+
+    fn dispatch_loop(
+        &self,
+        module: &BytecodeModule,
+        stack: &mut SmallVec<[Frame; 8]>,
+    ) -> Result<Value, VmError> {
         loop {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
             }
-            let instr = main
+            let top_idx = stack.len() - 1;
+            let function_id = stack[top_idx].function_id;
+            let function = module
+                .functions
+                .get(function_id as usize)
+                .ok_or(VmError::InvalidOperand)?;
+            let pc = stack[top_idx].pc;
+            let instr = function
                 .code
-                .get(frame.pc as usize)
+                .get(pc as usize)
                 .ok_or(VmError::MissingReturn)?;
-            match instr.op {
+            let op = instr.op;
+            let operands = instr.operands.clone();
+
+            // Stack-modifying opcodes go first so we don't hold a
+            // `&mut Frame` borrow while pushing / popping.
+            match op {
+                Op::ReturnValue | Op::Return => {
+                    let src = register_operand(operands.first())?;
+                    let value = stack[top_idx]
+                        .registers
+                        .get(src as usize)
+                        .cloned()
+                        .ok_or(VmError::InvalidOperand)?;
+                    if let Some(popped) = self.pop_frame(stack, value)? {
+                        return Ok(popped);
+                    }
+                    continue;
+                }
+                Op::ReturnUndefined => {
+                    if let Some(popped) = self.pop_frame(stack, Value::Undefined)? {
+                        return Ok(popped);
+                    }
+                    continue;
+                }
+                Op::Call => {
+                    self.do_call(stack, module, &operands)?;
+                    continue;
+                }
+                _ => {}
+            }
+
+            let frame = &mut stack[top_idx];
+            match op {
                 Op::Nop => {
                     frame.pc += 1;
                 }
                 Op::LoadUndefined => {
-                    let dst = register_operand(instr.operands.first())?;
-                    write_register(&mut frame, dst, Value::Undefined)?;
+                    let dst = register_operand(operands.first())?;
+                    write_register(frame, dst, Value::Undefined)?;
                     frame.pc += 1;
                 }
-                Op::Return => {
-                    let src = register_operand(instr.operands.first())?;
-                    let value = read_register(&frame, src)?.clone();
-                    return Ok(value);
+                Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::Call => {
+                    unreachable!("stack-modifying ops handled earlier in this loop")
+                }
+                Op::MakeFunction => {
+                    let dst = register_operand(operands.first())?;
+                    let idx = const_operand(operands.get(1))?;
+                    let function_id = match module.constants.get(idx as usize) {
+                        Some(Constant::FunctionId { index }) => *index,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    write_register(frame, dst, Value::Function { function_id })?;
+                    frame.pc += 1;
                 }
                 Op::LoadString => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let idx = const_operand(instr.operands.get(1))?;
+                    let dst = register_operand(operands.first())?;
+                    let idx = const_operand(operands.get(1))?;
                     let units = match module.constants.get(idx as usize) {
                         Some(otter_bytecode::Constant::String { utf16 }) => utf16.as_slice(),
                         _ => return Err(VmError::InvalidOperand),
                     };
                     let s = JsString::from_utf16_units(units, &self.string_heap)?;
-                    write_register(&mut frame, dst, Value::String(s))?;
+                    write_register(frame, dst, Value::String(s))?;
                     frame.pc += 1;
                 }
                 Op::LoadLength => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let src = register_operand(instr.operands.get(1))?;
-                    let s = read_register(&frame, src)?
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let s = read_register(frame, src)?
                         .as_string()
                         .ok_or(VmError::TypeMismatch)?;
                     let len = NumberValue::from_i32(s.len() as i32);
-                    write_register(&mut frame, dst, Value::Number(len))?;
+                    write_register(frame, dst, Value::Number(len))?;
                     frame.pc += 1;
                 }
                 Op::LoadNumber => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let idx = const_operand(instr.operands.get(1))?;
+                    let dst = register_operand(operands.first())?;
+                    let idx = const_operand(operands.get(1))?;
                     let value = match module.constants.get(idx as usize) {
                         Some(Constant::Number { bits }) => {
                             NumberValue::from_f64(f64::from_bits(*bits))
                         }
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    write_register(&mut frame, dst, Value::Number(value))?;
+                    write_register(frame, dst, Value::Number(value))?;
                     frame.pc += 1;
                 }
                 Op::LoadInt32 => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let imm = match instr.operands.get(1) {
-                        Some(Operand::Imm32(v)) => *v,
+                    let dst = register_operand(operands.first())?;
+                    let imm = match operands.get(1) {
+                        Some(&Operand::Imm32(v)) => v,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    write_register(&mut frame, dst, Value::Number(NumberValue::Smi(imm)))?;
+                    write_register(frame, dst, Value::Number(NumberValue::Smi(imm)))?;
                     frame.pc += 1;
                 }
                 Op::LoadTrue => {
-                    let dst = register_operand(instr.operands.first())?;
-                    write_register(&mut frame, dst, Value::Boolean(true))?;
+                    let dst = register_operand(operands.first())?;
+                    write_register(frame, dst, Value::Boolean(true))?;
                     frame.pc += 1;
                 }
                 Op::LoadFalse => {
-                    let dst = register_operand(instr.operands.first())?;
-                    write_register(&mut frame, dst, Value::Boolean(false))?;
+                    let dst = register_operand(operands.first())?;
+                    write_register(frame, dst, Value::Boolean(false))?;
                     frame.pc += 1;
                 }
                 Op::LoadNull => {
-                    let dst = register_operand(instr.operands.first())?;
-                    write_register(&mut frame, dst, Value::Null)?;
+                    let dst = register_operand(operands.first())?;
+                    write_register(frame, dst, Value::Null)?;
                     frame.pc += 1;
                 }
                 Op::LogicalNot => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let src = register_operand(instr.operands.get(1))?;
-                    let truthy = read_register(&frame, src)?.to_boolean();
-                    write_register(&mut frame, dst, Value::Boolean(!truthy))?;
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let truthy = read_register(frame, src)?.to_boolean();
+                    write_register(frame, dst, Value::Boolean(!truthy))?;
                     frame.pc += 1;
                 }
                 Op::ToBoolean => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let src = register_operand(instr.operands.get(1))?;
-                    let truthy = read_register(&frame, src)?.to_boolean();
-                    write_register(&mut frame, dst, Value::Boolean(truthy))?;
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let truthy = read_register(frame, src)?.to_boolean();
+                    write_register(frame, dst, Value::Boolean(truthy))?;
                     frame.pc += 1;
                 }
                 Op::Jump => {
-                    let offset = imm32_operand(instr.operands.first())?;
-                    apply_branch(&mut frame, offset, &self.interrupt)?;
+                    let offset = imm32_operand(operands.first())?;
+                    apply_branch(frame, offset, &self.interrupt)?;
                 }
                 Op::JumpIfTrue => {
-                    let offset = imm32_operand(instr.operands.first())?;
-                    let cond = register_operand(instr.operands.get(1))?;
-                    if read_register(&frame, cond)?.to_boolean() {
-                        apply_branch(&mut frame, offset, &self.interrupt)?;
+                    let offset = imm32_operand(operands.first())?;
+                    let cond = register_operand(operands.get(1))?;
+                    if read_register(frame, cond)?.to_boolean() {
+                        apply_branch(frame, offset, &self.interrupt)?;
                     } else {
                         frame.pc += 1;
                     }
                 }
                 Op::JumpIfFalse => {
-                    let offset = imm32_operand(instr.operands.first())?;
-                    let cond = register_operand(instr.operands.get(1))?;
-                    if !read_register(&frame, cond)?.to_boolean() {
-                        apply_branch(&mut frame, offset, &self.interrupt)?;
+                    let offset = imm32_operand(operands.first())?;
+                    let cond = register_operand(operands.get(1))?;
+                    if !read_register(frame, cond)?.to_boolean() {
+                        apply_branch(frame, offset, &self.interrupt)?;
                     } else {
                         frame.pc += 1;
                     }
                 }
                 Op::JumpIfNullish => {
-                    let offset = imm32_operand(instr.operands.first())?;
-                    let cond = register_operand(instr.operands.get(1))?;
-                    if read_register(&frame, cond)?.is_nullish() {
-                        apply_branch(&mut frame, offset, &self.interrupt)?;
+                    let offset = imm32_operand(operands.first())?;
+                    let cond = register_operand(operands.get(1))?;
+                    if read_register(frame, cond)?.is_nullish() {
+                        apply_branch(frame, offset, &self.interrupt)?;
                     } else {
                         frame.pc += 1;
                     }
                 }
                 Op::LoadLocal => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let idx = imm32_operand(instr.operands.get(1))?;
-                    let value = read_register(&frame, idx as u16)?.clone();
-                    write_register(&mut frame, dst, value)?;
+                    let dst = register_operand(operands.first())?;
+                    let idx = imm32_operand(operands.get(1))?;
+                    let value = read_register(frame, idx as u16)?.clone();
+                    write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
                 Op::StoreLocal => {
-                    let src = register_operand(instr.operands.first())?;
-                    let idx = imm32_operand(instr.operands.get(1))?;
-                    let value = read_register(&frame, src)?.clone();
-                    write_register(&mut frame, idx as u16, value)?;
+                    let src = register_operand(operands.first())?;
+                    let idx = imm32_operand(operands.get(1))?;
+                    let value = read_register(frame, src)?.clone();
+                    write_register(frame, idx as u16, value)?;
                     frame.pc += 1;
                 }
                 Op::TdzError => {
                     return Err(VmError::TemporalDeadZone {
-                        local_index: imm32_operand(instr.operands.first())? as u32,
+                        local_index: imm32_operand(operands.first())? as u32,
                     });
                 }
+                Op::NewObject => {
+                    let dst = register_operand(operands.first())?;
+                    write_register(frame, dst, Value::Object(JsObject::new()))?;
+                    frame.pc += 1;
+                }
+                Op::LoadProperty => {
+                    let dst = register_operand(operands.first())?;
+                    let obj_reg = register_operand(operands.get(1))?;
+                    let name_idx = const_operand(operands.get(2))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let value = match read_register(frame, obj_reg)? {
+                        Value::Object(o) => o.get(&name).unwrap_or(Value::Undefined),
+                        Value::String(s) if name == "length" => {
+                            Value::Number(NumberValue::from_i32(s.len() as i32))
+                        }
+                        Value::Array(a) if name == "length" => {
+                            Value::Number(NumberValue::from_i32(a.len() as i32))
+                        }
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::StoreProperty => {
+                    let obj_reg = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let src = register_operand(operands.get(2))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let value = read_register(frame, src)?.clone();
+                    let obj = match read_register(frame, obj_reg)? {
+                        Value::Object(o) => o.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    obj.set(&name, value);
+                    frame.pc += 1;
+                }
+                Op::DeleteProperty => {
+                    let dst = register_operand(operands.first())?;
+                    let obj_reg = register_operand(operands.get(1))?;
+                    let name_idx = const_operand(operands.get(2))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let obj = match read_register(frame, obj_reg)? {
+                        Value::Object(o) => o.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let removed = obj.delete(&name);
+                    write_register(frame, dst, Value::Boolean(removed))?;
+                    frame.pc += 1;
+                }
+                Op::GetPrototype => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let result = match read_register(frame, src)? {
+                        Value::Object(o) => match o.prototype() {
+                            Some(p) => Value::Object(p),
+                            None => Value::Null,
+                        },
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                Op::SetPrototype => {
+                    let obj_reg = register_operand(operands.first())?;
+                    let proto_reg = register_operand(operands.get(1))?;
+                    let obj = match read_register(frame, obj_reg)? {
+                        Value::Object(o) => o.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let proto = match read_register(frame, proto_reg)? {
+                        Value::Object(p) => Some(p.clone()),
+                        Value::Null => None,
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    obj.set_prototype(proto);
+                    frame.pc += 1;
+                }
+                Op::NewArray => {
+                    let dst = register_operand(operands.first())?;
+                    let count = match operands.get(1) {
+                        Some(&Operand::ConstIndex(n)) => n,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let mut elements: SmallVec<[Value; 4]> =
+                        SmallVec::with_capacity(count as usize);
+                    for i in 0..count as usize {
+                        let r = register_operand(operands.get(2 + i))?;
+                        elements.push(read_register(frame, r)?.clone());
+                    }
+                    write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
+                    frame.pc += 1;
+                }
+                Op::LoadElement => {
+                    let dst = register_operand(operands.first())?;
+                    let recv_reg = register_operand(operands.get(1))?;
+                    let idx_reg = register_operand(operands.get(2))?;
+                    let recv = read_register(frame, recv_reg)?.clone();
+                    let idx = match read_register(frame, idx_reg)? {
+                        Value::Number(n) => match n.as_smi() {
+                            Some(v) if v >= 0 => v as usize,
+                            _ => return Err(VmError::TypeMismatch),
+                        },
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let value = match recv {
+                        Value::Array(a) => a.get(idx),
+                        Value::String(s) => match s.char_code_at(idx as u32) {
+                            Some(unit) => Value::String(crate::JsString::from_utf16_units(
+                                &[unit],
+                                &self.string_heap,
+                            )?),
+                            None => Value::String(crate::JsString::empty(&self.string_heap)?),
+                        },
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::StoreElement => {
+                    let arr_reg = register_operand(operands.first())?;
+                    let idx_reg = register_operand(operands.get(1))?;
+                    let src_reg = register_operand(operands.get(2))?;
+                    let arr = match read_register(frame, arr_reg)? {
+                        Value::Array(a) => a.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let idx = match read_register(frame, idx_reg)? {
+                        Value::Number(n) => match n.as_smi() {
+                            Some(v) if v >= 0 => v as usize,
+                            _ => return Err(VmError::TypeMismatch),
+                        },
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let value = read_register(frame, src_reg)?.clone();
+                    arr.set(idx, value);
+                    frame.pc += 1;
+                }
+                Op::ArrayLength => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let arr = match read_register(frame, src)? {
+                        Value::Array(a) => a.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let n = NumberValue::from_i32(arr.len() as i32);
+                    write_register(frame, dst, Value::Number(n))?;
+                    frame.pc += 1;
+                }
+                Op::Instanceof => {
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
+                    let result = match (&lhs, &rhs) {
+                        (Value::Object(a), Value::Object(target)) => {
+                            // Foundation interpretation: rhs is
+                            // the "prototype to look for". Class
+                            // lowering (slice 26) replaces this
+                            // with a real `rhs.prototype` lookup.
+                            a.has_in_proto_chain(target)
+                        }
+                        _ => false,
+                    };
+                    write_register(frame, dst, Value::Boolean(result))?;
+                    frame.pc += 1;
+                }
                 Op::Add => {
-                    self.run_add(module, &instr.operands, &mut frame)?;
+                    self.run_add(module, &operands, frame)?;
                 }
                 Op::Sub => {
-                    self.run_numeric(&instr.operands, &mut frame, number::sub)?;
+                    self.run_numeric(&operands, frame, number::sub)?;
                 }
                 Op::Mul => {
-                    self.run_numeric(&instr.operands, &mut frame, number::mul)?;
+                    self.run_numeric(&operands, frame, number::mul)?;
                 }
                 Op::Div => {
-                    self.run_numeric(&instr.operands, &mut frame, number::div)?;
+                    self.run_numeric(&operands, frame, number::div)?;
                 }
                 Op::Rem => {
-                    self.run_numeric(&instr.operands, &mut frame, number::rem)?;
+                    self.run_numeric(&operands, frame, number::rem)?;
                 }
                 Op::Neg => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let src = register_operand(instr.operands.get(1))?;
-                    let n = read_register(&frame, src)?
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let n = read_register(frame, src)?
                         .as_number()
                         .ok_or(VmError::TypeMismatch)?;
-                    write_register(&mut frame, dst, Value::Number(number::neg(n)))?;
+                    write_register(frame, dst, Value::Number(number::neg(n)))?;
                     frame.pc += 1;
                 }
                 Op::ToNumber => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let src = register_operand(instr.operands.get(1))?;
-                    let value = match read_register(&frame, src)? {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let value = match read_register(frame, src)? {
                         Value::Number(n) => *n,
                         Value::Boolean(true) => NumberValue::Smi(1),
                         Value::Boolean(false) | Value::Null => NumberValue::Smi(0),
-                        Value::Undefined => NumberValue::Double(f64::NAN),
+                        Value::Undefined
+                        | Value::Function { .. }
+                        | Value::Object(_)
+                        | Value::Array(_) => NumberValue::Double(f64::NAN),
                         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
                     };
-                    write_register(&mut frame, dst, Value::Number(value))?;
+                    write_register(frame, dst, Value::Number(value))?;
                     frame.pc += 1;
                 }
                 Op::Equal => {
-                    let (dst, lhs, rhs) = self.binop_regs(&instr.operands, &frame)?;
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
                     let eq = lhs == rhs;
-                    write_register(&mut frame, dst, Value::Boolean(eq))?;
+                    write_register(frame, dst, Value::Boolean(eq))?;
                     frame.pc += 1;
                 }
                 Op::NotEqual => {
-                    let (dst, lhs, rhs) = self.binop_regs(&instr.operands, &frame)?;
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
                     let eq = lhs == rhs;
-                    write_register(&mut frame, dst, Value::Boolean(!eq))?;
+                    write_register(frame, dst, Value::Boolean(!eq))?;
                     frame.pc += 1;
                 }
                 Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
-                    self.run_compare(&instr.operands, &mut frame, instr.op)?;
+                    self.run_compare(&operands, frame, op)?;
                 }
                 Op::GetStringIndex => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let recv = register_operand(instr.operands.get(1))?;
-                    let idx_reg = register_operand(instr.operands.get(2))?;
-                    let recv_s = read_register(&frame, recv)?
+                    let dst = register_operand(operands.first())?;
+                    let recv = register_operand(operands.get(1))?;
+                    let idx_reg = register_operand(operands.get(2))?;
+                    let recv_s = read_register(frame, recv)?
                         .as_string()
                         .ok_or(VmError::TypeMismatch)?
                         .clone();
-                    let idx = match read_register(&frame, idx_reg)? {
+                    let idx = match read_register(frame, idx_reg)? {
                         Value::Number(n) => match n.as_smi() {
                             Some(v) if v >= 0 => v as u32,
                             _ => recv_s.len(), // out of range → empty
@@ -565,15 +932,15 @@ impl Interpreter {
                         Some(unit) => JsString::from_utf16_units(&[unit], &self.string_heap)?,
                         None => JsString::empty(&self.string_heap)?,
                     };
-                    write_register(&mut frame, dst, Value::String(result_str))?;
+                    write_register(frame, dst, Value::String(result_str))?;
                     frame.pc += 1;
                 }
                 Op::CallStringMethod => {
-                    let dst = register_operand(instr.operands.first())?;
-                    let recv = register_operand(instr.operands.get(1))?;
-                    let name_idx = const_operand(instr.operands.get(2))?;
-                    let argc = match instr.operands.get(3) {
-                        Some(Operand::ConstIndex(n)) => *n,
+                    let dst = register_operand(operands.first())?;
+                    let recv = register_operand(operands.get(1))?;
+                    let name_idx = const_operand(operands.get(2))?;
+                    let argc = match operands.get(3) {
+                        Some(&Operand::ConstIndex(n)) => n,
                         _ => return Err(VmError::InvalidOperand),
                     };
                     let name = match module.constants.get(name_idx as usize) {
@@ -585,10 +952,10 @@ impl Interpreter {
                     let mut arg_values: SmallVec<[Value; 4]> =
                         SmallVec::with_capacity(argc as usize);
                     for i in 0..argc as usize {
-                        let r = register_operand(instr.operands.get(4 + i))?;
-                        arg_values.push(read_register(&frame, r)?.clone());
+                        let r = register_operand(operands.get(4 + i))?;
+                        arg_values.push(read_register(frame, r)?.clone());
                     }
-                    let recv_value = read_register(&frame, recv)?.clone();
+                    let recv_value = read_register(frame, recv)?.clone();
                     let entry = string_prototype::lookup(&name)
                         .ok_or_else(|| VmError::UnknownIntrinsic { name: name.clone() })?;
                     let result = (entry.impl_fn)(&IntrinsicArgs {
@@ -597,7 +964,7 @@ impl Interpreter {
                         string_heap: &self.string_heap,
                     })
                     .map_err(intrinsic_to_vm_error)?;
-                    write_register(&mut frame, dst, result)?;
+                    write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
             }
@@ -606,6 +973,83 @@ impl Interpreter {
 }
 
 impl Interpreter {
+    /// Pop the top frame and write its result into the caller's
+    /// `return_register`. Returns `Some(value)` when the script
+    /// completes (`<main>` popped) so `run` can return that value
+    /// as the program's completion.
+    fn pop_frame(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        value: Value,
+    ) -> Result<Option<Value>, VmError> {
+        let popped = stack.pop().ok_or(VmError::InvalidOperand)?;
+        let Some(return_reg) = popped.return_register else {
+            return Ok(Some(value));
+        };
+        let caller = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        write_register(caller, return_reg, value)?;
+        // Caller's pc was set to the next instruction at call time;
+        // nothing to advance here.
+        Ok(None)
+    }
+
+    /// Handle `Op::Call`: push a new frame for the callee with
+    /// arguments copied into the parameter slots.
+    fn do_call(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let callee_reg = register_operand(operands.get(1))?;
+        let argc = match operands.get(2) {
+            Some(&Operand::ConstIndex(n)) => n,
+            _ => return Err(VmError::InvalidOperand),
+        };
+
+        let top_idx = stack.len() - 1;
+        let caller = &mut stack[top_idx];
+        let function_id = match read_register(caller, callee_reg)? {
+            Value::Function { function_id } => *function_id,
+            _ => return Err(VmError::NotCallable),
+        };
+        // Collect args from caller registers — bounded by argc, so
+        // a `SmallVec<[Value; 8]>` keeps the small-call path off
+        // the heap.
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
+        for i in 0..argc as usize {
+            let r = register_operand(operands.get(3 + i))?;
+            args.push(read_register(caller, r)?.clone());
+        }
+        // Advance caller's pc so the post-call dispatch resumes
+        // after the call instruction.
+        caller.pc = caller.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+
+        if stack.len() as u32 >= self.max_stack_depth {
+            return Err(VmError::StackOverflow {
+                limit: self.max_stack_depth,
+            });
+        }
+        let function = module
+            .functions
+            .get(function_id as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut new_frame = Frame::with_return(function, Some(dst));
+        // Bind parameters: extra args are dropped, missing args
+        // stay `Value::Undefined` (matches JS semantics).
+        let bind_count = (function.param_count as usize).min(args.len());
+        for (i, value) in args.into_iter().take(bind_count).enumerate() {
+            let slot = new_frame
+                .registers
+                .get_mut(i)
+                .ok_or(VmError::InvalidOperand)?;
+            *slot = value;
+        }
+        stack.push(new_frame);
+        Ok(())
+    }
+
     fn binop_regs(
         &self,
         operands: &[Operand],
@@ -684,6 +1128,30 @@ impl Interpreter {
     }
 }
 
+/// Walk a live frame stack top-down and build a snapshot the
+/// runtime / CLI can render. Top-of-stack first.
+fn snapshot_frames(module: &BytecodeModule, stack: &[Frame]) -> Vec<StackFrameSnapshot> {
+    stack
+        .iter()
+        .rev()
+        .map(|f| {
+            let function = module.functions.get(f.function_id as usize);
+            let function_name = function
+                .map(|fun| fun.name.clone())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let span = function
+                .and_then(|fun| fun.spans.iter().find(|s| s.pc == f.pc).map(|s| s.span))
+                .or_else(|| function.map(|fun| fun.span))
+                .unwrap_or((0, 0));
+            StackFrameSnapshot {
+                function_name,
+                module: module.module.clone(),
+                span,
+            }
+        })
+        .collect()
+}
+
 fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {
     match err {
         IntrinsicError::OutOfMemory {
@@ -716,6 +1184,16 @@ fn register_operand(operand: Option<&Operand>) -> Result<u16, VmError> {
 fn const_operand(operand: Option<&Operand>) -> Result<u32, VmError> {
     match operand {
         Some(Operand::ConstIndex(k)) => Ok(*k),
+        _ => Err(VmError::InvalidOperand),
+    }
+}
+
+/// Resolve a string constant referenced by index. Returned as a
+/// Rust `String` because `JsObject` keys are stored UTF-8 in this
+/// slice; task 18 (shapes) revisits the key representation.
+fn lookup_string_constant(module: &BytecodeModule, idx: u32) -> Result<String, VmError> {
+    match module.constants.get(idx as usize) {
+        Some(Constant::String { utf16 }) => Ok(String::from_utf16_lossy(utf16)),
         _ => Err(VmError::InvalidOperand),
     }
 }
@@ -782,6 +1260,7 @@ mod tests {
                 span: (0, 0),
                 locals: 0,
                 scratch,
+                param_count: 0,
                 code,
                 spans,
             }],
@@ -821,7 +1300,10 @@ mod tests {
             0,
         );
         let interp = Interpreter::new();
-        assert_eq!(interp.run(&module).unwrap_err(), VmError::MissingReturn);
+        assert_eq!(
+            interp.run(&module).unwrap_err().error,
+            VmError::MissingReturn
+        );
     }
 
     #[test]
@@ -844,6 +1326,6 @@ mod tests {
         let interp = Interpreter::new();
         let handle = interp.interrupt_handle();
         handle.interrupt();
-        assert_eq!(interp.run(&module).unwrap_err(), VmError::Interrupted);
+        assert_eq!(interp.run(&module).unwrap_err().error, VmError::Interrupted);
     }
 }

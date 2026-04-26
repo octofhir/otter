@@ -1,60 +1,93 @@
 [workspace]
 resolver = "3"
+# Foundation phase (2026-04-26 onward, ADR-0001):
+# the new engine lives in `crates-next/*`. The legacy stack under
+# `crates/*` is reference-only and is intentionally excluded from the
+# workspace build graph.
 members = [
-    "crates/otter-gc",
-    "crates/otter-runtime",
-    "crates/otter-vm",
-    "crates/otter-jit",
-    "crates/otter-nodejs",
-    "crates/otter-node-compat",
-    "crates/otter-modules",
-    "crates/otter-web",
-    "crates/otter-pm",
-    "crates/otter-test262",
-    "crates/otter-pm-manifest",
-    "crates/otter-pm-lockfile",
-    "crates/otterjs",
+    "crates-next/otter-bytecode",
+    "crates-next/otter-syntax",
+    "crates-next/otter-compiler",
+    "crates-next/otter-vm",
+    "crates-next/otter-runtime",
+    "crates-next/otter-test",
+    "crates-next/otter-cli",
+]
+exclude = [
+    "crates/*",
 ]
 
+[workspace.package]
+edition = "2024"
+publish = false
+license = "MIT"
+rust-version = "1.85"
+
 [workspace.dependencies]
-thiserror = "2"
-oxc_transformer = "0.123"
-oxc_codegen = "0.123"
-oxc_sourcemap = "6.1.1"
-oxc-miette = { version = "2.7", features = ["fancy"] }
+# Foundation-phase shared deps (versions pinned 2026-04-26).
 
-# Optimized release profile for minimal startup time.
-#
-# S5-c (2026-04-26): `panic = "unwind"` so the S5-b `catch_unwind`
-# wrapper around native descriptor dispatch is active in release
-# binaries — a panic inside an intrinsic surfaces as a catchable
-# JS-visible TypeError instead of aborting the embedder process.
-# Tradeoff: unwind tables add ~2 % binary size and a small cold-path
-# overhead at panic boundaries; matches the V8/JSC/SpiderMonkey
-# default and is required for any embedding use case where the
-# host process must survive a buggy native binding.
+# ADR-0002-managed: do not bump casually — see
+# docs/new-engine/adr/0002-oxc-frontend.md.
+oxc_allocator   = "0.127"
+oxc_span        = "0.127"
+oxc_syntax      = "0.127"
+oxc_ast         = "0.127"
+oxc_parser      = "0.127"
+oxc_ast_visit   = "0.127"
+oxc_diagnostics = "0.127"
+oxc_codegen     = "0.127"
+oxc_resolver    = "11.19"
+
+# Errors and serialization.
+thiserror   = "2"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.9"
+
+# CLI / diagnostics / tracing.
+clap                = { version = "4", features = ["derive"] }
+miette              = { version = "7", features = ["fancy"] }
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+
+# Collections / utilities.
+smallvec    = "1"
+indexmap    = "2"
+
+# Benchmarks.
+criterion   = { version = "0.8", features = ["html_reports"] }
+
+# Workspace-internal crates.
+otter-bytecode  = { path = "crates-next/otter-bytecode" }
+otter-syntax    = { path = "crates-next/otter-syntax" }
+otter-compiler  = { path = "crates-next/otter-compiler" }
+otter-vm        = { path = "crates-next/otter-vm" }
+otter-runtime   = { path = "crates-next/otter-runtime" }
+otter-test      = { path = "crates-next/otter-test" }
+
+[workspace.lints.rust]
+unsafe_code         = "forbid"
+missing_docs        = "deny"
+
+[workspace.lints.clippy]
+all                 = { level = "deny", priority = -1 }
+
+# Optimized release profile for the new foundation engine.
 [profile.release]
-lto = "thin"           # Link-time optimization (improves code layout)
-codegen-units = 1      # Single codegen unit (better inlining, worse compile time)
-strip = false          # Keep symbols for profiling
-# debug = true           # Include debug info for flamegraph
-panic = "unwind"       # Unwind so S5-b catch_unwind can convert panics → JS errors.
-opt-level = 3          # Maximum optimization
-
-# Release profile for test262 runner — needs panic=unwind for catch_unwind
-[profile.test262]
-inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = false
 panic = "unwind"
-split-debuginfo = "off"  # Keep debug symbols in the binary (required for samply on macOS)
+opt-level = 3
 
-# Fast release for development iteration
+# Fast release for development iteration.
 [profile.release-fast]
 inherits = "release"
 lto = false
 codegen-units = 16
 strip = false
 
-# Profile for flamegraph with debug symbols
+# Dev profile keeps debug info for flamegraph / lldb work.
 [profile.dev]
 debug = true
 strip = false

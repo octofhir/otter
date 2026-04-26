@@ -1,0 +1,20 @@
+[package]
+name = "otter-syntax"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OXC-only JS/TS frontend for the Otter foundation engine."
+
+[lints]
+workspace = true
+
+[dependencies]
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_span = { workspace = true }
+oxc_diagnostics = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

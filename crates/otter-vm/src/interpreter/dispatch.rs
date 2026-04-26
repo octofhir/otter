@@ -1065,6 +1065,30 @@ impl Interpreter {
                 let target = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let prop_id = idx_operand(&instr.operands, 1)?;
                 let property = resolve_property(function, runtime, prop_id)?;
+                // P0 (alloc-hotspot fix plan): primitive-receiver wrapper
+                // bypass. For TAG_PTR_STRING / Number / Boolean / BigInt
+                // / Symbol, `primitive_property_get` walks the relevant
+                // prototype chain directly without allocating a
+                // wrapper object. Receiver stays the original primitive
+                // so accessor getters see the raw value (§10.4.6 [[Get]]
+                // — Receiver preserved). Eliminates the per-call alloc
+                // that dominated string-primitive method-call cost.
+                if target.as_object_handle().is_none()
+                    && let Some(value) =
+                        runtime.primitive_property_get(target, property).map_err(
+                            |error| match error {
+                                crate::VmNativeCallError::Thrown(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                crate::VmNativeCallError::Internal(msg) => {
+                                    InterpreterError::NativeCall(msg)
+                                }
+                            },
+                        )?
+                {
+                    activation.set_accumulator(value);
+                    return Ok(StepOutcome::Continue);
+                }
                 // E1: auto-box primitive receivers so `(5n).toString`,
                 // `(1).toFixed`, `"s".length` etc. walk the primitive's
                 // prototype chain. `property_base_object_handle` returns
@@ -1241,6 +1265,28 @@ impl Interpreter {
             Opcode::LdaKeyedProperty => {
                 let base = read_reg(activation, function, reg(&instr.operands, 0)?)?;
                 let key = activation.accumulator();
+                // P0: primitive-receiver wrapper bypass — see comment on
+                // LdaNamedProperty. `string[i]` flows here, so the
+                // string-exotic indexed read is a TAG_PTR_STRING fast
+                // path inside `primitive_property_get`.
+                if base.as_object_handle().is_none() {
+                    let prop = key_to_property_name(runtime, key)?;
+                    if let Some(value) =
+                        runtime.primitive_property_get(base, prop).map_err(
+                            |error| match error {
+                                crate::VmNativeCallError::Thrown(v) => {
+                                    InterpreterError::UncaughtThrow(v)
+                                }
+                                crate::VmNativeCallError::Internal(msg) => {
+                                    InterpreterError::NativeCall(msg)
+                                }
+                            },
+                        )?
+                    {
+                        activation.set_accumulator(value);
+                        return Ok(StepOutcome::Continue);
+                    }
+                }
                 let handle = runtime.property_base_object_handle(base)?;
                 let prop = key_to_property_name(runtime, key)?;
                 let receiver = RegisterValue::from_object_handle(handle.0);

@@ -192,13 +192,17 @@ fn string_constructor(
     } else {
         coerce_to_string(args[0], runtime)?
     };
-    let primitive = runtime.alloc_string(coerced)?;
+    // Strategy B: allocate primitive via the new TAG_PTR_STRING path
+    // so the wrapper carries a GC-managed string value, not a legacy
+    // ObjectHandle. Eliminates the WTF-16 round-trip on every
+    // `String()` call and on `property_base_object_handle` boxing.
+    let primitive = runtime.alloc_string_value(&coerced)?;
 
     if let Some(receiver) = this.as_object_handle().map(ObjectHandle) {
         set_string_data(receiver, primitive, runtime)?;
         Ok(*this)
     } else {
-        Ok(RegisterValue::from_object_handle(primitive.0))
+        Ok(primitive)
     }
 }
 
@@ -217,7 +221,7 @@ fn string_value_of(
             return Ok(*this);
         }
         if let Some(primitive) = string_data(handle, runtime)? {
-            return Ok(RegisterValue::from_object_handle(primitive.0));
+            return Ok(primitive);
         }
     }
 
@@ -288,13 +292,20 @@ fn coerce_to_string(
         {
             return Ok(string.to_string().into_boxed_str());
         }
-        if let Some(primitive) = string_data(handle, runtime)?
-            && let Some(string) = runtime
-                .objects()
-                .string_value(primitive)
-                .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?
-        {
-            return Ok(string.to_string().into_boxed_str());
+        if let Some(primitive) = string_data(handle, runtime)? {
+            // TAG_PTR_STRING wrapper: read the GC-managed string content
+            // directly without round-tripping through legacy storage.
+            if let Some(gc_ref) = primitive.as_string_ref() {
+                return Ok(crate::js_string_gc::to_rust_string(gc_ref).into_boxed_str());
+            }
+            if let Some(inner) = primitive.as_object_handle().map(ObjectHandle)
+                && let Some(string) = runtime
+                    .objects()
+                    .string_value(inner)
+                    .map_err(|error| VmNativeCallError::Internal(format!("{error:?}").into()))?
+            {
+                return Ok(string.to_string().into_boxed_str());
+            }
         }
         return runtime.js_to_string(value).map_err(|error| match error {
             crate::interpreter::InterpreterError::UncaughtThrow(value) => {
@@ -335,15 +346,22 @@ fn initialize_string_prototype(
     intrinsics: &VmIntrinsics,
     cx: &mut IntrinsicInstallContext<'_>,
 ) -> Result<(), IntrinsicsError> {
-    let primitive = cx.heap.alloc_string("")?;
-    cx.heap
-        .set_prototype(primitive, Some(intrinsics.string_prototype()))?;
+    // Strategy B: install the empty primitive on `String.prototype` as a
+    // TAG_PTR_STRING value so wrapper-data lookups on the bare prototype
+    // see the same shape as freshly-constructed `new String("")`.
+    let empty_value = {
+        let gc_heap = cx.heap.gc_heap_mut();
+        let mut scope = otter_gc::local::HandleScope::new(gc_heap);
+        let local = crate::js_string_gc::empty(&mut scope)
+            .map_err(|_| IntrinsicsError::Heap(crate::object::ObjectError::OutOfMemory))?;
+        RegisterValue::from_string_ref(local.as_ref())
+    };
     let backing = cx.property_names.intern(STRING_DATA_SLOT);
     cx.heap.define_own_property(
         intrinsics.string_prototype(),
         backing,
         crate::object::PropertyValue::data_with_attrs(
-            RegisterValue::from_object_handle(primitive.0),
+            empty_value,
             crate::object::PropertyAttributes::from_flags(true, false, true),
         ),
     )?;
@@ -352,7 +370,7 @@ fn initialize_string_prototype(
 
 fn set_string_data(
     receiver: ObjectHandle,
-    primitive: ObjectHandle,
+    primitive: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<(), VmNativeCallError> {
     let backing = runtime.intern_property_name(STRING_DATA_SLOT);
@@ -362,7 +380,7 @@ fn set_string_data(
             receiver,
             backing,
             crate::object::PropertyValue::data_with_attrs(
-                RegisterValue::from_object_handle(primitive.0),
+                primitive,
                 crate::object::PropertyAttributes::from_flags(true, false, true),
             ),
         )
@@ -377,7 +395,7 @@ fn set_string_data(
 fn string_data(
     handle: ObjectHandle,
     runtime: &mut crate::interpreter::RuntimeState,
-) -> Result<Option<ObjectHandle>, VmNativeCallError> {
+) -> Result<Option<RegisterValue>, VmNativeCallError> {
     let backing = runtime.intern_property_name(STRING_DATA_SLOT);
     let Some(lookup) = runtime
         .objects()
@@ -393,11 +411,11 @@ fn string_data(
         return Ok(None);
     };
 
-    Ok(value.as_object_handle().map(ObjectHandle))
+    Ok(Some(value))
 }
 
 pub(crate) fn box_string_object(
-    primitive: ObjectHandle,
+    primitive: RegisterValue,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
     let wrapper =
@@ -1657,18 +1675,28 @@ fn this_js_string_value(
         let str_prop = runtime.intern_property_name("__otter_string_data__");
         if let Ok(Some(lookup)) = runtime.property_lookup(handle, str_prop)
             && let crate::object::PropertyValue::Data { value: v, .. } = lookup.value()
-            && let Some(inner_h) = v.as_object_handle().map(crate::object::ObjectHandle)
-            && runtime.objects().string_value(inner_h).ok().flatten().is_some()
         {
-            runtime.objects_mut().flatten_string(inner_h).map_err(|e| {
-                VmNativeCallError::Internal(
-                    format!("flatten_string on String wrapper data failed: {e:?}").into(),
-                )
-            })?;
-            if let Ok(Some(js)) = runtime.objects().string_value(inner_h) {
-                let mut clone = js.clone();
-                clone.ensure_two_byte();
-                return Ok(clone);
+            // TAG_PTR_STRING wrapper content: read WTF-16 directly via the
+            // GC-managed path; no flatten round-trip needed.
+            if let Some(gc_ref) = v.as_string_ref() {
+                let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+                let mut js = crate::js_string::JsString::from_utf16_vec(cow.into_owned());
+                js.ensure_two_byte();
+                return Ok(js);
+            }
+            if let Some(inner_h) = v.as_object_handle().map(crate::object::ObjectHandle)
+                && runtime.objects().string_value(inner_h).ok().flatten().is_some()
+            {
+                runtime.objects_mut().flatten_string(inner_h).map_err(|e| {
+                    VmNativeCallError::Internal(
+                        format!("flatten_string on String wrapper data failed: {e:?}").into(),
+                    )
+                })?;
+                if let Ok(Some(js)) = runtime.objects().string_value(inner_h) {
+                    let mut clone = js.clone();
+                    clone.ensure_two_byte();
+                    return Ok(clone);
+                }
             }
         }
     }

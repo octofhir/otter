@@ -834,17 +834,17 @@ impl RuntimeState {
             .own_keys_with_registry(object, &mut self.property_names)?;
         keys.retain(|key| !self.is_hidden_internal_property(*key));
 
-        let Some(string_handle) = self.string_exotic_value_handle(object)? else {
+        let Some(string_source) = self.string_exotic_value_handle(object)? else {
             return Ok(keys);
         };
-        if string_handle == object {
+        // If the source is the object itself (legacy primitive String),
+        // there is no wrapper and the indexed-property exotic walk has
+        // already covered the keys.
+        if string_source.as_object_handle() == Some(object.0) {
             return Ok(keys);
         }
 
-        let Some(string) = self.objects.string_value(string_handle)? else {
-            return Ok(keys);
-        };
-        let length = string.len();
+        let length = self.string_source_length(string_source)?;
         let mut result = Vec::with_capacity(length.saturating_add(1).saturating_add(keys.len()));
         for index in 0..length {
             result.push(self.property_names.intern(&index.to_string()));
@@ -1299,18 +1299,14 @@ impl RuntimeState {
         object: ObjectHandle,
         property: PropertyNameId,
     ) -> Result<Option<PropertyValue>, ObjectError> {
-        let Some(string_handle) = self.string_exotic_value_handle(object)? else {
+        let Some(string_source) = self.string_exotic_value_handle(object)? else {
             return Ok(None);
         };
-        if self.objects.string_value(string_handle)?.is_none() {
-            return Ok(None);
-        }
         let Some(property_name) = self.property_names.get(property) else {
             return Ok(None);
         };
 
-        // O(1) length read; works on Cons / Sliced / Thin without flatten.
-        let length = self.objects.string_length(string_handle)? as usize;
+        let length = self.string_source_length(string_source)?;
 
         if property_name == "length" {
             return Ok(Some(PropertyValue::data_with_attrs(
@@ -1325,14 +1321,7 @@ impl RuntimeState {
         if index >= length {
             return Ok(None);
         }
-        // C2: flatten before reading the unit. `code_unit_at` works on both
-        // SeqOneByte (upcasts to u16) and SeqTwoByte transparently.
-        self.objects.flatten_string(string_handle)?;
-        let string = self
-            .objects
-            .string_value(string_handle)?
-            .expect("string_value present after flatten");
-        let Some(unit) = string.code_unit_at(index) else {
+        let Some(unit) = self.string_source_code_unit_at(string_source, index)? else {
             return Ok(None);
         };
 
@@ -1347,12 +1336,18 @@ impl RuntimeState {
         )))
     }
 
+    /// Returns the underlying string source carried by `object` — either
+    /// the object itself (legacy primitive `HeapValueKind::String`) or
+    /// the `__otter_string_data__` slot value of a `String` wrapper.
+    /// After holdout #2 the slot may carry a TAG_PTR_STRING `RegisterValue`
+    /// or a legacy `ObjectHandle`-wrapped value; both are returned as a
+    /// raw `RegisterValue` and the caller dispatches on which.
     fn string_exotic_value_handle(
         &mut self,
         object: ObjectHandle,
-    ) -> Result<Option<ObjectHandle>, ObjectError> {
+    ) -> Result<Option<RegisterValue>, ObjectError> {
         if self.objects.string_value(object)?.is_some() {
-            return Ok(Some(object));
+            return Ok(Some(RegisterValue::from_object_handle(object.0)));
         }
 
         let backing = self.intern_property_name(STRING_DATA_SLOT);
@@ -1365,13 +1360,51 @@ impl RuntimeState {
         let PropertyValue::Data { value, .. } = lookup.value() else {
             return Ok(None);
         };
-        let Some(inner) = value.as_object_handle().map(ObjectHandle) else {
-            return Ok(None);
-        };
-        if self.objects.string_value(inner)?.is_some() {
-            return Ok(Some(inner));
+        if value.is_string_ref() {
+            return Ok(Some(value));
+        }
+        if let Some(inner) = value.as_object_handle().map(ObjectHandle)
+            && self.objects.string_value(inner)?.is_some()
+        {
+            return Ok(Some(RegisterValue::from_object_handle(inner.0)));
         }
         Ok(None)
+    }
+
+    /// Length (in code units) of a value returned by
+    /// [`Self::string_exotic_value_handle`]. Works on either a legacy
+    /// string `ObjectHandle` (Cons/Sliced/Thin without flatten) or a
+    /// TAG_PTR_STRING value.
+    fn string_source_length(&self, value: RegisterValue) -> Result<usize, ObjectError> {
+        if let Some(gc_ref) = value.as_string_ref() {
+            return Ok(crate::js_string_gc::len(gc_ref));
+        }
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            return self.objects.string_length(handle).map(|len| len as usize);
+        }
+        Err(ObjectError::InvalidKind)
+    }
+
+    /// Code-unit at `index` for a string-source `RegisterValue`. Flattens
+    /// the legacy backing if necessary; the GC-managed path is O(1) on
+    /// flat reprs, walks the rope only for unflattened Cons/Sliced.
+    fn string_source_code_unit_at(
+        &mut self,
+        value: RegisterValue,
+        index: usize,
+    ) -> Result<Option<u16>, ObjectError> {
+        if let Some(gc_ref) = value.as_string_ref() {
+            return Ok(crate::js_string_gc::code_unit_at(gc_ref, index));
+        }
+        if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
+            self.objects.flatten_string(handle)?;
+            let string = self
+                .objects
+                .string_value(handle)?
+                .expect("string_value present after flatten");
+            return Ok(string.code_unit_at(index));
+        }
+        Err(ObjectError::InvalidKind)
     }
 
     fn is_hidden_internal_property(&self, property: PropertyNameId) -> bool {
@@ -1628,6 +1661,78 @@ impl RuntimeState {
             },
             None => Ok(RegisterValue::undefined()),
         }
+    }
+
+    /// §10.4.6 [[Get]] on a primitive receiver — walks the relevant
+    /// prototype chain directly, **without** allocating a boxing wrapper
+    /// object. Receiver stays the original primitive so accessor
+    /// getters see the raw value (spec: `Receiver` argument preserved).
+    ///
+    /// Returns `Ok(None)` for null / undefined / object-handle receivers
+    /// (caller falls through to the wrapper-allocating slow path which
+    /// also throws for null / undefined).
+    ///
+    /// Production hot path — eliminates per-call wrapper alloc that
+    /// dominated string-primitive method-call cost (~9 s for 2M
+    /// `s.charCodeAt(i)` calls in baseline interp).
+    pub fn primitive_property_get(
+        &mut self,
+        receiver: RegisterValue,
+        property: PropertyNameId,
+    ) -> Result<Option<RegisterValue>, VmNativeCallError> {
+        // String primitive (TAG_PTR_STRING). Handle exotic length /
+        // numeric-index access first, then walk String.prototype.
+        if let Some(gc_ref) = receiver.as_string_ref() {
+            if let Some(name) = self.property_names.get(property) {
+                if name == "length" {
+                    let len = crate::js_string_gc::len(gc_ref);
+                    return Ok(Some(RegisterValue::from_i32(
+                        i32::try_from(len).unwrap_or(i32::MAX),
+                    )));
+                }
+                if let Some(index) = canonical_string_exotic_index(name) {
+                    let len = crate::js_string_gc::len(gc_ref);
+                    if index < len
+                        && let Some(unit) = crate::js_string_gc::code_unit_at(gc_ref, index)
+                    {
+                        // Per spec each indexed access produces a fresh
+                        // 1-char string (V8 also allocates here, just
+                        // cheaper). At least the receiver's wrapper is
+                        // gone and the result is one alloc not three.
+                        let value = self
+                            .alloc_string_value_from_utf16(&[unit])
+                            .map_err(|err| {
+                                VmNativeCallError::Internal(format!("{err}").into())
+                            })?;
+                        return Ok(Some(value));
+                    }
+                    return Ok(Some(RegisterValue::undefined()));
+                }
+            }
+            let proto = self.intrinsics().string_prototype();
+            return Ok(Some(self.ordinary_get(proto, property, receiver)?));
+        }
+        // Number primitive (i32-tagged or NaN-box double).
+        if receiver.as_number().is_some() {
+            let proto = self.intrinsics().number_prototype();
+            return Ok(Some(self.ordinary_get(proto, property, receiver)?));
+        }
+        // Boolean primitive.
+        if receiver.as_bool().is_some() {
+            let proto = self.intrinsics().boolean_prototype();
+            return Ok(Some(self.ordinary_get(proto, property, receiver)?));
+        }
+        // BigInt primitive.
+        if receiver.is_bigint() {
+            let proto = self.intrinsics().bigint_prototype();
+            return Ok(Some(self.ordinary_get(proto, property, receiver)?));
+        }
+        // Symbol primitive.
+        if receiver.is_symbol() {
+            let proto = self.intrinsics().symbol_prototype();
+            return Ok(Some(self.ordinary_get(proto, property, receiver)?));
+        }
+        Ok(None)
     }
 
     /// Executes ordinary named-property `[[Set]]` with an explicit receiver.

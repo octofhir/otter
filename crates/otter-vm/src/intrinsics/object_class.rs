@@ -242,9 +242,17 @@ fn object_constructor(
             return box_symbol_object(value, runtime);
         }
 
+        // Strategy B: TAG_PTR_STRING is a primitive string. Box it
+        // directly without any handle conversion.
+        if value.is_string_ref() {
+            return box_string_object(value, runtime);
+        }
+
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             return match runtime.objects().kind(handle) {
-                Ok(HeapValueKind::String) => box_string_object(handle, runtime),
+                Ok(HeapValueKind::String) => {
+                    box_string_object(RegisterValue::from_object_handle(handle.0), runtime)
+                }
                 Ok(_) => Ok(value),
                 Err(error) => Err(VmNativeCallError::Internal(
                     format!("Object constructor kind lookup failed: {error:?}").into(),
@@ -542,13 +550,23 @@ pub(super) fn to_object_for_prototype_method(
         ));
     }
 
+    // Strategy B: TAG_PTR_STRING — box directly into a String wrapper.
+    if value.is_string_ref() {
+        let object = box_string_object(value, runtime)?;
+        return Ok(ObjectHandle(
+            object
+                .as_object_handle()
+                .expect("boxed string should return an object"),
+        ));
+    }
+
     let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
         return Err(throw_type_error(runtime, context)?);
     };
 
     match runtime.objects().kind(handle) {
         Ok(HeapValueKind::String) => {
-            let object = box_string_object(handle, runtime)?;
+            let object = box_string_object(RegisterValue::from_object_handle(handle.0), runtime)?;
             Ok(ObjectHandle(
                 object
                     .as_object_handle()

@@ -67,11 +67,20 @@ impl RuntimeState {
             if self.objects.string_value(handle)?.is_some() {
                 return Ok(handle);
             }
-            // String wrapper object → unwrap to the inner primitive handle.
-            if let Some(inner) = self.string_wrapper_data(handle)?
-                && self.objects.string_value(inner)?.is_some()
-            {
-                return Ok(inner);
+            // String wrapper object → unwrap to the inner primitive.
+            if let Some(inner) = self.string_wrapper_data(handle)? {
+                if let Some(inner_handle) = inner.as_object_handle().map(ObjectHandle)
+                    && self.objects.string_value(inner_handle)?.is_some()
+                {
+                    return Ok(inner_handle);
+                }
+                // Wrapper carries TAG_PTR_STRING after holdout #2. Recurse
+                // through the GC-managed branch below by re-targeting `value`.
+                if let Some(gc_ref) = inner.as_string_ref() {
+                    let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+                    let js = crate::js_string::JsString::from_utf16_vec(cow.into_owned());
+                    return self.alloc_js_string(js);
+                }
             }
         }
         // Strategy B: read WTF-16 content via the new path (lossless,
@@ -108,13 +117,16 @@ impl RuntimeState {
         Ok(Some(value))
     }
 
+    /// Reads the inner string primitive carried by a `String` wrapper
+    /// (`__otter_string_data__` slot). After Strategy B's wrapper-slot
+    /// migration the slot may hold either a legacy `HeapValueKind::String`
+    /// `ObjectHandle` or a TAG_PTR_STRING value, so the return type is
+    /// the raw `RegisterValue` and the caller dispatches on which.
     fn string_wrapper_data(
         &mut self,
         handle: ObjectHandle,
-    ) -> Result<Option<ObjectHandle>, InterpreterError> {
-        Ok(self
-            .own_data_property(handle, STRING_DATA_SLOT)?
-            .and_then(|value| value.as_object_handle().map(ObjectHandle)))
+    ) -> Result<Option<RegisterValue>, InterpreterError> {
+        self.own_data_property(handle, STRING_DATA_SLOT)
     }
 
     /// §7.2.15 IsLooselyEqual(x, y)
@@ -336,17 +348,13 @@ impl RuntimeState {
         if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
             return Ok(handle);
         }
-        // Strategy B: GC-managed string ref. Materialise a legacy
-        // primitive string handle via WTF-16 round-trip (lossless), then
-        // box it into a `String` wrapper so the standard prototype-chain
-        // property lookup path applies. Once allocators all switch to
-        // TAG_PTR_STRING and the dispatch table understands TAG_PTR_STRING
-        // natively, this branch can route directly to String.prototype.
-        if let Some(gc_ref) = value.as_string_ref() {
-            let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
-            let js = crate::js_string::JsString::from_utf16_vec(cow.into_owned());
-            let primitive = self.alloc_js_string(js)?;
-            let wrapper = box_string_object(primitive, self).map_err(|error| match error {
+        // Strategy B: GC-managed string ref boxes into the wrapper
+        // directly — no WTF-16 round-trip, no legacy `JsString` alloc.
+        // Holdout #2 closure: the wrapper's `__otter_string_data__` slot
+        // now stores the TAG_PTR_STRING value verbatim, so wrapper-aware
+        // String.prototype methods read it back without copying.
+        if value.is_string_ref() {
+            let wrapper = box_string_object(value, self).map_err(|error| match error {
                 VmNativeCallError::Thrown(_) => {
                     InterpreterError::TypeError("string boxing threw".into())
                 }
@@ -1130,10 +1138,15 @@ impl RuntimeState {
         if self.objects.string_value(handle)?.is_some() {
             return Ok(true);
         }
-        if let Some(inner) = self.string_wrapper_data(handle)?
-            && self.objects.string_value(inner)?.is_some()
-        {
-            return Ok(true);
+        if let Some(inner) = self.string_wrapper_data(handle)? {
+            if inner.is_string_ref() {
+                return Ok(true);
+            }
+            if let Some(inner_h) = inner.as_object_handle().map(ObjectHandle)
+                && self.objects.string_value(inner_h)?.is_some()
+            {
+                return Ok(true);
+            }
         }
         Ok(false)
     }

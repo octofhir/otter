@@ -446,16 +446,13 @@ impl RuntimeState {
         let Ok(handle) = self.alloc_object_with_prototype(Some(prototype)) else {
             return RegisterValue::undefined();
         };
-        let Ok(message_string) = self.alloc_string(message) else {
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let Ok(message_value) = self.alloc_string_value(message) else {
             return RegisterValue::undefined();
         };
         let message_prop = self.intern_property_name("message");
         self.objects_mut()
-            .set_property(
-                handle,
-                message_prop,
-                RegisterValue::from_object_handle(message_string.0),
-            )
+            .set_property(handle, message_prop, message_value)
             .ok();
         RegisterValue::from_object_handle(handle.0)
     }
@@ -1006,7 +1003,15 @@ impl RuntimeState {
         &mut self,
         iterable_val: RegisterValue,
     ) -> Result<ObjectHandle, VmNativeCallError> {
-        let Some(iterable) = iterable_val.as_object_handle().map(ObjectHandle) else {
+        // Strategy B: TAG_PTR_STRING is a primitive string — box it via
+        // `property_base_object_handle` so the standard `@@iterator`
+        // lookup walks the String.prototype chain.
+        let iterable = if let Some(handle) = iterable_val.as_object_handle().map(ObjectHandle) {
+            handle
+        } else if iterable_val.is_string_ref() {
+            self.property_base_object_handle(iterable_val)
+                .map_err(|err| interp_err_to_vm(self, err))?
+        } else {
             return Err(self.throw_as_type_error("Value is not iterable"));
         };
         let iter_sym = self

@@ -998,11 +998,11 @@ fn object_keys(
             .get(*key_id)
             .unwrap_or("")
             .to_string();
-        let str_handle = runtime.alloc_string(name)?;
-        runtime
-            .objects_mut()
-            .push_element(array, RegisterValue::from_object_handle(str_handle.0))
-            .ok();
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(&name)
+            .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+        runtime.objects_mut().push_element(array, value).ok();
     }
 
     Ok(RegisterValue::from_object_handle(array.0))
@@ -1075,12 +1075,12 @@ fn object_entries(
             .get(*key_id)
             .unwrap_or("")
             .to_string();
-        let key_str = runtime.alloc_string(name)?;
+        // Strategy B: TAG_PTR_STRING.
+        let key_value = runtime
+            .alloc_string_value(&name)
+            .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
         let pair = runtime.alloc_array()?;
-        runtime
-            .objects_mut()
-            .push_element(pair, RegisterValue::from_object_handle(key_str.0))
-            .ok();
+        runtime.objects_mut().push_element(pair, key_value).ok();
         runtime.objects_mut().push_element(pair, value).ok();
         runtime
             .objects_mut()
@@ -1429,11 +1429,11 @@ fn object_get_own_property_names(
 
     let array = runtime.alloc_array()?;
     for name in &key_names {
-        let str_handle = runtime.alloc_string(name.as_str())?;
-        runtime
-            .objects_mut()
-            .push_element(array, RegisterValue::from_object_handle(str_handle.0))
-            .ok();
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(name.as_str())
+            .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+        runtime.objects_mut().push_element(array, value).ok();
     }
 
     Ok(RegisterValue::from_object_handle(array.0))

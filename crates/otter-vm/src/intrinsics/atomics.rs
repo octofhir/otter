@@ -791,15 +791,20 @@ fn atomics_wait(
 
     if !equal {
         // §25.4.13 step 14: If they are not equal, return "not-equal".
-        let s = runtime.alloc_string("not-equal")?;
-        return Ok(RegisterValue::from_object_handle(s.0));
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value("not-equal")
+            .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
 
     // Single-threaded: we can never be woken by another thread.
     // If timeout ≤ 0, return "timed-out" immediately.
     // If timeout > 0, we would deadlock — so also return "timed-out".
-    let s = runtime.alloc_string("timed-out")?;
-    Ok(RegisterValue::from_object_handle(s.0))
+    let value = runtime
+        .alloc_string_value("timed-out")
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ─── §25.4.14 Atomics.xor ( typedArray, index, value ) ──────────────────────

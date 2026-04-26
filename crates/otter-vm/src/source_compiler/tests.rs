@@ -1567,6 +1567,7 @@ fn loose_equality_wrapper_objects_coerce_to_primitives() {
     );
 }
 
+
 #[test]
 fn unary_negation_handles_non_int32_numbers() {
     assert_eq!(
@@ -2457,16 +2458,12 @@ fn typeof_int32_returns_number_string() {
     let result = Interpreter::new()
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
         .expect("execute");
-    let handle = result
-        .return_value()
-        .as_object_handle()
-        .expect("typeof returns a string object handle");
-    let text = runtime
-        .objects
-        .string_value(crate::object::ObjectHandle(handle))
-        .expect("typeof result readable")
-        .expect("typeof result has string value");
-    assert_eq!(text.to_rust_string(), "number");
+    // Strategy B: typeof returns a TAG_PTR_STRING value.
+    let return_value = result.return_value();
+    let gc_ref = return_value
+        .as_string_ref()
+        .expect("typeof returns a TAG_PTR_STRING");
+    assert_eq!(crate::js_string_gc::to_rust_string(gc_ref), "number");
 }
 
 #[test]
@@ -3682,9 +3679,10 @@ fn string_literal_returns_string() {
         .execute_with_runtime(&module, entry, &registers, &mut runtime)
         .expect("execute");
     let ret = result.return_value();
+    // Strategy B: string literals lower to TAG_PTR_STRING.
     assert!(
-        ret.as_object_handle().is_some(),
-        "string literal must lower to an object handle",
+        ret.is_string_ref(),
+        "string literal must lower to a TAG_PTR_STRING value",
     );
     let text = runtime.js_to_string_infallible(ret);
     assert_eq!(text.as_ref(), "hello");
@@ -10064,15 +10062,14 @@ fn s2_unbounded_recursion_surfaces_as_range_error() {
             panic!("error.message must be a data property")
         }
     };
-    let message_handle = message_value
-        .as_object_handle()
-        .expect("error.message must be a string handle");
-    let text = runtime
-        .objects
-        .string_value(crate::object::ObjectHandle(message_handle))
-        .expect("error.message string readable")
-        .expect("error.message populated");
-    assert_eq!(text.to_rust_string(), "Maximum call stack size exceeded");
+    // Strategy B: error.message is now stored as a TAG_PTR_STRING.
+    let gc_ref = message_value
+        .as_string_ref()
+        .expect("error.message must be a TAG_PTR_STRING");
+    assert_eq!(
+        crate::js_string_gc::to_rust_string(gc_ref),
+        "Maximum call stack size exceeded",
+    );
 }
 
 #[test]

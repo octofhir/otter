@@ -171,6 +171,46 @@ fn compare_string_primitives(
     lhs: RegisterValue,
     rhs: RegisterValue,
 ) -> Result<Option<bool>, ObjectError> {
+    // Strategy B: TAG_PTR_STRING vs TAG_PTR_STRING — content compare via
+    // the GC-managed reader.
+    if lhs.is_string_ref()
+        && rhs.is_string_ref()
+        && let (Some(l), Some(r)) = (lhs.as_string_ref(), rhs.as_string_ref())
+    {
+        return Ok(Some(crate::js_string_gc::equals(l, r)));
+    }
+    // Cross-tag: TAG_PTR_STRING vs legacy ObjectHandle string.
+    if let Some(gc_ref) = lhs.as_string_ref()
+        && let Some(rh) = rhs.as_object_handle().map(ObjectHandle)
+    {
+        if heap.string_value(rh)?.is_none() {
+            return Ok(None);
+        }
+        heap.flatten_string(rh).ok();
+        let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+        // SeqOneByte / SeqTwoByte both supported via the upcasting cow
+        // accessor, matching the WTF-16 view that GcRef provides.
+        let rs_cow = heap
+            .string_value(rh)?
+            .map(|s| s.as_utf16_cow().into_owned())
+            .expect("flatten leaves a flat string");
+        return Ok(Some(cow.as_ref() == rs_cow.as_slice()));
+    }
+    if let Some(lh) = lhs.as_object_handle().map(ObjectHandle)
+        && let Some(gc_ref) = rhs.as_string_ref()
+    {
+        if heap.string_value(lh)?.is_none() {
+            return Ok(None);
+        }
+        heap.flatten_string(lh).ok();
+        let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
+        let ls_cow = heap
+            .string_value(lh)?
+            .map(|s| s.as_utf16_cow().into_owned())
+            .expect("flatten leaves a flat string");
+        return Ok(Some(ls_cow.as_slice() == cow.as_ref()));
+    }
+
     let Some(lhs_handle) = lhs.as_object_handle().map(ObjectHandle) else {
         return Ok(None);
     };

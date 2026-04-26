@@ -23,16 +23,13 @@ impl RuntimeState {
         let Ok(handle) = self.alloc_object_with_prototype(Some(prototype)) else {
             return InterpreterError::OutOfMemory;
         };
-        let Ok(message) = self.alloc_string("Invalid array length") else {
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let Ok(message) = self.alloc_string_value("Invalid array length") else {
             return InterpreterError::OutOfMemory;
         };
         let message_prop = self.intern_property_name("message");
         self.objects
-            .set_property(
-                handle,
-                message_prop,
-                RegisterValue::from_object_handle(message.0),
-            )
+            .set_property(handle, message_prop, message)
             .ok();
         InterpreterError::UncaughtThrow(RegisterValue::from_object_handle(handle.0))
     }
@@ -45,16 +42,13 @@ impl RuntimeState {
         let Ok(handle) = self.alloc_object_with_prototype(Some(prototype)) else {
             return InterpreterError::OutOfMemory;
         };
-        let Ok(message) = self.alloc_string("Invalid string length") else {
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let Ok(message) = self.alloc_string_value("Invalid string length") else {
             return InterpreterError::OutOfMemory;
         };
         let message_prop = self.intern_property_name("message");
         self.objects
-            .set_property(
-                handle,
-                message_prop,
-                RegisterValue::from_object_handle(message.0),
-            )
+            .set_property(handle, message_prop, message)
             .ok();
         InterpreterError::UncaughtThrow(RegisterValue::from_object_handle(handle.0))
     }
@@ -1061,13 +1055,10 @@ impl RuntimeState {
     ) -> Result<ObjectHandle, InterpreterError> {
         let prototype = self.intrinsics().reference_error_prototype;
         let handle = self.alloc_object_with_prototype(Some(prototype))?;
-        let msg_handle = self.objects.alloc_string(message)?;
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let msg_value = self.alloc_string_value(message)?;
         let msg_prop = self.intern_property_name("message");
-        self.objects.set_property(
-            handle,
-            msg_prop,
-            RegisterValue::from_object_handle(msg_handle.0),
-        )?;
+        self.objects.set_property(handle, msg_prop, msg_value)?;
         Ok(handle)
     }
 
@@ -1103,12 +1094,9 @@ impl RuntimeState {
     ) -> Result<ObjectHandle, InterpreterError> {
         let obj = self.alloc_object()?;
         let status_prop = self.intern_property_name("status");
-        let status_str = self.objects.alloc_string(status)?;
-        let _ = self.objects.set_property(
-            obj,
-            status_prop,
-            RegisterValue::from_object_handle(status_str.0),
-        );
+        // Strategy B: status is TAG_PTR_STRING.
+        let status_value = self.alloc_string_value(status)?;
+        let _ = self.objects.set_property(obj, status_prop, status_value);
         let value_prop = self.intern_property_name(value_key);
         let _ = self.objects.set_property(obj, value_prop, value);
         Ok(obj)
@@ -1496,6 +1484,9 @@ impl RuntimeState {
             "symbol"
         } else if value.is_bigint() {
             "bigint"
+        } else if value.is_string_ref() {
+            // Strategy B: TAG_PTR_STRING is a string primitive.
+            "string"
         } else if value.as_number().is_some() {
             "number"
         } else if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
@@ -1536,7 +1527,9 @@ impl RuntimeState {
             "undefined"
         };
 
-        let string = self.alloc_string(kind)?;
-        Ok(RegisterValue::from_object_handle(string.0))
+        // Strategy B: typeof always returns one of a small set of static
+        // strings — emit them as TAG_PTR_STRING values.
+        let value = self.alloc_string_value(kind)?;
+        Ok(value)
     }
 }

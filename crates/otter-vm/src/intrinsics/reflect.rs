@@ -509,11 +509,11 @@ fn reflect_own_keys(
         if index.is_multiple_of(crate::interpreter::NATIVE_LOOP_POLL_INTERVAL) {
             runtime.check_interrupt()?;
         }
-        let str_handle = runtime.alloc_string(name.as_str())?;
-        runtime
-            .objects_mut()
-            .push_element(array, RegisterValue::from_object_handle(str_handle.0))
-            .ok();
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(name.as_str())
+            .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+        runtime.objects_mut().push_element(array, value).ok();
     }
 
     Ok(RegisterValue::from_object_handle(array.0))

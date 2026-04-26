@@ -235,8 +235,11 @@ fn structured_clone_inner(
                 .flatten()
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            let cloned = runtime.alloc_string(s.as_str())?;
-            Ok(RegisterValue::from_object_handle(cloned.0))
+            // Strategy B: TAG_PTR_STRING.
+            let value = runtime
+                .alloc_string_value(&s)
+                .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
 
         // §2.7.2 step 7: Array — deep clone elements and own properties.

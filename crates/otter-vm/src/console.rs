@@ -203,6 +203,10 @@ pub fn format_value(value: RegisterValue, runtime: &RuntimeState) -> String {
         }
         return format!("{n}");
     }
+    // Strategy B: TAG_PTR_STRING. Read content directly via the new path.
+    if let Some(gc_ref) = value.as_string_ref() {
+        return crate::js_string_gc::to_rust_string(gc_ref);
+    }
     if let Some(handle_id) = value.as_object_handle() {
         let handle = ObjectHandle(handle_id);
         // Try string value. Goes through `js_string_to_rust_string` so

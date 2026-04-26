@@ -326,13 +326,11 @@ fn aggregate_error_constructor(
         let msg = runtime
             .js_to_string(message_arg)
             .map_err(|error| map_interpreter_error(error, runtime))?;
-        let msg_handle = runtime.alloc_string(msg)?;
-        define_non_enumerable_data_property(
-            runtime,
-            handle,
-            "message",
-            RegisterValue::from_object_handle(msg_handle.0),
-        )?;
+        // Strategy B: store .message as TAG_PTR_STRING.
+        let msg_value = runtime
+            .alloc_string_value(&msg)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        define_non_enumerable_data_property(runtime, handle, "message", msg_value)?;
     }
 
     let errors_arg = args
@@ -637,8 +635,11 @@ fn error_to_string(
         format!("{name}: {msg}")
     };
 
-    let handle = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// Shared constructor for all Error types.
@@ -1036,8 +1037,10 @@ fn error_stack_getter(
     };
 
     let formatted = crate::stack_frame::format_v8_stack(&name, &message, &frames);
-    let str_handle = runtime.alloc_string(formatted)?;
-    let value = RegisterValue::from_object_handle(str_handle.0);
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&formatted)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
 
     // Memoize.
     define_non_enumerable_data_property(runtime, handle, ERROR_STACK_STRING_SLOT, value)?;

@@ -134,8 +134,12 @@ fn boolean_to_string(
         return Err(VmNativeCallError::Internal(BOOLEAN_TO_STRING_ERROR.into()));
     };
 
-    let string = runtime.alloc_string(if value { "true" } else { "false" })?;
-    Ok(RegisterValue::from_object_handle(string.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value_str = if value { "true" } else { "false" };
+    let value = runtime
+        .alloc_string_value(value_str)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 fn to_boolean(value: RegisterValue, runtime: &crate::interpreter::RuntimeState) -> bool {

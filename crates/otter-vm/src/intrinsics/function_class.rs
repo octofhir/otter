@@ -403,6 +403,9 @@ fn function_to_string(
         }
     };
 
-    let string = runtime.alloc_string(text)?;
-    Ok(RegisterValue::from_object_handle(string.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(text)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }

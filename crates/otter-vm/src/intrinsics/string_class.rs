@@ -276,6 +276,10 @@ fn coerce_to_string(
     if value.is_symbol() {
         return Ok(symbol_descriptive_string(value, runtime).into_boxed_str());
     }
+    // Strategy B: TAG_PTR_STRING — read content directly via the new path.
+    if let Some(gc_ref) = value.as_string_ref() {
+        return Ok(crate::js_string_gc::to_rust_string(gc_ref).into_boxed_str());
+    }
     if let Some(handle) = value.as_object_handle().map(ObjectHandle) {
         if let Some(string) = runtime
             .objects()
@@ -578,9 +582,11 @@ fn string_at(
         return Ok(RegisterValue::undefined());
     }
     let unit = units[actual as usize];
-    let handle = runtime
-        .alloc_js_string(crate::js_string::JsString::from_utf16(vec![unit]))?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value_from_utf16(&[unit])
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.2 String.prototype.charAt(pos) ─────────────────────────────────
@@ -598,18 +604,25 @@ fn string_char_at(
     // §22.1.3.2 step 2: Let position be ? ToIntegerOrInfinity(pos).
     let pos = to_integer_arg_i32(args, 0, 0, runtime)?;
     if pos < 0 {
-        let handle = runtime.alloc_string("")?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        // Strategy B: TAG_PTR_STRING for empty result.
+        let value = runtime
+            .alloc_string_value("")
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
     match js.code_unit_at(pos as usize) {
         Some(unit) => {
-            let handle = runtime
-                .alloc_js_string(crate::js_string::JsString::from_utf16(vec![unit]))?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            let value = runtime
+                .alloc_string_value_from_utf16(&[unit])
+                .map_err(|e| map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         None => {
-            let handle = runtime.alloc_string("")?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            // Strategy B: TAG_PTR_STRING for empty result.
+            let value = runtime
+                .alloc_string_value("")
+                .map_err(|e| map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
     }
 }
@@ -1351,11 +1364,11 @@ fn string_split(
         .unwrap_or_else(RegisterValue::undefined);
     if separator == RegisterValue::undefined() {
         let result = runtime.alloc_array()?;
-        let handle = runtime.alloc_string(&*s)?;
-        runtime
-            .objects_mut()
-            .set_index(result, 0, RegisterValue::from_object_handle(handle.0))
-            .ok();
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(&s)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        runtime.objects_mut().set_index(result, 0, value).ok();
         return Ok(RegisterValue::from_object_handle(result.0));
     }
     let sep = runtime
@@ -1375,11 +1388,12 @@ fn string_split(
             if i >= limit {
                 break;
             }
-            let handle = runtime.alloc_string(ch.to_string())?;
-            runtime
-                .objects_mut()
-                .set_index(result, i, RegisterValue::from_object_handle(handle.0))
-                .ok();
+            // Strategy B: TAG_PTR_STRING.
+            let ch_str = ch.to_string();
+            let value = runtime
+                .alloc_string_value(&ch_str)
+                .map_err(|e| map_interpreter_error(e, runtime))?;
+            runtime.objects_mut().set_index(result, i, value).ok();
         }
         return Ok(RegisterValue::from_object_handle(result.0));
     }
@@ -1396,11 +1410,11 @@ fn string_split(
         {
             Some(pos) => {
                 let piece = &s[start..start + pos];
-                let handle = runtime.alloc_string(piece)?;
-                runtime
-                    .objects_mut()
-                    .set_index(result, count, RegisterValue::from_object_handle(handle.0))
-                    .ok();
+                // Strategy B: TAG_PTR_STRING.
+                let value = runtime
+                    .alloc_string_value(piece)
+                    .map_err(|e| map_interpreter_error(e, runtime))?;
+                runtime.objects_mut().set_index(result, count, value).ok();
                 count += 1;
                 start = start + pos + sep_bytes.len();
             }
@@ -1411,11 +1425,11 @@ fn string_split(
     }
     if count < limit {
         let piece = &s[start..];
-        let handle = runtime.alloc_string(piece)?;
-        runtime
-            .objects_mut()
-            .set_index(result, count, RegisterValue::from_object_handle(handle.0))
-            .ok();
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(piece)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        runtime.objects_mut().set_index(result, count, value).ok();
     }
 
     Ok(RegisterValue::from_object_handle(result.0))
@@ -1499,11 +1513,17 @@ fn string_replace(
         result.push_str(&s[..pos]);
         result.push_str(&replacement);
         result.push_str(&s[pos + search.len()..]);
-        let handle = runtime.alloc_string(result)?;
-        Ok(RegisterValue::from_object_handle(handle.0))
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(&result)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        Ok(value)
     } else {
-        let handle = runtime.alloc_string(&*s)?;
-        Ok(RegisterValue::from_object_handle(handle.0))
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(&s)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        Ok(value)
     }
 }
 
@@ -1544,8 +1564,11 @@ fn string_replace_all(
             result.push(*ch);
             result.push_str(&replace_str);
         }
-        let handle = runtime.alloc_string(result)?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value(&result)
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
 
     let result = s.replace(&*search, &replace_str);
@@ -1679,8 +1702,12 @@ fn string_to_well_formed(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let js = this_js_string_value(this, runtime)?;
     let result = js.to_well_formed();
-    let handle = runtime.alloc_js_string(result)?;
-    Ok(RegisterValue::from_object_handle(handle.0))
+    // Strategy B: TAG_PTR_STRING preserving WTF-16.
+    let units: Vec<u16> = result.as_utf16_cow().into_owned();
+    let value = runtime
+        .alloc_string_value_from_utf16(&units)
+        .map_err(|e| map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 // ── §22.1.3.11 String.prototype.localeCompare(that [, locales [, options]]) ──
@@ -1948,8 +1975,11 @@ fn string_raw(
 
     // Step 5: If literalSegments == 0, return "".
     if literal_segments == 0 {
-        let handle = runtime.alloc_string("")?;
-        return Ok(RegisterValue::from_object_handle(handle.0));
+        // Strategy B: TAG_PTR_STRING.
+        let value = runtime
+            .alloc_string_value("")
+            .map_err(|e| map_interpreter_error(e, runtime))?;
+        return Ok(value);
     }
 
     let substitutions = if args.len() > 1 { &args[1..] } else { &[] };

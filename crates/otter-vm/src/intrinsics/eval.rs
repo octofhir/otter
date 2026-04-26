@@ -41,8 +41,11 @@ fn uri_codec_result(
 ) -> Result<RegisterValue, VmNativeCallError> {
     match result {
         Ok(output) => {
-            let handle = runtime.alloc_string(output)?;
-            Ok(RegisterValue::from_object_handle(handle.0))
+            // Strategy B: TAG_PTR_STRING.
+            let value = runtime
+                .alloc_string_value(&output)
+                .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+            Ok(value)
         }
         Err(UriCodecError::Uri(message)) => Err(uri_error(runtime, &message)),
         Err(UriCodecError::Interrupted) => {

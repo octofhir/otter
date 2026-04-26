@@ -1666,8 +1666,11 @@ fn typed_array_join(
             .unwrap_or(0.0);
         result.push_str(&format_number(val));
     }
-    let s = runtime.alloc_string(result)?;
-    Ok(RegisterValue::from_object_handle(s.0))
+    // Strategy B: TAG_PTR_STRING.
+    let value = runtime
+        .alloc_string_value(&result)
+        .map_err(|e| crate::intrinsics::string_class::map_interpreter_error(e, runtime))?;
+    Ok(value)
 }
 
 /// §23.2.3.19 %TypedArray%.prototype.keys ( )

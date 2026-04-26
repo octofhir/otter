@@ -141,22 +141,19 @@ impl RuntimeState {
             Ok(handle) => handle,
             Err(error) => return VmNativeCallError::from(error),
         };
-        let msg = match self.alloc_string(message) {
-            Ok(handle) => handle,
+        // Strategy B: store .message and .name as TAG_PTR_STRING.
+        let msg = match self.alloc_string_value(message) {
+            Ok(value) => value,
             Err(error) => return VmNativeCallError::from(error),
         };
         let msg_prop = self.intern_property_name("message");
-        self.objects
-            .set_property(handle, msg_prop, RegisterValue::from_object_handle(msg.0))
-            .ok();
-        let name = match self.alloc_string("SyntaxError") {
-            Ok(handle) => handle,
+        self.objects.set_property(handle, msg_prop, msg).ok();
+        let name = match self.alloc_string_value("SyntaxError") {
+            Ok(value) => value,
             Err(error) => return VmNativeCallError::from(error),
         };
         let name_prop = self.intern_property_name("name");
-        self.objects
-            .set_property(handle, name_prop, RegisterValue::from_object_handle(name.0))
-            .ok();
+        self.objects.set_property(handle, name_prop, name).ok();
         VmNativeCallError::Thrown(RegisterValue::from_object_handle(handle.0))
     }
 }

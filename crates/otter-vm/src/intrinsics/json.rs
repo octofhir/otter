@@ -122,14 +122,9 @@ fn json_parse(
             .objects_mut()
             .set_property(root, empty_key, result)
             .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-        let key_str = runtime.alloc_string("")?;
-        walk_reviver(
-            root,
-            RegisterValue::from_object_handle(key_str.0),
-            reviver_fn,
-            runtime,
-            0,
-        )
+        // Strategy B: empty key passed to reviver — TAG_PTR_STRING.
+        let key_value = runtime.alloc_string_value("")?;
+        walk_reviver(root, key_value, reviver_fn, runtime, 0)
     } else {
         Ok(result)
     }
@@ -198,13 +193,17 @@ impl<'de, 'a> Visitor<'de> for HeapVisitor<'a> {
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<RegisterValue, E> {
-        let handle = self.runtime.alloc_string(v).map_err(de::Error::custom)?;
-        Ok(RegisterValue::from_object_handle(handle.0))
+        // Strategy B: TAG_PTR_STRING.
+        self.runtime
+            .alloc_string_value(v)
+            .map_err(de::Error::custom)
     }
 
     fn visit_string<E: de::Error>(self, v: String) -> Result<RegisterValue, E> {
-        let handle = self.runtime.alloc_string(v).map_err(de::Error::custom)?;
-        Ok(RegisterValue::from_object_handle(handle.0))
+        // Strategy B: TAG_PTR_STRING.
+        self.runtime
+            .alloc_string_value(&v)
+            .map_err(de::Error::custom)
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<RegisterValue, E> {
@@ -308,14 +307,10 @@ fn walk_reviver(
                     if i % JSON_INTERRUPT_POLL_INTERVAL == 0 {
                         runtime.check_interrupt()?;
                     }
-                    let idx_str = runtime.alloc_string(i.to_string())?;
-                    let new_val = walk_reviver(
-                        obj_handle,
-                        RegisterValue::from_object_handle(idx_str.0),
-                        reviver,
-                        runtime,
-                        depth + 1,
-                    )?;
+                    // Strategy B: TAG_PTR_STRING.
+                    let idx_value = runtime.alloc_string_value(&i.to_string())?;
+                    let new_val =
+                        walk_reviver(obj_handle, idx_value, reviver, runtime, depth + 1)?;
                     if new_val == RegisterValue::undefined() {
                         let idx_prop = runtime.intern_property_name(&i.to_string());
                         let names = runtime.property_names().clone();
@@ -338,14 +333,10 @@ fn walk_reviver(
                 for prop_id in keys {
                     runtime.check_interrupt()?;
                     let prop_name = property_names.get(prop_id).unwrap_or("").to_string();
-                    let prop_str = runtime.alloc_string(&*prop_name)?;
-                    let new_val = walk_reviver(
-                        obj_handle,
-                        RegisterValue::from_object_handle(prop_str.0),
-                        reviver,
-                        runtime,
-                        depth + 1,
-                    )?;
+                    // Strategy B: TAG_PTR_STRING.
+                    let prop_value = runtime.alloc_string_value(&prop_name)?;
+                    let new_val =
+                        walk_reviver(obj_handle, prop_value, reviver, runtime, depth + 1)?;
                     if new_val == RegisterValue::undefined() {
                         let names = runtime.property_names().clone();
                         runtime
@@ -655,13 +646,10 @@ fn stringify_array(
             .unwrap_or_else(RegisterValue::undefined);
 
         let elem = if let Some(replacer) = replacer_fn {
-            let idx_str = runtime.alloc_string(i.to_string())?;
+            // Strategy B: TAG_PTR_STRING.
+            let idx_value = runtime.alloc_string_value(&i.to_string())?;
             let holder = RegisterValue::from_object_handle(handle.0);
-            runtime.call_callable(
-                replacer,
-                holder,
-                &[RegisterValue::from_object_handle(idx_str.0), elem],
-            )?
+            runtime.call_callable(replacer, holder, &[idx_value, elem])?
         } else {
             elem
         };
@@ -773,13 +761,10 @@ fn stringify_object(
         runtime.check_interrupt()?;
 
         let val = if let Some(replacer) = replacer_fn {
-            let key_str = runtime.alloc_string(&*prop_name)?;
+            // Strategy B: TAG_PTR_STRING.
+            let key_value = runtime.alloc_string_value(&prop_name)?;
             let holder = RegisterValue::from_object_handle(handle.0);
-            runtime.call_callable(
-                replacer,
-                holder,
-                &[RegisterValue::from_object_handle(key_str.0), val],
-            )?
+            runtime.call_callable(replacer, holder, &[key_value, val])?
         } else {
             val
         };

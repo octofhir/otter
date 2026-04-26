@@ -114,20 +114,20 @@ impl Interpreter {
             Opcode::LdaConstStr => {
                 let idx = idx_operand(&instr.operands, 0)?;
                 use crate::string::StringId;
-                // C2: read the table's `JsString` directly so any
-                // lone-surrogate content (oxc-encoded as `\u{FFFD}xxxx`,
-                // already decoded at intern time via `from_oxc_encoded`)
-                // survives. Going through `s.to_string()` + `alloc_string`
-                // would round-trip through UTF-8 and replace lone
-                // surrogates with U+FFFD.
+                // Strategy B: emit string literals as TAG_PTR_STRING
+                // values via the GC-managed allocator, preserving the
+                // WTF-16 backing. Lone surrogates that oxc encodes as
+                // `\u{FFFD}xxxx` are decoded at intern time by
+                // `from_oxc_encoded` and survive verbatim through
+                // `as_utf16_cow`.
                 let Some(js) = function.string_literals().get_js(StringId(idx as u16)) else {
                     return Err(InterpreterError::NativeCall(Box::from(format!(
                         "v2 LdaConstStr: string id {idx} out of range"
                     ))));
                 };
-                let cloned = js.clone();
-                let handle = runtime.alloc_js_string(cloned)?;
-                activation.set_accumulator(RegisterValue::from_object_handle(handle.0));
+                let units: Vec<u16> = js.as_utf16_cow().into_owned();
+                let value = runtime.alloc_string_value_from_utf16(&units)?;
+                activation.set_accumulator(value);
             }
             Opcode::LdaConstF64 => {
                 let idx = idx_operand(&instr.operands, 0)?;
@@ -254,29 +254,32 @@ impl Interpreter {
             // to user code as a thrown error.
             Opcode::DynamicImport => {
                 let spec_reg = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let Some(spec_handle) = spec_reg.as_object_handle() else {
+                // Strategy B: specifier may be TAG_PTR_STRING or a legacy
+                // primitive string handle.
+                let spec_str = if let Some(gc_ref) = spec_reg.as_string_ref() {
+                    crate::js_string_gc::to_rust_string(gc_ref)
+                } else if let Some(spec_handle) = spec_reg.as_object_handle() {
+                    let h = crate::object::ObjectHandle(spec_handle);
+                    if runtime.objects.string_value(h)?.is_none() {
+                        return Err(InterpreterError::TypeError(Box::from(
+                            "dynamic import: specifier must be a string",
+                        )));
+                    }
+                    runtime.objects.flatten_string(h)?;
+                    runtime
+                        .objects
+                        .string_value(h)?
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| {
+                            InterpreterError::TypeError(Box::from(
+                                "dynamic import: specifier must be a string",
+                            ))
+                        })?
+                } else {
                     return Err(InterpreterError::TypeError(Box::from(
                         "dynamic import: specifier must be a string",
                     )));
                 };
-                let h = crate::object::ObjectHandle(spec_handle);
-                if runtime.objects.string_value(h)?.is_none() {
-                    return Err(InterpreterError::TypeError(Box::from(
-                        "dynamic import: specifier must be a string",
-                    )));
-                }
-                // C2: flatten Cons / Sliced / Thin so the read returns the
-                // actual specifier instead of a debug placeholder.
-                runtime.objects.flatten_string(h)?;
-                let spec_str = runtime
-                    .objects
-                    .string_value(h)?
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        InterpreterError::TypeError(Box::from(
-                            "dynamic import: specifier must be a string",
-                        ))
-                    })?;
                 let promise_value =
                     crate::module_loader::dynamic_import_resolve(&spec_str, runtime)?;
                 activation.set_accumulator(promise_value);
@@ -288,12 +291,9 @@ impl Interpreter {
                 let meta = runtime.alloc_object()?;
                 let url_prop = runtime.intern_property_name("url");
                 let referrer = runtime.current_dynamic_import_referrer().to_string();
-                let url_value = runtime.alloc_string(referrer.as_str())?;
-                runtime.objects.set_property(
-                    meta,
-                    url_prop,
-                    RegisterValue::from_object_handle(url_value.0),
-                )?;
+                // Strategy B: store .url as TAG_PTR_STRING.
+                let url_value = runtime.alloc_string_value(&referrer)?;
+                runtime.objects.set_property(meta, url_prop, url_value)?;
                 activation.set_accumulator(RegisterValue::from_object_handle(meta.0));
             }
 
@@ -757,7 +757,8 @@ impl Interpreter {
                         runtime.objects.flatten_string(rh).ok();
                         if let Ok(Some(rs)) = runtime.objects.string_value(rh) {
                             let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
-                            cow.as_ref() == rs.as_utf16()
+                            let rs_cow = rs.as_utf16_cow().into_owned();
+                            cow.as_ref() == rs_cow.as_slice()
                         } else {
                             false
                         }
@@ -773,7 +774,8 @@ impl Interpreter {
                         runtime.objects.flatten_string(lh).ok();
                         if let Ok(Some(ls)) = runtime.objects.string_value(lh) {
                             let cow = crate::js_string_gc::as_utf16_cow(gc_ref);
-                            ls.as_utf16() == cow.as_ref()
+                            let ls_cow = ls.as_utf16_cow().into_owned();
+                            ls_cow.as_slice() == cow.as_ref()
                         } else {
                             false
                         }

@@ -37,6 +37,50 @@ fn vm_native_call_error_from_interpreter(error: InterpreterError) -> VmNativeCal
 }
 
 impl RuntimeState {
+    /// C6: acquires a `(registers, upvalues)` buffer pair sized for the
+    /// next call. Both vectors are zero-filled (`RegisterValue::default()`
+    /// / `None`) up to `register_count`. If the pool has a recycled buffer
+    /// we reuse its capacity; otherwise we allocate fresh.
+    ///
+    /// Pair the call with [`Self::release_call_buffers`] when the frame
+    /// pops, so the next call can reuse the allocation. Forgetting to
+    /// release is a perf regression but never a correctness issue —
+    /// the buffer just gets dropped with the activation.
+    pub fn acquire_call_buffers(
+        &mut self,
+        register_count: usize,
+    ) -> (Vec<RegisterValue>, Vec<Option<ObjectHandle>>) {
+        let mut registers = self.register_buffer_pool.pop().unwrap_or_default();
+        registers.clear();
+        registers.resize(register_count, RegisterValue::default());
+
+        let mut upvalues = self.upvalue_buffer_pool.pop().unwrap_or_default();
+        upvalues.clear();
+        upvalues.resize(register_count, None);
+
+        (registers, upvalues)
+    }
+
+    /// C6: returns a pair of activation buffers to the per-runtime pool.
+    /// Drops the buffers if the pool is at capacity, bounding the
+    /// memory cost. Both vectors are cleared (not deallocated) on entry
+    /// so reads from the pool always see a zero-filled buffer with the
+    /// previous capacity preserved.
+    pub fn release_call_buffers(
+        &mut self,
+        mut registers: Vec<RegisterValue>,
+        mut upvalues: Vec<Option<ObjectHandle>>,
+    ) {
+        registers.clear();
+        upvalues.clear();
+        if self.register_buffer_pool.len() < crate::interpreter::CALL_BUFFER_POOL_CAPACITY {
+            self.register_buffer_pool.push(registers);
+        }
+        if self.upvalue_buffer_pool.len() < crate::interpreter::CALL_BUFFER_POOL_CAPACITY {
+            self.upvalue_buffer_pool.push(upvalues);
+        }
+    }
+
     /// GC safepoint — called at loop back-edges and function call boundaries.
     /// Collects roots from intrinsics and the provided register window,
     /// then triggers collection if memory pressure warrants it.
@@ -186,13 +230,38 @@ impl RuntimeState {
         Ok(handle)
     }
 
-    /// Allocates one BigInt heap value (no prototype — BigInt is a primitive type).
+    /// Allocates one BigInt heap value from a [`BigIntPayload`].
+    /// (No prototype — BigInt is a primitive type.)
     ///
     /// §6.1.6.2 The BigInt Type
     /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
-    pub fn alloc_bigint(&mut self, value: &str) -> Result<ObjectHandle, InterpreterError> {
+    pub fn alloc_bigint(
+        &mut self,
+        value: crate::bigint_value::BigIntPayload,
+    ) -> Result<ObjectHandle, InterpreterError> {
         self.objects
             .alloc_bigint(value)
+            .map_err(InterpreterError::from)
+    }
+
+    /// Allocates a BigInt by parsing a decimal string. Returns `Err`
+    /// if the input is not a valid integer.
+    pub fn alloc_bigint_from_str(
+        &mut self,
+        value: &str,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        self.objects
+            .alloc_bigint_from_str(value)
+            .map_err(InterpreterError::from)
+    }
+
+    /// Allocates a BigInt from a signed 64-bit integer (always inline).
+    pub fn alloc_bigint_from_i64(
+        &mut self,
+        value: i64,
+    ) -> Result<ObjectHandle, InterpreterError> {
+        self.objects
+            .alloc_bigint_from_i64(value)
             .map_err(InterpreterError::from)
     }
 
@@ -226,11 +295,14 @@ impl RuntimeState {
         Ok(handle)
     }
 
-    /// Returns the decimal string backing a BigInt handle.
+    /// Returns the [`BigIntPayload`] backing a BigInt handle.
     ///
     /// §6.1.6.2 The BigInt Type
     /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
-    pub fn bigint_value(&self, handle: ObjectHandle) -> Option<&str> {
+    pub fn bigint_value(
+        &self,
+        handle: ObjectHandle,
+    ) -> Option<&crate::bigint_value::BigIntPayload> {
         self.objects.bigint_value(handle).ok().flatten()
     }
 

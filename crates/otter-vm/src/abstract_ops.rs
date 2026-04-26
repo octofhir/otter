@@ -136,7 +136,7 @@ fn interpreter_error_to_thrown(
     }
 }
 
-/// Compares two BigInt values by their decimal string representation.
+/// Compares two BigInt values via their structured payload.
 ///
 /// Returns `Some(true/false)` when both operands are BigInt, `None` otherwise.
 /// §6.1.6.2.13 BigInt::equal(x, y)
@@ -160,6 +160,9 @@ fn compare_bigint_primitives(
         return Ok(None);
     };
 
+    // `BigIntPayload: PartialEq` is canonical: equal magnitudes always share
+    // the same variant (Inline ↔ Heap demotion happens at construction), so a
+    // direct equality check suffices without re-stringifying.
     Ok(Some(lhs_value == rhs_value))
 }
 

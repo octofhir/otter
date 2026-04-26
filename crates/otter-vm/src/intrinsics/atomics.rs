@@ -298,20 +298,23 @@ fn coerce_atomic_value(
                 "Atomics: BigInt typed arrays require BigInt values",
             )?);
         };
-        let bigint_str = match runtime.objects().bigint_value(ObjectHandle(bigint_handle)) {
-            Ok(Some(s)) => s.to_string(),
+        let payload = match runtime.objects().bigint_value(ObjectHandle(bigint_handle)) {
+            Ok(Some(p)) => p.clone(),
             _ => return Err(type_error(runtime, "Atomics: invalid BigInt")?),
         };
 
+        // §7.1.4/§7.1.5 ToBigInt64 / ToBigUint64 — modulo 2^64 with the
+        // appropriate signedness applied at the Rust boundary.
+        let modulus = num_bigint::BigInt::from(1u128 << 64);
+        let mut m = payload.as_bigint().as_ref() % &modulus;
+        if m.sign() == num_bigint::Sign::Minus {
+            m += &modulus;
+        }
+        use num_traits::ToPrimitive;
+        let u = m.to_u64().unwrap_or(0);
         match kind {
-            TypedArrayKind::BigInt64 => {
-                let n: i64 = bigint_str.parse().unwrap_or(0);
-                Ok(AtomicValue::I64(n))
-            }
-            TypedArrayKind::BigUint64 => {
-                let n: u64 = bigint_str.parse().unwrap_or(0);
-                Ok(AtomicValue::U64(n))
-            }
+            TypedArrayKind::BigInt64 => Ok(AtomicValue::I64(u as i64)),
+            TypedArrayKind::BigUint64 => Ok(AtomicValue::U64(u)),
             _ => unreachable!(),
         }
     } else {
@@ -444,11 +447,12 @@ fn atomic_value_to_register(
     match value {
         AtomicValue::F64(n) => Ok(RegisterValue::from_number(n)),
         AtomicValue::I64(n) => {
-            let handle = runtime.alloc_bigint(&n.to_string())?;
+            let handle = runtime.alloc_bigint_from_i64(n)?;
             Ok(RegisterValue::from_bigint_handle(handle.0))
         }
         AtomicValue::U64(n) => {
-            let handle = runtime.alloc_bigint(&n.to_string())?;
+            let payload = crate::bigint_value::BigIntPayload::from_u64(n);
+            let handle = runtime.alloc_bigint(payload)?;
             Ok(RegisterValue::from_bigint_handle(handle.0))
         }
     }

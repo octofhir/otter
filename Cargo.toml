@@ -23,13 +23,22 @@ oxc_codegen = "0.123"
 oxc_sourcemap = "6.1.1"
 oxc-miette = { version = "2.7", features = ["fancy"] }
 
-# Optimized release profile for minimal startup time
+# Optimized release profile for minimal startup time.
+#
+# S5-c (2026-04-26): `panic = "unwind"` so the S5-b `catch_unwind`
+# wrapper around native descriptor dispatch is active in release
+# binaries — a panic inside an intrinsic surfaces as a catchable
+# JS-visible TypeError instead of aborting the embedder process.
+# Tradeoff: unwind tables add ~2 % binary size and a small cold-path
+# overhead at panic boundaries; matches the V8/JSC/SpiderMonkey
+# default and is required for any embedding use case where the
+# host process must survive a buggy native binding.
 [profile.release]
 lto = "thin"           # Link-time optimization (improves code layout)
 codegen-units = 1      # Single codegen unit (better inlining, worse compile time)
 strip = false          # Keep symbols for profiling
 # debug = true           # Include debug info for flamegraph
-panic = "abort"        # No unwinding (smaller binary)
+panic = "unwind"       # Unwind so S5-b catch_unwind can convert panics → JS errors.
 opt-level = 3          # Maximum optimization
 
 # Release profile for test262 runner — needs panic=unwind for catch_unwind

@@ -204,7 +204,10 @@ fn instant_epoch_ns(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let instant = require_instant(this, runtime)?;
     let ns = instant.epoch_nanoseconds().0;
-    let handle = runtime.alloc_bigint(&ns.to_string())?;
+    // Temporal nanoseconds are i128-bounded; route through BigInt directly.
+    let payload =
+        crate::bigint_value::BigIntPayload::from_bigint(num_bigint::BigInt::from(ns));
+    let handle = runtime.alloc_bigint(payload)?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 

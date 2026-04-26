@@ -66,6 +66,36 @@ const BOOLEAN_DATA_SLOT: &str = "__otter_boolean_data__";
 const ERROR_DATA_SLOT: &str = "__otter_error_data__";
 const EXECUTION_INTERRUPTED_MESSAGE: &str = "execution interrupted";
 
+/// C6: maximum number of recycled register/upvalue buffers retained per
+/// runtime. Each held buffer keeps its `Vec` capacity but no element
+/// payload, so the bound on memory is `~8 B/slot * cap * average frame
+/// size`. 64 entries × 256 slots × 8 B = 128 KB worst case — small
+/// enough to keep around, large enough to absorb call bursts.
+pub(crate) const CALL_BUFFER_POOL_CAPACITY: usize = 64;
+
+/// C5: maximum number of compiled-eval entries retained per runtime.
+/// LRU eviction; chosen empirically to absorb tight loops over a
+/// templating literal without unbounded memory growth.
+pub(crate) const EVAL_CACHE_CAPACITY: usize = 64;
+
+/// O3: type alias for the back-edge sample hook so the
+/// `RuntimeState::sample_hook` field stays readable. The closure
+/// observes a borrow of the live shadow stack — implementations must
+/// not hold the slice past the call. `Send + Sync` allows the runtime
+/// to share the hook with other diagnostic consumers in the future.
+pub type SampleHook =
+    std::sync::Arc<dyn Fn(&[crate::stack_frame::StackFrameInfo]) + Send + Sync>;
+
+/// C5: cache key for indirect eval. Source content hashed via
+/// `std::hash::DefaultHasher` (FNV-flavoured wyhash on stable). Splitting
+/// on `is_field_init` keeps the §B.3.5.2 early-error variant separate
+/// from the ordinary eval module — the two compile to different bytecode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct EvalCacheKey {
+    pub source_hash: u64,
+    pub is_field_init: bool,
+}
+
 /// Shared execution runtime for one interpreter/JIT run.
 pub struct RuntimeState {
     /// §9.3 — Realm records owned by this runtime. The vector is grown only
@@ -152,6 +182,25 @@ pub struct RuntimeState {
     /// `RangeError` ("Maximum call stack size exceeded") instead of
     /// overflowing the native Rust thread stack.
     pub(super) call_depth: u32,
+    /// O3: optional callback fired at every interpreter back-edge with the
+    /// current shadow-stack snapshot. Used by the CLI to drive the
+    /// instrumentation-based CPU profiler without a separate sampling
+    /// thread; otter-runtime installs an `Arc` closure that captures the
+    /// `CpuProfiler` and the per-sample interval timer.
+    pub(super) sample_hook: Option<crate::interpreter::SampleHook>,
+    /// C6: per-runtime register/upvalue buffer pool. Each entry is a
+    /// pre-allocated `Vec<RegisterValue>` (resp. `Vec<Option<ObjectHandle>>`)
+    /// returned by a previous activation; new calls reuse instead of
+    /// allocating fresh. Capped at [`CALL_BUFFER_POOL_CAPACITY`] entries.
+    pub(super) register_buffer_pool: Vec<Vec<RegisterValue>>,
+    pub(super) upvalue_buffer_pool: Vec<Vec<Option<ObjectHandle>>>,
+    /// C5: per-runtime indirect-eval bytecode cache. Keyed by `(source_hash,
+    /// is_field_init)` and capped at [`EVAL_CACHE_CAPACITY`]; evicts in
+    /// least-recently-used order. Hits skip the parse/lower/codegen pipeline,
+    /// which dominates `eval(literalString)` patterns common in templating
+    /// libraries and JSON-via-eval shims.
+    pub(super) eval_cache:
+        std::collections::VecDeque<(crate::interpreter::EvalCacheKey, std::rc::Rc<Module>)>,
     /// S6: per-runtime dynamic-import context. Replaces the thread-local
     /// `DYNAMIC_IMPORT_HOST` / `DYNAMIC_IMPORT_REGISTRY` /
     /// `DYNAMIC_IMPORT_REFERRER` so multi-threaded embedders (Axum,
@@ -509,12 +558,16 @@ impl Interpreter {
                     .function(callee_index)
                     .ok_or(InterpreterError::InvalidCallTarget)?;
                 let register_count = callee_function.frame_layout().register_count();
-                // Pass the closure handle so the activation can access upvalues.
-                let mut activation = Activation::with_context(
+                // C6: pull pooled buffers; recycle on every exit path below
+                // (sync return, async wrapper). Pass the closure handle so
+                // the activation can access upvalues.
+                let (regs, upvals) = runtime.acquire_call_buffers(usize::from(register_count));
+                let mut activation = Activation::with_pooled_buffers(
                     callee_index,
-                    register_count,
                     FrameMetadata::default(),
                     Some(callable),
+                    regs,
+                    upvals,
                 );
 
                 // Set up receiver.
@@ -542,15 +595,20 @@ impl Interpreter {
                 // C-args: capture the call-site argc for `arguments.length`.
                 activation.argc = u16::try_from(arguments.len()).unwrap_or(u16::MAX);
 
-                if is_async {
+                let result = if is_async {
                     // §27.7.5.1 AsyncFunctionStart — create a result promise,
                     // execute the body, and settle the promise on completion.
                     Self::execute_async_function_body(runtime, &module, &mut activation)
                 } else {
                     let interpreter = Interpreter::for_runtime(runtime);
-                    let result = interpreter.run_with_runtime(&module, &mut activation, runtime)?;
-                    Ok(result.return_value())
-                }
+                    let exec_result =
+                        interpreter.run_with_runtime(&module, &mut activation, runtime)?;
+                    Ok(exec_result.return_value())
+                };
+                // C6: recycle pooled buffers regardless of which path ran.
+                let (regs, upvals) = activation.into_pooled_buffers();
+                runtime.release_call_buffers(regs, upvals);
+                result
             }
             HeapValueKind::PromiseCapabilityFunction => {
                 let value = arguments
@@ -1546,7 +1604,11 @@ impl Interpreter {
                         activation: callee_activation,
                     } = *payload;
                     current_module = callee_module;
-                    *activation = callee_activation;
+                    // C6: extract the displaced activation so its buffers
+                    // can be recycled before the new one moves into place.
+                    let outgoing = std::mem::replace(activation, callee_activation);
+                    let (regs, upvals) = outgoing.into_pooled_buffers();
+                    runtime.release_call_buffers(regs, upvals);
                     function = current_module
                         .function(activation.function_index())
                         .expect("tail-call function index must be valid")

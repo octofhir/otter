@@ -686,7 +686,7 @@ fn data_view_get_big_int64(
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     };
-    let handle = runtime.alloc_bigint(&val.to_string())?;
+    let handle = runtime.alloc_bigint_from_i64(val)?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -707,7 +707,8 @@ fn data_view_get_big_uint64(
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])
     };
-    let handle = runtime.alloc_bigint(&val.to_string())?;
+    let payload = crate::bigint_value::BigIntPayload::from_u64(val);
+    let handle = runtime.alloc_bigint(payload)?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -943,10 +944,17 @@ fn to_bigint_i64(
             "Cannot convert a non-BigInt value to a BigInt",
         )?);
     };
-    let s = runtime
+    let payload = runtime
         .bigint_value(ObjectHandle(handle))
         .ok_or_else(|| VmNativeCallError::Internal("invalid BigInt handle".into()))?;
-    Ok(s.parse::<i64>().unwrap_or(0))
+    // §7.1.4 ToBigInt64 — modulo 2^64 sign-extended into i64.
+    let modulus = num_bigint::BigInt::from(1u128 << 64);
+    let mut m = payload.as_bigint().as_ref() % &modulus;
+    if m.sign() == num_bigint::Sign::Minus {
+        m += &modulus;
+    }
+    use num_traits::ToPrimitive;
+    Ok(m.to_u64().unwrap_or(0) as i64)
 }
 
 /// Helper: extract BigInt argument at given index and convert to `u64`.
@@ -967,12 +975,17 @@ fn to_bigint_u64(
             "Cannot convert a non-BigInt value to a BigInt",
         )?);
     };
-    let s = runtime
+    let payload = runtime
         .bigint_value(ObjectHandle(handle))
         .ok_or_else(|| VmNativeCallError::Internal("invalid BigInt handle".into()))?;
-    // For BigUint64, parse as i128 first to handle large positive values and wrap.
-    let parsed: i128 = s.parse().unwrap_or(0);
-    Ok(parsed as u64)
+    // §7.1.5 ToBigUint64 — modulo 2^64.
+    let modulus = num_bigint::BigInt::from(1u128 << 64);
+    let mut m = payload.as_bigint().as_ref() % &modulus;
+    if m.sign() == num_bigint::Sign::Minus {
+        m += &modulus;
+    }
+    use num_traits::ToPrimitive;
+    Ok(m.to_u64().unwrap_or(0))
 }
 
 /// Helper: extract numeric argument at given index.

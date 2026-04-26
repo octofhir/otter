@@ -280,7 +280,9 @@ fn zdt_epoch_ns(
 ) -> Result<RegisterValue, VmNativeCallError> {
     let zdt = require_zoned_date_time(this, runtime)?;
     let ns = zdt.epoch_nanoseconds().0;
-    let handle = runtime.alloc_bigint(&ns.to_string())?;
+    let payload =
+        crate::bigint_value::BigIntPayload::from_bigint(num_bigint::BigInt::from(ns));
+    let handle = runtime.alloc_bigint(payload)?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 

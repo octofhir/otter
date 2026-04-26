@@ -135,11 +135,11 @@ fn range_error(runtime: &mut crate::interpreter::RuntimeState, msg: &str) -> VmN
     runtime.throw_range_error(msg)
 }
 
-/// Extracts a BigInt value string from a register, or throws TypeError.
+/// Extracts the [`BigIntPayload`] backing a register, or throws TypeError.
 fn require_bigint_value<'a>(
     value: &RegisterValue,
     runtime: &'a crate::interpreter::RuntimeState,
-) -> Result<&'a str, VmNativeCallError> {
+) -> Result<&'a crate::bigint_value::BigIntPayload, VmNativeCallError> {
     let handle = value
         .as_bigint_handle()
         .ok_or_else(|| VmNativeCallError::Internal("expected BigInt value".into()))?;
@@ -176,8 +176,8 @@ fn to_bigint(
 
     // Boolean → 0n / 1n.
     if let Some(b) = value.as_bool() {
-        let val = if b { "1" } else { "0" };
-        let handle = runtime.alloc_bigint(val)?;
+        let payload = crate::bigint_value::BigIntPayload::from_bool(b);
+        let handle = runtime.alloc_bigint(payload)?;
         return Ok(RegisterValue::from_bigint_handle(handle.0));
     }
 
@@ -191,8 +191,8 @@ fn to_bigint(
         && let Ok(Some(s)) = runtime.objects().string_value(handle)
     {
         let s = s.trim().to_string();
-        if let Ok(_val) = s.parse::<num_bigint::BigInt>() {
-            let result = runtime.alloc_bigint(&s)?;
+        if let Ok(payload) = crate::bigint_value::BigIntPayload::from_decimal_str(&s) {
+            let result = runtime.alloc_bigint(payload)?;
             return Ok(RegisterValue::from_bigint_handle(result.0));
         }
         return Err(type_error(
@@ -228,9 +228,8 @@ fn bigint_constructor(
     if let Some(n) = value.as_number() {
         return number_to_bigint(n, runtime);
     }
-    if value.as_i32().is_some() {
-        let n = value.as_i32().unwrap();
-        let handle = runtime.alloc_bigint(&n.to_string())?;
+    if let Some(n) = value.as_i32() {
+        let handle = runtime.alloc_bigint_from_i64(n as i64)?;
         return Ok(RegisterValue::from_bigint_handle(handle.0));
     }
 
@@ -276,7 +275,8 @@ fn number_to_bigint(
         if sign_bit == 1 { -value } else { value }
     };
 
-    let handle = runtime.alloc_bigint(&big.to_string())?;
+    let payload = crate::bigint_value::BigIntPayload::from_bigint(big);
+    let handle = runtime.alloc_bigint(payload)?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -289,10 +289,11 @@ fn bigint_to_string(
     args: &[RegisterValue],
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<RegisterValue, VmNativeCallError> {
-    let value_str = require_bigint_value(this, runtime)?.to_string();
-    let parsed: num_bigint::BigInt = value_str
-        .parse()
-        .map_err(|_| VmNativeCallError::Internal("invalid BigInt value".into()))?;
+    // §21.2.3.2 step 1: `ThisBigIntValue(this)` MUST run before radix
+    // coercion. A non-BigInt receiver should produce a TypeError; if the
+    // radix check ran first, a bad radix on a wrong-typed receiver would
+    // leak a RangeError instead.
+    require_bigint_value(this, runtime)?;
 
     let radix = if let Some(r) = args.first() {
         if *r == RegisterValue::undefined() {
@@ -315,10 +316,15 @@ fn bigint_to_string(
         10
     };
 
-    let text = if radix == 10 {
-        parsed.to_string()
-    } else {
-        bigint_to_radix_string(&parsed, radix)
+    let text = {
+        let payload = require_bigint_value(this, runtime)?;
+        if radix == 10 {
+            payload.to_decimal_string()
+        } else {
+            // BigInt → radix string. The native fast-path inlines i64 magnitudes;
+            // larger values fall through to `BigInt::to_str_radix`.
+            payload.to_radix_string(radix)
+        }
     };
 
     let handle = runtime.alloc_string(text)?;
@@ -336,7 +342,7 @@ fn bigint_to_locale_string(
     use fixed_decimal::Decimal;
     use icu_decimal::DecimalFormatter;
 
-    let value_str = require_bigint_value(this, runtime)?.to_string();
+    let value_str = require_bigint_value(this, runtime)?.to_decimal_string();
 
     // Parse the BigInt decimal string into a FixedDecimal for locale formatting.
     let result = if let Ok(decimal) = value_str.parse::<Decimal>() {
@@ -385,10 +391,9 @@ fn bigint_as_int_n(
         .or_else(|| bits_val.as_i32().map(f64::from))
         .unwrap_or(0.0) as u32;
 
-    let value_str = require_bigint_value(&bigint_val, runtime)?;
-    let parsed: num_bigint::BigInt = value_str
-        .parse()
-        .map_err(|_| VmNativeCallError::Internal("invalid BigInt value".into()))?;
+    let parsed = require_bigint_value(&bigint_val, runtime)?
+        .as_bigint()
+        .into_owned();
 
     // §21.2.2.1 step 4: Let mod = n modulo 2^bits.
     let modulus = num_bigint::BigInt::from(1) << bits;
@@ -401,7 +406,8 @@ fn bigint_as_int_n(
         result
     };
 
-    let handle = runtime.alloc_bigint(&result.to_string())?;
+    let payload = crate::bigint_value::BigIntPayload::from_bigint(result);
+    let handle = runtime.alloc_bigint(payload)?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
@@ -420,10 +426,9 @@ fn bigint_as_uint_n(
         .or_else(|| bits_val.as_i32().map(f64::from))
         .unwrap_or(0.0) as u32;
 
-    let value_str = require_bigint_value(&bigint_val, runtime)?;
-    let parsed: num_bigint::BigInt = value_str
-        .parse()
-        .map_err(|_| VmNativeCallError::Internal("invalid BigInt value".into()))?;
+    let parsed = require_bigint_value(&bigint_val, runtime)?
+        .as_bigint()
+        .into_owned();
 
     // §21.2.2.2 step 4: Return n modulo 2^bits.
     let modulus = num_bigint::BigInt::from(1) << bits;
@@ -432,36 +437,11 @@ fn bigint_as_uint_n(
         result += &modulus;
     }
 
-    let handle = runtime.alloc_bigint(&result.to_string())?;
+    let payload = crate::bigint_value::BigIntPayload::from_bigint(result);
+    let handle = runtime.alloc_bigint(payload)?;
     Ok(RegisterValue::from_bigint_handle(handle.0))
 }
 
-// ─── Radix conversion ────────────────────────────────────────────────
-
-/// Converts a BigInt to a string in the given radix (2-36).
-fn bigint_to_radix_string(value: &num_bigint::BigInt, radix: u32) -> String {
-    use num_bigint::Sign;
-    use num_traits::Zero;
-
-    if value.is_zero() {
-        return "0".to_string();
-    }
-
-    let (sign, mut abs) = (value.sign(), value.magnitude().clone());
-    let radix_big = num_bigint::BigUint::from(radix);
-    let mut digits = Vec::new();
-
-    while !abs.is_zero() {
-        let remainder = &abs % &radix_big;
-        let digit = remainder.to_u32_digits().first().copied().unwrap_or(0);
-        digits.push(std::char::from_digit(digit, radix).unwrap_or('?'));
-        abs /= &radix_big;
-    }
-
-    digits.reverse();
-    let mut result: String = digits.into_iter().collect();
-    if sign == Sign::Minus {
-        result.insert(0, '-');
-    }
-    result
-}
+// Radix conversion is delegated to `BigIntPayload::to_radix_string`
+// (which itself routes inline values through `BigInt::to_str_radix` so
+// the canonical sign-prefixed output is preserved across variants).

@@ -452,14 +452,20 @@ impl RuntimeState {
                         .0,
                     )
                 };
-                let mut activation = Activation::with_context(
+                // C6: pull a (registers, upvalues) buffer pair from the
+                // per-runtime pool so the call avoids the per-frame
+                // allocation. `release_call_buffers` after run completion
+                // returns the buffers for reuse.
+                let (regs, upvals) = self.acquire_call_buffers(usize::from(register_count));
+                let mut activation = Activation::with_pooled_buffers(
                     callee_index,
-                    register_count,
                     FrameMetadata::new(
                         arguments.len() as RegisterIndex,
                         FrameFlags::new(true, true, false),
                     ),
                     Some(target),
+                    regs,
+                    upvals,
                 );
                 activation.set_construct_new_target(Some(new_target));
 
@@ -532,7 +538,7 @@ impl RuntimeState {
                         }
                         other => VmNativeCallError::Internal(format!("{other}").into()),
                     })?;
-                if is_derived_constructor {
+                let final_completion = if is_derived_constructor {
                     match completion {
                         Completion::Return(value) if self.is_ecma_object(value) => {
                             Completion::Return(value)
@@ -606,7 +612,13 @@ impl RuntimeState {
                     }
                 } else {
                     Interpreter::apply_construct_return_override(completion, default_receiver)
-                }
+                };
+                // C6: return the per-frame buffers to the pool now that
+                // run_completion_with_runtime has returned and the
+                // post-call accessors above no longer need them.
+                let (regs, upvals) = activation.into_pooled_buffers();
+                self.release_call_buffers(regs, upvals);
+                final_completion
             }
             _ => {
                 return Err(VmNativeCallError::Internal(

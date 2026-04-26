@@ -159,6 +159,17 @@ struct Cli {
     #[arg(long, global = true)]
     async_trace_file: Option<PathBuf>,
 
+    /// O2: write a Chrome DevTools `.heapsnapshot` JSON when the runtime
+    /// drops. Useful for inspecting live-object distribution after a
+    /// script run.
+    #[arg(long, global = true)]
+    heap_snapshot: bool,
+
+    /// O2: heap snapshot output file
+    /// (default: otter-<pid>-<ts>.heapsnapshot)
+    #[arg(long, global = true)]
+    heap_snapshot_file: Option<PathBuf>,
+
     /// Dump IC hit/miss statistics on exit (top 20 by miss count)
     #[arg(long, global = true)]
     trace_ic: bool,
@@ -605,5 +616,65 @@ fn build_runtime_for_cli(cli: &Cli, argv: Vec<String>) -> Result<otter_runtime::
         builder = builder.dump_jit_stats(true);
     }
 
-    Ok(builder.build())
+    let mut runtime = builder.build();
+
+    // O3: install CPU sampling profiler if requested. Sampling fires on
+    // every interpreter back-edge, gated by `--cpu-prof-interval` so a
+    // tight `for(;;)` loop produces ~1 sample per millisecond at the
+    // default interval.
+    if cli.cpu_prof {
+        use std::sync::Arc;
+        let interval = Duration::from_micros(cli.cpu_prof_interval);
+        let profiler = Arc::new(otter_profiler::CpuProfiler::with_interval(interval));
+        let stem = cli.cpu_prof_name.clone().unwrap_or_else(|| {
+            let pid = std::process::id();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("otter-{pid}-{ts}")
+        });
+        let dir = cli
+            .cpu_prof_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let cpuprofile = dir.join(format!("{stem}.cpuprofile"));
+        let folded = dir.join(format!("{stem}.folded"));
+        runtime.install_cpu_profiler(profiler, interval, cpuprofile, folded);
+    }
+
+    // O2: heap snapshot at exit. Path defaults to `otter-<pid>-<ts>.heapsnapshot`.
+    if cli.heap_snapshot {
+        let path = cli.heap_snapshot_file.clone().unwrap_or_else(|| {
+            let pid = std::process::id();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(format!("otter-{pid}-{ts}.heapsnapshot"))
+        });
+        runtime.enable_heap_snapshot(path);
+    }
+
+    // O3: install async-op tracer if requested. Spans are populated by
+    // host-side async sites that opt in via `state.async_tracer()`.
+    if cli.async_trace {
+        use std::sync::Arc;
+        let tracer = Arc::new(otter_profiler::AsyncTracer::new());
+        let path = cli.async_trace_file.clone().unwrap_or_else(|| {
+            let pid = std::process::id();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(format!("otter-{pid}-{ts}.trace.json"))
+        });
+        runtime.install_async_tracer(tracer, path);
+    }
+
+    Ok(runtime)
 }

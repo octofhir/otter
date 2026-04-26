@@ -28,6 +28,8 @@ pub mod abstract_ops;
 pub mod async_context;
 /// BigInt-constant side tables.
 pub mod bigint;
+/// Heap-stored BigInt payload (i64 fast path + arbitrary precision).
+pub mod bigint_value;
 /// Engine/runtime integration boundary.
 pub mod bridge;
 /// Builder-side adapters for descriptor-driven bootstrap.

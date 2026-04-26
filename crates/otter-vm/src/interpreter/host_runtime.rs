@@ -227,11 +227,15 @@ impl Interpreter {
             .map_err(|e| VmNativeCallError::Internal(format!("{e}").into()))?;
 
         let register_count = callee_function.frame_layout().register_count();
-        let mut activation = Activation::with_context(
+        // C6: pull pooled buffers; recycle on every exit path below
+        // (yield, return, throw, completion) so the next resume can reuse.
+        let (regs, upvals) = runtime.acquire_call_buffers(usize::from(register_count));
+        let mut activation = Activation::with_pooled_buffers(
             function_index,
-            register_count,
             FrameMetadata::new(arguments.len() as u16, FrameFlags::default()),
             closure_handle,
+            regs,
+            upvals,
         );
         // C-args: generator resume reuses this Activation as the per-resume
         // frame. The original argument vector at construction time is what
@@ -389,6 +393,11 @@ impl Interpreter {
         let _ = runtime
             .objects
             .set_generator_state(generator, GeneratorState::Completed);
+        // C6: completion path — recycle pooled buffers before producing
+        // the iterator result. Yield-suspended frames already returned
+        // earlier with the activation still alive.
+        let (regs, upvals) = activation.into_pooled_buffers();
+        runtime.release_call_buffers(regs, upvals);
         match completion {
             Completion::Return(v) => {
                 let handle = runtime.create_iter_result(v, true)?;

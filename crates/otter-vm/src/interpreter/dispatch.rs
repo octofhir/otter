@@ -156,7 +156,7 @@ impl Interpreter {
                         "v2 LdaConstBigInt: bigint id {idx} out of range"
                     ))));
                 };
-                let handle = runtime.objects.alloc_bigint(s.to_string())?;
+                let handle = runtime.objects.alloc_bigint_from_str(s)?;
                 // BigInt primitives use the dedicated `TAG_PTR_BIGINT` tag so
                 // `is_bigint()` discriminators and `bigint_binary_op` decoders
                 // both find the value; tagging as a regular object handle
@@ -591,17 +591,46 @@ impl Interpreter {
                 }
             }
             Opcode::Negate => {
+                // §13.5.4.1 Unary `-` runs ToNumeric, then dispatches to
+                // Number::unaryMinus or BigInt::unaryMinus depending on the
+                // operand type (§6.1.6.1.1 / §6.1.6.2.4).
                 let value = activation.accumulator();
                 if let Some(l) = value.as_i32() {
                     activation.set_accumulator(RegisterValue::from_i32(l.wrapping_neg()));
+                } else if let Some(handle) = value.as_bigint_handle() {
+                    // §6.1.6.2.4 BigInt::unaryMinus(x) — preserves
+                    // arbitrary precision via the structured payload.
+                    let lh = crate::object::ObjectHandle(handle);
+                    let result = runtime
+                        .objects
+                        .bigint_value(lh)?
+                        .ok_or(InterpreterError::InvalidHeapValueKind)?
+                        .neg();
+                    let new_handle = runtime.alloc_bigint(result)?;
+                    activation.set_accumulator(RegisterValue::from_bigint_handle(new_handle.0));
                 } else {
                     let n = runtime.js_to_number(value)?;
                     activation.set_accumulator(RegisterValue::from_number(-n));
                 }
             }
             Opcode::BitwiseNot => {
-                let l = i32_of(activation.accumulator())?;
-                activation.set_accumulator(RegisterValue::from_i32(!l));
+                // §13.5.6.1 Unary `~` runs ToNumeric, then BigInt::bitwiseNOT
+                // (§6.1.6.2.2) for BigInt operands or Number::bitwiseNOT
+                // (`!ToInt32(x)`) otherwise.
+                let value = activation.accumulator();
+                if let Some(handle) = value.as_bigint_handle() {
+                    let lh = crate::object::ObjectHandle(handle);
+                    let result = runtime
+                        .objects
+                        .bigint_value(lh)?
+                        .ok_or(InterpreterError::InvalidHeapValueKind)?
+                        .bitnot();
+                    let new_handle = runtime.alloc_bigint(result)?;
+                    activation.set_accumulator(RegisterValue::from_bigint_handle(new_handle.0));
+                } else {
+                    let l = i32_of(value)?;
+                    activation.set_accumulator(RegisterValue::from_i32(!l));
+                }
             }
             Opcode::LogicalNot => {
                 // §7.1.2 ToBoolean — must be runtime-aware so empty
@@ -629,33 +658,74 @@ impl Interpreter {
             // let the monotonic lattice record whatever we actually
             // saw.
             Opcode::TestLessThan => {
+                // §13.10 LessThanExpression — int32 fast path; otherwise
+                // fall through to §7.2.13 IsLessThan (handles Number, String,
+                // BigInt and mixed Number↔BigInt comparison).
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
-                activation.set_accumulator(RegisterValue::from_bool(l < r));
-                // C4: Comparison slot for the JIT / tier-2 IC.
-                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                let lhs = activation.accumulator();
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                    l < r
+                } else {
+                    let observation = classify_comparison_operands(lhs, rhs, &runtime.objects);
+                    frame_runtime.record_comparison(function, pc, observation);
+                    runtime
+                        .js_abstract_relational_comparison(lhs, rhs, true)?
+                        .unwrap_or(false)
+                };
+                activation.set_accumulator(RegisterValue::from_bool(result));
             }
             Opcode::TestGreaterThan => {
+                // `x > y` ≡ `IsLessThan(y, x, false)` (§7.2.13 with operand
+                // order reversed; second arg controls evaluation order of
+                // ToPrimitive on the original receivers).
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
-                activation.set_accumulator(RegisterValue::from_bool(l > r));
-                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                let lhs = activation.accumulator();
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                    l > r
+                } else {
+                    let observation = classify_comparison_operands(lhs, rhs, &runtime.objects);
+                    frame_runtime.record_comparison(function, pc, observation);
+                    runtime
+                        .js_abstract_relational_comparison(rhs, lhs, false)?
+                        .unwrap_or(false)
+                };
+                activation.set_accumulator(RegisterValue::from_bool(result));
             }
             Opcode::TestLessThanOrEqual => {
+                // `x <= y` ≡ `!IsLessThan(y, x, false)` per §13.10. NaN
+                // operands surface as `None` from the helper and must
+                // produce `false`, hence `unwrap_or(true)` then negate.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
-                activation.set_accumulator(RegisterValue::from_bool(l <= r));
-                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                let lhs = activation.accumulator();
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                    l <= r
+                } else {
+                    let observation = classify_comparison_operands(lhs, rhs, &runtime.objects);
+                    frame_runtime.record_comparison(function, pc, observation);
+                    !runtime
+                        .js_abstract_relational_comparison(rhs, lhs, false)?
+                        .unwrap_or(true)
+                };
+                activation.set_accumulator(RegisterValue::from_bool(result));
             }
             Opcode::TestGreaterThanOrEqual => {
+                // `x >= y` ≡ `!IsLessThan(x, y, true)`.
                 let rhs = read_reg(activation, function, reg(&instr.operands, 0)?)?;
-                let l = i32_of(activation.accumulator())?;
-                let r = i32_of(rhs)?;
-                activation.set_accumulator(RegisterValue::from_bool(l >= r));
-                frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                let lhs = activation.accumulator();
+                let result = if let (Some(l), Some(r)) = (lhs.as_i32(), rhs.as_i32()) {
+                    frame_runtime.record_comparison(function, pc, ComparisonFeedback::Int32);
+                    l >= r
+                } else {
+                    let observation = classify_comparison_operands(lhs, rhs, &runtime.objects);
+                    frame_runtime.record_comparison(function, pc, observation);
+                    !runtime
+                        .js_abstract_relational_comparison(lhs, rhs, true)?
+                        .unwrap_or(true)
+                };
+                activation.set_accumulator(RegisterValue::from_bool(result));
             }
             Opcode::TestEqualStrict => {
                 // §7.2.16 IsStrictlyEqual. Raw bit comparison covers
@@ -691,14 +761,15 @@ impl Interpreter {
                 {
                     // §6.1.6.2.13 BigInt::equal — two distinct BigInt
                     // heap allocations for the same integer must compare
-                    // strictly equal. Values are stored as decimal
-                    // strings, so a byte-wise compare after canonical
-                    // `to_string()` (no sign noise for 0) suffices.
+                    // strictly equal. The structured payload's `PartialEq`
+                    // is canonical (Inline ↔ Heap variants never collide
+                    // because `from_bigint` demotes when the magnitude
+                    // fits in i64).
                     let lh = crate::object::ObjectHandle(lb);
                     let rh = crate::object::ObjectHandle(rb);
-                    let lstr = runtime.objects.bigint_value(lh).ok().flatten();
-                    let rstr = runtime.objects.bigint_value(rh).ok().flatten();
-                    match (lstr, rstr) {
+                    let lpay = runtime.objects.bigint_value(lh).ok().flatten();
+                    let rpay = runtime.objects.bigint_value(rh).ok().flatten();
+                    match (lpay, rpay) {
                         (Some(a), Some(b)) => a == b,
                         _ => false,
                     }
@@ -1632,14 +1703,21 @@ impl Interpreter {
                     let callee = callee_module
                         .function(callee_idx)
                         .ok_or(InterpreterError::InvalidCallTarget)?;
-                    let mut callee_activation = Activation::with_context(
+                    // C6: pool-allocated buffers for the tail call. The
+                    // outgoing activation's buffers are recycled by the
+                    // run loop in `mod.rs` before it overwrites the
+                    // current frame.
+                    let (regs, upvals) =
+                        runtime.acquire_call_buffers(usize::from(callee.frame_layout().register_count()));
+                    let mut callee_activation = Activation::with_pooled_buffers(
                         callee_idx,
-                        callee.frame_layout().register_count(),
                         crate::frame::FrameMetadata::new(
                             u16::try_from(args.len()).unwrap_or(u16::MAX),
                             crate::frame::FrameFlags::empty(),
                         ),
                         Some(callable),
+                        regs,
+                        upvals,
                     );
                     // §10.4.4 overflow + parameter slot copy.
                     let param_count = callee.frame_layout().parameter_count();
@@ -3249,11 +3327,16 @@ impl Interpreter {
         };
         let register_count = callee.frame_layout().register_count();
         let argc = u16::try_from(arguments.len()).unwrap_or(u16::MAX);
-        let mut activation = Activation::with_context(
+        // C6: pull a (registers, upvalues) buffer pair from the per-runtime
+        // pool. The recycle paths below feed both the async-Promise wrap
+        // path and the synchronous `run_with_tier_up` exit.
+        let (regs, upvals) = runtime.acquire_call_buffers(usize::from(register_count));
+        let mut activation = Activation::with_pooled_buffers(
             callee_idx,
-            register_count,
             FrameMetadata::new(argc, FrameFlags::empty()),
             None,
+            regs,
+            upvals,
         );
         // Copy args into user-visible parameter slots.
         let param_count = callee.frame_layout().parameter_count();
@@ -3284,7 +3367,7 @@ impl Interpreter {
         // top-level function would return a plain value instead
         // of a Promise, so downstream `.then(...)` would fail.
         if callee.is_async() && !callee.is_generator() {
-            return match Self::execute_async_function_body(runtime, module, &mut activation) {
+            let result = match Self::execute_async_function_body(runtime, module, &mut activation) {
                 Ok(v) => Ok(v),
                 Err(InterpreterError::UncaughtThrow(v)) => Err(StepOutcome::Throw(v)),
                 Err(InterpreterError::TypeError(msg)) => match runtime.alloc_type_error(&msg) {
@@ -3293,6 +3376,10 @@ impl Interpreter {
                 },
                 Err(_) => Err(StepOutcome::Throw(RegisterValue::undefined())),
             };
+            // C6: recycle pooled buffers on every exit from the async path.
+            let (regs, upvals) = activation.into_pooled_buffers();
+            runtime.release_call_buffers(regs, upvals);
+            return result;
         }
 
         // M34: §27.5.1.1 / §27.6.1.1 — direct calls to
@@ -3301,6 +3388,10 @@ impl Interpreter {
         // instead of running the body. `.next()` on the
         // generator later drives `resume_generator_impl`.
         if callee.is_generator() {
+            // The generator object stashes the arguments and runs nothing
+            // here, so the per-call buffers go straight back to the pool.
+            let (regs, upvals) = activation.into_pooled_buffers();
+            runtime.release_call_buffers(regs, upvals);
             let gen_handle = if callee.is_async() {
                 runtime.alloc_async_generator(module.clone(), callee_idx, None, arguments.to_vec())
             } else {
@@ -3316,7 +3407,7 @@ impl Interpreter {
             return Ok(RegisterValue::from_object_handle(gen_handle.0));
         }
 
-        match self.run_with_tier_up(module, &mut activation, runtime) {
+        let result = match self.run_with_tier_up(module, &mut activation, runtime) {
             Ok(super::Completion::Return(v)) => Ok(v),
             Ok(super::Completion::Throw(v)) => Err(StepOutcome::Throw(v)),
             Err(InterpreterError::UncaughtThrow(v)) => Err(StepOutcome::Throw(v)),
@@ -3330,7 +3421,11 @@ impl Interpreter {
                 runtime.alloc_range_error_value("Maximum call stack size exceeded"),
             )),
             Err(_) => Err(StepOutcome::Throw(RegisterValue::undefined())),
-        }
+        };
+        // C6: recycle on the synchronous exit too.
+        let (regs, upvals) = activation.into_pooled_buffers();
+        runtime.release_call_buffers(regs, upvals);
+        result
     }
 }
 

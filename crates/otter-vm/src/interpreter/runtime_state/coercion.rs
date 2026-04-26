@@ -4,8 +4,6 @@
 //! OrdinaryHasInstance, `in`, plus `bigint_*` checked arithmetic and the
 //! `js_typeof` / `js_add` operator implementations.
 
-use num_traits::Zero;
-
 use crate::descriptors::VmNativeCallError;
 use crate::intrinsics::{
     WellKnownSymbol, box_boolean_object, box_number_object, box_symbol_object,
@@ -166,17 +164,21 @@ impl RuntimeState {
         // §7.2.15 step 12-13: BigInt == String comparison.
         if lhs.is_bigint() && rhs_is_string {
             let rhs_str = self.js_to_string(rhs)?;
-            if let Ok(rhs_val) = rhs_str.parse::<num_bigint::BigInt>() {
-                let lhs_val = self.parse_bigint_value(lhs)?;
-                return Ok(lhs_val == rhs_val);
+            if let Ok(rhs_payload) =
+                crate::bigint_value::BigIntPayload::from_decimal_str(&rhs_str)
+            {
+                let lhs_payload = self.bigint_payload_for(lhs)?;
+                return Ok(lhs_payload == &rhs_payload);
             }
             return Ok(false);
         }
         if lhs_is_string && rhs.is_bigint() {
             let lhs_str = self.js_to_string(lhs)?;
-            if let Ok(lhs_val) = lhs_str.parse::<num_bigint::BigInt>() {
-                let rhs_val = self.parse_bigint_value(rhs)?;
-                return Ok(lhs_val == rhs_val);
+            if let Ok(lhs_payload) =
+                crate::bigint_value::BigIntPayload::from_decimal_str(&lhs_str)
+            {
+                let rhs_payload = self.bigint_payload_for(rhs)?;
+                return Ok(rhs_payload == &lhs_payload);
             }
             return Ok(false);
         }
@@ -559,11 +561,12 @@ impl RuntimeState {
         }
         // §6.1.6.2.14 BigInt::toString(x)
         if let Some(handle) = value.as_bigint_handle() {
-            let str_val = self
+            let text = self
                 .objects
                 .bigint_value(ObjectHandle(handle))?
-                .unwrap_or("0");
-            return Ok(str_val.to_string().into_boxed_str());
+                .map(|p| p.to_decimal_string())
+                .unwrap_or_else(|| "0".to_string());
+            return Ok(text.into_boxed_str());
         }
         if let Some(number) = value.as_number() {
             return Ok(crate::abstract_ops::ecma_number_to_string(number).into_boxed_str());
@@ -705,17 +708,17 @@ impl RuntimeState {
         // §7.2.13 step 3.d: Mixed BigInt + String comparison.
         if px.is_bigint() && py_is_string {
             let sy = self.js_to_string(py)?;
-            if let Ok(ny) = sy.parse::<num_bigint::BigInt>() {
-                let lhs_val = self.parse_bigint_value(px)?;
-                return Ok(Some(lhs_val < ny));
+            if let Ok(ny) = crate::bigint_value::BigIntPayload::from_decimal_str(&sy) {
+                let lhs_payload = self.bigint_payload_for(px)?;
+                return Ok(Some(lhs_payload.cmp(&ny) == std::cmp::Ordering::Less));
             }
             return Ok(None);
         }
         if px_is_string && py.is_bigint() {
             let sx = self.js_to_string(px)?;
-            if let Ok(nx) = sx.parse::<num_bigint::BigInt>() {
-                let rhs_val = self.parse_bigint_value(py)?;
-                return Ok(Some(nx < rhs_val));
+            if let Ok(nx) = crate::bigint_value::BigIntPayload::from_decimal_str(&sx) {
+                let rhs_payload = self.bigint_payload_for(py)?;
+                return Ok(Some(nx.cmp(rhs_payload) == std::cmp::Ordering::Less));
             }
             return Ok(None);
         }
@@ -731,22 +734,18 @@ impl RuntimeState {
     }
 
     /// Parse the BigInt value from a register into a `num_bigint::BigInt`.
-    fn parse_bigint_value(
+    fn bigint_payload_for(
         &self,
         value: RegisterValue,
-    ) -> Result<num_bigint::BigInt, InterpreterError> {
+    ) -> Result<&crate::bigint_value::BigIntPayload, InterpreterError> {
         let handle = ObjectHandle(
             value
                 .as_bigint_handle()
                 .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
         );
-        let str_val = self
-            .objects
+        self.objects
             .bigint_value(handle)?
-            .ok_or(InterpreterError::InvalidHeapValueKind)?;
-        str_val
-            .parse()
-            .map_err(|_| InterpreterError::InvalidConstant)
+            .ok_or(InterpreterError::InvalidHeapValueKind)
     }
 
     /// §6.1.6.2.12 BigInt::lessThan(x, y)
@@ -756,9 +755,9 @@ impl RuntimeState {
         lhs: RegisterValue,
         rhs: RegisterValue,
     ) -> Result<Option<bool>, InterpreterError> {
-        let lhs_val = self.parse_bigint_value(lhs)?;
-        let rhs_val = self.parse_bigint_value(rhs)?;
-        Ok(Some(lhs_val < rhs_val))
+        let lhs_pay = self.bigint_payload_for(lhs)?;
+        let rhs_pay = self.bigint_payload_for(rhs)?;
+        Ok(Some(lhs_pay.cmp(rhs_pay) == std::cmp::Ordering::Less))
     }
 
     /// §7.2.13 step 3.b: BigInt < Number comparison.
@@ -777,16 +776,18 @@ impl RuntimeState {
                 Some(false) // bigint < -Infinity
             });
         }
-        let bv = self.parse_bigint_value(bigint_val)?;
-        // Convert number to integer for comparison.
+        let bv_payload = self.bigint_payload_for(bigint_val)?;
+        let bv = bv_payload.as_bigint();
         let n_int = num_bigint::BigInt::from(n as i64);
-        if bv < n_int {
+        if bv.as_ref() < &n_int {
             Ok(Some(true))
-        } else if bv > n_int {
+        } else if bv.as_ref() > &n_int {
             Ok(Some(false))
         } else {
             // bv == n_int, but n may have fractional part
-            Ok(Some((n_int.to_string().parse::<f64>().unwrap_or(0.0)) < n))
+            use num_traits::ToPrimitive;
+            let n_int_f = n_int.to_f64().unwrap_or(0.0);
+            Ok(Some(n_int_f < n))
         }
     }
 
@@ -806,15 +807,18 @@ impl RuntimeState {
                 Some(true) // -Infinity < bigint → true
             });
         }
-        let bv = self.parse_bigint_value(bigint_val)?;
+        let bv_payload = self.bigint_payload_for(bigint_val)?;
+        let bv = bv_payload.as_bigint();
         let n_int = num_bigint::BigInt::from(n as i64);
-        if n_int < bv {
+        if &n_int < bv.as_ref() {
             Ok(Some(true))
-        } else if n_int > bv {
+        } else if &n_int > bv.as_ref() {
             Ok(Some(false))
         } else {
             // n_int == bv, but n may have fractional part
-            Ok(Some(n < n_int.to_string().parse::<f64>().unwrap_or(0.0)))
+            use num_traits::ToPrimitive;
+            let n_int_f = n_int.to_f64().unwrap_or(0.0);
+            Ok(Some(n < n_int_f))
         }
     }
 
@@ -833,9 +837,10 @@ impl RuntimeState {
         if n.fract() != 0.0 {
             return Ok(false);
         }
-        let bv = self.parse_bigint_value(bigint_val)?;
+        let bv_payload = self.bigint_payload_for(bigint_val)?;
+        let bv = bv_payload.as_bigint();
         let n_int = num_bigint::BigInt::from(n as i64);
-        Ok(bv == n_int)
+        Ok(bv.as_ref() == &n_int)
     }
 
     /// ES spec 7.1.2 ToBoolean — runtime-aware truthiness check.
@@ -845,11 +850,12 @@ impl RuntimeState {
     pub(crate) fn js_to_boolean(&mut self, value: RegisterValue) -> Result<bool, InterpreterError> {
         // §7.1.2 step 7: BigInt — 0n is falsy, all others truthy.
         if let Some(handle) = value.as_bigint_handle() {
-            let str_val = self
+            let is_zero = self
                 .objects
                 .bigint_value(ObjectHandle(handle))?
-                .unwrap_or("0");
-            return Ok(str_val != "0");
+                .map(|p| p.is_zero())
+                .unwrap_or(true);
+            return Ok(!is_zero);
         }
         // Fast path: non-object values use the NaN-box check.
         let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
@@ -1108,12 +1114,20 @@ impl RuntimeState {
 
     /// §6.1.6.2 BigInt arithmetic helper — performs a binary operation on two
     /// BigInt register values and returns the result as a new BigInt.
+    ///
+    /// The `op` closure receives the structured [`BigIntPayload`] payloads
+    /// directly, so the i64 inline fast path inside `BigIntPayload::add` /
+    /// `sub` / `mul` skips the previous decimal-string parse + stringify
+    /// round-trip on every call. (C1 in `PRODUCTION_READINESS_PLAN.md`.)
     /// <https://tc39.es/ecma262/#sec-numeric-types-bigint-add>
     pub(crate) fn bigint_binary_op(
         &mut self,
         lhs: RegisterValue,
         rhs: RegisterValue,
-        op: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
+        op: impl FnOnce(
+            &crate::bigint_value::BigIntPayload,
+            &crate::bigint_value::BigIntPayload,
+        ) -> crate::bigint_value::BigIntPayload,
     ) -> Result<RegisterValue, InterpreterError> {
         let lhs_handle = ObjectHandle(
             lhs.as_bigint_handle()
@@ -1124,24 +1138,19 @@ impl RuntimeState {
                 .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
         );
 
-        let lhs_str = self
-            .objects
-            .bigint_value(lhs_handle)?
-            .ok_or(InterpreterError::InvalidHeapValueKind)?;
-        let rhs_str = self
-            .objects
-            .bigint_value(rhs_handle)?
-            .ok_or(InterpreterError::InvalidHeapValueKind)?;
+        let result = {
+            let lhs_pay = self
+                .objects
+                .bigint_value(lhs_handle)?
+                .ok_or(InterpreterError::InvalidHeapValueKind)?;
+            let rhs_pay = self
+                .objects
+                .bigint_value(rhs_handle)?
+                .ok_or(InterpreterError::InvalidHeapValueKind)?;
+            op(lhs_pay, rhs_pay)
+        };
 
-        let lhs_val: num_bigint::BigInt = lhs_str
-            .parse()
-            .map_err(|_| InterpreterError::InvalidConstant)?;
-        let rhs_val: num_bigint::BigInt = rhs_str
-            .parse()
-            .map_err(|_| InterpreterError::InvalidConstant)?;
-
-        let result = op(&lhs_val, &rhs_val);
-        let handle = self.alloc_bigint(&result.to_string())?;
+        let handle = self.alloc_bigint(result)?;
         Ok(RegisterValue::from_bigint_handle(handle.0))
     }
 
@@ -1152,28 +1161,21 @@ impl RuntimeState {
         lhs: RegisterValue,
         rhs: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
-        self.bigint_binary_op(lhs, rhs, |a, b| {
-            if b.is_zero() {
-                // Caller would need to signal error; we use a sentinel approach below.
-                num_bigint::BigInt::from(0)
-            } else {
-                a / b
-            }
-        })
-        .and_then(|result| {
-            // Re-check for division by zero via the original rhs.
-            let rhs_handle = ObjectHandle(rhs.as_bigint_handle().unwrap());
-            let rhs_str = self
-                .objects
-                .bigint_value(rhs_handle)
-                .ok()
-                .flatten()
-                .unwrap_or("0");
-            if rhs_str == "0" {
-                return Err(InterpreterError::TypeError("Division by zero".into()));
-            }
-            Ok(result)
-        })
+        // Spec step 1: throw RangeError when the divisor is 0n. Resolve the
+        // payload up front so the closure does not have to re-borrow.
+        let rhs_handle = ObjectHandle(
+            rhs.as_bigint_handle()
+                .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
+        );
+        let rhs_is_zero = self
+            .objects
+            .bigint_value(rhs_handle)?
+            .ok_or(InterpreterError::InvalidHeapValueKind)?
+            .is_zero();
+        if rhs_is_zero {
+            return Err(InterpreterError::TypeError("Division by zero".into()));
+        }
+        self.bigint_binary_op(lhs, rhs, |a, b| a.div_trunc(b))
     }
 
     /// §6.1.6.2.11 BigInt::remainder — RangeError on zero divisor.
@@ -1183,19 +1185,19 @@ impl RuntimeState {
         lhs: RegisterValue,
         rhs: RegisterValue,
     ) -> Result<RegisterValue, InterpreterError> {
-        // Check for zero divisor first.
         let rhs_handle = ObjectHandle(
             rhs.as_bigint_handle()
                 .ok_or_else(|| InterpreterError::TypeError("expected BigInt".into()))?,
         );
-        let rhs_str = self
+        let rhs_is_zero = self
             .objects
             .bigint_value(rhs_handle)?
-            .ok_or(InterpreterError::InvalidHeapValueKind)?;
-        if rhs_str == "0" {
+            .ok_or(InterpreterError::InvalidHeapValueKind)?
+            .is_zero();
+        if rhs_is_zero {
             return Err(InterpreterError::TypeError("Division by zero".into()));
         }
-        self.bigint_binary_op(lhs, rhs, |a, b| a % b)
+        self.bigint_binary_op(lhs, rhs, |a, b| a.rem_trunc(b))
     }
 
     /// §12.8.3 The Addition Operator ( + )
@@ -1246,7 +1248,7 @@ impl RuntimeState {
 
         // §6.1.6.2.7 BigInt::add — both operands BigInt.
         if lprim.is_bigint() && rprim.is_bigint() {
-            return self.bigint_binary_op(lprim, rprim, |a, b| a + b);
+            return self.bigint_binary_op(lprim, rprim, |a, b| a.add(b));
         }
         // Mixed BigInt + non-BigInt → TypeError (§12.15.3 step 6).
         if lprim.is_bigint() || rprim.is_bigint() {
@@ -1273,7 +1275,7 @@ impl RuntimeState {
         if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
             return Ok(RegisterValue::from_number(l - r));
         }
-        self.js_numeric_binop_fallback(lhs, rhs, |l, r| l - r, "-", |a, b| a - b)
+        self.js_numeric_binop_fallback(lhs, rhs, |l, r| l - r, "-", |a, b| Ok(a.sub(b)))
     }
 
     /// §13.15.3 ApplyStringOrNumericBinaryOperator for `*`.
@@ -1285,7 +1287,7 @@ impl RuntimeState {
         if let (Some(l), Some(r)) = (lhs.as_number(), rhs.as_number()) {
             return Ok(RegisterValue::from_number(l * r));
         }
-        self.js_numeric_binop_fallback(lhs, rhs, |l, r| l * r, "*", |a, b| a * b)
+        self.js_numeric_binop_fallback(lhs, rhs, |l, r| l * r, "*", |a, b| Ok(a.mul(b)))
     }
 
     /// §13.15.3 ApplyStringOrNumericBinaryOperator for `/`. Spec:
@@ -1308,13 +1310,14 @@ impl RuntimeState {
             |l, r| l / r,
             "/",
             |a, b| {
-                // §6.1.6.2.10 BigInt::divide — /0n throws RangeError. We
-                // delegate to the existing `bigint_checked_div` which
-                // rounds toward zero and throws on zero divisor.
+                // §6.1.6.2.10 BigInt::divide — /0n throws RangeError per spec.
+                // The pure-bigint branch above handles the common path; the
+                // fallback only fires after a string→bigint coercion that
+                // already guarantees both operands are BigInt-typed.
                 if b.is_zero() {
-                    num_bigint::BigInt::from(0)
+                    Err(InterpreterError::TypeError("Division by zero".into()))
                 } else {
-                    a / b
+                    Ok(a.div_trunc(b))
                 }
             },
         )
@@ -1332,13 +1335,7 @@ impl RuntimeState {
             return Ok(RegisterValue::from_number(l % r));
         }
         if lhs.is_bigint() && rhs.is_bigint() {
-            return self.bigint_binary_op(lhs, rhs, |a, b| {
-                if b.is_zero() {
-                    num_bigint::BigInt::from(0)
-                } else {
-                    a % b
-                }
-            });
+            return self.bigint_checked_rem(lhs, rhs);
         }
         self.js_numeric_binop_fallback(
             lhs,
@@ -1347,9 +1344,9 @@ impl RuntimeState {
             "%",
             |a, b| {
                 if b.is_zero() {
-                    num_bigint::BigInt::from(0)
+                    Err(InterpreterError::TypeError("Division by zero".into()))
                 } else {
-                    a % b
+                    Ok(a.rem_trunc(b))
                 }
             },
         )
@@ -1357,7 +1354,7 @@ impl RuntimeState {
 
     /// §13.15.3 ApplyStringOrNumericBinaryOperator for `**`.
     /// Number::exponentiate maps to `f64::powf`; BigInt::exponentiate
-    /// surfaces through `bigint_binary_op` with `num_bigint::BigInt::pow`.
+    /// surfaces through `BigIntPayload::pow` with the i64 inline fast path.
     pub(crate) fn js_exponentiate(
         &mut self,
         lhs: RegisterValue,
@@ -1372,15 +1369,13 @@ impl RuntimeState {
             |l, r| l.powf(r),
             "**",
             |a, b| {
-                // Negative exponent on BigInt throws per spec; clamping
-                // here keeps the fallback in arithmetic shape, and the
-                // BigInt-specific early-return above handles the non-
-                // mixed case without relying on this branch.
-                let exp = b
-                    .to_biguint()
-                    .and_then(|u| u32::try_from(u).ok())
-                    .unwrap_or(0);
-                a.pow(exp)
+                // §6.1.6.2.12 BigInt::exponentiate — RangeError on negative
+                // exponent. `BigIntPayload::pow` returns `None` for that,
+                // which we surface as a TypeError carrying the spec message
+                // (the runtime layer wraps it as RangeError).
+                a.pow(b).ok_or_else(|| {
+                    InterpreterError::TypeError("Exponent must be non-negative".into())
+                })
             },
         )
     }
@@ -1396,12 +1391,33 @@ impl RuntimeState {
         rhs: RegisterValue,
         number_op: fn(f64, f64) -> f64,
         op_name: &'static str,
-        bigint_op: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
+        bigint_op: impl Fn(
+            &crate::bigint_value::BigIntPayload,
+            &crate::bigint_value::BigIntPayload,
+        ) -> Result<
+            crate::bigint_value::BigIntPayload,
+            InterpreterError,
+        >,
     ) -> Result<RegisterValue, InterpreterError> {
         let lprim = self.js_to_primitive_with_hint(lhs, ToPrimitiveHint::Number)?;
         let rprim = self.js_to_primitive_with_hint(rhs, ToPrimitiveHint::Number)?;
         if lprim.is_bigint() && rprim.is_bigint() {
-            return self.bigint_binary_op(lprim, rprim, bigint_op);
+            // Borrow the payloads, run the closure, then alloc the result.
+            let result = {
+                let lhs_handle = ObjectHandle(lprim.as_bigint_handle().unwrap());
+                let rhs_handle = ObjectHandle(rprim.as_bigint_handle().unwrap());
+                let lpay = self
+                    .objects
+                    .bigint_value(lhs_handle)?
+                    .ok_or(InterpreterError::InvalidHeapValueKind)?;
+                let rpay = self
+                    .objects
+                    .bigint_value(rhs_handle)?
+                    .ok_or(InterpreterError::InvalidHeapValueKind)?;
+                bigint_op(lpay, rpay)?
+            };
+            let handle = self.alloc_bigint(result)?;
+            return Ok(RegisterValue::from_bigint_handle(handle.0));
         }
         if lprim.is_bigint() || rprim.is_bigint() {
             return Err(InterpreterError::TypeError(

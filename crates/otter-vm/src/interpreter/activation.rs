@@ -64,8 +64,12 @@ pub struct Activation {
     using_scope_markers: Vec<usize>,
     using_entries: Vec<UsingEntry>,
     pc: ProgramCounter,
-    registers: Box<[RegisterValue]>,
-    open_upvalues: Box<[Option<ObjectHandle>]>,
+    /// C6: per-call register file. `Vec` (not `Box<[T]>`) so the buffer can
+    /// be returned to a per-runtime pool on frame pop and reused for the
+    /// next call without an alloc/free round-trip.
+    registers: Vec<RegisterValue>,
+    /// C6: open-upvalue tracking for closure capture. Pooled identically.
+    open_upvalues: Vec<Option<ObjectHandle>>,
     written_registers: Vec<RegisterIndex>,
     /// ES2024 §10.4.4 — Overflow arguments beyond formal parameter count.
     /// Stored separately from the register file to avoid polluting the frame layout.
@@ -126,12 +130,43 @@ impl Activation {
     }
 
     /// Creates a zero-initialized activation with explicit frame metadata and closure context.
+    ///
+    /// C6: this constructor allocates fresh register/upvalue buffers and is
+    /// retained for tests and one-shot entry points. Hot-path call dispatch
+    /// reaches for [`Self::with_pooled_buffers`] instead, which takes
+    /// pre-acquired buffers from the per-runtime pool.
     #[must_use]
     pub fn with_context(
         function_index: FunctionIndex,
         register_count: RegisterIndex,
         metadata: FrameMetadata,
         closure_handle: Option<ObjectHandle>,
+    ) -> Self {
+        let len = usize::from(register_count);
+        let mut registers = Vec::with_capacity(len);
+        registers.resize(len, RegisterValue::default());
+        let mut open_upvalues = Vec::with_capacity(len);
+        open_upvalues.resize(len, None);
+        Self::with_pooled_buffers(
+            function_index,
+            metadata,
+            closure_handle,
+            registers,
+            open_upvalues,
+        )
+    }
+
+    /// C6: builds an activation around already-allocated register/upvalue
+    /// buffers. The buffers are zero-filled to `register_count` by the
+    /// caller (`RuntimeState::acquire_call_buffers`), so the constructor
+    /// itself avoids any heap allocation.
+    #[must_use]
+    pub fn with_pooled_buffers(
+        function_index: FunctionIndex,
+        metadata: FrameMetadata,
+        closure_handle: Option<ObjectHandle>,
+        registers: Vec<RegisterValue>,
+        open_upvalues: Vec<Option<ObjectHandle>>,
     ) -> Self {
         Self {
             function_index,
@@ -144,9 +179,8 @@ impl Activation {
             using_scope_markers: Vec::new(),
             using_entries: Vec::new(),
             pc: 0,
-            registers: vec![RegisterValue::default(); usize::from(register_count)]
-                .into_boxed_slice(),
-            open_upvalues: vec![None; usize::from(register_count)].into_boxed_slice(),
+            registers,
+            open_upvalues,
             written_registers: Vec::new(),
             overflow_args: Vec::new(),
             argc: 0,
@@ -154,6 +188,15 @@ impl Activation {
             secondary_result: RegisterValue::undefined(),
             current_class_id: 0,
         }
+    }
+
+    /// C6: drains the per-call buffers so the caller can return them to the
+    /// per-runtime pool. The activation itself is consumed.
+    #[must_use]
+    pub fn into_pooled_buffers(
+        self,
+    ) -> (Vec<RegisterValue>, Vec<Option<ObjectHandle>>) {
+        (self.registers, self.open_upvalues)
     }
 
     /// Returns the current function index.
@@ -311,7 +354,10 @@ impl Activation {
 
     /// Saves the entire register window as a boxed slice for generator suspension.
     pub fn save_registers(&self) -> Box<[RegisterValue]> {
-        self.registers.clone()
+        // Generator save/resume is a rare path (only fires on yield/await
+        // resume), so the extra `Box::from` allocation does not affect
+        // the hot call path that C6 targets.
+        self.registers.clone().into_boxed_slice()
     }
 
     /// Restores a previously saved register window into this activation.

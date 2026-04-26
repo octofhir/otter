@@ -109,11 +109,16 @@ pub fn to_bigint_i128(
             "Temporal.Instant requires a BigInt epoch nanoseconds argument".into(),
         )
     })?;
-    let s = runtime
+    let payload = runtime
         .bigint_value(ObjectHandle(handle))
         .ok_or_else(|| VmNativeCallError::Internal("invalid BigInt handle".into()))?;
-    s.parse::<i128>()
-        .map_err(|_| VmNativeCallError::Internal("BigInt value too large for i128".into()))
+    // i128 is wide enough for any valid Temporal nanosecond range (±10^17 ns).
+    use num_traits::ToPrimitive;
+    payload
+        .as_bigint()
+        .as_ref()
+        .to_i128()
+        .ok_or_else(|| VmNativeCallError::Internal("BigInt value too large for i128".into()))
 }
 
 // ── Temporal.*.prototype.valueOf ─────────────────────────────────────

@@ -115,6 +115,16 @@ impl RuntimeState {
             tier_up_blacklisted: std::collections::HashSet::new(),
             tier_up_hook: None,
             call_depth: 0,
+            sample_hook: None,
+            register_buffer_pool: Vec::with_capacity(
+                crate::interpreter::CALL_BUFFER_POOL_CAPACITY,
+            ),
+            upvalue_buffer_pool: Vec::with_capacity(
+                crate::interpreter::CALL_BUFFER_POOL_CAPACITY,
+            ),
+            eval_cache: std::collections::VecDeque::with_capacity(
+                crate::interpreter::EVAL_CACHE_CAPACITY,
+            ),
             dynamic_import_host: None,
             dynamic_import_registry: None,
             dynamic_import_referrer: String::new(),
@@ -393,7 +403,22 @@ impl RuntimeState {
         if self.objects.oom_flag().load(Ordering::Relaxed) {
             return Err(InterpreterError::OutOfMemory);
         }
+        // O3: fire the sample hook (if any) with the current shadow
+        // stack. Hot-path cost when no profiler is installed: one
+        // null-pointer check on the `Option<Arc<…>>`. The hook itself
+        // is responsible for rate-limiting (the otter-runtime adapter
+        // checks an interval timer before recording).
+        if let Some(hook) = self.sample_hook.as_ref() {
+            hook(&self.frame_info_stack);
+        }
         Ok(())
+    }
+
+    /// O3: install (or replace) the CPU-sample hook fired at every
+    /// interpreter back-edge. `None` removes the hook. `Arc` so multiple
+    /// observers can co-exist if a future profiler wants to multiplex.
+    pub fn set_sample_hook(&mut self, hook: Option<crate::interpreter::SampleHook>) {
+        self.sample_hook = hook;
     }
 
     /// Returns `Err(OutOfMemory)` if the object heap has signalled that the

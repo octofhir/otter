@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use num_traits::ToPrimitive;
 use otter_gc::heap::GcConfig;
 use otter_gc::typed::{Handle as GcHandle, OutOfMemory, Traceable, TypedHeap};
 use std::sync::Arc;
@@ -169,6 +170,17 @@ pub struct HeapTypeStats {
     pub total_bytes: usize,
     /// Per-variant count + bytes.
     pub by_type: std::collections::BTreeMap<&'static str, (usize, usize)>,
+}
+
+/// O2: thin shim over [`HeapTypeStats`] aimed at heap-snapshot consumers
+/// (otter-profiler, the CLI `--heap-snapshot` flag). Same data; named
+/// per-field to match the on-disk JSON schema produced by
+/// [`MemoryProfiler::to_heapsnapshot`](otter_profiler::MemoryProfiler::to_heapsnapshot).
+#[derive(Debug, Clone, Default)]
+pub struct HeapInfoSnapshot {
+    pub object_count: usize,
+    pub tracked_bytes: usize,
+    pub per_type: std::collections::BTreeMap<&'static str, (usize, usize)>,
 }
 
 /// Error produced by the minimal object heap.
@@ -1071,8 +1083,12 @@ enum HeapValue {
     },
     /// §6.1.6.2 The BigInt Type — heap-allocated arbitrary-precision integer.
     /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
+    ///
+    /// `BigIntPayload` carries an inline `i64` fast path + arbitrary-precision
+    /// fallback so binary ops do not have to parse a decimal string on every
+    /// invocation (C1 in `PRODUCTION_READINESS_PLAN.md`).
     BigInt {
-        value: Box<str>,
+        value: crate::bigint_value::BigIntPayload,
     },
     /// V8 extension — captured stack frame snapshots for `Error.prototype.stack`.
     /// Stored as a heap value so it can be referenced from a non-enumerable
@@ -1286,6 +1302,11 @@ enum HeapValue {
         pattern: Box<str>,
         /// Canonical flags string (alphabetically sorted).
         flags: Box<str>,
+        /// C3: lazily-compiled `regress::Regex`. The pattern + flags are
+        /// immutable per spec (no user-visible setter — `lastIndex` is the
+        /// only mutable field), so compile-once is sound. Compilation cost
+        /// is amortised across every `exec`/`test`/`match`/`replace`.
+        compiled: std::cell::OnceCell<regress::Regex>,
     },
     /// ES2024 §25.3 DataView Objects.
     /// Spec: <https://tc39.es/ecma262/#sec-dataview-objects>
@@ -1855,10 +1876,42 @@ impl Traceable for HeapValue {
     }
 }
 
+/// C7: canonical empty-object shape id. Every fresh `alloc_object` starts
+/// here, so two `{a:1,b:2}` literals in different call sites converge on
+/// identical transition paths and the property IC stays monomorphic.
+pub const EMPTY_SHAPE_ID: ObjectShapeId = ObjectShapeId(0);
+
 /// Object heap backed by the otter-gc TypedHeap for automatic collection.
 pub struct ObjectHeap {
     heap: TypedHeap,
     next_shape_id: u64,
+    /// C7: shape-transition tree. Keyed by `(parent_shape, added_property)`,
+    /// the value is the canonical child shape id minted on the first add.
+    /// Subsequent adds with the same `(parent, property)` reuse it, which
+    /// keeps the IC monomorphic across sibling allocations.
+    shape_transitions: std::collections::HashMap<(ObjectShapeId, PropertyNameId), ObjectShapeId>,
+    /// C8: proto-chain lookup cache. Keyed by `(receiver_shape, property)`,
+    /// records the inherited owner + slot so subsequent lookups skip the
+    /// proto walk. Validated against `prototype_generation` so any
+    /// `set_prototype` call site-wide invalidates every cached entry.
+    /// `RefCell` keeps the cache writable from `&self` accessors used in
+    /// the interpreter hot path.
+    proto_lookup_cache:
+        std::cell::RefCell<std::collections::HashMap<(ObjectShapeId, PropertyNameId), ProtoCacheEntry>>,
+    /// C8: bumped on every `set_prototype` mutation. Cached lookups stash
+    /// the generation at write-time and revalidate on read.
+    prototype_generation: u64,
+}
+
+/// C8: cached resolution of a prototype-chain property lookup. Valid only
+/// while `generation` matches the heap's current `prototype_generation`
+/// and the owner object still carries `owner_shape`.
+#[derive(Debug, Clone, Copy)]
+struct ProtoCacheEntry {
+    generation: u64,
+    owner: ObjectHandle,
+    owner_shape: ObjectShapeId,
+    slot: u16,
 }
 
 impl std::fmt::Debug for ObjectHeap {
@@ -1903,7 +1956,13 @@ impl ObjectHeap {
     pub fn new() -> Self {
         Self {
             heap: TypedHeap::new(),
+            // C7: shape ids 1..=u64::MAX. Id 0 is `EMPTY_SHAPE_ID`,
+            // reserved for the canonical empty shape that every
+            // `alloc_object` starts at.
             next_shape_id: 1,
+            shape_transitions: std::collections::HashMap::default(),
+            proto_lookup_cache: std::cell::RefCell::new(std::collections::HashMap::default()),
+            prototype_generation: 0,
         }
     }
 
@@ -1916,6 +1975,9 @@ impl ObjectHeap {
         Self {
             heap: TypedHeap::with_config(config),
             next_shape_id: 1,
+            shape_transitions: std::collections::HashMap::default(),
+            proto_lookup_cache: std::cell::RefCell::new(std::collections::HashMap::default()),
+            prototype_generation: 0,
         }
     }
 
@@ -2025,9 +2087,13 @@ impl ObjectHeap {
     }
 
     /// Allocates a plain empty object.
+    ///
+    /// C7: starts at the canonical [`EMPTY_SHAPE_ID`] so two literals built
+    /// in the same property order share transitions and the IC stays
+    /// monomorphic across them. Property adds in `set_named_property_storage`
+    /// look up the child shape via [`Self::shape_transition`].
     pub fn alloc_object(&mut self) -> Result<ObjectHandle, ObjectError> {
-        let shape_id = self.allocate_shape();
-        self.alloc_heap_value(HeapValue::Object(Box::new(JsObject::new(shape_id))))
+        self.alloc_heap_value(HeapValue::Object(Box::new(JsObject::new(EMPTY_SHAPE_ID))))
     }
 
     /// Allocates an ordinary object that carries one native payload link.
@@ -2901,24 +2967,24 @@ impl ObjectHeap {
         }
         let bytes = &buffer_data[byte_index..byte_index + elem_size];
         if kind.is_bigint_kind() {
-            let value_str = match kind {
+            let payload = match kind {
                 TypedArrayKind::BigInt64 => {
                     let raw = i64::from_le_bytes([
                         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
                         bytes[7],
                     ]);
-                    raw.to_string()
+                    crate::bigint_value::BigIntPayload::from_i64(raw)
                 }
                 TypedArrayKind::BigUint64 => {
                     let raw = u64::from_le_bytes([
                         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
                         bytes[7],
                     ]);
-                    raw.to_string()
+                    crate::bigint_value::BigIntPayload::from_u64(raw)
                 }
                 _ => unreachable!(),
             };
-            let bigint_handle = self.alloc_bigint(value_str)?;
+            let bigint_handle = self.alloc_bigint(payload)?;
             Ok(Some(RegisterValue::from_bigint_handle(bigint_handle.0)))
         } else {
             Ok(Some(RegisterValue::from_number(read_typed_element(
@@ -2953,8 +3019,11 @@ impl ObjectHeap {
         if index >= array_length {
             return Err(ObjectError::InvalidIndex);
         }
-        let bigint_str = match self.object(bigint_handle)? {
-            HeapValue::BigInt { value } => value.to_string(),
+        // §6.1.6.2 BigInt → typed-array element. Use the structured payload
+        // directly; previous decimal-string round-trip lost precision and
+        // forced an allocation per write.
+        let payload = match self.object(bigint_handle)? {
+            HeapValue::BigInt { value } => value.clone(),
             _ => return Err(ObjectError::InvalidKind),
         };
         let elem_size = kind.element_size();
@@ -2966,12 +3035,24 @@ impl ObjectHeap {
         let dest = &mut buffer_data[byte_index..byte_index + elem_size];
         match kind {
             TypedArrayKind::BigInt64 => {
-                let n: i64 = bigint_str.parse().unwrap_or(0);
-                dest.copy_from_slice(&n.to_le_bytes());
+                // §7.1.4 ToBigInt64 — modulo 2^64, sign-extended into i64.
+                let modulus = num_bigint::BigInt::from(1u128 << 64);
+                let mut m = payload.as_bigint().as_ref() % &modulus;
+                if m.sign() == num_bigint::Sign::Minus {
+                    m += &modulus;
+                }
+                let u = m.to_u64().unwrap_or(0);
+                dest.copy_from_slice(&(u as i64).to_le_bytes());
             }
             TypedArrayKind::BigUint64 => {
-                let n: u64 = bigint_str.parse().unwrap_or(0);
-                dest.copy_from_slice(&n.to_le_bytes());
+                // §7.1.5 ToBigUint64 — modulo 2^64.
+                let modulus = num_bigint::BigInt::from(1u128 << 64);
+                let mut m = payload.as_bigint().as_ref() % &modulus;
+                if m.sign() == num_bigint::Sign::Minus {
+                    m += &modulus;
+                }
+                let u = m.to_u64().unwrap_or(0);
+                dest.copy_from_slice(&u.to_le_bytes());
             }
             _ => return Err(ObjectError::InvalidKind),
         }
@@ -3003,6 +3084,7 @@ impl ObjectHeap {
             values: Vec::new(),
             pattern: pattern.into(),
             flags: flags.into(),
+            compiled: std::cell::OnceCell::new(),
         })
     }
 
@@ -3026,8 +3108,54 @@ impl ObjectHeap {
         }
     }
 
+    /// Returns the lazily-compiled `regress::Regex` for a RegExp object.
+    ///
+    /// C3 cache: pattern + flags are spec-immutable except via the deprecated
+    /// `RegExp.prototype.compile` (Annex B §B.2.4 — `set_regexp_pattern_flags`
+    /// resets the cache). The first `exec`/`test`/`match` triggers compile;
+    /// every subsequent call borrows the cached engine.
+    ///
+    /// Returns `Err(ObjectError::TypeError)` carrying the SyntaxError message
+    /// from `regress::Regex::with_flags` when the pattern is invalid. (Source
+    /// compiler's parse-time validation makes this path effectively
+    /// unreachable for literal regexes; runtime-built `new RegExp(...)` may
+    /// still fail here.)
+    pub fn regexp_compiled(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<&regress::Regex, ObjectError> {
+        match self.object(handle)? {
+            HeapValue::RegExp {
+                pattern,
+                flags,
+                compiled,
+                ..
+            } => {
+                if let Some(existing) = compiled.get() {
+                    return Ok(existing);
+                }
+                // OnceCell::get_or_try_init is unstable on stable Rust;
+                // implement the same semantics with separate get/set so
+                // a parallel initialiser would deterministically lose
+                // (`set` errors with the existing value, which we then
+                // fetch via `get`). Single-threaded VM never races.
+                let new_regex = regress::Regex::with_flags(pattern, flags.as_ref()).map_err(
+                    |err| {
+                        ObjectError::TypeError(
+                            format!("Invalid regular expression: {err}").into(),
+                        )
+                    },
+                )?;
+                let _ = compiled.set(new_regex);
+                Ok(compiled.get().expect("compiled cache populated above"))
+            }
+            _ => Err(ObjectError::InvalidKind),
+        }
+    }
+
     /// Mutates the pattern and flags of a RegExp object in place.
     /// Used by the deprecated `RegExp.prototype.compile` (Annex B §B.2.4).
+    /// Resets the cached compiled regex so the next exec rebuilds it.
     pub fn set_regexp_pattern_flags(
         &mut self,
         handle: ObjectHandle,
@@ -3035,9 +3163,16 @@ impl ObjectHeap {
         new_flags: &str,
     ) -> Result<(), ObjectError> {
         match self.object_mut(handle)? {
-            HeapValue::RegExp { pattern, flags, .. } => {
+            HeapValue::RegExp {
+                pattern,
+                flags,
+                compiled,
+                ..
+            } => {
                 *pattern = new_pattern.into();
                 *flags = new_flags.into();
+                // Invalidate the C3 cache so the next exec recompiles.
+                *compiled = std::cell::OnceCell::new();
                 Ok(())
             }
             _ => Err(ObjectError::InvalidKind),
@@ -3858,21 +3993,36 @@ impl ObjectHeap {
         })
     }
 
-    /// Allocates a heap-stored BigInt value.
+    /// Allocates a heap-stored BigInt value with an already-built payload.
     ///
     /// §6.1.6.2 The BigInt Type
     /// <https://tc39.es/ecma262/#sec-ecmascript-language-types-bigint-type>
     pub fn alloc_bigint(
         &mut self,
-        value: impl Into<Box<str>>,
+        value: crate::bigint_value::BigIntPayload,
     ) -> Result<ObjectHandle, ObjectError> {
-        self.alloc_heap_value(HeapValue::BigInt {
-            value: value.into(),
-        })
+        self.alloc_heap_value(HeapValue::BigInt { value })
     }
 
-    /// Returns the decimal string value of a BigInt heap object.
-    pub fn bigint_value(&self, handle: ObjectHandle) -> Result<Option<&str>, ObjectError> {
+    /// Allocates a BigInt by parsing a decimal string. Returns
+    /// `ObjectError::TypeError` for non-numeric input.
+    pub fn alloc_bigint_from_str(&mut self, value: &str) -> Result<ObjectHandle, ObjectError> {
+        let payload = crate::bigint_value::BigIntPayload::from_decimal_str(value)
+            .map_err(|_| ObjectError::TypeError(format!("invalid BigInt literal: {value}").into()))?;
+        self.alloc_bigint(payload)
+    }
+
+    /// Allocates a BigInt from a signed 64-bit integer (always inline).
+    pub fn alloc_bigint_from_i64(&mut self, value: i64) -> Result<ObjectHandle, ObjectError> {
+        self.alloc_bigint(crate::bigint_value::BigIntPayload::from_i64(value))
+    }
+
+    /// Returns the BigInt payload backing a handle. `None` if the slot is
+    /// not a `HeapValue::BigInt`.
+    pub fn bigint_value(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<&crate::bigint_value::BigIntPayload>, ObjectError> {
         match self.object(handle)? {
             HeapValue::BigInt { value } => Ok(Some(value)),
             _ => Ok(None),
@@ -4438,6 +4588,10 @@ impl ObjectHeap {
         if current == prototype {
             return Ok(true);
         }
+        // C8: bump the generation so every cached prototype-chain lookup
+        // misses on its next probe. We only invalidate on actual proto
+        // changes, not no-ops, so steady-state code pays nothing.
+        self.prototype_generation = self.prototype_generation.saturating_add(1);
         let is_string_value = matches!(self.object(handle)?, HeapValue::String { .. });
         if !is_string_value && !self.is_extensible(handle)? {
             return Ok(false);
@@ -6732,12 +6886,53 @@ impl ObjectHeap {
         property: PropertyNameId,
         property_names: &PropertyNameRegistry,
     ) -> Result<Option<PropertyLookup>, ObjectError> {
-        let mut current = Some(handle);
+        // Own-property fast path: try receiver first. If found, we don't
+        // need the proto cache. This branch was already in the loop below
+        // — hoisted so the C8 cache only fires on inherited lookups.
+        if let Some((value, cache)) = self.get_own_property(handle, property, property_names)? {
+            return Ok(Some(PropertyLookup::new(handle, value, Some(cache))));
+        }
+
+        // C8: prototype-chain cache. Keyed by `(receiver_shape, property)`.
+        // Validates against `prototype_generation` (bumped by every
+        // `set_prototype` call) and against the cached owner's current
+        // shape (a property delete on the owner mints a fresh shape via
+        // `delete_named_property_storage`, so a slot change is visible
+        // through the shape-id check).
+        let receiver_shape = self.shape_id(handle);
+        if let Some(receiver_shape) = receiver_shape {
+            let key = (receiver_shape, property);
+            let cached = self.proto_lookup_cache.borrow().get(&key).copied();
+            if let Some(entry) = cached
+                && entry.generation == self.prototype_generation
+                && self.shape_id(entry.owner) == Some(entry.owner_shape)
+                && let Some(value) = self.get_shaped(entry.owner, entry.owner_shape, entry.slot)?
+            {
+                return Ok(Some(PropertyLookup::new(entry.owner, value, None)));
+            }
+        }
+
+        // Cold path: walk the proto chain. We start from the FIRST proto
+        // because the receiver was already probed above.
+        let mut current = self.property_traversal_prototype(handle)?;
         let mut depth = 0;
         while let Some(owner) = current {
             if let Some((value, cache)) = self.get_own_property(owner, property, property_names)? {
-                let cache = (owner == handle).then_some(cache);
-                return Ok(Some(PropertyLookup::new(owner, value, cache)));
+                // C8: populate the cache so subsequent lookups skip the
+                // walk. Only when the receiver had a shape — anonymous
+                // shapeless kinds bypass the cache.
+                if let Some(rs) = receiver_shape {
+                    self.proto_lookup_cache.borrow_mut().insert(
+                        (rs, property),
+                        ProtoCacheEntry {
+                            generation: self.prototype_generation,
+                            owner,
+                            owner_shape: cache.shape_id(),
+                            slot: cache.slot_index(),
+                        },
+                    );
+                }
+                return Ok(Some(PropertyLookup::new(owner, value, None)));
             }
             depth += 1;
             if depth > MAX_PROTOTYPE_DEPTH {
@@ -6746,6 +6941,25 @@ impl ObjectHeap {
             current = self.property_traversal_prototype(owner)?;
         }
         Ok(None)
+    }
+
+    /// Returns the current shape id of `handle`, or `None` for kinds
+    /// without a shape (strings, big-ints, iterators, …).
+    fn shape_id(&self, handle: ObjectHandle) -> Option<ObjectShapeId> {
+        match self.object(handle).ok()? {
+            HeapValue::Object(obj) => Some(obj.shape_id),
+            HeapValue::NativeObject { shape_id, .. }
+            | HeapValue::Closure { shape_id, .. }
+            | HeapValue::HostFunction { shape_id, .. }
+            | HeapValue::BoundFunction { shape_id, .. }
+            | HeapValue::Array { shape_id, .. }
+            | HeapValue::ArrayBuffer { shape_id, .. }
+            | HeapValue::SharedArrayBuffer { shape_id, .. }
+            | HeapValue::DataView { shape_id, .. }
+            | HeapValue::TypedArray { shape_id, .. }
+            | HeapValue::RegExp { shape_id, .. } => Some(*shape_id),
+            _ => None,
+        }
     }
 
     /// Returns a shaped property value when the shape and slot still match.
@@ -8335,7 +8549,27 @@ impl ObjectHeap {
             return Ok(PropertyInlineCache::new(shape_id, 0));
         }
 
-        let shape_id = self.allocate_shape();
+        // C7: read the current (parent) shape id so the transition table
+        // can return a canonical child shape — two `{a:1,b:2}` literals
+        // built with the same property sequence will reach the same shape
+        // id. This is what keeps the property IC monomorphic across
+        // sibling allocations instead of going megamorphic on the 5th
+        // distinct sibling.
+        let parent_shape = match self.object(handle)? {
+            HeapValue::Object(obj) => obj.shape_id,
+            HeapValue::NativeObject { shape_id, .. }
+            | HeapValue::Closure { shape_id, .. }
+            | HeapValue::HostFunction { shape_id, .. }
+            | HeapValue::BoundFunction { shape_id, .. }
+            | HeapValue::Array { shape_id, .. }
+            | HeapValue::ArrayBuffer { shape_id, .. }
+            | HeapValue::SharedArrayBuffer { shape_id, .. }
+            | HeapValue::DataView { shape_id, .. }
+            | HeapValue::TypedArray { shape_id, .. }
+            | HeapValue::RegExp { shape_id, .. } => *shape_id,
+            _ => return Err(ObjectError::InvalidKind),
+        };
+        let shape_id = self.shape_transition(parent_shape, property);
         let object = self.object_mut(handle)?;
         let (object_shape_id, keys, values) = match object {
             HeapValue::Object(obj) => (&mut obj.shape_id, &mut obj.keys, &mut obj.values),
@@ -8675,6 +8909,27 @@ impl ObjectHeap {
         shape_id
     }
 
+    /// C7: returns the child shape id reached by adding `property` to an
+    /// object whose current shape is `parent`. The first such transition
+    /// mints a fresh id; subsequent adds with the same `(parent, property)`
+    /// reuse it. Side-effect-free for the heap aside from the transition
+    /// table — the caller is still responsible for pushing the property
+    /// into `keys`/`values` and writing the new shape id back onto the
+    /// object.
+    fn shape_transition(
+        &mut self,
+        parent: ObjectShapeId,
+        property: PropertyNameId,
+    ) -> ObjectShapeId {
+        if let Some(&child) = self.shape_transitions.get(&(parent, property)) {
+            return child;
+        }
+        let child = ObjectShapeId(self.next_shape_id);
+        self.next_shape_id = self.next_shape_id.saturating_add(1);
+        self.shape_transitions.insert((parent, property), child);
+        child
+    }
+
     /// Triggers garbage collection with ephemeron support for WeakMap/WeakSet.
     ///
     /// Phases: mark → ephemeron fixpoint → clear dead weak entries → sweep.
@@ -8774,6 +9029,19 @@ impl ObjectHeap {
     /// Returns the number of live objects.
     pub fn live_count(&self) -> usize {
         self.heap.live_count()
+    }
+
+    /// O2: aggregates the live heap into the layout `otter-profiler`'s
+    /// `HeapInfo` expects: total tracked bytes + per-type `(count, size)`.
+    /// Reuses `collect_type_stats` so the test262 leak-profile path and
+    /// the heap-snapshot writer share one walk over the slot table.
+    pub fn heap_snapshot_info(&self) -> HeapInfoSnapshot {
+        let stats = self.collect_type_stats();
+        HeapInfoSnapshot {
+            object_count: stats.total_count,
+            tracked_bytes: stats.total_bytes,
+            per_type: stats.by_type,
+        }
     }
 
     fn get_own_property(

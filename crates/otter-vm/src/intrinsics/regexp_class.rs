@@ -428,6 +428,10 @@ fn set_last_index(
 
 // ── Compile regex helper ──────────────────────────────────────────────────────
 
+/// One-shot compile used at construction time (`new RegExp(p, f)` and
+/// the deprecated Annex B `compile()`) to surface invalid patterns as
+/// SyntaxError before the object is materialised. The result is
+/// discarded — the per-object C3 cache rebuilds it on first use.
 fn compile_regex(
     pattern: &str,
     flags: &str,
@@ -435,6 +439,32 @@ fn compile_regex(
 ) -> Result<regress::Regex, VmNativeCallError> {
     regress::Regex::with_flags(pattern, flags)
         .map_err(|err| syntax_error(runtime, &format!("Invalid regular expression: {err}")))
+}
+
+/// C3: returns a clone of the cached `regress::Regex` for the given handle.
+///
+/// The compiled engine is stored in the `HeapValue::RegExp::compiled`
+/// `OnceCell` and built on first use. Pattern + flags are spec-immutable
+/// (Annex B `RegExp.prototype.compile` resets the cache), so subsequent
+/// calls borrow the cached engine. Cloning is cheap (`regress::Regex` is
+/// `#[derive(Clone)]` over Arc-shared compiled state on the regress fork),
+/// so we hand the caller an owned copy and avoid threading the borrow
+/// through the rest of the exec pipeline.
+fn cached_regex(
+    handle: ObjectHandle,
+    runtime: &mut crate::interpreter::RuntimeState,
+) -> Result<regress::Regex, VmNativeCallError> {
+    match runtime.objects().regexp_compiled(handle) {
+        Ok(compiled) => Ok(compiled.clone()),
+        Err(crate::object::ObjectError::TypeError(message)) => {
+            // Surface a SyntaxError carrying the regress message — matches
+            // the spec-mandated early error for `new RegExp(badPattern)`.
+            Err(syntax_error(runtime, &message))
+        }
+        Err(other) => Err(VmNativeCallError::Internal(
+            format!("regexp_compiled: {other:?}").into(),
+        )),
+    }
 }
 
 // ── §22.2.3 RegExpBuiltinExec ─────────────────────────────────────────────────
@@ -446,7 +476,9 @@ fn regexp_builtin_exec(
     input: &str,
     runtime: &mut crate::interpreter::RuntimeState,
 ) -> Result<Option<ObjectHandle>, VmNativeCallError> {
-    let pattern = regexp_pattern(handle, runtime).to_string();
+    // C3: borrow the cached `regress::Regex` instead of recompiling per call.
+    // Pattern + flags reads are still O(1) String clones because flags-string
+    // search later on (`contains('g')` etc.) wants the canonical form.
     let flags = regexp_flags_str(handle, runtime).to_string();
 
     let global = flags.contains('g');
@@ -454,7 +486,7 @@ fn regexp_builtin_exec(
     let has_indices = flags.contains('d');
     let unicode = flags.contains('u') || flags.contains('v');
 
-    let compiled = compile_regex(&pattern, &flags, runtime)?;
+    let compiled = cached_regex(handle, runtime)?;
 
     // Collect UTF-16 code units for index computations.
     let utf16: Vec<u16> = input.encode_utf16().collect();

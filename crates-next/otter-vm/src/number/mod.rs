@@ -1,4 +1,4 @@
-//! Foundation numeric model.
+//! Foundation numeric model + the surfaces built on top of it.
 //!
 //! Two-state representation per task 11:
 //!
@@ -21,21 +21,35 @@
 //!
 //! # Contents
 //! - [`NumberValue`] — public number variant.
-//! - [`from_i32`], [`from_f64`], `as_*` accessors.
-//! - Arithmetic: [`add`], [`sub`], [`mul`], [`div`], [`rem`],
-//!   [`neg`].
-//! - Comparison: [`compare`], [`equals`], [`strict_equals`].
-//! - String coercion subset: [`to_number_from_string`].
+//! - [`NumericOrdering`], [`compare`], [`equals`], [`strict_equals`].
+//! - Re-exports from submodules:
+//!   - [`arith`] — `+ - * / % unary-`.
+//!   - [`bitwise`] — bitwise operators + `**` + `ToInt32` / `ToUint32`.
+//!   - [`parse`] — `String → Number` coercion subset.
+//!   - [`prototype`] — `Number.prototype.{toString, toFixed}`.
 //!
 //! # See also
 //! - foundation plan §M5
-//! - [`docs/new-engine/tasks/11-number-core-slice.md`](
-//!     ../../../docs/new-engine/tasks/11-number-core-slice.md
+//! - [`docs/new-engine/tasks/28-bitwise-and-number-prototype.md`](
+//!     ../../../docs/new-engine/tasks/28-bitwise-and-number-prototype.md
 //!   )
 
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
+
+pub mod arith;
+pub mod bitwise;
+pub mod parse;
+pub mod prototype;
+
+pub use arith::{add, div, mul, neg, rem, sub};
+pub use bitwise::{
+    bitwise_and, bitwise_not, bitwise_or, bitwise_xor, pow, shl, shr_arith, shr_logical, to_int32,
+    to_uint32,
+};
+pub use parse::to_number_from_string;
+pub use prototype::lookup as prototype_lookup;
 
 /// JavaScript Number value.
 ///
@@ -143,9 +157,6 @@ impl NumberValue {
                 if d == 0.0 && d.is_sign_negative() {
                     return "0".to_string(); // Per ToString(-0) → "0".
                 }
-                // Foundation subset: simple debug rendering. Slice
-                // 11+ may swap in a full ECMA-262 Number to String
-                // algorithm.
                 if d.fract() == 0.0 && d.abs() < 1e21 {
                     format!("{}", d as i64)
                 } else {
@@ -216,126 +227,9 @@ pub fn strict_equals(lhs: NumberValue, rhs: NumberValue) -> bool {
     equals(lhs, rhs)
 }
 
-/// `lhs + rhs`. Stays in the `Smi` path when both operands are
-/// `Smi` and the result does not overflow.
-#[must_use]
-pub fn add(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
-    if let (NumberValue::Smi(a), NumberValue::Smi(b)) = (lhs, rhs)
-        && let Some(r) = a.checked_add(b)
-    {
-        return NumberValue::Smi(r);
-    }
-    NumberValue::Double(lhs.as_f64() + rhs.as_f64()).canonicalize()
-}
-
-/// `lhs - rhs`.
-#[must_use]
-pub fn sub(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
-    if let (NumberValue::Smi(a), NumberValue::Smi(b)) = (lhs, rhs)
-        && let Some(r) = a.checked_sub(b)
-    {
-        return NumberValue::Smi(r);
-    }
-    NumberValue::Double(lhs.as_f64() - rhs.as_f64()).canonicalize()
-}
-
-/// `lhs * rhs`.
-#[must_use]
-pub fn mul(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
-    if let (NumberValue::Smi(a), NumberValue::Smi(b)) = (lhs, rhs)
-        && let Some(r) = a.checked_mul(b)
-    {
-        // `0 * -1 = 0` (spec keeps `+0`, which matches `Smi(0)`).
-        return NumberValue::Smi(r);
-    }
-    NumberValue::Double(lhs.as_f64() * rhs.as_f64()).canonicalize()
-}
-
-/// `lhs / rhs`. Always returns `Double` because integer division
-/// rarely yields an exact integer; canonicalization promotes
-/// integer-valued results back to `Smi`.
-#[must_use]
-pub fn div(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
-    NumberValue::Double(lhs.as_f64() / rhs.as_f64()).canonicalize()
-}
-
-/// `lhs % rhs` per IEEE-754 remainder semantics.
-#[must_use]
-pub fn rem(lhs: NumberValue, rhs: NumberValue) -> NumberValue {
-    NumberValue::Double(lhs.as_f64() % rhs.as_f64()).canonicalize()
-}
-
-/// Unary `-`.
-#[must_use]
-pub fn neg(value: NumberValue) -> NumberValue {
-    match value {
-        NumberValue::Smi(0) => NumberValue::Double(-0.0),
-        NumberValue::Smi(n) => match n.checked_neg() {
-            Some(r) => NumberValue::Smi(r),
-            None => NumberValue::Double(-f64::from(n)).canonicalize(),
-        },
-        NumberValue::Double(d) => NumberValue::Double(-d).canonicalize(),
-    }
-}
-
-/// Foundation subset of `ToNumber(string)`.
-///
-/// Accepts:
-/// - empty / whitespace-only strings → `+0`;
-/// - `"Infinity"`, `"+Infinity"`, `"-Infinity"`;
-/// - `"NaN"`;
-/// - decimal-integer / decimal-float text (Rust `f64::from_str`).
-///
-/// Any other shape → `NaN`. Hex / binary / octal `StringNumeric`
-/// literals are deferred to a later slice.
-#[must_use]
-pub fn to_number_from_string(text: &str) -> NumberValue {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return NumberValue::Smi(0);
-    }
-    match trimmed {
-        "NaN" => return NumberValue::Double(f64::NAN),
-        "Infinity" | "+Infinity" => return NumberValue::Double(f64::INFINITY),
-        "-Infinity" => return NumberValue::Double(f64::NEG_INFINITY),
-        _ => {}
-    }
-    match trimmed.parse::<f64>() {
-        Ok(d) => NumberValue::Double(d).canonicalize(),
-        Err(_) => NumberValue::Double(f64::NAN),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn smi_add_stays_smi() {
-        assert_eq!(
-            add(NumberValue::Smi(1), NumberValue::Smi(2)),
-            NumberValue::Smi(3)
-        );
-    }
-
-    #[test]
-    fn smi_overflow_promotes_to_double() {
-        let a = NumberValue::Smi(i32::MAX);
-        let b = NumberValue::Smi(1);
-        let r = add(a, b);
-        match r {
-            NumberValue::Double(d) => assert!((d - (i32::MAX as f64 + 1.0)).abs() < 1e-9),
-            other => panic!("expected Double, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn negative_zero_round_trip() {
-        let neg_zero = neg(NumberValue::Smi(0));
-        assert!(neg_zero.is_negative_zero());
-        // -0 === +0 per spec.
-        assert!(strict_equals(neg_zero, NumberValue::Smi(0)));
-    }
 
     #[test]
     fn nan_compares_unordered() {
@@ -345,41 +239,6 @@ mod tests {
             NumericOrdering::Unordered
         );
         assert!(!equals(nan, nan));
-    }
-
-    #[test]
-    fn division_by_zero_produces_infinity() {
-        let r = div(NumberValue::Smi(1), NumberValue::Smi(0));
-        assert!(r.is_infinite());
-        let r = div(NumberValue::Smi(-1), NumberValue::Smi(0));
-        assert!(r.is_infinite());
-        // 0 / 0 is NaN.
-        let r = div(NumberValue::Smi(0), NumberValue::Smi(0));
-        assert!(r.is_nan());
-    }
-
-    #[test]
-    fn fractional_division_returns_double() {
-        let r = div(NumberValue::Smi(1), NumberValue::Smi(2));
-        match r {
-            NumberValue::Double(d) => assert!((d - 0.5).abs() < 1e-12),
-            other => panic!("expected Double, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn to_number_from_string_subset() {
-        assert_eq!(to_number_from_string("42"), NumberValue::Smi(42));
-        assert_eq!(to_number_from_string("  17 "), NumberValue::Smi(17));
-        assert!(to_number_from_string("NaN").is_nan());
-        assert!(to_number_from_string("Infinity").is_infinite());
-        assert!(to_number_from_string("-Infinity").is_infinite());
-        assert_eq!(to_number_from_string(""), NumberValue::Smi(0));
-        assert!(to_number_from_string("foo").is_nan());
-        match to_number_from_string("1.5") {
-            NumberValue::Double(d) => assert!((d - 1.5).abs() < 1e-12),
-            other => panic!("expected Double, got {other:?}"),
-        }
     }
 
     #[test]

@@ -8,8 +8,16 @@ numbers, booleans, control flow, locals, function declarations,
 recursive calls, objects, arrays, closures with captured upvalues,
 `this` binding, method calls, `Function.prototype.{call, apply,
 bind}`, `throw` / `try` / `catch` / `finally`, a foundation
-`Error` constructor, and the iterator protocol with `for…of` plus
-spread in array literals and calls. **91/91 engine fixtures pass.**
+`Error` constructor, the iterator protocol with `for…of` plus
+spread in array literals and calls, `class` declarations with
+`extends`, `super`, instance methods, and static members,
+default / rest / destructuring parameters (and matching `let`
+destructuring bindings), bitwise + `**` operators with all
+compound-assignment shapes, `Number.prototype.{toString, toFixed}`,
+the `Math` namespace (constants + abs/min/max/floor/ceil/round/
+trunc/sqrt/pow), and `BigInt` literals with arbitrary-precision
+arithmetic, bitwise ops, and spec-correct cross-kind coercion.
+**112/112 engine fixtures pass.**
 
 Foundation artifacts that stay (not tasks, never deleted):
 
@@ -71,17 +79,9 @@ ships independently end-to-end.
 
 ### Phase D — iterators and language essentials
 
-| File | One-line goal |
-|---|---|
-| [26-classes-extends-super.md](./26-classes-extends-super.md) | `class` declarations, `extends`, `super`, methods, getters / setters, static members. |
-| [27-rest-default-destructuring-params.md](./27-rest-default-destructuring-params.md) | Rest parameters, default parameter values, destructuring patterns in parameters. |
+✅ Phase D complete — see Phase E for the next batch.
 
 ### Phase E — number and string completion
-
-| File | One-line goal |
-|---|---|
-| [28-bitwise-and-number-prototype.md](./28-bitwise-and-number-prototype.md) | Bitwise operators (`& | ^ << >> >>> ~`), `Number.prototype.{toString, toFixed}`, `Math.*` essentials. |
-| [29-bigint-value.md](./29-bigint-value.md) | `BigInt` value, literals, arithmetic, comparison, mixed-type coercion rules. |
 | [30-string-prototype-completion.md](./30-string-prototype-completion.md) | Remaining `String.prototype` methods (`replace` / `split` / `repeat` / `pad*` / `trim*` / `at` / `codePointAt` / `toLowerCase` / `toUpperCase`). |
 | [31-regexp-and-pattern-methods.md](./31-regexp-and-pattern-methods.md) | RegExp value, literal syntax, `String.prototype.{match,matchAll,replace,replaceAll,search,split}` with regex args. |
 | [32-json-stringify-parse.md](./32-json-stringify-parse.md) | `JSON.stringify` and `JSON.parse` with deterministic key order. |

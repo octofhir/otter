@@ -28,7 +28,8 @@
 use std::collections::HashSet;
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, FormalParameters, Function, FunctionBody, Statement,
+    ArrowFunctionExpression, BindingPattern, Class, FormalParameters, Function, FunctionBody,
+    Statement,
 };
 use oxc_ast_visit::{Visit, walk};
 
@@ -133,6 +134,21 @@ impl<'a> Visit<'a> for OwnNameCollector {
         self.maybe_collect_pattern(&it.id);
         walk::walk_variable_declarator(self, it);
     }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        // Class declarations (and named class expressions) bind
+        // the class name in the enclosing scope, just like function
+        // declarations. Without this hook the capture analyser
+        // would miss class names referenced from inside methods.
+        if self.nested_depth == 0
+            && let Some(id) = it.id.as_ref()
+        {
+            self.names.insert(id.name.as_str().to_string());
+        }
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_class(self, it);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
 }
 
 /// Walks a function body and collects every identifier name
@@ -160,5 +176,15 @@ impl<'a> Visit<'a> for InnerRefCollector {
         if self.nested_depth > 0 {
             self.refs.insert(it.name.as_str().to_string());
         }
+    }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        // Class methods sit inside a Function value, so the
+        // function visit hooks already increment nested_depth for
+        // bodies. The class header itself (super_class expression)
+        // is at the current scope's depth — leave it untouched so
+        // `class B extends A {}` doesn't spuriously mark `A` as a
+        // captured-by-inner reference at module top level.
+        walk::walk_class(self, it);
     }
 }

@@ -31,7 +31,9 @@
 
 pub mod array;
 pub mod array_prototype;
+pub mod bigint;
 pub mod intrinsics;
+pub mod math;
 pub mod number;
 pub mod object;
 pub mod string;
@@ -67,6 +69,10 @@ pub enum Value {
     Boolean(bool),
     /// JS Number (smi + double; see [`NumberValue`]).
     Number(NumberValue),
+    /// JS BigInt — arbitrary-precision integer. Distinct from
+    /// `Number`; mixing the two through arithmetic is a spec
+    /// `TypeError`. See [`bigint::BigIntValue`].
+    BigInt(bigint::BigIntValue),
     /// JS string. Storage is WTF-16 with cons / sliced ropes; see
     /// [`JsString`].
     String(JsString),
@@ -109,6 +115,36 @@ pub enum Value {
     /// — they are not addressable via `o[@@iterator]` from user
     /// code.
     Iterator(std::rc::Rc<std::cell::RefCell<IteratorState>>),
+    /// Class value: the result of evaluating a `class` declaration
+    /// or expression. Wraps the underlying constructor callable,
+    /// the prototype object that fresh instances inherit from, and
+    /// a static-side object that holds class statics (and chains
+    /// through `extends`). The dispatcher unwraps a class to its
+    /// inner constructor for `Op::Call` / `Op::New`, but treats
+    /// `LoadProperty` / `StoreProperty` against the class as
+    /// operations on the static side (with `"prototype"` aliased
+    /// to the prototype object directly).
+    ClassConstructor(std::rc::Rc<ClassConstructor>),
+}
+
+/// Storage for [`Value::ClassConstructor`]. Cloned by handle so
+/// passing a class through registers stays cheap; the wrapper is
+/// `Rc`-shared and the inner objects are themselves heap-shared.
+#[derive(Debug)]
+pub struct ClassConstructor {
+    /// The actual callable (a `Value::Function` or
+    /// `Value::Closure`) the runtime invokes for `new C(...)` or
+    /// `super(...)`. Constructed by the compiler's class-lowering
+    /// pass.
+    pub ctor: Value,
+    /// `C.prototype` — every instance built by `new C(...)`
+    /// inherits from this object, and instance methods live here.
+    pub prototype: JsObject,
+    /// Static side: own static methods/properties live here, and
+    /// when `class D extends C` the static object's
+    /// `[[Prototype]]` chains to `C`'s static object so static
+    /// inheritance just falls out of the existing prototype walker.
+    pub statics: JsObject,
 }
 
 /// Foundation iterator-state machine. Each variant carries the
@@ -213,12 +249,16 @@ impl Value {
             Value::Null => "null".to_string(),
             Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
             Value::Number(n) => n.to_display_string(),
+            // BigInt rendering matches `BigInt.prototype.toString`:
+            // decimal digits, no `n` suffix.
+            Value::BigInt(b) => b.to_decimal_string(),
             Value::String(s) => s.to_lossy_string(),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 format!("[Function #{function_id}]")
             }
             Value::BoundFunction(b) => format!("[BoundFunction → {}]", b.target.display_string()),
             Value::Iterator(_) => "[object Iterator]".to_string(),
+            Value::ClassConstructor(_) => "[class]".to_string(),
             Value::Object(_) => "[object Object]".to_string(),
             Value::Array(a) => {
                 let body = a.borrow_body();
@@ -242,13 +282,16 @@ impl Value {
                     n.as_f64() != 0.0
                 }
             }
+            // Spec ToBoolean(BigInt): false iff zero.
+            Value::BigInt(b) => !b.as_inner().sign().eq(&num_bigint::Sign::NoSign),
             Value::String(s) => !s.is_empty(),
             Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
             | Value::Object(_)
             | Value::Array(_)
-            | Value::Iterator(_) => true,
+            | Value::Iterator(_)
+            | Value::ClassConstructor(_) => true,
         }
     }
 
@@ -302,6 +345,10 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Number(a), Value::Number(b)) => number::equals(*a, *b),
+            // Strict equality across Number / BigInt is always
+            // `false` per spec; the wildcard arm below handles
+            // the cross-kind case.
+            (Value::BigInt(a), Value::BigInt(b)) => a == b,
             (Value::String(a), Value::String(b)) => a.equals(b),
             (Value::Object(a), Value::Object(b)) => a.ptr_eq(b),
             (Value::Array(a), Value::Array(b)) => a.ptr_eq(b),
@@ -320,6 +367,7 @@ impl PartialEq for Value {
             ) => a == b && std::rc::Rc::ptr_eq(ua, ub),
             (Value::BoundFunction(a), Value::BoundFunction(b)) => std::rc::Rc::ptr_eq(a, b),
             (Value::Iterator(a), Value::Iterator(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::ClassConstructor(a), Value::ClassConstructor(b)) => std::rc::Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -397,6 +445,19 @@ pub struct Frame {
     /// `EndFinally` at the close of every finally body, so the
     /// re-throw protocol stays bytecode-visible.
     pub pending_throw: Option<Value>,
+    /// Newly-allocated receiver when this frame was entered via
+    /// [`Op::New`] (`new C(args)`). On return, [`Interpreter::pop_frame`]
+    /// substitutes this object for any non-object return value, so
+    /// constructors that don't `return` a replacement still hand the
+    /// caller the freshly-built instance.
+    pub construct_target: Option<JsObject>,
+    /// Trailing arguments past the declared `param_count`. Populated
+    /// by the call dispatcher only when the callee declares a rest
+    /// parameter (`function f(...rest) { … }`); consumed by
+    /// [`otter_bytecode::Op::CollectRest`] which packs them into a
+    /// fresh `JsArray`. Always empty for non-rest callees so the
+    /// allocation cost is paid only when needed.
+    pub rest_args: SmallVec<[Value; 4]>,
 }
 
 /// One active try-handler descriptor — the runtime counterpart to
@@ -495,6 +556,8 @@ impl Frame {
             this_value,
             handlers: SmallVec::new(),
             pending_throw: None,
+            construct_target: None,
+            rest_args: SmallVec::new(),
         }
     }
 }
@@ -805,6 +868,10 @@ impl Interpreter {
                     self.do_call_spread(stack, module, &operands)?;
                     continue;
                 }
+                Op::New => {
+                    self.do_construct(stack, module, &operands)?;
+                    continue;
+                }
                 Op::Throw => {
                     let src = register_operand(operands.first())?;
                     let value = stack[top_idx]
@@ -846,6 +913,7 @@ impl Interpreter {
                 | Op::CallWithThis
                 | Op::CallMethodValue
                 | Op::CallSpread
+                | Op::New
                 | Op::Throw
                 | Op::EndFinally => {
                     unreachable!("stack-modifying ops handled earlier in this loop")
@@ -979,6 +1047,19 @@ impl Interpreter {
                     write_register(frame, dst, Value::Number(NumberValue::Smi(imm)))?;
                     frame.pc += 1;
                 }
+                Op::LoadBigInt => {
+                    let dst = register_operand(operands.first())?;
+                    let idx = const_operand(operands.get(1))?;
+                    let value = match module.constants.get(idx as usize) {
+                        Some(Constant::BigInt { decimal }) => {
+                            bigint::BigIntValue::from_decimal(decimal)
+                                .ok_or(VmError::InvalidOperand)?
+                        }
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    write_register(frame, dst, Value::BigInt(value))?;
+                    frame.pc += 1;
+                }
                 Op::LoadTrue => {
                     let dst = register_operand(operands.first())?;
                     write_register(frame, dst, Value::Boolean(true))?;
@@ -1070,6 +1151,13 @@ impl Interpreter {
                     let name = lookup_string_constant(module, name_idx)?;
                     let value = match read_register(frame, obj_reg)? {
                         Value::Object(o) => o.get(&name).unwrap_or(Value::Undefined),
+                        Value::ClassConstructor(c) => {
+                            if name == "prototype" {
+                                Value::Object(c.prototype.clone())
+                            } else {
+                                c.statics.get(&name).unwrap_or(Value::Undefined)
+                            }
+                        }
                         Value::String(s) if name == "length" => {
                             Value::Number(NumberValue::from_i32(s.len() as i32))
                         }
@@ -1087,11 +1175,12 @@ impl Interpreter {
                     let src = register_operand(operands.get(2))?;
                     let name = lookup_string_constant(module, name_idx)?;
                     let value = read_register(frame, src)?.clone();
-                    let obj = match read_register(frame, obj_reg)? {
+                    let target = match read_register(frame, obj_reg)? {
                         Value::Object(o) => o.clone(),
+                        Value::ClassConstructor(c) => c.statics.clone(),
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    obj.set(&name, value);
+                    target.set(&name, value);
                     frame.pc += 1;
                 }
                 Op::DeleteProperty => {
@@ -1127,8 +1216,14 @@ impl Interpreter {
                         Value::Object(o) => o.clone(),
                         _ => return Err(VmError::TypeMismatch),
                     };
+                    // Class values chain through their statics
+                    // object — `class D extends C` sets
+                    // `D.statics.[[Prototype]] = C.statics` so
+                    // `D.staticMethod` walks up to `C.staticMethod`
+                    // through the existing prototype lookup.
                     let proto = match read_register(frame, proto_reg)? {
                         Value::Object(p) => Some(p.clone()),
+                        Value::ClassConstructor(c) => Some(c.statics.clone()),
                         Value::Null => None,
                         _ => return Err(VmError::TypeMismatch),
                     };
@@ -1225,24 +1320,72 @@ impl Interpreter {
                     self.run_add(module, &operands, frame)?;
                 }
                 Op::Sub => {
-                    self.run_numeric(&operands, frame, number::sub)?;
+                    self.run_numeric(&operands, frame, number::sub, bigint_sub_op)?;
                 }
                 Op::Mul => {
-                    self.run_numeric(&operands, frame, number::mul)?;
+                    self.run_numeric(&operands, frame, number::mul, bigint_mul_op)?;
                 }
                 Op::Div => {
-                    self.run_numeric(&operands, frame, number::div)?;
+                    self.run_numeric(&operands, frame, number::div, bigint::ops::div)?;
                 }
                 Op::Rem => {
-                    self.run_numeric(&operands, frame, number::rem)?;
+                    self.run_numeric(&operands, frame, number::rem, bigint::ops::rem)?;
+                }
+                Op::Pow => {
+                    self.run_numeric(&operands, frame, number::pow, bigint::ops::pow)?;
+                }
+                Op::BitwiseAnd => {
+                    self.run_numeric(&operands, frame, number::bitwise_and, bigint_and_op)?;
+                }
+                Op::BitwiseOr => {
+                    self.run_numeric(&operands, frame, number::bitwise_or, bigint_or_op)?;
+                }
+                Op::BitwiseXor => {
+                    self.run_numeric(&operands, frame, number::bitwise_xor, bigint_xor_op)?;
+                }
+                Op::Shl => {
+                    self.run_numeric(&operands, frame, number::shl, bigint::ops::shl)?;
+                }
+                Op::Shr => {
+                    self.run_numeric(&operands, frame, number::shr_arith, bigint::ops::shr)?;
+                }
+                Op::Ushr => {
+                    // `>>>` on BigInt is a spec TypeError — only the
+                    // Number path is allowed here.
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
+                    let result = match (&lhs, &rhs) {
+                        (Value::Number(a), Value::Number(b)) => {
+                            Value::Number(number::shr_logical(*a, *b))
+                        }
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
                 }
                 Op::Neg => {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
+                    let value = match read_register(frame, src)? {
+                        Value::Number(n) => Value::Number(number::neg(*n)),
+                        Value::BigInt(b) => Value::BigInt(bigint::ops::neg(b)),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::BitwiseNot => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    if let Value::BigInt(b) = read_register(frame, src)?.clone() {
+                        let value = Value::BigInt(bigint::ops::bitwise_not(&b));
+                        write_register(frame, dst, value)?;
+                        frame.pc += 1;
+                        continue;
+                    }
                     let n = read_register(frame, src)?
                         .as_number()
                         .ok_or(VmError::TypeMismatch)?;
-                    write_register(frame, dst, Value::Number(number::neg(n)))?;
+                    write_register(frame, dst, Value::Number(number::bitwise_not(n)))?;
                     frame.pc += 1;
                 }
                 Op::ToNumber => {
@@ -1252,13 +1395,18 @@ impl Interpreter {
                         Value::Number(n) => *n,
                         Value::Boolean(true) => NumberValue::Smi(1),
                         Value::Boolean(false) | Value::Null => NumberValue::Smi(0),
+                        // Spec ToNumber(BigInt) is a TypeError; we
+                        // surface it here so the unary `+` operator
+                        // doesn't silently coerce.
+                        Value::BigInt(_) => return Err(VmError::TypeMismatch),
                         Value::Undefined
                         | Value::Function { .. }
                         | Value::Closure { .. }
                         | Value::BoundFunction(_)
                         | Value::Object(_)
                         | Value::Array(_)
-                        | Value::Iterator(_) => NumberValue::Double(f64::NAN),
+                        | Value::Iterator(_)
+                        | Value::ClassConstructor(_) => NumberValue::Double(f64::NAN),
                         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
                     };
                     write_register(frame, dst, Value::Number(value))?;
@@ -1326,6 +1474,69 @@ impl Interpreter {
                         obj.set("message", Value::String(s));
                     }
                     write_register(frame, dst, Value::Object(obj))?;
+                    frame.pc += 1;
+                }
+                Op::MathLoad => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let value =
+                        math::load_constant(&name).ok_or_else(|| VmError::UnknownIntrinsic {
+                            name: format!("Math.{name}"),
+                        })?;
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::MathCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = math::call(&name, &args).map_err(math_to_vm_error)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                Op::CollectRest => {
+                    let dst = register_operand(operands.first())?;
+                    // Drain rather than clone — the rest array is
+                    // built once per call and CollectRest is the
+                    // single consumer, so freeing the backing
+                    // storage promptly keeps frame sizes small.
+                    let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
+                    write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
+                    frame.pc += 1;
+                }
+                Op::MakeClass => {
+                    let dst = register_operand(operands.first())?;
+                    let ctor_reg = register_operand(operands.get(1))?;
+                    let proto_reg = register_operand(operands.get(2))?;
+                    let statics_reg = register_operand(operands.get(3))?;
+                    let ctor = read_register(frame, ctor_reg)?.clone();
+                    if !is_callable(&ctor) {
+                        return Err(VmError::NotCallable);
+                    }
+                    let prototype = match read_register(frame, proto_reg)? {
+                        Value::Object(o) => o.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let statics = match read_register(frame, statics_reg)? {
+                        Value::Object(o) => o.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let class = std::rc::Rc::new(ClassConstructor {
+                        ctor,
+                        prototype,
+                        statics,
+                    });
+                    write_register(frame, dst, Value::ClassConstructor(class))?;
                     frame.pc += 1;
                 }
                 Op::EnterTry => {
@@ -1441,11 +1652,22 @@ impl Interpreter {
         value: Value,
     ) -> Result<Option<Value>, VmError> {
         let popped = stack.pop().ok_or(VmError::InvalidOperand)?;
+        // For frames entered via `Op::New`, ES spec
+        // `OrdinaryConstruct` step 11: if the constructor returned
+        // an object, hand that back; otherwise the freshly
+        // allocated `this` is the result.
+        let resolved = match popped.construct_target {
+            Some(target) => match value {
+                Value::Object(_) | Value::Array(_) => value,
+                _ => Value::Object(target),
+            },
+            None => value,
+        };
         let Some(return_reg) = popped.return_register else {
-            return Ok(Some(value));
+            return Ok(Some(resolved));
         };
         let caller = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-        write_register(caller, return_reg, value)?;
+        write_register(caller, return_reg, resolved)?;
         // Caller's pc was set to the next instruction at call time;
         // nothing to advance here.
         Ok(None)
@@ -1510,20 +1732,29 @@ impl Interpreter {
         let mut effective_this = this_value;
         let mut effective_args = args;
         let mut hops: u32 = 0;
-        while let Value::BoundFunction(bound) = current {
+        loop {
             if hops >= self.max_stack_depth {
                 return Err(VmError::StackOverflow {
                     limit: self.max_stack_depth,
                 });
             }
-            hops += 1;
-            let mut combined: SmallVec<[Value; 8]> =
-                SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
-            combined.extend(bound.bound_args.iter().cloned());
-            combined.extend(effective_args);
-            effective_this = bound.bound_this.clone();
-            effective_args = combined;
-            current = bound.target.clone();
+            match current {
+                Value::BoundFunction(bound) => {
+                    hops += 1;
+                    let mut combined: SmallVec<[Value; 8]> =
+                        SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
+                    combined.extend(bound.bound_args.iter().cloned());
+                    combined.extend(effective_args);
+                    effective_this = bound.bound_this.clone();
+                    effective_args = combined;
+                    current = bound.target.clone();
+                }
+                Value::ClassConstructor(cc) => {
+                    hops += 1;
+                    current = cc.ctor.clone();
+                }
+                _ => break,
+            }
         }
         let (function_id, parent_upvalues, this_for_callee) = match current {
             Value::Function { function_id } => {
@@ -1561,12 +1792,21 @@ impl Interpreter {
         // Bind parameters: extra args are dropped, missing args
         // stay `Value::Undefined` (matches JS semantics).
         let bind_count = (function.param_count as usize).min(effective_args.len());
-        for (i, value) in effective_args.into_iter().take(bind_count).enumerate() {
+        let total_args = effective_args.len();
+        let mut iter = effective_args.into_iter();
+        for i in 0..bind_count {
+            let value = iter.next().expect("bind_count <= len");
             let slot = new_frame
                 .registers
                 .get_mut(i)
                 .ok_or(VmError::InvalidOperand)?;
             *slot = value;
+        }
+        // Stash the trailing args for `Op::CollectRest`. Only the
+        // rest-aware callees pay the allocation; everyone else
+        // leaves `rest_args` empty as initialised.
+        if function.has_rest && total_args > function.param_count as usize {
+            new_frame.rest_args = iter.collect();
         }
         stack.push(new_frame);
         Ok(())
@@ -1615,6 +1855,56 @@ impl Interpreter {
             frame.pending_throw = Some(payload);
             return Ok(());
         }
+    }
+
+    /// Handle `Op::New`: allocate a fresh receiver, set its
+    /// `[[Prototype]]` to `callee.prototype` (when present), and
+    /// invoke the callee with `this = receiver`. The caller's `dst`
+    /// register receives either the constructor's returned object
+    /// or the freshly allocated receiver — `pop_frame` performs
+    /// that swap so the unwind path is uniform across call shapes.
+    fn do_construct(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let callee_reg = register_operand(operands.get(1))?;
+        let argc = match operands.get(2) {
+            Some(&Operand::ConstIndex(n)) => n,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        let top_idx = stack.len() - 1;
+        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        if !is_callable(&callee) {
+            return Err(VmError::NotCallable);
+        }
+        // Allocate receiver and link its prototype before pushing
+        // the new frame. The constructor might mutate the receiver
+        // immediately, so the prototype link must already be in
+        // place.
+        let receiver = JsObject::new();
+        if let Some(proto) = construct_prototype(&callee) {
+            receiver.set_prototype(Some(proto));
+        }
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
+        for i in 0..argc as usize {
+            let r = register_operand(operands.get(3 + i))?;
+            args.push(read_register(&stack[top_idx], r)?.clone());
+        }
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        let this_value = Value::Object(receiver.clone());
+        self.invoke(stack, module, &callee, this_value, args, dst)?;
+        // The pushed frame is now on top; mark it so `pop_frame`
+        // can substitute the receiver for any non-object return.
+        if let Some(top) = stack.last_mut() {
+            top.construct_target = Some(receiver);
+        }
+        Ok(())
     }
 
     /// Handle `Op::CallSpread`: read the args array, fan it out
@@ -1719,6 +2009,7 @@ impl Interpreter {
         let intrinsic = match &recv_value {
             Value::String(_) => string_prototype::lookup(&name),
             Value::Array(_) => array_prototype::lookup(&name),
+            Value::Number(_) => number::prototype_lookup(&name),
             _ => None,
         };
         if let Some(entry) = intrinsic {
@@ -1735,9 +2026,38 @@ impl Interpreter {
             return Ok(());
         }
 
+        // Property-bearing receivers — load the property first.
+        // For class constructors, `prototype` resolves to the
+        // instance prototype object (mirroring `Op::LoadProperty`'s
+        // class shape) and other names walk the static side. Only
+        // when the property lookup hands back a callable do we
+        // dispatch with `this = recv`; missing or non-callable
+        // properties surface as `NotCallable` so callers see the
+        // same error as `obj.notFn()`.
+        let lookup_via_property = match &recv_value {
+            Value::Object(obj) => Some(obj.get(&name).unwrap_or(Value::Undefined)),
+            Value::ClassConstructor(c) => Some(if name == "prototype" {
+                Value::Object(c.prototype.clone())
+            } else {
+                c.statics.get(&name).unwrap_or(Value::Undefined)
+            }),
+            _ => None,
+        };
+        if let Some(method) = lookup_via_property {
+            if !is_callable(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].pc = stack[top_idx]
+                .pc
+                .checked_add(1)
+                .ok_or(VmError::InvalidOperand)?;
+            return self.invoke(stack, module, &method, recv_value.clone(), arg_values, dst);
+        }
+
         // `Function.prototype.{call, apply, bind}` on a callable
-        // receiver. `apply` only accepts an `Array` (or omitted /
-        // null / undefined) for its second argument.
+        // receiver that doesn't expose the method as a property.
+        // `apply` only accepts an `Array` (or omitted / null /
+        // undefined) for its second argument.
         if is_callable(&recv_value) {
             return self.dispatch_function_method(
                 stack,
@@ -1747,20 +2067,6 @@ impl Interpreter {
                 arg_values,
                 dst,
             );
-        }
-
-        // Plain object: load the property, validate callable, then
-        // dispatch with `this = recv`.
-        if let Value::Object(obj) = &recv_value {
-            let method = obj.get(&name).unwrap_or(Value::Undefined);
-            if !is_callable(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].pc = stack[top_idx]
-                .pc
-                .checked_add(1)
-                .ok_or(VmError::InvalidOperand)?;
-            return self.invoke(stack, module, &method, recv_value.clone(), arg_values, dst);
         }
 
         Err(VmError::UnknownIntrinsic { name })
@@ -1844,11 +2150,21 @@ impl Interpreter {
         operands: &[Operand],
         frame: &mut Frame,
         op: fn(NumberValue, NumberValue) -> NumberValue,
+        bigint_op: BigIntBinop,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
-        let l = lhs.as_number().ok_or(VmError::TypeMismatch)?;
-        let r = rhs.as_number().ok_or(VmError::TypeMismatch)?;
-        write_register(frame, dst, Value::Number(op(l, r)))?;
+        let result = match (&lhs, &rhs) {
+            (Value::Number(a), Value::Number(b)) => Value::Number(op(*a, *b)),
+            (Value::BigInt(a), Value::BigInt(b)) => {
+                Value::BigInt(bigint_op(a, b).map_err(bigint_to_vm_error)?)
+            }
+            // Mixed Number/BigInt is a spec TypeError.
+            (Value::Number(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Number(_)) => {
+                return Err(VmError::TypeMismatch);
+            }
+            _ => return Err(VmError::TypeMismatch),
+        };
+        write_register(frame, dst, result)?;
         frame.pc += 1;
         Ok(())
     }
@@ -1862,6 +2178,10 @@ impl Interpreter {
         let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
         let result = match (&lhs, &rhs) {
             (Value::Number(a), Value::Number(b)) => Value::Number(number::add(*a, *b)),
+            (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(bigint::ops::add(a, b)),
+            (Value::Number(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Number(_)) => {
+                return Err(VmError::TypeMismatch);
+            }
             (Value::String(a), Value::String(b)) => {
                 Value::String(JsString::concat(a, b, &self.string_heap)?)
             }
@@ -1876,16 +2196,18 @@ impl Interpreter {
         let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
         let truthy = match (&lhs, &rhs) {
             (Value::Number(a), Value::Number(b)) => {
-                let ord = number::compare(*a, *b);
-                match (op, ord) {
-                    (_, NumericOrdering::Unordered) => false,
-                    (Op::LessThan, NumericOrdering::Less) => true,
-                    (Op::LessEq, NumericOrdering::Less | NumericOrdering::Equal) => true,
-                    (Op::GreaterThan, NumericOrdering::Greater) => true,
-                    (Op::GreaterEq, NumericOrdering::Greater | NumericOrdering::Equal) => true,
-                    _ => false,
-                }
+                ordering_matches_op(op, number_ordering_to_std(number::compare(*a, *b)))
             }
+            (Value::BigInt(a), Value::BigInt(b)) => {
+                ordering_matches_op(op, Some(bigint::ops::compare(a, b)))
+            }
+            (Value::BigInt(a), Value::Number(b)) => {
+                ordering_matches_op(op, bigint::ops::compare_to_f64(a, b.as_f64()))
+            }
+            (Value::Number(a), Value::BigInt(b)) => ordering_matches_op(
+                op,
+                bigint::ops::compare_to_f64(b, a.as_f64()).map(std::cmp::Ordering::reverse),
+            ),
             (Value::String(a), Value::String(b)) => {
                 let ord = a.compare_lex(b);
                 match op {
@@ -1901,6 +2223,89 @@ impl Interpreter {
         write_register(frame, dst, Value::Boolean(truthy))?;
         frame.pc += 1;
         Ok(())
+    }
+}
+
+/// Function-pointer alias for the BigInt sibling of the
+/// `NumberValue` arithmetic helpers. A few `BigInt` ops can fail
+/// (division by zero, negative exponent, oversized shift); the
+/// VM dispatcher maps each error variant to the matching
+/// `VmError`.
+type BigIntBinop = fn(
+    &bigint::BigIntValue,
+    &bigint::BigIntValue,
+) -> Result<bigint::BigIntValue, bigint::ops::OpError>;
+
+fn bigint_sub_op(
+    a: &bigint::BigIntValue,
+    b: &bigint::BigIntValue,
+) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    Ok(bigint::ops::sub(a, b))
+}
+
+fn bigint_mul_op(
+    a: &bigint::BigIntValue,
+    b: &bigint::BigIntValue,
+) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    Ok(bigint::ops::mul(a, b))
+}
+
+fn bigint_and_op(
+    a: &bigint::BigIntValue,
+    b: &bigint::BigIntValue,
+) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    Ok(bigint::ops::bitwise_and(a, b))
+}
+
+fn bigint_or_op(
+    a: &bigint::BigIntValue,
+    b: &bigint::BigIntValue,
+) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    Ok(bigint::ops::bitwise_or(a, b))
+}
+
+fn bigint_xor_op(
+    a: &bigint::BigIntValue,
+    b: &bigint::BigIntValue,
+) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    Ok(bigint::ops::bitwise_xor(a, b))
+}
+
+/// Map [`bigint::ops::OpError`] into the surrounding [`VmError`].
+fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
+    match err {
+        bigint::ops::OpError::DivisionByZero
+        | bigint::ops::OpError::NegativeExponent
+        | bigint::ops::OpError::ShiftOutOfRange => VmError::TypeMismatch,
+    }
+}
+
+/// Convert [`number::NumericOrdering`] (which carries an extra
+/// `Unordered` variant for `NaN`) into the standard library's
+/// `Ordering` paired with an `Option`. `None` means "NaN seen,
+/// any relational result is `false`".
+fn number_ordering_to_std(o: NumericOrdering) -> Option<std::cmp::Ordering> {
+    match o {
+        NumericOrdering::Less => Some(std::cmp::Ordering::Less),
+        NumericOrdering::Equal => Some(std::cmp::Ordering::Equal),
+        NumericOrdering::Greater => Some(std::cmp::Ordering::Greater),
+        NumericOrdering::Unordered => None,
+    }
+}
+
+/// Apply a `<`, `<=`, `>`, or `>=` opcode to an `Ordering`.
+/// `None` (one operand was `NaN` or otherwise unordered) yields
+/// `false` for every relational op per spec.
+fn ordering_matches_op(op: Op, ord: Option<std::cmp::Ordering>) -> bool {
+    let Some(o) = ord else {
+        return false;
+    };
+    match op {
+        Op::LessThan => o.is_lt(),
+        Op::LessEq => o.is_le() || o.is_eq(),
+        Op::GreaterThan => o.is_gt(),
+        Op::GreaterEq => o.is_ge() || o.is_eq(),
+        _ => unreachable!(),
     }
 }
 
@@ -1926,6 +2331,15 @@ fn snapshot_frames(module: &BytecodeModule, stack: &[Frame]) -> Vec<StackFrameSn
             }
         })
         .collect()
+}
+
+fn math_to_vm_error(err: math::MathError) -> VmError {
+    match err {
+        math::MathError::UnknownMember(name) => VmError::UnknownIntrinsic {
+            name: format!("Math.{name}"),
+        },
+        math::MathError::BadArgument { .. } => VmError::TypeMismatch,
+    }
 }
 
 fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {
@@ -2052,6 +2466,35 @@ fn step_iterator(
     }
 }
 
+/// Look up the `prototype` own property of a callable so the
+/// `Op::New` path can link the freshly allocated receiver. The
+/// foundation supports only object-shaped prototypes: anything
+/// else (or a missing `prototype`) leaves the receiver's chain
+/// unset, matching `Object.create(null)` semantics. For
+/// `Value::Function` (no own properties yet) we always fall back
+/// to no prototype; closures created by the class lowering carry
+/// `prototype` on the constructor's *own* property table by way
+/// of the `BoundFunction` / object surface — but native bytecode
+/// `Value::Function` values have no per-id property store, so
+/// proto-linking only fires for closures whose function table id
+/// has been augmented at class-build time. For the foundation
+/// slice that distinction is invisible because the compiler always
+/// installs `prototype` through a separate `StoreProperty` on a
+/// constructor object reference (the constructor itself is held in
+/// a register, with `prototype` set via `obj.prototype = …` style
+/// dispatch only on the rare path).
+fn construct_prototype(callee: &Value) -> Option<JsObject> {
+    match callee {
+        Value::ClassConstructor(c) => Some(c.prototype.clone()),
+        Value::Object(obj) => match obj.get("prototype") {
+            Some(Value::Object(p)) => Some(p),
+            _ => None,
+        },
+        Value::BoundFunction(b) => construct_prototype(&b.target),
+        _ => None,
+    }
+}
+
 /// `true` when `value` is one of the call-site shapes the dispatcher
 /// can invoke: a bytecode function, a closure, or a bound function.
 /// `Value::BoundFunction` is treated as callable even when it wraps
@@ -2059,7 +2502,10 @@ fn step_iterator(
 fn is_callable(value: &Value) -> bool {
     matches!(
         value,
-        Value::Function { .. } | Value::Closure { .. } | Value::BoundFunction(_)
+        Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
     )
 }
 
@@ -2090,6 +2536,7 @@ mod tests {
                 param_count: 0,
                 own_upvalue_count: 0,
                 is_arrow: false,
+                has_rest: false,
                 code,
                 spans,
             }],
@@ -2148,6 +2595,7 @@ mod tests {
             param_count: 0,
             own_upvalue_count: 0,
             is_arrow: false,
+            has_rest: false,
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -2182,6 +2630,7 @@ mod tests {
             param_count: 0,
             own_upvalue_count: 0,
             is_arrow: false,
+            has_rest: false,
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -2244,6 +2693,7 @@ mod tests {
             param_count: 0,
             own_upvalue_count: 0,
             is_arrow: false,
+            has_rest: false,
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -2263,6 +2713,7 @@ mod tests {
             param_count: 0,
             own_upvalue_count: 0,
             is_arrow: true,
+            has_rest: false,
             code: vec![
                 Instruction {
                     pc: 0,

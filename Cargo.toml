@@ -54,6 +54,10 @@ tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 smallvec    = "1"
 indexmap    = "2"
 
+# Arbitrary-precision integers for `Value::BigInt`.
+num-bigint  = "0.4"
+num-traits  = "0.2"
+
 # Benchmarks.
 criterion   = { version = "0.8", features = ["html_reports"] }
 

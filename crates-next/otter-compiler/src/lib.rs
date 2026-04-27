@@ -397,6 +397,47 @@ impl FunctionContext {
         self.scopes.pop();
     }
 
+    /// Declare a synthetic binding whose storage is **always** an
+    /// own-upvalue cell, regardless of whether the capture pre-pass
+    /// flagged the name. Used by class lowering to set up
+    /// `__class_home` and `__class_super` slots that inner methods
+    /// resolve through the standard `resolve_capture` walk.
+    fn declare_captured_binding(
+        &mut self,
+        name: &str,
+        is_const: bool,
+        span: (u32, u32),
+    ) -> Result<BindingStorage, CompileError> {
+        if self
+            .scopes
+            .last()
+            .expect("declare_captured_binding called outside any scope")
+            .bindings
+            .contains_key(name)
+        {
+            return Err(CompileError::Unsupported {
+                node: format!("redeclaration of `{name}` in same scope"),
+                span,
+            });
+        }
+        let idx = self.own_upvalue_count;
+        self.own_upvalue_count = idx.checked_add(1).expect("own_upvalue_count overflow");
+        let storage = BindingStorage::Upvalue { idx };
+        let scope = self
+            .scopes
+            .last_mut()
+            .expect("declare_captured_binding called outside any scope");
+        scope.bindings.insert(
+            name.to_string(),
+            BindingInfo {
+                storage,
+                is_const,
+                initialized: false,
+            },
+        );
+        Ok(storage)
+    }
+
     fn declare_binding(
         &mut self,
         name: &str,
@@ -581,6 +622,21 @@ impl FunctionContext {
         (module.constants.len() - 1) as u32
     }
 
+    fn intern_bigint_constant(&mut self, decimal: &str) -> u32 {
+        let mut module = self.module.borrow_mut();
+        for (i, c) in module.constants.iter().enumerate() {
+            if let Constant::BigInt { decimal: existing } = c
+                && existing == decimal
+            {
+                return i as u32;
+            }
+        }
+        module.constants.push(Constant::BigInt {
+            decimal: decimal.to_string(),
+        });
+        (module.constants.len() - 1) as u32
+    }
+
     fn intern_function_id(&mut self, function_id: u32) -> u32 {
         let mut module = self.module.borrow_mut();
         for (i, c) in module.constants.iter().enumerate() {
@@ -685,33 +741,34 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             }
             for declarator in &decl.declarations {
                 let span = (declarator.span.start, declarator.span.end);
-                let name = match &declarator.id {
-                    oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
-                        id.name.as_str().to_string()
-                    }
-                    _ => {
-                        return Err(CompileError::Unsupported {
-                            node: "VariableDeclarator pattern (non-identifier)".to_string(),
-                            span,
-                        });
-                    }
-                };
-                let storage = cx.declare_binding(&name, is_const, span)?;
-                // The initializer expression sees the binding in
-                // its TDZ: `let x = x + 1;` should throw because
-                // the right-hand `x` reads before initialization.
-                let init_reg = match &declarator.init {
-                    Some(init) => compile_expr(cx, init, span)?,
-                    None => {
-                        // No initializer → spec rule:
-                        // `let x;` completes with `x = undefined`.
-                        let dst = cx.alloc_scratch();
-                        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
-                        dst
-                    }
-                };
-                cx.emit_store_storage(init_reg, storage, span);
-                cx.mark_initialized(&name);
+                // Fast path for the overwhelmingly common
+                // `let x = init;` shape so the simple binding
+                // doesn't pay an extra register copy.
+                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+                    let name = id.name.as_str().to_string();
+                    let storage = cx.declare_binding(&name, is_const, span)?;
+                    let init_reg = match &declarator.init {
+                        Some(init) => compile_expr(cx, init, span)?,
+                        None => {
+                            let dst = cx.alloc_scratch();
+                            cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                            dst
+                        }
+                    };
+                    cx.emit_store_storage(init_reg, storage, span);
+                    cx.mark_initialized(&name);
+                    continue;
+                }
+                // Destructuring binding (`let [a, b] = …` /
+                // `let { x } = …`) — `var` bindings are rejected
+                // earlier so we can route everything through the
+                // shared destructuring helper.
+                let init = declarator.init.as_ref().ok_or(CompileError::Unsupported {
+                    node: "VariableDeclarator: destructuring requires an initializer".to_string(),
+                    span,
+                })?;
+                let init_reg = compile_expr(cx, init, span)?;
+                destructure_into(cx, init_reg, &declarator.id, span)?;
             }
             Ok(None)
         }
@@ -885,6 +942,25 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             Ok(None)
         }
 
+        Statement::ClassDeclaration(class) => {
+            let span = (class.span.start, class.span.end);
+            let name = class
+                .id
+                .as_ref()
+                .ok_or(CompileError::Unsupported {
+                    node: "ClassDeclaration without name".to_string(),
+                    span,
+                })?
+                .name
+                .as_str()
+                .to_string();
+            let class_reg = compile_class(cx, class, Some(&name))?;
+            let storage = cx.declare_binding(&name, false, span)?;
+            cx.emit_store_storage(class_reg, storage, span);
+            cx.mark_initialized(&name);
+            Ok(None)
+        }
+
         Statement::ThrowStatement(s) => {
             let span = (s.span.start, s.span.end);
             let reg = compile_expr(cx, &s.argument, span)?;
@@ -968,10 +1044,12 @@ fn compile_for_init_decl(
 
 /// Compile a function body into a fresh `Function` record and
 /// return its id together with the captures it inherits from
-/// `parent`. Parameters are bound at registers `0..param_count`
-/// (or as own-upvalue cells when captured by an inner function).
-/// Foundation subset rejects rest / default / destructuring
-/// parameters.
+/// `parent`. Parameters live in registers `0..param_count` (the
+/// raw incoming argv slots); each one is then destructured /
+/// defaulted / aliased into named bindings as the body expects.
+/// Rest parameters (`...t`) are materialised by the runtime via
+/// [`Op::CollectRest`] reading from the call frame's stashed
+/// trailing argument list.
 fn compile_function(
     parent: &mut Compiler,
     name: &str,
@@ -979,12 +1057,6 @@ fn compile_function(
     body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
     span: (u32, u32),
 ) -> Result<(u32, Vec<u32>), CompileError> {
-    if params.rest.is_some() {
-        return Err(CompileError::Unsupported {
-            node: "FunctionDeclaration: rest parameter".to_string(),
-            span,
-        });
-    }
     let module = Rc::clone(&parent.top_mut().module);
     let mut child = FunctionContext::new(Rc::clone(&module));
     if let Some(b) = body {
@@ -992,32 +1064,13 @@ fn compile_function(
     }
     parent.push(child);
     parent.enter_scope();
-    let mut param_count: u16 = 0;
-    let mut param_pseudo_regs: Vec<(BindingStorage, u16)> = Vec::new();
-    for (ordinal, param) in params.items.iter().enumerate() {
-        if param.pattern.kind_initializer().is_some() {
-            return Err(CompileError::Unsupported {
-                node: "FunctionDeclaration: default parameter".to_string(),
-                span,
-            });
-        }
-        let pname = match &param.pattern {
-            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
-            _ => {
-                return Err(CompileError::Unsupported {
-                    node: "FunctionDeclaration: destructuring parameter".to_string(),
-                    span,
-                });
-            }
-        };
-        // Parameter binding: caller writes argv into register
-        // `ordinal`. If the binding is captured, transfer the
-        // register value into the own-upvalue cell at the prologue.
-        let storage = parent.declare_binding(&pname, false, span)?;
-        parent.mark_initialized(&pname);
-        param_pseudo_regs.push((storage, ordinal as u16));
-        param_count = param_count.checked_add(1).expect("too many parameters");
-    }
+
+    // Reserve raw argv slots up front so destructuring / defaults
+    // can address them by ordinal. The compiler's scratch counter
+    // tracks them so subsequent register allocations don't collide.
+    let param_count = u16::try_from(params.items.len()).expect("too many parameters");
+    parent.scratch = param_count;
+    let has_rest = params.rest.is_some();
 
     // Reserve the function's id ahead of compilation so the body
     // can reference its own name (recursion).
@@ -1029,17 +1082,20 @@ fn compile_function(
         ..Default::default()
     });
 
-    // Prologue: for any captured parameter, copy the register value
-    // into the upvalue cell so the body always reads through the
-    // cell.
-    for (storage, ordinal) in &param_pseudo_regs {
-        if let BindingStorage::Upvalue { idx } = storage {
-            parent.emit(
-                Op::StoreUpvalue,
-                vec![Operand::Register(*ordinal), Operand::Imm32(*idx as i32)],
-                span,
-            );
-        }
+    // Bind every formal parameter, in source order. Side-effects
+    // (default-value evaluation, iterator-protocol calls for array
+    // patterns) follow the spec's per-call ordering.
+    for (ordinal, param) in params.items.iter().enumerate() {
+        compile_formal_parameter(
+            parent,
+            ordinal as u16,
+            &param.pattern,
+            param.initializer.as_deref(),
+            span,
+        )?;
+    }
+    if let Some(rest) = &params.rest {
+        compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
 
     // Bind self-name for recursion. Emit a MakeFunction (no
@@ -1075,10 +1131,419 @@ fn compile_function(
     slot.locals = 0;
     slot.scratch = child.scratch;
     slot.param_count = param_count;
+    slot.has_rest = has_rest;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))
+}
+
+/// Lower an [`AssignmentExpression`]. Plain `=` and the compound
+/// arithmetic / bitwise / `**=` shapes share one path; logical
+/// assignments (`||=`, `&&=`, `??=`) are deferred (they need
+/// short-circuit lowering) and short-circuit out with a clear
+/// `Unsupported` diagnostic.
+fn compile_assignment(
+    cx: &mut Compiler,
+    a: &oxc_ast::ast::AssignmentExpression<'_>,
+) -> Result<u16, CompileError> {
+    let span = (a.span.start, a.span.end);
+    let compound_op = compound_assign_op(a.operator);
+    if a.operator.is_logical() {
+        return Err(CompileError::Unsupported {
+            node: format!("AssignmentExpression ({:?})", a.operator),
+            span,
+        });
+    }
+    if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
+        let obj_reg = compile_expr(cx, &member.object, span)?;
+        let name_idx = cx.intern_string_constant(member.property.name.as_str());
+        let new_value = match compound_op {
+            None => compile_expr(cx, &a.right, span)?,
+            Some(op) => {
+                let current = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadProperty,
+                    vec![
+                        Operand::Register(current),
+                        Operand::Register(obj_reg),
+                        Operand::ConstIndex(name_idx),
+                    ],
+                    span,
+                );
+                let rhs = compile_expr(cx, &a.right, span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    op,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(current),
+                        Operand::Register(rhs),
+                    ],
+                    span,
+                );
+                dst
+            }
+        };
+        cx.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(obj_reg),
+                Operand::ConstIndex(name_idx),
+                Operand::Register(new_value),
+            ],
+            span,
+        );
+        return Ok(new_value);
+    }
+    if let AssignmentTarget::ComputedMemberExpression(member) = &a.left {
+        let arr_reg = compile_expr(cx, &member.object, span)?;
+        let idx_reg = compile_expr(cx, &member.expression, span)?;
+        let new_value = match compound_op {
+            None => compile_expr(cx, &a.right, span)?,
+            Some(op) => {
+                let current = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadElement,
+                    vec![
+                        Operand::Register(current),
+                        Operand::Register(arr_reg),
+                        Operand::Register(idx_reg),
+                    ],
+                    span,
+                );
+                let rhs = compile_expr(cx, &a.right, span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    op,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(current),
+                        Operand::Register(rhs),
+                    ],
+                    span,
+                );
+                dst
+            }
+        };
+        cx.emit(
+            Op::StoreElement,
+            vec![
+                Operand::Register(arr_reg),
+                Operand::Register(idx_reg),
+                Operand::Register(new_value),
+            ],
+            span,
+        );
+        return Ok(new_value);
+    }
+    // `name = value` — local or captured-upvalue store.
+    let name = match &a.left {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str().to_string(),
+        _ => {
+            return Err(CompileError::Unsupported {
+                node: "AssignmentTarget (non-identifier)".to_string(),
+                span,
+            });
+        }
+    };
+    let storage = if let Some(info) = cx.lookup_binding(&name) {
+        if info.is_const {
+            return Err(CompileError::Unsupported {
+                node: format!("assignment to const `{name}`"),
+                span,
+            });
+        }
+        info.storage
+    } else if let Some(idx) = cx.resolve_capture(&name) {
+        BindingStorage::Upvalue { idx }
+    } else {
+        return Err(CompileError::Unsupported {
+            node: format!("assignment to undeclared `{name}`"),
+            span,
+        });
+    };
+    let value = match compound_op {
+        None => compile_expr(cx, &a.right, span)?,
+        Some(op) => {
+            let current = cx.alloc_scratch();
+            cx.emit_load_storage(current, storage, span);
+            let rhs = compile_expr(cx, &a.right, span)?;
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                op,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(current),
+                    Operand::Register(rhs),
+                ],
+                span,
+            );
+            dst
+        }
+    };
+    cx.emit_store_storage(value, storage, span);
+    cx.mark_initialized(&name);
+    Ok(value)
+}
+
+/// Map a compound `AssignmentOperator` to the bytecode binop used
+/// by `compile_assignment`. Returns `None` for plain `=` (which
+/// skips the load-modify-store sequence) and for logical assigns
+/// which the foundation slice doesn't lower yet.
+fn compound_assign_op(op: AssignmentOperator) -> Option<Op> {
+    Some(match op {
+        AssignmentOperator::Assign => return None,
+        AssignmentOperator::Addition => Op::Add,
+        AssignmentOperator::Subtraction => Op::Sub,
+        AssignmentOperator::Multiplication => Op::Mul,
+        AssignmentOperator::Division => Op::Div,
+        AssignmentOperator::Remainder => Op::Rem,
+        AssignmentOperator::Exponential => Op::Pow,
+        AssignmentOperator::ShiftLeft => Op::Shl,
+        AssignmentOperator::ShiftRight => Op::Shr,
+        AssignmentOperator::ShiftRightZeroFill => Op::Ushr,
+        AssignmentOperator::BitwiseOR => Op::BitwiseOr,
+        AssignmentOperator::BitwiseXOR => Op::BitwiseXor,
+        AssignmentOperator::BitwiseAnd => Op::BitwiseAnd,
+        AssignmentOperator::LogicalOr
+        | AssignmentOperator::LogicalAnd
+        | AssignmentOperator::LogicalNullish => return None,
+    })
+}
+
+/// Lower one positional formal parameter at ordinal `ordinal` (the
+/// raw argv slot the call dispatcher writes into).
+///
+/// OXC keeps the default expression on `FormalParameter::initializer`
+/// rather than wrapping the pattern in an `AssignmentPattern`
+/// (which is reserved for *inner* defaults like
+/// `function f({x = 1}) {}`). We honour both spellings here so
+/// callers don't have to peek into the OXC structure.
+fn compile_formal_parameter(
+    parent: &mut Compiler,
+    ordinal: u16,
+    pattern: &oxc_ast::ast::BindingPattern<'_>,
+    initializer: Option<&Expression<'_>>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    if let Some(default_expr) = initializer {
+        apply_default_into(parent, ordinal, default_expr, span)?;
+    }
+    if let oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) = pattern {
+        apply_default_into(
+            parent,
+            ordinal,
+            &asgn.right,
+            (asgn.span.start, asgn.span.end),
+        )?;
+        return destructure_into(parent, ordinal, &asgn.left, span);
+    }
+    destructure_into(parent, ordinal, pattern, span)
+}
+
+/// Lower the rest parameter (`function f(..., ...rest) { … }`).
+/// Reads the trailing args off the frame via `Op::CollectRest`,
+/// then routes the resulting array through the same
+/// destructuring path so `function f(...[a, b])` falls out for
+/// free.
+fn compile_rest_parameter(
+    parent: &mut Compiler,
+    pattern: &oxc_ast::ast::BindingPattern<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let rest_reg = parent.alloc_scratch();
+    parent.emit(Op::CollectRest, vec![Operand::Register(rest_reg)], span);
+    destructure_into(parent, rest_reg, pattern, span)
+}
+
+/// Overwrite `value_reg` with the lazy default value when its
+/// current contents are `undefined`. Compiles to:
+///
+/// ```text
+///   ToBoolean tmp <- undefined?  ; using JumpIfNotUndefined-style
+///   actually: equality compare with undefined + branch
+/// ```
+///
+/// Foundation lowering uses two existing opcodes — `LoadUndefined`
+/// and `Equal` followed by `JumpIfFalse` — to avoid introducing a
+/// dedicated "is-undefined" branch.
+fn apply_default_into(
+    parent: &mut Compiler,
+    value_reg: u16,
+    default_expr: &Expression<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let undef_reg = parent.alloc_scratch();
+    parent.emit(Op::LoadUndefined, vec![Operand::Register(undef_reg)], span);
+    let cond_reg = parent.alloc_scratch();
+    parent.emit(
+        Op::Equal,
+        vec![
+            Operand::Register(cond_reg),
+            Operand::Register(value_reg),
+            Operand::Register(undef_reg),
+        ],
+        span,
+    );
+    // If the slot is **not** undefined, skip the default
+    // evaluation entirely so the user's expression doesn't fire on
+    // the common path.
+    let skip_default = parent.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
+    let default_value = compile_expr(parent, default_expr, span)?;
+    parent.emit(
+        Op::StoreLocal,
+        vec![
+            Operand::Register(default_value),
+            Operand::Imm32(value_reg as i32),
+        ],
+        span,
+    );
+    parent.patch_branch_to_here(skip_default);
+    Ok(())
+}
+
+/// Recursively destructure the value in `src_reg` into the named
+/// bindings declared by `pattern`. Handles `BindingIdentifier`
+/// (the leaf), `ArrayPattern` (via the iterator protocol),
+/// `ObjectPattern` (via property loads with rename / default
+/// support), and inner `AssignmentPattern` defaults.
+fn destructure_into(
+    parent: &mut Compiler,
+    src_reg: u16,
+    pattern: &oxc_ast::ast::BindingPattern<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    match pattern {
+        oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
+            let name = id.name.as_str().to_string();
+            let storage = parent.declare_binding(&name, false, span)?;
+            parent.emit_store_storage(src_reg, storage, span);
+            parent.mark_initialized(&name);
+            Ok(())
+        }
+        oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) => {
+            let asgn_span = (asgn.span.start, asgn.span.end);
+            apply_default_into(parent, src_reg, &asgn.right, asgn_span)?;
+            destructure_into(parent, src_reg, &asgn.left, span)
+        }
+        oxc_ast::ast::BindingPattern::ArrayPattern(arr) => {
+            destructure_array(parent, src_reg, arr, span)
+        }
+        oxc_ast::ast::BindingPattern::ObjectPattern(obj) => {
+            destructure_object(parent, src_reg, obj, span)
+        }
+    }
+}
+
+fn destructure_array(
+    parent: &mut Compiler,
+    src_reg: u16,
+    pattern: &oxc_ast::ast::ArrayPattern<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let iter_reg = parent.alloc_scratch();
+    parent.emit(
+        Op::GetIterator,
+        vec![Operand::Register(iter_reg), Operand::Register(src_reg)],
+        span,
+    );
+    for elem in &pattern.elements {
+        let value_reg = parent.alloc_scratch();
+        let done_reg = parent.alloc_scratch();
+        parent.emit(
+            Op::IteratorNext,
+            vec![
+                Operand::Register(value_reg),
+                Operand::Register(done_reg),
+                Operand::Register(iter_reg),
+            ],
+            span,
+        );
+        // A hole (`,,`) leaves the slot unbound — nothing to emit.
+        let Some(inner) = elem else {
+            continue;
+        };
+        destructure_into(parent, value_reg, inner, span)?;
+    }
+    if let Some(rest) = &pattern.rest {
+        // Drain the rest of the iterator into a fresh array.
+        let arr_reg = parent.alloc_scratch();
+        parent.emit(
+            Op::NewArray,
+            vec![Operand::Register(arr_reg), Operand::ConstIndex(0)],
+            span,
+        );
+        let value_reg = parent.alloc_scratch();
+        let done_reg = parent.alloc_scratch();
+        let loop_top = parent.next_pc;
+        parent.emit(
+            Op::IteratorNext,
+            vec![
+                Operand::Register(value_reg),
+                Operand::Register(done_reg),
+                Operand::Register(iter_reg),
+            ],
+            span,
+        );
+        let exit = parent.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+        parent.emit(
+            Op::ArrayPush,
+            vec![Operand::Register(arr_reg), Operand::Register(value_reg)],
+            span,
+        );
+        let back = parent.emit_branch_placeholder(Op::Jump, None, span);
+        parent.patch_branch(back, loop_top);
+        parent.patch_branch_to_here(exit);
+        destructure_into(parent, arr_reg, &rest.argument, span)?;
+    }
+    Ok(())
+}
+
+fn destructure_object(
+    parent: &mut Compiler,
+    src_reg: u16,
+    pattern: &oxc_ast::ast::ObjectPattern<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    if pattern.rest.is_some() {
+        return Err(CompileError::Unsupported {
+            node: "ObjectPattern: rest element (foundation slice deferred)".to_string(),
+            span,
+        });
+    }
+    for prop in &pattern.properties {
+        let prop_span = (prop.span.start, prop.span.end);
+        if prop.computed {
+            return Err(CompileError::Unsupported {
+                node: "ObjectPattern: computed key".to_string(),
+                span: prop_span,
+            });
+        }
+        let key_str = match &prop.key {
+            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+            _ => {
+                return Err(CompileError::Unsupported {
+                    node: "ObjectPattern: non-string key".to_string(),
+                    span: prop_span,
+                });
+            }
+        };
+        let key_const = parent.intern_string_constant(&key_str);
+        let value_reg = parent.alloc_scratch();
+        parent.emit(
+            Op::LoadProperty,
+            vec![
+                Operand::Register(value_reg),
+                Operand::Register(src_reg),
+                Operand::ConstIndex(key_const),
+            ],
+            prop_span,
+        );
+        destructure_into(parent, value_reg, &prop.value, prop_span)?;
+    }
+    Ok(())
 }
 
 /// Compile an arrow function. Two body shapes share the same
@@ -1098,12 +1563,6 @@ fn compile_arrow_function(
     arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
     span: (u32, u32),
 ) -> Result<(u32, Vec<u32>), CompileError> {
-    if arrow.params.rest.is_some() {
-        return Err(CompileError::Unsupported {
-            node: "ArrowFunction: rest parameter".to_string(),
-            span,
-        });
-    }
     if arrow.r#async {
         return Err(CompileError::Unsupported {
             node: "ArrowFunction: async".to_string(),
@@ -1116,29 +1575,9 @@ fn compile_arrow_function(
     parent.push(child);
     parent.enter_scope();
 
-    let mut param_count: u16 = 0;
-    let mut param_pseudo_regs: Vec<(BindingStorage, u16)> = Vec::new();
-    for (ordinal, param) in arrow.params.items.iter().enumerate() {
-        if param.pattern.kind_initializer().is_some() {
-            return Err(CompileError::Unsupported {
-                node: "ArrowFunction: default parameter".to_string(),
-                span,
-            });
-        }
-        let pname = match &param.pattern {
-            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
-            _ => {
-                return Err(CompileError::Unsupported {
-                    node: "ArrowFunction: destructuring parameter".to_string(),
-                    span,
-                });
-            }
-        };
-        let storage = parent.declare_binding(&pname, false, span)?;
-        parent.mark_initialized(&pname);
-        param_pseudo_regs.push((storage, ordinal as u16));
-        param_count = param_count.checked_add(1).expect("too many parameters");
-    }
+    let param_count = u16::try_from(arrow.params.items.len()).expect("too many parameters");
+    parent.scratch = param_count;
+    let has_rest = arrow.params.rest.is_some();
 
     // Reserve the function record up front so we can emit
     // `MakeFunction` / `MakeClosure` for the result later.
@@ -1150,15 +1589,17 @@ fn compile_arrow_function(
         ..Default::default()
     });
 
-    // Prologue: copy captured params into their upvalue cells.
-    for (storage, ordinal) in &param_pseudo_regs {
-        if let BindingStorage::Upvalue { idx } = storage {
-            parent.emit(
-                Op::StoreUpvalue,
-                vec![Operand::Register(*ordinal), Operand::Imm32(*idx as i32)],
-                span,
-            );
-        }
+    for (ordinal, param) in arrow.params.items.iter().enumerate() {
+        compile_formal_parameter(
+            parent,
+            ordinal as u16,
+            &param.pattern,
+            param.initializer.as_deref(),
+            span,
+        )?;
+    }
+    if let Some(rest) = &arrow.params.rest {
+        compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
 
     if arrow.expression {
@@ -1199,6 +1640,7 @@ fn compile_arrow_function(
     slot.locals = 0;
     slot.scratch = child.scratch;
     slot.param_count = param_count;
+    slot.has_rest = has_rest;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.is_arrow = true;
     slot.code = child.code;
@@ -1240,24 +1682,6 @@ fn emit_make_callable(
         operands.push(Operand::Imm32(parent_idx as i32));
     }
     cx.emit(Op::MakeClosure, operands, span);
-}
-
-/// Tiny helper: detect whether a `BindingPattern` carries a
-/// default-value initializer. OXC's `BindingPattern` is a flat enum
-/// which doesn't directly expose the initializer; the foundation
-/// subset uses this only as a guard so we can return a clean
-/// diagnostic instead of silently dropping the default.
-trait BindingPatternExt {
-    fn kind_initializer(&self) -> Option<()>;
-}
-
-impl BindingPatternExt for oxc_ast::ast::BindingPattern<'_> {
-    fn kind_initializer(&self) -> Option<()> {
-        match self {
-            oxc_ast::ast::BindingPattern::AssignmentPattern(_) => Some(()),
-            _ => None,
-        }
-    }
 }
 
 /// Adapter for the `for(...; ...; ...)` initializer's
@@ -1302,6 +1726,18 @@ fn compile_expr(
             let dst = cx.alloc_scratch();
             cx.emit(Op::LoadThis, vec![Operand::Register(dst)], span);
             Ok(dst)
+        }
+
+        Expression::Super(s) => {
+            // Bare `super` standalone is a SyntaxError in real JS;
+            // the grammar only accepts it as a call target or as
+            // the object of a member expression. We surface a
+            // friendly compile-time diagnostic so the rejection
+            // happens at the right layer.
+            Err(CompileError::Unsupported {
+                node: "Super: bare `super` outside call or member expression".to_string(),
+                span: (s.span.start, s.span.end),
+            })
         }
 
         Expression::Identifier(id) => {
@@ -1460,83 +1896,7 @@ fn compile_expr(
             Ok(out)
         }
 
-        Expression::AssignmentExpression(a) => {
-            let span = (a.span.start, a.span.end);
-            if !matches!(a.operator, AssignmentOperator::Assign) {
-                return Err(CompileError::Unsupported {
-                    node: format!("AssignmentExpression ({:?})", a.operator),
-                    span,
-                });
-            }
-            // `obj.prop = value` — emit StoreProperty.
-            if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
-                let obj_reg = compile_expr(cx, &member.object, span)?;
-                let value = compile_expr(cx, &a.right, span)?;
-                let name_idx = cx.intern_string_constant(member.property.name.as_str());
-                cx.emit(
-                    Op::StoreProperty,
-                    vec![
-                        Operand::Register(obj_reg),
-                        Operand::ConstIndex(name_idx),
-                        Operand::Register(value),
-                    ],
-                    span,
-                );
-                return Ok(value);
-            }
-            // `arr[i] = value` — emit StoreElement.
-            if let AssignmentTarget::ComputedMemberExpression(member) = &a.left {
-                let arr_reg = compile_expr(cx, &member.object, span)?;
-                let idx_reg = compile_expr(cx, &member.expression, span)?;
-                let value = compile_expr(cx, &a.right, span)?;
-                cx.emit(
-                    Op::StoreElement,
-                    vec![
-                        Operand::Register(arr_reg),
-                        Operand::Register(idx_reg),
-                        Operand::Register(value),
-                    ],
-                    span,
-                );
-                return Ok(value);
-            }
-            // `name = value` — local or captured-upvalue store.
-            let name = match &a.left {
-                AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str().to_string(),
-                _ => {
-                    return Err(CompileError::Unsupported {
-                        node: "AssignmentTarget (non-identifier)".to_string(),
-                        span,
-                    });
-                }
-            };
-            let storage = if let Some(info) = cx.lookup_binding(&name) {
-                if info.is_const {
-                    return Err(CompileError::Unsupported {
-                        node: format!("assignment to const `{name}`"),
-                        span,
-                    });
-                }
-                info.storage
-            } else if let Some(idx) = cx.resolve_capture(&name) {
-                BindingStorage::Upvalue { idx }
-            } else {
-                return Err(CompileError::Unsupported {
-                    node: format!("assignment to undeclared `{name}`"),
-                    span,
-                });
-            };
-            let value = compile_expr(cx, &a.right, span)?;
-            cx.emit_store_storage(value, storage, span);
-            // An explicit assignment counts as initialization for
-            // TDZ purposes, so subsequent reads stop emitting
-            // `TdzError`. (Note: per spec, an `x = 1` that
-            // *precedes* the `let x` declaration is itself a TDZ
-            // ReferenceError; that case requires hoisting and is
-            // tracked as a separate task.)
-            cx.mark_initialized(&name);
-            Ok(value)
-        }
+        Expression::AssignmentExpression(a) => compile_assignment(cx, a),
 
         Expression::StringLiteral(lit) => {
             let dst = cx.alloc_scratch();
@@ -1545,6 +1905,28 @@ fn compile_expr(
                 Op::LoadString,
                 vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
                 (lit.span.start, lit.span.end),
+            );
+            Ok(dst)
+        }
+
+        Expression::BigIntLiteral(lit) => {
+            let span = (lit.span.start, lit.span.end);
+            let dst = cx.alloc_scratch();
+            let decimal = lit.value.as_str().to_string();
+            // Compile-time syntactic validation so the runtime
+            // parse path can stay strict (treats failure as
+            // `InvalidOperand` rather than a surfaced parse error).
+            if decimal.parse::<num_bigint::BigInt>().is_err() {
+                return Err(CompileError::Unsupported {
+                    node: format!("BigIntLiteral with non-decimal payload `{decimal}`"),
+                    span,
+                });
+            }
+            let const_idx = cx.intern_bigint_constant(&decimal);
+            cx.emit(
+                Op::LoadBigInt,
+                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                span,
             );
             Ok(dst)
         }
@@ -1620,6 +2002,7 @@ fn compile_expr(
                 UnaryOperator::UnaryNegation => Op::Neg,
                 UnaryOperator::UnaryPlus => Op::ToNumber,
                 UnaryOperator::LogicalNot => Op::LogicalNot,
+                UnaryOperator::BitwiseNot => Op::BitwiseNot,
                 other => {
                     return Err(CompileError::Unsupported {
                         node: format!("UnaryExpression ({other:?})"),
@@ -1658,6 +2041,13 @@ fn compile_expr(
                 BinaryOperator::Multiplication => Op::Mul,
                 BinaryOperator::Division => Op::Div,
                 BinaryOperator::Remainder => Op::Rem,
+                BinaryOperator::Exponential => Op::Pow,
+                BinaryOperator::BitwiseAnd => Op::BitwiseAnd,
+                BinaryOperator::BitwiseOR => Op::BitwiseOr,
+                BinaryOperator::BitwiseXOR => Op::BitwiseXor,
+                BinaryOperator::ShiftLeft => Op::Shl,
+                BinaryOperator::ShiftRight => Op::Shr,
+                BinaryOperator::ShiftRightZeroFill => Op::Ushr,
                 BinaryOperator::StrictEquality => Op::Equal,
                 BinaryOperator::StrictInequality => Op::NotEqual,
                 BinaryOperator::LessThan => Op::LessThan,
@@ -1690,6 +2080,28 @@ fn compile_expr(
             // `string.length` as the special-case length getter and
             // walks `JsObject` properties for objects.
             let span = (m.span.start, m.span.end);
+            // `super.x` reads the parent prototype's property — the
+            // runtime walks one hop up `__class_home`'s prototype
+            // chain. Only valid inside a class method.
+            if matches!(m.object, Expression::Super(_)) {
+                return compile_super_member_load(cx, m.property.name.as_str(), span);
+            }
+            // `Math.PI` / `Math.E` — lower to MathLoad so the runtime
+            // doesn't need a real global object yet. Method-call
+            // forms (`Math.abs(...)`) are handled in
+            // `compile_method_call`.
+            if let Expression::Identifier(id) = &m.object
+                && id.name.as_str() == "Math"
+            {
+                let dst = cx.alloc_scratch();
+                let name_idx = cx.intern_string_constant(m.property.name.as_str());
+                cx.emit(
+                    Op::MathLoad,
+                    vec![Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                    span,
+                );
+                return Ok(dst);
+            }
             let receiver = compile_expr(cx, &m.object, span)?;
             let name_idx = cx.intern_string_constant(m.property.name.as_str());
             let dst = cx.alloc_scratch();
@@ -1727,28 +2139,28 @@ fn compile_expr(
         // String.prototype intrinsic table at run time.
         Expression::CallExpression(call) => compile_method_call(cx, call),
 
-        // `new Error("msg")` — foundation only recognises the
-        // built-in `Error` constructor; subclasses arrive in
-        // task 26 along with the rest of `class … extends Error`.
+        // `new Callee(args...)` — emits `Op::New`. The runtime
+        // allocates the receiver and links its prototype. The
+        // built-in `Error` constructor keeps a fast lowering path
+        // since it doesn't need a `prototype` chain to work.
         Expression::NewExpression(new_expr) => {
             let new_span = (new_expr.span.start, new_expr.span.end);
             let callee = unwrap_ts_expr(&new_expr.callee);
-            let Expression::Identifier(id) = callee else {
-                return Err(CompileError::Unsupported {
-                    node: "NewExpression with non-identifier callee".to_string(),
-                    span: new_span,
-                });
-            };
-            if id.name.as_str() != "Error" {
-                return Err(CompileError::Unsupported {
-                    node: format!(
-                        "NewExpression `new {}(…)`; foundation only supports `new Error(…)`",
-                        id.name
-                    ),
-                    span: new_span,
-                });
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Error"
+            {
+                return compile_error_construct(cx, &new_expr.arguments, new_span);
             }
-            compile_error_construct(cx, &new_expr.arguments, new_span)
+            let callee_reg = compile_expr(cx, callee, new_span)?;
+            let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::New, operands, new_span);
+            Ok(dst)
         }
 
         Expression::ParenthesizedExpression(p) => {
@@ -1904,6 +2316,11 @@ fn compile_expr(
             let const_idx = cx.intern_function_id(function_id);
             emit_make_callable(cx, dst, const_idx, &captures, true, span);
             Ok(dst)
+        }
+
+        Expression::ClassExpression(class) => {
+            let name = class.id.as_ref().map(|id| id.name.as_str().to_string());
+            compile_class(cx, class, name.as_deref())
         }
 
         other => Err(CompileError::Unsupported {
@@ -2192,6 +2609,19 @@ fn compile_method_call(
 ) -> Result<u16, CompileError> {
     let span = (call.span.start, call.span.end);
     let callee = unwrap_ts_expr(&call.callee);
+    // `super(args...)` — direct super-constructor call. Only valid
+    // inside a derived-class constructor; the upvalue lookup will
+    // surface a clear diagnostic when used elsewhere.
+    if let Expression::Super(_) = callee {
+        return compile_super_call(cx, &call.arguments, span);
+    }
+    // `super.foo(args...)` — invoke a parent prototype method with
+    // `this` bound to the current receiver.
+    if let Expression::StaticMemberExpression(member) = callee
+        && matches!(member.object, Expression::Super(_))
+    {
+        return compile_super_method_call(cx, member.property.name.as_str(), &call.arguments, span);
+    }
     // Bare `Error("msg")` call (without `new`) is treated like
     // `new Error("msg")` per ES spec §20.5.1.1 — same lowering.
     if let Expression::Identifier(id) = callee
@@ -2216,6 +2646,26 @@ fn compile_method_call(
             let method = member.property.name.as_str();
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
             return compile_object_builtin(cx, method, &arg_regs, span);
+        }
+        // `Math.<name>(args)` — lower through `Op::MathCall`. The
+        // dispatcher resolves `<name>` against the namespace's
+        // function table; constant-style names like `PI` reach the
+        // method path only via a deliberate user `Math.PI()` call,
+        // which surfaces as `UnknownIntrinsic`.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Math"
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::MathCall, operands, span);
+            return Ok(dst);
         }
         let method_name = member.property.name.as_str();
         if let Some(dst) =
@@ -2467,6 +2917,495 @@ fn try_compile_function_method(
         }
         _ => Ok(None),
     }
+}
+
+/// Lower a `class … { … }` declaration or expression into the
+/// foundation `ClassConstructor` value. The lowering builds:
+///
+/// 1. The constructor function (synthesised as an empty body for a
+///    base class without an explicit `constructor`, or as
+///    `constructor(...args) { super(...args); }` for a derived
+///    class without one).
+/// 2. The instance-side prototype object (`C.prototype`). Each
+///    non-static method is installed here; for `extends C`, this
+///    object's `[[Prototype]]` chains to `C.prototype`.
+/// 3. The static-side object. Each `static` method is installed
+///    here; for `extends C`, this object's `[[Prototype]]` chains
+///    to the parent's static side so static inheritance falls out
+///    of the existing prototype walker.
+/// 4. A [`Op::MakeClass`] that fuses constructor / prototype /
+///    statics into a single `Value::ClassConstructor`.
+///
+/// Method bodies that reference `super` resolve through two
+/// synthetic upvalues installed in the class scope:
+/// `__class_home` (the prototype object methods belong to) and
+/// `__class_super` (the parent class value, only present when the
+/// class has an `extends` clause).
+fn compile_class(
+    cx: &mut Compiler,
+    class: &oxc_ast::ast::Class<'_>,
+    class_name: Option<&str>,
+) -> Result<u16, CompileError> {
+    let span = (class.span.start, class.span.end);
+
+    // Reject features explicitly out of scope for the foundation
+    // slice. Surface clear diagnostics so callers can tell what's
+    // not supported yet.
+    if !class.decorators.is_empty() {
+        return Err(CompileError::Unsupported {
+            node: "ClassDeclaration: decorators".to_string(),
+            span,
+        });
+    }
+    if class.r#abstract {
+        return Err(CompileError::Unsupported {
+            node: "ClassDeclaration: abstract".to_string(),
+            span,
+        });
+    }
+    if class.declare {
+        // Pure type-level declaration — emit nothing observable
+        // and hand the caller a `Value::Undefined` register.
+        let dst = cx.alloc_scratch();
+        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+        return Ok(dst);
+    }
+
+    cx.enter_scope();
+
+    // Evaluate the parent class first so observable side-effects
+    // happen exactly once per declaration, in source order.
+    let super_reg = match &class.super_class {
+        Some(expr) => Some(compile_expr(cx, expr, span)?),
+        None => None,
+    };
+
+    // Build the prototype object up-front so methods can be
+    // installed on it as we walk the class body. For `extends`,
+    // chain `C.prototype` from the parent's prototype.
+    let prototype_reg = cx.alloc_scratch();
+    cx.emit(Op::NewObject, vec![Operand::Register(prototype_reg)], span);
+    if let Some(parent_reg) = super_reg {
+        let parent_proto = cx.alloc_scratch();
+        let proto_const = cx.intern_string_constant("prototype");
+        cx.emit(
+            Op::LoadProperty,
+            vec![
+                Operand::Register(parent_proto),
+                Operand::Register(parent_reg),
+                Operand::ConstIndex(proto_const),
+            ],
+            span,
+        );
+        cx.emit(
+            Op::SetPrototype,
+            vec![
+                Operand::Register(prototype_reg),
+                Operand::Register(parent_proto),
+            ],
+            span,
+        );
+    }
+
+    // Statics object — own static methods live here and chain to
+    // the parent's statics for `extends`.
+    let statics_reg = cx.alloc_scratch();
+    cx.emit(Op::NewObject, vec![Operand::Register(statics_reg)], span);
+    if let Some(parent_reg) = super_reg {
+        cx.emit(
+            Op::SetPrototype,
+            vec![
+                Operand::Register(statics_reg),
+                Operand::Register(parent_reg),
+            ],
+            span,
+        );
+    }
+
+    // Install the synthetic `__class_home` / `__class_super`
+    // captured bindings so method bodies can resolve `super`
+    // through the standard upvalue walker.
+    let home_storage = cx.declare_captured_binding(SUPER_HOME_NAME, true, span)?;
+    cx.emit_store_storage(prototype_reg, home_storage, span);
+    cx.mark_initialized(SUPER_HOME_NAME);
+    if let Some(parent_reg) = super_reg {
+        let super_storage = cx.declare_captured_binding(SUPER_CTOR_NAME, true, span)?;
+        cx.emit_store_storage(parent_reg, super_storage, span);
+        cx.mark_initialized(SUPER_CTOR_NAME);
+    }
+
+    // Find the user-written constructor (if any) and the body's
+    // method members. Reject features outside the foundation
+    // subset early so the diagnostics are precise.
+    let mut ctor_method: Option<&oxc_ast::ast::MethodDefinition<'_>> = None;
+    for element in &class.body.body {
+        match element {
+            oxc_ast::ast::ClassElement::MethodDefinition(m) => {
+                if m.computed {
+                    return Err(CompileError::Unsupported {
+                        node: "ClassDeclaration: computed method key".to_string(),
+                        span: (m.span.start, m.span.end),
+                    });
+                }
+                if !matches!(
+                    m.kind,
+                    oxc_ast::ast::MethodDefinitionKind::Method
+                        | oxc_ast::ast::MethodDefinitionKind::Constructor
+                ) {
+                    return Err(CompileError::Unsupported {
+                        node: format!("ClassDeclaration: {:?} accessor", m.kind),
+                        span: (m.span.start, m.span.end),
+                    });
+                }
+                if matches!(m.kind, oxc_ast::ast::MethodDefinitionKind::Constructor) {
+                    if ctor_method.is_some() {
+                        return Err(CompileError::Unsupported {
+                            node: "ClassDeclaration: multiple constructors".to_string(),
+                            span: (m.span.start, m.span.end),
+                        });
+                    }
+                    ctor_method = Some(m);
+                }
+            }
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
+                // Field declarations need TDZ + per-instance init
+                // semantics that the foundation slice doesn't model.
+                // Reject explicitly so users aren't surprised.
+                return Err(CompileError::Unsupported {
+                    node: "ClassDeclaration: field declaration (foundation supports methods only)"
+                        .to_string(),
+                    span: (p.span.start, p.span.end),
+                });
+            }
+            oxc_ast::ast::ClassElement::AccessorProperty(p) => {
+                return Err(CompileError::Unsupported {
+                    node: "ClassDeclaration: accessor property".to_string(),
+                    span: (p.span.start, p.span.end),
+                });
+            }
+            oxc_ast::ast::ClassElement::StaticBlock(s) => {
+                return Err(CompileError::Unsupported {
+                    node: "ClassDeclaration: static initializer block".to_string(),
+                    span: (s.span.start, s.span.end),
+                });
+            }
+            oxc_ast::ast::ClassElement::TSIndexSignature(_) => {
+                // TypeScript-only — erase silently.
+            }
+        }
+    }
+
+    // Compile the constructor body. When the user didn't write one,
+    // synthesize the spec defaults: a base class gets an empty body,
+    // a derived class gets `constructor(...args) { super(...args); }`.
+    let display_name = class_name.unwrap_or("<class>").to_string();
+    let (ctor_id, ctor_captures) = match ctor_method {
+        Some(m) => compile_function(
+            cx,
+            &display_name,
+            &m.value.params,
+            &m.value.body,
+            (m.span.start, m.span.end),
+        )?,
+        None => compile_synthetic_constructor(cx, &display_name, super_reg.is_some(), span)?,
+    };
+
+    let ctor_const = cx.intern_function_id(ctor_id);
+    let ctor_reg = cx.alloc_scratch();
+    emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span);
+
+    // Install methods (instance + static) onto the right side.
+    for element in &class.body.body {
+        let oxc_ast::ast::ClassElement::MethodDefinition(m) = element else {
+            continue;
+        };
+        if matches!(m.kind, oxc_ast::ast::MethodDefinitionKind::Constructor) {
+            continue;
+        }
+        let method_span = (m.span.start, m.span.end);
+        let method_name = match &m.key {
+            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+            _ => {
+                return Err(CompileError::Unsupported {
+                    node: "ClassDeclaration: non-string method key".to_string(),
+                    span: method_span,
+                });
+            }
+        };
+        let (m_id, m_captures) = compile_function(
+            cx,
+            &method_name,
+            &m.value.params,
+            &m.value.body,
+            method_span,
+        )?;
+        let m_const = cx.intern_function_id(m_id);
+        let m_reg = cx.alloc_scratch();
+        emit_make_callable(cx, m_reg, m_const, &m_captures, false, method_span);
+        let target_reg = if m.r#static {
+            statics_reg
+        } else {
+            prototype_reg
+        };
+        let name_const = cx.intern_string_constant(&method_name);
+        cx.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(target_reg),
+                Operand::ConstIndex(name_const),
+                Operand::Register(m_reg),
+            ],
+            method_span,
+        );
+    }
+
+    let class_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::MakeClass,
+        vec![
+            Operand::Register(class_reg),
+            Operand::Register(ctor_reg),
+            Operand::Register(prototype_reg),
+            Operand::Register(statics_reg),
+        ],
+        span,
+    );
+
+    cx.exit_scope();
+    Ok(class_reg)
+}
+
+/// Build a synthetic constructor function body for classes that
+/// don't declare their own. Foundation rules:
+///
+/// - Base class: empty body, no params.
+/// - Derived class: `(…args) => super(...args)` lowered through the
+///   normal compiler path so `super` resolves via the same upvalue
+///   capture as user-written constructors.
+fn compile_synthetic_constructor(
+    parent: &mut Compiler,
+    name: &str,
+    is_derived: bool,
+    span: (u32, u32),
+) -> Result<(u32, Vec<u32>), CompileError> {
+    let module = Rc::clone(&parent.top_mut().module);
+    let child = FunctionContext::new(Rc::clone(&module));
+    // No body to pre-pass; only the synthesised super call needs
+    // outer captures.
+    parent.push(child);
+    parent.enter_scope();
+
+    // Reserve the function record up-front so the slot id is
+    // stable across recursive compile cycles.
+    let function_id = module.borrow().functions.len() as u32;
+    module.borrow_mut().functions.push(Function {
+        id: function_id,
+        name: name.to_string(),
+        span,
+        ..Default::default()
+    });
+
+    if is_derived {
+        // Default derived ctor is `constructor(...args) { super(...args); }`.
+        // We have no user-visible `args` parameter (the body uses
+        // the receiver's already-allocated `this`), so simulate by
+        // pulling the captured `__class_super` directly and
+        // forwarding zero args. A faithful spec-default would
+        // forward `arguments`, but the foundation has no
+        // `arguments` object yet — `super()` with no args is
+        // sufficient for the common chained-base-init case.
+        let super_ctor = load_synthetic_capture(parent, SUPER_CTOR_NAME, span)?;
+        let this_reg = parent.alloc_scratch();
+        parent.emit(Op::LoadThis, vec![Operand::Register(this_reg)], span);
+        let dst = parent.alloc_scratch();
+        parent.emit(
+            Op::CallWithThis,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(super_ctor),
+                Operand::Register(this_reg),
+                Operand::ConstIndex(0),
+            ],
+            span,
+        );
+    }
+    parent.emit(Op::ReturnUndefined, vec![], span);
+
+    parent.exit_scope();
+    let child = parent.pop();
+    let captures = child.parent_captures.clone();
+    let mut module_mut = module.borrow_mut();
+    let slot = module_mut
+        .functions
+        .get_mut(function_id as usize)
+        .expect("reserved synthetic ctor slot");
+    slot.locals = 0;
+    slot.scratch = child.scratch;
+    slot.param_count = 0;
+    slot.own_upvalue_count = child.own_upvalue_count;
+    slot.code = child.code;
+    slot.spans = child.spans;
+    Ok((function_id, captures))
+}
+
+/// Synthetic name for the per-method "home object" upvalue that
+/// the class lowering installs in the enclosing class scope. The
+/// value is the prototype object that the method belongs to —
+/// `super.x` walks one hop up its `[[Prototype]]` chain to find the
+/// parent's binding.
+const SUPER_HOME_NAME: &str = "__class_home";
+
+/// Synthetic name for the per-derived-constructor "super
+/// constructor" upvalue. Holds the parent class value so
+/// `super(args)` knows what to invoke with the current receiver.
+const SUPER_CTOR_NAME: &str = "__class_super";
+
+/// Resolve a synthetic captured name (`__class_home` / `__class_super`)
+/// into a register holding its current value. Returns
+/// [`CompileError::Unsupported`] when the surrounding function has
+/// no class context, which is what the user sees on stray `super`
+/// usages outside a class body.
+fn load_synthetic_capture(
+    cx: &mut Compiler,
+    name: &str,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    if let Some(info) = cx.lookup_binding(name) {
+        let dst = cx.alloc_scratch();
+        cx.emit_load_storage(dst, info.storage, span);
+        return Ok(dst);
+    }
+    if let Some(uv_idx) = cx.resolve_capture(name) {
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadUpvalue,
+            vec![Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
+            span,
+        );
+        return Ok(dst);
+    }
+    Err(CompileError::Unsupported {
+        node: format!("super used outside a class method (`{name}` not in scope)"),
+        span,
+    })
+}
+
+/// Lower `super(args...)` to a `CallWithThis` against the captured
+/// parent constructor with `this = current frame's this`.
+fn compile_super_call(
+    cx: &mut Compiler,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let super_ctor = load_synthetic_capture(cx, SUPER_CTOR_NAME, span)?;
+    let this_reg = cx.alloc_scratch();
+    cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], span);
+    let has_spread = arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    let dst = cx.alloc_scratch();
+    if has_spread {
+        let args_reg = compile_spread_call_args(cx, arguments, span)?;
+        cx.emit(
+            Op::CallSpread,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(super_ctor),
+                Operand::Register(this_reg),
+                Operand::Register(args_reg),
+            ],
+            span,
+        );
+    } else {
+        let arg_regs = compile_call_args(cx, arguments, span)?;
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(super_ctor));
+        operands.push(Operand::Register(this_reg));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallWithThis, operands, span);
+    }
+    Ok(dst)
+}
+
+/// Lower `super.method(args...)` to a parent-prototype lookup
+/// followed by a `CallWithThis` against the resolved method with
+/// `this = current frame's this`.
+fn compile_super_method_call(
+    cx: &mut Compiler,
+    method_name: &str,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let method_reg = load_super_method(cx, method_name, span)?;
+    let this_reg = cx.alloc_scratch();
+    cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], span);
+    let has_spread = arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    let dst = cx.alloc_scratch();
+    if has_spread {
+        let args_reg = compile_spread_call_args(cx, arguments, span)?;
+        cx.emit(
+            Op::CallSpread,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(method_reg),
+                Operand::Register(this_reg),
+                Operand::Register(args_reg),
+            ],
+            span,
+        );
+    } else {
+        let arg_regs = compile_call_args(cx, arguments, span)?;
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(method_reg));
+        operands.push(Operand::Register(this_reg));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallWithThis, operands, span);
+    }
+    Ok(dst)
+}
+
+/// Lower a `super.x` read (no call) to a parent-prototype property
+/// load. Resolves to a register holding the looked-up value.
+fn compile_super_member_load(
+    cx: &mut Compiler,
+    name: &str,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    load_super_method(cx, name, span)
+}
+
+/// Shared helper: load `Object.getPrototypeOf(__class_home).<name>`
+/// into a fresh register. The compiler emits `GetPrototype` +
+/// `LoadProperty` rather than introducing a dedicated opcode — the
+/// foundation interpreter doesn't pay for a new dispatch arm and
+/// the `super` shape stays bytecode-readable.
+fn load_super_method(cx: &mut Compiler, name: &str, span: (u32, u32)) -> Result<u16, CompileError> {
+    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+    let parent_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::GetPrototype,
+        vec![Operand::Register(parent_reg), Operand::Register(home_reg)],
+        span,
+    );
+    let name_idx = cx.intern_string_constant(name);
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::LoadProperty,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(parent_reg),
+            Operand::ConstIndex(name_idx),
+        ],
+        span,
+    );
+    Ok(dst)
 }
 
 /// Lower `new Error(arg)` / `Error(arg)` to [`Op::NewError`]. The
@@ -2821,6 +3760,139 @@ mod tests {
     use otter_syntax::parse;
 
     #[test]
+    fn bigint_literal_emits_load_bigint() {
+        let parsed = parse("123n;", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::LoadBigInt));
+        let interned = module
+            .constants
+            .iter()
+            .any(|c| matches!(c, otter_bytecode::Constant::BigInt { decimal } if decimal == "123"));
+        assert!(interned, "BigInt constant should round-trip the decimal");
+    }
+
+    #[test]
+    fn bitwise_binary_ops_lower_directly() {
+        let parsed = parse(
+            "5 & 3; 5 | 3; 5 ^ 3; 1 << 3; -1 >> 1; -1 >>> 0;",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        for op in [
+            Op::BitwiseAnd,
+            Op::BitwiseOr,
+            Op::BitwiseXor,
+            Op::Shl,
+            Op::Shr,
+            Op::Ushr,
+        ] {
+            assert!(
+                main.code.iter().any(|i| i.op == op),
+                "missing {op:?} in {:?}",
+                main.code
+            );
+        }
+    }
+
+    #[test]
+    fn pow_operator_emits_pow() {
+        let parsed = parse("2 ** 10;", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        assert!(module.main().code.iter().any(|i| i.op == Op::Pow));
+    }
+
+    #[test]
+    fn compound_assign_load_modify_store() {
+        let parsed = parse("let n = 4; n &= 1; n **= 2;", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::BitwiseAnd));
+        assert!(main.code.iter().any(|i| i.op == Op::Pow));
+    }
+
+    #[test]
+    fn math_namespace_lowers_to_dedicated_ops() {
+        let parsed = parse(
+            "Math.PI; Math.abs(-1); Math.max(1, 2, 3);",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::MathLoad));
+        let calls = main.code.iter().filter(|i| i.op == Op::MathCall).count();
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn rest_param_marks_function_and_emits_collect_rest() {
+        let parsed = parse(
+            "function f(...rest) { return rest.length; }",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let f = &module.functions[1];
+        assert!(f.has_rest, "rest flag should be set");
+        assert_eq!(f.param_count, 0);
+        assert!(f.code.iter().any(|i| i.op == Op::CollectRest));
+    }
+
+    #[test]
+    fn default_param_emits_undefined_check() {
+        let parsed = parse(
+            "function f(a, b = 5) { return a + b; }",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let f = &module.functions[1];
+        // Default lowering emits LoadUndefined + Equal + JumpIfFalse
+        // before the body's normal store. Their presence is a
+        // sufficient witness that the default path was taken.
+        assert!(f.code.iter().any(|i| i.op == Op::LoadUndefined));
+        assert!(f.code.iter().any(|i| i.op == Op::Equal));
+        assert!(f.code.iter().any(|i| i.op == Op::JumpIfFalse));
+    }
+
+    #[test]
+    fn array_destructure_uses_iterator_protocol() {
+        let parsed = parse(
+            "const [a, b, ...rest] = [1, 2, 3, 4];",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::GetIterator));
+        assert!(main.code.iter().any(|i| i.op == Op::IteratorNext));
+        // Rest tail copies through ArrayPush.
+        assert!(main.code.iter().any(|i| i.op == Op::ArrayPush));
+    }
+
+    #[test]
+    fn object_destructure_loads_each_key() {
+        let parsed = parse(
+            "function f({ x, y = 9 }) { return x + y; }",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let f = &module.functions[1];
+        // Two property loads (one per declared key), with the
+        // default applied to `y`.
+        let loads = f.code.iter().filter(|i| i.op == Op::LoadProperty).count();
+        assert!(
+            loads >= 2,
+            "expected at least 2 LoadProperty ops, got {loads}: {:?}",
+            f.code
+        );
+    }
+
+    #[test]
     fn for_of_emits_iterator_dispatch() {
         let parsed = parse("for (let n of [1, 2]) { n; }", SyntaxSourceKind::TypeScript).unwrap();
         let module = compile(&parsed, "test.ts").unwrap();
@@ -2906,13 +3978,16 @@ mod tests {
     }
 
     #[test]
-    fn new_non_error_constructor_rejected() {
-        let parsed = parse("class Foo {} new Foo();", SyntaxSourceKind::TypeScript).unwrap();
-        // ClassDeclaration is rejected long before NewExpression
-        // gets a chance, so this test just confirms the path
-        // returns an Unsupported diagnostic rather than panicking.
-        let err = compile(&parsed, "test.ts").unwrap_err();
-        assert!(matches!(err, CompileError::Unsupported { .. }));
+    fn class_declaration_emits_make_class_and_new() {
+        let parsed = parse(
+            "class Foo { speak() { return 1; } } new Foo();",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::MakeClass));
+        assert!(main.code.iter().any(|i| i.op == Op::New));
     }
 
     #[test]

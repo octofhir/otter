@@ -20,3 +20,4 @@ oxc_span = { workspace = true }
 oxc_syntax = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+num-bigint = { workspace = true }

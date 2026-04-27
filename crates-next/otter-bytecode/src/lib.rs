@@ -69,6 +69,12 @@ pub enum Op {
     /// `r<dst> = imm:i32` (small-integer immediate via
     /// `Operand::ConstIndex` — the constant pool holds the literal).
     LoadInt32,
+    /// `r<dst> = constants[k<idx>]` (BigInt constant). The
+    /// constant carries the literal's decimal digits without the
+    /// trailing `n` suffix; the runtime parses them at load time
+    /// into a `Value::BigInt`. Compile-time validation guarantees
+    /// the digits are syntactically valid.
+    LoadBigInt,
     /// `r<dst> = true`.
     LoadTrue,
     /// `r<dst> = false`.
@@ -109,6 +115,26 @@ pub enum Op {
     Rem,
     /// `r<dst> = -r<src>` (Number).
     Neg,
+    /// `r<dst> = r<lhs> ** r<rhs>` (Number).
+    Pow,
+    /// `r<dst> = r<lhs> & r<rhs>` after `ToInt32` on both operands.
+    BitwiseAnd,
+    /// `r<dst> = r<lhs> | r<rhs>` after `ToInt32` on both operands.
+    BitwiseOr,
+    /// `r<dst> = r<lhs> ^ r<rhs>` after `ToInt32` on both operands.
+    BitwiseXor,
+    /// `r<dst> = ~r<src>` after `ToInt32`.
+    BitwiseNot,
+    /// `r<dst> = r<lhs> << (r<rhs> & 31)` after `ToInt32` /
+    /// `ToUint32` per spec.
+    Shl,
+    /// `r<dst> = r<lhs> >> (r<rhs> & 31)` (arithmetic / sign-
+    /// preserving shift).
+    Shr,
+    /// `r<dst> = r<lhs> >>> (r<rhs> & 31)` (logical / zero-fill
+    /// shift). The result is `ToUint32`, so values that would
+    /// overflow `i32` are returned as a `Double`.
+    Ushr,
     /// `r<dst> = ToNumber(r<src>)` (foundation subset).
     ToNumber,
     /// `r<dst> = (r<lhs> === r<rhs>)`. Returns Boolean.
@@ -259,6 +285,42 @@ pub enum Op {
     /// whose elements become the call arguments, in order. Used
     /// by spread in call expressions (`f(...arr)` and friends).
     CallSpread,
+    /// Construct call (the `new` expression). Operands:
+    /// `Register(dst), Register(callee), ConstIndex(argc),
+    /// Register(arg0), …`. The runtime allocates a fresh object
+    /// whose `[[Prototype]]` is `callee.prototype` (or `null` when
+    /// the callee has no `prototype` own property), invokes the
+    /// callee with `this` bound to the new object, and writes the
+    /// result. If the callee returns an object, that object becomes
+    /// the result; otherwise the freshly allocated object is used,
+    /// matching the spec's `OrdinaryCreateFromConstructor` behavior
+    /// stripped down for the foundation slice.
+    New,
+    /// `r<dst> = ClassConstructor { ctor, prototype, statics }`.
+    /// Operands: `Register(dst), Register(ctor), Register(prototype),
+    /// Register(statics)`. Used by class lowering to package the
+    /// constructor callable, instance-side prototype object, and
+    /// static-side object into a single first-class value.
+    MakeClass,
+    /// Read a constant or other read-only property off the
+    /// `Math` namespace. Operands:
+    /// `Register(dst), ConstIndex(name)`. Used by the compiler
+    /// when it sees `Math.PI` / `Math.E` / `Math.<known>` outside
+    /// a call expression.
+    MathLoad,
+    /// Variadic call against the `Math` namespace function table.
+    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`. The runtime resolves `name` against the
+    /// `math` module's registry; unknown names raise
+    /// `UnknownIntrinsic`.
+    MathCall,
+    /// `r<dst> = trailing-args-as-array`. Operand: `Register(dst)`.
+    /// Reads the call's overflow argument list (the values past
+    /// the declared `param_count`) that the dispatcher stashed on
+    /// the current frame and materialises them as a fresh
+    /// `JsArray`. Emitted by the compiler for the `...rest`
+    /// parameter at function entry.
+    CollectRest,
     /// Return `r<src>` from the current function. Reuses
     /// [`Op::Return`] semantics in `<main>`; in nested calls the
     /// dispatcher pops the frame and writes the value into the
@@ -323,6 +385,7 @@ impl Op {
             Op::LoadString => "LOAD_STRING",
             Op::LoadNumber => "LOAD_NUMBER",
             Op::LoadInt32 => "LOAD_INT32",
+            Op::LoadBigInt => "LOAD_BIGINT",
             Op::LoadTrue => "LOAD_TRUE",
             Op::LoadFalse => "LOAD_FALSE",
             Op::LoadLength => "LOAD_LENGTH",
@@ -340,12 +403,25 @@ impl Op {
             Op::IteratorNext => "ITERATOR_NEXT",
             Op::ArrayPush => "ARRAY_PUSH",
             Op::CallSpread => "CALL_SPREAD",
+            Op::New => "NEW",
+            Op::MakeClass => "MAKE_CLASS",
+            Op::CollectRest => "COLLECT_REST",
+            Op::MathLoad => "MATH_LOAD",
+            Op::MathCall => "MATH_CALL",
             Op::Add => "ADD",
             Op::Sub => "SUB",
             Op::Mul => "MUL",
             Op::Div => "DIV",
             Op::Rem => "REM",
             Op::Neg => "NEG",
+            Op::Pow => "POW",
+            Op::BitwiseAnd => "BIT_AND",
+            Op::BitwiseOr => "BIT_OR",
+            Op::BitwiseXor => "BIT_XOR",
+            Op::BitwiseNot => "BIT_NOT",
+            Op::Shl => "SHL",
+            Op::Shr => "SHR",
+            Op::Ushr => "USHR",
             Op::ToNumber => "TO_NUMBER",
             Op::Equal => "EQ",
             Op::NotEqual => "NEQ",
@@ -405,12 +481,15 @@ impl Op {
             | Op::Jump
             | Op::TdzError
             | Op::Throw
-            | Op::NewObject => 1,
+            | Op::NewObject
+            | Op::CollectRest => 1,
             Op::LoadString
             | Op::LoadNumber
             | Op::LoadInt32
+            | Op::LoadBigInt
             | Op::LoadLength
             | Op::Neg
+            | Op::BitwiseNot
             | Op::ToNumber
             | Op::LogicalNot
             | Op::ToBoolean
@@ -421,13 +500,21 @@ impl Op {
             | Op::StoreLocal
             | Op::LoadUpvalue
             | Op::StoreUpvalue
-            | Op::MakeFunction => 2,
+            | Op::MakeFunction
+            | Op::MathLoad => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
             | Op::Mul
             | Op::Div
             | Op::Rem
+            | Op::Pow
+            | Op::BitwiseAnd
+            | Op::BitwiseOr
+            | Op::BitwiseXor
+            | Op::Shl
+            | Op::Shr
+            | Op::Ushr
             | Op::Equal
             | Op::NotEqual
             | Op::LessThan
@@ -452,7 +539,9 @@ impl Op {
             Op::NewArray => 2,
             Op::LoadElement | Op::StoreElement => 3,
             Op::CallMethodValue => 4, // dst, recv, name_const, argc
-            Op::Call => 3,            // dst, callee, argc — args follow
+            Op::MathCall => 3,        // dst, name_const, argc — args follow
+            Op::Call | Op::New => 3,  // dst, callee, argc — args follow
+            Op::MakeClass => 4,       // dst, ctor, prototype, statics
             // dst, callee, this, argc — args follow.
             Op::CallWithThis | Op::BindFunction => 4,
             // catch_offset, finally_offset, exc_dst.
@@ -550,6 +639,13 @@ pub struct Function {
     /// receive `this` from the call site instead.
     #[serde(default)]
     pub is_arrow: bool,
+    /// `true` when this function declares a rest parameter
+    /// (`function f(a, b, ...rest) { … }`). The call dispatcher
+    /// honours the flag by stashing arguments past `param_count`
+    /// onto the new frame's `rest_args` slot for
+    /// [`Op::CollectRest`] to materialise.
+    #[serde(default)]
+    pub has_rest: bool,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.
@@ -587,6 +683,14 @@ pub enum Constant {
     FunctionId {
         /// Index into `BytecodeModule::functions`.
         index: u32,
+    },
+    /// Decimal digits of a BigInt literal (no `n` suffix). The
+    /// compiler validates the literal at intern time, so the
+    /// runtime can fall through to a strict-parse path.
+    BigInt {
+        /// Decimal-digit string (e.g., `"9007199254740993"`,
+        /// `"-1"`).
+        decimal: String,
     },
 }
 

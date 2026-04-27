@@ -75,6 +75,48 @@ pub enum Op {
     /// into a `Value::BigInt`. Compile-time validation guarantees
     /// the digits are syntactically valid.
     LoadBigInt,
+    /// `r<dst> = constants[k<idx>]` (RegExp constant). The constant
+    /// carries the WTF-16 pattern body and the ASCII flag string
+    /// (`"gimsuy"` subset). The runtime compiles the regex once at
+    /// load time; subsequent loads of the same constant share the
+    /// compiled engine via the constant pool slot.
+    LoadRegExp,
+    /// `r<dst> = JSON.<name>(args...)`. Operands:
+    /// `dst, name_const, argc, args...`.
+    ///
+    /// Variadic, same shape as [`Op::MathCall`]. The compiler
+    /// intercepts the literal `JSON.<name>(...)` call shape so the
+    /// runtime does not need a real global object yet. Unknown
+    /// `<name>` surfaces as `UnknownIntrinsic`.
+    JsonCall,
+    /// Enqueue a microtask: `queueMicrotask(callee, args...)`.
+    /// Operands: `callee_reg, argc, args...`. There is no
+    /// destination register — the global returns `undefined`
+    /// synchronously and the caller writes that itself with
+    /// [`Op::LoadUndefined`] when needed.
+    ///
+    /// The runtime stores `(callee, this=undefined, args)` on the
+    /// per-interpreter microtask queue and drains it after the
+    /// currently-running script completes (success or error).
+    QueueMicrotask,
+    /// `r<dst> = new Promise(executor)`. Operands: `dst,
+    /// executor_reg, scratch_dst`.
+    ///
+    /// Builds a fresh pending promise, materialises native
+    /// `resolve` / `reject` closures that capture the promise,
+    /// writes the promise into `dst`, then invokes `executor` with
+    /// `[resolve, reject]`. The executor's return value lands in
+    /// `scratch_dst` (and is ignored). If the executor throws
+    /// synchronously the throw propagates as a runtime error
+    /// today; spec-faithful "reject the promise" treatment lands
+    /// when try/catch around native calls is wired.
+    PromiseNew,
+    /// `r<dst> = Promise.<name>(args...)`. Operands:
+    /// `dst, name_const, argc, args...`. Variadic, same shape as
+    /// [`Op::JsonCall`]. Resolves `<name>` against the Promise
+    /// statics dispatcher; unknown names surface as
+    /// `UnknownIntrinsic`.
+    PromiseCall,
     /// `r<dst> = true`.
     LoadTrue,
     /// `r<dst> = false`.
@@ -386,6 +428,11 @@ impl Op {
             Op::LoadNumber => "LOAD_NUMBER",
             Op::LoadInt32 => "LOAD_INT32",
             Op::LoadBigInt => "LOAD_BIGINT",
+            Op::LoadRegExp => "LOAD_REGEXP",
+            Op::JsonCall => "JSON_CALL",
+            Op::QueueMicrotask => "QUEUE_MICROTASK",
+            Op::PromiseNew => "PROMISE_NEW",
+            Op::PromiseCall => "PROMISE_CALL",
             Op::LoadTrue => "LOAD_TRUE",
             Op::LoadFalse => "LOAD_FALSE",
             Op::LoadLength => "LOAD_LENGTH",
@@ -487,6 +534,7 @@ impl Op {
             | Op::LoadNumber
             | Op::LoadInt32
             | Op::LoadBigInt
+            | Op::LoadRegExp
             | Op::LoadLength
             | Op::Neg
             | Op::BitwiseNot
@@ -540,6 +588,10 @@ impl Op {
             Op::LoadElement | Op::StoreElement => 3,
             Op::CallMethodValue => 4, // dst, recv, name_const, argc
             Op::MathCall => 3,        // dst, name_const, argc — args follow
+            Op::JsonCall => 3,        // dst, name_const, argc — args follow
+            Op::QueueMicrotask => 2,  // callee, argc — args follow
+            Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
+            Op::PromiseCall => 3,     // dst, name_const, argc — args follow
             Op::Call | Op::New => 3,  // dst, callee, argc — args follow
             Op::MakeClass => 4,       // dst, ctor, prototype, statics
             // dst, callee, this, argc — args follow.
@@ -691,6 +743,19 @@ pub enum Constant {
         /// Decimal-digit string (e.g., `"9007199254740993"`,
         /// `"-1"`).
         decimal: String,
+    },
+    /// Regular-expression literal `/pattern/flags`. The pattern is
+    /// stored as WTF-16 code units to round-trip surrogates through
+    /// the JSON dump; flags are restricted to the ASCII subset
+    /// `"gimsuy"`. The runtime compiles the pattern once on first
+    /// load and caches the compiled engine.
+    RegExp {
+        /// WTF-16 code units of the pattern body (between the
+        /// slashes, no flags).
+        pattern_utf16: Vec<u16>,
+        /// ASCII flag string (`"gimsuy"` subset). Validated at
+        /// compile time so the runtime can rely on a clean parse.
+        flags: String,
     },
 }
 

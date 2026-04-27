@@ -671,10 +671,48 @@ impl Runtime {
     ) -> Result<ExecutionResult, OtterError> {
         let start = std::time::Instant::now();
         let module = self.compile_source(&source, specifier)?;
-        let value = self.interp.run(&module).map_err(map_vm_error)?;
+        // Run the script first; the script error wins if both the
+        // script and the drain fail. On script success we still
+        // drain so any `queueMicrotask` registered during script
+        // execution gets a chance to run before we report success.
+        let script_outcome = self.interp.run(&module);
+        let drain_outcome = self.interp.drain_microtasks(&module);
+        let value = match (script_outcome, drain_outcome) {
+            (Err(script_err), _) => return Err(map_vm_error(script_err)),
+            (Ok(_), Err(drain_err)) => return Err(map_vm_error(drain_err)),
+            (Ok(v), Ok(())) => v,
+        };
         Ok(ExecutionResult {
             completion: value,
             duration: start.elapsed(),
+        })
+    }
+
+    /// Drain the microtask queue manually. Embedders that want to
+    /// step the queue between script runs (or in response to
+    /// host-side events) call this directly. Foundation slices
+    /// run `run_script` / `eval` always drain after the script,
+    /// so manual draining is rarely needed today.
+    ///
+    /// # Errors
+    /// Any `VmError` raised by a microtask propagates as
+    /// `OtterError::Runtime`.
+    pub fn run_microtasks(&mut self) -> Result<(), OtterError> {
+        // Empty module so the drain has a `BytecodeModule` to look
+        // up function bodies in. Microtasks always reference
+        // functions defined in the original module they were
+        // queued from — this entry point is for embedders who
+        // already have that module on hand; for now we surface
+        // it as a no-op when the queue is empty.
+        if !self.interp.microtasks().has_any_pending() {
+            return Ok(());
+        }
+        // Without a module we cannot resolve function ids; the
+        // foundation contract is that callers use the auto-drain
+        // path. Document this loudly.
+        Err(OtterError::Internal {
+            code: "MICROTASK_DRAIN_NEEDS_MODULE".to_string(),
+            message: "manual microtask draining requires the originating module; use run_script which auto-drains".to_string(),
         })
     }
 
@@ -983,6 +1021,14 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             "UNCAUGHT",
             format!("uncaught exception: {value}"),
         ),
+        VmError::JsonError { code, message } => {
+            // `code` is `&'static str` so we can pass it straight
+            // through; it stays stable for telemetry/log filters.
+            runtime_diagnostic(DiagnosticKind::Type, code, message)
+        }
+        VmError::InvalidRegExp { message } => {
+            runtime_diagnostic(DiagnosticKind::Syntax, "INVALID_REGEXP", message)
+        }
         VmError::MissingReturn | VmError::InvalidOperand => OtterError::Internal {
             code: "VM_BYTECODE_INVARIANT".to_string(),
             message: display,
@@ -1010,6 +1056,62 @@ mod tests {
         let mut otter = Otter::new();
         let result = otter.run_typescript("undefined;").unwrap();
         assert_eq!(result.completion_string(), "undefined");
+    }
+
+    #[test]
+    fn json_cyclic_surfaces_jsc_style_diagnostic() {
+        let mut otter = Otter::new();
+        let err = otter
+            .run_typescript("const a = {}; a.self = a; JSON.stringify(a);")
+            .unwrap_err();
+        match err {
+            OtterError::Runtime { diagnostic } => {
+                assert_eq!(diagnostic.code, "JSON_CYCLIC");
+                assert_eq!(
+                    diagnostic.message,
+                    "JSON.stringify cannot serialize cyclic structures."
+                );
+            }
+            other => panic!("expected Runtime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_parse_error_carries_byte_position() {
+        let mut otter = Otter::new();
+        let err = otter
+            .run_typescript("JSON.parse(\"[1, 2,]\");")
+            .unwrap_err();
+        match err {
+            OtterError::Runtime { diagnostic } => {
+                assert_eq!(diagnostic.code, "JSON_PARSE");
+                assert!(
+                    diagnostic
+                        .message
+                        .starts_with("JSON Parse error: trailing comma")
+                );
+                assert!(diagnostic.message.contains("at byte 6"));
+            }
+            other => panic!("expected Runtime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_bigint_emits_jsc_style_message() {
+        let mut otter = Otter::new();
+        let err = otter
+            .run_typescript("JSON.stringify({ n: 1n });")
+            .unwrap_err();
+        match err {
+            OtterError::Runtime { diagnostic } => {
+                assert_eq!(diagnostic.code, "JSON_BIGINT");
+                assert_eq!(
+                    diagnostic.message,
+                    "JSON.stringify cannot serialize BigInt values."
+                );
+            }
+            other => panic!("expected Runtime, got {other:?}"),
+        }
     }
 
     #[test]

@@ -16,8 +16,40 @@ destructuring bindings), bitwise + `**` operators with all
 compound-assignment shapes, `Number.prototype.{toString, toFixed}`,
 the `Math` namespace (constants + abs/min/max/floor/ceil/round/
 trunc/sqrt/pow), and `BigInt` literals with arbitrary-precision
-arithmetic, bitwise ops, and spec-correct cross-kind coercion.
-**112/112 engine fixtures pass.**
+arithmetic, bitwise ops, and spec-correct cross-kind coercion. The
+full `String.prototype` foundation surface is in (`replace` /
+`replaceAll` / `split` / `repeat` / `padStart` / `padEnd` / `trim*`
+/ `at` / `codePointAt` / `toLowerCase` / `toUpperCase` / `concat`
+/ `includes` / `match` / `matchAll` / `search`), and JS regex
+literals are wired end-to-end: a `Value::RegExp` backed by the
+`regress` engine (octoshikari fork), `RegExp.prototype.{exec, test,
+toString}` plus `source` / `flags` / `lastIndex` accessors, the
+six standard flags (`g` / `i` / `m` / `s` / `u` / `y`), and the
+regex-arg overloads of every `String.prototype` pattern method
+including `$$` / `$&` / `$1`–`$9` substitution. The `JSON`
+namespace is implemented with a hand-rolled (no `serde_json`)
+strict parser and an iterative `stringify` walker — insertion-
+order preserved, `NaN`/`±Infinity` → `null`, BigInt + cycles +
+1024-deep nesting all surface as catchable runtime errors, and
+the `space` parameter accepts both numeric and string indents.
+The microtask queue is in: a per-`Interpreter` `MicrotaskQueue`
+(plain `&mut`-owned field, no `RefCell`/`UnsafeCell`),
+`queueMicrotask(fn, ...args)` global, swap-and-drain semantics
+with reentrant-depth tracking, generation counter, and a
+cross-thread `AsyncRuntime` trait skeleton + optional
+`crossbeam_channel` inbox ready for task 35 (async/await) to
+plug in. `Otter::run_*` auto-drains after every script. The
+`Promise` value is in: a `JsPromise` trait (the contract) plus
+a concrete `JsPromiseHandle` tagged enum (`PurePromise` today,
+host-bridged variants in Phase F) — no vtable indirection on
+the hot path. Constructor + `Promise.{resolve, reject, all,
+race}` statics + `.then`/`.catch`/`.finally` prototype methods
+all wire through `Microtask::result_capability` so the handler's
+return value flows into the next promise (chained `.then`
+works). `Value::NativeFunction` lands as part of this slice —
+host-implemented callables for `resolve` / `reject` /
+aggregator-functions, with `&mut Interpreter` access for
+microtask enqueueing. **158/158 engine fixtures pass.**
 
 Foundation artifacts that stay (not tasks, never deleted):
 
@@ -82,16 +114,20 @@ ships independently end-to-end.
 ✅ Phase D complete — see Phase E for the next batch.
 
 ### Phase E — number and string completion
-| [30-string-prototype-completion.md](./30-string-prototype-completion.md) | Remaining `String.prototype` methods (`replace` / `split` / `repeat` / `pad*` / `trim*` / `at` / `codePointAt` / `toLowerCase` / `toUpperCase`). |
-| [31-regexp-and-pattern-methods.md](./31-regexp-and-pattern-methods.md) | RegExp value, literal syntax, `String.prototype.{match,matchAll,replace,replaceAll,search,split}` with regex args. |
-| [32-json-stringify-parse.md](./32-json-stringify-parse.md) | `JSON.stringify` and `JSON.parse` with deterministic key order. |
+
+✅ Phase E complete — see Phase F for the next batch.
 
 ### Phase F — promises, modules, async
 
+> **No GC during foundation.** Foundation goal is full ES spec
+> coverage on the simple `Rc` value model. GC + JIT each ship as
+> their own dedicated plan + crate **after** spec coverage is
+> solid. Phase F tasks (34, 35, 36) all ship on `Rc` for now;
+> task 57 is the placeholder for the eventual GC plan and is
+> not on the critical path of foundation work.
+
 | File | One-line goal |
 |---|---|
-| [33-microtask-queue.md](./33-microtask-queue.md) | Microtask queue plus `queueMicrotask` global. |
-| [34-promise-value.md](./34-promise-value.md) | `Promise` constructor, `.then` / `.catch` / `.finally`, settled-state semantics. |
 | [35-async-await.md](./35-async-await.md) | `async` functions, `await`, async-call frame state machine. |
 | [36-modules-import-export.md](./36-modules-import-export.md) | ES modules, `import` / `export`, dynamic `import()`, `import.meta`. |
 
@@ -112,6 +148,9 @@ ships independently end-to-end.
 | [51-test262-curated-subset.md](./51-test262-curated-subset.md) | `otter test --suite test262` wired into CI; first conformance baseline recorded. |
 | [52-trace-events-emission.md](./52-trace-events-emission.md) | Wire `vm.instruction` / `vm.call` / `vm.return` events through the trace sink. |
 | [53-recreate-es-conformance.md](./53-recreate-es-conformance.md) | Recreate `ES_CONFORMANCE.md` once the curated test262 subset reports a stable baseline. |
+| [55-otter-macros-next.md](./55-otter-macros-next.md) | New `otter-macros-next` proc-macro crate (`#[js_method]`, `js_proto!`, `#[js_namespace]`); migrate string / array / number / math / regexp prototype tables. |
+| [56-remove-refcell-from-hot-paths.md](./56-remove-refcell-from-hot-paths.md) | Remove `RefCell` from every hot path in `crates-next/*`; replace with `&mut` field access threaded through `dispatch_loop`. Required before task 35 (async) lands. |
+| [57-tracing-gc-migration.md](./57-tracing-gc-migration.md) | **HIGH PRIORITY.** Write our own tracing GC (no `boa_gc`) and replace every `Rc<T>` / `Rc<RefCell<T>>` in `crates-next/*` with a GC-managed handle. No production JS engine uses refcounting; we won't be competitive with V8 / JSC / SpiderMonkey until this is done. Sequence *between Phase F basics and task 35 (async with worker threads)*. |
 
 ### One-off cleanup follow-ups
 

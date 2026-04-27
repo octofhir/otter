@@ -637,6 +637,26 @@ impl FunctionContext {
         (module.constants.len() - 1) as u32
     }
 
+    fn intern_regexp_constant(&mut self, pattern_utf16: &[u16], flags: &str) -> u32 {
+        let mut module = self.module.borrow_mut();
+        for (i, c) in module.constants.iter().enumerate() {
+            if let Constant::RegExp {
+                pattern_utf16: existing_pat,
+                flags: existing_flags,
+            } = c
+                && existing_pat == pattern_utf16
+                && existing_flags == flags
+            {
+                return i as u32;
+            }
+        }
+        module.constants.push(Constant::RegExp {
+            pattern_utf16: pattern_utf16.to_vec(),
+            flags: flags.to_string(),
+        });
+        (module.constants.len() - 1) as u32
+    }
+
     fn intern_function_id(&mut self, function_id: u32) -> u32 {
         let mut module = self.module.borrow_mut();
         for (i, c) in module.constants.iter().enumerate() {
@@ -1931,6 +1951,51 @@ fn compile_expr(
             Ok(dst)
         }
 
+        Expression::RegExpLiteral(lit) => {
+            let span = (lit.span.start, lit.span.end);
+            let pattern_text = lit.regex.pattern.text.as_str();
+            let flags_str = lit.regex.flags.to_string();
+            // Compile-time validation: feed the pattern + flags to
+            // `regress` so we surface a clean `Unsupported` for the
+            // few patterns the engine rejects (e.g. unterminated
+            // groups). Mirrors the BigIntLiteral approach. The `g`
+            // and `y` flags live above the matcher per JS spec, so
+            // we strip them before asking `regress` to compile.
+            let mut engine_flags = regress::Flags::default();
+            for c in flags_str.chars() {
+                match c {
+                    'g' | 'y' => {}
+                    'i' => engine_flags.icase = true,
+                    'm' => engine_flags.multiline = true,
+                    's' => engine_flags.dot_all = true,
+                    'u' => engine_flags.unicode = true,
+                    other => {
+                        return Err(CompileError::Unsupported {
+                            node: format!(
+                                "RegExpLiteral `/{pattern_text}/{flags_str}` has unsupported flag `{other}`"
+                            ),
+                            span,
+                        });
+                    }
+                }
+            }
+            if let Err(e) = regress::Regex::with_flags(pattern_text, engine_flags) {
+                return Err(CompileError::Unsupported {
+                    node: format!("RegExpLiteral `/{pattern_text}/{flags_str}` rejected: {e}"),
+                    span,
+                });
+            }
+            let pattern_utf16: Vec<u16> = pattern_text.encode_utf16().collect();
+            let dst = cx.alloc_scratch();
+            let const_idx = cx.intern_regexp_constant(&pattern_utf16, &flags_str);
+            cx.emit(
+                Op::LoadRegExp,
+                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                span,
+            );
+            Ok(dst)
+        }
+
         Expression::NumericLiteral(lit) => {
             let dst = cx.alloc_scratch();
             let span = (lit.span.start, lit.span.end);
@@ -2150,6 +2215,34 @@ fn compile_expr(
                 && id.name.as_str() == "Error"
             {
                 return compile_error_construct(cx, &new_expr.arguments, new_span);
+            }
+            // `new Promise(executor)` lowers to a dedicated
+            // opcode that builds a pending promise + native
+            // resolve/reject + invokes the executor.
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Promise"
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                if arg_regs.len() != 1 {
+                    return Err(CompileError::Unsupported {
+                        node: "Promise constructor requires exactly one executor argument"
+                            .to_string(),
+                        span: new_span,
+                    });
+                }
+                let executor_reg = arg_regs[0];
+                let dst = cx.alloc_scratch();
+                let scratch = cx.alloc_scratch();
+                cx.emit(
+                    Op::PromiseNew,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(executor_reg),
+                        Operand::Register(scratch),
+                    ],
+                    new_span,
+                );
+                return Ok(dst);
             }
             let callee_reg = compile_expr(cx, callee, new_span)?;
             let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
@@ -2667,6 +2760,69 @@ fn compile_method_call(
             cx.emit(Op::MathCall, operands, span);
             return Ok(dst);
         }
+        // `JSON.<name>(args)` — same shape as Math.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "JSON"
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::JsonCall, operands, span);
+            return Ok(dst);
+        }
+        // `Promise.<name>(args)` — same shape as Math / JSON.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Promise"
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::PromiseCall, operands, span);
+            return Ok(dst);
+        }
+    }
+    // Bare-identifier interceptions — `queueMicrotask(fn, ...args)`
+    // is the only one today. Lives at the call-site layer (not
+    // inside the StaticMember branch) because the syntax is a
+    // direct call, not a method call.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "queueMicrotask"
+    {
+        // Compile arguments first so any side effects in the args
+        // run before the enqueue, matching JS evaluation order.
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        if arg_regs.is_empty() {
+            return Err(CompileError::Unsupported {
+                node: "queueMicrotask requires a callback argument".to_string(),
+                span,
+            });
+        }
+        let mut iter = arg_regs.into_iter();
+        let callee_reg = iter.next().expect("checked non-empty");
+        let trailing: Vec<u16> = iter.collect();
+        let mut operands: Vec<Operand> = Vec::with_capacity(2 + trailing.len());
+        operands.push(Operand::Register(callee_reg));
+        operands.push(Operand::ConstIndex(trailing.len() as u32));
+        operands.extend(trailing.into_iter().map(Operand::Register));
+        cx.emit(Op::QueueMicrotask, operands, span);
+        // queueMicrotask returns `undefined` synchronously.
+        let dst = cx.alloc_scratch();
+        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+        return Ok(dst);
+    }
+    if let Expression::StaticMemberExpression(member) = callee {
         let method_name = member.property.name.as_str();
         if let Some(dst) =
             try_compile_function_method(cx, &member.object, method_name, &call.arguments, span)?

@@ -260,6 +260,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -489,6 +498,7 @@ dependencies = [
  "oxc_ast_visit",
  "oxc_span",
  "oxc_syntax",
+ "regress",
  "serde",
  "thiserror",
 ]
@@ -534,10 +544,12 @@ name = "otter-vm"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "crossbeam-channel",
  "indexmap",
  "num-bigint",
  "num-traits",
  "otter-bytecode",
+ "regress",
  "serde",
  "smallvec",
  "thiserror",
@@ -918,6 +930,14 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "regress"
+version = "0.11.1"
+source = "git+https://github.com/octoshikari/regress#ab3b4962dacb0687fd99ba01d8b20c28d6547050"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rustc-hash"

@@ -53,10 +53,20 @@ tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 # Collections / utilities.
 smallvec    = "1"
 indexmap    = "2"
+# Lock-free MPMC channel: cross-thread microtask enqueue from the
+# async runtime (fetch / timers / Promise.then completion handlers)
+# back into the interpreter. The single-thread sync side stays on
+# the plain VecDeque inside `MicrotaskQueue`.
+crossbeam-channel = "0.5"
 
 # Arbitrary-precision integers for `Value::BigInt`.
 num-bigint  = "0.4"
 num-traits  = "0.2"
+
+# Regex backend for `Value::RegExp` and pattern-arg `String.prototype`
+# methods. Pulled from the OctoShikari fork rather than crates.io so we
+# can land local fixes without waiting on upstream releases.
+regress     = { git = "https://github.com/octoshikari/regress", features = ["utf16"] }
 
 # Benchmarks.
 criterion   = { version = "0.8", features = ["html_reports"] }

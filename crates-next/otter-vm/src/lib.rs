@@ -33,9 +33,16 @@ pub mod array;
 pub mod array_prototype;
 pub mod bigint;
 pub mod intrinsics;
+pub mod json;
 pub mod math;
+pub mod microtask;
+pub mod native_function;
 pub mod number;
 pub mod object;
+pub mod promise;
+pub mod promise_dispatch;
+pub mod regexp;
+pub mod regexp_prototype;
 pub mod string;
 pub mod string_prototype;
 
@@ -49,8 +56,15 @@ use smallvec::SmallVec;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 
 pub use array::JsArray;
+pub use microtask::{AsyncRuntime, Microtask, MicrotaskError, MicrotaskQueue};
+pub use native_function::{NativeError, NativeFn, NativeFunction, native_value};
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
+pub use promise::{
+    JsPromise, JsPromiseHandle, PromiseCapability, PromiseReaction, PromiseSettleJobs,
+    PromiseState, PromiseThenOutcome, PurePromise, ReactionKind,
+};
+pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
 pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
 
 /// Foundation runtime value.
@@ -108,6 +122,11 @@ pub enum Value {
     /// `prefix ++ call_args` as the argument list. Cheap to clone:
     /// the wrapper is `Rc`-shared.
     BoundFunction(std::rc::Rc<BoundFunction>),
+    /// Host-implemented callable. Used by `Promise` resolve/reject
+    /// closures, the `Promise.all` aggregator-functions, and any
+    /// other native shape that needs to be JS-callable without
+    /// going through bytecode. See [`crate::NativeFunction`].
+    NativeFunction(std::rc::Rc<NativeFunction>),
     /// Internal iterator state, produced by [`otter_bytecode::Op::GetIterator`]
     /// and driven by [`otter_bytecode::Op::IteratorNext`]. Until
     /// task 37 adds real `Symbol.iterator` lookup, the foundation
@@ -115,6 +134,19 @@ pub enum Value {
     /// — they are not addressable via `o[@@iterator]` from user
     /// code.
     Iterator(std::rc::Rc<std::cell::RefCell<IteratorState>>),
+    /// Compiled regular-expression value, produced by
+    /// [`otter_bytecode::Op::LoadRegExp`] reading a pooled
+    /// [`otter_bytecode::Constant::RegExp`]. Identity is by handle:
+    /// `===` follows `Rc::ptr_eq` semantics.
+    RegExp(JsRegExp),
+    /// JS Promise. Concrete handle (tagged enum inside) so
+    /// foundation `PurePromise` and future host-bridged promise
+    /// types share one `Value` variant **without** vtable
+    /// indirection on the hot path. Implements [`JsPromise`] for
+    /// the method contract. Identity (`===`) goes through
+    /// [`JsPromise::ptr_eq`]. Long-term path: GC migration (task
+    /// 57) replaces the inner `Rc` with a `Gc<>` handle.
+    Promise(JsPromiseHandle),
     /// Class value: the result of evaluating a `class` declaration
     /// or expression. Wraps the underlying constructor callable,
     /// the prototype object that fresh instances inherit from, and
@@ -257,7 +289,10 @@ impl Value {
                 format!("[Function #{function_id}]")
             }
             Value::BoundFunction(b) => format!("[BoundFunction → {}]", b.target.display_string()),
+            Value::NativeFunction(f) => format!("[NativeFunction {}]", f.name),
             Value::Iterator(_) => "[object Iterator]".to_string(),
+            Value::RegExp(r) => format!("/{}/{}", r.source(), r.flags().to_js_string()),
+            Value::Promise(_) => "[object Promise]".to_string(),
             Value::ClassConstructor(_) => "[class]".to_string(),
             Value::Object(_) => "[object Object]".to_string(),
             Value::Array(a) => {
@@ -288,9 +323,12 @@ impl Value {
             Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
+            | Value::NativeFunction(_)
             | Value::Object(_)
             | Value::Array(_)
             | Value::Iterator(_)
+            | Value::RegExp(_)
+            | Value::Promise(_)
             | Value::ClassConstructor(_) => true,
         }
     }
@@ -366,7 +404,10 @@ impl PartialEq for Value {
                 },
             ) => a == b && std::rc::Rc::ptr_eq(ua, ub),
             (Value::BoundFunction(a), Value::BoundFunction(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::NativeFunction(a), Value::NativeFunction(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::Promise(a), Value::Promise(b)) => a.ptr_eq(b as &dyn JsPromise),
             (Value::Iterator(a), Value::Iterator(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::RegExp(a), Value::RegExp(b)) => a.ptr_eq(b),
             (Value::ClassConstructor(a), Value::ClassConstructor(b)) => std::rc::Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -615,6 +656,26 @@ pub enum VmError {
         /// Display rendering of the thrown value.
         value: String,
     },
+    /// `Op::LoadRegExp` produced a pattern that the regex backend
+    /// could not compile. Catchable as `SyntaxError` once a real
+    /// error model lands; for now it surfaces through the standard
+    /// runtime-error code.
+    InvalidRegExp {
+        /// Backend diagnostic — pattern + flags + reason.
+        message: String,
+    },
+    /// `JSON.stringify` / `JSON.parse` rejected its input. The
+    /// `code` discriminates the failure family so the runtime can
+    /// surface a precise diagnostic (`JSON.stringify cannot
+    /// serialize cyclic structures.`, `JSON Parse error: <reason>
+    /// at byte N`, …) instead of the generic `TYPE_MISMATCH`.
+    JsonError {
+        /// Stable identifier (e.g. `"JSON_CYCLIC"`).
+        code: &'static str,
+        /// Human-readable diagnostic. Includes the byte position
+        /// for `JSON_PARSE`.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for VmError {
@@ -640,6 +701,8 @@ impl std::fmt::Display for VmError {
             }
             VmError::NotCallable => write!(f, "value is not a function"),
             VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
+            VmError::InvalidRegExp { message } => write!(f, "{message}"),
+            VmError::JsonError { message, .. } => write!(f, "{message}"),
         }
     }
 }
@@ -725,6 +788,14 @@ pub struct Interpreter {
     interrupt: InterruptFlag,
     string_heap: Arc<StringHeap>,
     max_stack_depth: u32,
+    /// Per-interpreter microtask queue. Plain field — accessed
+    /// only through `&mut self`. The dispatch loop threads
+    /// `&mut self.microtasks` alongside `&mut stack` (split-borrow)
+    /// so `Op::QueueMicrotask` writes the deque without going
+    /// through interior mutability. See `microtask::MicrotaskQueue`
+    /// for the full contract; task 33 ships the sync side and
+    /// reserves the async-inbox slot for task 35.
+    microtasks: MicrotaskQueue,
 }
 
 impl Interpreter {
@@ -736,6 +807,7 @@ impl Interpreter {
             interrupt: InterruptFlag::new(),
             string_heap: Arc::new(StringHeap::default()),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
+            microtasks: MicrotaskQueue::new(),
         }
     }
 
@@ -747,7 +819,21 @@ impl Interpreter {
             interrupt: InterruptFlag::new(),
             string_heap: Arc::new(StringHeap::with_cap(cap_bytes)),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
+            microtasks: MicrotaskQueue::new(),
         }
+    }
+
+    /// Mutable handle to the microtask queue. Embedders use this
+    /// to wire an [`AsyncRuntime`] inbox or to enqueue host-side
+    /// callbacks before a script runs.
+    pub fn microtasks_mut(&mut self) -> &mut MicrotaskQueue {
+        &mut self.microtasks
+    }
+
+    /// Read-only view of the microtask queue.
+    #[must_use]
+    pub fn microtasks(&self) -> &MicrotaskQueue {
+        &self.microtasks
     }
 
     /// Override the stack-depth limit. `0` is treated as the
@@ -781,18 +867,243 @@ impl Interpreter {
     /// Returns [`RunError`] (a `VmError` plus a stack-frame
     /// snapshot) on bytecode malformation, type mismatch, OOM,
     /// interrupt, or stack overflow.
-    pub fn run(&self, module: &BytecodeModule) -> Result<Value, RunError> {
+    pub fn run(&mut self, module: &BytecodeModule) -> Result<Value, RunError> {
         match self.run_inner(module) {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError { error, frames }),
         }
     }
 
+    /// Drain the microtask queue until empty (or
+    /// [`microtask::MAX_DRAIN_ITERS`] is hit).
+    ///
+    /// Each task is executed by invoking its callee with `this`
+    /// and `args` set up at enqueue time. Tasks pushed during the
+    /// drain go on the **next** generation, mirroring V8 / JSC.
+    ///
+    /// Foundation exception policy: the **first** error wins.
+    /// The remaining queue is left in place so a follow-up
+    /// `drain_microtasks` after the embedder recovers picks up
+    /// where this drain stopped. Once the `Promise` constructor
+    /// lands (task 34), this flips to spec semantics ("rejected
+    /// promise, continue draining").
+    pub fn drain_microtasks(&mut self, module: &BytecodeModule) -> Result<(), RunError> {
+        let mut iters: u32 = 0;
+        loop {
+            let Some(batch) = self.microtasks.begin_drain() else {
+                return Ok(());
+            };
+            if batch.tasks.is_empty() {
+                self.microtasks.end_drain();
+                return Ok(());
+            }
+            for task in batch.tasks {
+                if iters >= microtask::MAX_DRAIN_ITERS {
+                    self.microtasks.end_drain();
+                    return Err(RunError {
+                        error: VmError::JsonError {
+                            // Reusing the structured-error channel
+                            // until task 34 introduces a real
+                            // microtask-error code.
+                            code: "MICROTASK_RUNAWAY",
+                            message: format!(
+                                "microtask drain exceeded {} iterations",
+                                microtask::MAX_DRAIN_ITERS
+                            ),
+                        },
+                        frames: Vec::new(),
+                    });
+                }
+                iters += 1;
+                if let Err(err) = self.invoke_microtask(module, task) {
+                    self.microtasks.end_drain();
+                    return Err(err);
+                }
+            }
+            self.microtasks.end_drain();
+            // Loop continues: any tasks pushed during this
+            // generation get picked up by the next `begin_drain`.
+            if !self.microtasks.has_any_pending() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Invoke one microtask top-level. Builds a fresh frame stack
+    /// containing just the task's callee; runs `dispatch_loop`
+    /// until it returns. Errors include the snapshot of frames
+    /// the task accumulated when it failed.
+    fn invoke_microtask(
+        &mut self,
+        module: &BytecodeModule,
+        task: Microtask,
+    ) -> Result<(), RunError> {
+        // Resolve callee → function_id + upvalues. Mirrors the
+        // unwrap loop inside `invoke`, but for a top-level call
+        // (no caller frame to write back into).
+        let result_capability = task.result_capability.clone();
+        let mut current = task.callee;
+        let mut effective_this = task.this_value;
+        let mut effective_args: SmallVec<[Value; 8]> = task.args.into_iter().collect();
+        let mut hops: u32 = 0;
+        loop {
+            if hops >= self.max_stack_depth {
+                return Err(RunError {
+                    error: VmError::StackOverflow {
+                        limit: self.max_stack_depth,
+                    },
+                    frames: Vec::new(),
+                });
+            }
+            match current {
+                Value::BoundFunction(bound) => {
+                    hops += 1;
+                    let mut combined: SmallVec<[Value; 8]> =
+                        SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
+                    combined.extend(bound.bound_args.iter().cloned());
+                    combined.extend(effective_args);
+                    effective_this = bound.bound_this.clone();
+                    effective_args = combined;
+                    current = bound.target.clone();
+                }
+                Value::ClassConstructor(cc) => {
+                    hops += 1;
+                    current = cc.ctor.clone();
+                }
+                _ => break,
+            }
+        }
+        // Native callables run inline at the drain site: no frame
+        // push, no return register. Errors propagate as RunError.
+        if let Value::NativeFunction(native) = &current {
+            let argv: Vec<Value> = effective_args.into_iter().collect();
+            let native = native.clone();
+            return match (native.call)(self, &argv) {
+                Ok(value) => {
+                    self.settle_microtask_capability(result_capability, Ok(value));
+                    Ok(())
+                }
+                Err(err) => {
+                    let vm_err = native_to_vm_error(err);
+                    if result_capability.is_some() {
+                        // Reaction-mode: route the error into the
+                        // downstream promise as a rejection rather
+                        // than aborting the drain.
+                        let reason = vm_err_to_value(&vm_err);
+                        self.settle_microtask_capability(result_capability, Err(reason));
+                        Ok(())
+                    } else {
+                        Err(RunError {
+                            error: vm_err,
+                            frames: Vec::new(),
+                        })
+                    }
+                }
+            };
+        }
+        let (function_id, parent_upvalues, this_for_callee) = match current {
+            Value::Function { function_id } => {
+                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
+            }
+            Value::Closure {
+                function_id,
+                upvalues,
+                bound_this,
+            } => {
+                let this_value = match bound_this {
+                    Some(t) => *t,
+                    None => effective_this,
+                };
+                (function_id, upvalues, this_value)
+            }
+            _ => {
+                return Err(RunError {
+                    error: VmError::NotCallable,
+                    frames: Vec::new(),
+                });
+            }
+        };
+        let function = match module.functions.get(function_id as usize) {
+            Some(f) => f,
+            None => {
+                return Err(RunError {
+                    error: VmError::InvalidOperand,
+                    frames: Vec::new(),
+                });
+            }
+        };
+        let mut new_frame = Frame::with_return_upvalues_and_this(
+            function,
+            None, // top-level — no return register
+            parent_upvalues,
+            this_for_callee,
+        );
+        let bind_count = (function.param_count as usize).min(effective_args.len());
+        let total_args = effective_args.len();
+        let mut iter = effective_args.into_iter();
+        for i in 0..bind_count {
+            let value = iter.next().expect("bind_count <= len");
+            if let Some(slot) = new_frame.registers.get_mut(i) {
+                *slot = value;
+            }
+        }
+        if function.has_rest && total_args > function.param_count as usize {
+            new_frame.rest_args = iter.collect();
+        }
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(new_frame);
+        match self.dispatch_loop(module, &mut stack) {
+            Ok(value) => {
+                // Reaction job: settle the downstream promise with
+                // the handler's return value (spec §27.2.5.4).
+                self.settle_microtask_capability(result_capability, Ok(value));
+                Ok(())
+            }
+            Err(error) => {
+                if result_capability.is_some() {
+                    let reason = vm_err_to_value(&error);
+                    self.settle_microtask_capability(result_capability, Err(reason));
+                    Ok(())
+                } else {
+                    let frames = snapshot_frames(module, &stack);
+                    Err(RunError { error, frames })
+                }
+            }
+        }
+    }
+
+    /// Resolve / reject the downstream promise that a reaction
+    /// job belongs to. No-op when `cap` is `None` (plain
+    /// `queueMicrotask` callbacks).
+    fn settle_microtask_capability(
+        &mut self,
+        cap: Option<microtask::MicrotaskCapability>,
+        outcome: Result<Value, Value>,
+    ) {
+        let Some(cap) = cap else {
+            return;
+        };
+        let (callee, args): (Value, SmallVec<[Value; 4]>) = match outcome {
+            Ok(v) => (cap.resolve, smallvec::smallvec![v]),
+            Err(reason) => (cap.reject, smallvec::smallvec![reason]),
+        };
+        // Settling enqueues another microtask so the resolve/
+        // reject native runs in a fresh job (matches spec
+        // ordering — the next reaction picks it up on the next
+        // generation).
+        self.microtasks.enqueue(Microtask {
+            callee,
+            this_value: Value::Undefined,
+            args,
+            result_capability: None,
+        });
+    }
+
     /// Internal driver. Pulls the snapshot capture out of the
     /// dispatch loop so the hot path remains allocation-free; the
     /// snapshot is built only when a `VmError` actually escapes.
     fn run_inner(
-        &self,
+        &mut self,
         module: &BytecodeModule,
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
         let main = module.main();
@@ -809,7 +1120,7 @@ impl Interpreter {
     }
 
     fn dispatch_loop(
-        &self,
+        &mut self,
         module: &BytecodeModule,
         stack: &mut SmallVec<[Frame; 8]>,
     ) -> Result<Value, VmError> {
@@ -1060,6 +1371,25 @@ impl Interpreter {
                     write_register(frame, dst, Value::BigInt(value))?;
                     frame.pc += 1;
                 }
+                Op::LoadRegExp => {
+                    // Foundation path: compile once per load. Per-
+                    // literal caching is task 31's explicit non-goal.
+                    let dst = register_operand(operands.first())?;
+                    let idx = const_operand(operands.get(1))?;
+                    let regex = match module.constants.get(idx as usize) {
+                        Some(Constant::RegExp {
+                            pattern_utf16,
+                            flags,
+                        }) => regexp::JsRegExp::compile(pattern_utf16, flags).map_err(|e| {
+                            VmError::InvalidRegExp {
+                                message: e.to_string(),
+                            }
+                        })?,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    write_register(frame, dst, Value::RegExp(regex))?;
+                    frame.pc += 1;
+                }
                 Op::LoadTrue => {
                     let dst = register_operand(operands.first())?;
                     write_register(frame, dst, Value::Boolean(true))?;
@@ -1164,6 +1494,9 @@ impl Interpreter {
                         Value::Array(a) if name == "length" => {
                             Value::Number(NumberValue::from_i32(a.len() as i32))
                         }
+                        Value::RegExp(r) => {
+                            regexp_prototype::load_property(r, &name, &self.string_heap)
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     write_register(frame, dst, value)?;
@@ -1176,11 +1509,17 @@ impl Interpreter {
                     let name = lookup_string_constant(module, name_idx)?;
                     let value = read_register(frame, src)?.clone();
                     let target = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => o.clone(),
-                        Value::ClassConstructor(c) => c.statics.clone(),
+                        Value::Object(o) => Some(o.clone()),
+                        Value::ClassConstructor(c) => Some(c.statics.clone()),
+                        Value::RegExp(r) => {
+                            regexp_prototype::store_property(r, &name, &value);
+                            None
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    target.set(&name, value);
+                    if let Some(target) = target {
+                        target.set(&name, value);
+                    }
                     frame.pc += 1;
                 }
                 Op::DeleteProperty => {
@@ -1403,9 +1742,12 @@ impl Interpreter {
                         | Value::Function { .. }
                         | Value::Closure { .. }
                         | Value::BoundFunction(_)
+                        | Value::NativeFunction(_)
                         | Value::Object(_)
                         | Value::Array(_)
                         | Value::Iterator(_)
+                        | Value::RegExp(_)
+                        | Value::Promise(_)
                         | Value::ClassConstructor(_) => NumberValue::Double(f64::NAN),
                         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
                     };
@@ -1503,6 +1845,99 @@ impl Interpreter {
                     let result = math::call(&name, &args).map_err(math_to_vm_error)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
+                }
+                Op::JsonCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result =
+                        json::call(&name, &args, &self.string_heap).map_err(json_to_vm_error)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                Op::QueueMicrotask => {
+                    // Operands: callee, argc, args... — no dst.
+                    let callee_reg = register_operand(operands.first())?;
+                    let argc = match operands.get(1) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let callee = read_register(frame, callee_reg)?.clone();
+                    if !is_callable(&callee) {
+                        return Err(VmError::NotCallable);
+                    }
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(2 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    // Advance pc *before* mutating self.microtasks
+                    // — the per-frame `frame: &mut Frame` borrow
+                    // ends at the next statement, so the disjoint
+                    // `&mut self.microtasks` borrow is legal.
+                    frame.pc += 1;
+                    self.microtasks.enqueue(Microtask {
+                        callee,
+                        this_value: Value::Undefined,
+                        args,
+                        result_capability: None,
+                    });
+                }
+                Op::PromiseNew => {
+                    // Operands: dst, executor_reg, scratch_dst.
+                    let dst = register_operand(operands.first())?;
+                    let executor_reg = register_operand(operands.get(1))?;
+                    let scratch_dst = register_operand(operands.get(2))?;
+                    let executor = read_register(frame, executor_reg)?.clone();
+                    if !is_callable(&executor) {
+                        return Err(VmError::NotCallable);
+                    }
+                    let (handle, resolve, reject) = promise_dispatch::construct();
+                    let promise_value = Value::Promise(handle);
+                    write_register(frame, dst, promise_value)?;
+                    // Advance pc, then invoke executor with [resolve, reject].
+                    frame.pc += 1;
+                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                    args.push(resolve);
+                    args.push(reject);
+                    self.invoke(
+                        stack,
+                        module,
+                        &executor,
+                        Value::Undefined,
+                        args,
+                        scratch_dst,
+                    )?;
+                }
+                Op::PromiseCall => {
+                    // Operands: dst, name_const, argc, args...
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let argv: Vec<Value> = args.into_iter().collect();
+                    frame.pc += 1;
+                    let result = promise_dispatch::statics_call(self, &name, &argv)
+                        .map_err(native_to_vm_error)?;
+                    let top_idx = stack.len() - 1;
+                    write_register(&mut stack[top_idx], dst, result)?;
                 }
                 Op::CollectRest => {
                     let dst = register_operand(operands.first())?;
@@ -1677,7 +2112,7 @@ impl Interpreter {
     /// arguments copied into the parameter slots and `this` bound
     /// to `Value::Undefined` (foundation strict default).
     fn do_call(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
         operands: &[Operand],
@@ -1714,7 +2149,7 @@ impl Interpreter {
     /// already be advanced before this call so the post-pop
     /// dispatch resumes after the originating instruction.
     fn invoke(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
         callee: &Value,
@@ -1755,6 +2190,21 @@ impl Interpreter {
                 }
                 _ => break,
             }
+        }
+        // Native callables short-circuit the frame push: invoke
+        // the closure inline, write the result into the caller's
+        // dst, and advance pc on the caller frame. No stack frame
+        // is created — the closure cannot itself push frames.
+        if let Value::NativeFunction(native) = &current {
+            let argv: Vec<Value> = effective_args.into_iter().collect();
+            // Clone the Rc out of `current` so the native body can
+            // freely take `&mut self` without holding a borrow on
+            // `current`.
+            let native = native.clone();
+            let result = (native.call)(self, &argv).map_err(native_to_vm_error)?;
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(());
         }
         let (function_id, parent_upvalues, this_for_callee) = match current {
             Value::Function { function_id } => {
@@ -1864,7 +2314,7 @@ impl Interpreter {
     /// or the freshly allocated receiver — `pop_frame` performs
     /// that swap so the unwind path is uniform across call shapes.
     fn do_construct(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
         operands: &[Operand],
@@ -1912,7 +2362,7 @@ impl Interpreter {
     /// the explicit `this` value (foundation lowers free spread
     /// calls with `this = undefined`).
     fn do_call_spread(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
         operands: &[Operand],
@@ -1941,7 +2391,7 @@ impl Interpreter {
     /// `Function.prototype.call` lowering and the array-literal
     /// path of `Function.prototype.apply`.
     fn do_call_with_this(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
         operands: &[Operand],
@@ -1980,7 +2430,7 @@ impl Interpreter {
     ///   `call`, `apply`, and `bind` shapes are recognised; anything
     ///   else surfaces as `UnknownIntrinsic`.
     fn do_call_method_value(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
         operands: &[Operand],
@@ -2004,12 +2454,27 @@ impl Interpreter {
             arg_values.push(read_register(&stack[top_idx], r)?.clone());
         }
 
+        // Promise.prototype dispatches separately because it
+        // needs `&mut self` to enqueue microtasks.
+        if let Value::Promise(p) = &recv_value {
+            let promise = p.clone();
+            let argv: Vec<Value> = arg_values.iter().cloned().collect();
+            let result = promise_dispatch::prototype_call(self, &promise, &name, &argv)
+                .map_err(native_to_vm_error)?;
+            let top_idx = stack.len() - 1;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
+        }
+
         // Primitive prototypes go through the intrinsic table —
         // synchronous, no frame push, advance pc and write directly.
         let intrinsic = match &recv_value {
             Value::String(_) => string_prototype::lookup(&name),
             Value::Array(_) => array_prototype::lookup(&name),
             Value::Number(_) => number::prototype_lookup(&name),
+            Value::RegExp(_) => regexp_prototype::lookup(&name),
             _ => None,
         };
         if let Some(entry) = intrinsic {
@@ -2078,7 +2543,7 @@ impl Interpreter {
     /// learn quickly that the foundation slice rejects dynamic
     /// argument arrays.
     fn dispatch_function_method(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
         callee: &Value,
@@ -2342,6 +2807,73 @@ fn math_to_vm_error(err: math::MathError) -> VmError {
     }
 }
 
+fn native_to_vm_error(err: NativeError) -> VmError {
+    match err {
+        NativeError::Thrown { name: _, message } => VmError::Uncaught { value: message },
+        NativeError::TypeError { .. } => VmError::TypeMismatch,
+    }
+}
+
+/// Convert a `VmError` into a JS `Value` used as a rejection
+/// reason for promise reactions. Foundation: a plain string is
+/// fine; once the full Error hierarchy is in we'll synthesize a
+/// real `TypeError` / `RangeError` instance.
+fn vm_err_to_value(err: &VmError) -> Value {
+    Value::String(
+        crate::JsString::from_str(&err.to_string(), &crate::StringHeap::default()).unwrap_or_else(
+            |_| {
+                // Allocator failure here is exceptional; substitute
+                // an empty string rather than panicking.
+                crate::JsString::from_str("", &crate::StringHeap::default())
+                    .expect("empty string allocates")
+            },
+        ),
+    )
+}
+
+fn json_to_vm_error(err: json::JsonError) -> VmError {
+    // Diagnostic strings stay short and spec-faithful (no cycle
+    // path-walk) to match the identity-pointer visit set. Parse
+    // errors additionally carry the byte position so users can
+    // locate the offending token.
+    match err {
+        json::JsonError::UnknownMember(name) => VmError::UnknownIntrinsic {
+            name: format!("JSON.{name}"),
+        },
+        json::JsonError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+        json::JsonError::Cyclic => VmError::JsonError {
+            code: "JSON_CYCLIC",
+            message: "JSON.stringify cannot serialize cyclic structures.".to_string(),
+        },
+        json::JsonError::BigInt => VmError::JsonError {
+            code: "JSON_BIGINT",
+            message: "JSON.stringify cannot serialize BigInt values.".to_string(),
+        },
+        json::JsonError::TooDeep { limit } => VmError::JsonError {
+            code: "JSON_DEPTH",
+            message: format!("JSON nesting exceeded {limit} levels."),
+        },
+        json::JsonError::ParseFailed { message, position } => VmError::JsonError {
+            code: "JSON_PARSE",
+            message: format!("JSON Parse error: {message} at byte {position}"),
+        },
+        json::JsonError::BadArgument {
+            name,
+            index,
+            reason,
+        } => VmError::JsonError {
+            code: "JSON_BAD_ARG",
+            message: format!("JSON.{name} argument {index} {reason}"),
+        },
+    }
+}
+
 fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {
     match err {
         IntrinsicError::OutOfMemory {
@@ -2505,8 +3037,16 @@ fn is_callable(value: &Value) -> bool {
         Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
+            | Value::NativeFunction(_)
             | Value::ClassConstructor(_)
     )
+}
+
+/// Public re-export of [`is_callable`] for crate-external dispatch
+/// helpers (e.g. [`crate::promise_dispatch`]).
+#[must_use]
+pub fn is_callable_value(value: &Value) -> bool {
+    is_callable(value)
 }
 
 #[cfg(test)]
@@ -2561,7 +3101,7 @@ mod tests {
             ],
             1,
         );
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         assert_eq!(interp.run(&module).unwrap(), Value::Undefined);
     }
 
@@ -2575,7 +3115,7 @@ mod tests {
             }],
             0,
         );
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         assert_eq!(
             interp.run(&module).unwrap_err().error,
             VmError::MissingReturn
@@ -2740,7 +3280,7 @@ mod tests {
         // Build the closure by hand and dispatch via `invoke`. The
         // bound_this is a marker string — if `LoadThis` returns it,
         // the lexical override is working.
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let bound = JsString::from_str("outer", interp.string_heap()).unwrap();
         let closure = Value::Closure {
             function_id: 1,
@@ -2811,7 +3351,7 @@ mod tests {
             ],
             1,
         );
-        let interp = Interpreter::new();
+        let mut interp = Interpreter::new();
         let handle = interp.interrupt_handle();
         handle.interrupt();
         assert_eq!(interp.run(&module).unwrap_err().error, VmError::Interrupted);

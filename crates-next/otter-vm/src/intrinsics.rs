@@ -62,6 +62,12 @@ pub enum IntrinsicReceiver {
     /// `Array.prototype.<name>`. Receiver is a `Value::Array`
     /// (added in slice 21).
     Array,
+    /// `RegExp.prototype.<name>`. Receiver is a `Value::RegExp`
+    /// (added in slice 31).
+    RegExp,
+    /// `Promise.prototype.<name>`. Receiver is a
+    /// `Value::Promise` (added in slice 34).
+    Promise,
 }
 
 /// Borrowed call frame for an intrinsic.

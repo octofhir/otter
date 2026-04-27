@@ -48,7 +48,7 @@ fn bench_dispatch(c: &mut Criterion) {
         }],
         constants: vec![],
     };
-    let interp = Interpreter::new();
+    let mut interp = Interpreter::new();
     c.bench_function("dispatch_10k_nop", |b| {
         b.iter(|| interp.run(&module).unwrap());
     });

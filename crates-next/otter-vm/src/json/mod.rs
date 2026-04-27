@@ -1,0 +1,248 @@
+//! `JSON` namespace — hand-rolled `stringify` and `parse`.
+//!
+//! Slice 32 picks the hot-path implementation deliberately: we
+//! **do not** depend on `serde_json`. Serde's parser is general-
+//! purpose and ~3–5× slower than a focused byte-cursor parser on
+//! the JS shapes we actually serialize. Stringify and parse both
+//! own their own buffer/cursor so we can keep them branch-free on
+//! the common case (ASCII strings, small integers, dense arrays).
+//!
+//! # Contents
+//! - [`call`] — namespace-call dispatcher (used by `Op::JsonCall`).
+//! - [`stringify`] / [`parse`] — public entry points.
+//! - [`stringify_with_options`] — programmable `space` + `replacer`.
+//! - [`JsonError`] — failure mode the dispatcher converts to
+//!   `VmError`.
+//!
+//! # Invariants
+//! - **No recursion.** Both serializer and parser walk an explicit
+//!   stack capped at `MAX_NESTING_DEPTH` (1024) so adversarial
+//!   nested input cannot blow the host stack.
+//! - **Cycle detection.** Stringify carries an
+//!   `Rc::ptr_eq`-comparing visit set; revisiting an active node
+//!   raises `JsonError::Cyclic`.
+//! - **Deterministic key order.** Object properties enumerate in
+//!   shape insertion order (`JsObject::borrow_props`).
+//! - **NaN / ±Infinity / -0 → `null`** per spec §25.5.2.4.
+//! - **BigInt → `TypeError`-equivalent** ([`JsonError::BigInt`]).
+//! - **Strict parse.** Trailing commas, comments, single quotes,
+//!   leading zeros, leading `+`, NaN/Infinity literals — all
+//!   rejected. The parser walks `&[u8]` for the ASCII fast path
+//!   and falls back to WTF-16 unescape only inside string literals.
+//!
+//! # See also
+//! - [`docs/new-engine/tasks/32-json-stringify-parse.md`](
+//!     ../../../docs/new-engine/tasks/32-json-stringify-parse.md
+//!   )
+
+mod parse;
+mod stringify;
+
+pub use parse::{ParseError, parse};
+pub use stringify::{StringifyOptions, stringify, stringify_with_options};
+
+use crate::Value;
+use crate::string::JsString;
+
+/// Hard cap on nesting depth. Both stringify and parse abort with
+/// `JsonError::TooDeep` once exceeded — keeps adversarial input
+/// from blowing the host stack and matches V8's `JSON.stringify`
+/// behaviour for very deep objects.
+pub const MAX_NESTING_DEPTH: usize = 1024;
+
+/// Failure modes for [`call`].
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum JsonError {
+    /// `JSON.<name>` is not a registered function.
+    #[error("JSON.{0} is not defined")]
+    UnknownMember(String),
+    /// Argument failed type / value coercion.
+    #[error("JSON.{name} argument {index} {reason}")]
+    BadArgument {
+        /// Function name.
+        name: &'static str,
+        /// Argument index (0-based).
+        index: u16,
+        /// Short reason.
+        reason: &'static str,
+    },
+    /// Cycle detected while serialising.
+    #[error("JSON.stringify cannot serialize cyclic structures.")]
+    Cyclic,
+    /// Nesting exceeded [`MAX_NESTING_DEPTH`].
+    #[error("JSON nesting exceeded {limit} levels.")]
+    TooDeep {
+        /// Configured cap.
+        limit: usize,
+    },
+    /// `BigInt` cannot be serialised per spec §25.5.2.4.
+    #[error("JSON.stringify cannot serialize BigInt values.")]
+    BigInt,
+    /// Underlying string-heap allocation failed.
+    #[error("out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}")]
+    OutOfMemory {
+        /// Bytes requested.
+        requested_bytes: u64,
+        /// Heap cap (`0` = unlimited).
+        heap_limit_bytes: u64,
+    },
+    /// Strict-mode parse failure.
+    #[error("JSON.parse: {message} at byte {position}")]
+    ParseFailed {
+        /// Diagnostic body.
+        message: String,
+        /// 0-based byte offset.
+        position: usize,
+    },
+}
+
+impl From<crate::string::StringError> for JsonError {
+    fn from(err: crate::string::StringError) -> Self {
+        match err {
+            crate::string::StringError::OutOfMemory {
+                requested_bytes,
+                heap_limit_bytes,
+            } => Self::OutOfMemory {
+                requested_bytes,
+                heap_limit_bytes,
+            },
+        }
+    }
+}
+
+impl From<ParseError> for JsonError {
+    fn from(err: ParseError) -> Self {
+        Self::ParseFailed {
+            message: err.message,
+            position: err.position,
+        }
+    }
+}
+
+/// Dispatch a `JSON.<name>(args...)` call. Mirrors
+/// [`crate::math::call`]; see the receiver-type guards below.
+pub fn call(
+    name: &str,
+    args: &[Value],
+    string_heap: &crate::string::StringHeap,
+) -> Result<Value, JsonError> {
+    match name {
+        "stringify" => json_stringify(args, string_heap),
+        "parse" => json_parse(args, string_heap),
+        _ => Err(JsonError::UnknownMember(name.to_string())),
+    }
+}
+
+fn json_stringify(args: &[Value], heap: &crate::string::StringHeap) -> Result<Value, JsonError> {
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let space = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let opts = StringifyOptions::from_space(&space)?;
+    match stringify_with_options(&value, &opts)? {
+        Some(text) => Ok(Value::String(JsString::from_str(&text, heap)?)),
+        None => Ok(Value::Undefined),
+    }
+}
+
+fn json_parse(args: &[Value], heap: &crate::string::StringHeap) -> Result<Value, JsonError> {
+    let text = match args.first() {
+        Some(Value::String(s)) => s.to_lossy_string(),
+        _ => {
+            return Err(JsonError::BadArgument {
+                name: "parse",
+                index: 0,
+                reason: "must be a string",
+            });
+        }
+    };
+    let value = parse(&text, heap)?;
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::number::NumberValue;
+    use crate::object::JsObject;
+    use crate::string::StringHeap;
+
+    fn n(v: i32) -> Value {
+        Value::Number(NumberValue::from_i32(v))
+    }
+
+    #[test]
+    fn stringify_primitives() {
+        assert_eq!(stringify(&Value::Null).unwrap().unwrap(), "null");
+        assert_eq!(stringify(&Value::Boolean(true)).unwrap().unwrap(), "true");
+        assert_eq!(stringify(&n(42)).unwrap().unwrap(), "42");
+        // Undefined → omitted (returns None).
+        assert!(stringify(&Value::Undefined).unwrap().is_none());
+    }
+
+    #[test]
+    fn stringify_nan_and_infinity_become_null() {
+        let nan = Value::Number(NumberValue::Double(f64::NAN));
+        let inf = Value::Number(NumberValue::Double(f64::INFINITY));
+        assert_eq!(stringify(&nan).unwrap().unwrap(), "null");
+        assert_eq!(stringify(&inf).unwrap().unwrap(), "null");
+    }
+
+    #[test]
+    fn stringify_object_preserves_insertion_order() {
+        let obj = JsObject::new();
+        obj.set("b", n(1));
+        obj.set("a", n(2));
+        let s = stringify(&Value::Object(obj)).unwrap().unwrap();
+        assert_eq!(s, "{\"b\":1,\"a\":2}");
+    }
+
+    #[test]
+    fn stringify_rejects_bigint() {
+        let bi = Value::BigInt(crate::bigint::BigIntValue::from_decimal("1").unwrap());
+        assert!(matches!(stringify(&bi), Err(JsonError::BigInt)));
+    }
+
+    #[test]
+    fn parse_round_trip() {
+        let heap = StringHeap::default();
+        let v = parse("{\"x\":[1,2,3]}", &heap).unwrap();
+        if let Value::Object(o) = v {
+            if let Some(Value::Array(arr)) = o.get("x") {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr.get(1).display_string(), "2");
+            } else {
+                panic!("expected x: array");
+            }
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn error_messages_are_specific() {
+        // Cyclic — no path walk (cheap identity-pointer set on the
+        // hot path; full path tracking can layer on later).
+        let obj = JsObject::new();
+        obj.set("self", Value::Object(obj.clone()));
+        let err = stringify(&Value::Object(obj)).unwrap_err();
+        assert!(matches!(err, JsonError::Cyclic));
+        assert_eq!(
+            err.to_string(),
+            "JSON.stringify cannot serialize cyclic structures.",
+        );
+
+        // BigInt.
+        let bi = Value::BigInt(crate::bigint::BigIntValue::from_decimal("1").unwrap());
+        let err = stringify(&bi).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "JSON.stringify cannot serialize BigInt values.",
+        );
+
+        // Parse with byte position.
+        let heap = StringHeap::default();
+        let err = parse("[1, 2,]", &heap).unwrap_err();
+        assert_eq!(err.position, 6);
+        assert_eq!(err.message, "trailing comma");
+    }
+}

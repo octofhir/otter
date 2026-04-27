@@ -139,6 +139,13 @@ impl JsArray {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
+
+    /// Raw `Rc` data-pointer for cycle-detection identity sets.
+    /// See [`crate::object::JsObject::identity_addr`] for caveats.
+    #[must_use]
+    pub fn identity_addr(&self) -> *const () {
+        Rc::as_ptr(&self.inner).cast()
+    }
 }
 
 impl Default for JsArray {

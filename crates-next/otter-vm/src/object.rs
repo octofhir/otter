@@ -319,6 +319,15 @@ impl JsObject {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// Raw `Rc` data-pointer for use as a hash key in cycle
+    /// detection (`JSON.stringify`, structuredClone). Anchor the
+    /// originating handle for the lifetime of the pointer — it
+    /// dangles once the last `Rc` is dropped.
+    #[must_use]
+    pub fn identity_addr(&self) -> *const () {
+        Rc::as_ptr(&self.inner).cast()
+    }
+
     /// Borrow the current hidden class. Used by debug / shape-
     /// identity tests; production code should not introspect it.
     #[must_use]

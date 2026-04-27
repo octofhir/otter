@@ -87,10 +87,79 @@ pub enum Value {
         /// Index into [`otter_bytecode::BytecodeModule::functions`].
         function_id: u32,
         /// Captured cells, in declaration order. The compiler emits
-        /// `MakeFunction` for closure-less functions and reserves
-        /// `MakeClosure` for the capture path.
+        /// `MakeFunction` for closure-less, non-arrow functions and
+        /// reserves `MakeClosure` for the capture path and for all
+        /// arrow expressions.
         upvalues: std::rc::Rc<[UpvalueCell]>,
+        /// `Some(this)` for arrow closures: the lexically-captured
+        /// receiver always wins over whatever the call site passes.
+        /// `None` for non-arrow closures, which take their `this`
+        /// from the call site.
+        bound_this: Option<Box<Value>>,
     },
+    /// Result of `Function.prototype.bind(thisArg, ...prefix)`. When
+    /// invoked, forwards to `target` with `this = bound_this` and
+    /// `prefix ++ call_args` as the argument list. Cheap to clone:
+    /// the wrapper is `Rc`-shared.
+    BoundFunction(std::rc::Rc<BoundFunction>),
+    /// Internal iterator state, produced by [`otter_bytecode::Op::GetIterator`]
+    /// and driven by [`otter_bytecode::Op::IteratorNext`]. Until
+    /// task 37 adds real `Symbol.iterator` lookup, the foundation
+    /// models iterators out-of-band as a dedicated value variant
+    /// — they are not addressable via `o[@@iterator]` from user
+    /// code.
+    Iterator(std::rc::Rc<std::cell::RefCell<IteratorState>>),
+}
+
+/// Foundation iterator-state machine. Each variant carries the
+/// minimum information needed to advance one step at a time. Once
+/// the iterator reports `done`, subsequent calls keep returning
+/// `done = true` with `value = undefined` (per spec §7.4.2 step 6).
+#[derive(Debug)]
+pub enum IteratorState {
+    /// Walks `array`'s dense storage in insertion order.
+    Array {
+        /// Backing array — held by `JsArray`'s internal `Rc` so
+        /// mutation through the original handle is observable.
+        array: JsArray,
+        /// Next element index to read. Compared against the
+        /// array's `len()` at every step so resizing the array
+        /// during iteration is observed correctly.
+        index: usize,
+    },
+    /// Walks `string`'s WTF-16 code units, yielding one-unit
+    /// strings. Surrogate pairs split (matches `String[@@iterator]`
+    /// only loosely; full code-point iteration arrives with task
+    /// 30's string completion).
+    String {
+        /// Backing string.
+        string: JsString,
+        /// Next code-unit index.
+        index: u32,
+    },
+    /// Permanently exhausted iterator — every step returns
+    /// `done = true`. The runtime transitions any iterator to this
+    /// state once it observes `done`, so re-driving an exhausted
+    /// iterator is a no-op rather than a re-iteration.
+    Exhausted,
+}
+
+/// Storage for `Value::BoundFunction`. Constructed by the
+/// `Op::BindFunction` opcode and consumed by every call dispatch
+/// path (`Op::Call`, `Op::CallWithThis`, `Op::CallMethodValue`).
+#[derive(Debug, Clone)]
+pub struct BoundFunction {
+    /// Underlying callable. Foundation slice keeps this as a
+    /// `Value`; chained `bind` flattens by re-wrapping at call
+    /// time without unbounded recursion (one hop per layer).
+    pub target: Value,
+    /// The `this` value the bound call receives. Overrides any
+    /// receiver the caller supplies.
+    pub bound_this: Value,
+    /// Arguments prepended to the caller's argument list at every
+    /// invocation. Stored inline up to four entries to keep the
+    /// usual `f.bind(t, a, b)` shape off the heap.
+    pub bound_args: SmallVec<[Value; 4]>,
 }
 
 /// One captured-variable cell. Cloning shares the same heap slot
@@ -148,6 +217,8 @@ impl Value {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 format!("[Function #{function_id}]")
             }
+            Value::BoundFunction(b) => format!("[BoundFunction → {}]", b.target.display_string()),
+            Value::Iterator(_) => "[object Iterator]".to_string(),
             Value::Object(_) => "[object Object]".to_string(),
             Value::Array(a) => {
                 let body = a.borrow_body();
@@ -172,9 +243,12 @@ impl Value {
                 }
             }
             Value::String(s) => !s.is_empty(),
-            Value::Function { .. } | Value::Closure { .. } | Value::Object(_) | Value::Array(_) => {
-                true
-            }
+            Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::Object(_)
+            | Value::Array(_)
+            | Value::Iterator(_) => true,
         }
     }
 
@@ -236,12 +310,16 @@ impl PartialEq for Value {
                 Value::Closure {
                     function_id: a,
                     upvalues: ua,
+                    ..
                 },
                 Value::Closure {
                     function_id: b,
                     upvalues: ub,
+                    ..
                 },
             ) => a == b && std::rc::Rc::ptr_eq(ua, ub),
+            (Value::BoundFunction(a), Value::BoundFunction(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::Iterator(a), Value::Iterator(b)) => std::rc::Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -302,12 +380,49 @@ pub struct Frame {
     /// frames. Indexed by `Op::LoadUpvalue` / `Op::StoreUpvalue`
     /// operands.
     pub upvalues: std::rc::Rc<[UpvalueCell]>,
+    /// `this` value visible inside the body. `<main>` and free
+    /// `Op::Call` invocations both bind `Value::Undefined`
+    /// (foundation strict default). Method calls set the receiver,
+    /// `Op::CallWithThis` and `Op::CallMethodValue` thread a caller-
+    /// provided value, and arrow closures override with their
+    /// lexically-captured `this` regardless of the call site.
+    pub this_value: Value,
+    /// Active try-handler stack. Pushed by [`Op::EnterTry`], popped
+    /// by [`Op::LeaveTry`] or by an exception unwind landing on a
+    /// matching catch / finally. Innermost handler is on top.
+    pub handlers: SmallVec<[TryHandler; 4]>,
+    /// In-flight exception parked when a throw routed into a
+    /// `finally` block. [`Op::EndFinally`] consumes it: `Some` →
+    /// re-throw, `None` → fall through. The compiler always emits
+    /// `EndFinally` at the close of every finally body, so the
+    /// re-throw protocol stays bytecode-visible.
+    pub pending_throw: Option<Value>,
+}
+
+/// One active try-handler descriptor — the runtime counterpart to
+/// the compiler's `TRY_BEGIN … TRY_END` block. Each
+/// [`Op::EnterTry`] dispatch pushes one of these onto the
+/// owning frame; throw unwinding pops back to the innermost match.
+#[derive(Debug, Clone, Copy)]
+pub struct TryHandler {
+    /// Catch clause entry pc, or `None` for `try { … } finally { … }`
+    /// without a catch.
+    pub catch_pc: Option<u32>,
+    /// Finally clause entry pc, or `None` when there is no
+    /// finally. The unwinder routes the in-flight exception
+    /// through finally even when a catch is present, so the
+    /// compiler emits the catch body first and chains its
+    /// completion through finally.
+    pub finally_pc: Option<u32>,
+    /// Register that the catch clause expects the thrown value in.
+    /// Ignored when `catch_pc` is `None`.
+    pub exc_register: u16,
 }
 
 impl Frame {
     /// Allocate a frame for `function`. Registers are pre-filled
     /// with `Value::Undefined`. Used for `<main>` (return register
-    /// = `None`).
+    /// = `None`, `this` = `undefined`).
     #[must_use]
     pub fn for_function(function: &Function) -> Self {
         Self::with_return(function, None)
@@ -320,16 +435,35 @@ impl Frame {
         Self::with_return_and_upvalues(function, return_register, std::rc::Rc::from(Vec::new()))
     }
 
-    /// Allocate a frame and bind captured upvalues. Used by
-    /// `MakeClosure`-driven calls. The function's own captured
-    /// locals are appended after the inherited parent upvalues — see
-    /// [`Op::MakeClosure`](otter_bytecode::Op::MakeClosure) for the
-    /// layout.
+    /// Allocate a frame and bind captured upvalues. `this` is left
+    /// at the foundation default (`Value::Undefined`); call sites
+    /// that need a non-default receiver use
+    /// [`Self::with_return_upvalues_and_this`].
     #[must_use]
     pub fn with_return_and_upvalues(
         function: &Function,
         return_register: Option<u16>,
         parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+    ) -> Self {
+        Self::with_return_upvalues_and_this(
+            function,
+            return_register,
+            parent_upvalues,
+            Value::Undefined,
+        )
+    }
+
+    /// Full constructor used by call sites that need to bind a
+    /// non-default `this`. The function's own captured locals are
+    /// appended after the inherited parent upvalues — see
+    /// [`Op::MakeClosure`](otter_bytecode::Op::MakeClosure) for the
+    /// layout.
+    #[must_use]
+    pub fn with_return_upvalues_and_this(
+        function: &Function,
+        return_register: Option<u16>,
+        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+        this_value: Value,
     ) -> Self {
         let total = function
             .param_count
@@ -358,6 +492,9 @@ impl Frame {
             registers,
             return_register,
             upvalues,
+            this_value,
+            handlers: SmallVec::new(),
+            pending_throw: None,
         }
     }
 }
@@ -406,6 +543,15 @@ pub enum VmError {
     },
     /// Tried to call a value that is not callable.
     NotCallable,
+    /// A user `throw` (or a re-throw from `finally`) walked the
+    /// entire frame stack without finding a matching handler. The
+    /// payload is the JS value that was thrown, rendered for
+    /// diagnostics through [`Value::display_string`]; the runtime
+    /// surfaces this as `OtterError::Runtime { code = "UNCAUGHT" }`.
+    Uncaught {
+        /// Display rendering of the thrown value.
+        value: String,
+    },
 }
 
 impl std::fmt::Display for VmError {
@@ -430,6 +576,7 @@ impl std::fmt::Display for VmError {
                 write!(f, "maximum call stack size exceeded (limit {limit})")
             }
             VmError::NotCallable => write!(f, "value is not a function"),
+            VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
         }
     }
 }
@@ -453,6 +600,12 @@ impl From<StringError> for VmError {
 /// Default JS call-stack depth limit. Catchable via
 /// [`VmError::StackOverflow`].
 pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
+
+/// Re-export of the bytecode-defined sentinel for "this try block
+/// has no catch / finally clause". Kept on the VM surface so
+/// embedders that want to hand-build EnterTry operands have one
+/// import path for the runtime semantics.
+pub use otter_bytecode::NO_HANDLER_OFFSET;
 
 /// One stack-frame snapshot captured at the moment an error is
 /// raised. Foundation slice 16 ships this — task 24 (exceptions)
@@ -640,6 +793,39 @@ impl Interpreter {
                     self.do_call(stack, module, &operands)?;
                     continue;
                 }
+                Op::CallWithThis => {
+                    self.do_call_with_this(stack, module, &operands)?;
+                    continue;
+                }
+                Op::CallMethodValue => {
+                    self.do_call_method_value(stack, module, &operands)?;
+                    continue;
+                }
+                Op::CallSpread => {
+                    self.do_call_spread(stack, module, &operands)?;
+                    continue;
+                }
+                Op::Throw => {
+                    let src = register_operand(operands.first())?;
+                    let value = stack[top_idx]
+                        .registers
+                        .get(src as usize)
+                        .cloned()
+                        .ok_or(VmError::InvalidOperand)?;
+                    Self::unwind_throw(stack, value)?;
+                    continue;
+                }
+                Op::EndFinally => {
+                    if let Some(value) = stack[top_idx].pending_throw.take() {
+                        Self::unwind_throw(stack, value)?;
+                    } else {
+                        stack[top_idx].pc = stack[top_idx]
+                            .pc
+                            .checked_add(1)
+                            .ok_or(VmError::InvalidOperand)?;
+                    }
+                    continue;
+                }
                 _ => {}
             }
 
@@ -653,7 +839,15 @@ impl Interpreter {
                     write_register(frame, dst, Value::Undefined)?;
                     frame.pc += 1;
                 }
-                Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::Call => {
+                Op::Return
+                | Op::ReturnValue
+                | Op::ReturnUndefined
+                | Op::Call
+                | Op::CallWithThis
+                | Op::CallMethodValue
+                | Op::CallSpread
+                | Op::Throw
+                | Op::EndFinally => {
                     unreachable!("stack-modifying ops handled earlier in this loop")
                 }
                 Op::MakeFunction => {
@@ -691,12 +885,26 @@ impl Interpreter {
                         cells.push(cell);
                     }
                     let upvalues: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(cells);
+                    // Arrow-closure receivers are bound lexically:
+                    // every later invocation ignores the call site
+                    // and uses the enclosing frame's `this`.
+                    let is_arrow = module
+                        .functions
+                        .get(function_id as usize)
+                        .map(|f| f.is_arrow)
+                        .unwrap_or(false);
+                    let bound_this = if is_arrow {
+                        Some(Box::new(frame.this_value.clone()))
+                    } else {
+                        None
+                    };
                     write_register(
                         frame,
                         dst,
                         Value::Closure {
                             function_id,
                             upvalues,
+                            bound_this,
                         },
                     )?;
                     frame.pc += 1;
@@ -1047,8 +1255,10 @@ impl Interpreter {
                         Value::Undefined
                         | Value::Function { .. }
                         | Value::Closure { .. }
+                        | Value::BoundFunction(_)
                         | Value::Object(_)
-                        | Value::Array(_) => NumberValue::Double(f64::NAN),
+                        | Value::Array(_)
+                        | Value::Iterator(_) => NumberValue::Double(f64::NAN),
                         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
                     };
                     write_register(frame, dst, Value::Number(value))?;
@@ -1091,44 +1301,128 @@ impl Interpreter {
                     write_register(frame, dst, Value::String(result_str))?;
                     frame.pc += 1;
                 }
-                Op::CallMethod => {
+                Op::LoadThis => {
                     let dst = register_operand(operands.first())?;
-                    let recv = register_operand(operands.get(1))?;
-                    let name_idx = const_operand(operands.get(2))?;
+                    let value = frame.this_value.clone();
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::NewError => {
+                    let dst = register_operand(operands.first())?;
+                    let msg_reg = register_operand(operands.get(1))?;
+                    let value = read_register(frame, msg_reg)?.clone();
+                    let message_str = match value {
+                        Value::Undefined => None,
+                        Value::String(s) => Some(s),
+                        other => {
+                            let s = JsString::from_str(&other.display_string(), &self.string_heap)?;
+                            Some(s)
+                        }
+                    };
+                    let obj = JsObject::new();
+                    let name = JsString::from_str("Error", &self.string_heap)?;
+                    obj.set("name", Value::String(name));
+                    if let Some(s) = message_str {
+                        obj.set("message", Value::String(s));
+                    }
+                    write_register(frame, dst, Value::Object(obj))?;
+                    frame.pc += 1;
+                }
+                Op::EnterTry => {
+                    let catch_off = imm32_operand(operands.first())?;
+                    let finally_off = imm32_operand(operands.get(1))?;
+                    let exc_register = register_operand(operands.get(2))?;
+                    let next_pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)? as i64;
+                    let resolve = |off: i32| -> Result<Option<u32>, VmError> {
+                        if off == NO_HANDLER_OFFSET {
+                            return Ok(None);
+                        }
+                        let target = next_pc + off as i64;
+                        if target < 0 || target > u32::MAX as i64 {
+                            return Err(VmError::InvalidOperand);
+                        }
+                        Ok(Some(target as u32))
+                    };
+                    let catch_pc = resolve(catch_off)?;
+                    let finally_pc = resolve(finally_off)?;
+                    if catch_pc.is_none() && finally_pc.is_none() {
+                        return Err(VmError::InvalidOperand);
+                    }
+                    frame.handlers.push(TryHandler {
+                        catch_pc,
+                        finally_pc,
+                        exc_register,
+                    });
+                    frame.pc += 1;
+                }
+                Op::LeaveTry => {
+                    if frame.handlers.pop().is_none() {
+                        return Err(VmError::InvalidOperand);
+                    }
+                    frame.pc += 1;
+                }
+                Op::BindFunction => {
+                    let dst = register_operand(operands.first())?;
+                    let callee_reg = register_operand(operands.get(1))?;
+                    let this_reg = register_operand(operands.get(2))?;
                     let argc = match operands.get(3) {
-                        Some(&Operand::ConstIndex(n)) => n,
+                        Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = match module.constants.get(name_idx as usize) {
-                        Some(Constant::String { utf16 }) => String::from_utf16_lossy(utf16),
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    // Collect argument registers into a SmallVec to
-                    // avoid `Vec` allocation for the common case.
-                    let mut arg_values: SmallVec<[Value; 4]> =
-                        SmallVec::with_capacity(argc as usize);
-                    for i in 0..argc as usize {
+                    let target = read_register(frame, callee_reg)?.clone();
+                    if !is_callable(&target) {
+                        return Err(VmError::NotCallable);
+                    }
+                    let bound_this = read_register(frame, this_reg)?.clone();
+                    let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
                         let r = register_operand(operands.get(4 + i))?;
-                        arg_values.push(read_register(frame, r)?.clone());
+                        bound_args.push(read_register(frame, r)?.clone());
                     }
-                    let recv_value = read_register(frame, recv)?.clone();
-                    // Dispatch by receiver kind. Each prototype
-                    // registry returns `None` for unknown method
-                    // names, falling through to the next branch
-                    // before raising `UnknownIntrinsic`.
-                    let entry = match &recv_value {
-                        Value::String(_) => string_prototype::lookup(&name),
-                        Value::Array(_) => array_prototype::lookup(&name),
-                        _ => None,
-                    }
-                    .ok_or_else(|| VmError::UnknownIntrinsic { name: name.clone() })?;
-                    let result = (entry.impl_fn)(&IntrinsicArgs {
-                        receiver: &recv_value,
-                        args: &arg_values,
-                        string_heap: &self.string_heap,
-                    })
-                    .map_err(intrinsic_to_vm_error)?;
-                    write_register(frame, dst, result)?;
+                    let bound = std::rc::Rc::new(BoundFunction {
+                        target,
+                        bound_this,
+                        bound_args,
+                    });
+                    write_register(frame, dst, Value::BoundFunction(bound))?;
+                    frame.pc += 1;
+                }
+                Op::GetIterator => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let value = read_register(frame, src)?.clone();
+                    let state = match value {
+                        Value::Array(array) => IteratorState::Array { array, index: 0 },
+                        Value::String(string) => IteratorState::String { string, index: 0 },
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let iter = std::rc::Rc::new(std::cell::RefCell::new(state));
+                    write_register(frame, dst, Value::Iterator(iter))?;
+                    frame.pc += 1;
+                }
+                Op::IteratorNext => {
+                    let value_dst = register_operand(operands.first())?;
+                    let done_dst = register_operand(operands.get(1))?;
+                    let iter_reg = register_operand(operands.get(2))?;
+                    let iter = match read_register(frame, iter_reg)? {
+                        Value::Iterator(rc) => rc.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let (value, done) = step_iterator(&iter, &self.string_heap)?;
+                    write_register(frame, value_dst, value)?;
+                    write_register(frame, done_dst, Value::Boolean(done))?;
+                    frame.pc += 1;
+                }
+                Op::ArrayPush => {
+                    let arr_reg = register_operand(operands.first())?;
+                    let value_reg = register_operand(operands.get(1))?;
+                    let value = read_register(frame, value_reg)?.clone();
+                    let array = match read_register(frame, arr_reg)? {
+                        Value::Array(a) => a.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let next_idx = array.len();
+                    array.set(next_idx, value);
                     frame.pc += 1;
                 }
             }
@@ -1158,7 +1452,8 @@ impl Interpreter {
     }
 
     /// Handle `Op::Call`: push a new frame for the callee with
-    /// arguments copied into the parameter slots.
+    /// arguments copied into the parameter slots and `this` bound
+    /// to `Value::Undefined` (foundation strict default).
     fn do_call(
         &self,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -1173,26 +1468,80 @@ impl Interpreter {
         };
 
         let top_idx = stack.len() - 1;
-        let caller = &mut stack[top_idx];
-        let (function_id, parent_upvalues) = match read_register(caller, callee_reg)? {
-            Value::Function { function_id } => (*function_id, std::rc::Rc::from(Vec::new())),
-            Value::Closure {
-                function_id,
-                upvalues,
-            } => (*function_id, upvalues.clone()),
-            _ => return Err(VmError::NotCallable),
-        };
-        // Collect args from caller registers — bounded by argc, so
-        // a `SmallVec<[Value; 8]>` keeps the small-call path off
-        // the heap.
+        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
         for i in 0..argc as usize {
             let r = register_operand(operands.get(3 + i))?;
-            args.push(read_register(caller, r)?.clone());
+            args.push(read_register(&stack[top_idx], r)?.clone());
         }
-        // Advance caller's pc so the post-call dispatch resumes
-        // after the call instruction.
-        caller.pc = caller.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        self.invoke(stack, module, &callee, Value::Undefined, args, dst)
+    }
+
+    /// Invoke `callee` with the explicit receiver `this_value` and
+    /// the given argument list. Centralizes the BoundFunction
+    /// unwrapping, closure `bound_this` override, and frame push so
+    /// every call opcode (`Op::Call`, `Op::CallWithThis`,
+    /// `Op::CallMethodValue`) shares one path.
+    ///
+    /// `dst` is the **caller's** register that should receive the
+    /// completion value when the callee returns. `caller_pc` must
+    /// already be advanced before this call so the post-pop
+    /// dispatch resumes after the originating instruction.
+    fn invoke(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        callee: &Value,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        // Walk through any number of `bind` layers, accumulating
+        // their bound arguments and overriding `this_value` with
+        // the innermost `bound_this`. The loop bound matches the
+        // JS-call stack-depth limit so a pathological self-bound
+        // chain still surfaces as `StackOverflow` rather than
+        // unbounded recursion.
+        let mut current = callee.clone();
+        let mut effective_this = this_value;
+        let mut effective_args = args;
+        let mut hops: u32 = 0;
+        while let Value::BoundFunction(bound) = current {
+            if hops >= self.max_stack_depth {
+                return Err(VmError::StackOverflow {
+                    limit: self.max_stack_depth,
+                });
+            }
+            hops += 1;
+            let mut combined: SmallVec<[Value; 8]> =
+                SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
+            combined.extend(bound.bound_args.iter().cloned());
+            combined.extend(effective_args);
+            effective_this = bound.bound_this.clone();
+            effective_args = combined;
+            current = bound.target.clone();
+        }
+        let (function_id, parent_upvalues, this_for_callee) = match current {
+            Value::Function { function_id } => {
+                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
+            }
+            Value::Closure {
+                function_id,
+                upvalues,
+                bound_this,
+            } => {
+                let this_value = match bound_this {
+                    Some(t) => *t,
+                    None => effective_this,
+                };
+                (function_id, upvalues, this_value)
+            }
+            _ => return Err(VmError::NotCallable),
+        };
 
         if stack.len() as u32 >= self.max_stack_depth {
             return Err(VmError::StackOverflow {
@@ -1203,11 +1552,16 @@ impl Interpreter {
             .functions
             .get(function_id as usize)
             .ok_or(VmError::InvalidOperand)?;
-        let mut new_frame = Frame::with_return_and_upvalues(function, Some(dst), parent_upvalues);
+        let mut new_frame = Frame::with_return_upvalues_and_this(
+            function,
+            Some(dst),
+            parent_upvalues,
+            this_for_callee,
+        );
         // Bind parameters: extra args are dropped, missing args
         // stay `Value::Undefined` (matches JS semantics).
-        let bind_count = (function.param_count as usize).min(args.len());
-        for (i, value) in args.into_iter().take(bind_count).enumerate() {
+        let bind_count = (function.param_count as usize).min(effective_args.len());
+        for (i, value) in effective_args.into_iter().take(bind_count).enumerate() {
             let slot = new_frame
                 .registers
                 .get_mut(i)
@@ -1216,6 +1570,260 @@ impl Interpreter {
         }
         stack.push(new_frame);
         Ok(())
+    }
+
+    /// Walk the live frame stack looking for a try-handler that
+    /// can absorb an in-flight throw. Within each frame, the
+    /// handler stack is searched innermost-first:
+    ///
+    /// - **Catch handler hit** — the thrown value is written into
+    ///   the handler's `exc_register`, the frame's pc jumps to the
+    ///   catch entry, the matching handler is popped, and dispatch
+    ///   resumes in that frame.
+    /// - **Finally-only handler hit** — the thrown value is parked
+    ///   on `frame.pending_throw`, the pc jumps to the finally
+    ///   entry, and the matching handler is popped.
+    ///   [`Op::EndFinally`] consumes the parked value to re-throw.
+    /// - **No handler in this frame** — the frame is popped and the
+    ///   search continues in the caller.
+    ///
+    /// Returns `Err(VmError::Uncaught { value })` when the frame
+    /// stack empties without a handler. The caller is expected to
+    /// propagate this as the script's failure outcome.
+    fn unwind_throw(stack: &mut SmallVec<[Frame; 8]>, value: Value) -> Result<(), VmError> {
+        let display = value.display_string();
+        let payload = value;
+        loop {
+            let Some(frame) = stack.last_mut() else {
+                return Err(VmError::Uncaught { value: display });
+            };
+            let Some(handler) = frame.handlers.pop() else {
+                stack.pop();
+                continue;
+            };
+            if let Some(catch_pc) = handler.catch_pc {
+                frame.pc = catch_pc;
+                let slot = frame
+                    .registers
+                    .get_mut(handler.exc_register as usize)
+                    .ok_or(VmError::InvalidOperand)?;
+                *slot = payload;
+                return Ok(());
+            }
+            let finally_pc = handler.finally_pc.ok_or(VmError::InvalidOperand)?;
+            frame.pc = finally_pc;
+            frame.pending_throw = Some(payload);
+            return Ok(());
+        }
+    }
+
+    /// Handle `Op::CallSpread`: read the args array, fan it out
+    /// into the standard call path. The receiver register holds
+    /// the explicit `this` value (foundation lowers free spread
+    /// calls with `this = undefined`).
+    fn do_call_spread(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let callee_reg = register_operand(operands.get(1))?;
+        let this_reg = register_operand(operands.get(2))?;
+        let args_reg = register_operand(operands.get(3))?;
+        let top_idx = stack.len() - 1;
+        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        let this_value = read_register(&stack[top_idx], this_reg)?.clone();
+        let args_array = match read_register(&stack[top_idx], args_reg)? {
+            Value::Array(a) => a.clone(),
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let args: SmallVec<[Value; 8]> = args_array.borrow_body().iter().cloned().collect();
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        self.invoke(stack, module, &callee, this_value, args, dst)
+    }
+
+    /// Handle `Op::CallWithThis`: same as `do_call` but the call
+    /// site supplies an explicit `this` register. Used by
+    /// `Function.prototype.call` lowering and the array-literal
+    /// path of `Function.prototype.apply`.
+    fn do_call_with_this(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let callee_reg = register_operand(operands.get(1))?;
+        let this_reg = register_operand(operands.get(2))?;
+        let argc = match operands.get(3) {
+            Some(&Operand::ConstIndex(n)) => n,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        let top_idx = stack.len() - 1;
+        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        let this_value = read_register(&stack[top_idx], this_reg)?.clone();
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
+        for i in 0..argc as usize {
+            let r = register_operand(operands.get(4 + i))?;
+            args.push(read_register(&stack[top_idx], r)?.clone());
+        }
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        self.invoke(stack, module, &callee, this_value, args, dst)
+    }
+
+    /// Handle `Op::CallMethodValue`: the universal method-call op.
+    /// Branches by receiver kind:
+    /// - `String` / `Array` — synchronous intrinsic-table dispatch.
+    ///   Result lands in the destination register without pushing
+    ///   a frame.
+    /// - `Object` — load the property; raise `NotCallable` if the
+    ///   resolved value is not a function; otherwise call it with
+    ///   `this = receiver`.
+    /// - `Function` / `Closure` / `BoundFunction` — only the
+    ///   `call`, `apply`, and `bind` shapes are recognised; anything
+    ///   else surfaces as `UnknownIntrinsic`.
+    fn do_call_method_value(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let recv_reg = register_operand(operands.get(1))?;
+        let name_idx = const_operand(operands.get(2))?;
+        let argc = match operands.get(3) {
+            Some(&Operand::ConstIndex(n)) => n as usize,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        let name = match module.constants.get(name_idx as usize) {
+            Some(Constant::String { utf16 }) => String::from_utf16_lossy(utf16),
+            _ => return Err(VmError::InvalidOperand),
+        };
+        let top_idx = stack.len() - 1;
+        let recv_value = read_register(&stack[top_idx], recv_reg)?.clone();
+        let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
+        for i in 0..argc {
+            let r = register_operand(operands.get(4 + i))?;
+            arg_values.push(read_register(&stack[top_idx], r)?.clone());
+        }
+
+        // Primitive prototypes go through the intrinsic table —
+        // synchronous, no frame push, advance pc and write directly.
+        let intrinsic = match &recv_value {
+            Value::String(_) => string_prototype::lookup(&name),
+            Value::Array(_) => array_prototype::lookup(&name),
+            _ => None,
+        };
+        if let Some(entry) = intrinsic {
+            let small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
+            let result = (entry.impl_fn)(&IntrinsicArgs {
+                receiver: &recv_value,
+                args: &small_args,
+                string_heap: &self.string_heap,
+            })
+            .map_err(intrinsic_to_vm_error)?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
+        }
+
+        // `Function.prototype.{call, apply, bind}` on a callable
+        // receiver. `apply` only accepts an `Array` (or omitted /
+        // null / undefined) for its second argument.
+        if is_callable(&recv_value) {
+            return self.dispatch_function_method(
+                stack,
+                module,
+                &recv_value,
+                &name,
+                arg_values,
+                dst,
+            );
+        }
+
+        // Plain object: load the property, validate callable, then
+        // dispatch with `this = recv`.
+        if let Value::Object(obj) = &recv_value {
+            let method = obj.get(&name).unwrap_or(Value::Undefined);
+            if !is_callable(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].pc = stack[top_idx]
+                .pc
+                .checked_add(1)
+                .ok_or(VmError::InvalidOperand)?;
+            return self.invoke(stack, module, &method, recv_value.clone(), arg_values, dst);
+        }
+
+        Err(VmError::UnknownIntrinsic { name })
+    }
+
+    /// Dispatch `call` / `apply` / `bind` on a callable receiver.
+    /// Foundation handles only the literal-array shape of `apply`
+    /// — non-array second arguments raise `TypeMismatch` so callers
+    /// learn quickly that the foundation slice rejects dynamic
+    /// argument arrays.
+    fn dispatch_function_method(
+        &self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        callee: &Value,
+        name: &str,
+        args: SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        match name {
+            "call" => {
+                let mut iter = args.into_iter();
+                let this_value = iter.next().unwrap_or(Value::Undefined);
+                let forwarded: SmallVec<[Value; 8]> = iter.collect();
+                stack[top_idx].pc = stack[top_idx]
+                    .pc
+                    .checked_add(1)
+                    .ok_or(VmError::InvalidOperand)?;
+                self.invoke(stack, module, callee, this_value, forwarded, dst)
+            }
+            "apply" => {
+                let mut iter = args.into_iter();
+                let this_value = iter.next().unwrap_or(Value::Undefined);
+                let forwarded: SmallVec<[Value; 8]> = match iter.next() {
+                    None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
+                    Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect(),
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                stack[top_idx].pc = stack[top_idx]
+                    .pc
+                    .checked_add(1)
+                    .ok_or(VmError::InvalidOperand)?;
+                self.invoke(stack, module, callee, this_value, forwarded, dst)
+            }
+            "bind" => {
+                let mut iter = args.into_iter();
+                let this_value = iter.next().unwrap_or(Value::Undefined);
+                let bound_args: SmallVec<[Value; 4]> = iter.collect();
+                let bound = std::rc::Rc::new(BoundFunction {
+                    target: callee.clone(),
+                    bound_this: this_value,
+                    bound_args,
+                });
+                let frame = &mut stack[top_idx];
+                write_register(frame, dst, Value::BoundFunction(bound))?;
+                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                Ok(())
+            }
+            _ => Err(VmError::UnknownIntrinsic {
+                name: name.to_string(),
+            }),
+        }
     }
 
     fn binop_regs(
@@ -1404,6 +2012,57 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
     Ok(())
 }
 
+/// Drive an iterator one step. Returns `(value, done)`. Once an
+/// iterator hands back `done = true`, its state transitions to
+/// `Exhausted` so subsequent calls are stable no-ops (matches the
+/// spec rule "an iterator never produces values after it has
+/// produced `done: true`"; §7.4.2 step 6).
+fn step_iterator(
+    iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+    string_heap: &StringHeap,
+) -> Result<(Value, bool), VmError> {
+    let mut state = iter.borrow_mut();
+    let outcome = match &mut *state {
+        IteratorState::Array { array, index } => {
+            if *index >= array.len() {
+                None
+            } else {
+                let v = array.get(*index);
+                *index += 1;
+                Some(v)
+            }
+        }
+        IteratorState::String { string, index } => {
+            if let Some(unit) = string.char_code_at(*index) {
+                let s = JsString::from_utf16_units(&[unit], string_heap)?;
+                *index += 1;
+                Some(Value::String(s))
+            } else {
+                None
+            }
+        }
+        IteratorState::Exhausted => None,
+    };
+    match outcome {
+        Some(value) => Ok((value, false)),
+        None => {
+            *state = IteratorState::Exhausted;
+            Ok((Value::Undefined, true))
+        }
+    }
+}
+
+/// `true` when `value` is one of the call-site shapes the dispatcher
+/// can invoke: a bytecode function, a closure, or a bound function.
+/// `Value::BoundFunction` is treated as callable even when it wraps
+/// another bound function — the call dispatcher unwraps the chain.
+fn is_callable(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Function { .. } | Value::Closure { .. } | Value::BoundFunction(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1430,6 +2089,7 @@ mod tests {
                 scratch,
                 param_count: 0,
                 own_upvalue_count: 0,
+                is_arrow: false,
                 code,
                 spans,
             }],
@@ -1473,6 +2133,214 @@ mod tests {
             interp.run(&module).unwrap_err().error,
             VmError::MissingReturn
         );
+    }
+
+    #[test]
+    fn unwind_throw_pops_frames_until_handler_or_uncaught() {
+        // No handlers anywhere in the stack: the throw escapes as
+        // VmError::Uncaught carrying the rendered value.
+        let main = Function {
+            id: 0,
+            name: "<main>".to_string(),
+            span: (0, 0),
+            locals: 0,
+            scratch: 1,
+            param_count: 0,
+            own_upvalue_count: 0,
+            is_arrow: false,
+            code: vec![Instruction {
+                pc: 0,
+                op: Op::ReturnUndefined,
+                operands: vec![],
+            }],
+            spans: vec![SpanEntry {
+                pc: 0,
+                span: (0, 0),
+            }],
+        };
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(&main));
+        // Push a second frame on top — should be popped during
+        // unwinding and not absorb the throw.
+        stack.push(Frame::for_function(&main));
+        let err = Interpreter::unwind_throw(&mut stack, Value::Boolean(true)).unwrap_err();
+        match err {
+            VmError::Uncaught { value } => assert_eq!(value, "true"),
+            other => panic!("expected Uncaught, got {other:?}"),
+        }
+        assert!(stack.is_empty(), "frames should be drained on uncaught");
+    }
+
+    #[test]
+    fn unwind_throw_lands_in_catch_handler() {
+        let main = Function {
+            id: 0,
+            name: "<main>".to_string(),
+            span: (0, 0),
+            locals: 0,
+            scratch: 2,
+            param_count: 0,
+            own_upvalue_count: 0,
+            is_arrow: false,
+            code: vec![Instruction {
+                pc: 0,
+                op: Op::ReturnUndefined,
+                operands: vec![],
+            }],
+            spans: vec![SpanEntry {
+                pc: 0,
+                span: (0, 0),
+            }],
+        };
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&main);
+        frame.handlers.push(TryHandler {
+            catch_pc: Some(42),
+            finally_pc: None,
+            exc_register: 1,
+        });
+        stack.push(frame);
+        Interpreter::unwind_throw(&mut stack, Value::Boolean(true)).unwrap();
+        assert_eq!(stack[0].pc, 42);
+        assert_eq!(stack[0].registers[1], Value::Boolean(true));
+        assert!(stack[0].handlers.is_empty());
+    }
+
+    #[test]
+    fn is_callable_recognises_call_shapes() {
+        assert!(is_callable(&Value::Function { function_id: 7 }));
+        assert!(is_callable(&Value::Closure {
+            function_id: 7,
+            upvalues: std::rc::Rc::from(Vec::new()),
+            bound_this: None,
+        }));
+        let bound = std::rc::Rc::new(BoundFunction {
+            target: Value::Function { function_id: 7 },
+            bound_this: Value::Undefined,
+            bound_args: SmallVec::new(),
+        });
+        assert!(is_callable(&Value::BoundFunction(bound)));
+        assert!(!is_callable(&Value::Number(NumberValue::Smi(1))));
+        assert!(!is_callable(&Value::Object(JsObject::new())));
+    }
+
+    #[test]
+    fn arrow_closure_overrides_call_site_this() {
+        // <main>: r0 = LoadThis; Return r0
+        // The arrow closure wraps function id 1 with `is_arrow=true`
+        // and a `bound_this = Some({tag: "outer"})`. We sneak the
+        // bound `this` in by hand-building the closure value rather
+        // than going through the full call sequence — the unit test
+        // is proving that the arrow's lexical receiver wins, not
+        // that the compiler emits the right opcode (the engine
+        // suite's `arrow-this.ts` covers the latter).
+        use std::rc::Rc;
+        let main = Function {
+            id: 0,
+            name: "<main>".to_string(),
+            span: (0, 0),
+            locals: 0,
+            scratch: 1,
+            param_count: 0,
+            own_upvalue_count: 0,
+            is_arrow: false,
+            code: vec![Instruction {
+                pc: 0,
+                op: Op::ReturnUndefined,
+                operands: vec![],
+            }],
+            spans: vec![SpanEntry {
+                pc: 0,
+                span: (0, 0),
+            }],
+        };
+        let arrow = Function {
+            id: 1,
+            name: "<arrow>".to_string(),
+            span: (0, 0),
+            locals: 0,
+            scratch: 1,
+            param_count: 0,
+            own_upvalue_count: 0,
+            is_arrow: true,
+            code: vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadThis,
+                    operands: vec![Operand::Register(0)],
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::ReturnValue,
+                    operands: vec![Operand::Register(0)],
+                },
+            ],
+            spans: vec![SpanEntry {
+                pc: 0,
+                span: (0, 0),
+            }],
+        };
+        let module = BytecodeModule {
+            module: "arrow.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![main, arrow],
+            constants: vec![],
+        };
+        // Build the closure by hand and dispatch via `invoke`. The
+        // bound_this is a marker string — if `LoadThis` returns it,
+        // the lexical override is working.
+        let interp = Interpreter::new();
+        let bound = JsString::from_str("outer", interp.string_heap()).unwrap();
+        let closure = Value::Closure {
+            function_id: 1,
+            upvalues: Rc::from(Vec::new()),
+            bound_this: Some(Box::new(Value::String(bound.clone()))),
+        };
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(&module.functions[0]));
+        // Reserve a scratch slot in <main> to receive the result.
+        stack[0].registers.push(Value::Undefined);
+        // Caller-supplied this is `Null` — the closure must override.
+        interp
+            .invoke(
+                &mut stack,
+                &module,
+                &closure,
+                Value::Null,
+                SmallVec::new(),
+                /* dst */ 0,
+            )
+            .unwrap();
+        // Drive the arrow's body to completion, then read r0 of <main>.
+        loop {
+            let top = stack.len() - 1;
+            let f = module
+                .functions
+                .get(stack[top].function_id as usize)
+                .unwrap();
+            let pc = stack[top].pc as usize;
+            let instr = &f.code[pc];
+            if matches!(instr.op, Op::ReturnValue) {
+                let value = stack[top].registers[0].clone();
+                stack.pop();
+                let caller = stack.last_mut().unwrap();
+                let dst = caller.return_register.unwrap_or(0) as usize;
+                caller.registers[dst] = value;
+                break;
+            }
+            if matches!(instr.op, Op::LoadThis) {
+                let dst = match instr.operands[0] {
+                    Operand::Register(r) => r,
+                    _ => unreachable!(),
+                };
+                let value = stack[top].this_value.clone();
+                stack[top].registers[dst as usize] = value;
+                stack[top].pc += 1;
+                continue;
+            }
+            unreachable!();
+        }
+        assert_eq!(stack[0].registers[0], Value::String(bound));
     }
 
     #[test]

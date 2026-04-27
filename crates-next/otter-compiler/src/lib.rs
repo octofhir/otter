@@ -461,6 +461,60 @@ impl FunctionContext {
         }
     }
 
+    /// Emit an [`Op::EnterTry`] with placeholder catch / finally
+    /// offsets and an exception register. Returns the instruction
+    /// pc so the caller can patch the targeted offset to the
+    /// emitted catch / finally landing.
+    ///
+    /// `catch_offset` and `finally_offset` are the **initial**
+    /// values stored in the operand list — typically a real
+    /// `0` placeholder for whichever clause needs patching, and
+    /// [`otter_vm::NO_HANDLER_OFFSET`] for the absent clause.
+    fn emit_enter_try(
+        &mut self,
+        catch_offset: i32,
+        finally_offset: i32,
+        exc_reg: u16,
+        span: (u32, u32),
+    ) -> u32 {
+        let pc = self.next_pc;
+        self.code.push(Instruction {
+            pc,
+            op: Op::EnterTry,
+            operands: vec![
+                Operand::Imm32(catch_offset),
+                Operand::Imm32(finally_offset),
+                Operand::Register(exc_reg),
+            ],
+        });
+        self.spans.push(SpanEntry { pc, span });
+        self.next_pc += 1;
+        pc
+    }
+
+    /// Patch a previously emitted [`Op::EnterTry`] so that one of
+    /// its offsets targets the **current** `next_pc`. Pass `true`
+    /// for `is_catch` to patch the catch offset, `false` to patch
+    /// the finally offset. The non-targeted offset is left
+    /// untouched (kept as the `NO_HANDLER_OFFSET` sentinel the
+    /// initial emit installed).
+    fn patch_enter_try_offset(&mut self, enter_pc: u32, is_catch: bool) {
+        let target = self.next_pc;
+        let offset = target as i64 - (enter_pc as i64 + 1);
+        let offset = i32::try_from(offset).expect("EnterTry offset out of i32 range");
+        let instr = self
+            .code
+            .iter_mut()
+            .find(|i| i.pc == enter_pc)
+            .expect("patch target missing");
+        debug_assert!(matches!(instr.op, Op::EnterTry));
+        let slot_idx = if is_catch { 0 } else { 1 };
+        match instr.operands.get_mut(slot_idx) {
+            Some(Operand::Imm32(slot)) => *slot = offset,
+            _ => panic!("EnterTry operand at index {slot_idx} not Imm32"),
+        }
+    }
+
     /// Emit a placeholder branch and return its instruction index
     /// so a later [`Self::patch_branch`] can fill in the offset.
     fn emit_branch_placeholder(&mut self, op: Op, cond_reg: Option<u16>, span: (u32, u32)) -> u32 {
@@ -769,6 +823,8 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             Ok(None)
         }
 
+        Statement::ForOfStatement(s) => compile_for_of_statement(cx, s),
+
         Statement::BreakStatement(s) => {
             let span = (s.span.start, s.span.end);
             if s.label.is_some() {
@@ -809,7 +865,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             let storage = cx.declare_binding(&name, false, span)?;
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
-            emit_make_callable(cx, tmp, const_idx, &captures, span);
+            emit_make_callable(cx, tmp, const_idx, &captures, false, span);
             cx.emit_store_storage(tmp, storage, span);
             cx.mark_initialized(&name);
             Ok(None)
@@ -828,6 +884,15 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             }
             Ok(None)
         }
+
+        Statement::ThrowStatement(s) => {
+            let span = (s.span.start, s.span.end);
+            let reg = compile_expr(cx, &s.argument, span)?;
+            cx.emit(Op::Throw, vec![Operand::Register(reg)], span);
+            Ok(None)
+        }
+
+        Statement::TryStatement(s) => compile_try_statement(cx, s),
 
         Statement::ContinueStatement(s) => {
             let span = (s.span.start, s.span.end);
@@ -1135,6 +1200,7 @@ fn compile_arrow_function(
     slot.scratch = child.scratch;
     slot.param_count = param_count;
     slot.own_upvalue_count = child.own_upvalue_count;
+    slot.is_arrow = true;
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))
@@ -1143,14 +1209,22 @@ fn compile_arrow_function(
 /// Emit the right "make a callable into `dst`" instruction:
 /// [`Op::MakeFunction`] when the inner function captures nothing,
 /// [`Op::MakeClosure`] otherwise.
+///
+/// Arrow functions always go through [`Op::MakeClosure`] (even with
+/// zero non-`this` captures) so the runtime can snapshot the
+/// enclosing frame's `this` into the closure value at construction
+/// time. Regular function declarations / expressions take `this`
+/// from the call site and use the lighter `MakeFunction` form when
+/// they have no captures.
 fn emit_make_callable(
     cx: &mut Compiler,
     dst: u16,
     function_const: u32,
     captures: &[u32],
+    is_arrow: bool,
     span: (u32, u32),
 ) {
-    if captures.is_empty() {
+    if captures.is_empty() && !is_arrow {
         cx.emit(
             Op::MakeFunction,
             vec![Operand::Register(dst), Operand::ConstIndex(function_const)],
@@ -1220,6 +1294,13 @@ fn compile_expr(
                 vec![Operand::Register(dst)],
                 (lit.span.start, lit.span.end),
             );
+            Ok(dst)
+        }
+
+        Expression::ThisExpression(t) => {
+            let span = (t.span.start, t.span.end);
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, vec![Operand::Register(dst)], span);
             Ok(dst)
         }
 
@@ -1646,40 +1727,106 @@ fn compile_expr(
         // String.prototype intrinsic table at run time.
         Expression::CallExpression(call) => compile_method_call(cx, call),
 
+        // `new Error("msg")` — foundation only recognises the
+        // built-in `Error` constructor; subclasses arrive in
+        // task 26 along with the rest of `class … extends Error`.
+        Expression::NewExpression(new_expr) => {
+            let new_span = (new_expr.span.start, new_expr.span.end);
+            let callee = unwrap_ts_expr(&new_expr.callee);
+            let Expression::Identifier(id) = callee else {
+                return Err(CompileError::Unsupported {
+                    node: "NewExpression with non-identifier callee".to_string(),
+                    span: new_span,
+                });
+            };
+            if id.name.as_str() != "Error" {
+                return Err(CompileError::Unsupported {
+                    node: format!(
+                        "NewExpression `new {}(…)`; foundation only supports `new Error(…)`",
+                        id.name
+                    ),
+                    span: new_span,
+                });
+            }
+            compile_error_construct(cx, &new_expr.arguments, new_span)
+        }
+
         Expression::ParenthesizedExpression(p) => {
             compile_expr(cx, &p.expression, (p.span.start, p.span.end))
         }
 
         Expression::ArrayExpression(arr) => {
             let span = (arr.span.start, arr.span.end);
-            let mut element_regs: Vec<u16> = Vec::with_capacity(arr.elements.len());
-            for el in &arr.elements {
-                match el {
-                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(s) => {
-                        return Err(CompileError::Unsupported {
-                            node: "ArrayExpression: spread element".to_string(),
-                            span: (s.span.start, s.span.end),
-                        });
-                    }
-                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
-                        // Hole: foundation slice fills with `undefined`.
-                        let r = cx.alloc_scratch();
-                        cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
-                        element_regs.push(r);
-                    }
-                    other => {
-                        let expr = other.to_expression();
-                        element_regs.push(compile_expr(cx, expr, span)?);
+            let has_spread = arr
+                .elements
+                .iter()
+                .any(|el| matches!(el, oxc_ast::ast::ArrayExpressionElement::SpreadElement(_)));
+            if !has_spread {
+                let mut element_regs: Vec<u16> = Vec::with_capacity(arr.elements.len());
+                for el in &arr.elements {
+                    match el {
+                        oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => {
+                            unreachable!("spread excluded above")
+                        }
+                        oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                            // Hole: foundation slice fills with `undefined`.
+                            let r = cx.alloc_scratch();
+                            cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                            element_regs.push(r);
+                        }
+                        other => {
+                            let expr = other.to_expression();
+                            element_regs.push(compile_expr(cx, expr, span)?);
+                        }
                     }
                 }
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(2 + element_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(element_regs.len() as u32));
+                operands.extend(element_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::NewArray, operands, span);
+                Ok(dst)
+            } else {
+                // Spread path: materialise an empty array, then
+                // append each element (or each iterator step for
+                // spread elements). Slightly less efficient than
+                // the dense `NewArray` form, but only paid for
+                // literals that actually contain `...`.
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::NewArray,
+                    vec![Operand::Register(dst), Operand::ConstIndex(0)],
+                    span,
+                );
+                for el in &arr.elements {
+                    match el {
+                        oxc_ast::ast::ArrayExpressionElement::SpreadElement(s) => {
+                            let inner_span = (s.span.start, s.span.end);
+                            emit_spread_into_array(cx, dst, &s.argument, inner_span)?;
+                        }
+                        oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                            let r = cx.alloc_scratch();
+                            cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                            cx.emit(
+                                Op::ArrayPush,
+                                vec![Operand::Register(dst), Operand::Register(r)],
+                                span,
+                            );
+                        }
+                        other => {
+                            let expr = other.to_expression();
+                            let r = compile_expr(cx, expr, span)?;
+                            cx.emit(
+                                Op::ArrayPush,
+                                vec![Operand::Register(dst), Operand::Register(r)],
+                                span,
+                            );
+                        }
+                    }
+                }
+                Ok(dst)
             }
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(2 + element_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(element_regs.len() as u32));
-            operands.extend(element_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::NewArray, operands, span);
-            Ok(dst)
         }
 
         Expression::ObjectExpression(obj) => {
@@ -1746,7 +1893,7 @@ fn compile_expr(
             let (function_id, captures) = compile_function(cx, &name, &f.params, &f.body, span)?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, span);
+            emit_make_callable(cx, dst, const_idx, &captures, false, span);
             Ok(dst)
         }
 
@@ -1755,7 +1902,7 @@ fn compile_expr(
             let (function_id, captures) = compile_arrow_function(cx, a, span)?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, span);
+            emit_make_callable(cx, dst, const_idx, &captures, true, span);
             Ok(dst)
         }
 
@@ -1766,22 +1913,299 @@ fn compile_expr(
     }
 }
 
-/// Lower a call expression. Two forms are supported:
+/// Lower `for (let x of expr) { body }` to the foundation
+/// iterator-protocol shape:
 ///
-/// - `receiver.method(args...)` — dispatched through the
-///   `String.prototype` intrinsic table at run time.
-/// - `callee(args...)` (free call) — emits `Op::Call`. Callee must
-///   evaluate to a `Value::Function` at run time; otherwise the VM
-///   raises `NotCallable`.
+/// ```text
+///   tmp_iter = GetIterator(expr)
+///   loop_top:
+///   IteratorNext value, done, tmp_iter
+///   JumpIfTrue done -> loop_exit
+///   <bind value into the loop variable>
+///   <body>
+///   Jump -> loop_top
+///   loop_exit:
+/// ```
+///
+/// The loop variable lives in a fresh scope per iteration so a
+/// `let`-declared binding does not leak between iterations or to
+/// the outside. `break` lands at `loop_exit`; `continue` jumps to
+/// the top so a fresh value is fetched. Real iterator-close
+/// semantics (running an `[@@return]` hook on early termination)
+/// land alongside generators in a later slice.
+fn compile_for_of_statement(
+    cx: &mut Compiler,
+    s: &oxc_ast::ast::ForOfStatement<'_>,
+) -> Result<Option<u16>, CompileError> {
+    let span = (s.span.start, s.span.end);
+    if s.r#await {
+        return Err(CompileError::Unsupported {
+            node: "ForOfStatement: for await".to_string(),
+            span,
+        });
+    }
+
+    // Identify the loop variable up front so we can complain
+    // clearly if the head shape exceeds the foundation subset.
+    let (binding_name, is_const) = match &s.left {
+        oxc_ast::ast::ForStatementLeft::VariableDeclaration(decl) => {
+            if matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var) {
+                return Err(CompileError::Unsupported {
+                    node: "ForOfStatement: `var` head".to_string(),
+                    span,
+                });
+            }
+            if decl.declarations.len() != 1 {
+                return Err(CompileError::Unsupported {
+                    node: "ForOfStatement: multi-declarator head".to_string(),
+                    span,
+                });
+            }
+            let declarator = &decl.declarations[0];
+            let name = match &declarator.id {
+                oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+                _ => {
+                    return Err(CompileError::Unsupported {
+                        node: "ForOfStatement: destructuring head".to_string(),
+                        span,
+                    });
+                }
+            };
+            let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+            (name, is_const)
+        }
+        _ => {
+            return Err(CompileError::Unsupported {
+                node: "ForOfStatement: assignment-target head (foundation requires `let`/`const`)"
+                    .to_string(),
+                span,
+            });
+        }
+    };
+
+    let iterable_reg = compile_expr(cx, &s.right, span)?;
+    let iter_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::GetIterator,
+        vec![Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+        span,
+    );
+
+    let value_reg = cx.alloc_scratch();
+    let done_reg = cx.alloc_scratch();
+
+    cx.loops.push(LoopFrame::default());
+    let loop_top = cx.next_pc;
+    cx.emit(
+        Op::IteratorNext,
+        vec![
+            Operand::Register(value_reg),
+            Operand::Register(done_reg),
+            Operand::Register(iter_reg),
+        ],
+        span,
+    );
+    let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+
+    // Per-iteration scope so `let x of …` rebinds fresh each pass.
+    cx.enter_scope();
+    let storage = cx.declare_binding(&binding_name, is_const, span)?;
+    cx.emit_store_storage(value_reg, storage, span);
+    cx.mark_initialized(&binding_name);
+    compile_statement(cx, &s.body)?;
+    cx.exit_scope();
+
+    let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
+    cx.patch_branch(back_jmp, loop_top);
+    cx.patch_branch_to_here(exit_jmp);
+
+    let frame = cx.loops.pop().expect("for-of loop frame");
+    for pc in frame.continue_patches {
+        cx.patch_branch(pc, loop_top);
+    }
+    for pc in frame.break_patches {
+        cx.patch_branch_to_here(pc);
+    }
+    Ok(None)
+}
+
+/// Lower `try { … } catch (e) { … } finally { … }` per ES spec
+/// completion-record semantics (the foundation slice approximates
+/// it with a `pending_throw` slot on the frame; see
+/// [`Frame::pending_throw`](otter_vm::Frame)). The lowering picks
+/// one of three shapes:
+///
+/// - `try { A } catch (e) { B }` (no finally): one [`Op::EnterTry`]
+///   with `catch_pc = C` and `finally_pc = NO_HANDLER_OFFSET`. The
+///   try body is followed by [`Op::LeaveTry`] and a forward jump
+///   past the catch landing.
+/// - `try { A } finally { C }` (no catch): one `EnterTry` with
+///   `catch_pc = NO_HANDLER_OFFSET` and `finally_pc = F`. The try
+///   body is followed by `LeaveTry` and falls through into `C`,
+///   which terminates with [`Op::EndFinally`].
+/// - `try { A } catch (e) { B } finally { C }`: two nested
+///   `EnterTry`s — the outer one routes any throw inside `A` or
+///   `B` through `C`, the inner one routes throws inside `A` to
+///   the catch landing. After `B` runs, control falls through into
+///   `C`; `EndFinally` re-throws any exception parked on the frame.
+///
+/// `finally`-rethrow rule (per the task spec): if `finally` itself
+/// throws, the new exception replaces the in-flight one. The
+/// runtime implements this by overwriting `pending_throw` whenever
+/// a fresh `Throw` walks into a finally handler.
+fn compile_try_statement(
+    cx: &mut Compiler,
+    s: &oxc_ast::ast::TryStatement<'_>,
+) -> Result<Option<u16>, CompileError> {
+    use otter_bytecode::NO_HANDLER_OFFSET;
+
+    let span = (s.span.start, s.span.end);
+    let has_catch = s.handler.is_some();
+    let has_finally = s.finalizer.is_some();
+    if !has_catch && !has_finally {
+        return Err(CompileError::Unsupported {
+            node: "TryStatement without catch or finally".to_string(),
+            span,
+        });
+    }
+
+    // Reserve the exception register up front so its index survives
+    // every branch — the unwinder writes the thrown value into it
+    // before jumping to the catch landing.
+    let exc_reg = cx.alloc_scratch();
+    let body_span = (s.block.span.start, s.block.span.end);
+
+    if has_catch && has_finally {
+        let outer = cx.emit_enter_try(NO_HANDLER_OFFSET, 0, exc_reg, span);
+        let inner = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
+
+        cx.enter_scope();
+        for inner_stmt in &s.block.body {
+            compile_statement(cx, inner_stmt)?;
+        }
+        cx.exit_scope();
+        cx.emit(Op::LeaveTry, vec![], span);
+        let success_jump = cx.emit_branch_placeholder(Op::Jump, None, span);
+
+        cx.patch_enter_try_offset(inner, /* catch */ true);
+        compile_catch_clause(cx, s.handler.as_ref().unwrap(), exc_reg, body_span)?;
+
+        cx.patch_branch_to_here(success_jump);
+
+        cx.patch_enter_try_offset(outer, /* finally */ false);
+        cx.emit(Op::LeaveTry, vec![], span);
+        compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
+        cx.emit(Op::EndFinally, vec![], span);
+        return Ok(None);
+    }
+
+    if has_catch {
+        let handler_pc = cx.emit_enter_try(0, NO_HANDLER_OFFSET, exc_reg, span);
+        cx.enter_scope();
+        for inner_stmt in &s.block.body {
+            compile_statement(cx, inner_stmt)?;
+        }
+        cx.exit_scope();
+        cx.emit(Op::LeaveTry, vec![], span);
+        let skip_catch = cx.emit_branch_placeholder(Op::Jump, None, span);
+
+        cx.patch_enter_try_offset(handler_pc, true);
+        compile_catch_clause(cx, s.handler.as_ref().unwrap(), exc_reg, body_span)?;
+
+        cx.patch_branch_to_here(skip_catch);
+        return Ok(None);
+    }
+
+    // try / finally only.
+    let handler_pc = cx.emit_enter_try(NO_HANDLER_OFFSET, 0, exc_reg, span);
+    cx.enter_scope();
+    for inner_stmt in &s.block.body {
+        compile_statement(cx, inner_stmt)?;
+    }
+    cx.exit_scope();
+    cx.emit(Op::LeaveTry, vec![], span);
+    cx.patch_enter_try_offset(handler_pc, false);
+    compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
+    cx.emit(Op::EndFinally, vec![], span);
+    Ok(None)
+}
+
+fn compile_catch_clause(
+    cx: &mut Compiler,
+    handler: &oxc_ast::ast::CatchClause<'_>,
+    exc_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    cx.enter_scope();
+    if let Some(param) = &handler.param {
+        let pname = match &param.pattern {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+            _ => {
+                return Err(CompileError::Unsupported {
+                    node: "CatchClause: destructuring binding".to_string(),
+                    span,
+                });
+            }
+        };
+        let storage = cx.declare_binding(&pname, false, span)?;
+        cx.emit_store_storage(exc_reg, storage, span);
+        cx.mark_initialized(&pname);
+    }
+    for inner in &handler.body.body {
+        compile_statement(cx, inner)?;
+    }
+    cx.exit_scope();
+    Ok(())
+}
+
+fn compile_finalizer(
+    cx: &mut Compiler,
+    finalizer: &oxc_ast::ast::BlockStatement<'_>,
+) -> Result<(), CompileError> {
+    cx.enter_scope();
+    for inner in &finalizer.body {
+        compile_statement(cx, inner)?;
+    }
+    cx.exit_scope();
+    Ok(())
+}
+
+/// Lower a call expression. Three forms are supported:
+///
+/// - `receiver.method(args...)` — emits [`Op::CallMethodValue`].
+///   The runtime branches by receiver kind (string / array
+///   intrinsics, plain object property dispatch, or
+///   `Function.prototype.{call, apply, bind}` for callables).
+/// - `callee.{call, apply, bind}(...)` with a syntactically obvious
+///   call shape — lowered directly to [`Op::CallWithThis`] /
+///   [`Op::BindFunction`] so the foundation interpreter avoids the
+///   `CallMethodValue` dispatch overhead and rejects non-array
+///   `apply` arguments at compile time when they're a literal.
+/// - `callee(args...)` (free call) — emits [`Op::Call`]; the callee
+///   receives `this = undefined`.
 ///
 /// Computed-method access, `new`, and spread arguments are
-/// deferred.
+/// deferred to later tasks.
 fn compile_method_call(
     cx: &mut Compiler,
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Result<u16, CompileError> {
     let span = (call.span.start, call.span.end);
     let callee = unwrap_ts_expr(&call.callee);
+    // Bare `Error("msg")` call (without `new`) is treated like
+    // `new Error("msg")` per ES spec §20.5.1.1 — same lowering.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Error"
+    {
+        return compile_error_construct(cx, &call.arguments, span);
+    }
+    let has_spread = call
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    if has_spread {
+        return compile_spread_call(cx, callee, &call.arguments, span);
+    }
     if let Expression::StaticMemberExpression(member) = callee {
         // Foundation built-ins on the global `Object`: lower a few
         // canonical forms directly to dedicated opcodes so the
@@ -1793,9 +2217,14 @@ fn compile_method_call(
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
             return compile_object_builtin(cx, method, &arg_regs, span);
         }
+        let method_name = member.property.name.as_str();
+        if let Some(dst) =
+            try_compile_function_method(cx, &member.object, method_name, &call.arguments, span)?
+        {
+            return Ok(dst);
+        }
         let receiver_reg = compile_expr(cx, &member.object, span)?;
-        let name = member.property.name.as_str();
-        let name_idx = cx.intern_string_constant(name);
+        let name_idx = cx.intern_string_constant(method_name);
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
@@ -1804,7 +2233,7 @@ fn compile_method_call(
         operands.push(Operand::ConstIndex(name_idx));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::CallMethod, operands, span);
+        cx.emit(Op::CallMethodValue, operands, span);
         return Ok(dst);
     }
     // Free call: `callee(args...)`.
@@ -1817,6 +2246,264 @@ fn compile_method_call(
     operands.push(Operand::ConstIndex(arg_regs.len() as u32));
     operands.extend(arg_regs.into_iter().map(Operand::Register));
     cx.emit(Op::Call, operands, span);
+    Ok(dst)
+}
+
+/// Lower a call expression whose argument list contains at least
+/// one `...spread` element to [`Op::CallSpread`]. Two callee
+/// shapes are handled:
+///
+/// - `obj.method(...args)` — receiver is evaluated once, the spread
+///   args become an array, dispatched with `this = obj`.
+/// - `callee(...args)` — free call, dispatched with
+///   `this = undefined`.
+///
+/// Mixed spread / non-spread arguments are folded into the same
+/// args array so `f(a, ...arr, b)` calls `f(a, ...arr items..., b)`.
+fn compile_spread_call(
+    cx: &mut Compiler,
+    callee: &Expression<'_>,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let (callee_reg, this_reg) = match callee {
+        Expression::StaticMemberExpression(member) => {
+            let recv = compile_expr(cx, &member.object, span)?;
+            let name_idx = cx.intern_string_constant(member.property.name.as_str());
+            let method_dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(method_dst),
+                    Operand::Register(recv),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            (method_dst, recv)
+        }
+        other => {
+            let r = compile_expr(cx, other, span)?;
+            let this_dst = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, vec![Operand::Register(this_dst)], span);
+            (r, this_dst)
+        }
+    };
+    let args_reg = compile_spread_call_args(cx, arguments, span)?;
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::CallSpread,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(callee_reg),
+            Operand::Register(this_reg),
+            Operand::Register(args_reg),
+        ],
+        span,
+    );
+    Ok(dst)
+}
+
+/// Lower the syntactic shapes `<expr>.call(...)`, `<expr>.apply(...)`,
+/// and `<expr>.bind(...)` directly to dedicated opcodes. Returns
+/// `None` when `method_name` is not one of the recognised triple,
+/// so the caller can fall through to the universal
+/// [`Op::CallMethodValue`] path.
+///
+/// The shape detection is **syntactic**: the receiver expression is
+/// evaluated only once, so `getFn().call(t, 1)` invokes `getFn()`
+/// exactly once. `apply` requires its second argument (when
+/// present) to be an array literal so the foundation can unpack it
+/// into [`Op::CallWithThis`] without a runtime spread; dynamic
+/// argument arrays surface as a `CompileError::Unsupported`
+/// pointing the caller at the future spread / `apply` task.
+fn try_compile_function_method(
+    cx: &mut Compiler,
+    receiver: &Expression<'_>,
+    method_name: &str,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<Option<u16>, CompileError> {
+    match method_name {
+        "call" => {
+            let callee_reg = compile_expr(cx, receiver, span)?;
+            let arg_regs = compile_call_args(cx, arguments, span)?;
+            let mut iter = arg_regs.into_iter();
+            let this_reg = match iter.next() {
+                Some(r) => r,
+                None => {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    r
+                }
+            };
+            let forwarded: Vec<u16> = iter.collect();
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::Register(this_reg));
+            operands.push(Operand::ConstIndex(forwarded.len() as u32));
+            operands.extend(forwarded.into_iter().map(Operand::Register));
+            cx.emit(Op::CallWithThis, operands, span);
+            Ok(Some(dst))
+        }
+        "bind" => {
+            let callee_reg = compile_expr(cx, receiver, span)?;
+            let arg_regs = compile_call_args(cx, arguments, span)?;
+            let mut iter = arg_regs.into_iter();
+            let this_reg = match iter.next() {
+                Some(r) => r,
+                None => {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    r
+                }
+            };
+            let bound: Vec<u16> = iter.collect();
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + bound.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::Register(this_reg));
+            operands.push(Operand::ConstIndex(bound.len() as u32));
+            operands.extend(bound.into_iter().map(Operand::Register));
+            cx.emit(Op::BindFunction, operands, span);
+            Ok(Some(dst))
+        }
+        "apply" => {
+            // `apply(thisArg, argsArray)` — second argument must
+            // be statically an array literal for foundation
+            // lowering. The receiver is still evaluated even when
+            // we fall back to the universal dispatch path so that
+            // observable side-effects keep their position.
+            let callee_reg = compile_expr(cx, receiver, span)?;
+            let mut args_iter = arguments.iter();
+            let this_reg = match args_iter.next() {
+                Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
+                    return Err(CompileError::Unsupported {
+                        node: "Function.prototype.apply: spread thisArg".to_string(),
+                        span: (s.span.start, s.span.end),
+                    });
+                }
+                Some(other) => compile_expr(cx, other.to_expression(), span)?,
+                None => {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    r
+                }
+            };
+            let mut forwarded: Vec<u16> = Vec::new();
+            match args_iter.next() {
+                None => {}
+                Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
+                    return Err(CompileError::Unsupported {
+                        node: "Function.prototype.apply: spread arg list".to_string(),
+                        span: (s.span.start, s.span.end),
+                    });
+                }
+                Some(other) => {
+                    let expr = unwrap_ts_expr(other.to_expression());
+                    match expr {
+                        Expression::ArrayExpression(arr) => {
+                            for el in &arr.elements {
+                                match el {
+                                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(s) => {
+                                        return Err(CompileError::Unsupported {
+                                            node: "Function.prototype.apply: spread element"
+                                                .to_string(),
+                                            span: (s.span.start, s.span.end),
+                                        });
+                                    }
+                                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                                        let r = cx.alloc_scratch();
+                                        cx.emit(
+                                            Op::LoadUndefined,
+                                            vec![Operand::Register(r)],
+                                            span,
+                                        );
+                                        forwarded.push(r);
+                                    }
+                                    el_expr => {
+                                        forwarded.push(compile_expr(
+                                            cx,
+                                            el_expr.to_expression(),
+                                            span,
+                                        )?);
+                                    }
+                                }
+                            }
+                        }
+                        Expression::NullLiteral(_) => {}
+                        Expression::Identifier(id) if id.name.as_str() == "undefined" => {}
+                        other => {
+                            return Err(CompileError::Unsupported {
+                                node: format!(
+                                    "Function.prototype.apply: dynamic args ({}); \
+                                     foundation requires an array literal",
+                                    expr_kind_name(other)
+                                ),
+                                span,
+                            });
+                        }
+                    }
+                }
+            }
+            if args_iter.next().is_some() {
+                return Err(CompileError::Unsupported {
+                    node: "Function.prototype.apply: extra arguments".to_string(),
+                    span,
+                });
+            }
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::Register(this_reg));
+            operands.push(Operand::ConstIndex(forwarded.len() as u32));
+            operands.extend(forwarded.into_iter().map(Operand::Register));
+            cx.emit(Op::CallWithThis, operands, span);
+            Ok(Some(dst))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Lower `new Error(arg)` / `Error(arg)` to [`Op::NewError`]. The
+/// foundation slice supports the zero- and one-argument shapes
+/// (the second `options` argument introduced by ES2022 is rejected
+/// with a clear diagnostic).
+fn compile_error_construct(
+    cx: &mut Compiler,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    if arguments.len() > 1 {
+        return Err(CompileError::Unsupported {
+            node: "Error: more than one argument (foundation accepts only `message`)".to_string(),
+            span,
+        });
+    }
+    let msg_reg = match arguments.first() {
+        None => {
+            let r = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+            r
+        }
+        Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
+            return Err(CompileError::Unsupported {
+                node: "Error: spread argument".to_string(),
+                span: (s.span.start, s.span.end),
+            });
+        }
+        Some(other) => compile_expr(cx, other.to_expression(), span)?,
+    };
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::NewError,
+        vec![Operand::Register(dst), Operand::Register(msg_reg)],
+        span,
+    );
     Ok(dst)
 }
 
@@ -1891,6 +2578,82 @@ fn compile_call_args(
         }
     }
     Ok(regs)
+}
+
+/// Emit the bytecode that builds a fresh `Array` register holding
+/// the call arguments fanned out from spreads. Returns the
+/// register that holds the resulting array. Used by the spread-in-
+/// call path; pure regular argument lists keep the dedicated
+/// fast path in [`compile_call_args`] / [`Op::Call`].
+fn compile_spread_call_args(
+    cx: &mut Compiler,
+    args: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::NewArray,
+        vec![Operand::Register(dst), Operand::ConstIndex(0)],
+        span,
+    );
+    for arg in args {
+        match arg {
+            oxc_ast::ast::Argument::SpreadElement(s) => {
+                let inner_span = (s.span.start, s.span.end);
+                emit_spread_into_array(cx, dst, &s.argument, inner_span)?;
+            }
+            other => {
+                let r = compile_expr(cx, other.to_expression(), span)?;
+                cx.emit(
+                    Op::ArrayPush,
+                    vec![Operand::Register(dst), Operand::Register(r)],
+                    span,
+                );
+            }
+        }
+    }
+    Ok(dst)
+}
+
+/// Append every element of `iterable` (already materialised as an
+/// expression) into the array in `dst_reg`. Lowered as a tight
+/// `IteratorNext` loop over a fresh iterator. Shared between the
+/// array-literal spread path and the call-argument spread path.
+fn emit_spread_into_array(
+    cx: &mut Compiler,
+    dst_reg: u16,
+    iterable: &Expression<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let iterable_reg = compile_expr(cx, iterable, span)?;
+    let iter_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::GetIterator,
+        vec![Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+        span,
+    );
+    let value_reg = cx.alloc_scratch();
+    let done_reg = cx.alloc_scratch();
+    let loop_top = cx.next_pc;
+    cx.emit(
+        Op::IteratorNext,
+        vec![
+            Operand::Register(value_reg),
+            Operand::Register(done_reg),
+            Operand::Register(iter_reg),
+        ],
+        span,
+    );
+    let exit = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+    cx.emit(
+        Op::ArrayPush,
+        vec![Operand::Register(dst_reg), Operand::Register(value_reg)],
+        span,
+    );
+    let back = cx.emit_branch_placeholder(Op::Jump, None, span);
+    cx.patch_branch(back, loop_top);
+    cx.patch_branch_to_here(exit);
+    Ok(())
 }
 
 fn expr_kind_name(expr: &Expression<'_>) -> &'static str {
@@ -1997,9 +2760,12 @@ fn stmt_kind_name(stmt: &Statement<'_>) -> &'static str {
         Statement::ClassDeclaration(_) => "ClassDeclaration",
         Statement::IfStatement(_) => "IfStatement",
         Statement::ForStatement(_) => "ForStatement",
+        Statement::ForOfStatement(_) => "ForOfStatement",
         Statement::WhileStatement(_) => "WhileStatement",
         Statement::DoWhileStatement(_) => "DoWhileStatement",
         Statement::ReturnStatement(_) => "ReturnStatement",
+        Statement::ThrowStatement(_) => "ThrowStatement",
+        Statement::TryStatement(_) => "TryStatement",
         Statement::BlockStatement(_) => "BlockStatement",
         Statement::TSEnumDeclaration(_) => "TSEnumDeclaration",
         Statement::TSInterfaceDeclaration(_) => "TSInterfaceDeclaration",
@@ -2055,6 +2821,211 @@ mod tests {
     use otter_syntax::parse;
 
     #[test]
+    fn for_of_emits_iterator_dispatch() {
+        let parsed = parse("for (let n of [1, 2]) { n; }", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::GetIterator));
+        assert!(main.code.iter().any(|i| i.op == Op::IteratorNext));
+    }
+
+    #[test]
+    fn array_literal_spread_emits_array_push_loop() {
+        let parsed = parse(
+            "const inner = [1, 2]; [0, ...inner, 3];",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::GetIterator));
+        assert!(main.code.iter().any(|i| i.op == Op::ArrayPush));
+    }
+
+    #[test]
+    fn spread_call_emits_call_spread() {
+        let parsed = parse(
+            "function f(a, b) { return a + b; } f(...[1, 2]);",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::CallSpread));
+    }
+
+    #[test]
+    fn throw_statement_emits_throw_op() {
+        let parsed = parse("throw new Error(\"x\");", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::NewError));
+        assert!(main.code.iter().any(|i| i.op == Op::Throw));
+    }
+
+    #[test]
+    fn try_catch_emits_enter_and_leave() {
+        let parsed = parse(
+            "try { throw new Error(\"x\"); } catch (e) { e; }",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::EnterTry));
+        assert!(main.code.iter().any(|i| i.op == Op::LeaveTry));
+        // No finally → no EndFinally.
+        assert!(!main.code.iter().any(|i| i.op == Op::EndFinally));
+    }
+
+    #[test]
+    fn try_finally_emits_end_finally() {
+        let parsed = parse("try { 1; } finally { 2; }", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(main.code.iter().any(|i| i.op == Op::EnterTry));
+        assert!(main.code.iter().any(|i| i.op == Op::EndFinally));
+    }
+
+    #[test]
+    fn try_catch_finally_emits_two_enter_try_blocks() {
+        let parsed = parse(
+            "try { throw new Error(\"x\"); } catch (e) { e; } finally { 1; }",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        let enters = main.code.iter().filter(|i| i.op == Op::EnterTry).count();
+        assert_eq!(
+            enters, 2,
+            "try/catch/finally should emit two EnterTry blocks: {:?}",
+            main.code
+        );
+        assert!(main.code.iter().any(|i| i.op == Op::EndFinally));
+    }
+
+    #[test]
+    fn new_non_error_constructor_rejected() {
+        let parsed = parse("class Foo {} new Foo();", SyntaxSourceKind::TypeScript).unwrap();
+        // ClassDeclaration is rejected long before NewExpression
+        // gets a chance, so this test just confirms the path
+        // returns an Unsupported diagnostic rather than panicking.
+        let err = compile(&parsed, "test.ts").unwrap_err();
+        assert!(matches!(err, CompileError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn this_expression_emits_load_this() {
+        let parsed = parse("this;", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(
+            main.code.iter().any(|i| i.op == Op::LoadThis),
+            "expected LoadThis in {:?}",
+            main.code
+        );
+    }
+
+    #[test]
+    fn method_call_emits_call_method_value() {
+        let parsed = parse(
+            "const o = { v: 1 }; o.toString();",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(
+            main.code.iter().any(|i| i.op == Op::CallMethodValue),
+            "expected CallMethodValue: {:?}",
+            main.code
+        );
+    }
+
+    #[test]
+    fn fn_call_lowers_to_call_with_this() {
+        let parsed = parse(
+            "function f() { return this; } f.call({});",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(
+            main.code.iter().any(|i| i.op == Op::CallWithThis),
+            "expected CallWithThis: {:?}",
+            main.code
+        );
+    }
+
+    #[test]
+    fn fn_apply_with_array_literal_unpacks() {
+        let parsed = parse(
+            "function f(a, b) { return a + b; } f.apply({}, [1, 2]);",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(
+            main.code.iter().any(|i| i.op == Op::CallWithThis),
+            "apply with literal array should lower to CallWithThis: {:?}",
+            main.code
+        );
+    }
+
+    #[test]
+    fn fn_apply_with_dynamic_args_rejected() {
+        let parsed = parse(
+            "function f() {} const args = [1]; f.apply({}, args);",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let err = compile(&parsed, "test.ts").unwrap_err();
+        assert!(
+            matches!(err, CompileError::Unsupported { ref node, .. } if node.contains("apply")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fn_bind_emits_bind_function() {
+        let parsed = parse(
+            "function f() {} f.bind({}, 1, 2);",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        let main = module.main();
+        assert!(
+            main.code.iter().any(|i| i.op == Op::BindFunction),
+            "expected BindFunction: {:?}",
+            main.code
+        );
+    }
+
+    #[test]
+    fn arrow_record_marked_arrow_and_emits_make_closure() {
+        let parsed = parse("const f = () => 1; f();", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        // Arrows always go through MakeClosure (even with zero
+        // captures) so the runtime can snapshot enclosing `this`.
+        let main = module.main();
+        assert!(
+            main.code.iter().any(|i| i.op == Op::MakeClosure),
+            "arrow should emit MakeClosure: {:?}",
+            main.code
+        );
+        let arrow_fn = module
+            .functions
+            .iter()
+            .find(|f| f.is_arrow)
+            .expect("arrow function record");
+        assert_eq!(arrow_fn.name, "<arrow>");
+    }
+
+    #[test]
     fn closure_emits_make_closure_with_capture() {
         let parsed = parse(
             "function makeCounter() { let n = 0; return function() { n = n + 1; return n; }; }\nmakeCounter();",
@@ -2107,10 +3078,11 @@ mod tests {
 
     #[test]
     fn unsupported_statement_rejects() {
-        // `try`/`catch` is not yet supported in the foundation
-        // subset; expect the Unsupported diagnostic with any
-        // descriptive node name.
-        let parsed = parse("try {} catch (e) {}", SyntaxSourceKind::TypeScript).unwrap();
+        // `with` is not in the foundation subset and never will be —
+        // expect the Unsupported diagnostic with a descriptive node
+        // name. (`try`/`catch` shipped in task 24 so it's no longer
+        // a useful exemplar here.)
+        let parsed = parse("with (o) { x; }", SyntaxSourceKind::TypeScript).unwrap();
         let err = compile(&parsed, "test.ts").unwrap_err();
         assert!(matches!(err, CompileError::Unsupported { .. }));
     }

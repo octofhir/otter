@@ -64,6 +64,7 @@ mod tests {
                 scratch: 1,
                 param_count: 0,
                 own_upvalue_count: 0,
+                is_arrow: false,
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::Return,

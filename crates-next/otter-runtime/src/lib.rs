@@ -978,6 +978,11 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             "NOT_CALLABLE",
             "value is not a function".to_string(),
         ),
+        VmError::Uncaught { value } => runtime_diagnostic(
+            DiagnosticKind::Type,
+            "UNCAUGHT",
+            format!("uncaught exception: {value}"),
+        ),
         VmError::MissingReturn | VmError::InvalidOperand => OtterError::Internal {
             code: "VM_BYTECODE_INVARIANT".to_string(),
             message: display,
@@ -1009,11 +1014,11 @@ mod tests {
 
     #[test]
     fn otter_rejects_unsupported_js_feature() {
-        // `try`/`catch` is intentionally not in the foundation
-        // subset (slice 13 ships function calls; exception handling
-        // is a separate, later slice).
+        // `with` is permanently outside the foundation subset, so
+        // it makes a stable canary for the FEATURE_NOT_IN_SLICE
+        // diagnostic shape. (`try`/`catch` shipped in task 24.)
         let mut otter = Otter::new();
-        let err = otter.run_typescript("try {} catch (e) {}").unwrap_err();
+        let err = otter.run_typescript("with (o) { x; }").unwrap_err();
         match err {
             OtterError::Compile { diagnostics } => {
                 assert_eq!(diagnostics.len(), 1);

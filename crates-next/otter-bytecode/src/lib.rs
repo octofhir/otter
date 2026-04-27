@@ -38,6 +38,14 @@ pub mod dump;
 
 use serde::{Deserialize, Serialize};
 
+/// Sentinel offset value that means "this try block does not have
+/// a catch (or finally) clause". Picked as `i32::MIN` so any real
+/// PC delta the compiler emits stays clear of it. The dispatcher
+/// translates the sentinel to `Option::None` when reading
+/// [`Op::EnterTry`] operands; the compiler installs it for the
+/// absent clause when emitting the instruction.
+pub const NO_HANDLER_OFFSET: i32 = i32::MIN;
+
 /// The canonical foundation opcode set.
 ///
 /// The harness slice (task 07) provides only the three opcodes
@@ -70,10 +78,20 @@ pub enum Op {
     /// `r<dst> = r<recv>[r<idx>]` for string operand. Out-of-range
     /// yields the empty string.
     GetStringIndex,
-    /// Variadic method call dispatched through the
-    /// `String.prototype` intrinsic table. Operands:
+    /// Universal variadic method call. Operands:
     /// `dst, recv, name_const, argc, args...`.
-    CallMethod,
+    ///
+    /// At runtime the dispatcher branches on the receiver kind:
+    /// - `String` / `Array` — looks the method up in the matching
+    ///   prototype intrinsic table.
+    /// - `Object` — loads the property; raises `TypeMismatch` when
+    ///   the property is missing or not callable; otherwise calls
+    ///   the resolved function with `this` bound to the receiver.
+    /// - `Function` / `Closure` / `BoundFunction` — dispatches the
+    ///   `call`, `apply`, and `bind` shapes through the same path
+    ///   so dynamic `f["call"](...)` keeps working.
+    /// - Anything else — `TypeMismatch`.
+    CallMethodValue,
 
     // Polymorphic binary operators. Operands: `dst, lhs, rhs`.
     // Handle Number+Number and String+String operand pairs;
@@ -165,8 +183,82 @@ pub enum Op {
     /// Operands: `Register(src), Imm32(upvalue_idx)`.
     StoreUpvalue,
     /// Variadic call. Operands: `dst, callee, argc, args...`. The
-    /// callee must be a function value at this slice.
+    /// callee must be a function value at this slice. The callee
+    /// receives `this = undefined` (foundation default).
     Call,
+    /// Variadic call with an explicit receiver. Operands:
+    /// `dst, callee, this, argc, args...`. Used by
+    /// `Function.prototype.call` / `apply` lowering.
+    CallWithThis,
+    /// `r<dst> = bound function`. Operands:
+    /// `dst, callee, this, argc, args...`. Builds a
+    /// `Value::BoundFunction` that, when invoked, forwards to
+    /// `callee` with `this` and `args` prepended to call-site
+    /// arguments. Used by `Function.prototype.bind` lowering.
+    BindFunction,
+    /// `r<dst> = current frame's `this` value`. Operand: `dst`.
+    /// Module top level binds `this` to `undefined` (foundation
+    /// strict default).
+    LoadThis,
+    /// Throw `r<src>` as an exception. Operand: `Register(src)`.
+    /// Walks the frame's handler stack; on miss, pops the frame and
+    /// continues the search in the caller. An exception that
+    /// reaches the bottom of the call stack surfaces through the
+    /// public API as `OtterError::Runtime` with `code = "UNCAUGHT"`.
+    Throw,
+    /// Push a try-handler entry onto the current frame's handler
+    /// stack. Operands:
+    /// `Imm32(catch_offset), Imm32(finally_offset), Register(exc_dst)`.
+    /// Offsets are signed PC deltas relative to the **next**
+    /// instruction (matching `Op::Jump`'s convention). A negative
+    /// or sentinel `i32::MIN` offset means "no such handler"; the
+    /// dispatcher treats absent offsets accordingly. `exc_dst` is
+    /// the register the catch clause expects the thrown value in;
+    /// for try/finally without a catch, the compiler still picks a
+    /// scratch register but the dispatcher leaves it untouched on
+    /// the finally path.
+    EnterTry,
+    /// Pop the most recent try-handler entry pushed by
+    /// [`Op::EnterTry`] in the current frame. No operands.
+    LeaveTry,
+    /// Re-throw any in-flight exception that was parked on the
+    /// frame when a throw routed through a `finally` block. No
+    /// operands. When no throw is parked the dispatcher falls
+    /// through, so a `finally` running on the success path is a
+    /// silent no-op.
+    EndFinally,
+    /// `r<dst> = new Error(r<msg>)`. Operands:
+    /// `Register(dst), Register(msg)`. Materialises a foundation
+    /// `Error` object with `name = "Error"` and `message = msg`,
+    /// where `msg` is coerced to its display string when not
+    /// already a `String`. Used by both `new Error(x)` and
+    /// `Error(x)` lowering — the foundation makes no observable
+    /// distinction yet (subclassing arrives with task 26).
+    NewError,
+
+    /// `r<dst> = GetIterator(r<src>)`. Operands:
+    /// `Register(dst), Register(src)`. The runtime produces an
+    /// internal iterator value over the source: `Array` walks
+    /// elements, `String` walks code units, anything else raises
+    /// `TypeMismatch`. Real `[@@iterator]` resolution lands when
+    /// `Symbol` arrives (task 37).
+    GetIterator,
+    /// Drive an iterator one step. Operands:
+    /// `Register(value_dst), Register(done_dst), Register(iter)`.
+    /// Writes the next value into `value_dst` and a `Boolean` into
+    /// `done_dst`; once `done_dst` is `true` the value is
+    /// `undefined` and further calls keep returning `done = true`.
+    IteratorNext,
+    /// Append `r<value>` to the array in `r<arr>`. Operands:
+    /// `Register(arr), Register(value)`. No result. Used by the
+    /// spread lowering for array literals.
+    ArrayPush,
+    /// Variadic-by-array call. Operands:
+    /// `Register(dst), Register(callee), Register(this),
+    /// Register(args)`. The args register holds a `Value::Array`
+    /// whose elements become the call arguments, in order. Used
+    /// by spread in call expressions (`f(...arr)` and friends).
+    CallSpread,
     /// Return `r<src>` from the current function. Reuses
     /// [`Op::Return`] semantics in `<main>`; in nested calls the
     /// dispatcher pops the frame and writes the value into the
@@ -235,7 +327,19 @@ impl Op {
             Op::LoadFalse => "LOAD_FALSE",
             Op::LoadLength => "LOAD_LENGTH",
             Op::GetStringIndex => "GET_STRING_INDEX",
-            Op::CallMethod => "CALL_METHOD",
+            Op::CallMethodValue => "CALL_METHOD_VALUE",
+            Op::CallWithThis => "CALL_WITH_THIS",
+            Op::BindFunction => "BIND_FUNCTION",
+            Op::LoadThis => "LOAD_THIS",
+            Op::Throw => "THROW",
+            Op::EnterTry => "ENTER_TRY",
+            Op::LeaveTry => "LEAVE_TRY",
+            Op::EndFinally => "END_FINALLY",
+            Op::NewError => "NEW_ERROR",
+            Op::GetIterator => "GET_ITERATOR",
+            Op::IteratorNext => "ITERATOR_NEXT",
+            Op::ArrayPush => "ARRAY_PUSH",
+            Op::CallSpread => "CALL_SPREAD",
             Op::Add => "ADD",
             Op::Sub => "SUB",
             Op::Mul => "MUL",
@@ -280,23 +384,27 @@ impl Op {
         }
     }
 
-    /// Declared operand arity. `CallMethod` is variadic; the
+    /// Declared operand arity. `CallMethodValue` is variadic; the
     /// instruction stream stores `dst, recv, name_const, argc`
     /// followed by `argc` register operands, so the actual operand
     /// count is `4 + argc`. `operand_count` returns the **prefix**
     /// length; consumers walk the variadic tail by reading `argc`.
+    /// `CallWithThis` and `BindFunction` follow the same convention
+    /// with an extra `this` register before `argc`.
     #[must_use]
     pub const fn operand_count(self) -> usize {
         match self {
-            Op::Nop | Op::ReturnUndefined => 0,
+            Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally => 0,
             Op::LoadUndefined
             | Op::LoadNull
             | Op::LoadTrue
             | Op::LoadFalse
+            | Op::LoadThis
             | Op::Return
             | Op::ReturnValue
             | Op::Jump
             | Op::TdzError
+            | Op::Throw
             | Op::NewObject => 1,
             Op::LoadString
             | Op::LoadNumber
@@ -330,14 +438,25 @@ impl Op {
             | Op::StoreProperty
             | Op::DeleteProperty
             | Op::Instanceof => 3,
-            Op::GetPrototype | Op::SetPrototype | Op::ArrayLength => 2,
+            Op::GetPrototype
+            | Op::SetPrototype
+            | Op::ArrayLength
+            | Op::NewError
+            | Op::GetIterator
+            | Op::ArrayPush => 2,
+            Op::IteratorNext => 3,
+            Op::CallSpread => 4,
             // `NewArray` is variadic: `dst, count, elems...`. The
             // dispatcher reads the count and walks the trailing
             // operands.
             Op::NewArray => 2,
             Op::LoadElement | Op::StoreElement => 3,
-            Op::CallMethod => 4, // dst, recv, name_const, argc
-            Op::Call => 3,       // dst, callee, argc — args follow
+            Op::CallMethodValue => 4, // dst, recv, name_const, argc
+            Op::Call => 3,            // dst, callee, argc — args follow
+            // dst, callee, this, argc — args follow.
+            Op::CallWithThis | Op::BindFunction => 4,
+            // catch_offset, finally_offset, exc_dst.
+            Op::EnterTry => 3,
             // `MakeClosure` is variadic: `dst, function_const,
             // upvalue_count, srcs...`. The dispatcher reads the
             // count and walks the trailing operands.
@@ -360,6 +479,8 @@ impl Op {
                 | Op::Return
                 | Op::ReturnValue
                 | Op::ReturnUndefined
+                | Op::Throw
+                | Op::EndFinally
         )
     }
 }
@@ -421,6 +542,14 @@ pub struct Function {
     /// and parent-passed captures follow.
     #[serde(default)]
     pub own_upvalue_count: u16,
+    /// `true` when this record is an arrow function. Arrow bodies
+    /// inherit the enclosing function's `this` lexically, so
+    /// `MakeClosure` snapshots the current frame's `this` into the
+    /// resulting closure value at construction time. Regular
+    /// function declarations and expressions have `false` here and
+    /// receive `this` from the call site instead.
+    #[serde(default)]
+    pub is_arrow: bool,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.

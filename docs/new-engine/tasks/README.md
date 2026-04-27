@@ -4,8 +4,12 @@ This directory holds the **currently open** tasks. Completed work
 gets removed once it ships; the foundation phase tasks (07–13) have
 already shipped and were deleted from this index. The new engine in
 `crates-next/*` runs JS / TS scripts end-to-end with strings,
-numbers, booleans, control flow, locals, function declarations, and
-recursive calls. **39/39 engine fixtures pass.**
+numbers, booleans, control flow, locals, function declarations,
+recursive calls, objects, arrays, closures with captured upvalues,
+`this` binding, method calls, `Function.prototype.{call, apply,
+bind}`, `throw` / `try` / `catch` / `finally`, a foundation
+`Error` constructor, and the iterator protocol with `for…of` plus
+spread in array literals and calls. **91/91 engine fixtures pass.**
 
 Foundation artifacts that stay (not tasks, never deleted):
 
@@ -63,17 +67,12 @@ ships independently end-to-end.
 
 ### Phase C — closures, methods, exceptions
 
-| File | One-line goal |
-|---|---|
-| [22-closures-with-upvalues.md](./22-closures-with-upvalues.md) | Captured-variable model so inner functions can read / mutate outer-scope locals. |
-| [23-this-and-method-calls.md](./23-this-and-method-calls.md) | `this` binding, `obj.method()` calling, `Function.prototype.{bind,call,apply}`. |
-| [24-throw-try-catch-finally.md](./24-throw-try-catch-finally.md) | `throw`, `try` / `catch` / `finally`, error objects, propagation through frames with diagnostics. |
+✅ Phase C complete — see Phase D for the next batch.
 
 ### Phase D — iterators and language essentials
 
 | File | One-line goal |
 |---|---|
-| [25-iterator-protocol-and-for-of.md](./25-iterator-protocol-and-for-of.md) | Iterator protocol, `for…of`, spread in calls and array literals. |
 | [26-classes-extends-super.md](./26-classes-extends-super.md) | `class` declarations, `extends`, `super`, methods, getters / setters, static members. |
 | [27-rest-default-destructuring-params.md](./27-rest-default-destructuring-params.md) | Rest parameters, default parameter values, destructuring patterns in parameters. |
 

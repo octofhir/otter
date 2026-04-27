@@ -41,6 +41,7 @@ fn bench_dispatch(c: &mut Criterion) {
             scratch: 1,
             param_count: 0,
             own_upvalue_count: 0,
+            is_arrow: false,
             code,
             spans,
         }],

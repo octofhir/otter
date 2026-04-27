@@ -59,6 +59,9 @@ pub enum IntrinsicReceiver {
     /// `Boolean.prototype.<name>`. Receiver is a `Value::Boolean`
     /// (added in slice 12).
     Boolean,
+    /// `Array.prototype.<name>`. Receiver is a `Value::Array`
+    /// (added in slice 21).
+    Array,
 }
 
 /// Borrowed call frame for an intrinsic.

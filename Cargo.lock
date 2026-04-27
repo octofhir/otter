@@ -485,7 +485,9 @@ dependencies = [
  "otter-syntax",
  "oxc_allocator",
  "oxc_ast",
+ "oxc_ast_visit",
  "oxc_span",
+ "oxc_syntax",
  "serde",
  "thiserror",
 ]
@@ -610,6 +612,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "oxc_ast_visit"
+version = "0.127.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82466fd1885834078becf1385380c40624bf511723b695104b21f293c7dc5271"
+dependencies = [
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_span",
+ "oxc_syntax",
 ]
 
 [[package]]

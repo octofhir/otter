@@ -41,7 +41,9 @@ pub struct JsArray {
 /// borrowed.
 #[derive(Debug, Default)]
 pub struct ArrayBody {
-    elements: SmallVec<[Value; 4]>,
+    /// Element storage. Crate-internal — outside callers should
+    /// go through `JsArray::{get, set, push, pop, ...}`.
+    pub(crate) elements: SmallVec<[Value; 4]>,
 }
 
 impl JsArray {

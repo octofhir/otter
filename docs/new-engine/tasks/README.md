@@ -59,9 +59,7 @@ ships independently end-to-end.
 
 ### Phase B — the object model
 
-| File | One-line goal |
-|---|---|
-| [21-array-prototype-essentials.md](./21-array-prototype-essentials.md) | `push` / `pop` / `slice` / `concat` / `forEach` / `map` / `reduce`. |
+✅ Phase B complete — see Phase C for the next batch.
 
 ### Phase C — closures, methods, exceptions
 

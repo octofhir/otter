@@ -1,0 +1,164 @@
+//! Capture analysis: which of a function's own bindings are read /
+//! written from inside a nested function?
+//!
+//! Closure semantics (task 22) needs every binding that escapes its
+//! lexical owner to live in a heap-shared
+//! [`UpvalueCell`](otter_vm::UpvalueCell), not a register slot. This
+//! module performs a **single pre-pass** over each function body
+//! that returns the set of names which need that promotion.
+//!
+//! # Contents
+//! - [`analyze_function`] — pre-pass driver for one function /
+//!   arrow / module body.
+//!
+//! # Invariants
+//! - The pre-pass is conservative: it ignores shadowing inside
+//!   nested functions, so a nested `let n` that shadows the outer
+//!   `n` may still mark the outer `n` as captured. That is harmless
+//!   (one extra cell allocated) and lets us skip per-scope shadow
+//!   tracking inside this analyzer.
+//! - We never recurse across module / file boundaries — each
+//!   function body is its own analysis unit.
+//!
+//! # See also
+//! - [`docs/new-engine/tasks/22-closures-with-upvalues.md`](
+//!     ../../../docs/new-engine/tasks/22-closures-with-upvalues.md
+//!   )
+
+use std::collections::HashSet;
+
+use oxc_ast::ast::{
+    ArrowFunctionExpression, BindingPattern, FormalParameters, Function, FunctionBody, Statement,
+};
+use oxc_ast_visit::{Visit, walk};
+
+/// Names declared by a function that some inner / nested function
+/// references. The compiler turns each of these into a fresh
+/// [`UpvalueCell`](otter_vm::UpvalueCell) at frame creation time.
+#[must_use]
+pub fn analyze_function(
+    params: Option<&FormalParameters<'_>>,
+    body: &FunctionBody<'_>,
+) -> HashSet<String> {
+    let mut own = OwnNameCollector::default();
+    if let Some(p) = params {
+        own.visit_formal_parameters(p);
+    }
+    own.visit_function_body(body);
+
+    let mut inner = InnerRefCollector::default();
+    inner.visit_function_body(body);
+
+    own.names.intersection(&inner.refs).cloned().collect()
+}
+
+/// Same as [`analyze_function`] but for arrow bodies (which carry a
+/// [`FunctionBody`] but no separate name).
+#[must_use]
+pub fn analyze_arrow(arrow: &ArrowFunctionExpression<'_>) -> HashSet<String> {
+    let mut own = OwnNameCollector::default();
+    own.visit_formal_parameters(&arrow.params);
+    own.visit_function_body(&arrow.body);
+
+    let mut inner = InnerRefCollector::default();
+    inner.visit_function_body(&arrow.body);
+
+    own.names.intersection(&inner.refs).cloned().collect()
+}
+
+/// Module-body variant: collect names declared at the top level of
+/// `<main>` that some nested function references.
+#[must_use]
+pub fn analyze_module(stmts: &[Statement<'_>]) -> HashSet<String> {
+    let mut own = OwnNameCollector::default();
+    for stmt in stmts {
+        own.visit_statement(stmt);
+    }
+    let mut inner = InnerRefCollector::default();
+    for stmt in stmts {
+        inner.visit_statement(stmt);
+    }
+    own.names.intersection(&inner.refs).cloned().collect()
+}
+
+/// Walks a function body and collects names declared in it (params,
+/// `let` / `const` / function declarations at any block depth),
+/// excluding anything declared inside a nested function.
+#[derive(Default)]
+struct OwnNameCollector {
+    names: HashSet<String>,
+    nested_depth: u32,
+}
+
+impl OwnNameCollector {
+    fn maybe_collect_pattern(&mut self, pattern: &BindingPattern<'_>) {
+        if self.nested_depth > 0 {
+            return;
+        }
+        if let BindingPattern::BindingIdentifier(id) = pattern {
+            self.names.insert(id.name.as_str().to_string());
+        }
+        // Foundation slice rejects destructuring patterns at the
+        // call-site, so we skip them here.
+    }
+}
+
+impl<'a> Visit<'a> for OwnNameCollector {
+    fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        // Function declarations binding their own id at the parent
+        // scope happen here (when this is a declaration, not an
+        // expression).
+        if self.nested_depth == 0
+            && let Some(id) = it.id.as_ref()
+        {
+            self.names.insert(id.name.as_str().to_string());
+        }
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_function(self, it, flags);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_arrow_function_expression(self, it);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
+
+    fn visit_formal_parameter(&mut self, it: &oxc_ast::ast::FormalParameter<'a>) {
+        self.maybe_collect_pattern(&it.pattern);
+        walk::walk_formal_parameter(self, it);
+    }
+
+    fn visit_variable_declarator(&mut self, it: &oxc_ast::ast::VariableDeclarator<'a>) {
+        self.maybe_collect_pattern(&it.id);
+        walk::walk_variable_declarator(self, it);
+    }
+}
+
+/// Walks a function body and collects every identifier name
+/// referenced from inside any nested function (transitively).
+#[derive(Default)]
+struct InnerRefCollector {
+    refs: HashSet<String>,
+    nested_depth: u32,
+}
+
+impl<'a> Visit<'a> for InnerRefCollector {
+    fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_function(self, it, flags);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_arrow_function_expression(self, it);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
+
+    fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        if self.nested_depth > 0 {
+            self.refs.insert(it.name.as_str().to_string());
+        }
+    }
+}

@@ -73,7 +73,7 @@ pub enum Op {
     /// Variadic method call dispatched through the
     /// `String.prototype` intrinsic table. Operands:
     /// `dst, recv, name_const, argc, args...`.
-    CallStringMethod,
+    CallMethod,
 
     // Polymorphic binary operators. Operands: `dst, lhs, rhs`.
     // Handle Number+Number and String+String operand pairs;
@@ -141,6 +141,29 @@ pub enum Op {
     /// is a [`Constant::FunctionId`] referencing
     /// [`BytecodeModule::functions`].
     MakeFunction,
+    /// `r<dst> = closure(constants[k<idx>], upvalues...)`. Variadic.
+    /// Operands: `dst, function_const, upvalue_count, src0, src1, ...`.
+    /// Each `srcN` is `Imm32(parent_upvalue_idx)` — a non-negative
+    /// index into the **enclosing** frame's `upvalues` array. The
+    /// runtime clones each cell handle into the new closure's
+    /// `upvalues: Rc<[UpvalueCell]>`, so writes through one are
+    /// visible through all.
+    ///
+    /// Captured locals always live in the declaring frame's own
+    /// upvalue cells (see [`Function::own_upvalue_count`]); a fresh
+    /// frame appends `own_upvalue_count` empty cells after the
+    /// inherited parent ones, and the function body initialises them
+    /// via [`Op::StoreUpvalue`]. Subsequent `MakeClosure` calls just
+    /// pick those indices off the current frame's `upvalues`.
+    MakeClosure,
+    /// `r<dst> = upvalue<idx>` — read the captured cell at index
+    /// `idx` in the current frame's upvalue table.
+    /// Operands: `Register(dst), Imm32(upvalue_idx)`.
+    LoadUpvalue,
+    /// `upvalue<idx> = r<src>` — write the captured cell at index
+    /// `idx` in the current frame's upvalue table.
+    /// Operands: `Register(src), Imm32(upvalue_idx)`.
+    StoreUpvalue,
     /// Variadic call. Operands: `dst, callee, argc, args...`. The
     /// callee must be a function value at this slice.
     Call,
@@ -212,7 +235,7 @@ impl Op {
             Op::LoadFalse => "LOAD_FALSE",
             Op::LoadLength => "LOAD_LENGTH",
             Op::GetStringIndex => "GET_STRING_INDEX",
-            Op::CallStringMethod => "CALL_STRING_METHOD",
+            Op::CallMethod => "CALL_METHOD",
             Op::Add => "ADD",
             Op::Sub => "SUB",
             Op::Mul => "MUL",
@@ -237,6 +260,9 @@ impl Op {
             Op::StoreLocal => "STORE_LOCAL",
             Op::TdzError => "TDZ_ERROR",
             Op::MakeFunction => "MAKE_FUNCTION",
+            Op::MakeClosure => "MAKE_CLOSURE",
+            Op::LoadUpvalue => "LOAD_UPVALUE",
+            Op::StoreUpvalue => "STORE_UPVALUE",
             Op::Call => "CALL",
             Op::ReturnValue => "RETURN_VALUE",
             Op::ReturnUndefined => "RETURN_UNDEFINED",
@@ -254,7 +280,7 @@ impl Op {
         }
     }
 
-    /// Declared operand arity. `CallStringMethod` is variadic; the
+    /// Declared operand arity. `CallMethod` is variadic; the
     /// instruction stream stores `dst, recv, name_const, argc`
     /// followed by `argc` register operands, so the actual operand
     /// count is `4 + argc`. `operand_count` returns the **prefix**
@@ -285,6 +311,8 @@ impl Op {
             | Op::JumpIfNullish
             | Op::LoadLocal
             | Op::StoreLocal
+            | Op::LoadUpvalue
+            | Op::StoreUpvalue
             | Op::MakeFunction => 2,
             Op::GetStringIndex
             | Op::Add
@@ -308,8 +336,12 @@ impl Op {
             // operands.
             Op::NewArray => 2,
             Op::LoadElement | Op::StoreElement => 3,
-            Op::CallStringMethod => 4, // dst, recv, name_const, argc
-            Op::Call => 3,             // dst, callee, argc — args follow
+            Op::CallMethod => 4, // dst, recv, name_const, argc
+            Op::Call => 3,       // dst, callee, argc — args follow
+            // `MakeClosure` is variadic: `dst, function_const,
+            // upvalue_count, srcs...`. The dispatcher reads the
+            // count and walks the trailing operands.
+            Op::MakeClosure => 3,
         }
     }
 
@@ -381,6 +413,14 @@ pub struct Function {
     /// register slots are reserved for parameter binding.
     #[serde(default)]
     pub param_count: u16,
+    /// Number of fresh [`UpvalueCell`]s the prologue allocates for
+    /// this function's own locals that are captured by inner
+    /// closures. The frame's `upvalues` array is laid out as
+    /// `[own_upvalues..., parent_upvalues...]`; own-upvalues live
+    /// at indices `0..own_upvalue_count` (stable from compile-time)
+    /// and parent-passed captures follow.
+    #[serde(default)]
+    pub own_upvalue_count: u16,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.

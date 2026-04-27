@@ -30,6 +30,7 @@
 //!   )
 
 pub mod array;
+pub mod array_prototype;
 pub mod intrinsics;
 pub mod number;
 pub mod object;
@@ -80,6 +81,51 @@ pub enum Value {
     Object(JsObject),
     /// JS array — dense, heap-shared. See [`JsArray`].
     Array(JsArray),
+    /// Closure — function with captured upvalues. See
+    /// [`UpvalueCell`].
+    Closure {
+        /// Index into [`otter_bytecode::BytecodeModule::functions`].
+        function_id: u32,
+        /// Captured cells, in declaration order. The compiler emits
+        /// `MakeFunction` for closure-less functions and reserves
+        /// `MakeClosure` for the capture path.
+        upvalues: std::rc::Rc<[UpvalueCell]>,
+    },
+}
+
+/// One captured-variable cell. Cloning shares the same heap slot
+/// so multiple closures + the original outer scope all see
+/// mutations through it.
+///
+/// Inside the foundation slice the cell stores a plain `Value`
+/// behind `Rc<RefCell<>>` — once a real GC ships, this becomes a
+/// GC handle.
+#[derive(Debug, Clone)]
+pub struct UpvalueCell(std::rc::Rc<std::cell::RefCell<Value>>);
+
+impl UpvalueCell {
+    /// Construct a fresh cell pre-populated with `value`.
+    #[must_use]
+    pub fn new(value: Value) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(value)))
+    }
+
+    /// Read the captured value (clones the payload).
+    #[must_use]
+    pub fn get(&self) -> Value {
+        self.0.borrow().clone()
+    }
+
+    /// Write a new value. Visible through every clone of this cell.
+    pub fn set(&self, value: Value) {
+        *self.0.borrow_mut() = value;
+    }
+
+    /// Identity comparison.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl Value {
@@ -99,7 +145,9 @@ impl Value {
             Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
             Value::Number(n) => n.to_display_string(),
             Value::String(s) => s.to_lossy_string(),
-            Value::Function { function_id } => format!("[Function #{function_id}]"),
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                format!("[Function #{function_id}]")
+            }
             Value::Object(_) => "[object Object]".to_string(),
             Value::Array(a) => {
                 let body = a.borrow_body();
@@ -124,9 +172,9 @@ impl Value {
                 }
             }
             Value::String(s) => !s.is_empty(),
-            Value::Function { .. } => true,
-            Value::Object(_) => true,
-            Value::Array(_) => true,
+            Value::Function { .. } | Value::Closure { .. } | Value::Object(_) | Value::Array(_) => {
+                true
+            }
         }
     }
 
@@ -184,6 +232,16 @@ impl PartialEq for Value {
             (Value::Object(a), Value::Object(b)) => a.ptr_eq(b),
             (Value::Array(a), Value::Array(b)) => a.ptr_eq(b),
             (Value::Function { function_id: a }, Value::Function { function_id: b }) => a == b,
+            (
+                Value::Closure {
+                    function_id: a,
+                    upvalues: ua,
+                },
+                Value::Closure {
+                    function_id: b,
+                    upvalues: ub,
+                },
+            ) => a == b && std::rc::Rc::ptr_eq(ua, ub),
             _ => false,
         }
     }
@@ -240,6 +298,10 @@ pub struct Frame {
     /// resumes at the caller's next pc. `<main>` carries `None`
     /// and propagates the value out as the script's completion.
     pub return_register: Option<u16>,
+    /// Captured upvalues for this call. Empty for non-closure
+    /// frames. Indexed by `Op::LoadUpvalue` / `Op::StoreUpvalue`
+    /// operands.
+    pub upvalues: std::rc::Rc<[UpvalueCell]>,
 }
 
 impl Frame {
@@ -255,17 +317,47 @@ impl Frame {
     /// caller's register `return_register`.
     #[must_use]
     pub fn with_return(function: &Function, return_register: Option<u16>) -> Self {
+        Self::with_return_and_upvalues(function, return_register, std::rc::Rc::from(Vec::new()))
+    }
+
+    /// Allocate a frame and bind captured upvalues. Used by
+    /// `MakeClosure`-driven calls. The function's own captured
+    /// locals are appended after the inherited parent upvalues — see
+    /// [`Op::MakeClosure`](otter_bytecode::Op::MakeClosure) for the
+    /// layout.
+    #[must_use]
+    pub fn with_return_and_upvalues(
+        function: &Function,
+        return_register: Option<u16>,
+        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+    ) -> Self {
         let total = function
             .param_count
             .saturating_add(function.locals)
             .saturating_add(function.scratch) as usize;
         let mut registers: SmallVec<[Value; 8]> = SmallVec::with_capacity(total);
         registers.resize(total, Value::Undefined);
+        let own = function.own_upvalue_count as usize;
+        // Layout: [own_caps..., parent_caps...]. Own slots come
+        // first so the compiler can assign stable indices `0..own`
+        // at declaration time before knowing how many parent
+        // captures will be added during the body's compilation.
+        let upvalues: std::rc::Rc<[UpvalueCell]> = if own == 0 {
+            parent_upvalues
+        } else {
+            let mut cells: Vec<UpvalueCell> = Vec::with_capacity(own + parent_upvalues.len());
+            for _ in 0..own {
+                cells.push(UpvalueCell::new(Value::Undefined));
+            }
+            cells.extend(parent_upvalues.iter().cloned());
+            std::rc::Rc::from(cells)
+        };
         Self {
             function_id: function.id,
             pc: 0,
             registers,
             return_register,
+            upvalues,
         }
     }
 }
@@ -572,6 +664,69 @@ impl Interpreter {
                         _ => return Err(VmError::InvalidOperand),
                     };
                     write_register(frame, dst, Value::Function { function_id })?;
+                    frame.pc += 1;
+                }
+                Op::MakeClosure => {
+                    let dst = register_operand(operands.first())?;
+                    let idx = const_operand(operands.get(1))?;
+                    let function_id = match module.constants.get(idx as usize) {
+                        Some(Constant::FunctionId { index }) => *index,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let count = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let mut cells: Vec<UpvalueCell> = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let parent_idx = match operands.get(3 + i) {
+                            Some(&Operand::Imm32(n)) if n >= 0 => n as usize,
+                            _ => return Err(VmError::InvalidOperand),
+                        };
+                        let cell = frame
+                            .upvalues
+                            .get(parent_idx)
+                            .cloned()
+                            .ok_or(VmError::InvalidOperand)?;
+                        cells.push(cell);
+                    }
+                    let upvalues: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(cells);
+                    write_register(
+                        frame,
+                        dst,
+                        Value::Closure {
+                            function_id,
+                            upvalues,
+                        },
+                    )?;
+                    frame.pc += 1;
+                }
+                Op::LoadUpvalue => {
+                    let dst = register_operand(operands.first())?;
+                    let idx = imm32_operand(operands.get(1))?;
+                    if idx < 0 {
+                        return Err(VmError::InvalidOperand);
+                    }
+                    let value = frame
+                        .upvalues
+                        .get(idx as usize)
+                        .ok_or(VmError::InvalidOperand)?
+                        .get();
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::StoreUpvalue => {
+                    let src = register_operand(operands.first())?;
+                    let idx = imm32_operand(operands.get(1))?;
+                    if idx < 0 {
+                        return Err(VmError::InvalidOperand);
+                    }
+                    let value = read_register(frame, src)?.clone();
+                    frame
+                        .upvalues
+                        .get(idx as usize)
+                        .ok_or(VmError::InvalidOperand)?
+                        .set(value);
                     frame.pc += 1;
                 }
                 Op::LoadString => {
@@ -891,6 +1046,7 @@ impl Interpreter {
                         Value::Boolean(false) | Value::Null => NumberValue::Smi(0),
                         Value::Undefined
                         | Value::Function { .. }
+                        | Value::Closure { .. }
                         | Value::Object(_)
                         | Value::Array(_) => NumberValue::Double(f64::NAN),
                         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
@@ -935,7 +1091,7 @@ impl Interpreter {
                     write_register(frame, dst, Value::String(result_str))?;
                     frame.pc += 1;
                 }
-                Op::CallStringMethod => {
+                Op::CallMethod => {
                     let dst = register_operand(operands.first())?;
                     let recv = register_operand(operands.get(1))?;
                     let name_idx = const_operand(operands.get(2))?;
@@ -956,8 +1112,16 @@ impl Interpreter {
                         arg_values.push(read_register(frame, r)?.clone());
                     }
                     let recv_value = read_register(frame, recv)?.clone();
-                    let entry = string_prototype::lookup(&name)
-                        .ok_or_else(|| VmError::UnknownIntrinsic { name: name.clone() })?;
+                    // Dispatch by receiver kind. Each prototype
+                    // registry returns `None` for unknown method
+                    // names, falling through to the next branch
+                    // before raising `UnknownIntrinsic`.
+                    let entry = match &recv_value {
+                        Value::String(_) => string_prototype::lookup(&name),
+                        Value::Array(_) => array_prototype::lookup(&name),
+                        _ => None,
+                    }
+                    .ok_or_else(|| VmError::UnknownIntrinsic { name: name.clone() })?;
                     let result = (entry.impl_fn)(&IntrinsicArgs {
                         receiver: &recv_value,
                         args: &arg_values,
@@ -1010,8 +1174,12 @@ impl Interpreter {
 
         let top_idx = stack.len() - 1;
         let caller = &mut stack[top_idx];
-        let function_id = match read_register(caller, callee_reg)? {
-            Value::Function { function_id } => *function_id,
+        let (function_id, parent_upvalues) = match read_register(caller, callee_reg)? {
+            Value::Function { function_id } => (*function_id, std::rc::Rc::from(Vec::new())),
+            Value::Closure {
+                function_id,
+                upvalues,
+            } => (*function_id, upvalues.clone()),
             _ => return Err(VmError::NotCallable),
         };
         // Collect args from caller registers — bounded by argc, so
@@ -1035,7 +1203,7 @@ impl Interpreter {
             .functions
             .get(function_id as usize)
             .ok_or(VmError::InvalidOperand)?;
-        let mut new_frame = Frame::with_return(function, Some(dst));
+        let mut new_frame = Frame::with_return_and_upvalues(function, Some(dst), parent_upvalues);
         // Bind parameters: extra args are dropped, missing args
         // stay `Value::Undefined` (matches JS semantics).
         let bind_count = (function.param_count as usize).min(args.len());
@@ -1261,6 +1429,7 @@ mod tests {
                 locals: 0,
                 scratch,
                 param_count: 0,
+                own_upvalue_count: 0,
                 code,
                 spans,
             }],

@@ -40,8 +40,10 @@
 //!     ../../../docs/new-engine/adr/0002-oxc-frontend.md
 //!   )
 
+mod capture;
+
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use otter_bytecode::{
@@ -80,7 +82,9 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
         span: (program.span.start, program.span.end),
         ..Default::default()
     });
-    let mut cx = FunctionContext::new(Rc::clone(&module));
+    let mut top = FunctionContext::new(Rc::clone(&module));
+    top.captured_names = capture::analyze_module(&program.body);
+    let mut cx = Compiler::new(top);
     cx.enter_scope();
     let mut last_value_reg: Option<u16> = None;
 
@@ -116,6 +120,7 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
         let mut m = module.borrow_mut();
         m.functions[0].locals = 0;
         m.functions[0].scratch = cx.scratch;
+        m.functions[0].own_upvalue_count = cx.own_upvalue_count;
         m.functions[0].code = std::mem::take(&mut cx.code);
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }
@@ -165,15 +170,30 @@ struct Scope {
 
 #[derive(Debug, Clone, Copy)]
 struct BindingInfo {
-    /// Register holding the binding's value.
-    reg: u16,
+    /// Backing storage. Foundation uses register-only locals for
+    /// non-captured names and an own-upvalue cell for names some
+    /// inner function references (see [`capture`]).
+    storage: BindingStorage,
     /// `true` for `const` declarations.
     is_const: bool,
     /// Whether the binding has been definitely initialized at the
     /// current compile point. `let x;` and `let x = init` start at
     /// `false` and flip to `true` after the initializer's
-    /// `StoreLocal`. Reads before that emit `Op::TdzError`.
+    /// `StoreLocal` / `StoreUpvalue`. Reads before that emit
+    /// `Op::TdzError`.
     initialized: bool,
+}
+
+/// Where a binding lives in the running frame.
+#[derive(Debug, Clone, Copy)]
+enum BindingStorage {
+    /// Plain register. Read with `LoadLocal`, written with
+    /// `StoreLocal`.
+    Register { reg: u16 },
+    /// Own-upvalue cell at index `idx` in `frame.upvalues`. Used
+    /// for any binding some inner function captures. Read /
+    /// written with `LoadUpvalue` / `StoreUpvalue`.
+    Upvalue { idx: u16 },
 }
 
 /// One pending loop label so `break` / `continue` can patch their
@@ -202,6 +222,134 @@ struct FunctionContext {
     scopes: Vec<Scope>,
     /// Stack of enclosing loops; the innermost is on top.
     loops: Vec<LoopFrame>,
+    /// Names of this function's own bindings that some nested
+    /// function references — populated by
+    /// [`capture::analyze_function`] before code gen starts. Each
+    /// such binding is allocated as an
+    /// [`UpvalueCell`](otter_vm::UpvalueCell) instead of a register.
+    captured_names: HashSet<String>,
+    /// Number of own-upvalue cells allocated so far. The first
+    /// `own_upvalue_count` slots in `frame.upvalues` belong to this
+    /// function's own captured bindings.
+    own_upvalue_count: u16,
+    /// One entry per capture from the enclosing function. Each
+    /// value is an absolute index into the **enclosing** frame's
+    /// `upvalues` array — used as the source operand of
+    /// `MakeClosure` when the parent emits the closure value.
+    parent_captures: Vec<u32>,
+    /// Map from captured-name → upvalue index in **this** function's
+    /// `frame.upvalues`. Captures live at
+    /// `own_upvalue_count..own_upvalue_count + parent_captures.len()`.
+    captured_uv: HashMap<String, u16>,
+}
+
+/// Compile-time stack of function contexts. The innermost context
+/// is at the top; capture resolution walks this stack downward to
+/// find a binding declared by an ancestor.
+///
+/// The compiler exposes the inner-most [`FunctionContext`] through
+/// `Deref` / `DerefMut` so existing code continues to use `cx.emit`,
+/// `cx.scratch`, etc. without referencing the stack explicitly.
+#[derive(Debug)]
+struct Compiler {
+    stack: Vec<FunctionContext>,
+}
+
+impl Compiler {
+    fn new(top: FunctionContext) -> Self {
+        Self { stack: vec![top] }
+    }
+
+    fn top_mut(&mut self) -> &mut FunctionContext {
+        self.stack
+            .last_mut()
+            .expect("compiler context stack is empty")
+    }
+
+    fn push(&mut self, ctx: FunctionContext) {
+        self.stack.push(ctx);
+    }
+
+    fn pop(&mut self) -> FunctionContext {
+        self.stack
+            .pop()
+            .expect("compiler pop on empty context stack")
+    }
+
+    /// Walk the ancestor chain (excluding the top frame) and resolve
+    /// `name` to an absolute upvalue index in the **top** frame's
+    /// `frame.upvalues`. Each intermediate ancestor that didn't yet
+    /// capture `name` gets a fresh capture slot pointing at the next
+    /// ancestor up.
+    fn resolve_capture(&mut self, name: &str) -> Option<u16> {
+        if self.stack.len() < 2 {
+            return None;
+        }
+        let top_idx = self.stack.len() - 1;
+        // Already captured at top?
+        if let Some(&idx) = self.stack[top_idx].captured_uv.get(name) {
+            return Some(idx);
+        }
+        // Find the deepest ancestor that has `name` as an
+        // own-upvalue (or already-resolved capture). Search from
+        // direct-parent (top_idx - 1) downward.
+        let mut found: Option<(usize, u16)> = None;
+        for i in (0..top_idx).rev() {
+            // Already-captured upvalue in this ancestor?
+            if let Some(&idx) = self.stack[i].captured_uv.get(name) {
+                found = Some((i, idx));
+                break;
+            }
+            // Local binding declared as own-upvalue?
+            let mut hit: Option<u16> = None;
+            for scope in self.stack[i].scopes.iter().rev() {
+                if let Some(info) = scope.bindings.get(name) {
+                    if let BindingStorage::Upvalue { idx } = info.storage {
+                        hit = Some(idx);
+                    }
+                    break;
+                }
+            }
+            if let Some(idx) = hit {
+                found = Some((i, idx));
+                break;
+            }
+        }
+        let (anchor_idx, mut current) = found?;
+        // Cascade the cell from anchor down to the top frame: each
+        // intermediate ancestor adds a capture entry pointing at the
+        // previous one.
+        for j in (anchor_idx + 1)..=top_idx {
+            let frame = &mut self.stack[j];
+            if let Some(&existing) = frame.captured_uv.get(name) {
+                current = existing;
+                continue;
+            }
+            let new_idx = frame
+                .own_upvalue_count
+                .checked_add(frame.parent_captures.len() as u16)
+                .expect("captured upvalue index overflow");
+            frame.parent_captures.push(current as u32);
+            frame.captured_uv.insert(name.to_string(), new_idx);
+            current = new_idx;
+        }
+        Some(current)
+    }
+}
+
+impl std::ops::Deref for Compiler {
+    type Target = FunctionContext;
+    fn deref(&self) -> &Self::Target {
+        self.stack.last().expect("compiler context stack is empty")
+    }
+}
+
+impl std::ops::DerefMut for Compiler {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.stack
+            .last_mut()
+            .expect("compiler context stack is empty")
+    }
 }
 
 impl FunctionContext {
@@ -214,7 +362,25 @@ impl FunctionContext {
             scratch: 0,
             scopes: Vec::new(),
             loops: Vec::new(),
+            captured_names: HashSet::new(),
+            own_upvalue_count: 0,
+            parent_captures: Vec::new(),
+            captured_uv: HashMap::new(),
         }
+    }
+
+    /// Check `name` against this function's `captured_names` set
+    /// (computed by the pre-pass) and, when present, allocate a
+    /// fresh own-upvalue index for it. Returns the assigned index
+    /// or `None` if the name is not captured (use a register
+    /// instead).
+    fn allocate_own_upvalue(&mut self, name: &str) -> Option<u16> {
+        if !self.captured_names.contains(name) {
+            return None;
+        }
+        let idx = self.own_upvalue_count;
+        self.own_upvalue_count = idx.checked_add(1).expect("own_upvalue_count overflow");
+        Some(idx)
     }
 
     fn alloc_scratch(&mut self) -> u16 {
@@ -236,28 +402,39 @@ impl FunctionContext {
         name: &str,
         is_const: bool,
         span: (u32, u32),
-    ) -> Result<u16, CompileError> {
-        let scope = self
+    ) -> Result<BindingStorage, CompileError> {
+        if self
             .scopes
-            .last_mut()
-            .expect("declare_binding called outside any scope");
-        if scope.bindings.contains_key(name) {
+            .last()
+            .expect("declare_binding called outside any scope")
+            .bindings
+            .contains_key(name)
+        {
             return Err(CompileError::Unsupported {
                 node: format!("redeclaration of `{name}` in same scope"),
                 span,
             });
         }
-        let reg = self.scratch;
-        self.scratch = self.scratch.checked_add(1).expect("register overflow");
+        let storage = if let Some(idx) = self.allocate_own_upvalue(name) {
+            BindingStorage::Upvalue { idx }
+        } else {
+            let reg = self.scratch;
+            self.scratch = self.scratch.checked_add(1).expect("register overflow");
+            BindingStorage::Register { reg }
+        };
+        let scope = self
+            .scopes
+            .last_mut()
+            .expect("declare_binding called outside any scope");
         scope.bindings.insert(
             name.to_string(),
             BindingInfo {
-                reg,
+                storage,
                 is_const,
                 initialized: false,
             },
         );
-        Ok(reg)
+        Ok(storage)
     }
 
     fn lookup_binding(&self, name: &str) -> Option<BindingInfo> {
@@ -371,15 +548,46 @@ impl FunctionContext {
         self.spans.push(SpanEntry { pc, span });
         self.next_pc += 1;
     }
+
+    /// Emit the appropriate "load this binding into `dst`" op pair
+    /// for the binding's storage kind.
+    fn emit_load_storage(&mut self, dst: u16, storage: BindingStorage, span: (u32, u32)) {
+        match storage {
+            BindingStorage::Register { reg } => self.emit(
+                Op::LoadLocal,
+                vec![Operand::Register(dst), Operand::Imm32(reg as i32)],
+                span,
+            ),
+            BindingStorage::Upvalue { idx } => self.emit(
+                Op::LoadUpvalue,
+                vec![Operand::Register(dst), Operand::Imm32(idx as i32)],
+                span,
+            ),
+        }
+    }
+
+    /// Emit the "write `src` into this binding" op pair for the
+    /// storage kind.
+    fn emit_store_storage(&mut self, src: u16, storage: BindingStorage, span: (u32, u32)) {
+        match storage {
+            BindingStorage::Register { reg } => self.emit(
+                Op::StoreLocal,
+                vec![Operand::Register(src), Operand::Imm32(reg as i32)],
+                span,
+            ),
+            BindingStorage::Upvalue { idx } => self.emit(
+                Op::StoreUpvalue,
+                vec![Operand::Register(src), Operand::Imm32(idx as i32)],
+                span,
+            ),
+        }
+    }
 }
 
 /// Compile one statement. Returns `Some(reg)` when the statement is
 /// an `ExpressionStatement` whose value should propagate as the
 /// program's completion value; `None` otherwise.
-fn compile_statement(
-    cx: &mut FunctionContext,
-    stmt: &Statement<'_>,
-) -> Result<Option<u16>, CompileError> {
+fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u16>, CompileError> {
     if is_erased_ts_statement(stmt) {
         return Ok(None);
     }
@@ -434,7 +642,7 @@ fn compile_statement(
                         });
                     }
                 };
-                let reg = cx.declare_binding(&name, is_const, span)?;
+                let storage = cx.declare_binding(&name, is_const, span)?;
                 // The initializer expression sees the binding in
                 // its TDZ: `let x = x + 1;` should throw because
                 // the right-hand `x` reads before initialization.
@@ -448,11 +656,7 @@ fn compile_statement(
                         dst
                     }
                 };
-                cx.emit(
-                    Op::StoreLocal,
-                    vec![Operand::Register(init_reg), Operand::Imm32(reg as i32)],
-                    span,
-                );
+                cx.emit_store_storage(init_reg, storage, span);
                 cx.mark_initialized(&name);
             }
             Ok(None)
@@ -597,24 +801,16 @@ fn compile_statement(
                     .name
                     .as_str()
                     .to_string();
-            let function_id = compile_function(cx, &name, &f.params, &f.body, span)?;
+            let (function_id, captures) = compile_function(cx, &name, &f.params, &f.body, span)?;
             // Bind the name in the current scope to a register
             // holding the function value. Foundation slice doesn't
             // hoist; declarations are evaluated at their lexical
             // position.
-            let reg = cx.declare_binding(&name, false, span)?;
+            let storage = cx.declare_binding(&name, false, span)?;
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
-            cx.emit(
-                Op::MakeFunction,
-                vec![Operand::Register(tmp), Operand::ConstIndex(const_idx)],
-                span,
-            );
-            cx.emit(
-                Op::StoreLocal,
-                vec![Operand::Register(tmp), Operand::Imm32(reg as i32)],
-                span,
-            );
+            emit_make_callable(cx, tmp, const_idx, &captures, span);
+            cx.emit_store_storage(tmp, storage, span);
             cx.mark_initialized(&name);
             Ok(None)
         }
@@ -667,7 +863,7 @@ fn compile_statement(
 /// the borrowed declaration without re-cloning it through OXC's
 /// allocator.
 fn compile_for_init_decl(
-    cx: &mut FunctionContext,
+    cx: &mut Compiler,
     decl: &oxc_ast::ast::VariableDeclaration<'_>,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
@@ -690,7 +886,7 @@ fn compile_for_init_decl(
                 });
             }
         };
-        let reg = cx.declare_binding(&name, is_const, span)?;
+        let storage = cx.declare_binding(&name, is_const, span)?;
         let init_reg = match &declarator.init {
             Some(init) => compile_expr(cx, init, span)?,
             None => {
@@ -699,44 +895,48 @@ fn compile_for_init_decl(
                 dst
             }
         };
-        cx.emit(
-            Op::StoreLocal,
-            vec![Operand::Register(init_reg), Operand::Imm32(reg as i32)],
-            span,
-        );
+        cx.emit_store_storage(init_reg, storage, span);
         cx.mark_initialized(&name);
     }
     Ok(())
 }
 
 /// Compile a function body into a fresh `Function` record and
-/// return its id. Parameters are bound as locals at registers
-/// `0..param_count`. Foundation subset rejects rest / default /
-/// destructuring parameters.
+/// return its id together with the captures it inherits from
+/// `parent`. Parameters are bound at registers `0..param_count`
+/// (or as own-upvalue cells when captured by an inner function).
+/// Foundation subset rejects rest / default / destructuring
+/// parameters.
 fn compile_function(
-    parent: &mut FunctionContext,
+    parent: &mut Compiler,
     name: &str,
     params: &oxc_ast::ast::FormalParameters<'_>,
     body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
     span: (u32, u32),
-) -> Result<u32, CompileError> {
+) -> Result<(u32, Vec<u32>), CompileError> {
     if params.rest.is_some() {
         return Err(CompileError::Unsupported {
             node: "FunctionDeclaration: rest parameter".to_string(),
             span,
         });
     }
-    let mut cx = FunctionContext::new(Rc::clone(&parent.module));
-    cx.enter_scope();
+    let module = Rc::clone(&parent.top_mut().module);
+    let mut child = FunctionContext::new(Rc::clone(&module));
+    if let Some(b) = body {
+        child.captured_names = capture::analyze_function(Some(params), b);
+    }
+    parent.push(child);
+    parent.enter_scope();
     let mut param_count: u16 = 0;
-    for param in &params.items {
+    let mut param_pseudo_regs: Vec<(BindingStorage, u16)> = Vec::new();
+    for (ordinal, param) in params.items.iter().enumerate() {
         if param.pattern.kind_initializer().is_some() {
             return Err(CompileError::Unsupported {
                 node: "FunctionDeclaration: default parameter".to_string(),
                 span,
             });
         }
-        let name = match &param.pattern {
+        let pname = match &param.pattern {
             oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
             _ => {
                 return Err(CompileError::Unsupported {
@@ -745,61 +945,75 @@ fn compile_function(
                 });
             }
         };
-        // Parameter binding lives at register index = param ordinal
-        // and is initialized by the caller's argument-binding step,
-        // so the body can read it without TDZ.
-        cx.declare_binding(&name, false, span)?;
-        cx.mark_initialized(&name);
+        // Parameter binding: caller writes argv into register
+        // `ordinal`. If the binding is captured, transfer the
+        // register value into the own-upvalue cell at the prologue.
+        let storage = parent.declare_binding(&pname, false, span)?;
+        parent.mark_initialized(&pname);
+        param_pseudo_regs.push((storage, ordinal as u16));
         param_count = param_count.checked_add(1).expect("too many parameters");
     }
 
     // Reserve the function's id ahead of compilation so the body
-    // can reference its own name (recursion). This mirrors the
-    // "function declaration is bound in its own scope" semantics
-    // without needing a real closure model — slice 13 keeps
-    // upvalues out.
-    let function_id = parent.module.borrow().functions.len() as u32;
-    parent.module.borrow_mut().functions.push(Function {
+    // can reference its own name (recursion).
+    let function_id = module.borrow().functions.len() as u32;
+    module.borrow_mut().functions.push(Function {
         id: function_id,
         name: name.to_string(),
         span,
         ..Default::default()
     });
-    let self_reg = cx.declare_binding(name, false, span)?;
-    let const_idx = cx.intern_function_id(function_id);
-    let tmp = cx.alloc_scratch();
-    cx.emit(
+
+    // Prologue: for any captured parameter, copy the register value
+    // into the upvalue cell so the body always reads through the
+    // cell.
+    for (storage, ordinal) in &param_pseudo_regs {
+        if let BindingStorage::Upvalue { idx } = storage {
+            parent.emit(
+                Op::StoreUpvalue,
+                vec![Operand::Register(*ordinal), Operand::Imm32(*idx as i32)],
+                span,
+            );
+        }
+    }
+
+    // Bind self-name for recursion. Emit a MakeFunction (no
+    // captures yet — the function value referencing itself doesn't
+    // need its own captures bound here).
+    let self_storage = parent.declare_binding(name, false, span)?;
+    let const_idx = parent.intern_function_id(function_id);
+    let tmp = parent.alloc_scratch();
+    parent.emit(
         Op::MakeFunction,
         vec![Operand::Register(tmp), Operand::ConstIndex(const_idx)],
         span,
     );
-    cx.emit(
-        Op::StoreLocal,
-        vec![Operand::Register(tmp), Operand::Imm32(self_reg as i32)],
-        span,
-    );
-    cx.mark_initialized(name);
+    parent.emit_store_storage(tmp, self_storage, span);
+    parent.mark_initialized(name);
 
     if let Some(body) = body {
         for stmt in &body.statements {
-            compile_statement(&mut cx, stmt)?;
+            compile_statement(parent, stmt)?;
         }
     }
-    cx.exit_scope();
+    parent.exit_scope();
     // Implicit `return undefined;` at the function tail.
-    cx.emit(Op::ReturnUndefined, vec![], span);
+    parent.emit(Op::ReturnUndefined, vec![], span);
 
-    let mut module = parent.module.borrow_mut();
-    let slot = module
+    let child = parent.pop();
+    let captures = child.parent_captures.clone();
+    let mut module_mut = module.borrow_mut();
+    let slot = module_mut
         .functions
         .get_mut(function_id as usize)
         .expect("reserved function slot");
     slot.locals = 0;
-    slot.scratch = cx.scratch;
+    slot.scratch = child.scratch;
     slot.param_count = param_count;
-    slot.code = cx.code;
-    slot.spans = cx.spans;
-    Ok(function_id)
+    slot.own_upvalue_count = child.own_upvalue_count;
+    slot.code = child.code;
+    slot.spans = child.spans;
+    Ok((function_id, captures))
 }
 
 /// Compile an arrow function. Two body shapes share the same
@@ -810,16 +1024,15 @@ fn compile_function(
 /// - `() => { ... }` (block body): existing function-body
 ///   compilation, with an implicit `ReturnUndefined` tail.
 ///
-/// Captured-environment access (`this`, outer-scope variables) is
-/// **not** supported in this slice — the compiler creates a fresh
-/// `FunctionContext` so a body that references an outer-scope
-/// binding fails fast with a clear `unresolved identifier`
-/// diagnostic.
+/// Captures from the enclosing scope flow through the same
+/// upvalue mechanism as nested function declarations — see
+/// [`capture`]. The arrow has no `this` of its own (foundation
+/// slice doesn't model `this` yet — task 23).
 fn compile_arrow_function(
-    parent: &mut FunctionContext,
+    parent: &mut Compiler,
     arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
     span: (u32, u32),
-) -> Result<u32, CompileError> {
+) -> Result<(u32, Vec<u32>), CompileError> {
     if arrow.params.rest.is_some() {
         return Err(CompileError::Unsupported {
             node: "ArrowFunction: rest parameter".to_string(),
@@ -832,18 +1045,22 @@ fn compile_arrow_function(
             span,
         });
     }
-    let mut cx = FunctionContext::new(Rc::clone(&parent.module));
-    cx.enter_scope();
+    let module = Rc::clone(&parent.top_mut().module);
+    let mut child = FunctionContext::new(Rc::clone(&module));
+    child.captured_names = capture::analyze_arrow(arrow);
+    parent.push(child);
+    parent.enter_scope();
 
     let mut param_count: u16 = 0;
-    for param in &arrow.params.items {
+    let mut param_pseudo_regs: Vec<(BindingStorage, u16)> = Vec::new();
+    for (ordinal, param) in arrow.params.items.iter().enumerate() {
         if param.pattern.kind_initializer().is_some() {
             return Err(CompileError::Unsupported {
                 node: "ArrowFunction: default parameter".to_string(),
                 span,
             });
         }
-        let name = match &param.pattern {
+        let pname = match &param.pattern {
             oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
             _ => {
                 return Err(CompileError::Unsupported {
@@ -852,20 +1069,32 @@ fn compile_arrow_function(
                 });
             }
         };
-        cx.declare_binding(&name, false, span)?;
-        cx.mark_initialized(&name);
+        let storage = parent.declare_binding(&pname, false, span)?;
+        parent.mark_initialized(&pname);
+        param_pseudo_regs.push((storage, ordinal as u16));
         param_count = param_count.checked_add(1).expect("too many parameters");
     }
 
     // Reserve the function record up front so we can emit
-    // `MakeFunction` for the result later.
-    let function_id = parent.module.borrow().functions.len() as u32;
-    parent.module.borrow_mut().functions.push(Function {
+    // `MakeFunction` / `MakeClosure` for the result later.
+    let function_id = module.borrow().functions.len() as u32;
+    module.borrow_mut().functions.push(Function {
         id: function_id,
         name: "<arrow>".to_string(),
         span,
         ..Default::default()
     });
+
+    // Prologue: copy captured params into their upvalue cells.
+    for (storage, ordinal) in &param_pseudo_regs {
+        if let BindingStorage::Upvalue { idx } = storage {
+            parent.emit(
+                Op::StoreUpvalue,
+                vec![Operand::Register(*ordinal), Operand::Imm32(*idx as i32)],
+                span,
+            );
+        }
+    }
 
     if arrow.expression {
         // `() => expr` — body is a single ExpressionStatement
@@ -885,27 +1114,58 @@ fn compile_arrow_function(
             });
         };
         let inner_span = (es.span.start, es.span.end);
-        let reg = compile_expr(&mut cx, &es.expression, inner_span)?;
-        cx.emit(Op::ReturnValue, vec![Operand::Register(reg)], inner_span);
+        let reg = compile_expr(parent, &es.expression, inner_span)?;
+        parent.emit(Op::ReturnValue, vec![Operand::Register(reg)], inner_span);
     } else {
         for stmt in &arrow.body.statements {
-            compile_statement(&mut cx, stmt)?;
+            compile_statement(parent, stmt)?;
         }
-        cx.emit(Op::ReturnUndefined, vec![], span);
+        parent.emit(Op::ReturnUndefined, vec![], span);
     }
-    cx.exit_scope();
+    parent.exit_scope();
 
-    let mut module = parent.module.borrow_mut();
-    let slot = module
+    let child = parent.pop();
+    let captures = child.parent_captures.clone();
+    let mut module_mut = module.borrow_mut();
+    let slot = module_mut
         .functions
         .get_mut(function_id as usize)
         .expect("reserved function slot");
     slot.locals = 0;
-    slot.scratch = cx.scratch;
+    slot.scratch = child.scratch;
     slot.param_count = param_count;
-    slot.code = cx.code;
-    slot.spans = cx.spans;
-    Ok(function_id)
+    slot.own_upvalue_count = child.own_upvalue_count;
+    slot.code = child.code;
+    slot.spans = child.spans;
+    Ok((function_id, captures))
+}
+
+/// Emit the right "make a callable into `dst`" instruction:
+/// [`Op::MakeFunction`] when the inner function captures nothing,
+/// [`Op::MakeClosure`] otherwise.
+fn emit_make_callable(
+    cx: &mut Compiler,
+    dst: u16,
+    function_const: u32,
+    captures: &[u32],
+    span: (u32, u32),
+) {
+    if captures.is_empty() {
+        cx.emit(
+            Op::MakeFunction,
+            vec![Operand::Register(dst), Operand::ConstIndex(function_const)],
+            span,
+        );
+        return;
+    }
+    let mut operands: Vec<Operand> = Vec::with_capacity(3 + captures.len());
+    operands.push(Operand::Register(dst));
+    operands.push(Operand::ConstIndex(function_const));
+    operands.push(Operand::ConstIndex(captures.len() as u32));
+    for &parent_idx in captures {
+        operands.push(Operand::Imm32(parent_idx as i32));
+    }
+    cx.emit(Op::MakeClosure, operands, span);
 }
 
 /// Tiny helper: detect whether a `BindingPattern` carries a
@@ -937,7 +1197,7 @@ fn init_to_expression<'a, 'b>(
 }
 
 fn compile_expr(
-    cx: &mut FunctionContext,
+    cx: &mut Compiler,
     expr: &Expression<'_>,
     enclosing_span: (u32, u32),
 ) -> Result<u16, CompileError> {
@@ -990,29 +1250,36 @@ fn compile_expr(
                 }
                 _ => {}
             }
-            match cx.lookup_binding(id.name.as_str()) {
-                Some(info) => {
-                    let dst = cx.alloc_scratch();
-                    if info.initialized {
-                        cx.emit(
-                            Op::LoadLocal,
-                            vec![Operand::Register(dst), Operand::Imm32(info.reg as i32)],
-                            span,
-                        );
-                    } else {
-                        // Reading a `let` / `const` binding before
-                        // its initializer ran — the runtime will
-                        // raise a `ReferenceError`-equivalent
-                        // diagnostic via `Op::TdzError`.
-                        cx.emit(Op::TdzError, vec![Operand::Imm32(info.reg as i32)], span);
-                    }
-                    Ok(dst)
+            if let Some(info) = cx.lookup_binding(id.name.as_str()) {
+                let dst = cx.alloc_scratch();
+                if info.initialized {
+                    cx.emit_load_storage(dst, info.storage, span);
+                } else {
+                    // Reading a `let` / `const` binding before its
+                    // initializer ran — runtime raises
+                    // `ReferenceError` via `Op::TdzError`.
+                    let diag_idx = match info.storage {
+                        BindingStorage::Register { reg } => reg,
+                        BindingStorage::Upvalue { idx } => idx,
+                    };
+                    cx.emit(Op::TdzError, vec![Operand::Imm32(diag_idx as i32)], span);
                 }
-                None => Err(CompileError::Unsupported {
-                    node: format!("unresolved identifier `{}`", id.name),
-                    span,
-                }),
+                return Ok(dst);
             }
+            // Walk the parent chain for a closure capture.
+            if let Some(uv_idx) = cx.resolve_capture(id.name.as_str()) {
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadUpvalue,
+                    vec![Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
+                    span,
+                );
+                return Ok(dst);
+            }
+            Err(CompileError::Unsupported {
+                node: format!("unresolved identifier `{}`", id.name),
+                span,
+            })
         }
 
         Expression::LogicalExpression(l) => {
@@ -1152,7 +1419,7 @@ fn compile_expr(
                 );
                 return Ok(value);
             }
-            // `name = value` — local binding store.
+            // `name = value` — local or captured-upvalue store.
             let name = match &a.left {
                 AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str().to_string(),
                 _ => {
@@ -1162,22 +1429,24 @@ fn compile_expr(
                     });
                 }
             };
-            let info = cx.lookup_binding(&name).ok_or(CompileError::Unsupported {
-                node: format!("assignment to undeclared `{name}`"),
-                span,
-            })?;
-            if info.is_const {
+            let storage = if let Some(info) = cx.lookup_binding(&name) {
+                if info.is_const {
+                    return Err(CompileError::Unsupported {
+                        node: format!("assignment to const `{name}`"),
+                        span,
+                    });
+                }
+                info.storage
+            } else if let Some(idx) = cx.resolve_capture(&name) {
+                BindingStorage::Upvalue { idx }
+            } else {
                 return Err(CompileError::Unsupported {
-                    node: format!("assignment to const `{name}`"),
+                    node: format!("assignment to undeclared `{name}`"),
                     span,
                 });
-            }
+            };
             let value = compile_expr(cx, &a.right, span)?;
-            cx.emit(
-                Op::StoreLocal,
-                vec![Operand::Register(value), Operand::Imm32(info.reg as i32)],
-                span,
-            );
+            cx.emit_store_storage(value, storage, span);
             // An explicit assignment counts as initialization for
             // TDZ purposes, so subsequent reads stop emitting
             // `TdzError`. (Note: per spec, an `x = 1` that
@@ -1474,27 +1743,19 @@ fn compile_expr(
                 f.id.as_ref()
                     .map(|id| id.name.as_str().to_string())
                     .unwrap_or_else(|| "<anonymous>".to_string());
-            let function_id = compile_function(cx, &name, &f.params, &f.body, span)?;
+            let (function_id, captures) = compile_function(cx, &name, &f.params, &f.body, span)?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
-            cx.emit(
-                Op::MakeFunction,
-                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
-                span,
-            );
+            emit_make_callable(cx, dst, const_idx, &captures, span);
             Ok(dst)
         }
 
         Expression::ArrowFunctionExpression(a) => {
             let span = (a.span.start, a.span.end);
-            let function_id = compile_arrow_function(cx, a, span)?;
+            let (function_id, captures) = compile_arrow_function(cx, a, span)?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
-            cx.emit(
-                Op::MakeFunction,
-                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
-                span,
-            );
+            emit_make_callable(cx, dst, const_idx, &captures, span);
             Ok(dst)
         }
 
@@ -1516,7 +1777,7 @@ fn compile_expr(
 /// Computed-method access, `new`, and spread arguments are
 /// deferred.
 fn compile_method_call(
-    cx: &mut FunctionContext,
+    cx: &mut Compiler,
     call: &oxc_ast::ast::CallExpression<'_>,
 ) -> Result<u16, CompileError> {
     let span = (call.span.start, call.span.end);
@@ -1543,7 +1804,7 @@ fn compile_method_call(
         operands.push(Operand::ConstIndex(name_idx));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::CallStringMethod, operands, span);
+        cx.emit(Op::CallMethod, operands, span);
         return Ok(dst);
     }
     // Free call: `callee(args...)`.
@@ -1563,7 +1824,7 @@ fn compile_method_call(
 /// dedicated opcode. Foundation slice 19 covers `create`,
 /// `getPrototypeOf`, and `setPrototypeOf`.
 fn compile_object_builtin(
-    cx: &mut FunctionContext,
+    cx: &mut Compiler,
     method: &str,
     arg_regs: &[u16],
     span: (u32, u32),
@@ -1610,7 +1871,7 @@ fn compile_object_builtin(
 }
 
 fn compile_call_args(
-    cx: &mut FunctionContext,
+    cx: &mut Compiler,
     args: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
     span: (u32, u32),
 ) -> Result<Vec<u16>, CompileError> {
@@ -1792,6 +2053,37 @@ pub enum CompileError {
 mod tests {
     use super::*;
     use otter_syntax::parse;
+
+    #[test]
+    fn closure_emits_make_closure_with_capture() {
+        let parsed = parse(
+            "function makeCounter() { let n = 0; return function() { n = n + 1; return n; }; }\nmakeCounter();",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile(&parsed, "test.ts").unwrap();
+        // The inner function captures `n` from `makeCounter`, so the
+        // outer body emits `MakeClosure` instead of `MakeFunction`.
+        let outer = &module.functions[1];
+        let has_make_closure = outer.code.iter().any(|i| i.op == Op::MakeClosure);
+        assert!(
+            has_make_closure,
+            "outer function should emit MakeClosure for capturing inner: {:?}",
+            outer.code
+        );
+        // The inner function reads / writes `n` through upvalue ops.
+        let inner = &module.functions[2];
+        assert!(
+            inner.code.iter().any(|i| i.op == Op::LoadUpvalue),
+            "inner should LoadUpvalue: {:?}",
+            inner.code
+        );
+        assert!(
+            inner.code.iter().any(|i| i.op == Op::StoreUpvalue),
+            "inner should StoreUpvalue: {:?}",
+            inner.code
+        );
+    }
 
     #[test]
     fn empty_script_compiles() {

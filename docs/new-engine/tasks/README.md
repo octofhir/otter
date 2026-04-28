@@ -70,8 +70,15 @@ workspace resolution layers on top via `oxc_resolver`-backed
 bare-specifier resolution: `import x from "lodash"`, `@scope/pkg`
 packages, `npm:` sugar prefix, walk-up `node_modules`,
 conditional `exports` maps with ESM / CJS condition names,
-configurable through `RuntimeBuilder::module_loader`. **176/176
-engine fixtures pass.**
+configurable through `RuntimeBuilder::module_loader`. The `Symbol`
+primitive ships with all 13 well-known symbols (asyncIterator,
+hasInstance, isConcatSpreadable, iterator, match, matchAll, replace,
+search, species, split, toPrimitive, toStringTag, unscopables),
+`Symbol.for` / `Symbol.keyFor` registry round-trip, symbol-keyed own
+properties on plain objects, the `typeof` operator returning
+`"symbol"`, `arr[Symbol.iterator]()` returning a foundation iterator
+factory, and `[Symbol.toPrimitive]` consultation from the unary `+`
+operator. **184/184 engine fixtures pass.**
 
 Foundation artifacts that stay (not tasks, never deleted):
 
@@ -159,7 +166,6 @@ ships independently end-to-end.
 
 | File | One-line goal |
 |---|---|
-| [37-symbol-and-well-known-symbols.md](./37-symbol-and-well-known-symbols.md) | `Symbol` value, well-known symbols, symbol-keyed properties. |
 | [38-map-set-and-weak-collections.md](./38-map-set-and-weak-collections.md) | `Map`, `Set`, `WeakMap`, `WeakSet`. |
 | [39-temporal.md](./39-temporal.md) | `Temporal.*` modern date / time API. |
 | [40-intl.md](./40-intl.md) | `Intl.*` (Collator, NumberFormat, DateTimeFormat). |

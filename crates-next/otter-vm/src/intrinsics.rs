@@ -68,6 +68,12 @@ pub enum IntrinsicReceiver {
     /// `Promise.prototype.<name>`. Receiver is a
     /// `Value::Promise` (added in slice 34).
     Promise,
+    /// `Symbol.prototype.<name>`. Receiver is a [`crate::Value::Symbol`]
+    /// (added in slice 37).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-symbol-prototype-object>
+    Symbol,
 }
 
 /// Borrowed call frame for an intrinsic.

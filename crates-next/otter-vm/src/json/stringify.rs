@@ -294,7 +294,12 @@ fn emit_value(
                 _root: obj.clone(),
             });
         }
-        Value::Function { .. }
+        // Symbols are silently dropped by `JSON.stringify` per
+        // §25.5.2. Inside an array context the upstream walker has
+        // already substituted `null`; for top-level symbols and
+        // belt-and-braces guards we also emit `null` here.
+        Value::Symbol(_)
+        | Value::Function { .. }
         | Value::Closure { .. }
         | Value::BoundFunction(_)
         | Value::NativeFunction(_)
@@ -302,9 +307,6 @@ fn emit_value(
         | Value::RegExp(_)
         | Value::Promise(_)
         | Value::ClassConstructor(_) => {
-            // Non-serialisable inside an array path — the array
-            // walker substituted `null` before calling us. As a
-            // belt-and-braces guard, emit `null` here too.
             out.push_str("null");
         }
     }

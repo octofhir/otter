@@ -45,6 +45,9 @@ pub mod regexp;
 pub mod regexp_prototype;
 pub mod string;
 pub mod string_prototype;
+pub mod symbol;
+pub mod symbol_dispatch;
+pub mod symbol_prototype;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +69,7 @@ pub use promise::{
 };
 pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
 pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
+pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 
 /// Foundation runtime value.
 ///
@@ -90,6 +94,13 @@ pub enum Value {
     /// JS string. Storage is WTF-16 with cons / sliced ropes; see
     /// [`JsString`].
     String(JsString),
+    /// JS Symbol primitive. Identity-shared via `Rc<SymbolBody>`;
+    /// each ordinary `Symbol(desc)` allocation produces a distinct
+    /// value even when descriptions match. See [`JsSymbol`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-symbol-objects>
+    Symbol(JsSymbol),
     /// JS function. Foundation slice 13: a closure-less reference
     /// to a [`otter_bytecode::Function`] in the loaded module.
     /// Real closures (captured upvalues) arrive in a later slice.
@@ -285,6 +296,7 @@ impl Value {
             // decimal digits, no `n` suffix.
             Value::BigInt(b) => b.to_decimal_string(),
             Value::String(s) => s.to_lossy_string(),
+            Value::Symbol(s) => s.descriptive_string(),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 format!("[Function #{function_id}]")
             }
@@ -320,7 +332,9 @@ impl Value {
             // Spec ToBoolean(BigInt): false iff zero.
             Value::BigInt(b) => !b.as_inner().sign().eq(&num_bigint::Sign::NoSign),
             Value::String(s) => !s.is_empty(),
-            Value::Function { .. }
+            // Symbol is always truthy per ECMA-262 §7.1.2.
+            Value::Symbol(_)
+            | Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
@@ -366,6 +380,54 @@ impl Value {
         }
     }
 
+    /// Borrow as a [`JsSymbol`] when the value is a symbol.
+    #[must_use]
+    pub fn as_symbol(&self) -> Option<&JsSymbol> {
+        match self {
+            Value::Symbol(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Spec [`typeof`](https://tc39.es/ecma262/#sec-typeof-operator)
+    /// — return the JS-visible type tag string.
+    ///
+    /// # Algorithm
+    /// 1. `undefined` → `"undefined"`.
+    /// 2. `null` → `"object"` (the historical wart preserved by the
+    ///    spec).
+    /// 3. `boolean` → `"boolean"`; `number` → `"number"`;
+    ///    `bigint` → `"bigint"`; `string` → `"string"`;
+    ///    `symbol` → `"symbol"`.
+    /// 4. Every callable (function / closure / bound / native /
+    ///    class) → `"function"`.
+    /// 5. Anything else → `"object"`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-typeof-operator>
+    #[must_use]
+    pub fn typeof_string(&self) -> &'static str {
+        match self {
+            Value::Undefined => "undefined",
+            Value::Null => "object",
+            Value::Boolean(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::BigInt(_) => "bigint",
+            Value::String(_) => "string",
+            Value::Symbol(_) => "symbol",
+            Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::NativeFunction(_)
+            | Value::ClassConstructor(_) => "function",
+            Value::Object(_)
+            | Value::Array(_)
+            | Value::Iterator(_)
+            | Value::RegExp(_)
+            | Value::Promise(_) => "object",
+        }
+    }
+
     /// Construct a string value from in-memory text. Convenience
     /// for tests and the compiler's literal table.
     ///
@@ -388,6 +450,10 @@ impl PartialEq for Value {
             // the cross-kind case.
             (Value::BigInt(a), Value::BigInt(b)) => a == b,
             (Value::String(a), Value::String(b)) => a.equals(b),
+            // Symbol identity is ptr_eq on the inner Rc — distinct
+            // `Symbol("x")` calls compare unequal even with matching
+            // descriptions.
+            (Value::Symbol(a), Value::Symbol(b)) => a.ptr_eq(b),
             (Value::Object(a), Value::Object(b)) => a.ptr_eq(b),
             (Value::Array(a), Value::Array(b)) => a.ptr_eq(b),
             (Value::Function { function_id: a }, Value::Function { function_id: b }) => a == b,
@@ -850,6 +916,13 @@ pub struct Interpreter {
     /// alongside `module_environments`.
     module_resolution_cache:
         std::collections::HashMap<(std::rc::Rc<str>, String), std::rc::Rc<str>>,
+    /// Per-interpreter table of well-known symbol singletons
+    /// (ECMA-262 §6.1.5.1). Populated in [`Self::new`]; constant
+    /// across an interpreter's lifetime.
+    well_known_symbols: WellKnownSymbols,
+    /// Global symbol registry backing `Symbol.for` / `Symbol.keyFor`
+    /// (ECMA-262 §20.4.2.4 / §20.4.2.6).
+    symbol_registry: SymbolRegistry,
 }
 
 impl Interpreter {
@@ -857,13 +930,18 @@ impl Interpreter {
     /// a no-cap string heap, and the default stack-depth limit.
     #[must_use]
     pub fn new() -> Self {
+        let string_heap = Arc::new(StringHeap::default());
+        let well_known_symbols = WellKnownSymbols::new(&string_heap)
+            .expect("populating well-known symbols on a fresh heap cannot fail");
         Self {
             interrupt: InterruptFlag::new(),
-            string_heap: Arc::new(StringHeap::default()),
+            string_heap,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
+            well_known_symbols,
+            symbol_registry: SymbolRegistry::new(),
         }
     }
 
@@ -871,14 +949,34 @@ impl Interpreter {
     /// unlimited).
     #[must_use]
     pub fn with_string_heap_cap(cap_bytes: u64) -> Self {
+        let string_heap = Arc::new(StringHeap::with_cap(cap_bytes));
+        let well_known_symbols = WellKnownSymbols::new(&string_heap)
+            .expect("well-known symbol descriptions fit within any positive cap");
         Self {
             interrupt: InterruptFlag::new(),
-            string_heap: Arc::new(StringHeap::with_cap(cap_bytes)),
+            string_heap,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
+            well_known_symbols,
+            symbol_registry: SymbolRegistry::new(),
         }
+    }
+
+    /// Borrow the per-interpreter table of well-known symbol
+    /// singletons. The table is constant across the interpreter's
+    /// lifetime.
+    #[must_use]
+    pub fn well_known_symbols(&self) -> &WellKnownSymbols {
+        &self.well_known_symbols
+    }
+
+    /// Borrow the global symbol registry backing `Symbol.for` /
+    /// `Symbol.keyFor`. Returns the same instance across calls.
+    #[must_use]
+    pub fn symbol_registry(&self) -> &SymbolRegistry {
+        &self.symbol_registry
     }
 
     /// Register or overwrite a module's `module_env` object so
@@ -1362,6 +1460,16 @@ impl Interpreter {
                     }
                     continue;
                 }
+                // ToNumber on an object whose `[Symbol.toPrimitive]`
+                // is callable must invoke that hook (ECMA-262
+                // §7.1.1 OrdinaryToPrimitive). The synchronous path
+                // pushes a frame, so the dispatch happens here —
+                // outside the in-frame mutable borrow below.
+                Op::ToNumber => {
+                    if let Some(()) = self.try_to_primitive_dispatch(stack, module, &operands)? {
+                        continue;
+                    }
+                }
                 _ => {}
             }
 
@@ -1656,6 +1764,7 @@ impl Interpreter {
                         Value::RegExp(r) => {
                             regexp_prototype::load_property(r, &name, &self.string_heap)
                         }
+                        Value::Symbol(s) => symbol_prototype::load_property(s, &name),
                         _ => return Err(VmError::TypeMismatch),
                     };
                     write_register(frame, dst, value)?;
@@ -1748,44 +1857,84 @@ impl Interpreter {
                     let recv_reg = register_operand(operands.get(1))?;
                     let idx_reg = register_operand(operands.get(2))?;
                     let recv = read_register(frame, recv_reg)?.clone();
-                    let idx = match read_register(frame, idx_reg)? {
-                        Value::Number(n) => match n.as_smi() {
-                            Some(v) if v >= 0 => v as usize,
-                            _ => return Err(VmError::TypeMismatch),
-                        },
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let value = match recv {
-                        Value::Array(a) => a.get(idx),
-                        Value::String(s) => match s.char_code_at(idx as u32) {
-                            Some(unit) => Value::String(crate::JsString::from_utf16_units(
-                                &[unit],
-                                &self.string_heap,
-                            )?),
-                            None => Value::String(crate::JsString::empty(&self.string_heap)?),
-                        },
-                        _ => return Err(VmError::TypeMismatch),
+                    let idx_value = read_register(frame, idx_reg)?.clone();
+                    let value = match (&recv, &idx_value) {
+                        // Symbol-keyed property access on objects —
+                        // foundation §7.4 (well-known symbols) +
+                        // §10.1 (ordinary objects). Arrays delegate
+                        // through their `JsObject`-style symbol
+                        // store too once the well-known iterator
+                        // exposes a callable (see below).
+                        (Value::Object(obj), Value::Symbol(sym)) => {
+                            obj.get_symbol(sym).unwrap_or(Value::Undefined)
+                        }
+                        // String-keyed access on objects with
+                        // computed names: `obj["foo"]` — falls back
+                        // to the string property table.
+                        (Value::Object(obj), Value::String(key)) => {
+                            obj.get(&key.to_lossy_string()).unwrap_or(Value::Undefined)
+                        }
+                        // `arr[Symbol.iterator]` — return a native
+                        // callable producing the foundation
+                        // iterator state for the array.
+                        (Value::Array(arr), Value::Symbol(sym))
+                            if sym
+                                .well_known_tag()
+                                .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
+                        {
+                            make_array_iterator_factory(arr.clone())
+                        }
+                        // Numeric-indexed array / string element
+                        // reads.
+                        _ => {
+                            let idx = match &idx_value {
+                                Value::Number(n) => match n.as_smi() {
+                                    Some(v) if v >= 0 => v as usize,
+                                    _ => return Err(VmError::TypeMismatch),
+                                },
+                                _ => return Err(VmError::TypeMismatch),
+                            };
+                            match recv {
+                                Value::Array(a) => a.get(idx),
+                                Value::String(s) => match s.char_code_at(idx as u32) {
+                                    Some(unit) => Value::String(crate::JsString::from_utf16_units(
+                                        &[unit],
+                                        &self.string_heap,
+                                    )?),
+                                    None => {
+                                        Value::String(crate::JsString::empty(&self.string_heap)?)
+                                    }
+                                },
+                                _ => return Err(VmError::TypeMismatch),
+                            }
+                        }
                     };
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
                 Op::StoreElement => {
-                    let arr_reg = register_operand(operands.first())?;
+                    let recv_reg = register_operand(operands.first())?;
                     let idx_reg = register_operand(operands.get(1))?;
                     let src_reg = register_operand(operands.get(2))?;
-                    let arr = match read_register(frame, arr_reg)? {
-                        Value::Array(a) => a.clone(),
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let idx = match read_register(frame, idx_reg)? {
-                        Value::Number(n) => match n.as_smi() {
-                            Some(v) if v >= 0 => v as usize,
+                    let recv = read_register(frame, recv_reg)?.clone();
+                    let idx_value = read_register(frame, idx_reg)?.clone();
+                    let value = read_register(frame, src_reg)?.clone();
+                    match (&recv, &idx_value) {
+                        // Symbol-keyed write on an object.
+                        (Value::Object(obj), Value::Symbol(sym)) => {
+                            obj.set_symbol(sym.clone(), value);
+                        }
+                        // Computed string-key write (`obj["k"] = …`).
+                        (Value::Object(obj), Value::String(key)) => {
+                            obj.set(&key.to_lossy_string(), value);
+                        }
+                        // Numeric-indexed array write.
+                        (Value::Array(arr), Value::Number(n)) => match n.as_smi() {
+                            Some(v) if v >= 0 => arr.set(v as usize, value),
                             _ => return Err(VmError::TypeMismatch),
                         },
                         _ => return Err(VmError::TypeMismatch),
-                    };
-                    let value = read_register(frame, src_reg)?.clone();
-                    arr.set(idx, value);
+                    }
                     frame.pc += 1;
                 }
                 Op::ArrayLength => {
@@ -1897,6 +2046,9 @@ impl Interpreter {
                         // surface it here so the unary `+` operator
                         // doesn't silently coerce.
                         Value::BigInt(_) => return Err(VmError::TypeMismatch),
+                        // Spec ToNumber(Symbol) is a TypeError per
+                        // §7.1.4 step 4.
+                        Value::Symbol(_) => return Err(VmError::TypeMismatch),
                         Value::Undefined
                         | Value::Function { .. }
                         | Value::Closure { .. }
@@ -2250,6 +2402,61 @@ impl Interpreter {
                     };
                     let next_idx = array.len();
                     array.set(next_idx, value);
+                    frame.pc += 1;
+                }
+                Op::SymbolLoad => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let value =
+                        symbol_dispatch::load_static(self, &name).map_err(symbol_to_vm_error)?;
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::SymbolCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result =
+                        symbol_dispatch::call(self, &name, &args).map_err(symbol_to_vm_error)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                Op::TypeOf => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let tag = read_register(frame, src)?.typeof_string();
+                    let s = JsString::from_str(tag, &self.string_heap)?;
+                    write_register(frame, dst, Value::String(s))?;
+                    frame.pc += 1;
+                }
+                Op::DeleteElement => {
+                    let dst = register_operand(operands.first())?;
+                    let obj_reg = register_operand(operands.get(1))?;
+                    let idx_reg = register_operand(operands.get(2))?;
+                    let obj = match read_register(frame, obj_reg)? {
+                        Value::Object(o) => o.clone(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let removed = match read_register(frame, idx_reg)? {
+                        Value::Symbol(sym) => obj.delete_symbol(sym),
+                        Value::String(s) => obj.delete(&s.to_lossy_string()),
+                        Value::Number(n) => match n.as_smi() {
+                            Some(v) if v >= 0 => obj.delete(&v.to_string()),
+                            _ => false,
+                        },
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    write_register(frame, dst, Value::Boolean(removed))?;
                     frame.pc += 1;
                 }
             }
@@ -2860,6 +3067,7 @@ impl Interpreter {
             Value::Array(_) => array_prototype::lookup(&name),
             Value::Number(_) => number::prototype_lookup(&name),
             Value::RegExp(_) => regexp_prototype::lookup(&name),
+            Value::Symbol(_) => symbol_prototype::lookup(&name),
             _ => None,
         };
         if let Some(entry) = intrinsic {
@@ -2980,6 +3188,56 @@ impl Interpreter {
                 name: name.to_string(),
             }),
         }
+    }
+
+    /// Pre-dispatch hook for [`Op::ToNumber`] that consults
+    /// `[Symbol.toPrimitive]` on object operands.
+    ///
+    /// # Algorithm
+    /// 1. If the source register holds a [`Value::Object`] whose
+    ///    `[Symbol.toPrimitive]` symbol-keyed property is callable,
+    ///    advance pc past the `ToNumber` instruction and invoke
+    ///    the hook with `this = obj` and `args = ["number"]`.
+    /// 2. The hook's return value lands in the `ToNumber`'s
+    ///    destination register on frame pop. The foundation does
+    ///    not re-coerce; tests targeting this slice return a
+    ///    Number directly.
+    /// 3. Return `Ok(Some(()))` when the hook fired (caller
+    ///    `continue`s the dispatch loop), `Ok(None)` otherwise so
+    ///    the in-frame fast path runs.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
+    fn try_to_primitive_dispatch(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<Option<()>, VmError> {
+        let dst = register_operand(operands.first())?;
+        let src = register_operand(operands.get(1))?;
+        let top_idx = stack.len() - 1;
+        let recv = read_register(&stack[top_idx], src)?.clone();
+        let Value::Object(obj) = &recv else {
+            return Ok(None);
+        };
+        let to_primitive_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
+        let Some(callee) = obj.get_symbol(&to_primitive_sym) else {
+            return Ok(None);
+        };
+        if !is_callable(&callee) {
+            return Ok(None);
+        }
+        let hint = JsString::from_str("number", &self.string_heap)?;
+        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+        args.push(Value::String(hint));
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        self.invoke(stack, module, &callee, recv.clone(), args, dst)?;
+        Ok(Some(()))
     }
 
     fn binop_regs(
@@ -3192,6 +3450,22 @@ fn math_to_vm_error(err: math::MathError) -> VmError {
     }
 }
 
+fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
+    match err {
+        symbol_dispatch::SymbolError::UnknownMember(name) => VmError::UnknownIntrinsic {
+            name: format!("Symbol.{name}"),
+        },
+        symbol_dispatch::SymbolError::BadArgument { .. } => VmError::TypeMismatch,
+        symbol_dispatch::SymbolError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+    }
+}
+
 fn native_to_vm_error(err: NativeError) -> VmError {
     match err {
         NativeError::Thrown { name: _, message } => VmError::Uncaught { value: message },
@@ -3348,6 +3622,29 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// `Exhausted` so subsequent calls are stable no-ops (matches the
 /// spec rule "an iterator never produces values after it has
 /// produced `done: true`"; §7.4.2 step 6).
+/// Build the native callable that `arr[Symbol.iterator]` evaluates
+/// to. Invoking the returned function (with any `this`) yields a
+/// fresh [`Value::Iterator`] over the captured array — matching the
+/// surface of `Array.prototype[@@iterator]` from
+/// [ECMA-262 §23.1.5.1](https://tc39.es/ecma262/#sec-array.prototype-@@iterator).
+///
+/// # Invariants
+/// - Capturing the array by handle means the iterator observes
+///   subsequent in-place mutations through the same `JsArray`,
+///   matching real-engine `Array.prototype[Symbol.iterator]`
+///   semantics.
+fn make_array_iterator_factory(array: JsArray) -> Value {
+    native_value("Array[Symbol.iterator]", move |_, _| {
+        let state = IteratorState::Array {
+            array: array.clone(),
+            index: 0,
+        };
+        Ok(Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+            state,
+        ))))
+    })
+}
+
 fn step_iterator(
     iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
     string_heap: &StringHeap,

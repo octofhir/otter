@@ -498,7 +498,8 @@ fn is_const_pool_ref(op: Op, pos: usize) -> bool {
         | Op::LoadRegExp
         | Op::MakeFunction
         | Op::MathLoad
-        | Op::ImportNamespace => pos == 1,
+        | Op::ImportNamespace
+        | Op::SymbolLoad => pos == 1,
         // [reg, reg, const] shape
         Op::LoadProperty | Op::DeleteProperty => pos == 2,
         // [reg, const, reg] shape
@@ -508,7 +509,7 @@ fn is_const_pool_ref(op: Op, pos: usize) -> bool {
         Op::MakeClosure => pos == 1,
         // [reg, name_const, argc, args...] — name at pos 1;
         // argc at pos 2 stays raw.
-        Op::MathCall | Op::JsonCall | Op::PromiseCall => pos == 1,
+        Op::MathCall | Op::JsonCall | Op::PromiseCall | Op::SymbolCall => pos == 1,
         // [reg, recv, name_const, argc, args...] — name at pos 2;
         // argc at pos 3 stays raw.
         Op::CallMethodValue => pos == 2,

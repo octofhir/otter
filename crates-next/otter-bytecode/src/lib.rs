@@ -453,6 +453,31 @@ pub enum Op {
     /// the surface matches `import("./x").then(ns => ...)`.
     PromiseFulfilledOf,
 
+    /// `r<dst> = Symbol.<name>` (well-known symbol read). Operands:
+    /// `Register(dst), ConstIndex(name)`. Lowered by the compiler
+    /// for static-member access on the `Symbol` namespace; the
+    /// runtime resolves `<name>` against the well-known table per
+    /// ECMA-262 §6.1.5.1.
+    SymbolLoad,
+    /// `r<dst> = Symbol(...) | Symbol.<method>(args...)`.
+    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`. When `name` is the empty-string sentinel
+    /// the runtime executes the bare `Symbol(desc)` constructor;
+    /// otherwise it dispatches `Symbol.for` / `Symbol.keyFor` /
+    /// other registered statics. Variadic, same shape as
+    /// [`Op::MathCall`].
+    SymbolCall,
+    /// `r<dst> = typeof r<src>`. Operands:
+    /// `Register(dst), Register(src)`. Returns one of `"undefined"`,
+    /// `"object"`, `"boolean"`, `"number"`, `"bigint"`, `"string"`,
+    /// `"symbol"`, `"function"` per ECMA-262 §13.5.3.
+    TypeOf,
+    /// `r<dst> = delete r<obj>[r<idx>]` (boolean result). Operands:
+    /// `dst, obj, idx`. Indexed counterpart of
+    /// [`Op::DeleteProperty`]; symbol- and string-keyed objects
+    /// route to the matching delete path based on the value of
+    /// `idx`.
+    DeleteElement,
     /// Suspend the current async frame on the awaited value. Operands:
     /// `Register(dst), Register(src)`.
     ///
@@ -567,6 +592,10 @@ impl Op {
             Op::ImportNamespace => "IMPORT_NAMESPACE",
             Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
             Op::Await => "AWAIT",
+            Op::SymbolLoad => "SYMBOL_LOAD",
+            Op::SymbolCall => "SYMBOL_CALL",
+            Op::TypeOf => "TYPEOF",
+            Op::DeleteElement => "DELETE_ELEMENT",
         }
     }
 
@@ -615,7 +644,9 @@ impl Op {
             | Op::MathLoad
             | Op::Await
             | Op::ImportNamespace
-            | Op::PromiseFulfilledOf => 2,
+            | Op::PromiseFulfilledOf
+            | Op::SymbolLoad
+            | Op::TypeOf => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -651,10 +682,11 @@ impl Op {
             // dispatcher reads the count and walks the trailing
             // operands.
             Op::NewArray => 2,
-            Op::LoadElement | Op::StoreElement => 3,
+            Op::LoadElement | Op::StoreElement | Op::DeleteElement => 3,
             Op::CallMethodValue => 4, // dst, recv, name_const, argc
             Op::MathCall => 3,        // dst, name_const, argc — args follow
             Op::JsonCall => 3,        // dst, name_const, argc — args follow
+            Op::SymbolCall => 3,      // dst, name_const, argc — args follow
             Op::QueueMicrotask => 2,  // callee, argc — args follow
             Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
             Op::PromiseCall => 3,     // dst, name_const, argc — args follow

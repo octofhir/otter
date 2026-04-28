@@ -2936,6 +2936,21 @@ fn compile_expr(
                     );
                     return Ok(dst);
                 }
+                if let Expression::ComputedMemberExpression(member) = &u.argument {
+                    let obj_reg = compile_expr(cx, &member.object, span)?;
+                    let idx_reg = compile_expr(cx, &member.expression, span)?;
+                    let dst = cx.alloc_scratch();
+                    cx.emit(
+                        Op::DeleteElement,
+                        vec![
+                            Operand::Register(dst),
+                            Operand::Register(obj_reg),
+                            Operand::Register(idx_reg),
+                        ],
+                        span,
+                    );
+                    return Ok(dst);
+                }
                 return Err(CompileError::Unsupported {
                     node: "delete on non-member expression".to_string(),
                     span,
@@ -2948,6 +2963,7 @@ fn compile_expr(
                 UnaryOperator::UnaryPlus => Op::ToNumber,
                 UnaryOperator::LogicalNot => Op::LogicalNot,
                 UnaryOperator::BitwiseNot => Op::BitwiseNot,
+                UnaryOperator::Typeof => Op::TypeOf,
                 other => {
                     return Err(CompileError::Unsupported {
                         node: format!("UnaryExpression ({other:?})"),
@@ -3042,6 +3058,21 @@ fn compile_expr(
                 let name_idx = cx.intern_string_constant(m.property.name.as_str());
                 cx.emit(
                     Op::MathLoad,
+                    vec![Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                    span,
+                );
+                return Ok(dst);
+            }
+            // `Symbol.<name>` — well-known symbol read. The runtime
+            // resolves the name against the per-interpreter
+            // well-known table (ECMA-262 §6.1.5.1).
+            if let Expression::Identifier(id) = &m.object
+                && id.name.as_str() == "Symbol"
+            {
+                let dst = cx.alloc_scratch();
+                let name_idx = cx.intern_string_constant(m.property.name.as_str());
+                cx.emit(
+                    Op::SymbolLoad,
                     vec![Operand::Register(dst), Operand::ConstIndex(name_idx)],
                     span,
                 );
@@ -3764,6 +3795,40 @@ fn compile_method_call(
             cx.emit(Op::PromiseCall, operands, span);
             return Ok(dst);
         }
+        // `Symbol.<method>(args)` — `Symbol.for` / `Symbol.keyFor`.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Symbol"
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::SymbolCall, operands, span);
+            return Ok(dst);
+        }
+    }
+    // Bare `Symbol(desc)` — fresh primitive symbol per call. Lower
+    // through the same Op::SymbolCall path with the empty-string
+    // sentinel as the method name (the runtime treats that as the
+    // constructor form).
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Symbol"
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let name_idx = cx.intern_string_constant("");
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::SymbolCall, operands, span);
+        return Ok(dst);
     }
     // Bare-identifier interceptions — `queueMicrotask(fn, ...args)`
     // is the only one today. Lives at the call-site layer (not
@@ -3812,6 +3877,34 @@ fn compile_method_call(
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::CallMethodValue, operands, span);
+        return Ok(dst);
+    }
+    // `obj[expr](args...)` — computed-member call. Lower as
+    // `LoadElement` + `CallWithThis` so the callee receives the
+    // receiver as its `this` value, matching ECMA-262 §13.3.6.1
+    // EvaluateCall step 5.b.
+    if let Expression::ComputedMemberExpression(member) = callee {
+        let receiver_reg = compile_expr(cx, &member.object, span)?;
+        let idx_reg = compile_expr(cx, &member.expression, span)?;
+        let callee_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadElement,
+            vec![
+                Operand::Register(callee_reg),
+                Operand::Register(receiver_reg),
+                Operand::Register(idx_reg),
+            ],
+            span,
+        );
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(callee_reg));
+        operands.push(Operand::Register(receiver_reg));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallWithThis, operands, span);
         return Ok(dst);
     }
     // Free call: `callee(args...)`.

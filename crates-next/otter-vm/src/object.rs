@@ -45,6 +45,7 @@ use smallvec::SmallVec;
 
 use crate::Value;
 use crate::string::JsString;
+use crate::symbol::JsSymbol;
 
 /// A hidden-class node. Shapes form a tree rooted at the empty
 /// shape; each non-root shape records the **parent** plus the
@@ -162,6 +163,16 @@ struct ObjectBody {
     /// `Object.prototype`; until then, fresh objects start with
     /// `None`.
     prototype: Option<JsObject>,
+    /// Symbol-keyed own properties. Foundation uses a flat vector
+    /// keyed by [`JsSymbol`] identity (`ptr_eq`); typical objects
+    /// carry zero symbol-keyed entries, so the linear scan is
+    /// effectively constant-time.
+    ///
+    /// Stored separately from the string-keyed shape model so the
+    /// hot string-key path (`obj.foo`) stays untouched. Spec
+    /// behaviour matches §10.1 [[OwnPropertyKeys]] — symbol keys
+    /// enumerate after string keys.
+    symbol_props: Vec<(JsSymbol, Value)>,
 }
 
 /// Maximum prototype-chain hops a property lookup will follow
@@ -296,6 +307,69 @@ impl JsObject {
         true
     }
 
+    /// Look up an **own** symbol-keyed property. Identity comparison
+    /// uses [`JsSymbol::ptr_eq`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinarygetownproperty>
+    #[must_use]
+    pub fn get_own_symbol(&self, key: &JsSymbol) -> Option<Value> {
+        self.inner
+            .borrow()
+            .symbol_props
+            .iter()
+            .find(|(k, _)| k.ptr_eq(key))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Look up a symbol-keyed property, walking the prototype chain
+    /// on miss. Bounded by [`PROTO_CHAIN_HARD_CAP`].
+    #[must_use]
+    pub fn get_symbol(&self, key: &JsSymbol) -> Option<Value> {
+        if let Some(v) = self.get_own_symbol(key) {
+            return Some(v);
+        }
+        let mut current = self.prototype();
+        let mut hops = 0;
+        while let Some(proto) = current {
+            if hops >= PROTO_CHAIN_HARD_CAP {
+                return None;
+            }
+            hops += 1;
+            if let Some(v) = proto.get_own_symbol(key) {
+                return Some(v);
+            }
+            current = proto.prototype();
+        }
+        None
+    }
+
+    /// Set or overwrite a symbol-keyed own property. Existing key
+    /// (matched by identity) is updated in place; otherwise a fresh
+    /// entry is appended.
+    pub fn set_symbol(&self, key: JsSymbol, value: Value) {
+        let mut body = self.inner.borrow_mut();
+        for (existing_key, slot) in body.symbol_props.iter_mut() {
+            if existing_key.ptr_eq(&key) {
+                *slot = value;
+                return;
+            }
+        }
+        body.symbol_props.push((key, value));
+    }
+
+    /// Remove a symbol-keyed own property. Returns `true` when the
+    /// entry was present.
+    pub fn delete_symbol(&self, key: &JsSymbol) -> bool {
+        let mut body = self.inner.borrow_mut();
+        if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
+            body.symbol_props.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Borrow a read-only view of the property table.
     #[must_use]
     pub fn borrow_props(&self) -> Properties<'_> {
@@ -344,6 +418,7 @@ impl Default for JsObject {
                 shape,
                 slots: SmallVec::new(),
                 prototype: None,
+                symbol_props: Vec::new(),
             })),
         }
     }

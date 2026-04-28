@@ -88,6 +88,54 @@ chosen the strongest form of that rule:
    The CI clippy gate runs `-D missing_docs` for every
    `crates-next/*` crate so this rule is enforced mechanically, not
    socially.
+
+   **Function-level LLM-friendly comments.** Every public function
+   carries a `///` rustdoc; that's the `-D missing_docs` baseline.
+   On top of that, **non-trivial functions** (anything more than a
+   one-line wrapper) must also carry a structured doc comment that
+   a coding agent can scan without reading the body. The shape:
+   ```rust
+   /// <one-sentence summary of what the function does and why>
+   ///
+   /// # Algorithm
+   /// <numbered or bulleted steps; reference spec sections / task
+   /// numbers where relevant>
+   ///
+   /// # Invariants
+   /// - <pre/post-conditions; what the caller can rely on>
+   ///
+   /// # Errors
+   /// - `<ErrorVariant>` — <when this is returned>
+   ///
+   /// # See also
+   /// - [`<related_fn>`] — <why a reader might jump there>
+   ```
+   Sections are optional — keep only the ones that carry weight.
+   "Algorithm" is required for any function whose body is more
+   than ~15 lines or that implements a spec algorithm; for small
+   helpers the one-sentence summary is enough. Private helpers
+   that are non-obvious (cycle handling, state-machine steps,
+   spec-faithful reaction jobs) get the same treatment even though
+   `missing_docs` doesn't enforce it. The bar: a coding agent
+   modifying a sibling function should be able to understand this
+   one from its docstring alone.
+
+   **ECMA-262 spec-link rule (mandatory).** Any module or
+   function in `crates-next/*` that implements an ECMA-262
+   algorithm, intrinsic, or spec-mandated semantic MUST cite the
+   spec section in its docstring with a deep link of the form
+   `https://tc39.es/ecma262/#sec-<anchor>`. The link goes in the
+   module's `# See also` block and in the function's `# Algorithm`
+   or `# See also` block — short helpers may use a single-line
+   `/// Spec: <url>`. When more than one section is in play
+   (e.g., an algorithm calls into a spec abstract operation),
+   list each. Non-spec helpers (parser glue, compiler internals,
+   dispatch plumbing) are exempt from the link rule but still
+   carry the regular docstring. Audit + back-fill on already-
+   shipped code is filed as
+   [task 59](../tasks/59-spec-link-audit-and-rule.md); from this
+   ADR amendment onward, every new spec-faithful surface
+   includes the link in the same commit it lands.
 7. **Import rule:**
    - `crates-next/*` crates depend on each other and on third-party
      crates from crates.io.

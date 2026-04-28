@@ -414,6 +414,66 @@ pub enum Op {
     ///   before classes land.
     /// - Anything else returns `false`.
     Instanceof,
+
+    /// Resolve a module specifier to its `module_env` object.
+    /// Operands: `Register(dst), ConstIndex(specifier_const)`.
+    ///
+    /// The constant pool slot at `specifier_const` is a
+    /// [`Constant::String`] holding the raw specifier text from
+    /// the source (`"./other.ts"`, `"@scope/x"`, etc.). At runtime
+    /// the dispatcher resolves it against the **caller frame's
+    /// module URL** (see [`Frame::module_url`] in the VM crate)
+    /// using the linker's pre-built specifier → URL table, then
+    /// writes `Value::Object(module_env)` into `dst`.
+    ///
+    /// Used by:
+    /// - The `<entry>` synthesised driver to allocate fresh
+    ///   `module_env` objects per module before invoking each
+    ///   `<module-init>`.
+    /// - `import * as ns from "./other.ts"` lowering — the load
+    ///   binds `ns` to the source module's `module_env` directly.
+    /// - `import { x } from "./other.ts"` lowering — the compiler
+    ///   loads the source `module_env` once at the top of the
+    ///   importing module's body, hoists the result into a captured
+    ///   upvalue, then emits per-reference `LoadProperty` against
+    ///   it. Live bindings fall out: every read traverses the
+    ///   exporter's current `module_env.x`.
+    /// - `import("./literal.ts")` (literal-string dynamic import).
+    ///   The slice rejects non-literal `import(expr)` at compile
+    ///   time so this is the only dynamic-import path the runtime
+    ///   needs to support today.
+    ImportNamespace,
+    /// Wrap the value in `r<src>` as a fulfilled `Promise` and
+    /// write to `r<dst>`. Operands:
+    /// `Register(dst), Register(src)`.
+    ///
+    /// Used by the literal-string dynamic-import lowering: after
+    /// [`Op::ImportNamespace`] resolves the namespace synchronously
+    /// the compiler wraps the result in a pre-fulfilled promise so
+    /// the surface matches `import("./x").then(ns => ...)`.
+    PromiseFulfilledOf,
+
+    /// Suspend the current async frame on the awaited value. Operands:
+    /// `Register(dst), Register(src)`.
+    ///
+    /// The dispatcher reads `src`, wraps a non-promise value as
+    /// `Promise.resolve(value)`, parks the current frame off the
+    /// active stack, and attaches resume / reject handlers to the
+    /// awaited promise. When the awaited promise fulfils, the
+    /// resume handler enqueues an internal microtask that re-pushes
+    /// the parked frame onto a fresh stack, writes the resolved
+    /// value into `dst`, and continues from the next pc. Rejection
+    /// re-enters the parked frame and immediately throws the
+    /// rejection reason, threading through any in-frame `try`/
+    /// `catch`/`finally` handlers exactly as a synchronous throw
+    /// would.
+    ///
+    /// Only legal inside a function whose
+    /// [`Function::is_async`] flag is `true`; the compiler enforces
+    /// this. The dispatcher does not validate the flag — the
+    /// runtime simply uses the surrounding frame's async-state to
+    /// decide where the suspension point's settlement lands.
+    Await,
 }
 
 impl Op {
@@ -504,6 +564,9 @@ impl Op {
             Op::StoreElement => "STORE_ELEMENT",
             Op::ArrayLength => "ARRAY_LENGTH",
             Op::Instanceof => "INSTANCEOF",
+            Op::ImportNamespace => "IMPORT_NAMESPACE",
+            Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
+            Op::Await => "AWAIT",
         }
     }
 
@@ -549,7 +612,10 @@ impl Op {
             | Op::LoadUpvalue
             | Op::StoreUpvalue
             | Op::MakeFunction
-            | Op::MathLoad => 2,
+            | Op::MathLoad
+            | Op::Await
+            | Op::ImportNamespace
+            | Op::PromiseFulfilledOf => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -622,6 +688,7 @@ impl Op {
                 | Op::ReturnUndefined
                 | Op::Throw
                 | Op::EndFinally
+                | Op::Await
         )
     }
 }
@@ -698,6 +765,43 @@ pub struct Function {
     /// [`Op::CollectRest`] to materialise.
     #[serde(default)]
     pub has_rest: bool,
+    /// `true` when this function was declared with the `async`
+    /// keyword. The runtime treats async-call entry specially: it
+    /// synthesises a fresh pending [`crate::Constant::FunctionId`]
+    /// at the call site (well, the runtime allocates a pending
+    /// promise — see `crates-next/otter-vm/src/lib.rs`'s
+    /// `invoke()`), writes that promise into the caller's `dst`
+    /// register, and parks the new frame so [`Op::Await`] can
+    /// suspend it cleanly. A return / unhandled throw from an
+    /// async frame settles its parked promise rather than writing
+    /// the value back into the caller's register.
+    #[serde(default)]
+    pub is_async: bool,
+    /// `true` when this function is the synthesised
+    /// `<module-init>` for an ES module fragment. Module-init
+    /// functions take two implicit parameters (`module_env`,
+    /// `import_meta`) that the linker's `<entry>` driver passes
+    /// in; closures defined inside the body capture these via
+    /// upvalues.
+    ///
+    /// The flag is currently informational — the runtime treats
+    /// the `<module-init>` body identically to any other call.
+    /// It exists so the disassembler / dump can render the role,
+    /// and so future slices that want to special-case module
+    /// initialisation (e.g. capability gating, top-level await)
+    /// have a stable hook.
+    #[serde(default)]
+    pub is_module: bool,
+    /// The source-module URL this function belongs to (e.g.
+    /// `"file:///path/to/other.ts"`), recorded by the linker
+    /// during module-fragment merging. The runtime threads this
+    /// onto each call-frame's `module_url` field so `Op::ImportNamespace`
+    /// can resolve specifiers against the correct referrer.
+    /// Empty string for non-module functions (e.g. the linker's
+    /// synthesised `<entry>` driver) — those frames inherit their
+    /// caller's URL or stay empty.
+    #[serde(default)]
+    pub module_url: String,
     /// Encoded instructions.
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.
@@ -771,6 +875,54 @@ pub struct BytecodeModule {
     /// Module-wide constant pool.
     #[serde(default)]
     pub constants: Vec<Constant>,
+    /// Linker-populated map from `(referrer_module_url,
+    /// specifier_text)` → resolved module URL. The runtime's
+    /// [`Op::ImportNamespace`] dispatch consults this table by
+    /// reading the caller frame's `module_url` and the operand's
+    /// specifier constant.
+    ///
+    /// Stored as a flat list of `(referrer, specifier, target)`
+    /// triples for stable JSON-dump shape; the runtime builds an
+    /// in-memory hashmap on first use and caches it on the
+    /// interpreter side. Empty for script-mode bytecode.
+    #[serde(default)]
+    pub module_resolutions: Vec<ModuleResolution>,
+    /// Linker-populated map from module URL → function ID of that
+    /// module's `<module-init>`. The synthesised `<entry>` driver
+    /// reads this to call inits in post-order; runtime dynamic
+    /// `import("./literal")` reads it to find the namespace's
+    /// initialised `module_env` (registry built lazily on first
+    /// import). Empty for script-mode bytecode.
+    #[serde(default)]
+    pub module_inits: Vec<ModuleInit>,
+}
+
+/// One linker-resolved import edge: `(referrer module URL,
+/// raw specifier text) → target module URL`. Stored as a flat
+/// vector inside [`BytecodeModule`] so the JSON dump round-trips
+/// cleanly; the runtime constructs an in-memory hashmap from
+/// these on first import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleResolution {
+    /// Module URL of the importing source (e.g.
+    /// `"file:///path/to/main.ts"`).
+    pub referrer: String,
+    /// Raw specifier text from the import statement
+    /// (`"./other.ts"`).
+    pub specifier: String,
+    /// Resolved target module URL.
+    pub target: String,
+}
+
+/// One module's `<module-init>` entry record: `URL → function ID`.
+/// Populated by the linker after merging module fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleInit {
+    /// Module URL.
+    pub url: String,
+    /// Function ID of the module's `<module-init>` in the
+    /// merged function table.
+    pub function_id: u32,
 }
 
 impl BytecodeModule {

@@ -66,6 +66,9 @@ mod tests {
                 own_upvalue_count: 0,
                 is_arrow: false,
                 has_rest: false,
+                is_async: false,
+                is_module: false,
+                module_url: String::new(),
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::Return,
@@ -77,6 +80,8 @@ mod tests {
                 }],
             }],
             constants: vec![],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
         };
         let json = to_json_pretty(&module).unwrap();
         assert!(json.contains("\"otterBytecodeDumpVersion\": 1"));

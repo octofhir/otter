@@ -49,7 +49,29 @@ return value flows into the next promise (chained `.then`
 works). `Value::NativeFunction` lands as part of this slice —
 host-implemented callables for `resolve` / `reject` /
 aggregator-functions, with `&mut Interpreter` access for
-microtask enqueueing. **158/158 engine fixtures pass.**
+microtask enqueueing. `async` functions / `await` / async-arrow
+lowering ship on top of the same machinery: each `await` parks
+the running async frame, attaches resume / reject native
+reactions to the awaited promise, and resumes via a fresh
+`MicrotaskKind::AsyncResume` task that re-pushes the parked
+frame and continues from the next pc; throws inside an async
+body settle the result promise as rejected, and `await` of a
+rejected promise re-enters as a synchronous throw so existing
+`try`/`catch`/`finally` shapes still work. ES modules are wired
+end-to-end on a relative-path loader: one linked `BytecodeModule`
+per program, post-order DFS evaluation, synthesised `<entry>`
+driver, per-module `module_env` JsObject holding live bindings
+(every importer-side read goes through `LoadProperty` so write
+propagation is automatic), `import.meta`, literal-string
+`import("./x")` resolved at compile time, cyclic graphs caught
+with a `RangeError`-shaped diagnostic, multi-file fixtures via
+the `_*` helper-directory convention. npm / `node_modules` /
+workspace resolution layers on top via `oxc_resolver`-backed
+bare-specifier resolution: `import x from "lodash"`, `@scope/pkg`
+packages, `npm:` sugar prefix, walk-up `node_modules`,
+conditional `exports` maps with ESM / CJS condition names,
+configurable through `RuntimeBuilder::module_loader`. **176/176
+engine fixtures pass.**
 
 Foundation artifacts that stay (not tasks, never deleted):
 
@@ -81,7 +103,12 @@ Foundation artifacts that stay (not tasks, never deleted):
 5. **Interpreter only.** No JIT in any task in this pool.
 6. **LLM-friendly module docstrings.** Every Rust file in
    `crates-next/*` opens with `//! Summary / Contents / Invariants /
-   See also` (ADR-0001 §6).
+   See also` (ADR-0001 §6). **ECMA-262 spec links are mandatory**
+   on any module / function that implements a spec algorithm,
+   intrinsic, or spec-mandated semantic — cite as
+   `https://tc39.es/ecma262/#sec-<anchor>` in the docstring's
+   `# See also` (or `# Algorithm`) block. Audit + back-fill of
+   already-shipped code is task 59.
 7. **Idiomatic Rust.** `thiserror` for error enums, `serde` derive
    for wire types, `SmallVec` for small inline collections, `?` for
    propagation, no `Box<dyn Error>` on the public API,
@@ -126,10 +153,7 @@ ships independently end-to-end.
 > task 57 is the placeholder for the eventual GC plan and is
 > not on the critical path of foundation work.
 
-| File | One-line goal |
-|---|---|
-| [35-async-await.md](./35-async-await.md) | `async` functions, `await`, async-call frame state machine. |
-| [36-modules-import-export.md](./36-modules-import-export.md) | ES modules, `import` / `export`, dynamic `import()`, `import.meta`. |
+✅ Phase F complete — see Phase G for the next batch.
 
 ### Phase G — modern surfaces (later)
 
@@ -148,6 +172,7 @@ ships independently end-to-end.
 | [51-test262-curated-subset.md](./51-test262-curated-subset.md) | `otter test --suite test262` wired into CI; first conformance baseline recorded. |
 | [52-trace-events-emission.md](./52-trace-events-emission.md) | Wire `vm.instruction` / `vm.call` / `vm.return` events through the trace sink. |
 | [53-recreate-es-conformance.md](./53-recreate-es-conformance.md) | Recreate `ES_CONFORMANCE.md` once the curated test262 subset reports a stable baseline. |
+| [54-harness-richer-assertions.md](./54-harness-richer-assertions.md) | Wire spec-already-defined `expect.value` / `expect.stdout_contains` / `expect.throws` into the engine-suite runner so fixtures stop relying on the `undefined.x` fail-trick. |
 | [55-otter-macros-next.md](./55-otter-macros-next.md) | New `otter-macros-next` proc-macro crate (`#[js_method]`, `js_proto!`, `#[js_namespace]`); migrate string / array / number / math / regexp prototype tables. |
 | [56-remove-refcell-from-hot-paths.md](./56-remove-refcell-from-hot-paths.md) | Remove `RefCell` from every hot path in `crates-next/*`; replace with `&mut` field access threaded through `dispatch_loop`. Required before task 35 (async) lands. |
 | [57-tracing-gc-migration.md](./57-tracing-gc-migration.md) | **HIGH PRIORITY.** Write our own tracing GC (no `boa_gc`) and replace every `Rc<T>` / `Rc<RefCell<T>>` in `crates-next/*` with a GC-managed handle. No production JS engine uses refcounting; we won't be competitive with V8 / JSC / SpiderMonkey until this is done. Sequence *between Phase F basics and task 35 (async with worker threads)*. |
@@ -156,6 +181,8 @@ ships independently end-to-end.
 
 | File | One-line goal |
 |---|---|
+| [58-modules-runtime-lazy-import.md](./58-modules-runtime-lazy-import.md) | Drop the literal-only `import()` restriction from 36a; runtime parse + compile + link for non-literal specifiers. |
+| [59-spec-link-audit-and-rule.md](./59-spec-link-audit-and-rule.md) | Make ECMA-262 deep links mandatory in module / function docstrings; back-fill audit on already-shipped code in `crates-next/*`. |
 | [60-archive-superseded-root-docs.md](./60-archive-superseded-root-docs.md) | Move `PRODUCTION_READINESS_PLAN.md` / `TOOLING_ROADMAP.md` / `ROADMAP.md` / `gc_migration_baseline.md` into `docs/archive/`. |
 | [61-delete-committed-results.md](./61-delete-committed-results.md) | Delete `test262_results/`, `benchmarks/results/`, `benchmarks/node_modules/`, `scratch/`, root one-off shell scripts; extend `.gitignore`. |
 

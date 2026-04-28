@@ -291,6 +291,26 @@ fn discover(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), OtterError> {
         })?;
         let path = entry.path();
         if path.is_dir() {
+            // Convention: any directory whose name starts with
+            // `_` is a helper bundle — its contents are imported
+            // by sibling entry fixtures but never enumerated as
+            // standalone tests. This is how multi-file module
+            // fixtures co-locate their helpers
+            // (`tests/engine/modules/foo/_modules/util.ts`).
+            //
+            // `node_modules/` is skipped by the same logic: its
+            // contents are package source loaded through the
+            // module-graph driver, never tests themselves.
+            //
+            // See `docs/new-engine/specs/otter-test-harness.md` §2
+            // for the full fixture-format spec amendment.
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name.starts_with('_') || name == "node_modules" {
+                continue;
+            }
             discover(&path, out)?;
         } else if matches!(
             path.extension().and_then(|e| e.to_str()),

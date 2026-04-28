@@ -266,6 +266,7 @@ fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[V
                 this_value: Value::Undefined,
                 args: smallvec![],
                 result_capability: None,
+                kind: crate::microtask::MicrotaskKind::Call,
             });
             Ok(value)
         })
@@ -278,6 +279,7 @@ fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[V
                 this_value: Value::Undefined,
                 args: smallvec![],
                 result_capability: None,
+                kind: crate::microtask::MicrotaskKind::Call,
             });
             // Propagate the rejection through the next promise:
             // returning the reason here would convert it to a

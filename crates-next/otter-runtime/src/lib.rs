@@ -26,6 +26,8 @@
 //! - [ADR-0003](../../../docs/new-engine/adr/0003-public-api-and-cli.md)
 
 pub mod error;
+pub mod module_graph;
+pub mod module_loader;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -544,6 +546,7 @@ struct RuntimeConfig {
     timeout: Duration,
     max_stack_depth: u32,
     capabilities: CapabilitySet,
+    loader: Option<module_loader::LoaderConfig>,
 }
 
 impl Default for RuntimeConfig {
@@ -553,6 +556,7 @@ impl Default for RuntimeConfig {
             timeout: DEFAULT_TIMEOUT,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             capabilities: CapabilitySet::default(),
+            loader: None,
         }
     }
 }
@@ -589,6 +593,19 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn max_stack_depth(mut self, depth: u32) -> Self {
         self.config.max_stack_depth = depth;
+        self
+    }
+
+    /// Override the module-loader configuration. The default
+    /// (used when this is left untouched) infers `base_dir` from
+    /// the entry file's parent directory at `run_module` time
+    /// and uses the foundation extension list / ESM+CJS
+    /// condition names with `node_modules` walk-up enabled.
+    ///
+    /// Spec mapping: <https://nodejs.org/api/esm.html#resolution-and-loading-algorithm>
+    #[must_use]
+    pub fn module_loader(mut self, loader: module_loader::LoaderConfig) -> Self {
+        self.config.loader = Some(loader);
         self
     }
 
@@ -751,6 +768,94 @@ impl Runtime {
             })?;
         compile(&parsed, specifier).map_err(map_compile_error)
     }
+
+    /// Load + link + execute the module-graph rooted at `entry_path`.
+    ///
+    /// # Algorithm
+    /// 1. Build a [`module_loader::ModuleLoader`] rooted at the
+    ///    entry's parent directory.
+    /// 2. Walk the dependency graph
+    ///    ([`module_graph::load_program`]), resolving every static
+    ///    import + literal-string `import("./x")` into a unified
+    ///    linked [`BytecodeModule`].
+    /// 3. Pre-allocate one `module_env` JsObject per module URL,
+    ///    register each in the interpreter, and append self-loop
+    ///    `(referrer = entry_url, specifier = url, target = url)`
+    ///    rows to `module_resolutions` so the synthesised
+    ///    `<entry>` driver's `Op::ImportNamespace` lookups succeed.
+    /// 4. Run `<entry>` through the existing dispatch loop. Drain
+    ///    microtasks afterwards.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants. Loader / link errors surface
+    /// as [`OtterError::Compile`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-modules>
+    pub fn run_module(
+        &mut self,
+        entry_path: impl AsRef<Path>,
+    ) -> Result<ExecutionResult, OtterError> {
+        let start = std::time::Instant::now();
+        let entry_path = entry_path.as_ref();
+        let loader = match &self.config.loader {
+            Some(cfg) => module_loader::ModuleLoader::with_config(cfg.clone()),
+            None => {
+                let base_dir = entry_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                module_loader::ModuleLoader::new(base_dir)
+            }
+        };
+        let linked =
+            module_graph::load_program(&loader, entry_path).map_err(|e| OtterError::Compile {
+                diagnostics: vec![Diagnostic::syntax(e.to_string())],
+            })?;
+
+        // Pre-populate the per-run module-env registry. Every
+        // module URL gets a fresh JsObject; <entry> resolves via
+        // self-loop ImportNamespace edges and stores into the
+        // env as the body runs.
+        self.interp.reset_module_state();
+        let mut module = linked.module;
+        let entry_url = linked.entry_url.clone();
+        for init in &module.module_inits {
+            let env = otter_vm::JsObject::new();
+            self.interp
+                .register_module_env(std::rc::Rc::from(init.url.as_str()), env);
+            // Self-loop edge: <entry>'s referrer is the entry's URL
+            // (the synthesized <entry> function carries empty
+            // module_url, so the dispatcher uses an empty string;
+            // we add edges keyed on both shapes).
+            module
+                .module_resolutions
+                .push(otter_bytecode::ModuleResolution {
+                    referrer: entry_url.clone(),
+                    specifier: init.url.clone(),
+                    target: init.url.clone(),
+                });
+            module
+                .module_resolutions
+                .push(otter_bytecode::ModuleResolution {
+                    referrer: String::new(),
+                    specifier: init.url.clone(),
+                    target: init.url.clone(),
+                });
+        }
+
+        let script_outcome = self.interp.run(&module);
+        let drain_outcome = self.interp.drain_microtasks(&module);
+        let value = match (script_outcome, drain_outcome) {
+            (Err(script_err), _) => return Err(map_vm_error(script_err)),
+            (Ok(_), Err(drain_err)) => return Err(map_vm_error(drain_err)),
+            (Ok(v), Ok(())) => v,
+        };
+        Ok(ExecutionResult {
+            completion: value,
+            duration: start.elapsed(),
+        })
+    }
 }
 
 /// Layer A entry point: zero-config Otter.
@@ -774,13 +879,27 @@ impl Otter {
         }
     }
 
-    /// Run a file from disk, detecting kind by extension.
+    /// Run a file from disk, detecting kind by extension and
+    /// routing module-shaped files through the module-graph
+    /// pipeline.
+    ///
+    /// # Algorithm
+    /// 1. Read the file's source text.
+    /// 2. Heuristically detect "is this a module?" by scanning
+    ///    the source for top-level `import` / `export` keywords
+    ///    (the parser would tell us authoritatively, but cheap
+    ///    string matching avoids two parses on the script path).
+    /// 3. Module sources go through [`Runtime::run_module`];
+    ///    plain scripts go through [`Runtime::run_script`].
     ///
     /// # Errors
     /// See [`OtterError`] variants.
     pub fn run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
         let path = path.as_ref();
         let source = SourceInput::from_path(path)?;
+        if source_text_looks_like_module(&source.text, source.kind) {
+            return self.runtime.run_module(path);
+        }
         let specifier = path.to_string_lossy().to_string();
         self.runtime.run_script(source, &specifier)
     }
@@ -937,6 +1056,86 @@ pub struct StackFrame {
     pub span: Option<(u32, u32)>,
 }
 
+/// AST-based "is this a module?" detection.
+///
+/// Parses the source through `otter-syntax` (the same OXC frontend
+/// the compiler uses) and walks the program's AST looking for any
+/// of:
+/// - `ImportDeclaration` / `ExportNamedDeclaration` /
+///   `ExportDefaultDeclaration` / `ExportAllDeclaration` (these
+///   can only appear at the module top level — finding one is
+///   conclusive proof);
+/// - any `ImportExpression` (`import(specifier)` — only legal in
+///   modules);
+/// - any `MetaProperty` whose base is `import` (`import.meta` —
+///   only legal in modules).
+///
+/// The walk uses [`oxc_ast_visit::Visit`] so we don't hand-roll a
+/// match arm per AST node kind. ADR-0002 forbids regex / string
+/// parsing of JS/TS source.
+///
+/// Parse failures default to `false`: the caller routes to the
+/// script path, which will re-parse and surface the same syntax
+/// error through its diagnostic pipeline.
+fn source_text_looks_like_module(text: &str, kind: SourceKind) -> bool {
+    let parsed = match parse(text.to_string(), kind) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let program = match parsed.program() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    use oxc_ast::ast::{Expression, Statement};
+    use oxc_ast_visit::Visit;
+
+    #[derive(Default)]
+    struct ModuleSyntaxFinder {
+        found: bool,
+    }
+
+    impl<'a> Visit<'a> for ModuleSyntaxFinder {
+        fn visit_import_declaration(&mut self, _: &oxc_ast::ast::ImportDeclaration<'a>) {
+            self.found = true;
+        }
+        fn visit_export_named_declaration(&mut self, _: &oxc_ast::ast::ExportNamedDeclaration<'a>) {
+            self.found = true;
+        }
+        fn visit_export_default_declaration(
+            &mut self,
+            _: &oxc_ast::ast::ExportDefaultDeclaration<'a>,
+        ) {
+            self.found = true;
+        }
+        fn visit_export_all_declaration(&mut self, _: &oxc_ast::ast::ExportAllDeclaration<'a>) {
+            self.found = true;
+        }
+        fn visit_import_expression(&mut self, _: &oxc_ast::ast::ImportExpression<'a>) {
+            self.found = true;
+        }
+        fn visit_meta_property(&mut self, meta: &oxc_ast::ast::MetaProperty<'a>) {
+            if meta.meta.name.as_str() == "import" && meta.property.name.as_str() == "meta" {
+                self.found = true;
+            }
+        }
+    }
+
+    let mut finder = ModuleSyntaxFinder::default();
+    // Visit each statement; the visitor short-circuits via the
+    // `found` flag (we still walk everything, but the boolean
+    // result is correct).
+    for stmt in &program.body {
+        finder.visit_statement(stmt);
+        if finder.found {
+            return true;
+        }
+    }
+    // Also check program-level expressions inside expression
+    // statements — covered by visit_statement above.
+    let _ = (Statement::EmptyStatement, Expression::NullLiteral);
+    finder.found
+}
+
 fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
     use otter_compiler::CompileError;
     match err {
@@ -1043,6 +1242,107 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_like_module_detects_import_at_top_level() {
+        let text = "import { x } from \"./y.ts\";\n";
+        assert!(source_text_looks_like_module(text, SourceKind::TypeScript));
+    }
+
+    #[test]
+    fn looks_like_module_detects_export_function() {
+        let text = "export function f() {}\n";
+        assert!(source_text_looks_like_module(text, SourceKind::TypeScript));
+    }
+
+    #[test]
+    fn looks_like_module_with_leading_block_comment() {
+        let text = "/* hi */\nimport { x } from \"./y.ts\";\n";
+        assert!(source_text_looks_like_module(text, SourceKind::TypeScript));
+    }
+
+    #[test]
+    fn module_program_runs_two_file_static_import() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("other.ts"), "export let value = 7;\n").unwrap();
+        std::fs::write(
+            dir.path().join("entry.ts"),
+            "import { value } from \"./other.ts\";\nfunction fail() { return undefined.x; }\nif (value !== 7) fail();\n",
+        )
+        .unwrap();
+        let mut otter = Otter::new();
+        otter.run_file(dir.path().join("entry.ts")).unwrap();
+    }
+
+    #[test]
+    fn module_program_propagates_live_binding_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("counter.ts"),
+            "export let count = 0;\nexport function inc() { count = count + 1; }\nexport function get() { return count; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entry.ts"),
+            "import { inc, get } from \"./counter.ts\";\nfunction fail() { return undefined.x; }\ninc(); inc();\nif (get() !== 2) fail();\n",
+        )
+        .unwrap();
+        let mut otter = Otter::new();
+        otter.run_file(dir.path().join("entry.ts")).unwrap();
+    }
+
+    #[test]
+    fn module_program_detects_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.ts"),
+            "import { b } from \"./b.ts\";\nexport let a = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.ts"),
+            "import { a } from \"./a.ts\";\nexport let b = 2;\n",
+        )
+        .unwrap();
+        let mut otter = Otter::new();
+        let err = otter.run_file(dir.path().join("a.ts")).unwrap_err();
+        match err {
+            OtterError::Compile { diagnostics } => {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|d| d.message.contains("cycle") || d.message.contains("RangeError")),
+                    "expected cycle diagnostic, got {diagnostics:?}"
+                );
+            }
+            other => panic!("expected Compile (cycle), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_program_dynamic_import_literal_resolves_to_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("util.ts"), "export let answer = 42;\n").unwrap();
+        std::fs::write(
+            dir.path().join("entry.ts"),
+            "function fail() { return undefined.x; }\nimport(\"./util.ts\").then((m) => { if (m.answer !== 42) fail(); });\n",
+        )
+        .unwrap();
+        let mut otter = Otter::new();
+        otter.run_file(dir.path().join("entry.ts")).unwrap();
+    }
+
+    #[test]
+    fn module_program_import_meta_url_matches_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("entry.ts"),
+            "function fail() { return undefined.x; }\nlet u = import.meta.url;\nif (u.indexOf(\"file://\") !== 0) fail();\nif (u.indexOf(\"entry.ts\") < 0) fail();\n",
+        )
+        .unwrap();
+        let mut otter = Otter::new();
+        otter.run_file(dir.path().join("entry.ts")).unwrap();
+    }
 
     #[test]
     fn otter_runs_empty_typescript() {

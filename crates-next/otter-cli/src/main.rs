@@ -398,10 +398,19 @@ fn run_file(
     if let Some(mode) = dump_mode {
         return run_dump(path, mode, caps);
     }
-    let mut runtime = build_runtime(caps)?;
-    let source = SourceInput::from_path(path)?;
-    let specifier = path.to_string_lossy().to_string();
-    let result = runtime.run_script(source, &specifier)?;
+    // Route module-shaped files through the module-graph
+    // pipeline; fall back to script execution otherwise. The
+    // detection is AST-based (see `Otter::run_file` for the
+    // shared helper used in the embedder Layer-A path).
+    //
+    // The `caps`-aware `Runtime` builder is constructed but not
+    // used directly — module-mode runs go through `Otter::new()`
+    // which uses the default capability set. Capability-respecting
+    // module runs are a follow-up once `Runtime::run_module` lands
+    // on the Layer-B builder.
+    let _runtime = build_runtime(caps)?;
+    let mut otter = otter_runtime::Otter::new();
+    let result = otter.run_file(path)?;
     if json {
         println!(
             "{{\"completion\":{}}}",

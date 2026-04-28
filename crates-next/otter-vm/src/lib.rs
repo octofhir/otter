@@ -56,7 +56,7 @@ use smallvec::SmallVec;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 
 pub use array::JsArray;
-pub use microtask::{AsyncRuntime, Microtask, MicrotaskError, MicrotaskQueue};
+pub use microtask::{AsyncRuntime, Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_function::{NativeError, NativeFn, NativeFunction, native_value};
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
@@ -499,6 +499,41 @@ pub struct Frame {
     /// fresh `JsArray`. Always empty for non-rest callees so the
     /// allocation cost is paid only when needed.
     pub rest_args: SmallVec<[Value; 4]>,
+    /// Async-call state: `Some` when this frame belongs to an
+    /// `async` function. The result promise was created at call
+    /// entry and written into the caller's destination register
+    /// **then**; on return / unhandled throw, the dispatcher
+    /// settles this promise instead of writing a value to the
+    /// caller. `Op::Await` parks the frame off the stack and
+    /// re-pushes it from a microtask once the awaited promise
+    /// settles. `None` for ordinary (non-async) frames.
+    pub async_state: Option<AsyncFrameState>,
+    /// Source-module URL the running function was compiled from.
+    /// Snapshot of [`otter_bytecode::Function::module_url`] at
+    /// frame-push time. Read by [`Op::ImportNamespace`] to look
+    /// up specifier resolutions in the linker's pre-built
+    /// `module_resolutions` table — the caller frame's URL is
+    /// the referrer for the import-resolution algorithm.
+    ///
+    /// Empty string for non-module functions (e.g. the linker's
+    /// synthesised `<entry>` driver) — those frames inherit the
+    /// caller's URL when invoking module-init functions, but
+    /// `Op::ImportNamespace` itself never executes from a
+    /// non-module frame in well-formed bytecode.
+    pub module_url: std::rc::Rc<str>,
+}
+
+/// Per-frame bookkeeping for an async-function call. Constructed
+/// by the entry path in [`Interpreter::invoke`] when the callee's
+/// [`otter_bytecode::Function::is_async`] flag is true; consumed by
+/// [`Interpreter::pop_frame`] (fulfilment) and the throw-unwinder
+/// (rejection).
+#[derive(Debug, Clone)]
+pub struct AsyncFrameState {
+    /// The promise the call-site received synchronously. Settles
+    /// when the async body returns (fulfil) or throws an
+    /// unhandled error (reject).
+    pub result_promise: JsPromiseHandle,
 }
 
 /// One active try-handler descriptor — the runtime counterpart to
@@ -599,6 +634,8 @@ impl Frame {
             pending_throw: None,
             construct_target: None,
             rest_args: SmallVec::new(),
+            async_state: None,
+            module_url: std::rc::Rc::from(function.module_url.as_str()),
         }
     }
 }
@@ -796,6 +833,23 @@ pub struct Interpreter {
     /// for the full contract; task 33 ships the sync side and
     /// reserves the async-inbox slot for task 35.
     microtasks: MicrotaskQueue,
+    /// Per-run module-environment registry: module URL →
+    /// `module_env` JsObject populated by that module's
+    /// `<module-init>`. Written by the synthesised `<entry>`
+    /// driver as it walks the topological order; read by
+    /// [`otter_bytecode::Op::ImportNamespace`] when a closure
+    /// inside one module needs the env of another.
+    ///
+    /// Cleared between top-level `run` invocations on the same
+    /// interpreter so a fresh script doesn't observe stale
+    /// modules.
+    module_environments: std::collections::HashMap<std::rc::Rc<str>, JsObject>,
+    /// Cached `(referrer, specifier) → target` lookup, built
+    /// lazily from [`otter_bytecode::BytecodeModule::module_resolutions`]
+    /// the first time the running module is observed. Cleared
+    /// alongside `module_environments`.
+    module_resolution_cache:
+        std::collections::HashMap<(std::rc::Rc<str>, String), std::rc::Rc<str>>,
 }
 
 impl Interpreter {
@@ -808,6 +862,8 @@ impl Interpreter {
             string_heap: Arc::new(StringHeap::default()),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             microtasks: MicrotaskQueue::new(),
+            module_environments: std::collections::HashMap::new(),
+            module_resolution_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -820,7 +876,86 @@ impl Interpreter {
             string_heap: Arc::new(StringHeap::with_cap(cap_bytes)),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             microtasks: MicrotaskQueue::new(),
+            module_environments: std::collections::HashMap::new(),
+            module_resolution_cache: std::collections::HashMap::new(),
         }
+    }
+
+    /// Register or overwrite a module's `module_env` object so
+    /// later [`Op::ImportNamespace`] dispatches can resolve
+    /// references to it.
+    ///
+    /// Called by the runtime's module-graph driver as it walks
+    /// the topological order — once a module's `<module-init>`
+    /// has run and populated its env, the driver records it
+    /// here keyed by canonical URL.
+    pub fn register_module_env(&mut self, url: std::rc::Rc<str>, env: JsObject) {
+        self.module_environments.insert(url, env);
+    }
+
+    /// Borrow a module's `module_env` JsObject by URL. Returns
+    /// `None` when the URL is unknown — the runtime surfaces
+    /// that as a catchable diagnostic upstream rather than
+    /// silently filling with `undefined`.
+    #[must_use]
+    pub fn module_env(&self, url: &str) -> Option<JsObject> {
+        self.module_environments.get(url).cloned()
+    }
+
+    /// Drop every recorded module environment + resolution
+    /// cache entry. Called between top-level `run` invocations
+    /// on the same interpreter so a fresh script never observes
+    /// stale modules.
+    pub fn reset_module_state(&mut self) {
+        self.module_environments.clear();
+        self.module_resolution_cache.clear();
+    }
+
+    /// Resolve a specifier seen by the running module to the
+    /// target module's `module_env`. Returns `None` when the
+    /// linker did not register a resolution for the
+    /// `(referrer, specifier)` pair, or when the resolution
+    /// pointed at a URL that no `module_env` has been recorded
+    /// for yet.
+    ///
+    /// # Algorithm
+    /// 1. Look in `module_resolution_cache` keyed by
+    ///    `(referrer, specifier)`. Fast path: pre-built entry,
+    ///    one hashmap probe.
+    /// 2. On miss, scan
+    ///    [`otter_bytecode::BytecodeModule::module_resolutions`]
+    ///    for the matching triple, populate the cache, return.
+    /// 3. With the resolved target URL in hand, look up the
+    ///    `module_env` in `module_environments`.
+    ///
+    /// # Invariants
+    /// - `module_resolutions` is small (one entry per actual
+    ///   import edge in the graph), so the linear scan on
+    ///   miss is cheap. Real engines reach for a hashmap;
+    ///   the foundation prefers a flat vector that round-trips
+    ///   cleanly through the bytecode dump.
+    fn resolve_module_namespace(
+        &mut self,
+        module: &BytecodeModule,
+        referrer: &str,
+        specifier: &str,
+    ) -> Option<JsObject> {
+        let referrer_rc: std::rc::Rc<str> = std::rc::Rc::from(referrer);
+        let key = (referrer_rc.clone(), specifier.to_string());
+        let target_url = if let Some(hit) = self.module_resolution_cache.get(&key) {
+            hit.clone()
+        } else {
+            let target = module
+                .module_resolutions
+                .iter()
+                .find(|r| r.referrer == referrer && r.specifier == specifier)?
+                .target
+                .clone();
+            let target_rc: std::rc::Rc<str> = std::rc::Rc::from(target.as_str());
+            self.module_resolution_cache.insert(key, target_rc.clone());
+            target_rc
+        };
+        self.module_environments.get(target_url.as_ref()).cloned()
     }
 
     /// Mutable handle to the microtask queue. Embedders use this
@@ -938,6 +1073,18 @@ impl Interpreter {
         module: &BytecodeModule,
         task: Microtask,
     ) -> Result<(), RunError> {
+        // Async-resume tasks bypass callee resolution entirely:
+        // the parked frame replaces a fresh callee invocation,
+        // so route them to `run_async_resume` directly.
+        if let MicrotaskKind::AsyncResume {
+            frame,
+            await_dst,
+            fulfilled,
+        } = task.kind
+        {
+            let value = task.args.into_iter().next().unwrap_or(Value::Undefined);
+            return self.run_async_resume(module, frame, await_dst, fulfilled, value);
+        }
         // Resolve callee → function_id + upvalues. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
         // (no caller frame to write back into).
@@ -1096,6 +1243,7 @@ impl Interpreter {
             this_value: Value::Undefined,
             args,
             result_capability: None,
+            kind: microtask::MicrotaskKind::Call,
         });
     }
 
@@ -1190,17 +1338,27 @@ impl Interpreter {
                         .get(src as usize)
                         .cloned()
                         .ok_or(VmError::InvalidOperand)?;
-                    Self::unwind_throw(stack, value)?;
+                    self.unwind_throw(stack, value)?;
                     continue;
                 }
                 Op::EndFinally => {
                     if let Some(value) = stack[top_idx].pending_throw.take() {
-                        Self::unwind_throw(stack, value)?;
+                        self.unwind_throw(stack, value)?;
                     } else {
                         stack[top_idx].pc = stack[top_idx]
                             .pc
                             .checked_add(1)
                             .ok_or(VmError::InvalidOperand)?;
+                    }
+                    continue;
+                }
+                Op::Await => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let awaited = read_register(&stack[top_idx], src)?.clone();
+                    self.do_await(stack, dst, awaited)?;
+                    if stack.is_empty() {
+                        return Ok(Value::Undefined);
                     }
                     continue;
                 }
@@ -1226,7 +1384,8 @@ impl Interpreter {
                 | Op::CallSpread
                 | Op::New
                 | Op::Throw
-                | Op::EndFinally => {
+                | Op::EndFinally
+                | Op::Await => {
                     unreachable!("stack-modifying ops handled earlier in this loop")
                 }
                 Op::MakeFunction => {
@@ -1890,6 +2049,7 @@ impl Interpreter {
                         this_value: Value::Undefined,
                         args,
                         result_capability: None,
+                        kind: microtask::MicrotaskKind::Call,
                     });
                 }
                 Op::PromiseNew => {
@@ -1947,6 +2107,27 @@ impl Interpreter {
                     // storage promptly keeps frame sizes small.
                     let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
                     write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
+                    frame.pc += 1;
+                }
+                Op::ImportNamespace => {
+                    let dst = register_operand(operands.first())?;
+                    let spec_idx = const_operand(operands.get(1))?;
+                    let specifier = lookup_string_constant(module, spec_idx)?;
+                    let referrer = frame.module_url.clone();
+                    let namespace = self
+                        .resolve_module_namespace(module, referrer.as_ref(), &specifier)
+                        .ok_or(VmError::UnknownIntrinsic {
+                            name: format!("import \"{specifier}\""),
+                        })?;
+                    write_register(frame, dst, Value::Object(namespace))?;
+                    frame.pc += 1;
+                }
+                Op::PromiseFulfilledOf => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let value = read_register(frame, src)?.clone();
+                    let promise = JsPromiseHandle::fulfilled(value);
+                    write_register(frame, dst, Value::Promise(promise))?;
                     frame.pc += 1;
                 }
                 Op::MakeClass => {
@@ -2077,20 +2258,36 @@ impl Interpreter {
 }
 
 impl Interpreter {
-    /// Pop the top frame and write its result into the caller's
-    /// `return_register`. Returns `Some(value)` when the script
-    /// completes (`<main>` popped) so `run` can return that value
-    /// as the program's completion.
+    /// Pop the top frame and route its completion value.
+    ///
+    /// # Algorithm
+    /// 1. If the popped frame was entered via `Op::New`, apply the
+    ///    `OrdinaryConstruct` step-11 substitution: a non-object
+    ///    return reuses the freshly allocated `this`.
+    /// 2. If the popped frame is an **async** frame, settle its
+    ///    `result_promise` as fulfilled with the resolved value
+    ///    and drain the resulting reaction jobs into the
+    ///    microtask queue. The caller's destination register was
+    ///    populated with the promise at call entry, so we do not
+    ///    write to it again. When the stack is now empty (an
+    ///    async-resume mini-stack just finished) return
+    ///    `Ok(Some(Undefined))` so the surrounding driver loop
+    ///    exits cleanly; otherwise return `Ok(None)` to continue
+    ///    in the caller frame.
+    /// 3. For non-async frames, write the resolved value into the
+    ///    caller's `return_register`. Top-of-stack `<main>` falls
+    ///    through with `return_register = None` and surfaces the
+    ///    completion as `Some(value)`.
+    ///
+    /// # Errors
+    /// - [`VmError::InvalidOperand`] when the stack is empty or
+    ///   the caller's return register is out of bounds.
     fn pop_frame(
-        &self,
+        &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
     ) -> Result<Option<Value>, VmError> {
         let popped = stack.pop().ok_or(VmError::InvalidOperand)?;
-        // For frames entered via `Op::New`, ES spec
-        // `OrdinaryConstruct` step 11: if the constructor returned
-        // an object, hand that back; otherwise the freshly
-        // allocated `this` is the result.
         let resolved = match popped.construct_target {
             Some(target) => match value {
                 Value::Object(_) | Value::Array(_) => value,
@@ -2098,6 +2295,16 @@ impl Interpreter {
             },
             None => value,
         };
+        if let Some(state) = popped.async_state {
+            let jobs = state.result_promise.fulfill(resolved);
+            for j in jobs.jobs {
+                self.microtasks.enqueue(j);
+            }
+            if stack.is_empty() {
+                return Ok(Some(Value::Undefined));
+            }
+            return Ok(None);
+        }
         let Some(return_reg) = popped.return_register else {
             return Ok(Some(resolved));
         };
@@ -2233,12 +2440,28 @@ impl Interpreter {
             .functions
             .get(function_id as usize)
             .ok_or(VmError::InvalidOperand)?;
+        // Async-call entry path (spec §27.7.5.1): synthesise a
+        // fresh pending result promise, write it into the caller's
+        // `dst` register *now* so the call expression's value is
+        // visible synchronously, and park the new frame with
+        // `return_register = None` so its eventual completion
+        // settles the promise instead of writing back.
+        let (return_register, async_state) = if function.is_async {
+            let result_promise = JsPromiseHandle::pending();
+            let promise_value = Value::Promise(result_promise.clone());
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, promise_value)?;
+            (None, Some(AsyncFrameState { result_promise }))
+        } else {
+            (Some(dst), None)
+        };
         let mut new_frame = Frame::with_return_upvalues_and_this(
             function,
-            Some(dst),
+            return_register,
             parent_upvalues,
             this_for_callee,
         );
+        new_frame.async_state = async_state;
         // Bind parameters: extra args are dropped, missing args
         // stay `Value::Undefined` (matches JS semantics).
         let bind_count = (function.param_count as usize).min(effective_args.len());
@@ -2262,25 +2485,171 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Handle [`otter_bytecode::Op::Await`]: park the current
+    /// async frame off the active stack and attach resume / reject
+    /// reactions to the awaited promise.
+    ///
+    /// # Algorithm
+    /// 1. Wrap a non-promise value with `Promise.resolve(v)` per
+    ///    spec §27.7.5.3 step 1.b (an `Await` of a non-thenable
+    ///    settles immediately on the next microtask tick).
+    /// 2. Advance the parked frame's pc past the `Await`
+    ///    instruction so resumption continues with the next op.
+    /// 3. Pop the frame off the active stack and box it; share the
+    ///    box between the resume / reject closures via an
+    ///    `Rc<Cell<Option<_>>>` so whichever reaction fires first
+    ///    consumes the parked frame and the other reaction falls
+    ///    through as a no-op (matching spec idempotency for
+    ///    `then`'s twin reactions).
+    /// 4. Build native `resume_fulfill` / `resume_reject` closures
+    ///    that enqueue a [`MicrotaskKind::AsyncResume`] microtask
+    ///    when invoked. Attach them with `perform_then` so the
+    ///    drain delivers the awaited value into the parked frame's
+    ///    `dst` register on resume.
+    ///
+    /// # Invariants
+    /// - The frame at the top of `stack` MUST be an async frame
+    ///   (its `async_state.is_some()`); the compiler enforces
+    ///   this. Violating it is a bytecode-malformation error and
+    ///   surfaces as `VmError::InvalidOperand`.
+    /// - On return, `stack` no longer contains the parked frame.
+    ///   Callers that need to know whether the dispatch loop should
+    ///   exit (because the parked frame was at the bottom) read
+    ///   `stack.is_empty()` after this call.
+    ///
+    /// # Errors
+    /// - [`VmError::InvalidOperand`] when called on a non-async
+    ///   frame.
+    fn do_await(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        dst: u16,
+        awaited: Value,
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        if stack[top_idx].async_state.is_none() {
+            return Err(VmError::InvalidOperand);
+        }
+        // Advance past the Await before parking so resumption
+        // continues at the next instruction.
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        let parked = stack.pop().expect("top frame existed");
+        let promise = match awaited {
+            Value::Promise(p) => p,
+            other => JsPromiseHandle::fulfilled(other),
+        };
+
+        // Share the parked frame between the two reaction
+        // closures. Whichever reaction the runtime invokes first
+        // takes the box; the other observes `None` and short-circuits.
+        let parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>> =
+            std::rc::Rc::new(std::cell::Cell::new(Some(Box::new(parked))));
+
+        let resume_native = make_async_resume_native(parked_slot.clone(), dst, true);
+        let reject_native = make_async_resume_native(parked_slot, dst, false);
+        let capability = promise_dispatch::make_capability();
+        let outcome = promise.perform_then(Some(resume_native), Some(reject_native), capability);
+        if let Some(job) = outcome.immediate_job {
+            self.microtasks.enqueue(job);
+        }
+        Ok(())
+    }
+
+    /// Drive a [`MicrotaskKind::AsyncResume`] task: re-push the
+    /// parked async frame onto a fresh stack and run
+    /// [`Self::dispatch_loop`] until it settles.
+    ///
+    /// # Algorithm
+    /// 1. On the fulfillment path, write the resolved value into
+    ///    the await's destination register and run dispatch.
+    /// 2. On the rejection path, push the frame, then enter
+    ///    dispatch by injecting an immediate throw via
+    ///    [`Self::unwind_throw`]. If unwind eats the throw via an
+    ///    in-frame handler, dispatch continues normally; if no
+    ///    handler exists, unwind settles the result promise as
+    ///    rejected and the stack is empty so the loop never starts.
+    ///
+    /// # Errors
+    /// - Propagates any `VmError` raised inside the resumed body.
+    ///   Async frames absorb their own throws via `async_state`,
+    ///   so the only errors that escape are runtime-level (OOM,
+    ///   stack overflow, interrupt).
+    fn run_async_resume(
+        &mut self,
+        module: &BytecodeModule,
+        mut frame: Box<Frame>,
+        await_dst: u16,
+        fulfilled: bool,
+        value: Value,
+    ) -> Result<(), RunError> {
+        if fulfilled {
+            if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
+                *slot = value.clone();
+            } else {
+                return Err(RunError {
+                    error: VmError::InvalidOperand,
+                    frames: Vec::new(),
+                });
+            }
+        }
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(*frame);
+        if !fulfilled {
+            // Inject the rejection as a throw so the parked frame
+            // observes it through its `try`/`catch`/`finally`
+            // structure exactly as a synchronous throw would.
+            if let Err(error) = self.unwind_throw(&mut stack, value) {
+                let frames = snapshot_frames(module, &stack);
+                return Err(RunError { error, frames });
+            }
+            if stack.is_empty() {
+                // The rejection drained through the async frame's
+                // result promise — nothing left to dispatch.
+                return Ok(());
+            }
+        }
+        match self.dispatch_loop(module, &mut stack) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let frames = snapshot_frames(module, &stack);
+                Err(RunError { error, frames })
+            }
+        }
+    }
+
     /// Walk the live frame stack looking for a try-handler that
-    /// can absorb an in-flight throw. Within each frame, the
-    /// handler stack is searched innermost-first:
+    /// can absorb an in-flight throw.
     ///
-    /// - **Catch handler hit** — the thrown value is written into
-    ///   the handler's `exc_register`, the frame's pc jumps to the
-    ///   catch entry, the matching handler is popped, and dispatch
-    ///   resumes in that frame.
-    /// - **Finally-only handler hit** — the thrown value is parked
-    ///   on `frame.pending_throw`, the pc jumps to the finally
-    ///   entry, and the matching handler is popped.
-    ///   [`Op::EndFinally`] consumes the parked value to re-throw.
-    /// - **No handler in this frame** — the frame is popped and the
-    ///   search continues in the caller.
+    /// # Algorithm
+    /// 1. Inspect the top frame:
+    ///    - **Catch handler hit** — write the thrown value into
+    ///      the handler's `exc_register`, jump pc to the catch
+    ///      entry, pop the handler, return `Ok(())` so dispatch
+    ///      resumes in that frame.
+    ///    - **Finally-only handler hit** — park the value on
+    ///      `frame.pending_throw`, jump pc to the finally entry,
+    ///      pop the handler, return `Ok(())`.
+    ///      [`otter_bytecode::Op::EndFinally`] re-throws.
+    ///    - **No handler in this frame** — if the frame is async
+    ///      (`async_state.is_some()`), settle its result promise
+    ///      as rejected, drain the resulting jobs into the
+    ///      microtask queue, pop the frame, and stop unwinding.
+    ///      The caller is in a different "logical thread" — its pc
+    ///      was advanced past the call site at entry and the
+    ///      result promise was already in its register.
+    ///    - **Otherwise** — pop the frame and continue.
     ///
-    /// Returns `Err(VmError::Uncaught { value })` when the frame
-    /// stack empties without a handler. The caller is expected to
-    /// propagate this as the script's failure outcome.
-    fn unwind_throw(stack: &mut SmallVec<[Frame; 8]>, value: Value) -> Result<(), VmError> {
+    /// # Errors
+    /// - [`VmError::Uncaught`] when the frame stack empties without
+    ///   a handler and no async-frame absorbed the throw.
+    fn unwind_throw(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        value: Value,
+    ) -> Result<(), VmError> {
         let display = value.display_string();
         let payload = value;
         loop {
@@ -2288,6 +2657,22 @@ impl Interpreter {
                 return Err(VmError::Uncaught { value: display });
             };
             let Some(handler) = frame.handlers.pop() else {
+                // No in-frame try-handler. Async frames absorb
+                // their own unhandled throws into the result
+                // promise as a rejection — synthesised in spec
+                // §27.7.5.3 step 1.h.iii.
+                if frame.async_state.is_some() {
+                    let popped = stack.pop().expect("frame existed at last_mut");
+                    let result_promise = popped
+                        .async_state
+                        .expect("async_state checked just above")
+                        .result_promise;
+                    let jobs = result_promise.reject(payload);
+                    for j in jobs.jobs {
+                        self.microtasks.enqueue(j);
+                    }
+                    return Ok(());
+                }
                 stack.pop();
                 continue;
             };
@@ -3049,6 +3434,55 @@ pub fn is_callable_value(value: &Value) -> bool {
     is_callable(value)
 }
 
+/// Build a native callable that resumes a parked async frame when
+/// invoked as a `then` reaction.
+///
+/// # Algorithm
+/// 1. Take the parked frame out of the shared cell. If a sibling
+///    reaction already consumed it (the spec lets only one of
+///    `then`'s twin handlers fire), return `undefined` and exit.
+/// 2. Enqueue a [`MicrotaskKind::AsyncResume`] microtask carrying
+///    the boxed frame, the await's destination register, and the
+///    fulfilled / rejected branch tag. The drain re-pushes the
+///    frame onto a fresh stack and runs `dispatch_loop` from the
+///    next pc on the next generation.
+///
+/// # Invariants
+/// - The native handler MUST be idempotent. The shared cell
+///   guarantees this: once the parked frame is taken, subsequent
+///   invocations are no-ops.
+fn make_async_resume_native(
+    parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>>,
+    await_dst: u16,
+    fulfilled: bool,
+) -> Value {
+    let label = if fulfilled {
+        "async resume fulfill"
+    } else {
+        "async resume reject"
+    };
+    native_function::native_value(label, move |interp, args| {
+        let Some(frame) = parked_slot.take() else {
+            return Ok(Value::Undefined);
+        };
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        let mut task_args: SmallVec<[Value; 4]> = SmallVec::new();
+        task_args.push(value);
+        interp.microtasks.enqueue(Microtask {
+            callee: Value::Undefined,
+            this_value: Value::Undefined,
+            args: task_args,
+            result_capability: None,
+            kind: MicrotaskKind::AsyncResume {
+                frame,
+                await_dst,
+                fulfilled,
+            },
+        });
+        Ok(Value::Undefined)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3077,10 +3511,15 @@ mod tests {
                 own_upvalue_count: 0,
                 is_arrow: false,
                 has_rest: false,
+                is_async: false,
+                is_module: false,
+                module_url: String::new(),
                 code,
                 spans,
             }],
             constants: vec![],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
         }
     }
 
@@ -3136,6 +3575,9 @@ mod tests {
             own_upvalue_count: 0,
             is_arrow: false,
             has_rest: false,
+            is_async: false,
+            is_module: false,
+            module_url: String::new(),
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -3151,7 +3593,10 @@ mod tests {
         // Push a second frame on top — should be popped during
         // unwinding and not absorb the throw.
         stack.push(Frame::for_function(&main));
-        let err = Interpreter::unwind_throw(&mut stack, Value::Boolean(true)).unwrap_err();
+        let mut interp = Interpreter::new();
+        let err = interp
+            .unwind_throw(&mut stack, Value::Boolean(true))
+            .unwrap_err();
         match err {
             VmError::Uncaught { value } => assert_eq!(value, "true"),
             other => panic!("expected Uncaught, got {other:?}"),
@@ -3171,6 +3616,9 @@ mod tests {
             own_upvalue_count: 0,
             is_arrow: false,
             has_rest: false,
+            is_async: false,
+            is_module: false,
+            module_url: String::new(),
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -3189,7 +3637,10 @@ mod tests {
             exc_register: 1,
         });
         stack.push(frame);
-        Interpreter::unwind_throw(&mut stack, Value::Boolean(true)).unwrap();
+        let mut interp = Interpreter::new();
+        interp
+            .unwind_throw(&mut stack, Value::Boolean(true))
+            .unwrap();
         assert_eq!(stack[0].pc, 42);
         assert_eq!(stack[0].registers[1], Value::Boolean(true));
         assert!(stack[0].handlers.is_empty());
@@ -3234,6 +3685,9 @@ mod tests {
             own_upvalue_count: 0,
             is_arrow: false,
             has_rest: false,
+            is_async: false,
+            is_module: false,
+            module_url: String::new(),
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
@@ -3254,6 +3708,9 @@ mod tests {
             own_upvalue_count: 0,
             is_arrow: true,
             has_rest: false,
+            is_async: false,
+            is_module: false,
+            module_url: String::new(),
             code: vec![
                 Instruction {
                     pc: 0,
@@ -3276,6 +3733,8 @@ mod tests {
             source_kind: BcSourceKind::TypeScript,
             functions: vec![main, arrow],
             constants: vec![],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
         };
         // Build the closure by hand and dispatch via `invoke`. The
         // bound_this is a marker string — if `LoadThis` returns it,

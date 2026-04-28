@@ -43,10 +43,15 @@ fn bench_dispatch(c: &mut Criterion) {
             own_upvalue_count: 0,
             is_arrow: false,
             has_rest: false,
+            is_async: false,
+            is_module: false,
+            module_url: String::new(),
             code,
             spans,
         }],
         constants: vec![],
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
     c.bench_function("dispatch_10k_nop", |b| {

@@ -296,7 +296,36 @@ returns, not against `Debug`-formatted strings.
 
 ## Spec amendments
 
-(Empty — no amendments yet.)
+### 2026-04-29 — `_*` helper directory convention
+
+- **Change:** The fixture discoverer skips every directory whose
+  name starts with `_`. Files inside such a directory are not
+  enumerated as standalone fixtures. They exist solely as module
+  helpers loaded by sibling entry fixtures (e.g.,
+  `tests/engine/modules/static-import/_modules/util.ts` is
+  imported by `tests/engine/modules/static-import/entry.ts` but
+  never run on its own).
+- **Reason:** Module-graph fixtures inherently span more than one
+  file. Running each helper as a standalone fixture would either
+  fail the unrelated assertions or silently pass — neither is
+  useful. The leading-`_` prefix is the common Rust / Cargo
+  convention for "private to siblings, not a public entry point".
+- **Linked task:** task 36a — modules / live bindings / dynamic
+  import (closed; merged into the README's banner section).
+
+### 2026-04-29 — `node_modules/` directories skipped
+
+- **Change:** The discoverer also skips any directory whose name
+  is exactly `node_modules` (case-sensitive). Files inside are
+  npm packages loaded through the module-graph driver, never
+  tests.
+- **Reason:** task 36b ships fixtures with real `node_modules/`
+  trees on disk to exercise `oxc_resolver`-driven bare-specifier
+  resolution. Without this skip the `index.js` files inside the
+  packages would be picked up as standalone fixtures and either
+  fail or produce noise.
+- **Linked task:** [task 36b — oxc_resolver loader upgrade](
+  ../tasks/36b-modules-npm-and-workspace-resolution.md).
 
 When a slice changes the harness contract, append a dated entry of
 the form:

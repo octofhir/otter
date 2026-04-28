@@ -58,7 +58,93 @@ use oxc_ast::ast::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Compile a parsed program into a [`BytecodeModule`].
+/// Compile-time mode discriminator. Reserved for the public API
+/// once embedders gain a single entry point; today the two
+/// flavours have separate functions ([`compile`] for scripts,
+/// [`compile_module_fragment`] for ES-module fragments).
+///
+/// Spec: <https://tc39.es/ecma262/#sec-types-of-source-code>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // public-API consolidation is its own slice
+pub enum CompileMode {
+    /// Plain script. Top-level statements compile into `<main>`'s
+    /// body; `import` / `export` declarations are rejected.
+    Script,
+    /// ES module fragment. Top-level statements compile into a
+    /// `<module-init>` whose first two parameters are `module_env`
+    /// and `import_meta`, with `is_module = true` set on the
+    /// resulting [`Function`]. Import / export declarations
+    /// lower against the captured environment objects so live
+    /// bindings fall out via `LoadProperty` / `StoreProperty`.
+    Module,
+}
+
+/// One pre-resolved import-record binding: maps an importer-side
+/// alias (`import { a as alias } from "./other.ts"`) to the
+/// import-record upvalue index plus the original source-side name
+/// the property load reads.
+#[derive(Debug, Clone)]
+struct ImportBinding {
+    /// Own-upvalue index of the `import_record_<n>` JsObject inside
+    /// the running `<module-init>` frame.
+    record_uv_idx: u16,
+    /// Source-module name of the binding (e.g., the `a` in
+    /// `import { a as alias } from "./other.ts"`). For default
+    /// imports this is `"default"`. For namespace imports the
+    /// alias resolves directly to the record itself; we store an
+    /// empty string here as the sentinel.
+    source_name: String,
+    /// `true` for `import * as ns from "./..."` — the alias binds
+    /// to the namespace JsObject directly, so reads return the
+    /// record without an extra `LoadProperty`.
+    is_namespace: bool,
+}
+
+/// Module-mode state attached to a [`FunctionContext`] when the
+/// function is the top-level `<module-init>` of an ES-module
+/// fragment.
+#[derive(Debug, Default)]
+struct ModuleState {
+    /// Own-upvalue index of the `module_env` JsObject (param 0,
+    /// hoisted into a cell at the top of the body so closures can
+    /// capture it).
+    module_env_uv: u16,
+    /// Own-upvalue index of the `import_meta` JsObject (param 1).
+    import_meta_uv: u16,
+    /// Per-specifier upvalue index of the import-record JsObject.
+    /// Populated by the import pre-pass at the start of the body.
+    import_records: HashMap<String, u16>,
+    /// Importer-side alias → import-record binding info.
+    imported_names: HashMap<String, ImportBinding>,
+    /// Names that this module exports. Every assignment to a name
+    /// in this set emits an extra
+    /// `StoreProperty module_env, name, value` after the regular
+    /// store so live-binding writes propagate.
+    exported_names: HashSet<String>,
+    /// Per-specifier resolved target URL — populated by the host
+    /// before module compilation begins. The compiler emits the
+    /// pre-resolved (referrer, specifier, target) triple into the
+    /// produced fragment's `module_resolutions` table.
+    pre_resolved_imports: HashMap<String, String>,
+}
+
+/// Pre-resolved import / export information passed by the host
+/// (typically the runtime's module-graph driver) into
+/// [`compile_module_fragment`]. The compiler trusts the host for
+/// resolution; it lowers identifier references against the
+/// resolved structure.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleHostInfo {
+    /// Canonical URL of this module (e.g.,
+    /// `"file:///abs/path/to/main.ts"`).
+    pub module_url: String,
+    /// Specifier → target URL pairs — every specifier the
+    /// module references in a static `import` or
+    /// literal-string `import("./x")` must be present.
+    pub resolved_imports: HashMap<String, String>,
+}
+
+/// Compile a parsed program into a [`BytecodeModule`] script.
 ///
 /// `module_specifier` is recorded on the resulting bytecode and
 /// surfaces in dump output, traces, and diagnostics.
@@ -143,7 +229,478 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
         source_kind: kind,
         functions,
         constants,
+        module_resolutions: Vec::new(),
+        module_inits: Vec::new(),
     })
+}
+
+/// Compile a parsed program as one ES-module fragment.
+///
+/// The output is a stand-alone [`BytecodeModule`] with a single
+/// `<module-init>` function (id 0) carrying `is_module = true` +
+/// `module_url` set, plus the `module_resolutions` table populated
+/// from `host.resolved_imports`. The runtime's module-graph driver
+/// chains these fragments through the linker into a unified
+/// `BytecodeModule`.
+///
+/// # Algorithm (spec mapping: ECMA-262 §16.2 Modules)
+/// 1. Run an import pre-pass over the program body, registering a
+///    fresh `import_record_<n>` upvalue per source specifier and
+///    recording each importer-side alias → `(record_uv, source_name)`
+///    binding (§16.2.2 ModuleNamespaceObject for `import * as`,
+///    §16.2.3 ImportEntry for named imports).
+/// 2. Run an export pre-pass to collect the names this module
+///    exports (§16.2.3 ExportEntry). Every later assignment to one
+///    of those names emits an extra `StoreProperty module_env,
+///    name, value` so live bindings propagate across modules.
+/// 3. Allocate own-upvalue cells for `module_env` (param 0) and
+///    `import_meta` (param 1), hoist the parameters into those
+///    cells at function entry so closures defined inside the body
+///    can capture them via the regular upvalue mechanism.
+/// 4. Allocate one own-upvalue cell per import source and emit
+///    `Op::ImportNamespace cell_dst, specifier_const` followed by
+///    a `StoreUpvalue` to populate it. Subsequent reads of an
+///    imported alias resolve through this cell.
+/// 5. Compile the rest of the body via the existing
+///    [`compile_statement`] path; the import / export awareness
+///    stays in [`FunctionContext::module_state`] and the identifier
+///    resolution paths consult it.
+/// 6. Emit `Op::ReturnUndefined` at the tail.
+///
+/// # Errors
+/// - [`CompileError::Syntax`] on parse-level failures.
+/// - [`CompileError::Unsupported`] for foundation-out-of-scope
+///   constructs.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-modules>
+/// - <https://tc39.es/ecma262/#sec-source-text-module-records>
+pub fn compile_module_fragment(
+    parsed: &Parsed,
+    host: &ModuleHostInfo,
+) -> Result<BytecodeModule, CompileError> {
+    let program = parsed.program().map_err(|e| CompileError::Syntax {
+        messages: e.messages,
+    })?;
+
+    let module = Rc::new(RefCell::new(ModuleBuilder::default()));
+    module.borrow_mut().functions.push(Function {
+        id: 0,
+        name: "<module-init>".to_string(),
+        span: (program.span.start, program.span.end),
+        is_module: true,
+        module_url: host.module_url.clone(),
+        param_count: 2, // module_env, import_meta
+        ..Default::default()
+    });
+
+    let mut top = FunctionContext::new(Rc::clone(&module));
+    top.captured_names = capture::analyze_module(&program.body);
+    // Also capture names that any inner function references whose
+    // bindings live as `module_env` / `import_meta` / `import_record_*`
+    // — those are forced own-upvalues (see allocate_module_upvalues).
+
+    // Allocate own-upvalues for module_env, import_meta, and
+    // every imported source. These slots must be stable for the
+    // body's compilation so we reserve them up front.
+    let module_env_uv = top.own_upvalue_count;
+    top.own_upvalue_count = top.own_upvalue_count.checked_add(1).expect("uv overflow");
+    let import_meta_uv = top.own_upvalue_count;
+    top.own_upvalue_count = top.own_upvalue_count.checked_add(1).expect("uv overflow");
+
+    let mut state = ModuleState {
+        module_env_uv,
+        import_meta_uv,
+        ..ModuleState::default()
+    };
+    state.pre_resolved_imports = host.resolved_imports.clone();
+
+    // Pre-pass: collect import sources + record per-source upvalue
+    // slots; collect exported names + import bindings.
+    let mut import_sources_in_order: Vec<String> = Vec::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::ImportDeclaration(decl) if !decl.import_kind.is_type() => {
+                let specifier = decl.source.value.as_str().to_string();
+                if !state.import_records.contains_key(&specifier) {
+                    let uv = top.own_upvalue_count;
+                    top.own_upvalue_count =
+                        top.own_upvalue_count.checked_add(1).expect("uv overflow");
+                    state.import_records.insert(specifier.clone(), uv);
+                    import_sources_in_order.push(specifier.clone());
+                }
+                let record_uv = state.import_records[&specifier];
+                if let Some(specifiers) = &decl.specifiers {
+                    for spec in specifiers.iter() {
+                        match spec {
+                            oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                                let alias = s.local.name.as_str().to_string();
+                                let source_name = match &s.imported {
+                                    oxc_ast::ast::ModuleExportName::IdentifierName(id) => {
+                                        id.name.as_str().to_string()
+                                    }
+                                    oxc_ast::ast::ModuleExportName::IdentifierReference(id) => {
+                                        id.name.as_str().to_string()
+                                    }
+                                    oxc_ast::ast::ModuleExportName::StringLiteral(lit) => {
+                                        lit.value.as_str().to_string()
+                                    }
+                                };
+                                state.imported_names.insert(
+                                    alias,
+                                    ImportBinding {
+                                        record_uv_idx: record_uv,
+                                        source_name,
+                                        is_namespace: false,
+                                    },
+                                );
+                            }
+                            oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                                let alias = s.local.name.as_str().to_string();
+                                state.imported_names.insert(
+                                    alias,
+                                    ImportBinding {
+                                        record_uv_idx: record_uv,
+                                        source_name: "default".to_string(),
+                                        is_namespace: false,
+                                    },
+                                );
+                            }
+                            oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(
+                                s,
+                            ) => {
+                                let alias = s.local.name.as_str().to_string();
+                                state.imported_names.insert(
+                                    alias,
+                                    ImportBinding {
+                                        record_uv_idx: record_uv,
+                                        source_name: String::new(),
+                                        is_namespace: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
+                if let Some(inner) = &decl.declaration {
+                    match inner {
+                        oxc_ast::ast::Declaration::VariableDeclaration(var_decl) => {
+                            for declarator in &var_decl.declarations {
+                                if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) =
+                                    &declarator.id
+                                {
+                                    state.exported_names.insert(id.name.as_str().to_string());
+                                }
+                            }
+                        }
+                        oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
+                            if let Some(id) = &f.id {
+                                state.exported_names.insert(id.name.as_str().to_string());
+                            }
+                        }
+                        oxc_ast::ast::Declaration::ClassDeclaration(c) => {
+                            if let Some(id) = &c.id {
+                                state.exported_names.insert(id.name.as_str().to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for spec in &decl.specifiers {
+                    let exported_name = module_export_name_to_str(&spec.exported);
+                    state.exported_names.insert(exported_name);
+                }
+            }
+            Statement::ExportDefaultDeclaration(_) => {
+                state.exported_names.insert("default".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    top.module_state = Some(state);
+
+    let mut cx = Compiler::new(top);
+    cx.enter_scope();
+
+    // Register synthetic bindings for module_env and each
+    // import_record so inner functions can capture them through
+    // the regular `resolve_capture` cascade. Without these, an
+    // inner function that references an imported alias would see
+    // no binding in its scope chain and fail with
+    // "unresolved identifier".
+    {
+        let env_uv_sb = cx.module_state.as_ref().unwrap().module_env_uv;
+        let meta_uv_sb = cx.module_state.as_ref().unwrap().import_meta_uv;
+        let record_uvs: Vec<u16> = cx
+            .module_state
+            .as_ref()
+            .unwrap()
+            .import_records
+            .values()
+            .copied()
+            .collect();
+        cx.scopes[0].bindings.insert(
+            module_env_synthetic_name(),
+            BindingInfo {
+                storage: BindingStorage::Upvalue { idx: env_uv_sb },
+                is_const: true,
+                initialized: true,
+            },
+        );
+        cx.scopes[0].bindings.insert(
+            import_meta_synthetic_name(),
+            BindingInfo {
+                storage: BindingStorage::Upvalue { idx: meta_uv_sb },
+                is_const: true,
+                initialized: true,
+            },
+        );
+        for uv in &record_uvs {
+            cx.scopes[0].bindings.insert(
+                import_record_synthetic_name(*uv),
+                BindingInfo {
+                    storage: BindingStorage::Upvalue { idx: *uv },
+                    is_const: true,
+                    initialized: true,
+                },
+            );
+        }
+    }
+
+    // Hoist params into upvalue cells: param 0 → module_env_uv,
+    // param 1 → import_meta_uv. The runtime stores params in
+    // registers 0..param_count; we re-emit StoreUpvalue from those.
+    let span0 = (program.span.start, program.span.end);
+    let env_uv = cx.module_state.as_ref().unwrap().module_env_uv;
+    let meta_uv = cx.module_state.as_ref().unwrap().import_meta_uv;
+    cx.emit(
+        Op::StoreUpvalue,
+        vec![Operand::Register(0), Operand::Imm32(env_uv as i32)],
+        span0,
+    );
+    cx.emit(
+        Op::StoreUpvalue,
+        vec![Operand::Register(1), Operand::Imm32(meta_uv as i32)],
+        span0,
+    );
+    cx.scratch = 2; // params occupy r0, r1
+
+    // For each import source, emit Op::ImportNamespace then
+    // StoreUpvalue to populate the per-source record cell.
+    for specifier in &import_sources_in_order {
+        let record_uv = cx.module_state.as_ref().unwrap().import_records[specifier];
+        let scratch = cx.alloc_scratch();
+        let spec_const = cx.intern_string_constant(specifier);
+        cx.emit(
+            Op::ImportNamespace,
+            vec![Operand::Register(scratch), Operand::ConstIndex(spec_const)],
+            span0,
+        );
+        cx.emit(
+            Op::StoreUpvalue,
+            vec![Operand::Register(scratch), Operand::Imm32(record_uv as i32)],
+            span0,
+        );
+    }
+
+    for stmt in &program.body {
+        compile_statement(&mut cx, stmt)?;
+    }
+    cx.exit_scope();
+
+    cx.emit(Op::ReturnUndefined, vec![], span0);
+
+    {
+        let mut m = module.borrow_mut();
+        m.functions[0].locals = 0;
+        m.functions[0].scratch = cx.scratch;
+        m.functions[0].own_upvalue_count = cx.own_upvalue_count;
+        m.functions[0].code = std::mem::take(&mut cx.code);
+        m.functions[0].spans = std::mem::take(&mut cx.spans);
+    }
+    drop(cx);
+
+    let kind = match parsed.kind {
+        SyntaxSourceKind::JavaScript => BytecodeSourceKind::JavaScript,
+        SyntaxSourceKind::TypeScript => BytecodeSourceKind::TypeScript,
+    };
+
+    let ModuleBuilder {
+        functions,
+        constants,
+    } = Rc::try_unwrap(module)
+        .expect("module builder should be uniquely owned at finalize")
+        .into_inner();
+
+    // Populate module_resolutions from host info: every specifier
+    // → (referrer, specifier, target) triple.
+    let module_resolutions: Vec<otter_bytecode::ModuleResolution> = host
+        .resolved_imports
+        .iter()
+        .map(|(specifier, target)| otter_bytecode::ModuleResolution {
+            referrer: host.module_url.clone(),
+            specifier: specifier.clone(),
+            target: target.clone(),
+        })
+        .collect();
+
+    Ok(BytecodeModule {
+        module: host.module_url.clone(),
+        source_kind: kind,
+        functions,
+        constants,
+        module_resolutions,
+        module_inits: Vec::new(),
+    })
+}
+
+/// Compile the inner declaration of an `export <decl>` statement
+/// (`export let x = …`, `export function f() {…}`,
+/// `export class C {…}`). Mirrors the matching `compile_statement`
+/// arms without re-wrapping into a `Statement` — re-wrapping
+/// requires arena allocation that isn't available here.
+///
+/// The pre-pass already added each declared name to
+/// `module_state.exported_names`, so the regular store paths
+/// emit the `module_env` mirror automatically.
+fn compile_export_inner_declaration(
+    cx: &mut Compiler,
+    decl: &oxc_ast::ast::Declaration<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    match decl {
+        oxc_ast::ast::Declaration::VariableDeclaration(v) => {
+            let is_const = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+            let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+            if is_var {
+                return Err(CompileError::Unsupported {
+                    node: "export var (foundation rejects var)".to_string(),
+                    span,
+                });
+            }
+            for declarator in &v.declarations {
+                let dspan = (declarator.span.start, declarator.span.end);
+                let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id else {
+                    return Err(CompileError::Unsupported {
+                        node: "export with destructuring not yet supported".to_string(),
+                        span: dspan,
+                    });
+                };
+                let name = id.name.as_str().to_string();
+                let storage = cx.declare_binding(&name, is_const, dspan)?;
+                let init_reg = match &declarator.init {
+                    Some(init) => compile_expr(cx, init, dspan)?,
+                    None => {
+                        let dst = cx.alloc_scratch();
+                        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], dspan);
+                        dst
+                    }
+                };
+                cx.emit_store_storage(init_reg, storage, dspan);
+                cx.mark_initialized(&name);
+                cx.emit_module_export_mirror(&name, init_reg, dspan);
+            }
+            Ok(())
+        }
+        oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
+            let fspan = (f.span.start, f.span.end);
+            let name =
+                f.id.as_ref()
+                    .ok_or(CompileError::Unsupported {
+                        node: "export function without name".to_string(),
+                        span: fspan,
+                    })?
+                    .name
+                    .as_str()
+                    .to_string();
+            let (function_id, captures) =
+                compile_function(cx, &name, &f.params, &f.body, fspan, f.r#async)?;
+            let storage = cx.declare_binding(&name, false, fspan)?;
+            let const_idx = cx.intern_function_id(function_id);
+            let tmp = cx.alloc_scratch();
+            emit_make_callable(cx, tmp, const_idx, &captures, false, fspan);
+            cx.emit_store_storage(tmp, storage, fspan);
+            cx.mark_initialized(&name);
+            cx.emit_module_export_mirror(&name, tmp, fspan);
+            Ok(())
+        }
+        oxc_ast::ast::Declaration::ClassDeclaration(c) => {
+            let cspan = (c.span.start, c.span.end);
+            let name =
+                c.id.as_ref()
+                    .ok_or(CompileError::Unsupported {
+                        node: "export class without name".to_string(),
+                        span: cspan,
+                    })?
+                    .name
+                    .as_str()
+                    .to_string();
+            let class_reg = compile_class(cx, c, Some(&name))?;
+            let storage = cx.declare_binding(&name, false, cspan)?;
+            cx.emit_store_storage(class_reg, storage, cspan);
+            cx.mark_initialized(&name);
+            cx.emit_module_export_mirror(&name, class_reg, cspan);
+            Ok(())
+        }
+        _ => Err(CompileError::Unsupported {
+            node: "ExportNamedDeclaration: non-runtime inner declaration".to_string(),
+            span,
+        }),
+    }
+}
+
+/// Synthetic binding name used to capture the `module_env`
+/// JsObject through inner-function `resolve_capture` cascades.
+/// Inner functions that mutate a module-level export reach the
+/// outer module-init's `module_env` cell via this name.
+fn module_env_synthetic_name() -> String {
+    "__otter_module_env".to_string()
+}
+
+/// Synthetic binding name for the `import_meta` JsObject.
+fn import_meta_synthetic_name() -> String {
+    "__otter_import_meta".to_string()
+}
+
+/// Synthetic binding name for an import-record at the given
+/// outer-frame upvalue index. Distinct names per-record let inner
+/// functions cascade each independently.
+fn import_record_synthetic_name(record_uv: u16) -> String {
+    format!("__otter_import_record_{record_uv}")
+}
+
+/// Find the deepest [`ModuleState`] frame that declares an
+/// imported alias matching `name`. Returns the binding info
+/// alongside the synthetic upvalue name the inner function should
+/// resolve via `resolve_capture` to land at the same record cell.
+fn find_module_import_binding(cx: &Compiler, name: &str) -> Option<(ImportBinding, String)> {
+    for frame in cx.stack.iter().rev() {
+        if let Some(state) = &frame.module_state
+            && let Some(binding) = state.imported_names.get(name)
+        {
+            return Some((
+                binding.clone(),
+                import_record_synthetic_name(binding.record_uv_idx),
+            ));
+        }
+    }
+    None
+}
+
+/// Stringify an OXC `ModuleExportName` (used by named-export
+/// specifiers). The three variants are:
+/// - `IdentifierName` (`export { a }`),
+/// - `IdentifierReference` (`export { a as b }`'s `a`),
+/// - `StringLiteral` (`export { "a" as b }`).
+fn module_export_name_to_str(name: &oxc_ast::ast::ModuleExportName<'_>) -> String {
+    match name {
+        oxc_ast::ast::ModuleExportName::IdentifierName(id) => id.name.as_str().to_string(),
+        oxc_ast::ast::ModuleExportName::IdentifierReference(id) => id.name.as_str().to_string(),
+        oxc_ast::ast::ModuleExportName::StringLiteral(lit) => lit.value.as_str().to_string(),
+    }
 }
 
 /// Module-level mutable state shared across nested function
@@ -241,6 +798,13 @@ struct FunctionContext {
     /// `frame.upvalues`. Captures live at
     /// `own_upvalue_count..own_upvalue_count + parent_captures.len()`.
     captured_uv: HashMap<String, u16>,
+    /// `Some` when this context is the top-level `<module-init>`
+    /// of an ES-module fragment. Drives the lowering of
+    /// `import` / `export` declarations + `import.meta` references
+    /// against captured `module_env` / `import_meta` upvalues.
+    /// Inner functions inherit module-mode lookups via the
+    /// existing capture walk — they never set this themselves.
+    module_state: Option<ModuleState>,
 }
 
 /// Compile-time stack of function contexts. The innermost context
@@ -366,6 +930,7 @@ impl FunctionContext {
             own_upvalue_count: 0,
             parent_captures: Vec::new(),
             captured_uv: HashMap::new(),
+            module_state: None,
         }
     }
 
@@ -696,6 +1261,60 @@ impl FunctionContext {
         }
     }
 
+    /// In module mode, mirror an assignment to an exported name
+    /// through to the captured `module_env` JsObject so importers'
+    /// later reads observe the new value (live bindings).
+    /// No-op when `name` is not in the export set or when not in
+    /// module mode.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-module-environment-records-setmutablebinding-n-v-s>
+    fn emit_module_export_mirror(&mut self, name: &str, value_reg: u16, span: (u32, u32)) {
+        let env_uv = match &self.module_state {
+            Some(state) if state.exported_names.contains(name) => state.module_env_uv,
+            _ => return,
+        };
+        let env_reg = self.alloc_scratch();
+        self.emit(
+            Op::LoadUpvalue,
+            vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+            span,
+        );
+        self.emit_store_property(env_reg, name, value_reg, span);
+    }
+
+    /// Emit `Op::StoreProperty obj_reg, name_const, src_reg`.
+    /// Used by the module-mode lowering to mirror writes through
+    /// to `module_env` for exported bindings, and by the export
+    /// declaration arms.
+    fn emit_store_property(&mut self, obj_reg: u16, name: &str, src: u16, span: (u32, u32)) {
+        let name_const = self.intern_string_constant(name);
+        self.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(obj_reg),
+                Operand::ConstIndex(name_const),
+                Operand::Register(src),
+            ],
+            span,
+        );
+    }
+
+    /// Emit `Op::LoadProperty dst, obj_reg, name_const`. Used by
+    /// the module-mode lowering for imported-name reads
+    /// (`LoadProperty import_record, "name"`) and `import.meta.url`.
+    fn emit_load_property(&mut self, dst: u16, obj_reg: u16, name: &str, span: (u32, u32)) {
+        let name_const = self.intern_string_constant(name);
+        self.emit(
+            Op::LoadProperty,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(obj_reg),
+                Operand::ConstIndex(name_const),
+            ],
+            span,
+        );
+    }
+
     /// Emit the "write `src` into this binding" op pair for the
     /// storage kind.
     fn emit_store_storage(&mut self, src: u16, storage: BindingStorage, span: (u32, u32)) {
@@ -777,6 +1396,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                     };
                     cx.emit_store_storage(init_reg, storage, span);
                     cx.mark_initialized(&name);
+                    cx.emit_module_export_mirror(&name, init_reg, span);
                     continue;
                 }
                 // Destructuring binding (`let [a, b] = …` /
@@ -934,7 +1554,8 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                     .name
                     .as_str()
                     .to_string();
-            let (function_id, captures) = compile_function(cx, &name, &f.params, &f.body, span)?;
+            let (function_id, captures) =
+                compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
             // Bind the name in the current scope to a register
             // holding the function value. Foundation slice doesn't
             // hoist; declarations are evaluated at their lexical
@@ -945,6 +1566,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             emit_make_callable(cx, tmp, const_idx, &captures, false, span);
             cx.emit_store_storage(tmp, storage, span);
             cx.mark_initialized(&name);
+            cx.emit_module_export_mirror(&name, tmp, span);
             Ok(None)
         }
 
@@ -978,6 +1600,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             let storage = cx.declare_binding(&name, false, span)?;
             cx.emit_store_storage(class_reg, storage, span);
             cx.mark_initialized(&name);
+            cx.emit_module_export_mirror(&name, class_reg, span);
             Ok(None)
         }
 
@@ -989,6 +1612,229 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
         }
 
         Statement::TryStatement(s) => compile_try_statement(cx, s),
+
+        Statement::ImportDeclaration(decl) => {
+            // Type-only `import type { … }` is erased earlier via
+            // `is_erased_ts_statement`. Runtime imports were
+            // pre-resolved by `compile_module_fragment`'s pre-pass:
+            // the import-record upvalue is already populated and
+            // identifier resolution routes references through
+            // `imported_names`. Nothing left to do at the
+            // statement site.
+            //
+            // Outside module mode, an import is a hard error: the
+            // foundation rejects mixed script + module input.
+            //
+            // Spec: <https://tc39.es/ecma262/#sec-imports>
+            let span = (decl.span.start, decl.span.end);
+            if cx.module_state.is_none() {
+                return Err(CompileError::Unsupported {
+                    node: "ImportDeclaration outside ES-module fragment".to_string(),
+                    span,
+                });
+            }
+            Ok(None)
+        }
+
+        Statement::ExportNamedDeclaration(decl) => {
+            // Three shapes:
+            //   1. `export let x = …` / `export function f() {…}` /
+            //      `export class C {…}` — the inner declaration
+            //      compiles via the regular path and the export
+            //      mirror runs because the pre-pass added the name
+            //      to `exported_names`.
+            //   2. `export { a, b as c }` — re-export of names that
+            //      already live in the module body. We synthesise a
+            //      property store on `module_env` for each spec.
+            //   3. `export { x } from "./other.ts"` (re-export from
+            //      another module) — read from the source's import
+            //      record, write to `module_env`.
+            //
+            // Spec: <https://tc39.es/ecma262/#sec-exports>
+            let span = (decl.span.start, decl.span.end);
+            if cx.module_state.is_none() {
+                return Err(CompileError::Unsupported {
+                    node: "ExportNamedDeclaration outside ES-module fragment".to_string(),
+                    span,
+                });
+            }
+            if let Some(inner) = &decl.declaration {
+                compile_export_inner_declaration(cx, inner, span)?;
+            }
+            // Mirror each `export { name as exported_name }` spec
+            // through to module_env. When `decl.source` is set the
+            // source is another module; we read from its import
+            // record (already present courtesy of the pre-pass).
+            let from_source = decl.source.as_ref().map(|s| s.value.as_str().to_string());
+            for spec in &decl.specifiers {
+                let exported = module_export_name_to_str(&spec.exported);
+                let local = module_export_name_to_str(&spec.local);
+                let value_reg = if let Some(src) = &from_source {
+                    let record_uv = cx
+                        .module_state
+                        .as_ref()
+                        .and_then(|s| s.import_records.get(src).copied())
+                        .ok_or(CompileError::Unsupported {
+                            node: format!(
+                                "ExportNamedDeclaration: unresolved re-export source `{src}`"
+                            ),
+                            span,
+                        })?;
+                    let record_reg = cx.alloc_scratch();
+                    cx.emit(
+                        Op::LoadUpvalue,
+                        vec![
+                            Operand::Register(record_reg),
+                            Operand::Imm32(record_uv as i32),
+                        ],
+                        span,
+                    );
+                    let dst = cx.alloc_scratch();
+                    cx.emit_load_property(dst, record_reg, &local, span);
+                    dst
+                } else if decl.declaration.is_some() {
+                    // The declaration arm already mirrored via
+                    // emit_module_export_mirror. Nothing to do.
+                    continue;
+                } else {
+                    // `export { name }` — read from the local
+                    // binding (the body must have declared it).
+                    let info = cx.lookup_binding(&local).ok_or(CompileError::Unsupported {
+                        node: format!("export of undeclared `{local}`"),
+                        span,
+                    })?;
+                    let dst = cx.alloc_scratch();
+                    cx.emit_load_storage(dst, info.storage, span);
+                    dst
+                };
+                let env_uv = cx
+                    .module_state
+                    .as_ref()
+                    .map(|s| s.module_env_uv)
+                    .expect("module_state checked above");
+                let env_reg = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadUpvalue,
+                    vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+                    span,
+                );
+                cx.emit_store_property(env_reg, &exported, value_reg, span);
+            }
+            Ok(None)
+        }
+
+        Statement::ExportDefaultDeclaration(decl) => {
+            // `export default expr` — evaluate the expression
+            // then store on `module_env.default`.
+            //
+            // Spec: <https://tc39.es/ecma262/#sec-exports-runtime-semantics-evaluation>
+            let span = (decl.span.start, decl.span.end);
+            if cx.module_state.is_none() {
+                return Err(CompileError::Unsupported {
+                    node: "ExportDefaultDeclaration outside ES-module fragment".to_string(),
+                    span,
+                });
+            }
+            let value_reg = match &decl.declaration {
+                oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                    let name =
+                        f.id.as_ref()
+                            .map(|id| id.name.as_str().to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                    let (function_id, captures) =
+                        compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
+                    let const_idx = cx.intern_function_id(function_id);
+                    let dst = cx.alloc_scratch();
+                    emit_make_callable(cx, dst, const_idx, &captures, false, span);
+                    dst
+                }
+                oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                    let name = c.id.as_ref().map(|id| id.name.as_str().to_string());
+                    compile_class(cx, c, name.as_deref())?
+                }
+                other => {
+                    let expr = other.as_expression().ok_or(CompileError::Unsupported {
+                        node: "ExportDefaultDeclaration: unsupported declaration kind".to_string(),
+                        span,
+                    })?;
+                    compile_expr(cx, expr, span)?
+                }
+            };
+            let env_uv = cx
+                .module_state
+                .as_ref()
+                .map(|s| s.module_env_uv)
+                .expect("module_state checked above");
+            let env_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadUpvalue,
+                vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+                span,
+            );
+            cx.emit_store_property(env_reg, "default", value_reg, span);
+            Ok(None)
+        }
+
+        Statement::ExportAllDeclaration(decl) => {
+            // `export * from "./other.ts"` and `export * as ns from
+            // "./other.ts"`. Foundation supports the latter as a
+            // simple re-export (the source module's namespace
+            // becomes a property on module_env). The bare
+            // `export *` would need to copy every own property of
+            // the source's namespace into our module_env at the
+            // moment of evaluation — doable but would also need
+            // re-resolution of those names on every read for live
+            // bindings, which the foundation does not yet model.
+            // Reject the bare form for now.
+            //
+            // Spec: <https://tc39.es/ecma262/#sec-getmoduleexports>
+            let span = (decl.span.start, decl.span.end);
+            if cx.module_state.is_none() {
+                return Err(CompileError::Unsupported {
+                    node: "ExportAllDeclaration outside ES-module fragment".to_string(),
+                    span,
+                });
+            }
+            let source = decl.source.value.as_str().to_string();
+            let record_uv = cx
+                .module_state
+                .as_ref()
+                .and_then(|s| s.import_records.get(&source).copied())
+                .ok_or(CompileError::Unsupported {
+                    node: format!("ExportAllDeclaration: unresolved source `{source}`"),
+                    span,
+                })?;
+            let exported_alias = decl
+                .exported
+                .as_ref()
+                .map(module_export_name_to_str)
+                .ok_or(CompileError::Unsupported {
+                    node: "ExportAllDeclaration: bare `export *` not yet supported".to_string(),
+                    span,
+                })?;
+            let record_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadUpvalue,
+                vec![
+                    Operand::Register(record_reg),
+                    Operand::Imm32(record_uv as i32),
+                ],
+                span,
+            );
+            let env_uv = cx
+                .module_state
+                .as_ref()
+                .map(|s| s.module_env_uv)
+                .expect("module_state checked above");
+            let env_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadUpvalue,
+                vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+                span,
+            );
+            cx.emit_store_property(env_reg, &exported_alias, record_reg, span);
+            Ok(None)
+        }
 
         Statement::ContinueStatement(s) => {
             let span = (s.span.start, s.span.end);
@@ -1076,6 +1922,7 @@ fn compile_function(
     params: &oxc_ast::ast::FormalParameters<'_>,
     body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
     span: (u32, u32),
+    is_async: bool,
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
     let mut child = FunctionContext::new(Rc::clone(&module));
@@ -1152,6 +1999,7 @@ fn compile_function(
     slot.scratch = child.scratch;
     slot.param_count = param_count;
     slot.has_rest = has_rest;
+    slot.is_async = is_async;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;
@@ -1304,6 +2152,7 @@ fn compile_assignment(
     };
     cx.emit_store_storage(value, storage, span);
     cx.mark_initialized(&name);
+    cx.emit_module_export_mirror(&name, value, span);
     Ok(value)
 }
 
@@ -1583,12 +2432,6 @@ fn compile_arrow_function(
     arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>,
     span: (u32, u32),
 ) -> Result<(u32, Vec<u32>), CompileError> {
-    if arrow.r#async {
-        return Err(CompileError::Unsupported {
-            node: "ArrowFunction: async".to_string(),
-            span,
-        });
-    }
     let module = Rc::clone(&parent.top_mut().module);
     let mut child = FunctionContext::new(Rc::clone(&module));
     child.captured_names = capture::analyze_arrow(arrow);
@@ -1661,6 +2504,7 @@ fn compile_arrow_function(
     slot.scratch = child.scratch;
     slot.param_count = param_count;
     slot.has_rest = has_rest;
+    slot.is_async = arrow.r#async;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.is_arrow = true;
     slot.code = child.code;
@@ -1786,6 +2630,42 @@ fn compile_expr(
                     return Ok(dst);
                 }
                 _ => {}
+            }
+            // Module-mode identifier resolution: imported aliases
+            // resolve to a `LoadProperty` against the source
+            // module's import-record (live binding — every read
+            // observes the current export value).
+            //
+            // Inner functions that reference an imported alias
+            // walk up the function-context stack to find the
+            // matching record-upvalue, then capture it via the
+            // standard `resolve_capture` cascade so the cell is
+            // available in the inner frame's upvalues array.
+            //
+            // Spec: <https://tc39.es/ecma262/#sec-getidentifierreference>
+            //       <https://tc39.es/ecma262/#sec-module-environment-records-getbindingvalue-n-s>
+            if let Some((binding, synthetic)) = find_module_import_binding(cx, id.name.as_str()) {
+                let resolved_uv = if cx.module_state.is_some() {
+                    binding.record_uv_idx
+                } else {
+                    cx.resolve_capture(&synthetic)
+                        .expect("synthetic import-record binding must resolve")
+                };
+                let record_dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadUpvalue,
+                    vec![
+                        Operand::Register(record_dst),
+                        Operand::Imm32(resolved_uv as i32),
+                    ],
+                    span,
+                );
+                if binding.is_namespace {
+                    return Ok(record_dst);
+                }
+                let dst = cx.alloc_scratch();
+                cx.emit_load_property(dst, record_dst, &binding.source_name, span);
+                return Ok(dst);
             }
             if let Some(info) = cx.lookup_binding(id.name.as_str()) {
                 let dst = cx.alloc_scratch();
@@ -2395,7 +3275,8 @@ fn compile_expr(
                 f.id.as_ref()
                     .map(|id| id.name.as_str().to_string())
                     .unwrap_or_else(|| "<anonymous>".to_string());
-            let (function_id, captures) = compile_function(cx, &name, &f.params, &f.body, span)?;
+            let (function_id, captures) =
+                compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
             emit_make_callable(cx, dst, const_idx, &captures, false, span);
@@ -2414,6 +3295,97 @@ fn compile_expr(
         Expression::ClassExpression(class) => {
             let name = class.id.as_ref().map(|id| id.name.as_str().to_string());
             compile_class(cx, class, name.as_deref())
+        }
+
+        Expression::MetaProperty(meta) => {
+            // The only legal MetaProperty inside a module is
+            // `import.meta`. The runtime materialises it as a
+            // JsObject the linker passes in as param 1; we hoist
+            // it into `import_meta_uv` at function entry so
+            // closures capture it.
+            //
+            // Spec: <https://tc39.es/ecma262/#prod-ImportMeta>
+            //       <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
+            let span = (meta.span.start, meta.span.end);
+            if meta.meta.name.as_str() != "import" || meta.property.name.as_str() != "meta" {
+                return Err(CompileError::Unsupported {
+                    node: format!(
+                        "MetaProperty other than `import.meta` ({}.{})",
+                        meta.meta.name, meta.property.name
+                    ),
+                    span,
+                });
+            }
+            let import_meta_uv = cx.module_state.as_ref().map(|s| s.import_meta_uv).ok_or(
+                CompileError::Unsupported {
+                    node: "`import.meta` outside an ES-module fragment".to_string(),
+                    span,
+                },
+            )?;
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadUpvalue,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Imm32(import_meta_uv as i32),
+                ],
+                span,
+            );
+            Ok(dst)
+        }
+
+        Expression::ImportExpression(imp) => {
+            // Foundation: only literal-string `import("./x")` is
+            // accepted. Non-literal specifiers raise
+            // `MODULE_DYNAMIC_NON_LITERAL` (recorded in task 36a;
+            // task 58 lifts the restriction with runtime-lazy
+            // loading).
+            //
+            // Spec: <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>
+            let span = (imp.span.start, imp.span.end);
+            if cx.module_state.is_none() {
+                return Err(CompileError::Unsupported {
+                    node: "dynamic `import()` outside an ES-module fragment".to_string(),
+                    span,
+                });
+            }
+            let specifier = match unwrap_ts_expr(&imp.source) {
+                Expression::StringLiteral(lit) => lit.value.as_str().to_string(),
+                _ => {
+                    return Err(CompileError::Unsupported {
+                        node:
+                            "MODULE_DYNAMIC_NON_LITERAL: non-literal `import(specifier)` argument"
+                                .to_string(),
+                        span,
+                    });
+                }
+            };
+            let ns_dst = cx.alloc_scratch();
+            let spec_const = cx.intern_string_constant(&specifier);
+            cx.emit(
+                Op::ImportNamespace,
+                vec![Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
+                span,
+            );
+            let promise_dst = cx.alloc_scratch();
+            cx.emit(
+                Op::PromiseFulfilledOf,
+                vec![Operand::Register(promise_dst), Operand::Register(ns_dst)],
+                span,
+            );
+            Ok(promise_dst)
+        }
+
+        Expression::AwaitExpression(a) => {
+            let span = (a.span.start, a.span.end);
+            let src = compile_expr(cx, &a.argument, span)?;
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::Await,
+                vec![Operand::Register(dst), Operand::Register(src)],
+                span,
+            );
+            Ok(dst)
         }
 
         other => Err(CompileError::Unsupported {
@@ -3262,6 +4234,7 @@ fn compile_class(
             &m.value.params,
             &m.value.body,
             (m.span.start, m.span.end),
+            m.value.r#async,
         )?,
         None => compile_synthetic_constructor(cx, &display_name, super_reg.is_some(), span)?,
     };
@@ -3295,6 +4268,7 @@ fn compile_class(
             &m.value.params,
             &m.value.body,
             method_span,
+            m.value.r#async,
         )?;
         let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
@@ -3914,6 +4888,113 @@ pub enum CompileError {
 mod tests {
     use super::*;
     use otter_syntax::parse;
+
+    fn host_info(specifiers: &[(&str, &str)]) -> ModuleHostInfo {
+        ModuleHostInfo {
+            module_url: "file:///test/main.ts".to_string(),
+            resolved_imports: specifiers
+                .iter()
+                .map(|(s, t)| (s.to_string(), t.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn module_fragment_marks_module_init() {
+        let parsed = parse("export let x = 7;", SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+        let init = &module.functions[0];
+        assert!(init.is_module);
+        assert_eq!(init.name, "<module-init>");
+        assert_eq!(init.module_url, "file:///test/main.ts");
+        assert_eq!(init.param_count, 2);
+        assert_eq!(module.module, "file:///test/main.ts");
+        // Two own-upvalues for module_env + import_meta.
+        assert!(init.own_upvalue_count >= 2);
+    }
+
+    #[test]
+    fn module_export_mirrors_assignment() {
+        let parsed = parse(
+            "export let counter = 0; counter = counter + 1;",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+        let init = &module.functions[0];
+        // Two StoreProperty ops expected: initial declaration
+        // mirror + assignment mirror.
+        let store_property_count = init
+            .code
+            .iter()
+            .filter(|i| i.op == Op::StoreProperty)
+            .count();
+        assert!(
+            store_property_count >= 2,
+            "expected >=2 StoreProperty mirrors, got {store_property_count}"
+        );
+    }
+
+    #[test]
+    fn module_import_lowers_to_load_property_chain() {
+        let src = "import { value } from \"./other.ts\"; let y = value;";
+        let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
+        let host = host_info(&[("./other.ts", "file:///test/other.ts")]);
+        let module = compile_module_fragment(&parsed, &host).unwrap();
+        let init = &module.functions[0];
+        // ImportNamespace at the top of the body.
+        assert!(init.code.iter().any(|i| i.op == Op::ImportNamespace));
+        // LoadProperty for the read of `value`.
+        assert!(init.code.iter().any(|i| i.op == Op::LoadProperty));
+        // module_resolutions populated from host info.
+        assert_eq!(module.module_resolutions.len(), 1);
+        assert_eq!(module.module_resolutions[0].specifier, "./other.ts");
+        assert_eq!(module.module_resolutions[0].target, "file:///test/other.ts");
+    }
+
+    #[test]
+    fn import_outside_module_mode_is_rejected() {
+        let parsed = parse(
+            "import { a } from \"./x.ts\";",
+            SyntaxSourceKind::TypeScript,
+        )
+        .unwrap();
+        let err = compile(&parsed, "test.ts").unwrap_err();
+        match err {
+            CompileError::Unsupported { node, .. } => {
+                assert!(node.contains("ImportDeclaration"), "got {node}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_import_with_non_literal_argument_is_rejected() {
+        let src = "let s = \"./x.ts\"; import(s);";
+        let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
+        let err = compile_module_fragment(&parsed, &host_info(&[])).unwrap_err();
+        match err {
+            CompileError::Unsupported { node, .. } => {
+                assert!(node.contains("MODULE_DYNAMIC_NON_LITERAL"), "got {node}");
+            }
+            other => panic!("expected MODULE_DYNAMIC_NON_LITERAL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_meta_lowers_to_load_upvalue() {
+        let src = "let u = import.meta.url;";
+        let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
+        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+        let init = &module.functions[0];
+        // The body should LoadUpvalue then LoadProperty for .url.
+        let load_upvalue_count = init.code.iter().filter(|i| i.op == Op::LoadUpvalue).count();
+        assert!(
+            load_upvalue_count >= 1,
+            "expected at least one LoadUpvalue (import.meta), got {load_upvalue_count}"
+        );
+        assert!(init.code.iter().any(|i| i.op == Op::LoadProperty));
+    }
 
     #[test]
     fn bigint_literal_emits_load_bigint() {

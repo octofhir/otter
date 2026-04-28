@@ -489,6 +489,7 @@ fn reaction_to_microtask(reaction: PromiseReaction, value: Value) -> Microtask {
         this_value: Value::Undefined,
         args: smallvec![value],
         result_capability,
+        kind: crate::microtask::MicrotaskKind::Call,
     }
 }
 

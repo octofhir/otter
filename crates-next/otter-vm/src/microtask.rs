@@ -67,7 +67,7 @@ use std::collections::VecDeque;
 use crossbeam_channel::Receiver;
 use smallvec::SmallVec;
 
-use crate::Value;
+use crate::{Frame, Value};
 
 /// Hard cap on tasks drained per single drain call. Past this we
 /// return [`MicrotaskError::Runaway`] so a misbehaving JS program
@@ -79,16 +79,26 @@ pub const MAX_DRAIN_ITERS: u32 = 1_000_000;
 /// Args use a 4-element inline `SmallVec` so the typical
 /// `Promise.resolve().then(fn)` (1 arg) and `queueMicrotask(fn)`
 /// (0 args) shapes never allocate.
-#[derive(Debug, Clone)]
+///
+/// The default [`MicrotaskKind::Call`] dispatch invokes `callee`
+/// with `args`. The [`MicrotaskKind::AsyncResume`] kind is the
+/// async-await suspension point's settlement vehicle: when the
+/// awaited promise settles, the runtime parks the suspended frame
+/// onto a fresh microtask of this kind so the drain re-pushes it
+/// onto a one-deep stack and runs `dispatch_loop` from where the
+/// `Op::Await` left off.
+#[derive(Debug)]
 pub struct Microtask {
-    /// Function value to invoke. Must satisfy `is_callable`. Any
-    /// `BoundFunction` / `ClassConstructor` layers are unwrapped at
-    /// invocation time, not at enqueue.
+    /// Function value to invoke. Must satisfy `is_callable` for
+    /// [`MicrotaskKind::Call`] tasks; ignored entirely for the
+    /// async-resume kind.
     pub callee: Value,
     /// `this` binding for the call. Spec microtasks have
     /// `undefined`; embedder-injected callbacks may bind otherwise.
     pub this_value: Value,
-    /// Arguments. 0–4 inline; 5+ heap.
+    /// Arguments. 0–4 inline; 5+ heap. For
+    /// [`MicrotaskKind::AsyncResume`] the slot at index 0 carries
+    /// the resolved value (fulfilment) or rejection reason.
     pub args: SmallVec<[Value; 4]>,
     /// Optional `{resolve, reject}` capability to settle with the
     /// task's outcome. Promise reaction jobs use this so the
@@ -96,6 +106,44 @@ pub struct Microtask {
     /// chain (and a thrown error rejects it). `None` for plain
     /// `queueMicrotask(fn)` callbacks.
     pub result_capability: Option<MicrotaskCapability>,
+    /// What flavour of work this task represents. Defaults to
+    /// [`MicrotaskKind::Call`] (the `queueMicrotask(fn, args...)`
+    /// shape). `Op::Await` enqueues [`MicrotaskKind::AsyncResume`]
+    /// to wake a parked async frame.
+    pub kind: MicrotaskKind,
+}
+
+/// What a queued microtask actually does when the drain reaches
+/// it. The default `Call` is `queueMicrotask(callee, args...)` — a
+/// plain top-level invocation with optional reaction-mode
+/// settlement. `AsyncResume` is the await-suspension settlement
+/// vehicle: instead of calling `callee`, the drain re-pushes the
+/// parked frame, writes the resolution value into the await's
+/// destination register (or throws into the frame on rejection),
+/// and runs `dispatch_loop` until the frame settles its result
+/// promise.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum MicrotaskKind {
+    /// `queueMicrotask(callee, args...)`. Default for both plain
+    /// `queueMicrotask` calls and promise-reaction handlers.
+    Call,
+    /// Resume a parked async frame. `frame` was popped off the
+    /// active stack at the matching `Op::Await`; the drain rebuilds
+    /// a fresh stack containing only this frame and continues
+    /// execution from the next pc.
+    AsyncResume {
+        /// Frame the drain re-pushes. Boxed so the `Microtask`
+        /// stays small in the common-case `Call` enqueue path.
+        frame: Box<Frame>,
+        /// Register inside `frame` that receives the awaited
+        /// value on the fulfilled path.
+        await_dst: u16,
+        /// `true` when the awaited promise fulfilled. `false`
+        /// rejects: the resume path immediately unwinds with
+        /// `args[0]` as the thrown value.
+        fulfilled: bool,
+    },
 }
 
 /// `{resolve, reject}` pair the runtime uses to settle a
@@ -321,6 +369,7 @@ mod tests {
             this_value: Value::Undefined,
             args: SmallVec::new(),
             result_capability: None,
+            kind: MicrotaskKind::Call,
         }
     }
 

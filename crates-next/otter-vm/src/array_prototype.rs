@@ -1,11 +1,16 @@
 //! `Array.prototype.*` non-callback intrinsic implementations.
 //!
-//! Slice 21 ships methods that do **not** invoke a JS callback:
+//! This module hosts methods that do **not** invoke a JS callback:
 //! `push`, `pop`, `shift`, `unshift`, `slice`, `concat`, `join`,
-//! `includes`, `indexOf`. The callback-driven family
-//! (`forEach`, `map`, `filter`, `reduce`) lowers to inline bytecode
-//! loops in the compiler so we don't need a host-callable bridge
-//! for the runtime.
+//! `includes`, `indexOf`, `lastIndexOf`, `at`, `reverse`, `fill`,
+//! `flat`, `splice`, `sort` (default lexicographic). The callback-
+//! driven family (`forEach`, `map`, `filter`, `reduce`, `find`,
+//! `findIndex`, `every`, `some`, `flatMap`, `sort` with comparator)
+//! is dispatched by the interpreter in `do_call_method_value` so
+//! the callbacks run on the active VM stack via `run_callable_sync`.
+//!
+//! # See also
+//! - <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
 //!
 //! # Contents
 //! - [`ARRAY_PROTOTYPE_TABLE`] — declarative registry built with
@@ -178,20 +183,207 @@ fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Number(NumberValue::from_i32(-1)))
 }
 
+/// §23.1.3.1 `Array.prototype.at(index)` — clamp negative indexing.
+/// <https://tc39.es/ecma262/#sec-array.prototype.at>
+fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = receiver_array(args)?;
+    let len = arr.len() as i64;
+    let raw = arg_signed_index(args, 0, 0)?;
+    let idx = if raw < 0 { len + raw } else { raw };
+    if idx < 0 || idx >= len {
+        return Ok(Value::Undefined);
+    }
+    Ok(arr.get(idx as usize))
+}
+
+/// §23.1.3.18 `Array.prototype.lastIndexOf(value, fromIndex?)`.
+/// <https://tc39.es/ecma262/#sec-array.prototype.lastindexof>
+fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = receiver_array(args)?;
+    let len = arr.len();
+    let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let from_default = (len as i64).saturating_sub(1);
+    let from_raw = arg_signed_index(args, 1, from_default)?;
+    let from = if from_raw < 0 {
+        let v = (len as i64) + from_raw;
+        if v < 0 {
+            return Ok(Value::Number(NumberValue::from_i32(-1)));
+        }
+        v as usize
+    } else if (from_raw as usize) >= len {
+        len.saturating_sub(1)
+    } else {
+        from_raw as usize
+    };
+    let body = arr.borrow_body();
+    if body.elements.is_empty() {
+        return Ok(Value::Number(NumberValue::from_i32(-1)));
+    }
+    let mut i = from as i64;
+    while i >= 0 {
+        if body.elements[i as usize] == needle {
+            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+        }
+        i -= 1;
+    }
+    Ok(Value::Number(NumberValue::from_i32(-1)))
+}
+
+/// §23.1.3.27 `Array.prototype.reverse()` — in-place.
+/// <https://tc39.es/ecma262/#sec-array.prototype.reverse>
+fn impl_reverse(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = receiver_array(args)?;
+    arr.borrow_body_mut().elements.reverse();
+    Ok(Value::Array(arr.clone()))
+}
+
+/// §23.1.3.7 `Array.prototype.fill(value, start?, end?)` — in-place.
+/// <https://tc39.es/ecma262/#sec-array.prototype.fill>
+fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = receiver_array(args)?;
+    let len = arr.len();
+    let value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
+    let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
+    if start < end {
+        let mut body = arr.borrow_body_mut();
+        for i in start..end {
+            body.elements[i] = value.clone();
+        }
+    }
+    Ok(Value::Array(arr.clone()))
+}
+
+/// §23.1.3.11 `Array.prototype.flat(depth?)` — flattens at most
+/// `depth` levels (default 1). Sparse holes are dropped — foundation
+/// arrays are dense, so the spec's `IsConcatSpreadable` short-circuit
+/// reduces to "is `Value::Array`".
+/// <https://tc39.es/ecma262/#sec-array.prototype.flat>
+fn impl_flat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = receiver_array(args)?;
+    let depth = match args.args.first() {
+        None | Some(Value::Undefined) => 1i64,
+        Some(Value::Number(n)) => match n.as_smi() {
+            Some(v) if v >= 0 => v as i64,
+            Some(_) => 0,
+            None => n.as_f64() as i64,
+        },
+        _ => 1,
+    };
+    fn walk(out: &mut Vec<Value>, body: &[Value], depth: i64) {
+        for v in body {
+            match v {
+                Value::Array(a) if depth > 0 => {
+                    let inner = a.borrow_body();
+                    walk(out, &inner.elements, depth - 1);
+                }
+                other => out.push(other.clone()),
+            }
+        }
+    }
+    let body = arr.borrow_body();
+    let mut out: Vec<Value> = Vec::with_capacity(body.elements.len());
+    walk(&mut out, &body.elements, depth);
+    Ok(Value::Array(JsArray::from_elements(out)))
+}
+
+/// §23.1.3.31 `Array.prototype.splice(start, deleteCount?, ...items)`.
+/// Mutates the receiver in place; returns the removed elements.
+/// <https://tc39.es/ecma262/#sec-array.prototype.splice>
+fn impl_splice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = receiver_array(args)?;
+    let len = arr.len();
+    let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
+    // §23.1.3.31 step 6 — when `deleteCount` is omitted (foundation
+    // accepts `undefined`), splice removes through the tail.
+    let delete_count = match args.args.get(1) {
+        None | Some(Value::Undefined) => len.saturating_sub(start),
+        Some(Value::Number(n)) => {
+            let raw = match n.as_smi() {
+                Some(v) => v as i64,
+                None => n.as_f64() as i64,
+            };
+            if raw < 0 {
+                0
+            } else if (raw as usize) > len.saturating_sub(start) {
+                len.saturating_sub(start)
+            } else {
+                raw as usize
+            }
+        }
+        _ => 0,
+    };
+    let inserts: Vec<Value> = args.args.iter().skip(2).cloned().collect();
+    let mut body = arr.borrow_body_mut();
+    // `SmallVec` lacks a `splice` API — perform the equivalent by
+    // hand: drain the removed slice, then insert the new items at
+    // `start`.
+    let mut removed: Vec<Value> = Vec::with_capacity(delete_count);
+    for _ in 0..delete_count {
+        removed.push(body.elements.remove(start));
+    }
+    for (i, v) in inserts.into_iter().enumerate() {
+        body.elements.insert(start + i, v);
+    }
+    drop(body);
+    Ok(Value::Array(JsArray::from_elements(removed)))
+}
+
+/// §23.1.3.30 `Array.prototype.sort()` — default lexicographic
+/// comparator (calls `String(a)` / `String(b)` and compares as
+/// UTF-16). Comparator-driven sort is interpreter-dispatched.
+/// <https://tc39.es/ecma262/#sec-array.prototype.sort>
+fn impl_sort_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = receiver_array(args)?;
+    if let Some(Value::Undefined) | None = args.args.first() {
+        let mut body = arr.borrow_body_mut();
+        // §23.1.3.30.2 SortCompare (no comparator) — undefined values
+        // sort to the end; remaining values compare by their
+        // ToString result.
+        body.elements.sort_by(|a, b| {
+            let a_undef = matches!(a, Value::Undefined);
+            let b_undef = matches!(b, Value::Undefined);
+            match (a_undef, b_undef) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => a.display_string().cmp(&b.display_string()),
+            }
+        });
+        Ok(Value::Array(arr.clone()))
+    } else {
+        // Comparator path — interpreter dispatches it. Returning the
+        // BadArgument here surfaces as a clear diagnostic during
+        // bring-up; in practice the interpreter intercept above
+        // catches comparator-driven sorts before this point.
+        Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "sort comparator must be dispatched by the interpreter",
+        })
+    }
+}
+
 /// Declarative `Array.prototype` table.
 pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
     std::sync::LazyLock::new(|| {
         crate::intrinsics!(
             Array,
-            "push"     / 1 => impl_push,
-            "pop"      / 0 => impl_pop,
-            "shift"    / 0 => impl_shift,
-            "unshift"  / 1 => impl_unshift,
-            "slice"    / 2 => impl_slice,
-            "concat"   / 1 => impl_concat,
-            "join"     / 1 => impl_join,
-            "includes" / 1 => impl_includes,
-            "indexOf"  / 1 => impl_index_of,
+            "push"        / 1 => impl_push,
+            "pop"         / 0 => impl_pop,
+            "shift"       / 0 => impl_shift,
+            "unshift"     / 1 => impl_unshift,
+            "slice"       / 2 => impl_slice,
+            "concat"      / 1 => impl_concat,
+            "join"        / 1 => impl_join,
+            "includes"    / 1 => impl_includes,
+            "indexOf"     / 1 => impl_index_of,
+            "lastIndexOf" / 1 => impl_last_index_of,
+            "at"          / 1 => impl_at,
+            "reverse"     / 0 => impl_reverse,
+            "fill"        / 3 => impl_fill,
+            "flat"        / 1 => impl_flat,
+            "splice"      / 2 => impl_splice,
+            "sort"        / 1 => impl_sort_default,
         )
     });
 

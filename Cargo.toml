@@ -63,6 +63,27 @@ crossbeam-channel = "0.5"
 num-bigint  = "0.4"
 num-traits  = "0.2"
 
+# `Temporal` proposal implementation — drives every Temporal value
+# in `crates-next/otter-vm/src/temporal/`. Pinned to match the
+# foundation-phase set; bumps go through ADR review when the
+# Temporal stage advances.
+temporal_rs = { version = "0.2.3", features = ["sys-local"] }
+
+# ICU 4X — backs `Intl.*` in `crates-next/otter-vm/src/intl/`. We
+# pin the minimal feature set (collation, decimal/number formatting,
+# date-time formatting, locale parsing) and rely on each crate's
+# `compiled_data` feature so no external data file ships with the
+# binary. Binary-size impact is documented in the intl module
+# docstring; bumps go through ADR review.
+icu_collator = { version = "2.1", features = ["compiled_data"] }
+icu_decimal  = { version = "2.1", features = ["compiled_data"] }
+icu_datetime = { version = "2.1", features = ["compiled_data"] }
+icu_locale   = { version = "2.1", features = ["compiled_data"] }
+icu_calendar = { version = "2.1", features = ["compiled_data"] }
+icu_experimental = { version = "0.5", features = ["compiled_data"] }
+fixed_decimal = "0.7"
+writeable     = "0.6"
+
 # Regex backend for `Value::RegExp` and pattern-arg `String.prototype`
 # methods. Pulled from the OctoShikari fork rather than crates.io so we
 # can land local fixes without waiting on upstream releases.

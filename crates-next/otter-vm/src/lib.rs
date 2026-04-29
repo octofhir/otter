@@ -29,9 +29,15 @@
 //!     ../../../docs/new-engine/specs/bytecode-dump-disasm-trace.md
 //!   )
 
+pub mod abstract_ops;
 pub mod array;
 pub mod array_prototype;
+pub mod array_statics;
 pub mod bigint;
+pub mod collections;
+pub mod collections_prototype;
+pub mod error_classes;
+pub mod intl;
 pub mod intrinsics;
 pub mod json;
 pub mod math;
@@ -39,6 +45,7 @@ pub mod microtask;
 pub mod native_function;
 pub mod number;
 pub mod object;
+pub mod object_statics;
 pub mod promise;
 pub mod promise_dispatch;
 pub mod regexp;
@@ -48,6 +55,7 @@ pub mod string_prototype;
 pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
+pub mod temporal;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +67,9 @@ use smallvec::SmallVec;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 
 pub use array::JsArray;
+pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
+pub use error_classes::{ErrorClassRegistry, ErrorKind};
+pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use microtask::{AsyncRuntime, Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_function::{NativeError, NativeFn, NativeFunction, native_value};
 pub use number::{NumberValue, NumericOrdering};
@@ -70,6 +81,7 @@ pub use promise::{
 pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
 pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
+pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 
 /// Foundation runtime value.
 ///
@@ -158,6 +170,40 @@ pub enum Value {
     /// [`JsPromise::ptr_eq`]. Long-term path: GC migration (task
     /// 57) replaces the inner `Rc` with a `Gc<>` handle.
     Promise(JsPromiseHandle),
+    /// JS `Map` — ordered associative store. See [`JsMap`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-map-objects>
+    Map(JsMap),
+    /// JS `Set` — ordered unique-element store. See [`JsSet`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-set-objects>
+    Set(JsSet),
+    /// JS `WeakMap` — object-keyed map. Foundation keeps strong
+    /// refs until task 57 lands the tracing GC.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-weakmap-objects>
+    WeakMap(JsWeakMap),
+    /// JS `WeakSet` — object-keyed set. Same foundation gap as
+    /// [`Self::WeakMap`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-weakset-objects>
+    WeakSet(JsWeakSet),
+    /// `Temporal.*` value — `Instant` / `Duration` / `PlainDate` /
+    /// `PlainTime` / `PlainDateTime`. Backed by `temporal_rs`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/proposal-temporal/>
+    Temporal(JsTemporal),
+    /// `Intl.*` value — `Collator` / `NumberFormat` /
+    /// `DateTimeFormat`. Backed by ICU 4X. See [`JsIntl`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma402/>
+    Intl(JsIntl),
     /// Class value: the result of evaluating a `class` declaration
     /// or expression. Wraps the underlying constructor callable,
     /// the prototype object that fresh instances inherit from, and
@@ -215,6 +261,21 @@ pub enum IteratorState {
         string: JsString,
         /// Next code-unit index.
         index: u32,
+    },
+    /// User-defined iterable: the result of calling
+    /// `obj[@@iterator]()`. The contained `Value` is the iterator
+    /// object; the dispatcher invokes its `next()` method on every
+    /// `Op::IteratorNext`, unpacks `{ value, done }` from the
+    /// returned record, and transitions to [`Self::Exhausted`]
+    /// when `done` becomes truthy. Per ECMA-262 §7.4.2 step 6 a
+    /// `done` iterator stays `done` forever.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-getiterator>
+    /// - <https://tc39.es/ecma262/#sec-iteratornext>
+    User {
+        /// Iterator object returned by `obj[@@iterator]()`.
+        iterator: Value,
     },
     /// Permanently exhausted iterator — every step returns
     /// `done = true`. The runtime transitions any iterator to this
@@ -306,6 +367,12 @@ impl Value {
             Value::RegExp(r) => format!("/{}/{}", r.source(), r.flags().to_js_string()),
             Value::Promise(_) => "[object Promise]".to_string(),
             Value::ClassConstructor(_) => "[class]".to_string(),
+            Value::Map(_) => "[object Map]".to_string(),
+            Value::Set(_) => "[object Set]".to_string(),
+            Value::WeakMap(_) => "[object WeakMap]".to_string(),
+            Value::WeakSet(_) => "[object WeakSet]".to_string(),
+            Value::Temporal(t) => format!("[object Temporal.{}]", t.kind().class_name()),
+            Value::Intl(i) => format!("[object Intl.{}]", i.kind().class_name()),
             Value::Object(_) => "[object Object]".to_string(),
             Value::Array(a) => {
                 let body = a.borrow_body();
@@ -332,7 +399,8 @@ impl Value {
             // Spec ToBoolean(BigInt): false iff zero.
             Value::BigInt(b) => !b.as_inner().sign().eq(&num_bigint::Sign::NoSign),
             Value::String(s) => !s.is_empty(),
-            // Symbol is always truthy per ECMA-262 §7.1.2.
+            // Symbol is always truthy per ECMA-262 §7.1.2; same for
+            // every object-shaped reference type.
             Value::Symbol(_)
             | Value::Function { .. }
             | Value::Closure { .. }
@@ -343,7 +411,13 @@ impl Value {
             | Value::Iterator(_)
             | Value::RegExp(_)
             | Value::Promise(_)
-            | Value::ClassConstructor(_) => true,
+            | Value::ClassConstructor(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::Temporal(_)
+            | Value::Intl(_) => true,
         }
     }
 
@@ -389,6 +463,17 @@ impl Value {
         }
     }
 
+    /// Borrow as a [`JsTemporal`] when the value is a Temporal
+    /// instance. Used by the `Temporal` prototype dispatcher to
+    /// pick the right per-kind table.
+    #[must_use]
+    pub fn as_temporal(&self) -> Option<&JsTemporal> {
+        match self {
+            Value::Temporal(t) => Some(t),
+            _ => None,
+        }
+    }
+
     /// Spec [`typeof`](https://tc39.es/ecma262/#sec-typeof-operator)
     /// — return the JS-visible type tag string.
     ///
@@ -424,7 +509,13 @@ impl Value {
             | Value::Array(_)
             | Value::Iterator(_)
             | Value::RegExp(_)
-            | Value::Promise(_) => "object",
+            | Value::Promise(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::Temporal(_)
+            | Value::Intl(_) => "object",
         }
     }
 
@@ -475,6 +566,12 @@ impl PartialEq for Value {
             (Value::Iterator(a), Value::Iterator(b)) => std::rc::Rc::ptr_eq(a, b),
             (Value::RegExp(a), Value::RegExp(b)) => a.ptr_eq(b),
             (Value::ClassConstructor(a), Value::ClassConstructor(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::Map(a), Value::Map(b)) => a.ptr_eq(b),
+            (Value::Set(a), Value::Set(b)) => a.ptr_eq(b),
+            (Value::WeakMap(a), Value::WeakMap(b)) => a.ptr_eq(b),
+            (Value::WeakSet(a), Value::WeakSet(b)) => a.ptr_eq(b),
+            (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(b),
+            (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -587,6 +684,121 @@ pub struct Frame {
     /// `Op::ImportNamespace` itself never executes from a
     /// non-module frame in well-formed bytecode.
     pub module_url: std::rc::Rc<str>,
+    /// State machine for the in-flight ECMA-262 §7.1.1 `ToPrimitive`
+    /// ladder. `Some` while the dispatcher is mid-way through the
+    /// `[Symbol.toPrimitive]` / `valueOf` / `toString` chain on a
+    /// specific `Op::ToPrimitive` instruction; `None` otherwise.
+    /// Set by [`Interpreter::drive_to_primitive`] before pushing a
+    /// call frame, cleared once the ladder hands back a primitive
+    /// (or exhausts every stage and the dispatcher raises a
+    /// `TypeMismatch`).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    pub pending_to_primitive: Option<PendingToPrimitive>,
+    /// In-flight ECMA-262 §7.4.3 `GetIterator` over a user object.
+    /// `Some` while the dispatcher is awaiting the result of
+    /// `obj[@@iterator]()`; the resume step wraps that return
+    /// value as [`IteratorState::User`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-getiterator>
+    pub pending_get_iterator: Option<PendingGetIterator>,
+    /// In-flight ECMA-262 §7.4.5 `IteratorNext` over a user
+    /// iterator. `Some` while the dispatcher is awaiting the
+    /// result of `iter.next()`; the resume step extracts
+    /// `value` / `done` from the returned record.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-iteratornext>
+    pub pending_iterator_next: Option<PendingIteratorNext>,
+}
+
+/// In-flight state for [`Op::GetIterator`] when the source operand
+/// is a user object. Carries the originating `pc` (so the resume
+/// guard can verify) and the destination register that should
+/// receive the [`Value::Iterator`] handle on completion.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-getiterator>
+#[derive(Debug, Clone)]
+pub struct PendingGetIterator {
+    /// pc of the originating `Op::GetIterator`.
+    pub pc: u32,
+    /// Destination register the iterator handle must land in.
+    pub dst: u16,
+}
+
+/// In-flight state for [`Op::IteratorNext`] over a user iterator.
+/// The dispatcher calls `iter.next()` and parks this record with
+/// the destination registers for `value` and `done` plus the
+/// scratch register that received the call's result record.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-iteratornext>
+#[derive(Debug, Clone)]
+pub struct PendingIteratorNext {
+    /// pc of the originating `Op::IteratorNext`.
+    pub pc: u32,
+    /// Destination register for the unpacked `value`.
+    pub value_dst: u16,
+    /// Destination register for the unpacked `done` flag.
+    pub done_dst: u16,
+    /// Scratch register that receives the `iter.next()` result
+    /// record. The resume step reads `value` / `done` off this
+    /// register and clears the slot.
+    pub result_reg: u16,
+    /// The iterator value itself. Cloned onto the parked record
+    /// so the resume step can transition the inner state to
+    /// [`IteratorState::Exhausted`] once `done` becomes truthy.
+    pub iterator: Value,
+}
+
+/// In-flight state for an [`Op::ToPrimitive`] dispatch.
+///
+/// Carries the original object operand, the resolved hint, the
+/// destination register the ladder writes its final result into,
+/// and the next stage to run when the dispatcher resumes. Cloning
+/// is cheap: every payload is either a small enum variant or a
+/// `Value` clone.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-toprimitive>
+/// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
+#[derive(Debug, Clone)]
+pub struct PendingToPrimitive {
+    /// pc of the originating `Op::ToPrimitive` — so the resume
+    /// hook can verify the dispatcher is back on the same
+    /// instruction.
+    pub pc: u32,
+    /// Destination register for the final primitive value.
+    pub dst: u16,
+    /// Original (object) operand.
+    pub obj: Value,
+    /// Caller's preferred-type hint.
+    pub hint: abstract_ops::ToPrimitiveHint,
+    /// Next stage to attempt.
+    pub stage: ToPrimitiveStage,
+}
+
+/// Stages of the §7.1.1 / §7.1.1.1 ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToPrimitiveStage {
+    /// About to look up `[Symbol.toPrimitive]` and (if callable)
+    /// invoke it. On resume, validate the result is primitive;
+    /// otherwise fall through to [`Self::OrdinaryFirst`].
+    SymbolToPrim,
+    /// First slot of the OrdinaryToPrimitive chain — `valueOf` for
+    /// `Default` / `Number` hints, `toString` for `String` hint.
+    OrdinaryFirst,
+    /// Second slot — `toString` after `valueOf`, or `valueOf` after
+    /// `toString`.
+    OrdinarySecond,
+    /// Both ordinary slots have run and returned non-primitive
+    /// values. The next dispatch tick raises `TypeMismatch` per
+    /// §7.1.1.1 step 6.
+    Exhausted,
 }
 
 /// Per-frame bookkeeping for an async-function call. Constructed
@@ -702,6 +914,9 @@ impl Frame {
             rest_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_str()),
+            pending_to_primitive: None,
+            pending_get_iterator: None,
+            pending_iterator_next: None,
         }
     }
 }
@@ -923,6 +1138,14 @@ pub struct Interpreter {
     /// Global symbol registry backing `Symbol.for` / `Symbol.keyFor`
     /// (ECMA-262 §20.4.2.4 / §20.4.2.6).
     symbol_registry: SymbolRegistry,
+    /// Per-interpreter registry of the seven canonical error
+    /// classes (`Error`, `TypeError`, `RangeError`, `SyntaxError`,
+    /// `ReferenceError`, `URIError`, `EvalError`) — ECMA-262 §19.3.
+    /// Allocated once at startup; every `Op::NewError` /
+    /// `Op::NewBuiltinError` / `Op::LoadBuiltinError` dispatch reads
+    /// from this table so prototype identity (and therefore
+    /// `instanceof`) stays stable across the interpreter's lifetime.
+    error_classes: ErrorClassRegistry,
 }
 
 impl Interpreter {
@@ -933,6 +1156,8 @@ impl Interpreter {
         let string_heap = Arc::new(StringHeap::default());
         let well_known_symbols = WellKnownSymbols::new(&string_heap)
             .expect("populating well-known symbols on a fresh heap cannot fail");
+        let error_classes = ErrorClassRegistry::new(&string_heap)
+            .expect("populating error class prototypes on a fresh heap cannot fail");
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
@@ -942,6 +1167,7 @@ impl Interpreter {
             module_resolution_cache: std::collections::HashMap::new(),
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
+            error_classes,
         }
     }
 
@@ -952,6 +1178,8 @@ impl Interpreter {
         let string_heap = Arc::new(StringHeap::with_cap(cap_bytes));
         let well_known_symbols = WellKnownSymbols::new(&string_heap)
             .expect("well-known symbol descriptions fit within any positive cap");
+        let error_classes = ErrorClassRegistry::new(&string_heap)
+            .expect("error class prototypes fit within any positive cap");
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
@@ -961,6 +1189,7 @@ impl Interpreter {
             module_resolution_cache: std::collections::HashMap::new(),
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
+            error_classes,
         }
     }
 
@@ -1470,6 +1699,59 @@ impl Interpreter {
                         continue;
                     }
                 }
+                // §7.1.1 `ToPrimitive` ladder. Each invocation of
+                // the dispatch loop either advances pc with a
+                // primitive in `dst` or pushes a frame for
+                // `[Symbol.toPrimitive]` / `valueOf` / `toString`
+                // and parks the ladder state on the running frame.
+                // Stack-modifying so it has to happen before the
+                // in-frame mutable borrow below. Always re-enters
+                // the dispatch loop afterwards — the in-frame
+                // match below has no arm for `Op::ToPrimitive`.
+                Op::ToPrimitive => {
+                    self.drive_to_primitive(stack, module, &operands)?;
+                    continue;
+                }
+                // §7.4.3 `GetIterator`. Built-in iterables fall
+                // through to the in-frame fast path; user objects
+                // route through the call-frame ladder.
+                // <https://tc39.es/ecma262/#sec-getiterator>
+                Op::GetIterator => {
+                    if self.drive_get_iterator(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                // §7.4.5 `IteratorNext`. Built-in iterators step
+                // synchronously; user iterators push a call to
+                // `iter.next()` and resume to extract `value` /
+                // `done`.
+                // <https://tc39.es/ecma262/#sec-iteratornext>
+                Op::IteratorNext => {
+                    if self.drive_iterator_next(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                // §10.1.8 [[Get]] — when the resolved property is an
+                // accessor descriptor at any depth in the prototype
+                // chain, the runtime invokes the getter with `this`
+                // bound to the original receiver. Stack-modifying so
+                // it must run outside the in-frame mutable borrow
+                // below.
+                // <https://tc39.es/ecma262/#sec-ordinaryget>
+                Op::LoadProperty => {
+                    if self.drive_load_property(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                // §10.1.9 [[Set]] — accessor setter dispatch follows
+                // the same pattern as `LoadProperty`. Non-writable
+                // and non-extensible rejections surface here too.
+                // <https://tc39.es/ecma262/#sec-ordinaryset>
+                Op::StoreProperty => {
+                    if self.drive_store_property(stack, module, &operands)? {
+                        continue;
+                    }
+                }
                 _ => {}
             }
 
@@ -1758,13 +2040,16 @@ impl Interpreter {
                         Value::String(s) if name == "length" => {
                             Value::Number(NumberValue::from_i32(s.len() as i32))
                         }
-                        Value::Array(a) if name == "length" => {
-                            Value::Number(NumberValue::from_i32(a.len() as i32))
-                        }
+                        Value::Array(a) => a.get_named_property(&name).unwrap_or(Value::Undefined),
                         Value::RegExp(r) => {
                             regexp_prototype::load_property(r, &name, &self.string_heap)
                         }
                         Value::Symbol(s) => symbol_prototype::load_property(s, &name),
+                        v @ (Value::Map(_)
+                        | Value::Set(_)
+                        | Value::WeakMap(_)
+                        | Value::WeakSet(_)) => collections_prototype::load_property(v, &name),
+                        Value::Temporal(t) => temporal::load_property(t, &name),
                         _ => return Err(VmError::TypeMismatch),
                     };
                     write_register(frame, dst, value)?;
@@ -1781,6 +2066,15 @@ impl Interpreter {
                         Value::ClassConstructor(c) => Some(c.statics.clone()),
                         Value::RegExp(r) => {
                             regexp_prototype::store_property(r, &name, &value);
+                            None
+                        }
+                        Value::Array(a) => {
+                            // §10.4.2.1 [[DefineOwnProperty]] for
+                            // arrays: indexed names route to the
+                            // dense element table; non-index names
+                            // land in the optional named-property
+                            // bag. `length` writes are filed.
+                            a.set_named_property(&name, value.clone());
                             None
                         }
                         _ => return Err(VmError::TypeMismatch),
@@ -1884,6 +2178,23 @@ impl Interpreter {
                         {
                             make_array_iterator_factory(arr.clone())
                         }
+                        // `map[Symbol.iterator]` aliases `entries` per
+                        // Spec §24.1.3.12; `set[Symbol.iterator]`
+                        // aliases `values` per §24.2.3.11.
+                        (Value::Map(m), Value::Symbol(sym))
+                            if sym
+                                .well_known_tag()
+                                .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
+                        {
+                            collections_prototype::make_map_iterator_factory(m.clone())
+                        }
+                        (Value::Set(s), Value::Symbol(sym))
+                            if sym
+                                .well_known_tag()
+                                .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
+                        {
+                            collections_prototype::make_set_iterator_factory(s.clone())
+                        }
                         // Numeric-indexed array / string element
                         // reads.
                         _ => {
@@ -1949,17 +2260,113 @@ impl Interpreter {
                     frame.pc += 1;
                 }
                 Op::Instanceof => {
+                    // ECMA-262 §13.10.2 InstanceofOperator —
+                    // OrdinaryHasInstance fallback: walk
+                    // `lhs.[[Prototype]]` looking for `rhs.prototype`
+                    // (or just `rhs` itself, kept as a
+                    // backwards-compatible foundation shape so
+                    // `obj instanceof proto` still works for tests
+                    // that pass a raw prototype object).
+                    //
+                    // <https://tc39.es/ecma262/#sec-ordinaryhasinstance>
                     let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
                     let result = match (&lhs, &rhs) {
                         (Value::Object(a), Value::Object(target)) => {
-                            // Foundation interpretation: rhs is
-                            // the "prototype to look for". Class
-                            // lowering (slice 26) replaces this
-                            // with a real `rhs.prototype` lookup.
-                            a.has_in_proto_chain(target)
+                            // Spec path: `target.prototype` is the
+                            // proto object instances inherit from.
+                            // When `target.prototype` resolves to an
+                            // object, walk the chain against it.
+                            // Otherwise fall back to walking the
+                            // chain against `target` directly so
+                            // older fixtures that pass a prototype
+                            // object as rhs still work.
+                            match target.get("prototype") {
+                                Some(Value::Object(proto)) => a.has_in_proto_chain(&proto),
+                                _ => a.has_in_proto_chain(target),
+                            }
                         }
                         _ => false,
                     };
+                    write_register(frame, dst, Value::Boolean(result))?;
+                    frame.pc += 1;
+                }
+                // §13.10.1 / §7.3.10 HasProperty — `key in obj`.
+                // Right operand must be an Object. The left operand
+                // is coerced via §7.1.19 ToPropertyKey: strings stay
+                // as-is, symbols stay as-is, anything else coerces
+                // to its display string.
+                // <https://tc39.es/ecma262/#sec-hasproperty>
+                Op::HasProperty => {
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
+                    let present = match &rhs {
+                        Value::Object(obj) => match &lhs {
+                            Value::Symbol(s) => obj.get_symbol(s).is_some(),
+                            Value::String(s) => {
+                                let key = s.to_lossy_string();
+                                !matches!(obj.lookup(&key), object::PropertyLookup::Absent)
+                            }
+                            Value::Number(n) => {
+                                let key = n.to_display_string();
+                                !matches!(obj.lookup(&key), object::PropertyLookup::Absent)
+                            }
+                            other => {
+                                let key = other.display_string();
+                                !matches!(obj.lookup(&key), object::PropertyLookup::Absent)
+                            }
+                        },
+                        Value::Array(arr) => match &lhs {
+                            // §10.4.2 ArrayExoticObject: indexed
+                            // properties are present iff index is
+                            // in `[0, len)`. The string `"length"`
+                            // is also always present.
+                            Value::Number(n) => match n.as_smi() {
+                                Some(i) if i >= 0 => (i as usize) < arr.len(),
+                                _ => false,
+                            },
+                            Value::String(s) => {
+                                let key = s.to_lossy_string();
+                                if key == "length" {
+                                    true
+                                } else if let Ok(i) = key.parse::<usize>() {
+                                    i < arr.len()
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        },
+                        Value::ClassConstructor(c) => {
+                            // Static side: "prototype" plus whatever
+                            // the statics object carries.
+                            match &lhs {
+                                Value::String(s) if s.to_lossy_string() == "prototype" => true,
+                                Value::String(s) => !matches!(
+                                    c.statics.lookup(&s.to_lossy_string()),
+                                    object::PropertyLookup::Absent
+                                ),
+                                _ => false,
+                            }
+                        }
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    write_register(frame, dst, Value::Boolean(present))?;
+                    frame.pc += 1;
+                }
+                Op::SameValue => {
+                    // `Object.is(x, y)` — ECMA-262 §7.2.11.
+                    // <https://tc39.es/ecma262/#sec-samevalue>
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
+                    let result = abstract_ops::same_value(&lhs, &rhs);
+                    write_register(frame, dst, Value::Boolean(result))?;
+                    frame.pc += 1;
+                }
+                Op::IsArray => {
+                    // `Array.isArray(v)` — ECMA-262 §7.2.2.
+                    // <https://tc39.es/ecma262/#sec-isarray>
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let value = read_register(frame, src)?.clone();
+                    let result = abstract_ops::is_array(&value);
                     write_register(frame, dst, Value::Boolean(result))?;
                     frame.pc += 1;
                 }
@@ -2059,7 +2466,13 @@ impl Interpreter {
                         | Value::Iterator(_)
                         | Value::RegExp(_)
                         | Value::Promise(_)
-                        | Value::ClassConstructor(_) => NumberValue::Double(f64::NAN),
+                        | Value::ClassConstructor(_)
+                        | Value::Map(_)
+                        | Value::Set(_)
+                        | Value::WeakMap(_)
+                        | Value::WeakSet(_)
+                        | Value::Temporal(_)
+                        | Value::Intl(_) => NumberValue::Double(f64::NAN),
                         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
                     };
                     write_register(frame, dst, Value::Number(value))?;
@@ -2074,6 +2487,23 @@ impl Interpreter {
                 Op::NotEqual => {
                     let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
                     let eq = lhs == rhs;
+                    write_register(frame, dst, Value::Boolean(!eq))?;
+                    frame.pc += 1;
+                }
+                Op::LooseEqual => {
+                    // ECMA-262 §7.2.13. The compiler has already
+                    // coerced both operands through
+                    // `Op::ToPrimitive(default)`, so the runtime
+                    // sees primitives only.
+                    // <https://tc39.es/ecma262/#sec-islooselyequal>
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
+                    let eq = abstract_ops::is_loosely_equal(&lhs, &rhs);
+                    write_register(frame, dst, Value::Boolean(eq))?;
+                    frame.pc += 1;
+                }
+                Op::LooseNotEqual => {
+                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
+                    let eq = abstract_ops::is_loosely_equal(&lhs, &rhs);
                     write_register(frame, dst, Value::Boolean(!eq))?;
                     frame.pc += 1;
                 }
@@ -2109,24 +2539,73 @@ impl Interpreter {
                     frame.pc += 1;
                 }
                 Op::NewError => {
+                    // Foundation `new Error(arg)` shape — preserved
+                    // alongside the wider [`Op::NewBuiltinError`]
+                    // opcode for backwards compatibility with already-
+                    // shipped fixtures. Both routes consult the per-
+                    // interpreter [`ErrorClassRegistry`] so prototype
+                    // identity matches `instanceof Error`.
+                    //
+                    // <https://tc39.es/ecma262/#sec-error-constructor>
                     let dst = register_operand(operands.first())?;
                     let msg_reg = register_operand(operands.get(1))?;
                     let value = read_register(frame, msg_reg)?.clone();
-                    let message_str = match value {
+                    let owned_message: Option<String> = match value {
                         Value::Undefined => None,
-                        Value::String(s) => Some(s),
-                        other => {
-                            let s = JsString::from_str(&other.display_string(), &self.string_heap)?;
-                            Some(s)
-                        }
+                        Value::String(s) => Some(s.to_lossy_string()),
+                        other => Some(other.display_string()),
                     };
-                    let obj = JsObject::new();
-                    let name = JsString::from_str("Error", &self.string_heap)?;
-                    obj.set("name", Value::String(name));
-                    if let Some(s) = message_str {
-                        obj.set("message", Value::String(s));
-                    }
+                    let obj = self.error_classes.make_instance(
+                        ErrorKind::Error,
+                        owned_message.as_deref(),
+                        &self.string_heap,
+                    )?;
                     write_register(frame, dst, Value::Object(obj))?;
+                    frame.pc += 1;
+                }
+                Op::NewBuiltinError => {
+                    // ECMA-262 §19.3 / §20.5 native error
+                    // constructors. The compiler resolves the
+                    // identifier to an [`ErrorKind`] before emitting
+                    // this opcode, so a missing variant in the
+                    // constant pool is a compiler bug surfaced as
+                    // `InvalidOperand`.
+                    //
+                    // <https://tc39.es/ecma262/#sec-error-objects>
+                    let dst = register_operand(operands.first())?;
+                    let kind_idx = const_operand(operands.get(1))?;
+                    let msg_reg = register_operand(operands.get(2))?;
+                    let kind_name = lookup_string_constant(module, kind_idx)?;
+                    let kind =
+                        ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
+                    let value = read_register(frame, msg_reg)?.clone();
+                    let owned_message: Option<String> = match value {
+                        Value::Undefined => None,
+                        Value::String(s) => Some(s.to_lossy_string()),
+                        other => Some(other.display_string()),
+                    };
+                    let obj = self.error_classes.make_instance(
+                        kind,
+                        owned_message.as_deref(),
+                        &self.string_heap,
+                    )?;
+                    write_register(frame, dst, Value::Object(obj))?;
+                    frame.pc += 1;
+                }
+                Op::LoadBuiltinError => {
+                    // Resolve a bare identifier reference (e.g.
+                    // `e instanceof TypeError`) to the matching
+                    // constructor object out of
+                    // [`ErrorClassRegistry`].
+                    //
+                    // <https://tc39.es/ecma262/#sec-error-objects>
+                    let dst = register_operand(operands.first())?;
+                    let kind_idx = const_operand(operands.get(1))?;
+                    let kind_name = lookup_string_constant(module, kind_idx)?;
+                    let kind =
+                        ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
+                    let ctor = self.error_classes.constructor(kind);
+                    write_register(frame, dst, Value::Object(ctor))?;
                     frame.pc += 1;
                 }
                 Op::MathLoad => {
@@ -2172,6 +2651,54 @@ impl Interpreter {
                     }
                     let result =
                         json::call(&name, &args, &self.string_heap).map_err(json_to_vm_error)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §23.1.2 Array static dispatch. Routes
+                // `Array.from` / `Array.of` through one entry point.
+                // <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
+                Op::ArrayCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    // Callback-driven `Array.from(iter, mapFn)` would
+                    // need the interpreter; the foundation slice
+                    // routes the no-callback shape through
+                    // `array_statics::call`. With a callback we
+                    // dispatch on the surrounding stack instead —
+                    // filed as a follow-up.
+                    let result = array_statics::call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §20.1.2 / §10.1.6 — Object static dispatch.
+                // Routes through `object_statics::call` which honours
+                // ECMA-262 ValidateAndApplyPropertyDescriptor and the
+                // freeze/seal/preventExtensions integrity ladder.
+                // <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
+                Op::ObjectCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = object_statics::call(&name, &args, &self.string_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -2373,6 +2900,33 @@ impl Interpreter {
                     let state = match value {
                         Value::Array(array) => IteratorState::Array { array, index: 0 },
                         Value::String(string) => IteratorState::String { string, index: 0 },
+                        // `for…of` over a `Map` yields `[key, value]`
+                        // pairs (Spec §24.1.3.12 — `@@iterator` aliases
+                        // `entries`); over a `Set` yields values
+                        // (Spec §24.2.3.11). We snapshot at iteration
+                        // start, building a synthetic backing array.
+                        Value::Map(m) => {
+                            let entries = m.entries();
+                            let mut snap: SmallVec<[Value; 4]> =
+                                SmallVec::with_capacity(entries.len());
+                            for (k, v) in entries {
+                                let mut pair: SmallVec<[Value; 4]> = SmallVec::new();
+                                pair.push(k);
+                                pair.push(v);
+                                snap.push(Value::Array(JsArray::from_elements(pair)));
+                            }
+                            IteratorState::Array {
+                                array: JsArray::from_elements(snap),
+                                index: 0,
+                            }
+                        }
+                        Value::Set(s) => {
+                            let snap: SmallVec<[Value; 4]> = s.values().into_iter().collect();
+                            IteratorState::Array {
+                                array: JsArray::from_elements(snap),
+                                index: 0,
+                            }
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     let iter = std::rc::Rc::new(std::cell::RefCell::new(state));
@@ -2458,6 +3012,62 @@ impl Interpreter {
                     };
                     write_register(frame, dst, Value::Boolean(removed))?;
                     frame.pc += 1;
+                }
+                Op::NewCollection => {
+                    let dst = register_operand(operands.first())?;
+                    let kind_idx = const_operand(operands.get(1))?;
+                    let iter_reg = register_operand(operands.get(2))?;
+                    let kind = lookup_string_constant(module, kind_idx)?;
+                    let seed = read_register(frame, iter_reg)?.clone();
+                    let value = build_collection(&kind, &seed)?;
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::TemporalCall => {
+                    let dst = register_operand(operands.first())?;
+                    let class_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(2))?;
+                    let argc = match operands.get(3) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let class = lookup_string_constant(module, class_idx)?;
+                    let method = lookup_string_constant(module, method_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(4 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = temporal::call_static(&self.string_heap, &class, &method, &args)
+                        .map_err(temporal_to_vm_error)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                Op::TemporalLoad => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let value = temporal::load_static(&name).map_err(temporal_to_vm_error)?;
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::NewIntl => {
+                    let dst = register_operand(operands.first())?;
+                    let class_idx = const_operand(operands.get(1))?;
+                    let locale_reg = register_operand(operands.get(2))?;
+                    let options_reg = register_operand(operands.get(3))?;
+                    let class = lookup_string_constant(module, class_idx)?;
+                    let locale = read_register(frame, locale_reg)?.clone();
+                    let options = read_register(frame, options_reg)?.clone();
+                    let value =
+                        intl::construct(&class, &locale, &options).map_err(intl_to_vm_error)?;
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::ToPrimitive => {
+                    // Stack-modifying ladder dispatched in the
+                    // pre-frame-borrow block above.
+                    unreachable!("Op::ToPrimitive is handled by the pre-dispatch ladder")
                 }
             }
         }
@@ -3060,6 +3670,38 @@ impl Interpreter {
             return Ok(());
         }
 
+        // `forEach` on a collection requires a callback dispatch
+        // that pushes a frame; lives outside the static intrinsic
+        // table so it can drive `self.invoke`.
+        if name == "forEach" && matches!(&recv_value, Value::Map(_) | Value::Set(_)) {
+            return self.do_collection_for_each(stack, module, &recv_value, &arg_values, dst);
+        }
+
+        // §23.1.3 callback-driven Array.prototype methods. The
+        // intrinsic table can't drive callbacks, so the foundation
+        // dispatches them here via `run_callable_sync`. Each method
+        // matches its ECMA-262 algorithm with sloppy edge handling
+        // (sparse holes, throwing comparators, length mutation
+        // mid-walk) deferred to follow-ups.
+        if let Value::Array(arr) = &recv_value {
+            if matches!(
+                name.as_str(),
+                "forEach"
+                    | "map"
+                    | "filter"
+                    | "reduce"
+                    | "reduceRight"
+                    | "find"
+                    | "findIndex"
+                    | "every"
+                    | "some"
+                    | "flatMap"
+                    | "sort"
+            ) && self.array_callback_dispatch(stack, module, arr, &name, &arg_values, dst)?
+            {
+                return Ok(());
+            }
+        }
         // Primitive prototypes go through the intrinsic table —
         // synchronous, no frame push, advance pc and write directly.
         let intrinsic = match &recv_value {
@@ -3068,6 +3710,12 @@ impl Interpreter {
             Value::Number(_) => number::prototype_lookup(&name),
             Value::RegExp(_) => regexp_prototype::lookup(&name),
             Value::Symbol(_) => symbol_prototype::lookup(&name),
+            Value::Map(_) => collections_prototype::lookup_map(&name),
+            Value::Set(_) => collections_prototype::lookup_set(&name),
+            Value::WeakMap(_) => collections_prototype::lookup_weak_map(&name),
+            Value::WeakSet(_) => collections_prototype::lookup_weak_set(&name),
+            Value::Temporal(_) => temporal::lookup_prototype(&recv_value, &name),
+            Value::Intl(_) => intl::lookup_prototype(&recv_value, &name),
             _ => None,
         };
         if let Some(entry) = intrinsic {
@@ -3082,6 +3730,30 @@ impl Interpreter {
             write_register(frame, dst, result)?;
             frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(());
+        }
+
+        // §20.1.3 Object.prototype methods that ordinary objects
+        // inherit. Foundation has no installed Object.prototype yet,
+        // so the runtime intercepts the canonical names directly when
+        // the receiver is an ordinary `JsObject`. Once the prototype
+        // tree is real (task 61 follow-up) these route through the
+        // standard property lookup below.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-object-prototype-object>
+        if let Value::Object(obj) = &recv_value {
+            // Only intercept when the user hasn't overridden the
+            // method via an own / inherited data property. This
+            // keeps `Object.create({hasOwnProperty: () => 'shadow'})`
+            // observable.
+            if matches!(obj.lookup(&name), crate::object::PropertyLookup::Absent) {
+                if let Some(result) =
+                    object_prototype_intercept(obj, &name, &arg_values, &self.string_heap)?
+                {
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, result)?;
+                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    return Ok(());
+                }
+            }
         }
 
         // Property-bearing receivers — load the property first.
@@ -3135,6 +3807,415 @@ impl Interpreter {
     /// — non-array second arguments raise `TypeMismatch` so callers
     /// learn quickly that the foundation slice rejects dynamic
     /// argument arrays.
+    /// Drive `Map.prototype.forEach` / `Set.prototype.forEach` —
+    /// invoke the callback on each entry in insertion order.
+    ///
+    /// # Algorithm
+    /// 1. Snapshot the entry list at call time (matches Spec
+    ///    §24.1.3.5 / §24.2.3.6 — observable mutation during the
+    ///    walk is captured by re-reading the live receiver, but the
+    ///    snapshot still gates `index < snapshot.len()`).
+    /// 2. For each entry, enqueue an inline call: every callback is
+    ///    invoked synchronously through `self.invoke`. Because each
+    ///    invoke pushes a frame and returns through the dispatch
+    ///    loop, the foundation chains them by stashing the iteration
+    ///    state in a tiny native closure that re-enters this helper.
+    /// 3. Foundation simplification: rather than a re-entrant
+    ///    chain, walk the snapshot here and synchronously invoke
+    ///    each callback via a fresh dispatch_loop run on a new
+    ///    stack. This matches the synchronous-callback model the
+    ///    rest of the foundation already uses (see
+    ///    [`Interpreter::run_callable_sync`]).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-map.prototype.foreach>
+    /// - <https://tc39.es/ecma262/#sec-set.prototype.foreach>
+    fn do_collection_for_each(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        recv: &Value,
+        args: &SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let callee = match args.first() {
+            Some(c) if is_callable(c) => c.clone(),
+            _ => return Err(VmError::NotCallable),
+        };
+        let entries: Vec<(Value, Value)> = match recv {
+            Value::Map(m) => m.entries(),
+            Value::Set(s) => s.values().into_iter().map(|v| (v.clone(), v)).collect(),
+            _ => return Err(VmError::TypeMismatch),
+        };
+        // Advance pc *before* invoking the callbacks so each
+        // callback returns to the next instruction in the caller
+        // frame.
+        let top_idx = stack.len() - 1;
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        // Write `undefined` into the dst slot — `forEach` returns
+        // `undefined` synchronously, even if the callback chain
+        // produces values.
+        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+        let recv_for_callback = recv.clone();
+        for (key, value) in entries {
+            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+            cb_args.push(value);
+            cb_args.push(key);
+            cb_args.push(recv_for_callback.clone());
+            self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+        }
+        Ok(())
+    }
+
+    /// Dispatch the §23.1.3 callback-driven Array prototype methods.
+    /// Returns `Ok(true)` when the call was handled here (the
+    /// dispatcher should fall through to the post-dispatch return),
+    /// `Ok(false)` when the method is `sort` with no comparator
+    /// (intrinsic-table path takes over).
+    ///
+    /// All callbacks run synchronously through
+    /// [`Self::run_callable_sync`] — the foundation walks the array
+    /// snapshot at call time, matching spec semantics for arrays
+    /// whose length doesn't change mid-iteration.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.foreach>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.map>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.filter>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.reduce>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.find>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.findindex>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.every>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.some>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.flatmap>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.sort>
+    #[allow(clippy::too_many_arguments)]
+    fn array_callback_dispatch(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        arr: &JsArray,
+        name: &str,
+        args: &SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<bool, VmError> {
+        // `sort` without a comparator falls through to the intrinsic
+        // table's lexicographic path. Comparator-driven sort is
+        // handled here.
+        if name == "sort" && matches!(args.first(), None | Some(Value::Undefined)) {
+            return Ok(false);
+        }
+
+        let arr_value = Value::Array(arr.clone());
+        // Snapshot the elements so callback-driven mutation of the
+        // receiver does not corrupt iteration. Foundation matches
+        // ECMA-262's "single-pass over indices 0..len" by capturing
+        // length at entry; growing the array inside the callback
+        // does not extend the walk (spec-compliant for `forEach` /
+        // `map` / `filter`).
+        let elements: Vec<Value> = arr.borrow_body().elements.iter().cloned().collect();
+        let len = elements.len();
+
+        let top_idx = stack.len() - 1;
+        // Advance pc up front so each synchronous callback returns to
+        // the next caller instruction.
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+
+        let result = match name {
+            "forEach" => {
+                let callee = require_callable(args.first())?;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                }
+                Value::Undefined
+            }
+            "map" => {
+                let callee = require_callable(args.first())?;
+                let mut out: Vec<Value> = Vec::with_capacity(len);
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    out.push(self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?);
+                }
+                Value::Array(JsArray::from_elements(out))
+            }
+            "filter" => {
+                let callee = require_callable(args.first())?;
+                let mut out: Vec<Value> = Vec::new();
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let kept =
+                        self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    if kept.to_boolean() {
+                        out.push(arr.get(i));
+                    }
+                }
+                Value::Array(JsArray::from_elements(out))
+            }
+            "reduce" | "reduceRight" => {
+                let callee = require_callable(args.first())?;
+                let has_init = args.len() >= 2;
+                let initial = if has_init {
+                    args[1].clone()
+                } else {
+                    Value::Undefined
+                };
+                let reverse = name == "reduceRight";
+                if !has_init && elements.is_empty() {
+                    return Err(VmError::TypeMismatch);
+                }
+                let mut acc = if has_init {
+                    initial
+                } else if reverse {
+                    elements[len - 1].clone()
+                } else {
+                    elements[0].clone()
+                };
+                let start_idx = if has_init {
+                    if reverse {
+                        len.saturating_sub(1) as i64
+                    } else {
+                        0
+                    }
+                } else if reverse {
+                    (len as i64) - 2
+                } else {
+                    1
+                };
+                let step: i64 = if reverse { -1 } else { 1 };
+                let mut i = start_idx;
+                while i >= 0 && (i as usize) < len {
+                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                    cb_args.push(acc.clone());
+                    cb_args.push(elements[i as usize].clone());
+                    cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
+                    cb_args.push(arr_value.clone());
+                    acc = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    i += step;
+                }
+                acc
+            }
+            "find" => {
+                let callee = require_callable(args.first())?;
+                let mut found = Value::Undefined;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    if hit.to_boolean() {
+                        found = arr.get(i);
+                        break;
+                    }
+                }
+                found
+            }
+            "findIndex" => {
+                let callee = require_callable(args.first())?;
+                let mut idx: i32 = -1;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    if hit.to_boolean() {
+                        idx = i as i32;
+                        break;
+                    }
+                }
+                Value::Number(NumberValue::from_i32(idx))
+            }
+            "every" => {
+                let callee = require_callable(args.first())?;
+                let mut all = true;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    if !hit.to_boolean() {
+                        all = false;
+                        break;
+                    }
+                }
+                Value::Boolean(all)
+            }
+            "some" => {
+                let callee = require_callable(args.first())?;
+                let mut any = false;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    if hit.to_boolean() {
+                        any = true;
+                        break;
+                    }
+                }
+                Value::Boolean(any)
+            }
+            "flatMap" => {
+                let callee = require_callable(args.first())?;
+                let mut out: Vec<Value> = Vec::with_capacity(len);
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let mapped =
+                        self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    match mapped {
+                        Value::Array(inner) => {
+                            for el in inner.borrow_body().iter() {
+                                out.push(el.clone());
+                            }
+                        }
+                        other => out.push(other),
+                    }
+                }
+                Value::Array(JsArray::from_elements(out))
+            }
+            "sort" => {
+                let callee = require_callable(args.first())?;
+                // Snapshot, sort by user comparator, write back.
+                let mut buffer: Vec<Value> = elements;
+                // `sort_by` requires a closure that doesn't itself
+                // mutate the engine — we can't recurse the
+                // interpreter from inside `Ord::cmp`. Use a manual
+                // insertion sort over the snapshot to stay
+                // interpreter-friendly. O(n²) but matches the
+                // foundation's "correctness over speed" stance.
+                let n = buffer.len();
+                for i in 1..n {
+                    let mut j = i;
+                    while j > 0 {
+                        let mut cmp_args: SmallVec<[Value; 8]> = SmallVec::new();
+                        cmp_args.push(buffer[j - 1].clone());
+                        cmp_args.push(buffer[j].clone());
+                        let outcome =
+                            self.run_callable_sync(module, &callee, Value::Undefined, cmp_args)?;
+                        let order = match outcome {
+                            Value::Number(n) => n.as_f64(),
+                            _ => 0.0,
+                        };
+                        if order > 0.0 {
+                            buffer.swap(j - 1, j);
+                            j -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                {
+                    let mut body = arr.borrow_body_mut();
+                    body.elements.clear();
+                    for v in buffer {
+                        body.elements.push(v);
+                    }
+                }
+                arr_value.clone()
+            }
+            _ => return Ok(false),
+        };
+
+        let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        write_register(frame_top, dst, result)?;
+        Ok(true)
+    }
+
+    /// Synchronously invoke `callee(args)` with the given `this` and
+    /// return the completion value.
+    ///
+    /// # Algorithm
+    /// 1. NativeFunction callees run inline — the foundation native
+    ///    surface is `Fn`, so calling them here is just a function
+    ///    pointer hop with `&mut self` access.
+    /// 2. BoundFunction layers are unwrapped iteratively, prepending
+    ///    bound args and replacing `this_value` with `bound_this`.
+    /// 3. Bytecode / closure callees push a frame whose
+    ///    `return_register` is `None`, which makes
+    ///    [`Self::dispatch_loop`] return the completion value when
+    ///    the frame pops.
+    ///
+    /// Used by collection `forEach` and other host-driven iteration
+    /// helpers.
+    fn run_callable_sync(
+        &mut self,
+        module: &BytecodeModule,
+        callee: &Value,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        let mut current = callee.clone();
+        let mut effective_this = this_value;
+        let mut effective_args = args;
+        let mut hops: u32 = 0;
+        loop {
+            if hops >= self.max_stack_depth {
+                return Err(VmError::StackOverflow {
+                    limit: self.max_stack_depth,
+                });
+            }
+            match current {
+                Value::BoundFunction(bound) => {
+                    hops += 1;
+                    let mut combined: SmallVec<[Value; 8]> =
+                        SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
+                    combined.extend(bound.bound_args.iter().cloned());
+                    combined.extend(effective_args);
+                    effective_this = bound.bound_this.clone();
+                    effective_args = combined;
+                    current = bound.target.clone();
+                }
+                Value::ClassConstructor(cc) => {
+                    hops += 1;
+                    current = cc.ctor.clone();
+                }
+                _ => break,
+            }
+        }
+        if let Value::NativeFunction(native) = &current {
+            let argv: Vec<Value> = effective_args.into_iter().collect();
+            return (native.call)(self, &argv).map_err(native_to_vm_error);
+        }
+        let (function_id, parent_upvalues, this_for_callee) = match current {
+            Value::Function { function_id } => {
+                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
+            }
+            Value::Closure {
+                function_id,
+                upvalues,
+                bound_this,
+            } => {
+                let this_value = match bound_this {
+                    Some(t) => *t,
+                    None => effective_this,
+                };
+                (function_id, upvalues, this_value)
+            }
+            _ => return Err(VmError::NotCallable),
+        };
+        let function = module
+            .functions
+            .get(function_id as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut new_frame =
+            Frame::with_return_upvalues_and_this(function, None, parent_upvalues, this_for_callee);
+        let bind_count = (function.param_count as usize).min(effective_args.len());
+        let total_args = effective_args.len();
+        let mut arg_iter = effective_args.into_iter();
+        for i in 0..bind_count {
+            let v = arg_iter.next().expect("bind_count <= len");
+            let slot = new_frame
+                .registers
+                .get_mut(i)
+                .ok_or(VmError::InvalidOperand)?;
+            *slot = v;
+        }
+        if function.has_rest && total_args > function.param_count as usize {
+            new_frame.rest_args = arg_iter.collect();
+        }
+        inner.push(new_frame);
+        self.dispatch_loop(module, &mut inner)
+    }
+
     fn dispatch_function_method(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -3240,6 +4321,547 @@ impl Interpreter {
         Ok(Some(()))
     }
 
+    /// Drive one tick of the [`Op::ToPrimitive`] ladder.
+    ///
+    /// # Algorithm
+    /// Implements ECMA-262 §7.1.1 `ToPrimitive` plus §7.1.1.1
+    /// `OrdinaryToPrimitive`:
+    ///
+    /// 1. **Already primitive** — write `src` to `dst`, advance pc.
+    /// 2. **Resume from prior stage** — read the result the called
+    ///    function wrote into `dst`. If primitive, advance pc and
+    ///    clear the parked state. Otherwise advance the stage.
+    /// 3. **`SymbolToPrim`** — look up `[Symbol.toPrimitive]`. If
+    ///    callable, push a frame with `[hint]` and `this = obj`,
+    ///    park state with `stage = OrdinaryFirst` (set so a
+    ///    non-primitive result falls through to the ordinary
+    ///    chain). Otherwise fall through to `OrdinaryFirst`
+    ///    immediately.
+    /// 4. **`OrdinaryFirst` / `OrdinarySecond`** — pick `valueOf`
+    ///    (default / number) or `toString` (string) for the first
+    ///    slot; the other method for the second. If callable, push
+    ///    a frame with no arguments. If neither slot returns a
+    ///    primitive, raise `VmError::TypeMismatch` (task 25 will
+    ///    upgrade this to a real `TypeError` Error object).
+    ///
+    /// Returns `Ok(true)` when the ladder pushed a frame (the
+    /// dispatch loop must `continue` to the new top frame),
+    /// `Ok(false)` when the ladder finished synchronously and pc
+    /// advanced.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
+    fn drive_to_primitive(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let src = register_operand(operands.get(1))?;
+        let hint_idx = const_operand(operands.get(2))?;
+        let hint_token = lookup_string_constant(module, hint_idx)?;
+        let hint = abstract_ops::ToPrimitiveHint::from_token(&hint_token)
+            .ok_or(VmError::InvalidOperand)?;
+
+        let top_idx = stack.len() - 1;
+        let pc = stack[top_idx].pc;
+
+        // 1. Resume path — only when the parked state matches this
+        //    instruction. Read the result the called function wrote
+        //    to `dst`; if primitive, finish.
+        let resume = stack[top_idx]
+            .pending_to_primitive
+            .as_ref()
+            .filter(|s| s.pc == pc && s.dst == dst)
+            .cloned();
+        if let Some(state) = resume {
+            let produced = read_register(&stack[top_idx], dst)?.clone();
+            if abstract_ops::is_primitive(&produced) {
+                stack[top_idx].pending_to_primitive = None;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                return Ok(false);
+            }
+            // Non-primitive — advance to the next stage.
+            return self.drive_to_primitive_stage(stack, module, dst, state.obj, hint, state.stage);
+        }
+
+        // 2. Fresh entry — primitive fast path.
+        let recv = read_register(&stack[top_idx], src)?.clone();
+        if abstract_ops::is_primitive(&recv) {
+            write_register(&mut stack[top_idx], dst, recv)?;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(false);
+        }
+
+        // 3. Object operand — start the ladder at SymbolToPrim.
+        self.drive_to_primitive_stage(
+            stack,
+            module,
+            dst,
+            recv,
+            hint,
+            ToPrimitiveStage::SymbolToPrim,
+        )
+    }
+
+    /// Run a single stage of the §7.1.1 / §7.1.1.1 ladder, falling
+    /// through synchronously when the chosen method is missing or
+    /// non-callable until we either push a frame, throw, or write
+    /// a primitive result.
+    fn drive_to_primitive_stage(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        dst: u16,
+        obj: Value,
+        hint: abstract_ops::ToPrimitiveHint,
+        mut stage: ToPrimitiveStage,
+    ) -> Result<bool, VmError> {
+        loop {
+            match stage {
+                ToPrimitiveStage::SymbolToPrim => {
+                    let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
+                    let callee = match &obj {
+                        Value::Object(o) => o.get_symbol(&to_prim_sym),
+                        _ => None,
+                    };
+                    if let Some(callee) = callee
+                        && is_callable(&callee)
+                    {
+                        let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
+                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                        args.push(Value::String(hint_str));
+                        // §7.1.1 step 5.d. The resume guard
+                        // upstream validates the result is a
+                        // primitive — if not, that branch lands
+                        // on `OrdinaryFirst` which is **wrong**
+                        // per spec (a non-primitive return from
+                        // `[Symbol.toPrimitive]` is supposed to
+                        // throw TypeError directly). The runtime
+                        // currently routes that case through the
+                        // ordinary chain rather than throwing, to
+                        // mirror the existing `Op::ToNumber` hook
+                        // behaviour. Task 25 + a follow-up will
+                        // tighten this branch to spec.
+                        return self.push_to_primitive_call(
+                            stack,
+                            module,
+                            dst,
+                            obj.clone(),
+                            hint,
+                            ToPrimitiveStage::OrdinaryFirst,
+                            &callee,
+                            obj.clone(),
+                            args,
+                        );
+                    }
+                    stage = ToPrimitiveStage::OrdinaryFirst;
+                }
+                ToPrimitiveStage::OrdinaryFirst => {
+                    let method = ordinary_method_for(hint, stage);
+                    let callee = match &obj {
+                        Value::Object(o) => o.get(method),
+                        _ => None,
+                    };
+                    if let Some(callee) = callee
+                        && is_callable(&callee)
+                    {
+                        // OrdinaryToPrimitive calls valueOf /
+                        // toString with `this = obj` and no args.
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        return self.push_to_primitive_call(
+                            stack,
+                            module,
+                            dst,
+                            obj.clone(),
+                            hint,
+                            ToPrimitiveStage::OrdinarySecond,
+                            &callee,
+                            obj.clone(),
+                            args,
+                        );
+                    }
+                    stage = ToPrimitiveStage::OrdinarySecond;
+                }
+                ToPrimitiveStage::OrdinarySecond => {
+                    let method = ordinary_method_for(hint, stage);
+                    let callee = match &obj {
+                        Value::Object(o) => o.get(method),
+                        _ => None,
+                    };
+                    if let Some(callee) = callee
+                        && is_callable(&callee)
+                    {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        // After OrdinarySecond the only spec-legal
+                        // outcomes are: primitive result (resume
+                        // path writes it) or non-primitive →
+                        // throw. Park the stage as `Exhausted` so
+                        // the resume re-entry can't loop back into
+                        // this slot.
+                        return self.push_to_primitive_call(
+                            stack,
+                            module,
+                            dst,
+                            obj.clone(),
+                            hint,
+                            ToPrimitiveStage::Exhausted,
+                            &callee,
+                            obj.clone(),
+                            args,
+                        );
+                    }
+                    stage = ToPrimitiveStage::Exhausted;
+                }
+                ToPrimitiveStage::Exhausted => {
+                    // §7.1.1.1 step 6 — TypeError. Task 25 will
+                    // upgrade `VmError::TypeMismatch` to a real
+                    // `TypeError` Error object.
+                    let top_idx = stack.len() - 1;
+                    stack[top_idx].pending_to_primitive = None;
+                    return Err(VmError::TypeMismatch);
+                }
+            }
+        }
+    }
+
+    /// Park `Op::ToPrimitive` ladder state on the running frame and
+    /// invoke `callee`. The dispatcher re-enters the same opcode
+    /// after the call returns; the resume path validates the
+    /// result.
+    #[allow(clippy::too_many_arguments)]
+    fn push_to_primitive_call(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        dst: u16,
+        obj: Value,
+        hint: abstract_ops::ToPrimitiveHint,
+        next_stage: ToPrimitiveStage,
+        callee: &Value,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<bool, VmError> {
+        let top_idx = stack.len() - 1;
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pending_to_primitive = Some(PendingToPrimitive {
+            pc,
+            dst,
+            obj,
+            hint,
+            stage: next_stage,
+        });
+        // pc stays on the Op::ToPrimitive instruction so the
+        // dispatcher re-enters the resume path after the called
+        // function returns.
+        self.invoke(stack, module, callee, this_value, args, dst)?;
+        Ok(true)
+    }
+
+    /// Drive one tick of [`Op::LoadProperty`] when the receiver is
+    /// an object and the resolved property is an accessor descriptor.
+    /// Returns `Ok(true)` when an accessor was dispatched (frame
+    /// pushed or undefined written) and the outer loop should
+    /// `continue`; `Ok(false)` when the in-frame fast path should
+    /// run (data slot, non-object receiver, or absent property).
+    ///
+    /// # Algorithm — §10.1.8 OrdinaryGet
+    /// 1. Decode the operands and read the receiver register.
+    /// 2. Probe the receiver's own + prototype chain.
+    ///    - Absent / data slot: hand off to the in-frame fast path.
+    ///    - Accessor with no getter: write `undefined` to `dst`,
+    ///      advance pc, signal handled.
+    ///    - Accessor with a getter: advance pc, push a call to the
+    ///      getter with `this = receiver` and dst = `dst`.
+    /// 3. Class constructors and other special receiver kinds skip
+    ///    accessor handling: their property tables are plain data
+    ///    today, so the in-frame match is authoritative.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinaryget>
+    fn drive_load_property(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let obj_reg = register_operand(operands.get(1))?;
+        let name_idx = const_operand(operands.get(2))?;
+        let name = lookup_string_constant(module, name_idx)?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let obj = match &receiver {
+            Value::Object(o) => o.clone(),
+            _ => return Ok(false),
+        };
+        match obj.lookup(&name) {
+            object::PropertyLookup::Accessor { getter, .. } => {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                match getter {
+                    Some(callee) if abstract_ops::is_callable(&callee) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, module, &callee, receiver, args, dst)?;
+                    }
+                    _ => {
+                        // No getter (or non-callable) — §10.1.8.1
+                        // step 4.b returns undefined.
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+                Ok(true)
+            }
+            // Data or absent — fall through to the in-frame fast path.
+            _ => Ok(false),
+        }
+    }
+
+    /// Drive one tick of [`Op::StoreProperty`] when §10.1.9
+    /// OrdinarySet routes through an accessor setter, hits a
+    /// non-writable shadow, or hits a non-extensible receiver.
+    /// Returns `Ok(true)` when the dispatch path took over,
+    /// `Ok(false)` when the in-frame data-write fast path should run.
+    ///
+    /// Non-writable / accessor-without-setter / non-extensible
+    /// rejections surface as [`VmError::TypeMismatch`] today —
+    /// follow-up [task 25](../docs/new-engine/tasks/25-internal-error-throwability.md)
+    /// upgrades these to real `TypeError` instances. Sloppy-mode
+    /// silent rejection is filed against the same task.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinaryset>
+    /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
+    fn drive_store_property(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let obj_reg = register_operand(operands.first())?;
+        let name_idx = const_operand(operands.get(1))?;
+        let src_reg = register_operand(operands.get(2))?;
+        let scratch_reg = register_operand(operands.get(3))?;
+        let name = lookup_string_constant(module, name_idx)?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let obj = match &receiver {
+            Value::Object(o) => o.clone(),
+            _ => return Ok(false),
+        };
+        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        let outcome = obj.resolve_set(&name);
+        match outcome {
+            object::SetOutcome::AssignData => {
+                // Fall through to the in-frame data-write path so
+                // the existing semantics keep applying.
+                Ok(false)
+            }
+            object::SetOutcome::InvokeSetter { setter } => {
+                if !abstract_ops::is_callable(&setter) {
+                    // Spec §10.1.9 step 5.b — accessor with non-
+                    // callable setter rejects.
+                    return Err(VmError::TypeMismatch);
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                Ok(true)
+            }
+            object::SetOutcome::Reject { .. } => {
+                // Spec routes this to a strict-mode TypeError. The
+                // foundation has no strict flag yet — surface the
+                // failure unconditionally so test fixtures observe
+                // the rejection. Task 25 wires the real `TypeError`.
+                Err(VmError::TypeMismatch)
+            }
+        }
+    }
+
+    /// Drive one tick of [`Op::GetIterator`] for user objects.
+    ///
+    /// Returns `Ok(true)` when the dispatcher must restart the
+    /// outer loop (frame pushed or pc advanced synchronously),
+    /// `Ok(false)` when the source operand is a built-in iterable
+    /// and the in-frame fast path should run instead.
+    ///
+    /// # Algorithm (§7.4.3 `GetIterator`)
+    /// 1. **Resume** — when the running frame's
+    ///    [`Frame::pending_get_iterator`] matches the current pc,
+    ///    read the called function's result from `dst`. The result
+    ///    must be an Object (the iterator). On non-Object, raise
+    ///    `TypeMismatch` (foundation surface for §7.4.3 step 2's
+    ///    TypeError; task 25 upgrades to a real Error).
+    /// 2. **Fresh entry, built-in** — `Value::Array` / `String` /
+    ///    `Map` / `Set` flow through the existing fast path.
+    /// 3. **Fresh entry, user object** — look up
+    ///    `[Symbol.iterator]`; if callable, push a frame to invoke
+    ///    it with `this = obj`, no arguments. Pc stays on the
+    ///    `Op::GetIterator` so resume can wrap the returned
+    ///    iterator object as [`IteratorState::User`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-getiterator>
+    fn drive_get_iterator(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let src = register_operand(operands.get(1))?;
+        let top_idx = stack.len() - 1;
+        let pc = stack[top_idx].pc;
+
+        // 1. Resume path.
+        let resume = stack[top_idx]
+            .pending_get_iterator
+            .as_ref()
+            .filter(|s| s.pc == pc && s.dst == dst)
+            .cloned();
+        if let Some(_state) = resume {
+            let produced = read_register(&stack[top_idx], dst)?.clone();
+            // §7.4.3 step 2 — `[@@iterator]()` must return an
+            // Object. Anything else is a TypeError.
+            if !matches!(produced, Value::Object(_)) {
+                stack[top_idx].pending_get_iterator = None;
+                return Err(VmError::TypeMismatch);
+            }
+            let iter_state = IteratorState::User { iterator: produced };
+            let iter = std::rc::Rc::new(std::cell::RefCell::new(iter_state));
+            write_register(&mut stack[top_idx], dst, Value::Iterator(iter))?;
+            stack[top_idx].pending_get_iterator = None;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(true);
+        }
+
+        // 2 + 3. Fresh entry — only intercept user objects. The
+        // built-in fast path is the existing in-frame match arm.
+        let value = read_register(&stack[top_idx], src)?.clone();
+        let Value::Object(obj) = &value else {
+            return Ok(false);
+        };
+        let iter_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
+        let Some(callee) = obj.get_symbol(&iter_sym) else {
+            // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
+            return Err(VmError::TypeMismatch);
+        };
+        if !is_callable(&callee) {
+            return Err(VmError::TypeMismatch);
+        }
+        stack[top_idx].pending_get_iterator = Some(PendingGetIterator { pc, dst });
+        let args: SmallVec<[Value; 8]> = SmallVec::new();
+        // pc stays on Op::GetIterator; the called frame's result
+        // lands in `dst` and the resume guard above wraps it.
+        self.invoke(stack, module, &callee, value, args, dst)?;
+        Ok(true)
+    }
+
+    /// Drive one tick of [`Op::IteratorNext`] for user iterators.
+    ///
+    /// Returns `Ok(true)` when the dispatcher must restart (frame
+    /// pushed or pc advanced synchronously), `Ok(false)` when the
+    /// iterator is a built-in synchronous shape and the in-frame
+    /// fast path should run.
+    ///
+    /// # Algorithm (§7.4.5 `IteratorNext`)
+    /// 1. **Resume** — read the result record from the scratch
+    ///    register; pull `value` and `done`; truthy `done`
+    ///    transitions the iterator to `Exhausted` per §7.4.2 step 6.
+    /// 2. **Fresh entry, built-in iterator** — fall through.
+    /// 3. **Fresh entry, user iterator** — look up `iterator.next`,
+    ///    push a frame to invoke it with `this = iterator`, no
+    ///    arguments. Result lands in a scratch slot adjacent to
+    ///    the `value` / `done` destinations.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-iteratornext>
+    /// - <https://tc39.es/ecma262/#sec-iteratorcomplete>
+    /// - <https://tc39.es/ecma262/#sec-iteratorvalue>
+    fn drive_iterator_next(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let value_dst = register_operand(operands.first())?;
+        let done_dst = register_operand(operands.get(1))?;
+        let iter_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let pc = stack[top_idx].pc;
+
+        // 1. Resume path — read the parked record.
+        let resume = stack[top_idx]
+            .pending_iterator_next
+            .as_ref()
+            .filter(|s| s.pc == pc && s.value_dst == value_dst && s.done_dst == done_dst)
+            .cloned();
+        if let Some(state) = resume {
+            let result = read_register(&stack[top_idx], state.result_reg)?.clone();
+            let Value::Object(obj) = &result else {
+                stack[top_idx].pending_iterator_next = None;
+                return Err(VmError::TypeMismatch);
+            };
+            let value = obj.get("value").unwrap_or(Value::Undefined);
+            let done_value = obj.get("done").unwrap_or(Value::Undefined);
+            let done = done_value.to_boolean();
+            if done {
+                if let Value::Iterator(rc) = &state.iterator {
+                    *rc.borrow_mut() = IteratorState::Exhausted;
+                }
+            }
+            write_register(&mut stack[top_idx], value_dst, value)?;
+            write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
+            stack[top_idx].pending_iterator_next = None;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(true);
+        }
+
+        // 2 + 3. Fresh entry. Inspect the iterator's inner state.
+        let iter_value = read_register(&stack[top_idx], iter_reg)?.clone();
+        let Value::Iterator(iter_rc) = &iter_value else {
+            return Err(VmError::TypeMismatch);
+        };
+        // Snapshot the user iterator object out of the inner
+        // state so the borrow does not span the `invoke` call
+        // below.
+        let user_iter = match &*iter_rc.borrow() {
+            IteratorState::User { iterator } => Some(iterator.clone()),
+            _ => None,
+        };
+        let Some(user_iter_value) = user_iter else {
+            // Built-in iterator — let the synchronous in-frame
+            // path drive it.
+            return Ok(false);
+        };
+        // Already-exhausted user iterators short-circuit per
+        // §7.4.2 step 6.
+        let Value::Object(iter_obj) = &user_iter_value else {
+            return Err(VmError::TypeMismatch);
+        };
+        let next_fn = iter_obj.get("next").ok_or(VmError::TypeMismatch)?;
+        if !is_callable(&next_fn) {
+            return Err(VmError::TypeMismatch);
+        }
+        // Park the state and push a call. `result_reg` reuses the
+        // `value_dst` slot — the resume step overwrites it with
+        // the unpacked value before the user code observes it.
+        stack[top_idx].pending_iterator_next = Some(PendingIteratorNext {
+            pc,
+            value_dst,
+            done_dst,
+            result_reg: value_dst,
+            iterator: iter_value,
+        });
+        let args: SmallVec<[Value; 8]> = SmallVec::new();
+        self.invoke(stack, module, &next_fn, user_iter_value, args, value_dst)?;
+        Ok(true)
+    }
+
     fn binop_regs(
         &self,
         operands: &[Operand],
@@ -3277,6 +4899,20 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Implements ECMA-262 §13.15.4
+    /// `ApplyStringOrNumericBinaryOperator` for the `+` operator
+    /// after the compiler has already coerced both operands through
+    /// `Op::ToPrimitive(default)`.
+    ///
+    /// # Algorithm
+    /// 1. If either operand is a `String`, ToString the other
+    ///    operand and return the concatenation.
+    /// 2. Otherwise apply spec-faithful numeric add — `Number +
+    ///    Number` and `BigInt + BigInt` keep their kind; mixed
+    ///    `Number` / `BigInt` is a `TypeError`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator>
     fn run_add(
         &self,
         _module: &BytecodeModule,
@@ -3284,49 +4920,107 @@ impl Interpreter {
         frame: &mut Frame,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
-        let result = match (&lhs, &rhs) {
-            (Value::Number(a), Value::Number(b)) => Value::Number(number::add(*a, *b)),
-            (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(bigint::ops::add(a, b)),
-            (Value::Number(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Number(_)) => {
-                return Err(VmError::TypeMismatch);
+        let result = if matches!(lhs, Value::String(_)) || matches!(rhs, Value::String(_)) {
+            // §13.15.4 step 1.c.ii — string concat path. The
+            // operand that is already a String stays as-is; the
+            // other goes through ToString.
+            let l_str = self.to_display_string(&lhs)?;
+            let r_str = self.to_display_string(&rhs)?;
+            Value::String(JsString::concat(&l_str, &r_str, &self.string_heap)?)
+        } else {
+            match (&lhs, &rhs) {
+                (Value::Number(a), Value::Number(b)) => Value::Number(number::add(*a, *b)),
+                (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(bigint::ops::add(a, b)),
+                (Value::Number(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Number(_)) => {
+                    return Err(VmError::TypeMismatch);
+                }
+                _ => return Err(VmError::TypeMismatch),
             }
-            (Value::String(a), Value::String(b)) => {
-                Value::String(JsString::concat(a, b, &self.string_heap)?)
-            }
-            _ => return Err(VmError::TypeMismatch),
         };
         write_register(frame, dst, result)?;
         frame.pc += 1;
         Ok(())
     }
 
+    /// Display-form `ToString` over already-primitive `Value`s.
+    ///
+    /// Used by [`Self::run_add`]'s string-concat path — the
+    /// compiler has already inserted `Op::ToPrimitive(default)`
+    /// before the `+` so any object operand has been collapsed.
+    /// Symbol operands raise a `TypeError` per §7.1.17 step 4.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-tostring>
+    fn to_display_string(&self, value: &Value) -> Result<JsString, VmError> {
+        match value {
+            Value::String(s) => Ok(s.clone()),
+            Value::Number(n) => Ok(JsString::from_str(
+                &n.to_display_string(),
+                &self.string_heap,
+            )?),
+            Value::BigInt(b) => Ok(JsString::from_str(
+                &b.to_decimal_string(),
+                &self.string_heap,
+            )?),
+            Value::Boolean(true) => Ok(JsString::from_str("true", &self.string_heap)?),
+            Value::Boolean(false) => Ok(JsString::from_str("false", &self.string_heap)?),
+            Value::Null => Ok(JsString::from_str("null", &self.string_heap)?),
+            Value::Undefined => Ok(JsString::from_str("undefined", &self.string_heap)?),
+            // §7.1.17 step 4 — Symbol → TypeError.
+            Value::Symbol(_) => Err(VmError::TypeMismatch),
+            // Object-shaped values would normally come through
+            // ToPrimitive(string) first; reaching here means an
+            // object slipped through (e.g. ToPrimitive(default)
+            // returned an object via [Symbol.toPrimitive], in
+            // which case the resume path already raised
+            // TypeMismatch).
+            _ => Err(VmError::TypeMismatch),
+        }
+    }
+
+    /// Implements ECMA-262 §7.2.14 `AbstractRelationalComparison`
+    /// for the four relational operators `<`, `<=`, `>`, `>=`.
+    /// The compiler has already coerced both operands through
+    /// `Op::ToPrimitive(number)`, so the runtime sees primitives.
+    ///
+    /// # Algorithm
+    /// 1. Delegate to [`abstract_ops::abstract_relational_comparison`]
+    ///    with the operands in the canonical order — `lhs < rhs`
+    ///    for `LessThan` / `LessEq`, swapped for `GreaterThan` /
+    ///    `GreaterEq`.
+    /// 2. Translate the [`abstract_ops::RelationalOutcome`] into
+    ///    the boolean each opcode reports:
+    ///    - `<`  / `>`  → `LessThan` only.
+    ///    - `<=` / `>=` → spec `r === undefined ? false : !r` (i.e.
+    ///      `NotLessThan` of the swapped operands).
+    ///    - `Undefined` → always `false`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
     fn run_compare(&self, operands: &[Operand], frame: &mut Frame, op: Op) -> Result<(), VmError> {
         let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
-        let truthy = match (&lhs, &rhs) {
-            (Value::Number(a), Value::Number(b)) => {
-                ordering_matches_op(op, number_ordering_to_std(number::compare(*a, *b)))
+        let truthy = match op {
+            Op::LessThan => {
+                matches!(
+                    abstract_ops::abstract_relational_comparison(&lhs, &rhs),
+                    abstract_ops::RelationalOutcome::LessThan
+                )
             }
-            (Value::BigInt(a), Value::BigInt(b)) => {
-                ordering_matches_op(op, Some(bigint::ops::compare(a, b)))
+            Op::GreaterThan => {
+                matches!(
+                    abstract_ops::abstract_relational_comparison(&rhs, &lhs),
+                    abstract_ops::RelationalOutcome::LessThan
+                )
             }
-            (Value::BigInt(a), Value::Number(b)) => {
-                ordering_matches_op(op, bigint::ops::compare_to_f64(a, b.as_f64()))
-            }
-            (Value::Number(a), Value::BigInt(b)) => ordering_matches_op(
-                op,
-                bigint::ops::compare_to_f64(b, a.as_f64()).map(std::cmp::Ordering::reverse),
+            Op::LessEq => matches!(
+                abstract_ops::abstract_relational_comparison(&rhs, &lhs),
+                abstract_ops::RelationalOutcome::NotLessThan
             ),
-            (Value::String(a), Value::String(b)) => {
-                let ord = a.compare_lex(b);
-                match op {
-                    Op::LessThan => ord.is_lt(),
-                    Op::LessEq => ord.is_le(),
-                    Op::GreaterThan => ord.is_gt(),
-                    Op::GreaterEq => ord.is_ge(),
-                    _ => unreachable!(),
-                }
-            }
-            _ => return Err(VmError::TypeMismatch),
+            Op::GreaterEq => matches!(
+                abstract_ops::abstract_relational_comparison(&lhs, &rhs),
+                abstract_ops::RelationalOutcome::NotLessThan
+            ),
+            _ => unreachable!("run_compare called with non-relational op"),
         };
         write_register(frame, dst, Value::Boolean(truthy))?;
         frame.pc += 1;
@@ -3388,35 +5082,6 @@ fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
     }
 }
 
-/// Convert [`number::NumericOrdering`] (which carries an extra
-/// `Unordered` variant for `NaN`) into the standard library's
-/// `Ordering` paired with an `Option`. `None` means "NaN seen,
-/// any relational result is `false`".
-fn number_ordering_to_std(o: NumericOrdering) -> Option<std::cmp::Ordering> {
-    match o {
-        NumericOrdering::Less => Some(std::cmp::Ordering::Less),
-        NumericOrdering::Equal => Some(std::cmp::Ordering::Equal),
-        NumericOrdering::Greater => Some(std::cmp::Ordering::Greater),
-        NumericOrdering::Unordered => None,
-    }
-}
-
-/// Apply a `<`, `<=`, `>`, or `>=` opcode to an `Ordering`.
-/// `None` (one operand was `NaN` or otherwise unordered) yields
-/// `false` for every relational op per spec.
-fn ordering_matches_op(op: Op, ord: Option<std::cmp::Ordering>) -> bool {
-    let Some(o) = ord else {
-        return false;
-    };
-    match op {
-        Op::LessThan => o.is_lt(),
-        Op::LessEq => o.is_le() || o.is_eq(),
-        Op::GreaterThan => o.is_gt(),
-        Op::GreaterEq => o.is_ge() || o.is_eq(),
-        _ => unreachable!(),
-    }
-}
-
 /// Walk a live frame stack top-down and build a snapshot the
 /// runtime / CLI can render. Top-of-stack first.
 fn snapshot_frames(module: &BytecodeModule, stack: &[Frame]) -> Vec<StackFrameSnapshot> {
@@ -3457,6 +5122,43 @@ fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
         },
         symbol_dispatch::SymbolError::BadArgument { .. } => VmError::TypeMismatch,
         symbol_dispatch::SymbolError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+    }
+}
+
+fn intl_to_vm_error(err: intl::IntlError) -> VmError {
+    match err {
+        intl::IntlError::UnknownClass(name) => VmError::UnknownIntrinsic {
+            name: format!("Intl.{name}"),
+        },
+        intl::IntlError::UnknownMember { class, method } => VmError::UnknownIntrinsic {
+            name: format!("Intl.{class}.prototype.{method}"),
+        },
+        intl::IntlError::BadArgument { .. } => VmError::TypeMismatch,
+        intl::IntlError::Engine { message, .. } => VmError::Uncaught { value: message },
+        intl::IntlError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+    }
+}
+
+fn temporal_to_vm_error(err: temporal::TemporalError) -> VmError {
+    match err {
+        temporal::TemporalError::UnknownMember { class, method } => VmError::UnknownIntrinsic {
+            name: format!("Temporal.{class}.{method}"),
+        },
+        temporal::TemporalError::BadArgument { .. } => VmError::TypeMismatch,
+        temporal::TemporalError::Engine { message, .. } => VmError::Uncaught { value: message },
+        temporal::TemporalError::OutOfMemory {
             requested_bytes,
             heap_limit_bytes,
         } => VmError::OutOfMemory {
@@ -3601,6 +5303,101 @@ fn apply_branch(frame: &mut Frame, offset: i32, interrupt: &InterruptFlag) -> Re
     Ok(())
 }
 
+/// Foundation §20.1.3 `Object.prototype.<method>` interception for
+/// ordinary objects. Returns `Ok(Some(value))` when the call was
+/// dispatched here, `Ok(None)` when the method is not one of the
+/// prototype names so the caller falls through to the regular lookup.
+///
+/// Handles: `hasOwnProperty`, `propertyIsEnumerable`,
+/// `isPrototypeOf`, `toString`, `valueOf`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-properties-of-the-object-prototype-object>
+fn object_prototype_intercept(
+    obj: &object::JsObject,
+    name: &str,
+    args: &SmallVec<[Value; 8]>,
+    string_heap: &string::StringHeap,
+) -> Result<Option<Value>, VmError> {
+    match name {
+        // §20.1.3.2 Object.prototype.hasOwnProperty(V)
+        // <https://tc39.es/ecma262/#sec-object.prototype.hasownproperty>
+        "hasOwnProperty" => {
+            let key = property_key_from_arg(args.first())?;
+            let present = !matches!(obj.lookup_own(&key), object::PropertyLookup::Absent);
+            Ok(Some(Value::Boolean(present)))
+        }
+        // §20.1.3.4 Object.prototype.propertyIsEnumerable(V)
+        // <https://tc39.es/ecma262/#sec-object.prototype.propertyisenumerable>
+        "propertyIsEnumerable" => {
+            let key = property_key_from_arg(args.first())?;
+            let result = match obj.lookup_own(&key) {
+                object::PropertyLookup::Data { flags, .. } => flags.enumerable(),
+                object::PropertyLookup::Accessor { flags, .. } => flags.enumerable(),
+                object::PropertyLookup::Absent => false,
+            };
+            Ok(Some(Value::Boolean(result)))
+        }
+        // §20.1.3.3 Object.prototype.isPrototypeOf(V)
+        // <https://tc39.es/ecma262/#sec-object.prototype.isprototypeof>
+        "isPrototypeOf" => {
+            let result = match args.first() {
+                Some(Value::Object(other)) => other.has_in_proto_chain(obj),
+                _ => false,
+            };
+            Ok(Some(Value::Boolean(result)))
+        }
+        // §20.1.3.6 Object.prototype.toString() — foundation returns
+        // `[object Object]`. Per spec the tag is derived from
+        // `[Symbol.toStringTag]` / `[[Class]]`; full lowering is filed
+        // against task 61 follow-ups.
+        // <https://tc39.es/ecma262/#sec-object.prototype.tostring>
+        "toString" => {
+            let s = JsString::from_str("[object Object]", string_heap)
+                .map_err(|_| VmError::TypeMismatch)?;
+            Ok(Some(Value::String(s)))
+        }
+        // §20.1.3.7 Object.prototype.valueOf() — returns the receiver.
+        // <https://tc39.es/ecma262/#sec-object.prototype.valueof>
+        "valueOf" => Ok(Some(Value::Object(obj.clone()))),
+        _ => Ok(None),
+    }
+}
+
+/// §7.1.19 ToPropertyKey for a single optional argument used by
+/// `Object.prototype.hasOwnProperty` / `propertyIsEnumerable`.
+fn property_key_from_arg(arg: Option<&Value>) -> Result<String, VmError> {
+    match arg {
+        Some(Value::String(s)) => Ok(s.to_lossy_string()),
+        Some(Value::Number(n)) => Ok(n.to_display_string()),
+        Some(Value::Boolean(b)) => Ok((if *b { "true" } else { "false" }).to_string()),
+        Some(Value::Null) => Ok("null".to_string()),
+        Some(Value::Undefined) | None => Ok("undefined".to_string()),
+        _ => Err(VmError::TypeMismatch),
+    }
+}
+
+/// Validate that the first callback argument to an Array method is
+/// callable per ECMA-262 §23.1.3 step 3 (CheckObjectCoercible +
+/// IsCallable). Returns the callable value cloned out for the
+/// dispatch loop.
+fn require_callable(arg: Option<&Value>) -> Result<Value, VmError> {
+    match arg {
+        Some(v) if abstract_ops::is_callable(v) => Ok(v.clone()),
+        _ => Err(VmError::NotCallable),
+    }
+}
+
+/// Build the canonical `(value, index, array)` argument tuple every
+/// `Array.prototype` callback expects.
+fn build_array_cb_args(value: &Value, index: usize, arr: &Value) -> SmallVec<[Value; 8]> {
+    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+    cb_args.push(value.clone());
+    cb_args.push(Value::Number(NumberValue::from_i32(index as i32)));
+    cb_args.push(arr.clone());
+    cb_args
+}
+
 fn read_register(frame: &Frame, idx: u16) -> Result<&Value, VmError> {
     frame
         .registers
@@ -3622,6 +5419,103 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// `Exhausted` so subsequent calls are stable no-ops (matches the
 /// spec rule "an iterator never produces values after it has
 /// produced `done: true`"; §7.4.2 step 6).
+/// Build a fresh `Map` / `Set` / `WeakMap` / `WeakSet`, optionally
+/// seeded from an iterable.
+///
+/// # Algorithm
+/// 1. Match `kind` against the four collection names and allocate
+///    the corresponding handle.
+/// 2. If `seed` is `Value::Undefined` or `Value::Null`, return the
+///    fresh empty handle (Spec §24.1.1.1 / §24.2.1.1 step 5 et al.).
+/// 3. Otherwise the seed must be a `Value::Array` (foundation
+///    relaxation: a real iterable protocol consultation lands when
+///    user-defined iterables are wired); for `Map` / `WeakMap`
+///    each element is a 2-element `[key, value]` array; for
+///    `Set` / `WeakSet` each element is added directly.
+///
+/// # Errors
+/// - [`VmError::TypeMismatch`] when the seed is non-iterable, when a
+///   `Map` / `WeakMap` seed element is not a 2-array, or when a
+///   `WeakMap` / `WeakSet` seed key is a primitive (the underlying
+///   [`crate::collections::CollectionError::NonObjectKey`] surfaces
+///   through this arm).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-map-constructor>
+/// - <https://tc39.es/ecma262/#sec-set-constructor>
+/// - <https://tc39.es/ecma262/#sec-weakmap-constructor>
+/// - <https://tc39.es/ecma262/#sec-weakset-constructor>
+fn build_collection(kind: &str, seed: &Value) -> Result<Value, VmError> {
+    match kind {
+        "Map" => {
+            let m = JsMap::new();
+            if seed_is_present(seed) {
+                let entries = seed_array(seed)?;
+                for entry in entries {
+                    let pair = match entry {
+                        Value::Array(a) => a,
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    if pair.len() < 2 {
+                        return Err(VmError::TypeMismatch);
+                    }
+                    m.set(pair.get(0), pair.get(1));
+                }
+            }
+            Ok(Value::Map(m))
+        }
+        "Set" => {
+            let s = JsSet::new();
+            if seed_is_present(seed) {
+                for v in seed_array(seed)? {
+                    s.add(v);
+                }
+            }
+            Ok(Value::Set(s))
+        }
+        "WeakMap" => {
+            let m = JsWeakMap::new();
+            if seed_is_present(seed) {
+                for entry in seed_array(seed)? {
+                    let pair = match entry {
+                        Value::Array(a) => a,
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    if pair.len() < 2 {
+                        return Err(VmError::TypeMismatch);
+                    }
+                    m.set(pair.get(0), pair.get(1))
+                        .map_err(|_| VmError::TypeMismatch)?;
+                }
+            }
+            Ok(Value::WeakMap(m))
+        }
+        "WeakSet" => {
+            let s = JsWeakSet::new();
+            if seed_is_present(seed) {
+                for v in seed_array(seed)? {
+                    s.add(v).map_err(|_| VmError::TypeMismatch)?;
+                }
+            }
+            Ok(Value::WeakSet(s))
+        }
+        _ => Err(VmError::UnknownIntrinsic {
+            name: format!("new {kind}"),
+        }),
+    }
+}
+
+fn seed_is_present(v: &Value) -> bool {
+    !matches!(v, Value::Undefined | Value::Null)
+}
+
+fn seed_array(seed: &Value) -> Result<Vec<Value>, VmError> {
+    match seed {
+        Value::Array(a) => Ok(a.borrow_body().iter().cloned().collect()),
+        _ => Err(VmError::TypeMismatch),
+    }
+}
+
 /// Build the native callable that `arr[Symbol.iterator]` evaluates
 /// to. Invoking the returned function (with any `this`) yields a
 /// fresh [`Value::Iterator`] over the captured array — matching the
@@ -3669,6 +5563,14 @@ fn step_iterator(
                 None
             }
         }
+        IteratorState::User { .. } => {
+            // The user-iterator protocol requires invoking
+            // `iter.next()` on each step, which mutates the
+            // dispatch stack. The synchronous helper cannot push
+            // frames; the dispatcher must take the user path
+            // before reaching `step_iterator`.
+            return Err(VmError::TypeMismatch);
+        }
         IteratorState::Exhausted => None,
     };
     match outcome {
@@ -3709,26 +5611,52 @@ fn construct_prototype(callee: &Value) -> Option<JsObject> {
     }
 }
 
+/// Pick the property name for the current
+/// [`ToPrimitiveStage`] under ECMA-262 §7.1.1.1
+/// `OrdinaryToPrimitive`.
+///
+/// - `Default` / `Number` → first slot is `"valueOf"`, second is
+///   `"toString"`.
+/// - `String` → first slot is `"toString"`, second is `"valueOf"`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
+fn ordinary_method_for(
+    hint: abstract_ops::ToPrimitiveHint,
+    stage: ToPrimitiveStage,
+) -> &'static str {
+    let (first, second) = match hint {
+        abstract_ops::ToPrimitiveHint::String => ("toString", "valueOf"),
+        abstract_ops::ToPrimitiveHint::Default | abstract_ops::ToPrimitiveHint::Number => {
+            ("valueOf", "toString")
+        }
+    };
+    match stage {
+        ToPrimitiveStage::OrdinaryFirst => first,
+        ToPrimitiveStage::OrdinarySecond => second,
+        ToPrimitiveStage::SymbolToPrim | ToPrimitiveStage::Exhausted => "",
+    }
+}
+
 /// `true` when `value` is one of the call-site shapes the dispatcher
-/// can invoke: a bytecode function, a closure, or a bound function.
-/// `Value::BoundFunction` is treated as callable even when it wraps
-/// another bound function — the call dispatcher unwraps the chain.
+/// can invoke. Thin wrapper over [`abstract_ops::is_callable`]
+/// (ECMA-262 §7.2.3) — kept under the same name so existing call
+/// sites do not change.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-iscallable>
 fn is_callable(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Function { .. }
-            | Value::Closure { .. }
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_)
-            | Value::ClassConstructor(_)
-    )
+    abstract_ops::is_callable(value)
 }
 
 /// Public re-export of [`is_callable`] for crate-external dispatch
 /// helpers (e.g. [`crate::promise_dispatch`]).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-iscallable>
 #[must_use]
 pub fn is_callable_value(value: &Value) -> bool {
-    is_callable(value)
+    abstract_ops::is_callable(value)
 }
 
 /// Build a native callable that resumes a parked async frame when

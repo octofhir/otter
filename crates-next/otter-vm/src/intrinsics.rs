@@ -74,6 +74,40 @@ pub enum IntrinsicReceiver {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-symbol-prototype-object>
     Symbol,
+    /// `Map.prototype.<name>`. Receiver is a [`crate::Value::Map`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-map-prototype-object>
+    Map,
+    /// `Set.prototype.<name>`. Receiver is a [`crate::Value::Set`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-set-prototype-object>
+    Set,
+    /// `WeakMap.prototype.<name>`. Receiver is a [`crate::Value::WeakMap`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-weakmap-prototype-object>
+    WeakMap,
+    /// `WeakSet.prototype.<name>`. Receiver is a [`crate::Value::WeakSet`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-weakset-prototype-object>
+    WeakSet,
+    /// `Temporal.<Class>.prototype.<name>`. Receiver is a
+    /// [`crate::Value::Temporal`]. Per-kind routing happens in
+    /// [`crate::temporal::lookup_prototype`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/proposal-temporal/>
+    Temporal,
+    /// `Intl.<Class>.prototype.<name>`. Receiver is a
+    /// [`crate::Value::Intl`]. Per-kind routing happens in
+    /// [`crate::intl::lookup_prototype`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma402/>
+    Intl,
 }
 
 /// Borrowed call frame for an intrinsic.

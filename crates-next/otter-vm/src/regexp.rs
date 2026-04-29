@@ -234,6 +234,14 @@ impl JsRegExp {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
+
+    /// Raw `Rc`-data pointer for use as a hash / map key in
+    /// identity-keyed collections (`WeakMap` / `WeakSet`). Anchor
+    /// the originating handle for the lifetime of the pointer.
+    #[must_use]
+    pub fn identity_addr(&self) -> *const () {
+        Rc::as_ptr(&self.inner).cast()
+    }
 }
 
 impl PartialEq for JsRegExp {

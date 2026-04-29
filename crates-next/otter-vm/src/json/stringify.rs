@@ -282,10 +282,16 @@ fn emit_value(
             }
             visit.enter_object(obj)?;
             out.push('{');
+            // Per ECMA-262 §25.5.2.4 SerializeJSONObject step 4 we
+            // walk only the enumerable own string keys. Accessor
+            // slots are skipped here for the slice — invoking
+            // getters during serialisation requires interpreter
+            // access and is filed as a follow-up.
+            // <https://tc39.es/ecma262/#sec-serializejsonobject>
             let entries: Vec<(String, Value)> = obj
                 .borrow_props()
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .enumerable_data_iter()
+                .map(|(k, v)| (k.to_string(), v))
                 .collect();
             stack.push(Frame::Object {
                 entries,
@@ -297,7 +303,11 @@ fn emit_value(
         // Symbols are silently dropped by `JSON.stringify` per
         // §25.5.2. Inside an array context the upstream walker has
         // already substituted `null`; for top-level symbols and
-        // belt-and-braces guards we also emit `null` here.
+        // belt-and-braces guards we also emit `null` here. Map /
+        // Set / Weak collections do not have a JSON representation
+        // either — their default serialisation is `{}`. For the
+        // foundation we render them as `null` to match the
+        // existing wildcard behaviour.
         Value::Symbol(_)
         | Value::Function { .. }
         | Value::Closure { .. }
@@ -306,7 +316,13 @@ fn emit_value(
         | Value::Iterator(_)
         | Value::RegExp(_)
         | Value::Promise(_)
-        | Value::ClassConstructor(_) => {
+        | Value::ClassConstructor(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::WeakMap(_)
+        | Value::WeakSet(_)
+        | Value::Temporal(_)
+        | Value::Intl(_) => {
             out.push_str("null");
         }
     }

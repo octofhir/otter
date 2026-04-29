@@ -55,6 +55,13 @@ impl BigIntValue {
         Self::from_inner(BigInt::from(n))
     }
 
+    /// Convert from a 128-bit signed integer (used by Temporal
+    /// `epochNanoseconds` / `Instant.fromEpochMilliseconds`).
+    #[must_use]
+    pub fn from_i128(n: i128) -> Self {
+        Self::from_inner(BigInt::from(n))
+    }
+
     /// Parse a decimal-integer literal (no `n` suffix). Returns
     /// `None` when the string isn't a syntactically valid BigInt.
     #[must_use]

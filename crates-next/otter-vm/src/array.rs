@@ -44,6 +44,15 @@ pub struct ArrayBody {
     /// Element storage. Crate-internal — outside callers should
     /// go through `JsArray::{get, set, push, pop, ...}`.
     pub(crate) elements: SmallVec<[Value; 4]>,
+    /// Optional non-index string-keyed own properties. ECMA-262
+    /// §10.4.2 arrays inherit from `Object` and accept arbitrary
+    /// own properties; the foundation needs this to support
+    /// tagged-template `strings.raw` and the rare assignment
+    /// `arr.someName = ...`. Allocated lazily on first use.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array-exotic-objects>
+    pub(crate) named_properties: Option<std::collections::HashMap<String, Value>>,
 }
 
 impl JsArray {
@@ -119,6 +128,46 @@ impl JsArray {
             .elements
             .pop()
             .unwrap_or(Value::Undefined)
+    }
+
+    /// Set a string-keyed own property. Used for tagged-template
+    /// `strings.raw` and rare `arr.namedProp = …` assignments.
+    /// Numeric strings (`"0"`, `"1"`, …) are routed back into the
+    /// indexed-element storage so `arr["0"] = x` matches `arr[0] = x`.
+    pub fn set_named_property(&self, key: &str, value: Value) {
+        if let Ok(idx) = key.parse::<usize>() {
+            self.set(idx, value);
+            return;
+        }
+        let mut body = self.inner.borrow_mut();
+        let map = body
+            .named_properties
+            .get_or_insert_with(std::collections::HashMap::new);
+        map.insert(key.to_string(), value);
+    }
+
+    /// Read a string-keyed own property. Numeric strings route to
+    /// indexed elements; `length` returns the array length.
+    /// Returns `None` for missing names.
+    #[must_use]
+    pub fn get_named_property(&self, key: &str) -> Option<Value> {
+        if key == "length" {
+            return Some(Value::Number(crate::number::NumberValue::from_i32(
+                self.len() as i32,
+            )));
+        }
+        if let Ok(idx) = key.parse::<usize>() {
+            return if idx < self.len() {
+                Some(self.get(idx))
+            } else {
+                None
+            };
+        }
+        self.inner
+            .borrow()
+            .named_properties
+            .as_ref()
+            .and_then(|m| m.get(key).cloned())
     }
 
     /// Borrow the underlying storage read-only.

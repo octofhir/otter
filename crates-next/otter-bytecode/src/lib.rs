@@ -378,7 +378,19 @@ pub enum Op {
     /// Missing property reads as `undefined`. Non-object receivers
     /// raise `TypeMismatch`.
     LoadProperty,
-    /// `r<obj>.<name> = r<src>`. Operands: `obj, name_const, src`.
+    /// `r<obj>.<name> = r<src>`. Operands:
+    /// `obj, name_const, src, scratch_dst`.
+    ///
+    /// The fourth operand reserves a register that the runtime
+    /// uses as the throwaway destination when an accessor setter is
+    /// invoked on the receiver's prototype chain — the setter's
+    /// completion value is discarded by §10.1.9 OrdinarySet, but the
+    /// dispatch loop's `invoke` helper needs a register slot to
+    /// write the return into. Data-property writes leave the slot
+    /// untouched.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinaryset>
     StoreProperty,
     /// `r<dst> = delete r<obj>.<name>` (boolean result).
     /// Operands: `dst, obj, name_const`.
@@ -402,6 +414,22 @@ pub enum Op {
     StoreElement,
     /// `r<dst> = r<arr>.length`. Operands: `dst, arr`.
     ArrayLength,
+    /// `r<dst> = (r<lhs> in r<rhs>)`. Operands:
+    /// `Register(dst), Register(lhs), Register(rhs)`.
+    ///
+    /// Implements ECMA-262 §13.10.1 (`RelationalExpression in
+    /// ShiftExpression`). The right operand must be an Object;
+    /// otherwise the dispatcher raises `TypeMismatch` (eventually
+    /// `TypeError`). The left operand is coerced via §7.1.19
+    /// ToPropertyKey: strings stay as-is, symbols stay as-is,
+    /// numbers / booleans / null / undefined coerce to their display
+    /// string. The runtime walks own + prototype-chain entries for
+    /// the resolved key and writes a Boolean.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+    /// - <https://tc39.es/ecma262/#sec-hasproperty>
+    HasProperty,
     /// `r<dst> = (r<lhs> instanceof r<rhs>)`. Operands:
     /// `dst, lhs, rhs`. Foundation slice 19 semantics:
     ///
@@ -453,6 +481,39 @@ pub enum Op {
     /// the surface matches `import("./x").then(ns => ...)`.
     PromiseFulfilledOf,
 
+    /// Build a fresh `Intl.<Class>` instance. Operands:
+    /// `Register(dst), ConstIndex(class), Register(locale),
+    /// Register(options)`.
+    ///
+    /// `class` is one of `"Collator"` / `"NumberFormat"` /
+    /// `"DateTimeFormat"`. The runtime resolves the option bag at
+    /// construction time and stashes it on the resulting
+    /// `Value::Intl(JsIntl)` payload; subsequent method calls
+    /// rebuild the underlying ICU formatter / collator on demand.
+    NewIntl,
+    /// `r<dst> = Temporal.<Class>.<method>(args...)`. Operands:
+    /// `Register(dst), ConstIndex(class), ConstIndex(method),
+    /// ConstIndex(argc), Register(arg0), …`.
+    ///
+    /// Variadic. The runtime resolves `class` against the Temporal
+    /// type table (`Instant` / `Duration` / `PlainDate` / `PlainTime`
+    /// / `PlainDateTime` / `Now`) and routes `method` through the
+    /// per-class static dispatcher.
+    TemporalCall,
+    /// `r<dst> = Temporal.<member>` (read accessor). Operand pair:
+    /// `Register(dst), ConstIndex(member)`. Reserved for future
+    /// calendar / unit constants — today every Temporal member is
+    /// reached through `TemporalCall`.
+    TemporalLoad,
+    /// Build a fresh `Map` / `Set` / `WeakMap` / `WeakSet`. Operands:
+    /// `Register(dst), ConstIndex(kind_const), Register(iterable)`.
+    /// `kind_const` is a string constant naming the collection kind
+    /// (`"Map"`, `"Set"`, `"WeakMap"`, `"WeakSet"`); `iterable` is
+    /// either `Value::Undefined` (no seed) or a `Value::Array` whose
+    /// elements seed the collection. For `Map` / `WeakMap` each
+    /// seed element must itself be a 2-element array `[key, value]`;
+    /// for `Set` / `WeakSet` each element is added directly.
+    NewCollection,
     /// `r<dst> = Symbol.<name>` (well-known symbol read). Operands:
     /// `Register(dst), ConstIndex(name)`. Lowered by the compiler
     /// for static-member access on the `Symbol` namespace; the
@@ -499,6 +560,119 @@ pub enum Op {
     /// runtime simply uses the surrounding frame's async-state to
     /// decide where the suspension point's settlement lands.
     Await,
+    /// `r<dst> = Object.is(r<x>, r<y>)`. Operands:
+    /// `Register(dst), Register(x), Register(y)`. Dispatches to
+    /// ECMA-262 §7.2.11 `SameValue` via
+    /// [`otter_vm::abstract_ops::same_value`]. Distinguishes
+    /// `+0` / `-0` and treats `NaN` as equal to itself.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-samevalue>
+    /// - <https://tc39.es/ecma262/#sec-object.is>
+    SameValue,
+    /// `r<dst> = Array.isArray(r<src>)`. Operands:
+    /// `Register(dst), Register(src)`. Dispatches to ECMA-262
+    /// §7.2.2 `IsArray`. Today the runtime checks the `Value::Array`
+    /// tag directly; once Proxy lands the dispatcher walks the
+    /// proxy-target chain.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-isarray>
+    /// - <https://tc39.es/ecma262/#sec-array.isarray>
+    IsArray,
+    /// `r<dst> = (r<x> == r<y>)`. Operands:
+    /// `Register(dst), Register(x), Register(y)`. Implements
+    /// ECMA-262 §7.2.13 `IsLooselyEqual` over operands the
+    /// compiler has already coerced through
+    /// `Op::ToPrimitive(default)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-islooselyequal>
+    LooseEqual,
+    /// `r<dst> = (r<x> != r<y>)`. Operands:
+    /// `Register(dst), Register(x), Register(y)`. Negation of
+    /// [`Self::LooseEqual`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-islooselyequal>
+    LooseNotEqual,
+    /// `r<dst> = new <Kind>(r<msg>)`. Operands:
+    /// `Register(dst), ConstIndex(kind_const), Register(msg)`.
+    ///
+    /// `kind_const` references a [`Constant::String`] whose value
+    /// is the canonical class name (`"Error"` /
+    /// `"TypeError"` / `"RangeError"` / `"SyntaxError"` /
+    /// `"ReferenceError"` / `"URIError"` / `"EvalError"`). The
+    /// runtime allocates a fresh `JsObject`, links its
+    /// `[[Prototype]]` to the kind's prototype from the
+    /// interpreter's [`ErrorClassRegistry`], and stamps an own
+    /// `message` property when `msg` is not `undefined`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-error-objects>
+    /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
+    NewBuiltinError,
+    /// `r<dst> = <Kind>` (the constructor object for one of the
+    /// seven canonical error classes). Operands:
+    /// `Register(dst), ConstIndex(kind_const)`.
+    ///
+    /// Used by the compiler when a source identifier names one of
+    /// the canonical classes (e.g. `e instanceof TypeError`). The
+    /// runtime fetches the constructor object from the
+    /// interpreter's [`ErrorClassRegistry`]; the constructor
+    /// carries a `prototype` own property so `Op::Instanceof`
+    /// resolves correctly.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-error-objects>
+    LoadBuiltinError,
+    /// `r<dst> = Array.<name>(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Variadic. Routes `Array.from` / `Array.of` (the foundation
+    /// surface today) through one synchronous dispatcher.
+    /// `Array.isArray` keeps its dedicated [`Self::IsArray`] opcode.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
+    ArrayCall,
+    /// `r<dst> = Object.<name>(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Variadic, same shape as [`Self::MathCall`] / [`Self::JsonCall`].
+    /// Routes Object-namespace static calls (`defineProperty`,
+    /// `getOwnPropertyDescriptor`, `freeze`, `seal`,
+    /// `preventExtensions`, the `is*` predicates) through one
+    /// dispatcher; unknown names raise `UnknownIntrinsic`. The
+    /// canonical lowerings `Object.create` / `Object.getPrototypeOf`
+    /// / `Object.setPrototypeOf` / `Object.is` keep their dedicated
+    /// opcodes for back-compat.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
+    ObjectCall,
+    /// `r<dst> = ToPrimitive(r<src>, hint)`. Operands:
+    /// `Register(dst), Register(src), ConstIndex(hint_const)`.
+    ///
+    /// `hint_const` references a [`Constant::String`] holding one
+    /// of `"default"`, `"number"`, or `"string"` per §7.1.1 step 4.
+    ///
+    /// Already-primitive `src` short-circuits: the dispatcher writes
+    /// `src` to `dst` and advances pc. Otherwise the dispatcher
+    /// drives a multi-stage ladder over `[Symbol.toPrimitive]` and
+    /// the OrdinaryToPrimitive `valueOf` / `toString` chain. The
+    /// stages are tracked on the active frame's
+    /// [`Frame::pending_to_primitive`](otter_vm::Frame) slot; pc
+    /// stays on this opcode until the ladder produces a primitive
+    /// value (or every stage is exhausted, in which case the
+    /// dispatcher raises `TypeMismatch`).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
+    ToPrimitive,
 }
 
 impl Op {
@@ -596,6 +770,20 @@ impl Op {
             Op::SymbolCall => "SYMBOL_CALL",
             Op::TypeOf => "TYPEOF",
             Op::DeleteElement => "DELETE_ELEMENT",
+            Op::NewCollection => "NEW_COLLECTION",
+            Op::TemporalCall => "TEMPORAL_CALL",
+            Op::TemporalLoad => "TEMPORAL_LOAD",
+            Op::NewIntl => "NEW_INTL",
+            Op::SameValue => "SAME_VALUE",
+            Op::IsArray => "IS_ARRAY",
+            Op::ToPrimitive => "TO_PRIMITIVE",
+            Op::LooseEqual => "LOOSE_EQ",
+            Op::LooseNotEqual => "LOOSE_NEQ",
+            Op::NewBuiltinError => "NEW_BUILTIN_ERROR",
+            Op::LoadBuiltinError => "LOAD_BUILTIN_ERROR",
+            Op::ObjectCall => "OBJECT_CALL",
+            Op::ArrayCall => "ARRAY_CALL",
+            Op::HasProperty => "HAS_PROPERTY",
         }
     }
 
@@ -646,7 +834,10 @@ impl Op {
             | Op::ImportNamespace
             | Op::PromiseFulfilledOf
             | Op::SymbolLoad
-            | Op::TypeOf => 2,
+            | Op::TypeOf
+            | Op::TemporalLoad
+            | Op::IsArray
+            | Op::LoadBuiltinError => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -667,9 +858,14 @@ impl Op {
             | Op::GreaterThan
             | Op::GreaterEq
             | Op::LoadProperty
-            | Op::StoreProperty
             | Op::DeleteProperty
-            | Op::Instanceof => 3,
+            | Op::Instanceof
+            | Op::HasProperty
+            | Op::SameValue
+            | Op::ToPrimitive
+            | Op::LooseEqual
+            | Op::LooseNotEqual
+            | Op::NewBuiltinError => 3,
             Op::GetPrototype
             | Op::SetPrototype
             | Op::ArrayLength
@@ -677,7 +873,10 @@ impl Op {
             | Op::GetIterator
             | Op::ArrayPush => 2,
             Op::IteratorNext => 3,
+            Op::NewCollection => 3,
             Op::CallSpread => 4,
+            // dst, name_const, src, scratch_dst.
+            Op::StoreProperty => 4,
             // `NewArray` is variadic: `dst, count, elems...`. The
             // dispatcher reads the count and walks the trailing
             // operands.
@@ -687,6 +886,10 @@ impl Op {
             Op::MathCall => 3,        // dst, name_const, argc — args follow
             Op::JsonCall => 3,        // dst, name_const, argc — args follow
             Op::SymbolCall => 3,      // dst, name_const, argc — args follow
+            Op::ObjectCall => 3,      // dst, name_const, argc — args follow
+            Op::ArrayCall => 3,       // dst, name_const, argc — args follow
+            Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
+            Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
             Op::QueueMicrotask => 2,  // callee, argc — args follow
             Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
             Op::PromiseCall => 3,     // dst, name_const, argc — args follow

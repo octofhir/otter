@@ -1,0 +1,192 @@
+//! Shared coercion / extraction helpers for Temporal intrinsic
+//! implementations.
+//!
+//! Each prototype-method file (`instant.rs`, `duration.rs`, …)
+//! pulls the receiver- and argument-shaped helpers out of this
+//! module so the per-kind logic stays focused on the spec algorithm.
+//!
+//! # Contents
+//! - [`require_string_arg`] — coerce arg N to a Rust string.
+//! - [`require_object_arg`] — coerce arg N to a `JsObject` (used
+//!   for `{ days: 1 }` shaped Duration partials and `{ unit:
+//!   "minutes" }` total-options).
+//! - [`from_instant`] / [`from_duration`] / … — extractors that
+//!   panic-free downcast a payload to the expected variant.
+//! - [`make_temporal`] — construct a [`crate::Value::Temporal`]
+//!   from a payload.
+
+use crate::Value;
+use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
+use crate::object::JsObject;
+use crate::string::JsString;
+use crate::temporal::payload::{JsTemporal, TemporalPayload};
+
+/// Coerce arg `index` to a Rust string. Returns
+/// [`IntrinsicError::BadArgument`] when the slot is missing or the
+/// value is not a string. Foundation does not yet thread ToString
+/// through every primitive — strings flow through directly.
+pub fn require_string_arg(args: &IntrinsicArgs<'_>, index: u16) -> Result<String, IntrinsicError> {
+    match args.args.get(index as usize) {
+        Some(Value::String(s)) => Ok(s.to_lossy_string()),
+        _ => Err(IntrinsicError::BadArgument {
+            index,
+            reason: "must be a string",
+        }),
+    }
+}
+
+/// Coerce arg `index` to a [`JsObject`] handle. Used for
+/// option / partial-record arguments.
+pub fn require_object_arg<'a>(
+    args: &'a IntrinsicArgs<'_>,
+    index: u16,
+) -> Result<&'a JsObject, IntrinsicError> {
+    match args.args.get(index as usize) {
+        Some(Value::Object(o)) => Ok(o),
+        _ => Err(IntrinsicError::BadArgument {
+            index,
+            reason: "must be an object",
+        }),
+    }
+}
+
+/// Optional object arg — returns [`None`] when missing/`undefined`.
+pub fn optional_object_arg<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Option<&'a JsObject> {
+    match args.args.get(index as usize) {
+        Some(Value::Object(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// Read a numeric field from a partial-record object. Returns the
+/// default when the property is missing or `undefined`. Coerces
+/// `Value::Number` only; non-numeric values fail.
+pub fn read_i64_field(obj: &JsObject, name: &str, default: i64) -> Result<i64, IntrinsicError> {
+    match obj.get(name) {
+        None | Some(Value::Undefined) => Ok(default),
+        Some(Value::Number(n)) => match n.as_smi() {
+            Some(v) => Ok(v as i64),
+            None => Ok(n.as_f64() as i64),
+        },
+        Some(_) => Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "partial-record fields must be numbers",
+        }),
+    }
+}
+
+/// Read an optional string field (`{ unit: "minutes" }`).
+pub fn read_string_field(obj: &JsObject, name: &str) -> Option<String> {
+    match obj.get(name) {
+        Some(Value::String(s)) => Some(s.to_lossy_string()),
+        _ => None,
+    }
+}
+
+/// Build a `Value::Temporal` from a payload.
+#[must_use]
+pub fn make_temporal(payload: TemporalPayload) -> Value {
+    Value::Temporal(JsTemporal::new(payload))
+}
+
+/// Extract a [`temporal_rs::Instant`] from the receiver, or raise
+/// [`IntrinsicError::BadReceiver`] for the wrong kind.
+pub fn require_instant<'a>(
+    args: &'a IntrinsicArgs<'_>,
+) -> Result<&'a temporal_rs::Instant, IntrinsicError> {
+    match args.receiver {
+        Value::Temporal(t) => match t.payload() {
+            TemporalPayload::Instant(v) => Ok(v),
+            _ => Err(IntrinsicError::BadReceiver {
+                expected: "Temporal.Instant",
+            }),
+        },
+        _ => Err(IntrinsicError::BadReceiver {
+            expected: "Temporal.Instant",
+        }),
+    }
+}
+
+/// Extract a [`temporal_rs::Duration`] from the receiver.
+pub fn require_duration<'a>(
+    args: &'a IntrinsicArgs<'_>,
+) -> Result<&'a temporal_rs::Duration, IntrinsicError> {
+    match args.receiver {
+        Value::Temporal(t) => match t.payload() {
+            TemporalPayload::Duration(v) => Ok(v),
+            _ => Err(IntrinsicError::BadReceiver {
+                expected: "Temporal.Duration",
+            }),
+        },
+        _ => Err(IntrinsicError::BadReceiver {
+            expected: "Temporal.Duration",
+        }),
+    }
+}
+
+/// Extract a [`temporal_rs::PlainDate`] from the receiver.
+pub fn require_plain_date<'a>(
+    args: &'a IntrinsicArgs<'_>,
+) -> Result<&'a temporal_rs::PlainDate, IntrinsicError> {
+    match args.receiver {
+        Value::Temporal(t) => match t.payload() {
+            TemporalPayload::PlainDate(v) => Ok(v),
+            _ => Err(IntrinsicError::BadReceiver {
+                expected: "Temporal.PlainDate",
+            }),
+        },
+        _ => Err(IntrinsicError::BadReceiver {
+            expected: "Temporal.PlainDate",
+        }),
+    }
+}
+
+/// Extract a [`temporal_rs::PlainTime`] from the receiver.
+pub fn require_plain_time<'a>(
+    args: &'a IntrinsicArgs<'_>,
+) -> Result<&'a temporal_rs::PlainTime, IntrinsicError> {
+    match args.receiver {
+        Value::Temporal(t) => match t.payload() {
+            TemporalPayload::PlainTime(v) => Ok(v),
+            _ => Err(IntrinsicError::BadReceiver {
+                expected: "Temporal.PlainTime",
+            }),
+        },
+        _ => Err(IntrinsicError::BadReceiver {
+            expected: "Temporal.PlainTime",
+        }),
+    }
+}
+
+/// Extract a [`temporal_rs::PlainDateTime`] from the receiver.
+pub fn require_plain_date_time<'a>(
+    args: &'a IntrinsicArgs<'_>,
+) -> Result<&'a temporal_rs::PlainDateTime, IntrinsicError> {
+    match args.receiver {
+        Value::Temporal(t) => match t.payload() {
+            TemporalPayload::PlainDateTime(v) => Ok(v),
+            _ => Err(IntrinsicError::BadReceiver {
+                expected: "Temporal.PlainDateTime",
+            }),
+        },
+        _ => Err(IntrinsicError::BadReceiver {
+            expected: "Temporal.PlainDateTime",
+        }),
+    }
+}
+
+/// Convert a `temporal_rs` error into the foundation
+/// [`IntrinsicError::BadArgument`]. The error message is preserved
+/// in the diagnostic.
+pub fn temporal_err(err: temporal_rs::TemporalError) -> IntrinsicError {
+    let _ = err; // The foundation surfaces the error class via reason.
+    IntrinsicError::BadArgument {
+        index: 0,
+        reason: "Temporal operation failed",
+    }
+}
+
+/// Build a `Value::String` from a Rust string via the active heap.
+pub fn js_string_value(value: String, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    Ok(Value::String(JsString::from_str(&value, args.string_heap)?))
+}

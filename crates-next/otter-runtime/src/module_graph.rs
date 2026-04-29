@@ -499,9 +499,17 @@ fn is_const_pool_ref(op: Op, pos: usize) -> bool {
         | Op::MakeFunction
         | Op::MathLoad
         | Op::ImportNamespace
-        | Op::SymbolLoad => pos == 1,
+        | Op::SymbolLoad
+        | Op::TemporalLoad
+        | Op::LoadBuiltinError => pos == 1,
         // [reg, reg, const] shape
-        Op::LoadProperty | Op::DeleteProperty => pos == 2,
+        Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
+        // [reg, kind_const, reg] shape — name at pos 1 references
+        // the constant pool; the iterable at pos 2 stays raw.
+        Op::NewCollection | Op::NewBuiltinError => pos == 1,
+        // [reg, class_const, reg, reg] shape — class name at pos 1
+        // is a pool ref; locale + options are register operands.
+        Op::NewIntl => pos == 1,
         // [reg, const, reg] shape
         Op::StoreProperty => pos == 1,
         // [reg, function_const, count, parent_idxs...] —
@@ -509,7 +517,15 @@ fn is_const_pool_ref(op: Op, pos: usize) -> bool {
         Op::MakeClosure => pos == 1,
         // [reg, name_const, argc, args...] — name at pos 1;
         // argc at pos 2 stays raw.
-        Op::MathCall | Op::JsonCall | Op::PromiseCall | Op::SymbolCall => pos == 1,
+        Op::MathCall
+        | Op::JsonCall
+        | Op::PromiseCall
+        | Op::SymbolCall
+        | Op::ObjectCall
+        | Op::ArrayCall => pos == 1,
+        // `TemporalCall` is `dst, class_const, method_const, argc`
+        // — both class and method positions are pool refs.
+        Op::TemporalCall => pos == 1 || pos == 2,
         // [reg, recv, name_const, argc, args...] — name at pos 2;
         // argc at pos 3 stays raw.
         Op::CallMethodValue => pos == 2,
@@ -620,6 +636,8 @@ fn build_entry_body(
                 Operand::ConstIndex(url_const_idx),
             ],
         );
+        let r_store_scratch = next_reg;
+        next_reg += 1;
         emit_op(
             &mut code,
             &mut spans,
@@ -629,6 +647,7 @@ fn build_entry_body(
                 Operand::Register(r_meta),
                 Operand::ConstIndex(url_name_idx),
                 Operand::Register(r_url_str),
+                Operand::Register(r_store_scratch),
             ],
         );
 

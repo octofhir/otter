@@ -172,8 +172,18 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
     top.captured_names = capture::analyze_module(&program.body);
     let mut cx = Compiler::new(top);
     cx.enter_scope();
-    let mut last_value_reg: Option<u16> = None;
 
+    // §16.1.7 GlobalDeclarationInstantiation / §16.2.1.7
+    // ModuleDeclarationInstantiation step 11: top-level `var`
+    // declarations hoist to the script / module scope. Pre-bind
+    // them to `undefined` here so reads before the source-level
+    // declaration see the hoisted value rather than a TDZ error.
+    let program_span = (program.span.start, program.span.end);
+    let mut top_level_vars: Vec<String> = Vec::new();
+    hoist_var_names(&program.body, &mut top_level_vars);
+    pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
+
+    let mut last_value_reg: Option<u16> = None;
     for stmt in &program.body {
         if let Some(reg) = compile_statement(&mut cx, stmt)? {
             last_value_reg = Some(reg);
@@ -506,6 +516,15 @@ pub fn compile_module_fragment(
         );
     }
 
+    // §16.2.1.7 ModuleDeclarationInstantiation step 11 — hoist
+    // every `var`-declared name in the module body to the
+    // module-init function's variable scope, pre-bound to
+    // `undefined`. The pass is identical to the script-level
+    // `<main>` entry, just at the module-fragment level.
+    let mut module_vars: Vec<String> = Vec::new();
+    hoist_var_names(&program.body, &mut module_vars);
+    pre_declare_var_bindings(&mut cx, &module_vars, span0)?;
+
     for stmt in &program.body {
         compile_statement(&mut cx, stmt)?;
     }
@@ -575,12 +594,6 @@ fn compile_export_inner_declaration(
         oxc_ast::ast::Declaration::VariableDeclaration(v) => {
             let is_const = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
             let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
-            if is_var {
-                return Err(CompileError::Unsupported {
-                    node: "export var (foundation rejects var)".to_string(),
-                    span,
-                });
-            }
             for declarator in &v.declarations {
                 let dspan = (declarator.span.start, declarator.span.end);
                 let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id else {
@@ -590,7 +603,20 @@ fn compile_export_inner_declaration(
                     });
                 };
                 let name = id.name.as_str().to_string();
-                let storage = cx.declare_binding(&name, is_const, dspan)?;
+                // §16.2.3.7 ExportEntry: `export var x` reuses the
+                // module-scope binding pre-hoisted at module entry;
+                // `export let x` / `export const x` declare a fresh
+                // lexical binding here.
+                let storage = if is_var {
+                    cx.lookup_binding(&name)
+                        .ok_or(CompileError::Unsupported {
+                            node: format!("export var `{name}` not pre-hoisted"),
+                            span: dspan,
+                        })?
+                        .storage
+                } else {
+                    cx.declare_binding(&name, is_const, dspan)?
+                };
                 let init_reg = match &declarator.init {
                     Some(init) => compile_expr(cx, init, dspan)?,
                     None => {
@@ -753,8 +779,17 @@ enum BindingStorage {
     Upvalue { idx: u16 },
 }
 
-/// One pending loop label so `break` / `continue` can patch their
-/// offsets at scope close.
+/// One pending control-flow target so `break` / `continue` can patch
+/// their offsets at scope close.
+///
+/// Tracks both real loops (`for` / `while` / `do-while` / `for-of` /
+/// `for-in`) and pseudo-loops (`switch` body — only `break` is
+/// legal, `continue` skips switch frames per spec §13.10.1).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-iteration-statements>
+/// - <https://tc39.es/ecma262/#sec-switch-statement>
+/// - <https://tc39.es/ecma262/#sec-labelled-statements>
 #[derive(Debug, Default)]
 struct LoopFrame {
     /// Instruction PCs where `continue` emitted a placeholder
@@ -764,6 +799,35 @@ struct LoopFrame {
     /// Instruction PCs where `break` emitted a placeholder JUMP.
     /// Patched to point at the instruction after the loop body.
     break_patches: Vec<u32>,
+    /// Optional label attached to this frame by an enclosing
+    /// `LabeledStatement`. `break label;` matches against this
+    /// field walking outward; `continue label;` only matches
+    /// when [`LoopFrame::is_real_loop`] is true.
+    label: Option<String>,
+    /// `true` when the frame represents an iteration statement.
+    /// `false` for a `switch` body, where `continue` must skip the
+    /// frame and target the enclosing loop instead.
+    is_real_loop: bool,
+}
+
+impl LoopFrame {
+    fn iteration() -> Self {
+        Self {
+            continue_patches: Vec::new(),
+            break_patches: Vec::new(),
+            label: None,
+            is_real_loop: true,
+        }
+    }
+
+    fn switch_body() -> Self {
+        Self {
+            continue_patches: Vec::new(),
+            break_patches: Vec::new(),
+            label: None,
+            is_real_loop: false,
+        }
+    }
 }
 
 /// Per-function compilation context.
@@ -779,6 +843,10 @@ struct FunctionContext {
     scopes: Vec<Scope>,
     /// Stack of enclosing loops; the innermost is on top.
     loops: Vec<LoopFrame>,
+    /// Label deposited by the immediately-enclosing
+    /// `LabeledStatement` waiting to be consumed by the next pushed
+    /// loop / switch frame. See [`compile_labeled_statement`].
+    pending_label: Option<String>,
     /// Names of this function's own bindings that some nested
     /// function references — populated by
     /// [`capture::analyze_function`] before code gen starts. Each
@@ -926,6 +994,7 @@ impl FunctionContext {
             scratch: 0,
             scopes: Vec::new(),
             loops: Vec::new(),
+            pending_label: None,
             captured_names: HashSet::new(),
             own_upvalue_count: 0,
             parent_captures: Vec::new(),
@@ -952,6 +1021,14 @@ impl FunctionContext {
         let r = self.scratch;
         self.scratch = self.scratch.checked_add(1).expect("register overflow");
         r
+    }
+
+    /// Push `frame` onto the loop stack, consuming any pending
+    /// `LabeledStatement` label so `break label;` / `continue label;`
+    /// inside the body resolves to this frame.
+    fn push_loop_frame(&mut self, mut frame: LoopFrame) {
+        frame.label = self.pending_label.take();
+        self.loops.push(frame);
     }
 
     fn enter_scope(&mut self) {
@@ -1282,18 +1359,21 @@ impl FunctionContext {
         self.emit_store_property(env_reg, name, value_reg, span);
     }
 
-    /// Emit `Op::StoreProperty obj_reg, name_const, src_reg`.
+    /// Emit `Op::StoreProperty obj_reg, name_const, src_reg, scratch`.
     /// Used by the module-mode lowering to mirror writes through
     /// to `module_env` for exported bindings, and by the export
-    /// declaration arms.
+    /// declaration arms. The `scratch` slot is reserved for
+    /// accessor-setter dispatch per [`Op::StoreProperty`]'s contract.
     fn emit_store_property(&mut self, obj_reg: u16, name: &str, src: u16, span: (u32, u32)) {
         let name_const = self.intern_string_constant(name);
+        let scratch = self.alloc_scratch();
         self.emit(
             Op::StoreProperty,
             vec![
                 Operand::Register(obj_reg),
                 Operand::ConstIndex(name_const),
                 Operand::Register(src),
+                Operand::Register(scratch),
             ],
             span,
         );
@@ -1372,11 +1452,44 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
         Statement::VariableDeclaration(decl) => {
             let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
             let is_var = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+            // §14.3.2 VariableStatement — the binding itself was
+            // hoisted to the enclosing function / script / module
+            // variable scope by the entry-point pre-pass. Here we
+            // only have to evaluate each initializer (when present)
+            // and store it into the pre-bound storage.
+            // <https://tc39.es/ecma262/#sec-variable-statement>
             if is_var {
-                return Err(CompileError::Unsupported {
-                    node: "VariableDeclaration (var; foundation rejects var)".to_string(),
-                    span: (decl.span.start, decl.span.end),
-                });
+                for declarator in &decl.declarations {
+                    let span = (declarator.span.start, declarator.span.end);
+                    if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+                        let name = id.name.as_str().to_string();
+                        // No initializer → leave the hoisted
+                        // `undefined` in place per §14.3.2.1
+                        // RuntimeSemantics: Evaluation of
+                        // VariableDeclaration step 1.
+                        let Some(init) = &declarator.init else {
+                            continue;
+                        };
+                        let info = cx.lookup_binding(&name).ok_or(CompileError::Unsupported {
+                            node: format!("var `{name}` not pre-hoisted"),
+                            span,
+                        })?;
+                        let init_reg = compile_expr(cx, init, span)?;
+                        cx.emit_store_storage(init_reg, info.storage, span);
+                        cx.emit_module_export_mirror(&name, init_reg, span);
+                        continue;
+                    }
+                    // Destructuring `var [a, b] = x`. Spec-correct
+                    // semantics: every name was already hoisted —
+                    // we walk the pattern and assign each component.
+                    let init = declarator.init.as_ref().ok_or(CompileError::Unsupported {
+                        node: "var destructuring requires an initializer".to_string(),
+                        span,
+                    })?;
+                    let init_reg = compile_expr(cx, init, span)?;
+                    destructure_into(cx, init_reg, &declarator.id, span)?;
+                }
+                return Ok(None);
             }
             for declarator in &decl.declarations {
                 let span = (declarator.span.start, declarator.span.end);
@@ -1435,7 +1548,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
         Statement::WhileStatement(s) => {
             let span = (s.span.start, s.span.end);
             let loop_top = cx.next_pc;
-            cx.loops.push(LoopFrame::default());
+            cx.push_loop_frame(LoopFrame::iteration());
             let cond_reg = compile_expr(cx, &s.test, span)?;
             let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
             compile_statement(cx, &s.body)?;
@@ -1456,7 +1569,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
         Statement::DoWhileStatement(s) => {
             let span = (s.span.start, s.span.end);
             let body_top = cx.next_pc;
-            cx.loops.push(LoopFrame::default());
+            cx.push_loop_frame(LoopFrame::iteration());
             compile_statement(cx, &s.body)?;
             let continue_target = cx.next_pc;
             let cond_reg = compile_expr(cx, &s.test, span)?;
@@ -1488,7 +1601,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                     }
                 }
             }
-            cx.loops.push(LoopFrame::default());
+            cx.push_loop_frame(LoopFrame::iteration());
             let test_top = cx.next_pc;
             // Test.
             let exit_patch = if let Some(test) = &s.test {
@@ -1524,22 +1637,31 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
 
         Statement::BreakStatement(s) => {
             let span = (s.span.start, s.span.end);
-            if s.label.is_some() {
-                return Err(CompileError::Unsupported {
-                    node: "BreakStatement (labeled)".to_string(),
-                    span,
-                });
-            }
-            let loop_idx = cx
-                .loops
-                .len()
-                .checked_sub(1)
-                .ok_or(CompileError::Unsupported {
-                    node: "BreakStatement outside any loop".to_string(),
-                    span,
-                })?;
+            // §14.13 / §13.15: `break label;` targets the matching
+            // labelled enclosing statement (loop or switch). Bare
+            // `break;` targets the innermost loop or switch frame.
+            // <https://tc39.es/ecma262/#sec-break-statement>
+            let label = s.label.as_ref().map(|id| id.name.as_str().to_string());
+            let target_idx = match &label {
+                None => cx
+                    .loops
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(CompileError::Unsupported {
+                        node: "BreakStatement outside any loop or switch".to_string(),
+                        span,
+                    })?,
+                Some(name) => cx
+                    .loops
+                    .iter()
+                    .rposition(|f| f.label.as_deref() == Some(name.as_str()))
+                    .ok_or_else(|| CompileError::Unsupported {
+                        node: format!("BreakStatement: unknown label `{name}`"),
+                        span,
+                    })?,
+            };
             let pc = cx.emit_branch_placeholder(Op::Jump, None, span);
-            cx.loops[loop_idx].break_patches.push(pc);
+            cx.loops[target_idx].break_patches.push(pc);
             Ok(None)
         }
 
@@ -1838,24 +1960,55 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
 
         Statement::ContinueStatement(s) => {
             let span = (s.span.start, s.span.end);
-            if s.label.is_some() {
-                return Err(CompileError::Unsupported {
-                    node: "ContinueStatement (labeled)".to_string(),
-                    span,
-                });
-            }
-            let loop_idx = cx
-                .loops
-                .len()
-                .checked_sub(1)
-                .ok_or(CompileError::Unsupported {
-                    node: "ContinueStatement outside any loop".to_string(),
-                    span,
-                })?;
+            // §14.8: `continue` targets the innermost real iteration
+            // statement (switch frames are skipped per §13.10.1).
+            // `continue label;` targets the matching labelled loop.
+            // <https://tc39.es/ecma262/#sec-continue-statement>
+            let label = s.label.as_ref().map(|id| id.name.as_str().to_string());
+            let target_idx = match &label {
+                None => cx.loops.iter().rposition(|f| f.is_real_loop).ok_or(
+                    CompileError::Unsupported {
+                        node: "ContinueStatement outside any loop".to_string(),
+                        span,
+                    },
+                )?,
+                Some(name) => {
+                    let idx = cx
+                        .loops
+                        .iter()
+                        .rposition(|f| f.label.as_deref() == Some(name.as_str()))
+                        .ok_or_else(|| CompileError::Unsupported {
+                            node: format!("ContinueStatement: unknown label `{name}`"),
+                            span,
+                        })?;
+                    if !cx.loops[idx].is_real_loop {
+                        return Err(CompileError::Unsupported {
+                            node: format!("ContinueStatement: label `{name}` does not name a loop"),
+                            span,
+                        });
+                    }
+                    idx
+                }
+            };
             let pc = cx.emit_branch_placeholder(Op::Jump, None, span);
-            cx.loops[loop_idx].continue_patches.push(pc);
+            cx.loops[target_idx].continue_patches.push(pc);
             Ok(None)
         }
+
+        // §14.13 — `with` is forbidden in strict mode and ES modules.
+        // Foundation is always strict, so reject with a clear
+        // diagnostic rather than the generic "unsupported".
+        // <https://tc39.es/ecma262/#sec-with-statement>
+        Statement::WithStatement(w) => Err(CompileError::Unsupported {
+            node: "WithStatement is forbidden in strict mode / ES modules (§14.13)".to_string(),
+            span: (w.span.start, w.span.end),
+        }),
+
+        Statement::SwitchStatement(s) => compile_switch_statement(cx, s),
+
+        Statement::ForInStatement(s) => compile_for_in_statement(cx, s),
+
+        Statement::LabeledStatement(s) => compile_labeled_statement(cx, s),
 
         other => Err(CompileError::Unsupported {
             node: stmt_kind_name(other).to_string(),
@@ -1872,16 +2025,10 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
 fn compile_for_init_decl(
     cx: &mut Compiler,
     decl: &oxc_ast::ast::VariableDeclaration<'_>,
-    span: (u32, u32),
+    _span: (u32, u32),
 ) -> Result<(), CompileError> {
     let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
     let is_var = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
-    if is_var {
-        return Err(CompileError::Unsupported {
-            node: "for-init `var` (foundation rejects var)".to_string(),
-            span,
-        });
-    }
     for declarator in &decl.declarations {
         let span = (declarator.span.start, declarator.span.end);
         let name = match &declarator.id {
@@ -1893,7 +2040,20 @@ fn compile_for_init_decl(
                 });
             }
         };
-        let storage = cx.declare_binding(&name, is_const, span)?;
+        // §14.7.4 ForLoopEvaluation — `var` re-uses the function-
+        // scope binding pre-hoisted at function entry; `let`/`const`
+        // declare a fresh per-loop binding. Fail-fast if the var
+        // pre-pass missed a name.
+        let storage = if is_var {
+            cx.lookup_binding(&name)
+                .ok_or(CompileError::Unsupported {
+                    node: format!("for-init var `{name}` not pre-hoisted"),
+                    span,
+                })?
+                .storage
+        } else {
+            cx.declare_binding(&name, is_const, span)?
+        };
         let init_reg = match &declarator.init {
             Some(init) => compile_expr(cx, init, span)?,
             None => {
@@ -1916,6 +2076,156 @@ fn compile_for_init_decl(
 /// Rest parameters (`...t`) are materialised by the runtime via
 /// [`Op::CollectRest`] reading from the call frame's stashed
 /// trailing argument list.
+/// Walk `stmts` collecting every `var`-declared name reachable
+/// without crossing a function or class boundary. Per ECMA-262
+/// §8.1.6 VarScopedDeclarations, these names belong to the
+/// enclosing function (or script / module) variable environment.
+///
+/// Walks through:
+/// - Block statements (`{ var x; }`).
+/// - `if / else`, `while`, `do-while`, `for(;;)`, `for-in`, `for-of`,
+///   `switch` cases, `try / catch / finally`, labelled statements.
+/// - The init clause of `for(var ... ; ; )` and the head of
+///   `for(var x in/of ...)`.
+///
+/// Stops at function / class declarations: their bodies own their
+/// own variable scope.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-static-semantics-varscopeddeclarations>
+fn hoist_var_names<'a>(stmts: &[Statement<'a>], out: &mut Vec<String>) {
+    for stmt in stmts {
+        hoist_var_names_in_stmt(stmt, out);
+    }
+}
+
+fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<String>) {
+    match stmt {
+        Statement::VariableDeclaration(d)
+            if matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Var) =>
+        {
+            for declarator in d.declarations.iter() {
+                collect_pattern_var_names(&declarator.id, out);
+            }
+        }
+        Statement::BlockStatement(b) => hoist_var_names(&b.body, out),
+        Statement::IfStatement(s) => {
+            hoist_var_names_in_stmt(&s.consequent, out);
+            if let Some(alt) = &s.alternate {
+                hoist_var_names_in_stmt(alt, out);
+            }
+        }
+        Statement::WhileStatement(s) => hoist_var_names_in_stmt(&s.body, out),
+        Statement::DoWhileStatement(s) => hoist_var_names_in_stmt(&s.body, out),
+        Statement::ForStatement(s) => {
+            if let Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(d)) = &s.init
+                && matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            {
+                for declarator in d.declarations.iter() {
+                    collect_pattern_var_names(&declarator.id, out);
+                }
+            }
+            hoist_var_names_in_stmt(&s.body, out);
+        }
+        Statement::ForInStatement(s) => {
+            if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(d) = &s.left
+                && matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            {
+                for declarator in d.declarations.iter() {
+                    collect_pattern_var_names(&declarator.id, out);
+                }
+            }
+            hoist_var_names_in_stmt(&s.body, out);
+        }
+        Statement::ForOfStatement(s) => {
+            if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(d) = &s.left
+                && matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            {
+                for declarator in d.declarations.iter() {
+                    collect_pattern_var_names(&declarator.id, out);
+                }
+            }
+            hoist_var_names_in_stmt(&s.body, out);
+        }
+        Statement::SwitchStatement(s) => {
+            for case in s.cases.iter() {
+                hoist_var_names(&case.consequent, out);
+            }
+        }
+        Statement::TryStatement(s) => {
+            hoist_var_names(&s.block.body, out);
+            if let Some(handler) = &s.handler {
+                hoist_var_names(&handler.body.body, out);
+            }
+            if let Some(finalizer) = &s.finalizer {
+                hoist_var_names(&finalizer.body, out);
+            }
+        }
+        Statement::LabeledStatement(s) => hoist_var_names_in_stmt(&s.body, out),
+        // `function`, `class`, plain expressions, etc. — none
+        // contribute var-declared names to this scope.
+        _ => {}
+    }
+}
+
+/// Collect every binding identifier reachable from `pattern` —
+/// supports plain identifiers and the destructuring patterns the
+/// foundation accepts.
+fn collect_pattern_var_names(pattern: &oxc_ast::ast::BindingPattern<'_>, out: &mut Vec<String>) {
+    use oxc_ast::ast::BindingPattern;
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => out.push(id.name.as_str().to_string()),
+        BindingPattern::ArrayPattern(p) => {
+            for elem in p.elements.iter().flatten() {
+                collect_pattern_var_names(elem, out);
+            }
+            if let Some(rest) = &p.rest {
+                collect_pattern_var_names(&rest.argument, out);
+            }
+        }
+        BindingPattern::ObjectPattern(p) => {
+            for prop in p.properties.iter() {
+                collect_pattern_var_names(&prop.value, out);
+            }
+            if let Some(rest) = &p.rest {
+                collect_pattern_var_names(&rest.argument, out);
+            }
+        }
+        BindingPattern::AssignmentPattern(p) => collect_pattern_var_names(&p.left, out),
+    }
+}
+
+/// Pre-declare each hoisted `var` name on the current scope per
+/// §10.2.11 FunctionDeclarationInstantiation step 28: bind to
+/// `undefined` with `[[Mutable]]`, no TDZ. Names that already live
+/// in the current scope (formal parameters, `let`/`const` shadowing,
+/// the function's self-name) are skipped — this matches §10.2.11
+/// step 27 ("If the same name is bound by both a parameter and a
+/// VarDeclaration, the parameter binding wins").
+fn pre_declare_var_bindings(
+    cx: &mut Compiler,
+    names: &[String],
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for name in names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if cx.lookup_binding(name).is_some() {
+            // Already bound by a parameter or the function self-name —
+            // §10.2.11 step 27.b leaves the existing binding intact.
+            continue;
+        }
+        let storage = cx.declare_binding(name, false, span)?;
+        let dst = cx.alloc_scratch();
+        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+        cx.emit_store_storage(dst, storage, span);
+        cx.mark_initialized(name);
+    }
+    Ok(())
+}
+
 fn compile_function(
     parent: &mut Compiler,
     name: &str,
@@ -1979,7 +2289,14 @@ fn compile_function(
     parent.emit_store_storage(tmp, self_storage, span);
     parent.mark_initialized(name);
 
+    // §10.2.11 FunctionDeclarationInstantiation step 28 — hoist
+    // every `var`-declared name in the body to the function scope
+    // and pre-bind it to `undefined`. Reads before the source-level
+    // declaration site observe the hoisted `undefined` (no TDZ).
     if let Some(body) = body {
+        let mut var_names: Vec<String> = Vec::new();
+        hoist_var_names(&body.statements, &mut var_names);
+        pre_declare_var_bindings(parent, &var_names, span)?;
         for stmt in &body.statements {
             compile_statement(parent, stmt)?;
         }
@@ -2053,12 +2370,14 @@ fn compile_assignment(
                 dst
             }
         };
+        let store_scratch = cx.alloc_scratch();
         cx.emit(
             Op::StoreProperty,
             vec![
                 Operand::Register(obj_reg),
                 Operand::ConstIndex(name_idx),
                 Operand::Register(new_value),
+                Operand::Register(store_scratch),
             ],
             span,
         );
@@ -2631,6 +2950,31 @@ fn compile_expr(
                 }
                 _ => {}
             }
+            // ECMA-262 §19.3 / §20.5 native error constructors
+            // (`Error`, `TypeError`, `RangeError`, `SyntaxError`,
+            // `ReferenceError`, `URIError`, `EvalError`). Bare
+            // identifier reads — e.g. `e instanceof TypeError` —
+            // lower to `Op::LoadBuiltinError` so the runtime hands
+            // back the per-interpreter constructor object whose
+            // `prototype` own property feeds `Op::Instanceof`.
+            // Local bindings of the same name still take precedence
+            // (checked below via `lookup_binding`), so user code
+            // can shadow the global if it really needs to.
+            //
+            // <https://tc39.es/ecma262/#sec-error-objects>
+            if cx.lookup_binding(id.name.as_str()).is_none()
+                && find_module_import_binding(cx, id.name.as_str()).is_none()
+                && is_builtin_error_class_name(id.name.as_str())
+            {
+                let dst = cx.alloc_scratch();
+                let kind_idx = cx.intern_string_constant(id.name.as_str());
+                cx.emit(
+                    Op::LoadBuiltinError,
+                    vec![Operand::Register(dst), Operand::ConstIndex(kind_idx)],
+                    span,
+                );
+                return Ok(dst);
+            }
             // Module-mode identifier resolution: imported aliases
             // resolve to a `LoadProperty` against the source
             // module's import-record (live binding — every read
@@ -2951,10 +3295,22 @@ fn compile_expr(
                     );
                     return Ok(dst);
                 }
-                return Err(CompileError::Unsupported {
-                    node: "delete on non-member expression".to_string(),
-                    span,
-                });
+                // §13.5.1.2 — `delete` on a non-Reference returns
+                // `true`. The argument is still evaluated for side
+                // effects, then we discard it.
+                // <https://tc39.es/ecma262/#sec-delete-operator-runtime-semantics-evaluation>
+                let _ = compile_expr(cx, &u.argument, span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadTrue, vec![Operand::Register(dst)], span);
+                return Ok(dst);
+            }
+            // §13.5.2 `void expr` — evaluate, discard, return `undefined`.
+            // <https://tc39.es/ecma262/#sec-void-operator>
+            if matches!(u.operator, UnaryOperator::Void) {
+                let _ = compile_expr(cx, &u.argument, span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                return Ok(dst);
             }
             let inner = compile_expr(cx, &u.argument, span)?;
             let dst = cx.alloc_scratch();
@@ -2979,18 +3335,28 @@ fn compile_expr(
             Ok(dst)
         }
 
-        Expression::TemplateLiteral(t) if t.expressions.is_empty() && t.quasis.len() == 1 => {
-            let quasi = &t.quasis[0];
-            let cooked = quasi.value.cooked.as_deref().unwrap_or("");
-            let dst = cx.alloc_scratch();
-            let const_idx = cx.intern_string_constant(cooked);
-            cx.emit(
-                Op::LoadString,
-                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
-                (t.span.start, t.span.end),
-            );
-            Ok(dst)
+        // §13.16 — `(a, b, c)`. Evaluate each in order, return the
+        // last value.
+        // <https://tc39.es/ecma262/#sec-comma-operator>
+        Expression::SequenceExpression(s) => {
+            let span = (s.span.start, s.span.end);
+            let mut last = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, vec![Operand::Register(last)], span);
+            for expr in s.expressions.iter() {
+                last = compile_expr(cx, expr, span)?;
+            }
+            Ok(last)
         }
+
+        Expression::TemplateLiteral(t) => compile_template_literal(cx, t),
+
+        // §13.3.11 TaggedTemplate — `tag` call with `(strings, ...exprs)`.
+        // <https://tc39.es/ecma262/#sec-tagged-templates>
+        Expression::TaggedTemplateExpression(t) => compile_tagged_template(cx, t),
+
+        // §13.3.9 Optional Chaining (`a?.b`, `a?.[k]`, `a?.()`).
+        // <https://tc39.es/ecma262/#sec-optional-chains>
+        Expression::ChainExpression(c) => compile_chain_expression(cx, c),
 
         Expression::BinaryExpression(b) => {
             let span = (b.span.start, b.span.end);
@@ -3011,25 +3377,59 @@ fn compile_expr(
                 BinaryOperator::ShiftRightZeroFill => Op::Ushr,
                 BinaryOperator::StrictEquality => Op::Equal,
                 BinaryOperator::StrictInequality => Op::NotEqual,
+                // §7.2.13 IsLooselyEqual — operands flow through
+                // `Op::ToPrimitive(default)` below before the
+                // runtime applies the type-coercion table.
+                BinaryOperator::Equality => Op::LooseEqual,
+                BinaryOperator::Inequality => Op::LooseNotEqual,
                 BinaryOperator::LessThan => Op::LessThan,
                 BinaryOperator::LessEqualThan => Op::LessEq,
                 BinaryOperator::GreaterThan => Op::GreaterThan,
                 BinaryOperator::GreaterEqualThan => Op::GreaterEq,
                 BinaryOperator::Instanceof => Op::Instanceof,
-                other => {
-                    return Err(CompileError::Unsupported {
-                        node: format!("BinaryExpression ({other:?})"),
-                        span,
-                    });
+                // §13.10.1 `RelationalExpression in ShiftExpression`.
+                // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+                BinaryOperator::In => Op::HasProperty,
+            };
+            // §13.15.4 ApplyStringOrNumericBinaryOperator step 1
+            // requires both operands of `+` to pass through
+            // `ToPrimitive(default)` before the runtime decides
+            // between string concat and numeric add. Emit that
+            // coercion at compile time so the runtime never sees
+            // a non-primitive operand on the `Op::Add` fast path.
+            //
+            // §7.2.13 `IsLooselyEqual` (`==` / `!=`) consults
+            // `[Symbol.toPrimitive]` on object operands too. Same
+            // shape — emit `ToPrimitive(default)` and let the
+            // runtime work over primitives.
+            //
+            // §7.2.14 `AbstractRelationalComparison` (`<`, `<=`,
+            // `>`, `>=`) consults `ToPrimitive(number)` on each
+            // operand per step 1.
+            //
+            // <https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator>
+            // <https://tc39.es/ecma262/#sec-islooselyequal>
+            // <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
+            let (lhs_in, rhs_in) = match op {
+                Op::Add | Op::LooseEqual | Op::LooseNotEqual => {
+                    let l = emit_to_primitive(cx, lhs, "default", span);
+                    let r = emit_to_primitive(cx, rhs, "default", span);
+                    (l, r)
                 }
+                Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+                    let l = emit_to_primitive(cx, lhs, "number", span);
+                    let r = emit_to_primitive(cx, rhs, "number", span);
+                    (l, r)
+                }
+                _ => (lhs, rhs),
             };
             let dst = cx.alloc_scratch();
             cx.emit(
                 op,
                 vec![
                     Operand::Register(dst),
-                    Operand::Register(lhs),
-                    Operand::Register(rhs),
+                    Operand::Register(lhs_in),
+                    Operand::Register(rhs_in),
                 ],
                 span,
             );
@@ -3122,10 +3522,93 @@ fn compile_expr(
         Expression::NewExpression(new_expr) => {
             let new_span = (new_expr.span.start, new_expr.span.end);
             let callee = unwrap_ts_expr(&new_expr.callee);
+            // ECMA-262 §19.3 / §20.5 native error constructors —
+            // every one of `Error`, `TypeError`, `RangeError`,
+            // `SyntaxError`, `ReferenceError`, `URIError`,
+            // `EvalError` lowers to a dedicated opcode that
+            // consults the per-interpreter [`ErrorClassRegistry`]
+            // for the right prototype linkage.
+            //
+            // <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
             if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "Error"
+                && cx.lookup_binding(id.name.as_str()).is_none()
+                && find_module_import_binding(cx, id.name.as_str()).is_none()
+                && is_builtin_error_class_name(id.name.as_str())
             {
-                return compile_error_construct(cx, &new_expr.arguments, new_span);
+                return compile_builtin_error_construct(
+                    cx,
+                    id.name.as_str(),
+                    &new_expr.arguments,
+                    new_span,
+                );
+            }
+            // `new Intl.<Class>(locale?, options?)` — dedicated
+            // `Op::NewIntl` lowering. The callee is a static-member
+            // expression `Intl.<Class>`; we pull the class name out
+            // of the property and emit the constructor opcode.
+            if let Expression::StaticMemberExpression(member) = callee
+                && let Expression::Identifier(id) = &member.object
+                && id.name.as_str() == "Intl"
+                && matches!(
+                    member.property.name.as_str(),
+                    "Collator" | "NumberFormat" | "DateTimeFormat"
+                )
+            {
+                let class = member.property.name.as_str();
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let locale_reg = arg_regs.first().copied().unwrap_or_else(|| {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
+                    r
+                });
+                let options_reg = arg_regs.get(1).copied().unwrap_or_else(|| {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
+                    r
+                });
+                let dst = cx.alloc_scratch();
+                let class_idx = cx.intern_string_constant(class);
+                cx.emit(
+                    Op::NewIntl,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::ConstIndex(class_idx),
+                        Operand::Register(locale_reg),
+                        Operand::Register(options_reg),
+                    ],
+                    new_span,
+                );
+                return Ok(dst);
+            }
+            // `new Map(iter?)` / `new Set(iter?)` /
+            // `new WeakMap(iter?)` / `new WeakSet(iter?)` —
+            // dedicated `Op::NewCollection` lowering. Iterable
+            // argument is optional; when omitted the collection is
+            // empty.
+            if let Expression::Identifier(id) = callee
+                && matches!(id.name.as_str(), "Map" | "Set" | "WeakMap" | "WeakSet")
+            {
+                let kind = id.name.as_str();
+                let iter_reg = if new_expr.arguments.is_empty() {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
+                    r
+                } else {
+                    let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                    arg_regs[0]
+                };
+                let dst = cx.alloc_scratch();
+                let kind_idx = cx.intern_string_constant(kind);
+                cx.emit(
+                    Op::NewCollection,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::ConstIndex(kind_idx),
+                        Operand::Register(iter_reg),
+                    ],
+                    new_span,
+                );
+                return Ok(dst);
             }
             // `new Promise(executor)` lowers to a dedicated
             // opcode that builds a pending promise + native
@@ -3279,12 +3762,14 @@ fn compile_expr(
                         };
                         let value_reg = compile_expr(cx, &p.value, key_span)?;
                         let const_idx = cx.intern_string_constant(&key_str);
+                        let store_scratch = cx.alloc_scratch();
                         cx.emit(
                             Op::StoreProperty,
                             vec![
                                 Operand::Register(dst),
                                 Operand::ConstIndex(const_idx),
                                 Operand::Register(value_reg),
+                                Operand::Register(store_scratch),
                             ],
                             key_span,
                         );
@@ -3460,14 +3945,8 @@ fn compile_for_of_statement(
 
     // Identify the loop variable up front so we can complain
     // clearly if the head shape exceeds the foundation subset.
-    let (binding_name, is_const) = match &s.left {
+    let (binding_name, is_const, is_var) = match &s.left {
         oxc_ast::ast::ForStatementLeft::VariableDeclaration(decl) => {
-            if matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var) {
-                return Err(CompileError::Unsupported {
-                    node: "ForOfStatement: `var` head".to_string(),
-                    span,
-                });
-            }
             if decl.declarations.len() != 1 {
                 return Err(CompileError::Unsupported {
                     node: "ForOfStatement: multi-declarator head".to_string(),
@@ -3485,11 +3964,12 @@ fn compile_for_of_statement(
                 }
             };
             let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
-            (name, is_const)
+            let is_var = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+            (name, is_const, is_var)
         }
         _ => {
             return Err(CompileError::Unsupported {
-                node: "ForOfStatement: assignment-target head (foundation requires `let`/`const`)"
+                node: "ForOfStatement: assignment-target head (foundation requires `let`/`const`/`var`)"
                     .to_string(),
                 span,
             });
@@ -3507,7 +3987,7 @@ fn compile_for_of_statement(
     let value_reg = cx.alloc_scratch();
     let done_reg = cx.alloc_scratch();
 
-    cx.loops.push(LoopFrame::default());
+    cx.push_loop_frame(LoopFrame::iteration());
     let loop_top = cx.next_pc;
     cx.emit(
         Op::IteratorNext,
@@ -3520,9 +4000,20 @@ fn compile_for_of_statement(
     );
     let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
 
-    // Per-iteration scope so `let x of …` rebinds fresh each pass.
+    // §14.7.5.6 ForIn/OfBodyEvaluation: `let`/`const` re-bind per
+    // iteration in a fresh lexical scope; `var` writes back into
+    // the function-scope binding pre-hoisted at function entry.
     cx.enter_scope();
-    let storage = cx.declare_binding(&binding_name, is_const, span)?;
+    let storage = if is_var {
+        cx.lookup_binding(&binding_name)
+            .ok_or(CompileError::Unsupported {
+                node: format!("for-of var `{binding_name}` not pre-hoisted"),
+                span,
+            })?
+            .storage
+    } else {
+        cx.declare_binding(&binding_name, is_const, span)?
+    };
     cx.emit_store_storage(value_reg, storage, span);
     cx.mark_initialized(&binding_name);
     compile_statement(cx, &s.body)?;
@@ -3540,6 +4031,310 @@ fn compile_for_of_statement(
         cx.patch_branch_to_here(pc);
     }
     Ok(None)
+}
+
+/// Lower `switch (disc) { case ...; default: ...; }` per ECMA-262
+/// §14.12 SwitchStatement.
+///
+/// # Algorithm
+/// 1. Evaluate the discriminant once into a scratch register.
+/// 2. Walk every `case label:` and emit a strict-equality compare
+///    (`disc === label`) followed by `JUMP_IF_TRUE → case_body_pc`.
+///    Patch the jump targets after we know each case body's pc.
+/// 3. After all case probes, emit one unconditional `JUMP` to the
+///    `default:` body when present, or to the switch end otherwise.
+///    This implements the spec's two-pass `CaseSelector` evaluation:
+///    cases run in source order, then `default` if no case matched.
+/// 4. Compile every case body in source order, falling through into
+///    the next on missing `break`. Each body's start pc is captured
+///    so step 2's placeholders can be patched.
+/// 5. Push a [`LoopFrame::switch_frame`] so `break` targets the
+///    end of the switch and `continue` skips the frame entirely
+///    (per §13.10.1).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-switch-statement>
+/// - <https://tc39.es/ecma262/#sec-runtime-semantics-caseclauseisselected>
+fn compile_switch_statement(
+    cx: &mut Compiler,
+    s: &oxc_ast::ast::SwitchStatement<'_>,
+) -> Result<Option<u16>, CompileError> {
+    let span = (s.span.start, s.span.end);
+    let disc_reg = compile_expr(cx, &s.discriminant, span)?;
+
+    // Fresh lexical scope so per-case `let` bindings don't leak.
+    cx.enter_scope();
+    cx.push_loop_frame(LoopFrame::switch_body());
+
+    // Pass 1: emit selector comparisons for every non-default case.
+    // The placeholders carry the target PC inside the JUMP_IF_TRUE
+    // operand; we patch them once each body's pc is known.
+    let mut case_jump_pcs: Vec<(usize, u32)> = Vec::with_capacity(s.cases.len());
+    let mut default_idx: Option<usize> = None;
+    for (idx, case) in s.cases.iter().enumerate() {
+        let case_span = (case.span.start, case.span.end);
+        match &case.test {
+            Some(test) => {
+                let test_reg = compile_expr(cx, test, case_span)?;
+                let cmp_reg = cx.alloc_scratch();
+                // §13.11.1 strict equality.
+                cx.emit(
+                    Op::Equal,
+                    vec![
+                        Operand::Register(cmp_reg),
+                        Operand::Register(disc_reg),
+                        Operand::Register(test_reg),
+                    ],
+                    case_span,
+                );
+                let placeholder =
+                    cx.emit_branch_placeholder(Op::JumpIfTrue, Some(cmp_reg), case_span);
+                case_jump_pcs.push((idx, placeholder));
+            }
+            None => {
+                if default_idx.is_some() {
+                    return Err(CompileError::Unsupported {
+                        node: "SwitchStatement: multiple default clauses".to_string(),
+                        span: case_span,
+                    });
+                }
+                default_idx = Some(idx);
+            }
+        }
+    }
+    // Fall-through after all case probes — jump to default body if
+    // present, else to the end of the switch.
+    let default_jump = cx.emit_branch_placeholder(Op::Jump, None, span);
+
+    // Pass 2: compile each case body in source order.
+    let mut case_body_pcs: Vec<u32> = Vec::with_capacity(s.cases.len());
+    for case in s.cases.iter() {
+        let body_pc = cx.next_pc;
+        case_body_pcs.push(body_pc);
+        for inner in case.consequent.iter() {
+            compile_statement(cx, inner)?;
+        }
+    }
+    let switch_end_pc = cx.next_pc;
+
+    // Patch case selector jumps to their body pc.
+    for (idx, placeholder) in case_jump_pcs {
+        cx.patch_branch(placeholder, case_body_pcs[idx]);
+    }
+    // Patch the post-probe fall-through jump.
+    match default_idx {
+        Some(idx) => cx.patch_branch(default_jump, case_body_pcs[idx]),
+        None => cx.patch_branch(default_jump, switch_end_pc),
+    }
+
+    // Patch every `break` inside the switch to land at the end.
+    let frame = cx.loops.pop().expect("switch frame disappeared");
+    for pc in frame.break_patches {
+        cx.patch_branch_to_here(pc);
+    }
+    debug_assert!(
+        frame.continue_patches.is_empty(),
+        "switch frames must not collect continue patches"
+    );
+    cx.exit_scope();
+    Ok(None)
+}
+
+/// Lower `for (k in obj) { … }` per ECMA-262 §14.7.5.6
+/// `ForIn/OfHeadEvaluation` + §14.7.5.10 EnumerateObjectProperties.
+///
+/// # Algorithm
+/// 1. Evaluate the right-hand side. If it is `null` / `undefined`
+///    the loop is silently skipped (§14.7.5.6 step 7.b).
+/// 2. Snapshot the receiver's enumerable own + inherited string
+///    keys at loop entry. Foundation keeps the snapshot static —
+///    spec §14.7.5.10's "iterate keys created during enumeration"
+///    is filed against a follow-up.
+/// 3. Walk the snapshot via an integer counter; on each iteration
+///    re-bind the loop variable in a fresh per-iteration scope so
+///    `let k in o` matches §14.7.5.6 step 7.f.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-for-in-and-for-of-statements>
+/// - <https://tc39.es/ecma262/#sec-enumerate-object-properties>
+fn compile_for_in_statement(
+    cx: &mut Compiler,
+    s: &oxc_ast::ast::ForInStatement<'_>,
+) -> Result<Option<u16>, CompileError> {
+    let span = (s.span.start, s.span.end);
+    let (binding_name, is_const, is_var) = match &s.left {
+        oxc_ast::ast::ForStatementLeft::VariableDeclaration(decl) => {
+            if decl.declarations.len() != 1 {
+                return Err(CompileError::Unsupported {
+                    node: "ForInStatement: multi-declarator head".to_string(),
+                    span,
+                });
+            }
+            let declarator = &decl.declarations[0];
+            let name = match &declarator.id {
+                oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+                _ => {
+                    return Err(CompileError::Unsupported {
+                        node: "ForInStatement: destructuring head".to_string(),
+                        span,
+                    });
+                }
+            };
+            let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+            let is_var = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+            (name, is_const, is_var)
+        }
+        _ => {
+            return Err(CompileError::Unsupported {
+                node: "ForInStatement: assignment-target head (foundation requires `let`/`const`/`var`)"
+                    .to_string(),
+                span,
+            });
+        }
+    };
+
+    // Foundation lowering: convert `for (k in o)` into
+    // `for (k of Object.keys(o))` using the existing iterator
+    // machinery. The key set is captured at loop entry per
+    // step (2) above. `Object.keys` returns own enumerable
+    // string-keyed properties — close enough to the spec's
+    // EnumerateObjectProperties for foundation use cases; full
+    // proto-chain enumeration is filed as a follow-up.
+    //
+    // We emit:
+    //   r_obj = <right>;
+    //   r_keys = Object.keys(r_obj);   // Op::ObjectCall
+    //   r_iter = GetIterator(r_keys);
+    //   loop_top:
+    //     IteratorNext r_value, r_done, r_iter
+    //     JumpIfTrue r_done -> exit
+    //     <bind let k = r_value>
+    //     <body>
+    //     Jump loop_top
+    //   exit:
+    let obj_reg = compile_expr(cx, &s.right, span)?;
+    let keys_reg = cx.alloc_scratch();
+    let keys_name_idx = cx.intern_string_constant("keys");
+    cx.emit(
+        Op::ObjectCall,
+        vec![
+            Operand::Register(keys_reg),
+            Operand::ConstIndex(keys_name_idx),
+            Operand::ConstIndex(1),
+            Operand::Register(obj_reg),
+        ],
+        span,
+    );
+
+    let iter_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::GetIterator,
+        vec![Operand::Register(iter_reg), Operand::Register(keys_reg)],
+        span,
+    );
+
+    let value_reg = cx.alloc_scratch();
+    let done_reg = cx.alloc_scratch();
+
+    cx.push_loop_frame(LoopFrame::iteration());
+    let loop_top = cx.next_pc;
+    cx.emit(
+        Op::IteratorNext,
+        vec![
+            Operand::Register(value_reg),
+            Operand::Register(done_reg),
+            Operand::Register(iter_reg),
+        ],
+        span,
+    );
+    let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+
+    // §14.7.5.6 — `let`/`const` rebinds per iteration; `var`
+    // re-uses the function-scope binding.
+    cx.enter_scope();
+    let storage = if is_var {
+        cx.lookup_binding(&binding_name)
+            .ok_or(CompileError::Unsupported {
+                node: format!("for-in var `{binding_name}` not pre-hoisted"),
+                span,
+            })?
+            .storage
+    } else {
+        cx.declare_binding(&binding_name, is_const, span)?
+    };
+    cx.emit_store_storage(value_reg, storage, span);
+    cx.mark_initialized(&binding_name);
+    compile_statement(cx, &s.body)?;
+    cx.exit_scope();
+
+    let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
+    cx.patch_branch(back_jmp, loop_top);
+    cx.patch_branch_to_here(exit_jmp);
+
+    let frame = cx.loops.pop().expect("for-in loop frame");
+    for pc in frame.continue_patches {
+        cx.patch_branch(pc, loop_top);
+    }
+    for pc in frame.break_patches {
+        cx.patch_branch_to_here(pc);
+    }
+    Ok(None)
+}
+
+/// Lower `label: stmt` per ECMA-262 §14.13.
+///
+/// Foundation supports labels on iteration statements and `switch`
+/// only — every other shape (block-statement label, function
+/// declaration, etc.) is theoretically valid spec-wise but the
+/// foundation keeps the surface tight. Adding the missing shapes is
+/// purely a matter of stamping the label onto a fresh
+/// [`LoopFrame::switch_frame`]-style entry and patching break
+/// targets at scope close.
+///
+/// The label is attached to the enclosed statement by injecting it
+/// into the loop / switch frame the inner statement pushes. We
+/// detect the label site, stash the name in the next-pushed
+/// frame, and recurse into the body — the inner compile_*
+/// helpers consult `cx.loops.last()` already, so the label is
+/// visible to nested `break label;` / `continue label;`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-labelled-statements>
+fn compile_labeled_statement(
+    cx: &mut Compiler,
+    s: &oxc_ast::ast::LabeledStatement<'_>,
+) -> Result<Option<u16>, CompileError> {
+    let span = (s.span.start, s.span.end);
+    let label = s.label.name.as_str().to_string();
+    // Reject duplicate labels in the enclosing chain — §14.13.1
+    // early error.
+    if cx
+        .loops
+        .iter()
+        .any(|f| f.label.as_deref() == Some(label.as_str()))
+    {
+        return Err(CompileError::Unsupported {
+            node: format!("LabeledStatement: duplicate label `{label}` in enclosing chain"),
+            span,
+        });
+    }
+    // Stash a sentinel pending label so the next-pushed loop /
+    // switch frame picks it up.
+    let prev_pending = cx.pending_label.replace(label);
+    let result = compile_statement(cx, &s.body);
+    // If the inner statement consumed the label (pushed a frame),
+    // `pending_label` is already cleared. Otherwise (e.g., the
+    // label wraps an expression statement) the label has no
+    // attachment point — restore the previous pending and complain.
+    if cx.pending_label.is_some() {
+        cx.pending_label = prev_pending;
+        return Err(CompileError::Unsupported {
+            node: "LabeledStatement: label must wrap a loop or switch in this slice".to_string(),
+            span,
+        });
+    }
+    cx.pending_label = prev_pending;
+    result
 }
 
 /// Lower `try { … } catch (e) { … } finally { … }` per ES spec
@@ -3718,12 +4513,15 @@ fn compile_method_call(
     {
         return compile_super_method_call(cx, member.property.name.as_str(), &call.arguments, span);
     }
-    // Bare `Error("msg")` call (without `new`) is treated like
-    // `new Error("msg")` per ES spec §20.5.1.1 — same lowering.
+    // Bare `Error("msg")` / `TypeError("msg")` / etc. without
+    // `new` is treated like the matching `new <Kind>("msg")` per
+    // ES spec §20.5.1.1 — same lowering.
     if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Error"
+        && cx.lookup_binding(id.name.as_str()).is_none()
+        && find_module_import_binding(cx, id.name.as_str()).is_none()
+        && is_builtin_error_class_name(id.name.as_str())
     {
-        return compile_error_construct(cx, &call.arguments, span);
+        return compile_builtin_error_construct(cx, id.name.as_str(), &call.arguments, span);
     }
     let has_spread = call
         .arguments
@@ -3742,6 +4540,44 @@ fn compile_method_call(
             let method = member.property.name.as_str();
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
             return compile_object_builtin(cx, method, &arg_regs, span);
+        }
+        // §23.1.2 Array static surface. `Array.isArray` keeps a
+        // dedicated [`Op::IsArray`] for the §7.2.2 fast path; the
+        // remaining statics (`Array.from` / `Array.of`) route
+        // through a single variadic [`Op::ArrayCall`] dispatcher.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Array"
+        {
+            let method = member.property.name.as_str();
+            if method == "isArray" {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                if arg_regs.len() != 1 {
+                    return Err(CompileError::Unsupported {
+                        node: format!("Array.isArray/{}", arg_regs.len()),
+                        span,
+                    });
+                }
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::IsArray,
+                    vec![Operand::Register(dst), Operand::Register(arg_regs[0])],
+                    span,
+                );
+                return Ok(dst);
+            }
+            if matches!(method, "from" | "of") {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                let name_idx = cx.intern_string_constant(method);
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.iter().copied().map(Operand::Register));
+                cx.emit(Op::ArrayCall, operands, span);
+                return Ok(dst);
+            }
         }
         // `Math.<name>(args)` — lower through `Op::MathCall`. The
         // dispatcher resolves `<name>` against the namespace's
@@ -3793,6 +4629,31 @@ fn compile_method_call(
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::PromiseCall, operands, span);
+            return Ok(dst);
+        }
+        // `Temporal.<Class>.<method>(args)` — lower through
+        // `Op::TemporalCall`. The callee here is a *nested* static
+        // member expression: `member.object` is itself a member
+        // (`Temporal.<Class>`), and `member.property` is the static
+        // method name. We detect that shape directly so the runtime
+        // does not need a real `Temporal` global.
+        if let Expression::StaticMemberExpression(outer) = &member.object
+            && let Expression::Identifier(id) = &outer.object
+            && id.name.as_str() == "Temporal"
+        {
+            let class = outer.property.name.as_str();
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let class_idx = cx.intern_string_constant(class);
+            let method_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(class_idx));
+            operands.push(Operand::ConstIndex(method_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::TemporalCall, operands, span);
             return Ok(dst);
         }
         // `Symbol.<method>(args)` — `Symbol.for` / `Symbol.keyFor`.
@@ -4372,12 +5233,14 @@ fn compile_class(
             prototype_reg
         };
         let name_const = cx.intern_string_constant(&method_name);
+        let store_scratch = cx.alloc_scratch();
         cx.emit(
             Op::StoreProperty,
             vec![
                 Operand::Register(target_reg),
                 Operand::ConstIndex(name_const),
                 Operand::Register(m_reg),
+                Operand::Register(store_scratch),
             ],
             method_span,
         );
@@ -4631,18 +5494,47 @@ fn load_super_method(cx: &mut Compiler, name: &str, span: (u32, u32)) -> Result<
     Ok(dst)
 }
 
-/// Lower `new Error(arg)` / `Error(arg)` to [`Op::NewError`]. The
-/// foundation slice supports the zero- and one-argument shapes
-/// (the second `options` argument introduced by ES2022 is rejected
-/// with a clear diagnostic).
-fn compile_error_construct(
+/// `true` when `name` is one of the seven canonical native error
+/// classes (`Error`, `TypeError`, `RangeError`, `SyntaxError`,
+/// `ReferenceError`, `URIError`, `EvalError`).
+///
+/// Used by [`compile_expr`] (bare-identifier read) and
+/// [`compile_method_call`] / new-expression lowering. Local
+/// bindings of the same name take precedence — callers must
+/// confirm `lookup_binding` and `find_module_import_binding` both
+/// returned `None` before consulting this helper.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
+fn is_builtin_error_class_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Error"
+            | "TypeError"
+            | "RangeError"
+            | "SyntaxError"
+            | "ReferenceError"
+            | "URIError"
+            | "EvalError"
+    )
+}
+
+/// Lower `new <Kind>(arg)` / `<Kind>(arg)` for any of the seven
+/// canonical native error classes to [`Op::NewBuiltinError`]. The
+/// `Error` kind keeps the legacy [`Op::NewError`] lowering for
+/// backwards compatibility with already-shipped fixtures.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
+fn compile_builtin_error_construct(
     cx: &mut Compiler,
+    kind: &str,
     arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
     if arguments.len() > 1 {
         return Err(CompileError::Unsupported {
-            node: "Error: more than one argument (foundation accepts only `message`)".to_string(),
+            node: format!("{kind}: more than one argument (foundation accepts only `message`)"),
             span,
         });
     }
@@ -4654,16 +5546,30 @@ fn compile_error_construct(
         }
         Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
             return Err(CompileError::Unsupported {
-                node: "Error: spread argument".to_string(),
+                node: format!("{kind}: spread argument"),
                 span: (s.span.start, s.span.end),
             });
         }
         Some(other) => compile_expr(cx, other.to_expression(), span)?,
     };
+    if kind == "Error" {
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::NewError,
+            vec![Operand::Register(dst), Operand::Register(msg_reg)],
+            span,
+        );
+        return Ok(dst);
+    }
     let dst = cx.alloc_scratch();
+    let kind_idx = cx.intern_string_constant(kind);
     cx.emit(
-        Op::NewError,
-        vec![Operand::Register(dst), Operand::Register(msg_reg)],
+        Op::NewBuiltinError,
+        vec![
+            Operand::Register(dst),
+            Operand::ConstIndex(kind_idx),
+            Operand::Register(msg_reg),
+        ],
         span,
     );
     Ok(dst)
@@ -4712,11 +5618,612 @@ fn compile_object_builtin(
             // mirrors that.
             Ok(obj_reg)
         }
+        // `Object.is(x, y)` — ECMA-262 §20.1.2.13. Lowers to
+        // [`Op::SameValue`], which dispatches §7.2.11 SameValue.
+        // <https://tc39.es/ecma262/#sec-object.is>
+        ("is", 2) => {
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::SameValue,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(arg_regs[0]),
+                    Operand::Register(arg_regs[1]),
+                ],
+                span,
+            );
+            Ok(dst)
+        }
+        // ECMA-262 §20.1.2 / §10.1.6 — Object descriptor surface.
+        // Routed through one variadic `Op::ObjectCall` opcode.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
+        (
+            "defineProperty"
+            | "defineProperties"
+            | "getOwnPropertyDescriptor"
+            | "getOwnPropertyDescriptors"
+            | "freeze"
+            | "isFrozen"
+            | "seal"
+            | "isSealed"
+            | "preventExtensions"
+            | "isExtensible"
+            | "keys"
+            | "values"
+            | "entries"
+            | "assign"
+            | "fromEntries"
+            | "hasOwn"
+            | "getOwnPropertyNames",
+            _,
+        ) => {
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.iter().copied().map(Operand::Register));
+            cx.emit(Op::ObjectCall, operands, span);
+            Ok(dst)
+        }
         _ => Err(CompileError::Unsupported {
             node: format!("Object.{method}/{}", arg_regs.len()),
             span,
         }),
     }
+}
+
+/// Lower a template literal `\`hello ${x} world\`` per §13.2.8 — a
+/// sequence of `String` concats over cooked quasis and
+/// interpolations.
+///
+/// # Algorithm
+/// Per ECMA-262 §13.2.8.6:
+/// 1. Evaluate `quasi[0].cooked` → result.
+/// 2. For each expression `expr[i]`: `result = result + ToString(expr[i])`.
+///    The runtime handles `ToString` via `Op::Add`'s string-or-numeric
+///    ladder once `Op::ToPrimitive(default)` ran on each operand —
+///    template-literal interpolations always produce strings, so the
+///    `+` lowering works out of the box.
+/// 3. After each interpolation, append `quasi[i+1].cooked`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-template-literals>
+fn compile_template_literal(
+    cx: &mut Compiler,
+    t: &oxc_ast::ast::TemplateLiteral<'_>,
+) -> Result<u16, CompileError> {
+    let span = (t.span.start, t.span.end);
+    if t.expressions.is_empty() && t.quasis.len() == 1 {
+        let cooked = t.quasis[0].value.cooked.as_deref().unwrap_or("");
+        let dst = cx.alloc_scratch();
+        let const_idx = cx.intern_string_constant(cooked);
+        cx.emit(
+            Op::LoadString,
+            vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            span,
+        );
+        return Ok(dst);
+    }
+    // Seed with first cooked quasi.
+    let mut acc = {
+        let cooked = t.quasis[0].value.cooked.as_deref().unwrap_or("");
+        let dst = cx.alloc_scratch();
+        let const_idx = cx.intern_string_constant(cooked);
+        cx.emit(
+            Op::LoadString,
+            vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            span,
+        );
+        dst
+    };
+    for (i, expr) in t.expressions.iter().enumerate() {
+        let expr_reg = compile_expr(cx, expr, span)?;
+        // Mirror the BinaryExpression `+` lowering: pass each operand
+        // through ToPrimitive(default) so `Op::Add`'s string-or-
+        // numeric ladder fires correctly when an object exposes
+        // `[Symbol.toPrimitive]` / `valueOf` / `toString`.
+        let lhs_in = emit_to_primitive(cx, acc, "default", span);
+        let rhs_in = emit_to_primitive(cx, expr_reg, "default", span);
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::Add,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(lhs_in),
+                Operand::Register(rhs_in),
+            ],
+            span,
+        );
+        acc = dst;
+        // Append the next cooked quasi.
+        let cooked = t.quasis[i + 1].value.cooked.as_deref().unwrap_or("");
+        if !cooked.is_empty() {
+            let quasi_reg = cx.alloc_scratch();
+            let const_idx = cx.intern_string_constant(cooked);
+            cx.emit(
+                Op::LoadString,
+                vec![Operand::Register(quasi_reg), Operand::ConstIndex(const_idx)],
+                span,
+            );
+            let lhs_in = emit_to_primitive(cx, acc, "default", span);
+            let rhs_in = emit_to_primitive(cx, quasi_reg, "default", span);
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::Add,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(lhs_in),
+                    Operand::Register(rhs_in),
+                ],
+                span,
+            );
+            acc = dst;
+        }
+    }
+    Ok(acc)
+}
+
+/// Lower a tagged-template call: `tag\`...${a}...${b}...\`` per
+/// ECMA-262 §13.3.11.4.
+///
+/// # Algorithm
+/// 1. Build the `strings` array — `cooked` quasis in order. Attach
+///    a `.raw` own property whose value is an array of the same
+///    length holding the raw quasi text.
+/// 2. Evaluate every interpolation expression, in source order.
+/// 3. Call `tag(strings, ...exprs)` with `this = undefined` (foundation
+///    matches the spec's `Reference` resolution; method-receiver
+///    forms via `obj.tag\`...\`` are filed as a follow-up).
+///
+/// `strings.raw` is installed via `Op::StoreProperty` for foundation
+/// fidelity; spec mandates the strings array be frozen and the `raw`
+/// array be a separate own property — the foundation slice ships
+/// the un-frozen shape and files freezing as a follow-up.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-tagged-templates>
+/// - <https://tc39.es/ecma262/#sec-runtime-semantics-getemplateobject>
+fn compile_tagged_template(
+    cx: &mut Compiler,
+    t: &oxc_ast::ast::TaggedTemplateExpression<'_>,
+) -> Result<u16, CompileError> {
+    let span = (t.span.start, t.span.end);
+
+    // §22.1.2.4 String.raw — recognise the literal call shape
+    // `String.raw\`...\`` and inline the raw-text reconstruction.
+    // Avoids the need for a real `String` namespace binding.
+    // <https://tc39.es/ecma262/#sec-string.raw>
+    if let Expression::StaticMemberExpression(member) = &t.tag
+        && let Expression::Identifier(id) = &member.object
+        && id.name.as_str() == "String"
+        && member.property.name.as_str() == "raw"
+        && cx.lookup_binding("String").is_none()
+    {
+        return compile_string_raw_template(cx, &t.quasi, span);
+    }
+
+    let tag_reg = compile_expr(cx, &t.tag, span)?;
+
+    // Build cooked + raw quasi arrays.
+    let mut cooked_regs: Vec<u16> = Vec::with_capacity(t.quasi.quasis.len());
+    let mut raw_regs: Vec<u16> = Vec::with_capacity(t.quasi.quasis.len());
+    for q in t.quasi.quasis.iter() {
+        let cooked = q.value.cooked.as_deref().unwrap_or("");
+        let raw = q.value.raw.as_str();
+        let cr = cx.alloc_scratch();
+        let ci = cx.intern_string_constant(cooked);
+        cx.emit(
+            Op::LoadString,
+            vec![Operand::Register(cr), Operand::ConstIndex(ci)],
+            span,
+        );
+        let rr = cx.alloc_scratch();
+        let ri = cx.intern_string_constant(raw);
+        cx.emit(
+            Op::LoadString,
+            vec![Operand::Register(rr), Operand::ConstIndex(ri)],
+            span,
+        );
+        cooked_regs.push(cr);
+        raw_regs.push(rr);
+    }
+
+    // Materialise the cooked array.
+    let strings_reg = cx.alloc_scratch();
+    let mut cooked_operands: Vec<Operand> = Vec::with_capacity(2 + cooked_regs.len());
+    cooked_operands.push(Operand::Register(strings_reg));
+    cooked_operands.push(Operand::ConstIndex(cooked_regs.len() as u32));
+    cooked_operands.extend(cooked_regs.iter().copied().map(Operand::Register));
+    cx.emit(Op::NewArray, cooked_operands, span);
+
+    // Materialise the raw array.
+    let raw_arr_reg = cx.alloc_scratch();
+    let mut raw_operands: Vec<Operand> = Vec::with_capacity(2 + raw_regs.len());
+    raw_operands.push(Operand::Register(raw_arr_reg));
+    raw_operands.push(Operand::ConstIndex(raw_regs.len() as u32));
+    raw_operands.extend(raw_regs.iter().copied().map(Operand::Register));
+    cx.emit(Op::NewArray, raw_operands, span);
+
+    // Attach `strings.raw = raw_arr`.
+    cx.emit_store_property(strings_reg, "raw", raw_arr_reg, span);
+
+    // Evaluate interpolations.
+    let mut arg_regs: Vec<u16> = Vec::with_capacity(1 + t.quasi.expressions.len());
+    arg_regs.push(strings_reg);
+    for expr in t.quasi.expressions.iter() {
+        arg_regs.push(compile_expr(cx, expr, span)?);
+    }
+
+    // Emit `tag(strings, ...exprs)`.
+    let dst = cx.alloc_scratch();
+    let mut call_operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+    call_operands.push(Operand::Register(dst));
+    call_operands.push(Operand::Register(tag_reg));
+    call_operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+    call_operands.extend(arg_regs.into_iter().map(Operand::Register));
+    cx.emit(Op::Call, call_operands, span);
+    Ok(dst)
+}
+
+/// Inline §22.1.2.4 `String.raw` for the tagged-template call shape.
+/// Walks raw quasi text + interpolations, concatenating each.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-string.raw>
+fn compile_string_raw_template(
+    cx: &mut Compiler,
+    quasi: &oxc_ast::ast::TemplateLiteral<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    // Seed accumulator with the first raw quasi.
+    let mut acc = {
+        let raw = quasi.quasis[0].value.raw.as_str();
+        let dst = cx.alloc_scratch();
+        let const_idx = cx.intern_string_constant(raw);
+        cx.emit(
+            Op::LoadString,
+            vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            span,
+        );
+        dst
+    };
+    for (i, expr) in quasi.expressions.iter().enumerate() {
+        let expr_reg = compile_expr(cx, expr, span)?;
+        let lhs_in = emit_to_primitive(cx, acc, "default", span);
+        let rhs_in = emit_to_primitive(cx, expr_reg, "default", span);
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::Add,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(lhs_in),
+                Operand::Register(rhs_in),
+            ],
+            span,
+        );
+        acc = dst;
+        let raw = quasi.quasis[i + 1].value.raw.as_str();
+        if !raw.is_empty() {
+            let qr = cx.alloc_scratch();
+            let const_idx = cx.intern_string_constant(raw);
+            cx.emit(
+                Op::LoadString,
+                vec![Operand::Register(qr), Operand::ConstIndex(const_idx)],
+                span,
+            );
+            let lhs_in = emit_to_primitive(cx, acc, "default", span);
+            let rhs_in = emit_to_primitive(cx, qr, "default", span);
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::Add,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(lhs_in),
+                    Operand::Register(rhs_in),
+                ],
+                span,
+            );
+            acc = dst;
+        }
+    }
+    Ok(acc)
+}
+
+/// Lower an optional chain `a?.b?.c?.()` per §13.3.9.
+///
+/// # Algorithm
+/// 1. Walk to the chain root, collecting each step (member access /
+///    call) and its `optional` flag in source order.
+/// 2. Compile the root, then apply each step:
+///    - Evaluate the receiver into a scratch register.
+///    - If the step is optional, emit `JumpIfNullish receiver →
+///      exit` to short-circuit when the receiver is `null` or
+///      `undefined`. The exit target writes `undefined` into the
+///      result register.
+///    - Otherwise, perform the property load / call as usual.
+/// 3. After the final step writes its value, emit an unconditional
+///    jump past the exit handler so the chain's success result lands
+///    directly in the output register.
+///
+/// Foundation simplifications:
+/// - Optional `super` chains (`super?.foo`) are illegal per §15.6.4
+///   and not exercised here.
+/// - `delete a?.b` follows the no-op rule §13.3.9.5; foundation
+///   relies on the chain producing `undefined` and the regular
+///   `delete` path handling the rest.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-optional-chains>
+/// - <https://tc39.es/ecma262/#sec-optional-chaining-evaluation>
+fn compile_chain_expression(
+    cx: &mut Compiler,
+    chain: &oxc_ast::ast::ChainExpression<'_>,
+) -> Result<u16, CompileError> {
+    let span = (chain.span.start, chain.span.end);
+    let result = cx.alloc_scratch();
+    let exits = compile_chain_into(cx, &chain.expression, result)?;
+    // Success path falls through here — jump past the undefined
+    // writer so the chain's value lives in `result`.
+    let join = cx.emit_branch_placeholder(Op::Jump, None, span);
+    // Land every optional-step short-circuit at the undefined writer.
+    for pc in exits {
+        cx.patch_branch_to_here(pc);
+    }
+    cx.emit(Op::LoadUndefined, vec![Operand::Register(result)], span);
+    cx.patch_branch_to_here(join);
+    Ok(result)
+}
+
+/// Recursive helper: compile one chain element, writing the success
+/// result into `result_reg`. Returns the list of short-circuit
+/// jump PCs that should land at the chain's `undefined` writer.
+fn compile_chain_into(
+    cx: &mut Compiler,
+    elem: &oxc_ast::ast::ChainElement<'_>,
+    result_reg: u16,
+) -> Result<Vec<u32>, CompileError> {
+    use oxc_ast::ast::ChainElement;
+    match elem {
+        ChainElement::CallExpression(call) => {
+            let span = (call.span.start, call.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let callee_reg = compile_chain_callee(cx, &call.callee, &mut exits)?;
+            if call.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(callee_reg), span);
+                exits.push(pc);
+            }
+            // Compile call arguments.
+            let mut arg_regs: Vec<u16> = Vec::with_capacity(call.arguments.len());
+            for arg in call.arguments.iter() {
+                if let Some(expr) = arg.as_expression() {
+                    arg_regs.push(compile_expr(cx, expr, span)?);
+                } else {
+                    return Err(CompileError::Unsupported {
+                        node: "ChainExpression: spread argument".to_string(),
+                        span,
+                    });
+                }
+            }
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(result_reg));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::Call, operands, span);
+            Ok(exits)
+        }
+        ChainElement::StaticMemberExpression(m) => {
+            let span = (m.span.start, m.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+            if m.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), span);
+                exits.push(pc);
+            }
+            let name_idx = cx.intern_string_constant(m.property.name.as_str());
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(result_reg),
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            Ok(exits)
+        }
+        ChainElement::ComputedMemberExpression(m) => {
+            let span = (m.span.start, m.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+            if m.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), span);
+                exits.push(pc);
+            }
+            let key_reg = compile_expr(cx, &m.expression, span)?;
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(result_reg),
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            Ok(exits)
+        }
+        other => Err(CompileError::Unsupported {
+            node: format!("ChainElement ({:?})", std::mem::discriminant(other)),
+            span: (0, 0),
+        }),
+    }
+}
+
+/// Compile a chain object — either another chain step (recurse) or a
+/// regular expression. Threads short-circuit jump PCs upward.
+fn compile_chain_object(
+    cx: &mut Compiler,
+    expr: &oxc_ast::ast::Expression<'_>,
+    exits: &mut Vec<u32>,
+) -> Result<u16, CompileError> {
+    if let Some(elem) = expression_as_chain_element(expr) {
+        let result_reg = cx.alloc_scratch();
+        let inner = compile_chain_into_chain_object(cx, elem, result_reg)?;
+        exits.extend(inner);
+        return Ok(result_reg);
+    }
+    let span = expression_span(expr);
+    compile_expr(cx, expr, span)
+}
+
+/// Same as [`compile_chain_object`] but accepts a callee position
+/// (the callee of `a?.b()`'s call step).
+fn compile_chain_callee(
+    cx: &mut Compiler,
+    expr: &oxc_ast::ast::Expression<'_>,
+    exits: &mut Vec<u32>,
+) -> Result<u16, CompileError> {
+    if let Some(elem) = expression_as_chain_element(expr) {
+        let result_reg = cx.alloc_scratch();
+        let inner = compile_chain_into_chain_object(cx, elem, result_reg)?;
+        exits.extend(inner);
+        return Ok(result_reg);
+    }
+    let span = expression_span(expr);
+    compile_expr(cx, expr, span)
+}
+
+/// Internal — same as [`compile_chain_into`] but borrows the element
+/// reference rather than cloning, since OXC doesn't expose a free
+/// conversion. We inline the dispatch here.
+fn compile_chain_into_chain_object(
+    cx: &mut Compiler,
+    elem: ChainObjectRef<'_>,
+    result_reg: u16,
+) -> Result<Vec<u32>, CompileError> {
+    match elem {
+        ChainObjectRef::Static(m) => {
+            let span = (m.span.start, m.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+            if m.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), span);
+                exits.push(pc);
+            }
+            let name_idx = cx.intern_string_constant(m.property.name.as_str());
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(result_reg),
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            Ok(exits)
+        }
+        ChainObjectRef::Computed(m) => {
+            let span = (m.span.start, m.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let obj_reg = compile_chain_object(cx, &m.object, &mut exits)?;
+            if m.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(obj_reg), span);
+                exits.push(pc);
+            }
+            let key_reg = compile_expr(cx, &m.expression, span)?;
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(result_reg),
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            Ok(exits)
+        }
+        ChainObjectRef::Call(c) => {
+            let span = (c.span.start, c.span.end);
+            let mut exits: Vec<u32> = Vec::new();
+            let callee_reg = compile_chain_callee(cx, &c.callee, &mut exits)?;
+            if c.optional {
+                let pc = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(callee_reg), span);
+                exits.push(pc);
+            }
+            let mut arg_regs: Vec<u16> = Vec::with_capacity(c.arguments.len());
+            for arg in c.arguments.iter() {
+                if let Some(expr) = arg.as_expression() {
+                    arg_regs.push(compile_expr(cx, expr, span)?);
+                } else {
+                    return Err(CompileError::Unsupported {
+                        node: "ChainExpression: spread argument".to_string(),
+                        span,
+                    });
+                }
+            }
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(result_reg));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::Call, operands, span);
+            Ok(exits)
+        }
+    }
+}
+
+/// Borrowed handle for an inner chain step — avoids cloning OXC's
+/// arena-allocated nodes.
+enum ChainObjectRef<'a> {
+    Static(&'a oxc_ast::ast::StaticMemberExpression<'a>),
+    Computed(&'a oxc_ast::ast::ComputedMemberExpression<'a>),
+    Call(&'a oxc_ast::ast::CallExpression<'a>),
+}
+
+fn expression_as_chain_element<'a>(
+    expr: &'a oxc_ast::ast::Expression<'a>,
+) -> Option<ChainObjectRef<'a>> {
+    match expr {
+        Expression::StaticMemberExpression(m) => Some(ChainObjectRef::Static(m)),
+        Expression::ComputedMemberExpression(m) => Some(ChainObjectRef::Computed(m)),
+        Expression::CallExpression(c) => Some(ChainObjectRef::Call(c)),
+        _ => None,
+    }
+}
+
+fn expression_span(expr: &oxc_ast::ast::Expression<'_>) -> (u32, u32) {
+    use oxc_span::GetSpan;
+    let s = expr.span();
+    (s.start, s.end)
+}
+
+/// Emit `Op::ToPrimitive(hint)` reading from `src_reg` and writing
+/// into a fresh scratch register; return the scratch register.
+///
+/// Used by the `+` lowering path to satisfy §13.15.4
+/// `ApplyStringOrNumericBinaryOperator` step 1: both operands must
+/// pass through `ToPrimitive(default)` before the runtime decides
+/// between string concat and numeric add. The runtime fast-path
+/// short-circuits on already-primitive values, so the extra
+/// instruction is cheap.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-toprimitive>
+fn emit_to_primitive(cx: &mut Compiler, src_reg: u16, hint: &str, span: (u32, u32)) -> u16 {
+    let dst = cx.alloc_scratch();
+    let hint_idx = cx.intern_string_constant(hint);
+    cx.emit(
+        Op::ToPrimitive,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(src_reg),
+            Operand::ConstIndex(hint_idx),
+        ],
+        span,
+    );
+    dst
 }
 
 fn compile_call_args(

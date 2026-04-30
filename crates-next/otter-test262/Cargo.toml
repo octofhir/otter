@@ -1,0 +1,40 @@
+[package]
+name = "otter-test262"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+license.workspace = true
+description = "Test262 conformance runner for the new-engine (crates-next/*) Otter stack."
+
+[lib]
+name = "otter_test262"
+path = "src/lib.rs"
+
+[[bin]]
+name = "otter-test262"
+path = "src/main.rs"
+
+[dependencies]
+# Active runtime / VM surface — per docs/new-engine/tasks/100-test262-conformance.md
+# §"Crate skeleton" (slice 101).
+otter-runtime = { workspace = true }
+
+# Parsing helpers (frontmatter + reports).
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yaml  = "0.9"
+toml        = { workspace = true }
+
+# CLI + traversal + parallelism. Slice 101 picks `rayon` over `tokio`
+# per task-100 §"Crate skeleton" — the test262 driver is CPU-bound
+# per worker and the per-test isolation rules out shared async runtime
+# state.
+clap        = { workspace = true }
+walkdir     = "2"
+ignore      = "0.4"
+rayon       = "1.10"
+indicatif   = "0.18"
+
+# Errors.
+anyhow      = "1"
+thiserror   = { workspace = true }

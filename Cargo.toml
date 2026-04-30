@@ -11,6 +11,7 @@ members = [
     "crates-next/otter-vm",
     "crates-next/otter-runtime",
     "crates-next/otter-test",
+    "crates-next/otter-test262",
     "crates-next/otter-cli",
 ]
 exclude = [

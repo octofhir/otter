@@ -110,6 +110,43 @@ test262-full *args:
 test262-conformance:
     cargo run --profile test262 -p otter-test262 --bin gen-conformance
 
+# === Test262 (new engine, crates-next/otter-test262) ===
+#
+# The canonical conformance surface for the foundation runtime.
+# See docs/new-engine/tasks/100-test262-conformance.md.
+
+# Walk vendor/test262 without executing any tests (slice 101).
+test262-next-dry *args:
+    cargo run -p otter-test262 -- run --dry-run {{args}}
+
+# Same as test262-next-dry — short alias.
+test262-dry *args:
+    cargo run -p otter-test262 -- run --dry-run {{args}}
+
+# Pretty-print a test's frontmatter (slice 102).
+test262-next-parse path:
+    cargo run -p otter-test262 -- parse {{path}}
+
+# Emit a histogram of `features:` tokens across the corpus (slice 102).
+test262-next-features:
+    cargo run -p otter-test262 -- run --dry-run --collect-features
+
+# Run the corpus end-to-end (slice 103+). Pass --filter / --shard / etc.
+test262-next *args:
+    cargo run --release -p otter-test262 -- run {{args}}
+
+# Diff a freshly produced report against an earlier baseline (slice 104).
+test262-next-diff previous:
+    cargo run -p otter-test262 -- diff {{previous}}
+
+# Shard helper: just test262-next-shard 3/8 -- runs --shard 3/8 (slice 104).
+test262-next-shard shard *args:
+    cargo run --release -p otter-test262 -- run --shard {{shard}} {{args}}
+
+# Run under the safety wrapper (slice 105). Linux-only ulimit + heap cap.
+test262-next-safe *args:
+    bash scripts/test262-safe.sh {{args}}
+
 # === Node Compatibility Tests ===
 
 # Fetch the official Node.js test suite used by the node-compat runner.

@@ -1,9 +1,11 @@
 //! `otter-test262` CLI entry point.
 //!
-//! Slice 101 ships the skeleton: corpus traversal, `--dry-run`, and
-//! a refusal-to-launch check on the `vendor/test262` submodule.
-//! Real metadata parsing / per-test execution / reports land with
-//! slices 102 → 105.
+//! Slice 101 ships the skeleton (corpus traversal, `--dry-run`, and
+//! a refusal-to-launch check on the `vendor/test262` submodule).
+//! Slice 102 adds the YAML frontmatter parser, the `parse`
+//! subcommand, and the `--collect-features` histogram. Real
+//! per-test execution / reports / sharding land with slices 103 →
+//! 105.
 //!
 //! Spec links:
 //! - <https://tc39.es/ecma262/>
@@ -18,6 +20,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use otter_test262::config::Test262Config;
+use otter_test262::metadata::Frontmatter;
 use otter_test262::runner::{CorpusError, ensure_corpus_present, list_tests};
 
 /// Default per-test timeout in milliseconds (slice 103 wires the
@@ -32,8 +36,8 @@ const DEFAULT_MAX_HEAP_BYTES: u64 = 512 * 1024 * 1024;
     name = "otter-test262",
     about = "Test262 conformance runner for the new-engine Otter stack.",
     long_about = "Drives the tc39/test262 corpus through the active otter-runtime / \
-                  otter-vm stack and publishes a versioned baseline. Slice 101 only \
-                  wires the skeleton — see docs/new-engine/tasks/100-test262-conformance.md."
+                  otter-vm stack and publishes a versioned baseline. See \
+                  docs/new-engine/tasks/100-test262-conformance.md."
 )]
 struct Cli {
     /// Path to the repository root. Defaults to the current
@@ -48,8 +52,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the corpus (slice 101: only `--dry-run` is wired).
+    /// Run the corpus (slice 101: `--dry-run`; slice 102:
+    /// `--collect-features`; real execution lands in slice 103).
     Run(RunArgs),
+    /// Pretty-print a single test's frontmatter (slice 102).
+    Parse(ParseArgs),
     /// Diff a freshly produced report against an earlier baseline
     /// (lands in slice 104).
     Diff(DiffArgs),
@@ -85,14 +92,15 @@ struct RunArgs {
     config: Option<PathBuf>,
 
     /// Walk the corpus and print the test count without executing
-    /// anything. The only mode wired in slice 101.
+    /// anything.
     #[arg(long)]
     dry_run: bool,
+}
 
-    /// Print the histogram of `features:` tokens encountered in the
-    /// corpus (lands in slice 102).
-    #[arg(long)]
-    collect_features: bool,
+#[derive(Parser, Debug)]
+struct ParseArgs {
+    /// Path to a single Test262 test file.
+    path: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -119,8 +127,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         .unwrap_or_else(|| std::env::current_dir().expect("cwd should be readable"));
     match cli.command {
         Command::Run(args) => run(&repo_root, args),
+        Command::Parse(args) => parse(args),
         Command::Diff(args) => {
-            // Slice 104 wires the real diff. Slice 101 surfaces
+            // Slice 104 wires the real diff. Earlier slices surface
             // an actionable stub so users see the gate.
             let _ = args;
             eprintln!("error: `diff` subcommand lands in slice 104.");
@@ -156,14 +165,11 @@ fn run(repo_root: &std::path::Path, args: RunArgs) -> Result<ExitCode> {
             .unwrap_or(DEFAULT_MAX_HEAP_BYTES)
     });
 
-    if args.collect_features {
-        eprintln!("error: --collect-features lands in slice 102.");
-        return Ok(ExitCode::from(2));
-    }
+    let _config = Test262Config::load_or_default(args.config.as_deref());
 
     if !args.dry_run {
         eprintln!(
-            "error: only --dry-run is wired in slice 101. Real execution lands with slice 103."
+            "error: only --dry-run is wired pre-slice-103. Real execution (with config-driven `skip_features`) lands with slice 103."
         );
         return Ok(ExitCode::from(2));
     }
@@ -175,3 +181,21 @@ fn run(repo_root: &std::path::Path, args: RunArgs) -> Result<ExitCode> {
     }
     Ok(ExitCode::SUCCESS)
 }
+
+/// Implementation of `parse <path>` — read one test, parse the
+/// frontmatter, pretty-print as JSON.
+fn parse(args: ParseArgs) -> Result<ExitCode> {
+    let source = std::fs::read_to_string(&args.path)
+        .with_context(|| format!("failed to read {}", args.path.display()))?;
+    let fm = match Frontmatter::parse(&source) {
+        Ok(fm) => fm,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let json = serde_json::to_string_pretty(&fm).context("failed to serialise frontmatter")?;
+    println!("{json}");
+    Ok(ExitCode::SUCCESS)
+}
+

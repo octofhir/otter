@@ -127,10 +127,6 @@ test262-dry *args:
 test262-next-parse path:
     cargo run -p otter-test262 -- parse {{path}}
 
-# Emit a histogram of `features:` tokens across the corpus (slice 102).
-test262-next-features:
-    cargo run -p otter-test262 -- run --dry-run --collect-features
-
 # Run the corpus end-to-end (slice 103+). Pass --filter / --shard / etc.
 test262-next *args:
     cargo run --release -p otter-test262 -- run {{args}}

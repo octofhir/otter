@@ -38,3 +38,6 @@ indicatif   = "0.18"
 # Errors.
 anyhow      = "1"
 thiserror   = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

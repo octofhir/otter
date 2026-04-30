@@ -208,7 +208,8 @@ impl std::fmt::Debug for ModuleLoader {
     }
 }
 
-const FOUNDATION_EXTENSIONS: &[&str] = &["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx"];
+const FOUNDATION_EXTENSIONS: &[&str] =
+    &["ts", "mts", "cts", "tsx", "js", "mjs", "cjs", "jsx", "json"];
 
 impl ModuleLoader {
     /// Construct a loader rooted at `base_dir` with foundation
@@ -339,14 +340,36 @@ impl ModuleLoader {
     ) -> Result<ResolvedSource, LoaderError> {
         let url = self.resolve(specifier, referrer)?;
         let path = url.strip_prefix("file://").unwrap_or(&url);
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        // §16.2 JSON modules — `.json` files load as a single
+        // `export default <parsed>` module. The foundation realises
+        // this by wrapping the raw JSON text in a module shim;
+        // every JSON value (object, array, string, number, boolean,
+        // null) is a valid parenthesised JS expression. Behaviour
+        // matches the import-attributes proposal's `with { type:
+        // "json" }` form even when the attribute is omitted, so
+        // ergonomic `import data from "./x.json"` works without
+        // the host having to surface the attribute parse.
+        // <https://tc39.es/proposal-json-modules/>
+        if extension == "json" {
+            let raw = std::fs::read_to_string(path).map_err(|e| LoaderError::Load {
+                url: url.clone(),
+                message: e.to_string(),
+            })?;
+            let wrapped = format!("export default ({raw});\n");
+            return Ok(ResolvedSource {
+                url,
+                kind: SourceKind::JavaScript,
+                text: wrapped,
+            });
+        }
         let kind = otter_syntax::detect_source_kind(Path::new(path)).ok_or_else(|| {
             LoaderError::Extension {
                 url: url.clone(),
-                extension: Path::new(path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_string(),
+                extension: extension.to_string(),
             }
         })?;
         let text = std::fs::read_to_string(path).map_err(|e| LoaderError::Load {

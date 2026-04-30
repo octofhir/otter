@@ -37,6 +37,7 @@ pub mod bigint;
 pub mod collections;
 pub mod collections_prototype;
 pub mod error_classes;
+pub mod global_functions;
 pub mod intl;
 pub mod intrinsics;
 pub mod json;
@@ -1101,7 +1102,6 @@ impl std::error::Error for RunError {}
 /// Match-based dispatch loop. The harness baseline; slice tasks may
 /// later switch to threaded dispatch after benchmark-driven review
 /// (foundation plan §"Interpreter requirements").
-#[derive(Debug)]
 pub struct Interpreter {
     interrupt: InterruptFlag,
     string_heap: Arc<StringHeap>,
@@ -1146,7 +1146,36 @@ pub struct Interpreter {
     /// from this table so prototype identity (and therefore
     /// `instanceof`) stays stable across the interpreter's lifetime.
     error_classes: ErrorClassRegistry,
+    /// Per-interpreter shared `globalThis` object — every
+    /// `Op::LoadGlobalThis` returns a clone of this handle. Lazily
+    /// allocated; the foundation seeds it with a self-reference
+    /// (`globalThis.globalThis === globalThis`) so identity tests
+    /// observe the standard shape.
+    /// <https://tc39.es/ecma262/#sec-globalthis>
+    global_this: JsObject,
+    /// Optional embedder hook for `Op::Eval` / `Op::NewFunction`.
+    /// Wired by the runtime layer at construction time to parse +
+    /// compile a source string into a fresh [`BytecodeModule`].
+    /// When `None`, both opcodes raise a SyntaxError so embedders
+    /// can opt out of dynamic code.
+    #[allow(clippy::type_complexity)]
+    eval_hook: Option<EvalHook>,
 }
+
+impl std::fmt::Debug for Interpreter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Interpreter")
+            .field("max_stack_depth", &self.max_stack_depth)
+            .field("eval_hook_installed", &self.eval_hook.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Embedder-supplied parse + compile callback used by
+/// [`Op::Eval`] / [`Op::NewFunction`]. Returns a freshly linked
+/// [`BytecodeModule`] whose `<main>` completion value becomes the
+/// dispatch result.
+pub type EvalHook = std::rc::Rc<dyn Fn(&str) -> Result<BytecodeModule, String>>;
 
 impl Interpreter {
     /// Construct a fresh interpreter with its own interrupt flag,
@@ -1168,6 +1197,8 @@ impl Interpreter {
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
             error_classes,
+            global_this: build_global_this(),
+            eval_hook: None,
         }
     }
 
@@ -1190,6 +1221,8 @@ impl Interpreter {
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
             error_classes,
+            global_this: build_global_this(),
+            eval_hook: None,
         }
     }
 
@@ -1308,6 +1341,15 @@ impl Interpreter {
         } else {
             depth
         };
+    }
+
+    /// Install the parse + compile callback used by `Op::Eval` and
+    /// `Op::NewFunction`. The runtime layer hooks the otter-compiler
+    /// in here at construction time. Pass `None` (the default) to
+    /// disable dynamic code; both opcodes will raise SyntaxError
+    /// when invoked without a hook.
+    pub fn set_eval_hook(&mut self, hook: Option<EvalHook>) {
+        self.eval_hook = hook;
     }
 
     /// Cloneable handle for cooperative cancellation.
@@ -1583,10 +1625,48 @@ impl Interpreter {
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
         let main = module.main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        stack.push(Frame::for_function(main));
+        let mut entry = Frame::for_function(main);
+        // §16.2.1.7 ModuleDeclarationInstantiation step 5 — when the
+        // entry function carries top-level await, wire up an async
+        // result promise so `Op::Await` can park / resume normally.
+        // The dispatch loop's exit returns the result promise's
+        // resolved value once microtasks drain.
+        let entry_promise = if main.is_async {
+            let result = JsPromiseHandle::pending();
+            entry.async_state = Some(AsyncFrameState {
+                result_promise: result.clone(),
+            });
+            Some(result)
+        } else {
+            None
+        };
+        stack.push(entry);
 
-        match self.dispatch_loop(module, &mut stack) {
-            Ok(value) => Ok(value),
+        let dispatch_result = self.dispatch_loop(module, &mut stack);
+        match dispatch_result {
+            Ok(value) => {
+                if let Some(promise) = entry_promise {
+                    // Drain microtasks until the entry promise
+                    // settles. The settled value (or rejection)
+                    // becomes the program's completion value.
+                    if let Err(err) = self.drain_microtasks(module) {
+                        return Err((err.error, err.frames));
+                    }
+                    match promise.state() {
+                        crate::promise::PromiseState::Fulfilled(v) => return Ok(v),
+                        crate::promise::PromiseState::Rejected(reason) => {
+                            return Err((
+                                VmError::Uncaught {
+                                    value: reason.display_string(),
+                                },
+                                Vec::new(),
+                            ));
+                        }
+                        crate::promise::PromiseState::Pending => return Ok(Value::Undefined),
+                    }
+                }
+                Ok(value)
+            }
             Err(err) => {
                 let frames = snapshot_frames(module, &stack);
                 Err((err, frames))
@@ -1594,7 +1674,72 @@ impl Interpreter {
         }
     }
 
+    /// Drive the dispatch loop, converting convertible `VmError`
+    /// variants (TypeMismatch, NotCallable, TemporalDeadZone, etc.)
+    /// into typed `Error` instances that flow through `unwind_throw`
+    /// — so user code can `try { … } catch (e) { e instanceof
+    /// TypeError }` and observe the same shape it would in any
+    /// spec-conforming engine. Variants that aren't user-recoverable
+    /// (StackOverflow, Interrupted, Uncaught, MissingReturn,
+    /// InvalidOperand) propagate as-is.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-error-objects>
+    /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
     fn dispatch_loop(
+        &mut self,
+        module: &BytecodeModule,
+        stack: &mut SmallVec<[Frame; 8]>,
+    ) -> Result<Value, VmError> {
+        loop {
+            match self.dispatch_loop_inner(module, stack) {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    if let Some(thrown) = self.vm_error_to_throwable(&err) {
+                        self.unwind_throw(stack, thrown)?;
+                        if stack.is_empty() {
+                            return Ok(Value::Undefined);
+                        }
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Convert a `VmError` raised by a dispatch step into a thrown
+    /// `Error` instance. Returns `None` for variants that should
+    /// keep propagating as host errors (StackOverflow, etc.).
+    fn vm_error_to_throwable(&self, err: &VmError) -> Option<Value> {
+        let (kind, message) = match err {
+            VmError::TypeMismatch => (error_classes::ErrorKind::TypeError, "operand type mismatch"),
+            VmError::NotCallable => (
+                error_classes::ErrorKind::TypeError,
+                "value is not a function",
+            ),
+            VmError::TemporalDeadZone { .. } => (
+                error_classes::ErrorKind::ReferenceError,
+                "cannot access binding before initialization",
+            ),
+            VmError::UnknownIntrinsic { .. } => (
+                error_classes::ErrorKind::TypeError,
+                "unknown intrinsic method",
+            ),
+            // Hard / structural errors stay as host failures so the
+            // caller surfaces them through `RunError` rather than
+            // catching them as `try { ... } catch`.
+            _ => return None,
+        };
+        let proto = self.error_classes.prototype(kind);
+        let obj = JsObject::new();
+        obj.set_prototype(Some(proto));
+        let message_str = JsString::from_str(message, &self.string_heap).ok()?;
+        obj.set("message", Value::String(message_str));
+        Some(Value::Object(obj))
+    }
+
+    fn dispatch_loop_inner(
         &mut self,
         module: &BytecodeModule,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -1752,6 +1897,42 @@ impl Interpreter {
                         continue;
                     }
                 }
+                // §19.4.1 indirect eval — recursively dispatches a
+                // freshly compiled module on a sub-stack, then
+                // writes the completion value into `dst`. Stack-
+                // modifying so it has to run before the in-frame
+                // borrow below.
+                Op::Eval => {
+                    let dst = register_operand(operands.first())?;
+                    let src_reg = register_operand(operands.get(1))?;
+                    let top_idx = stack.len() - 1;
+                    let value = read_register(&stack[top_idx], src_reg)?.clone();
+                    let result = self.run_eval(&value)?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    continue;
+                }
+                // §20.2.1.1 — `new Function(args, body)` recurses
+                // into the eval hook with a synthesised wrapper.
+                Op::NewFunction => {
+                    let dst = register_operand(operands.first())?;
+                    let argc = match operands.get(1) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let top_idx = stack.len() - 1;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(2 + i))?;
+                        args.push(read_register(&stack[top_idx], r)?.clone());
+                    }
+                    let result = self.build_function_constructor(&args)?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    continue;
+                }
                 _ => {}
             }
 
@@ -1764,6 +1945,9 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     write_register(frame, dst, Value::Undefined)?;
                     frame.pc += 1;
+                }
+                Op::Eval | Op::NewFunction => {
+                    unreachable!("stack-modifying ops handled earlier in this loop")
                 }
                 Op::Return
                 | Op::ReturnValue
@@ -2034,13 +2218,72 @@ impl Interpreter {
                             if name == "prototype" {
                                 Value::Object(c.prototype.clone())
                             } else {
-                                c.statics.get(&name).unwrap_or(Value::Undefined)
+                                match c.statics.get(&name) {
+                                    Some(v) => v,
+                                    None if name == "name" || name == "length" => {
+                                        // Fall back to the underlying
+                                        // ctor's intrinsic property
+                                        // when the user hasn't shadowed
+                                        // it via a static field.
+                                        match &c.ctor {
+                                            Value::Function { function_id }
+                                            | Value::Closure { function_id, .. } => {
+                                                function_intrinsic_property(
+                                                    module,
+                                                    *function_id,
+                                                    &name,
+                                                    &self.string_heap,
+                                                )?
+                                            }
+                                            _ => Value::Undefined,
+                                        }
+                                    }
+                                    None => Value::Undefined,
+                                }
                             }
                         }
                         Value::String(s) if name == "length" => {
                             Value::Number(NumberValue::from_i32(s.len() as i32))
                         }
                         Value::Array(a) => a.get_named_property(&name).unwrap_or(Value::Undefined),
+                        // §20.2.4 Function-instance properties — every
+                        // callable carries `.name` / `.length`.
+                        // <https://tc39.es/ecma262/#sec-function-instances>
+                        Value::Function { function_id } if name == "name" || name == "length" => {
+                            function_intrinsic_property(
+                                module,
+                                *function_id,
+                                &name,
+                                &self.string_heap,
+                            )?
+                        }
+                        Value::Closure { function_id, .. }
+                            if name == "name" || name == "length" =>
+                        {
+                            function_intrinsic_property(
+                                module,
+                                *function_id,
+                                &name,
+                                &self.string_heap,
+                            )?
+                        }
+                        Value::NativeFunction(native) if name == "name" || name == "length" => {
+                            if name == "name" {
+                                let s = JsString::from_str(native.name, &self.string_heap)
+                                    .map_err(|_| VmError::TypeMismatch)?;
+                                Value::String(s)
+                            } else {
+                                Value::Number(NumberValue::from_i32(0))
+                            }
+                        }
+                        Value::BoundFunction(bound) if name == "name" || name == "length" => {
+                            bound_function_intrinsic_property(
+                                module,
+                                bound,
+                                &name,
+                                &self.string_heap,
+                            )?
+                        }
                         Value::RegExp(r) => {
                             regexp_prototype::load_property(r, &name, &self.string_heap)
                         }
@@ -2801,6 +3044,70 @@ impl Interpreter {
                     write_register(frame, dst, Value::Object(namespace))?;
                     frame.pc += 1;
                 }
+                Op::LoadGlobalThis => {
+                    let dst = register_operand(operands.first())?;
+                    let value = Value::Object(self.global_this.clone());
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::GlobalCall => {
+                    // §19.2 global functions — parseInt / parseFloat /
+                    // isNaN / isFinite / encodeURI* / decodeURI*.
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = global_functions::call(&name, &args, &self.string_heap)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                Op::ImportMetaResolve => {
+                    // Resolve `specifier` against frame.module_url
+                    // and write the resulting absolute URL string.
+                    let dst = register_operand(operands.first())?;
+                    let spec_reg = register_operand(operands.get(1))?;
+                    let spec_value = read_register(frame, spec_reg)?.clone();
+                    let specifier = match spec_value {
+                        Value::String(s) => s.to_lossy_string(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let referrer_str: &str = &frame.module_url;
+                    let resolved = resolve_relative_url(Some(referrer_str), &specifier);
+                    let resolved_str = JsString::from_str(&resolved, &self.string_heap)
+                        .map_err(|_| VmError::TypeMismatch)?;
+                    write_register(frame, dst, Value::String(resolved_str))?;
+                    frame.pc += 1;
+                }
+                Op::ImportNamespaceDynamic => {
+                    // Runtime-resolved `import(spec)` per §16.2.1.7.
+                    // The specifier is whatever string the user
+                    // expression evaluated to. Fall back to a
+                    // TypeError when the linker hasn't pre-resolved
+                    // it — re-entrant compile is filed.
+                    let dst = register_operand(operands.first())?;
+                    let spec_reg = register_operand(operands.get(1))?;
+                    let spec_value = read_register(frame, spec_reg)?.clone();
+                    let specifier = match spec_value {
+                        Value::String(s) => s.to_lossy_string(),
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let referrer = frame.module_url.clone();
+                    let namespace = self
+                        .resolve_module_namespace(module, referrer.as_ref(), &specifier)
+                        .ok_or(VmError::UnknownIntrinsic {
+                            name: format!("import \"{specifier}\""),
+                        })?;
+                    write_register(frame, dst, Value::Object(namespace))?;
+                    frame.pc += 1;
+                }
                 Op::PromiseFulfilledOf => {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
@@ -3467,7 +3774,7 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
     ) -> Result<(), VmError> {
-        let display = value.display_string();
+        let display = render_thrown_value(&value);
         let payload = value;
         loop {
             let Some(frame) = stack.last_mut() else {
@@ -3756,6 +4063,28 @@ impl Interpreter {
             }
         }
 
+        // §20.2.3 Function.prototype canonical methods —
+        // `call` / `apply` / `bind` / `toString`. They are
+        // unconditionally available on any callable, even when the
+        // receiver is a ClassConstructor whose statics object
+        // hasn't installed them. The intercept runs before the
+        // property-lookup so user-installed shadows take precedence
+        // only when the receiver is a plain Object. Callable
+        // receivers go straight here.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-function-prototype-object>
+        if matches!(name.as_str(), "call" | "apply" | "bind" | "toString")
+            && is_callable(&recv_value)
+        {
+            return self.dispatch_function_method(
+                stack,
+                module,
+                &recv_value,
+                &name,
+                arg_values,
+                dst,
+            );
+        }
+
         // Property-bearing receivers — load the property first.
         // For class constructors, `prototype` resolves to the
         // instance prototype object (mirroring `Op::LoadProperty`'s
@@ -3784,10 +4113,9 @@ impl Interpreter {
             return self.invoke(stack, module, &method, recv_value.clone(), arg_values, dst);
         }
 
-        // `Function.prototype.{call, apply, bind}` on a callable
-        // receiver that doesn't expose the method as a property.
-        // `apply` only accepts an `Array` (or omitted / null /
-        // undefined) for its second argument.
+        // `Function.prototype.{call, apply, bind, toString}` on a
+        // callable receiver that doesn't expose the method as a
+        // property — fallback path.
         if is_callable(&recv_value) {
             return self.dispatch_function_method(
                 stack,
@@ -4265,6 +4593,21 @@ impl Interpreter {
                 frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                 Ok(())
             }
+            // §20.2.3.5 Function.prototype.toString — foundation
+            // returns the canonical `function <name>() { [native
+            // code] }` placeholder. Spec mandates a source-faithful
+            // representation when source is available; the
+            // foundation defers source preservation to a follow-up.
+            // <https://tc39.es/ecma262/#sec-function.prototype.tostring>
+            "toString" => {
+                let display = function_to_string(module, callee);
+                let s = JsString::from_str(&display, &self.string_heap)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                let frame = &mut stack[top_idx];
+                write_register(frame, dst, Value::String(s))?;
+                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                Ok(())
+            }
             _ => Err(VmError::UnknownIntrinsic {
                 name: name.to_string(),
             }),
@@ -4558,6 +4901,167 @@ impl Interpreter {
         // function returns.
         self.invoke(stack, module, callee, this_value, args, dst)?;
         Ok(true)
+    }
+
+    /// Execute `eval(source)` per §19.4.1.1 indirect-eval semantics:
+    /// parse + compile via the embedder hook, then run `<main>`
+    /// on a sub-stack. The current dispatch loop's stack stays
+    /// untouched.
+    ///
+    /// # Errors
+    /// - [`VmError::TypeMismatch`] when no eval hook is installed.
+    /// - [`VmError::JsonError`] (mapped to `SyntaxError` by the
+    ///   throwable-conversion path) when parsing / compilation fail.
+    fn run_eval(&mut self, value: &Value) -> Result<Value, VmError> {
+        let source = match value {
+            Value::String(s) => s.to_lossy_string(),
+            // Per §19.4.1.1 step 4, eval'd non-strings are returned
+            // unchanged — `eval(42) === 42`.
+            _ => return Ok(value.clone()),
+        };
+        let module = self.compile_eval_source(&source)?;
+        let main = module.main();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut entry = Frame::for_function(main);
+        let entry_promise = if main.is_async {
+            let result = JsPromiseHandle::pending();
+            entry.async_state = Some(AsyncFrameState {
+                result_promise: result.clone(),
+            });
+            Some(result)
+        } else {
+            None
+        };
+        stack.push(entry);
+        let value = self.dispatch_loop(&module, &mut stack)?;
+        if let Some(promise) = entry_promise {
+            // Drain microtasks attached to top-level await so the
+            // entry promise settles before we read its value.
+            self.drain_microtasks(&module).map_err(|e| e.error)?;
+            return Ok(match promise.state() {
+                crate::promise::PromiseState::Fulfilled(v) => v,
+                crate::promise::PromiseState::Rejected(reason) => {
+                    return Err(VmError::Uncaught {
+                        value: reason.display_string(),
+                    });
+                }
+                crate::promise::PromiseState::Pending => Value::Undefined,
+            });
+        }
+        Ok(value)
+    }
+
+    /// Build a `Function(args, body)` callable per §20.2.1.1. The
+    /// result is a [`NativeFunction`] that holds the freshly
+    /// compiled inner module and dispatches it on every call;
+    /// inner-module function IDs aren't valid against the outer
+    /// running module, so wrapping in a native rather than
+    /// returning the inner closure handle directly keeps the call
+    /// surface correct.
+    fn build_function_constructor(&mut self, args: &[Value]) -> Result<Value, VmError> {
+        // Coerce every argument to a string per §20.2.1.1 step 1.
+        let parts: Vec<String> = args
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.to_lossy_string(),
+                other => other.display_string(),
+            })
+            .collect();
+        let (params, body): (Vec<&str>, &str) = if parts.is_empty() {
+            (Vec::new(), "")
+        } else {
+            let body = parts.last().expect("non-empty checked above").as_str();
+            let params: Vec<&str> = parts[..parts.len() - 1]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            (params, body)
+        };
+        let params_joined = params.join(",");
+        let source = format!("(function anonymous({params_joined}) {{\n{body}\n}})");
+        let module = self.compile_eval_source(&source)?;
+        // Running the synthesised module's `<main>` returns the
+        // function value (the parenthesised expression is the
+        // program's completion). We capture that value's
+        // `function_id` together with the inner module so the
+        // returned native can replay calls against the right
+        // bytecode.
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(module.main()));
+        let value = self.dispatch_loop(&module, &mut stack)?;
+        let function_id = match &value {
+            Value::Function { function_id } => *function_id,
+            Value::Closure { function_id, .. } => *function_id,
+            _ => {
+                return Err(VmError::JsonError {
+                    code: "EVAL_NOT_FUNCTION",
+                    message: "Function constructor body did not produce a function value"
+                        .to_string(),
+                });
+            }
+        };
+        let module_rc = std::rc::Rc::new(module);
+        let module_clone = std::rc::Rc::clone(&module_rc);
+        let native = std::rc::Rc::new(NativeFunction::new(
+            "anonymous",
+            move |interp: &mut Interpreter, call_args: &[Value]| {
+                interp
+                    .invoke_eval_function(&module_clone, function_id, call_args)
+                    .map_err(|err| crate::native_function::NativeError::TypeError {
+                        name: "anonymous",
+                        reason: format!("{err}"),
+                    })
+            },
+        ));
+        Ok(Value::NativeFunction(native))
+    }
+
+    /// Invoke a function from a previously-eval'd module on a
+    /// fresh sub-stack, binding `args` to its formal parameters.
+    /// Used by [`Self::build_function_constructor`] so that
+    /// `new Function(...)` results stay callable across the outer
+    /// module's lifetime.
+    fn invoke_eval_function(
+        &mut self,
+        module: &BytecodeModule,
+        function_id: u32,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let function = module
+            .functions
+            .get(function_id as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut frame = Frame::with_return_upvalues_and_this(
+            function,
+            None,
+            std::rc::Rc::from(Vec::new()),
+            Value::Undefined,
+        );
+        // Bind args to parameter slots; extras drop, missing stay
+        // `Value::Undefined` (matches §10.2.1.4 step 22.b).
+        let bind_count = (function.param_count as usize).min(args.len());
+        for (i, arg) in args.iter().take(bind_count).enumerate() {
+            if let Some(slot) = frame.registers.get_mut(i) {
+                *slot = arg.clone();
+            }
+        }
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(frame);
+        self.dispatch_loop(module, &mut stack)
+    }
+
+    /// Helper — invoke the eval hook, mapping its error to a
+    /// VmError that the throwable-conversion path will surface as
+    /// `SyntaxError`.
+    fn compile_eval_source(&self, source: &str) -> Result<BytecodeModule, VmError> {
+        let hook = self.eval_hook.as_ref().ok_or_else(|| VmError::JsonError {
+            code: "EVAL_DISABLED",
+            message: "eval / new Function are disabled (no compiler hook installed)".to_string(),
+        })?;
+        hook(source).map_err(|message| VmError::JsonError {
+            code: "EVAL_PARSE",
+            message,
+        })
     }
 
     /// Drive one tick of [`Op::LoadProperty`] when the receiver is
@@ -5303,6 +5807,204 @@ fn apply_branch(frame: &mut Frame, offset: i32, interrupt: &InterruptFlag) -> Re
     Ok(())
 }
 
+/// Render an uncaught JS value for diagnostic output. Routes
+/// Error-shaped objects through [`error_classes::render_error_to_string`]
+/// so the unwind printout matches what `e.toString()` returns at
+/// the JS surface (§20.5.3.4).
+fn render_thrown_value(value: &Value) -> String {
+    if let Value::Object(obj) = value {
+        // Treat anything with both `name` and `message` data slots
+        // as an Error instance. Plain objects fall through to
+        // `[object Object]` via `display_string`.
+        let has_name = obj.get("name").is_some();
+        let has_message = obj.get("message").is_some();
+        if has_name || has_message {
+            let rendered = error_classes::render_error_to_string(value);
+            if !rendered.is_empty() {
+                return rendered;
+            }
+        }
+    }
+    value.display_string()
+}
+
+/// §20.2.3.5 — render a callable as a string. Foundation returns
+/// the canonical placeholder `function <name>() { [native code] }`
+/// for every callable shape; source-faithful output is filed.
+fn function_to_string(module: &BytecodeModule, callee: &Value) -> String {
+    let display = match callee {
+        Value::Function { function_id } | Value::Closure { function_id, .. } => module
+            .functions
+            .get(*function_id as usize)
+            .map(|f| f.name.as_str())
+            .unwrap_or("anonymous"),
+        Value::NativeFunction(n) => n.name,
+        Value::ClassConstructor(c) => match &c.ctor {
+            Value::Function { function_id } | Value::Closure { function_id, .. } => module
+                .functions
+                .get(*function_id as usize)
+                .map(|f| f.name.as_str())
+                .unwrap_or("anonymous"),
+            _ => "anonymous",
+        },
+        Value::BoundFunction(_) => "bound",
+        _ => "anonymous",
+    };
+    format!("function {display}() {{ [native code] }}")
+}
+
+/// §20.2.4 — read `name` or `length` off a function record. `name`
+/// returns the recorded display name (`<anonymous>` for unnamed
+/// expressions); `length` returns `param_count` minus the rest
+/// parameter (excluded per spec §10.2.4).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-function-instances-name>
+/// - <https://tc39.es/ecma262/#sec-function-instances-length>
+fn function_intrinsic_property(
+    module: &BytecodeModule,
+    function_id: u32,
+    name: &str,
+    heap: &StringHeap,
+) -> Result<Value, VmError> {
+    let function = module
+        .functions
+        .get(function_id as usize)
+        .ok_or(VmError::InvalidOperand)?;
+    Ok(match name {
+        "name" => {
+            let display = function.name.as_str();
+            // Synthetic class names like "<anonymous>" / "<class>"
+            // round-trip as their literal text — matching V8's
+            // `(function () {}).name === ""` behaviour requires
+            // empty-string canonicalisation, which is filed.
+            let s = JsString::from_str(display, heap).map_err(|_| VmError::TypeMismatch)?;
+            Value::String(s)
+        }
+        "length" => {
+            // `param_count` already excludes the rest parameter
+            // (it lives separately in `Function::has_rest`), so it
+            // matches §10.2.4 ExpectedArgumentCount directly.
+            // Default-valued parameters would also reduce the
+            // count; the foundation tracks them as ordinary params
+            // for now — filed in the param-defaults follow-up.
+            Value::Number(NumberValue::from_i32(function.param_count as i32))
+        }
+        _ => Value::Undefined,
+    })
+}
+
+/// §20.2.3.2 — derive `.name` / `.length` for a bound function.
+/// The spec prepends `"bound "` to the target's name; foundation
+/// matches that. `length` is `target.length - bound_args.len()`,
+/// clamped at zero.
+fn bound_function_intrinsic_property(
+    module: &BytecodeModule,
+    bound: &BoundFunction,
+    name: &str,
+    heap: &StringHeap,
+) -> Result<Value, VmError> {
+    let inner = match &bound.target {
+        Value::Function { function_id } | Value::Closure { function_id, .. } => Some(
+            module
+                .functions
+                .get(*function_id as usize)
+                .ok_or(VmError::InvalidOperand)?,
+        ),
+        _ => None,
+    };
+    Ok(match name {
+        "name" => {
+            let inner_name = inner.map(|f| f.name.as_str()).unwrap_or("");
+            let s = JsString::from_str(&format!("bound {inner_name}"), heap)
+                .map_err(|_| VmError::TypeMismatch)?;
+            Value::String(s)
+        }
+        "length" => {
+            let raw = inner.map(|f| f.param_count as i32).unwrap_or(0);
+            let bound_count = bound.bound_args.len() as i32;
+            Value::Number(NumberValue::from_i32(
+                raw.saturating_sub(bound_count).max(0),
+            ))
+        }
+        _ => Value::Undefined,
+    })
+}
+
+/// Build the per-Interpreter shared `globalThis` JsObject. Foundation
+/// seeds the self-reference so `globalThis.globalThis === globalThis`
+/// and leaves the rest of the global namespace empty — the §19.2
+/// global functions are reached through `Op::GlobalCall`, not
+/// `globalThis.parseInt`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-globalthis>
+fn build_global_this() -> JsObject {
+    let obj = JsObject::new();
+    obj.set("globalThis", Value::Object(obj.clone()));
+    obj
+}
+
+/// Resolve `specifier` against `referrer`, mirroring the WHATWG URL
+/// join semantics used by `import.meta.resolve`. Foundation handles:
+///
+/// - Absolute URLs (any scheme `xxx://`) and `file://` paths pass
+///   through unchanged.
+/// - Relative paths (`./foo`, `../bar`, `bar.ts`) join against the
+///   referrer's directory.
+/// - Bare specifiers without a referrer return as-is so the embedder's
+///   resolver can pick them up.
+///
+/// # See also
+/// - <https://html.spec.whatwg.org/multipage/webappapis.html#resolve-a-module-specifier>
+fn resolve_relative_url(referrer: Option<&str>, specifier: &str) -> String {
+    // Absolute URLs / data: URIs etc. pass through.
+    if specifier.contains("://") || specifier.starts_with("data:") {
+        return specifier.to_string();
+    }
+    let Some(referrer) = referrer else {
+        return specifier.to_string();
+    };
+    if referrer.is_empty() {
+        return specifier.to_string();
+    }
+    if specifier.starts_with('/') {
+        // Replace path component of referrer.
+        if let Some(scheme_end) = referrer.find("://") {
+            let after = scheme_end + 3;
+            let host_end = referrer[after..]
+                .find('/')
+                .map(|i| after + i)
+                .unwrap_or(referrer.len());
+            return format!("{}{}", &referrer[..host_end], specifier);
+        }
+        return specifier.to_string();
+    }
+    // Relative path — pop referrer's last path segment and join.
+    let dir_end = referrer.rfind('/').unwrap_or(referrer.len());
+    let dir = &referrer[..dir_end];
+    let mut parts: Vec<&str> = if dir.contains("://") {
+        let scheme_end = dir.find("://").map(|i| i + 3).unwrap_or(0);
+        let mut acc = vec![&dir[..scheme_end]];
+        acc.extend(dir[scheme_end..].split('/'));
+        acc
+    } else {
+        dir.split('/').collect()
+    };
+    for component in specifier.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => {
+                if parts.last().is_some_and(|s| !s.contains("://")) {
+                    parts.pop();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
 /// Foundation §20.1.3 `Object.prototype.<method>` interception for
 /// ordinary objects. Returns `Ok(Some(value))` when the call was
 /// dispatched here, `Ok(None)` when the method is not one of the
@@ -5347,14 +6049,29 @@ fn object_prototype_intercept(
             };
             Ok(Some(Value::Boolean(result)))
         }
-        // §20.1.3.6 Object.prototype.toString() — foundation returns
-        // `[object Object]`. Per spec the tag is derived from
-        // `[Symbol.toStringTag]` / `[[Class]]`; full lowering is filed
-        // against task 61 follow-ups.
+        // §20.1.3.6 / §20.5.3.4 — `toString()`. Error instances
+        // override Object.prototype.toString to return
+        // `<name>: <message>`; plain objects fall back to
+        // `[object Object]`. The Error path routes through
+        // [`error_classes::render_error_to_string`] so the
+        // user-facing call and the unwind diagnostic share one
+        // implementation.
         // <https://tc39.es/ecma262/#sec-object.prototype.tostring>
+        // <https://tc39.es/ecma262/#sec-error.prototype.tostring>
         "toString" => {
-            let s = JsString::from_str("[object Object]", string_heap)
-                .map_err(|_| VmError::TypeMismatch)?;
+            let recv_value = Value::Object(obj.clone());
+            let has_error_shape = obj.get("name").is_some() || obj.get("message").is_some();
+            let display = if has_error_shape {
+                let rendered = error_classes::render_error_to_string(&recv_value);
+                if rendered.is_empty() {
+                    "[object Object]".to_string()
+                } else {
+                    rendered
+                }
+            } else {
+                "[object Object]".to_string()
+            };
+            let s = JsString::from_str(&display, string_heap).map_err(|_| VmError::TypeMismatch)?;
             Ok(Some(Value::String(s)))
         }
         // §20.1.3.7 Object.prototype.valueOf() — returns the receiver.

@@ -522,7 +522,8 @@ fn is_const_pool_ref(op: Op, pos: usize) -> bool {
         | Op::PromiseCall
         | Op::SymbolCall
         | Op::ObjectCall
-        | Op::ArrayCall => pos == 1,
+        | Op::ArrayCall
+        | Op::GlobalCall => pos == 1,
         // `TemporalCall` is `dst, class_const, method_const, argc`
         // — both class and method positions are pool refs.
         Op::TemporalCall => pos == 1 || pos == 2,

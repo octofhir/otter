@@ -114,7 +114,7 @@ straight to `temporal_rs` so the runtime needs no global object;
 component accessors flow through `Op::LoadProperty`; ISO calendar
 + host time-zone supported, non-ISO calendars / `ZonedDateTime` /
 `PlainYearMonth` / `PlainMonthDay` filed as follow-ups.
-**256/256 engine fixtures pass.**
+**277/277 engine fixtures pass.**
 
 The §7.2 type-check abstract operations have shipped as canonical
 helpers (task 43): `same_value` / `same_value_zero` /
@@ -132,9 +132,13 @@ proper prototype chains; new opcodes `Op::NewBuiltinError` /
 `Op::LoadBuiltinError` build instances and load constructors;
 the compiler intercepts `new <Kind>(msg)` / bare-identifier reads
 of all seven names; `Op::Instanceof` was widened to read
-`rhs.prototype` per §13.10.2 OrdinaryHasInstance. Internal-error
-→ throwable conversion is filed as a follow-up
-([25-internal-error-throwability.md](./25-internal-error-throwability.md)).
+`rhs.prototype` per §13.10.2 OrdinaryHasInstance. Implicit
+runtime failures (`VmError::TypeMismatch` / `NotCallable` /
+`TemporalDeadZone` / `UnknownIntrinsic`) are now converted into
+typed `Error` instances by `Interpreter::vm_error_to_throwable`
+and routed through `unwind_throw` so `try { ... } catch (e) { e
+instanceof TypeError }` catches the same shape it would in any
+spec-conforming engine.
 
 The §7.4 iterator-protocol consultation shipped as task 79:
 `IteratorState::User { iterator: Value }` plus multi-stage
@@ -353,8 +357,6 @@ individual task files split out as work begins. Headlines:
 
 | File | One-line goal |
 |---|---|
-| [25-internal-error-throwability.md](./25-internal-error-throwability.md) | Wire VmError variants (TypeMismatch / NotCallable / OOM / TDZ / etc.) into thrown Error instances so `try/catch (e instanceof TypeError)` covers implicit failures. |
-| [58-modules-runtime-lazy-import.md](./58-modules-runtime-lazy-import.md) | Drop the literal-only `import()` restriction from 36a; runtime parse + compile + link for non-literal specifiers. |
 | [59-spec-link-audit-and-rule.md](./59-spec-link-audit-and-rule.md) | Make ECMA-262 deep links mandatory in module / function docstrings; back-fill audit on already-shipped code in `crates-next/*`. |
 | [60-archive-superseded-root-docs.md](./60-archive-superseded-root-docs.md) | Move `PRODUCTION_READINESS_PLAN.md` / `TOOLING_ROADMAP.md` / `ROADMAP.md` / `gc_migration_baseline.md` into `docs/archive/`. |
 | [61-delete-committed-results.md](./61-delete-committed-results.md) | Delete `test262_results/`, `benchmarks/results/`, `benchmarks/node_modules/`, `scratch/`, root one-off shell scripts; extend `.gitignore`. |

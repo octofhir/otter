@@ -48,7 +48,10 @@ pub use bitwise::{
     bitwise_and, bitwise_not, bitwise_or, bitwise_xor, pow, shl, shr_arith, shr_logical, to_int32,
     to_uint32,
 };
-pub use parse::to_number_from_string;
+pub use parse::{
+    is_finite, is_integer, is_nan, is_safe_integer, parse_float, parse_int, to_number_from_string,
+    to_number_value,
+};
 pub use prototype::lookup as prototype_lookup;
 
 /// JavaScript Number value.

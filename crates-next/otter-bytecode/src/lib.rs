@@ -443,6 +443,87 @@ pub enum Op {
     /// - Anything else returns `false`.
     Instanceof,
 
+    /// `r<dst> = eval(r<source>)` — indirect eval. Operands:
+    /// `Register(dst), Register(source_reg)`.
+    ///
+    /// The runtime parses + compiles the source string as a fresh
+    /// script, runs `<main>` to completion, and writes the program's
+    /// completion value (or `undefined` when the script ended on a
+    /// non-expression statement) into `dst`. Foundation runs eval'd
+    /// code in a fresh global scope per ECMA-262 §19.4.1.1 indirect-
+    /// eval semantics — direct-eval access to caller-local bindings
+    /// is intentionally not supported.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-eval-x>
+    Eval,
+
+    /// `r<dst> = new Function(arg0, arg1, …, body)`. Operands:
+    /// `Register(dst), ConstIndex(argc), Register(arg0), …`.
+    ///
+    /// Variadic. The runtime stringifies each argument; the leading
+    /// `argc - 1` strings become the function's parameter list and
+    /// the trailing string becomes the body. The result is a
+    /// callable closure-less `Value::Function` (no captures from
+    /// the caller's lexical environment, per §20.2.1.1).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
+    NewFunction,
+
+    /// `r<dst> = <name>(args...)` for one of the §19.2 global
+    /// functions: `parseInt`, `parseFloat`, `isNaN`, `isFinite`,
+    /// `encodeURI`, `encodeURIComponent`, `decodeURI`,
+    /// `decodeURIComponent`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Variadic, same shape as [`Self::MathCall`]. Routed by name
+    /// against the runtime's global-function table.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-function-properties-of-the-global-object>
+    GlobalCall,
+
+    /// `r<dst> = globalThis`. Operand: `Register(dst)`. Returns the
+    /// per-Interpreter shared `globalThis` JsObject. The foundation
+    /// surface is intentionally minimal (the global functions are
+    /// reached through dedicated opcodes; the value is mostly used
+    /// for identity comparisons + `globalThis.foo = x` patterns).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-globalthis>
+    LoadGlobalThis,
+
+    /// `r<dst> = import.meta.resolve(r<spec>)`. Operands:
+    /// `Register(dst), Register(specifier_reg)`.
+    ///
+    /// Resolves `specifier` against the active frame's
+    /// `module_url` and writes the resulting absolute URL string.
+    /// Foundation supports the relative-path form
+    /// (`./foo` / `../bar`) and the absolute / `https://` /
+    /// `file://` pass-through case; bare specifiers fall through
+    /// to the loader's resolver when one is wired.
+    ///
+    /// # See also
+    /// - <https://html.spec.whatwg.org/multipage/webappapis.html#hostmetagetimportmetaproperties>
+    ImportMetaResolve,
+
+    /// `r<dst> = await import(r<spec>)` — runtime-resolved dynamic
+    /// import. Operands: `Register(dst), Register(specifier_reg)`.
+    ///
+    /// Reads the string in `specifier_reg`, looks the result up
+    /// against the active frame's module URL in the linker-built
+    /// resolution table, and writes the target module's `module_env`
+    /// into `dst`. Specifiers that aren't in the resolution table
+    /// raise a `TypeError` (the foundation does not yet support
+    /// re-entrant parse / compile / link for runtime-discovered
+    /// modules — that's filed as part of the loader follow-up).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>
+    ImportNamespaceDynamic,
+
     /// Resolve a module specifier to its `module_env` object.
     /// Operands: `Register(dst), ConstIndex(specifier_const)`.
     ///
@@ -784,6 +865,12 @@ impl Op {
             Op::ObjectCall => "OBJECT_CALL",
             Op::ArrayCall => "ARRAY_CALL",
             Op::HasProperty => "HAS_PROPERTY",
+            Op::ImportNamespaceDynamic => "IMPORT_NAMESPACE_DYNAMIC",
+            Op::ImportMetaResolve => "IMPORT_META_RESOLVE",
+            Op::GlobalCall => "GLOBAL_CALL",
+            Op::LoadGlobalThis => "LOAD_GLOBAL_THIS",
+            Op::Eval => "EVAL",
+            Op::NewFunction => "NEW_FUNCTION",
         }
     }
 
@@ -809,7 +896,8 @@ impl Op {
             | Op::TdzError
             | Op::Throw
             | Op::NewObject
-            | Op::CollectRest => 1,
+            | Op::CollectRest
+            | Op::LoadGlobalThis => 1,
             Op::LoadString
             | Op::LoadNumber
             | Op::LoadInt32
@@ -832,6 +920,9 @@ impl Op {
             | Op::MathLoad
             | Op::Await
             | Op::ImportNamespace
+            | Op::ImportNamespaceDynamic
+            | Op::ImportMetaResolve
+            | Op::Eval
             | Op::PromiseFulfilledOf
             | Op::SymbolLoad
             | Op::TypeOf
@@ -888,6 +979,8 @@ impl Op {
             Op::SymbolCall => 3,      // dst, name_const, argc — args follow
             Op::ObjectCall => 3,      // dst, name_const, argc — args follow
             Op::ArrayCall => 3,       // dst, name_const, argc — args follow
+            Op::GlobalCall => 3,      // dst, name_const, argc — args follow
+            Op::NewFunction => 2,     // dst, argc — args follow
             Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
             Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
             Op::QueueMicrotask => 2,  // callee, argc — args follow

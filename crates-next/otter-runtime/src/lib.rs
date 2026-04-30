@@ -624,6 +624,16 @@ impl RuntimeBuilder {
         }
         let mut interp = Interpreter::new();
         interp.set_max_stack_depth(self.config.max_stack_depth);
+        // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
+        // `new Function(...)` reach a real parse + compile path.
+        // The closure is reusable across calls; each invocation
+        // builds a fresh `BytecodeModule`.
+        let hook: otter_vm::EvalHook = std::rc::Rc::new(|source: &str| {
+            let parsed = parse(source, SourceKind::JavaScript)
+                .map_err(|e| format!("syntax error: {e:?}"))?;
+            compile(&parsed, "<eval>").map_err(|e| format!("compile error: {e:?}"))
+        });
+        interp.set_eval_hook(Some(hook));
         Ok(Runtime {
             interp,
             config: self.config,

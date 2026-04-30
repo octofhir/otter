@@ -158,6 +158,10 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
     })?;
 
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
+    // §16.2.1.7 — top-level `await` upgrades `<main>` to async so
+    // the dispatch loop's async machinery parks / resumes the
+    // entry frame on suspension points.
+    let main_is_async = module_body_uses_top_level_await(&program.body);
     // Reserve slot 0 for `<main>` so nested function compilation
     // can pre-register their ids deterministically (slice 13 only
     // needs the immediate id, but the slot reservation keeps the
@@ -166,6 +170,7 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
         id: 0,
         name: "<main>".to_string(),
         span: (program.span.start, program.span.end),
+        is_async: main_is_async,
         ..Default::default()
     });
     let mut top = FunctionContext::new(Rc::clone(&module));
@@ -182,6 +187,17 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
     let mut top_level_vars: Vec<String> = Vec::new();
     hoist_var_names(&program.body, &mut top_level_vars);
     pre_declare_var_bindings(&mut cx, &top_level_vars, program_span)?;
+    // §10.2.11 step 33 — pre-declare top-level `let` / `const` /
+    // `class` names with TDZ so the function-hoist pass below can
+    // see them when an inner function captures one of these
+    // forward references.
+    let mut top_level_lex: Vec<(String, bool)> = Vec::new();
+    hoist_lexical_names(&program.body, &mut top_level_lex);
+    pre_declare_lexical_bindings(&mut cx, &top_level_lex, program_span)?;
+    // §10.2.11 step 30 — top-level `function f() {…}` declarations
+    // hoist to the script scope so calls before the source-level
+    // declaration resolve to the function value.
+    hoist_function_declarations(&mut cx, &program.body)?;
 
     let mut last_value_reg: Option<u16> = None;
     for stmt in &program.body {
@@ -230,6 +246,7 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
     let ModuleBuilder {
         functions,
         constants,
+        next_private_namespace: _,
     } = Rc::try_unwrap(module)
         .expect("module builder should be uniquely owned at finalize")
         .into_inner();
@@ -294,11 +311,13 @@ pub fn compile_module_fragment(
     })?;
 
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
+    let init_is_async = module_body_uses_top_level_await(&program.body);
     module.borrow_mut().functions.push(Function {
         id: 0,
         name: "<module-init>".to_string(),
         span: (program.span.start, program.span.end),
         is_module: true,
+        is_async: init_is_async,
         module_url: host.module_url.clone(),
         param_count: 2, // module_env, import_meta
         ..Default::default()
@@ -524,6 +543,13 @@ pub fn compile_module_fragment(
     let mut module_vars: Vec<String> = Vec::new();
     hoist_var_names(&program.body, &mut module_vars);
     pre_declare_var_bindings(&mut cx, &module_vars, span0)?;
+    let mut module_lex: Vec<(String, bool)> = Vec::new();
+    hoist_lexical_names(&program.body, &mut module_lex);
+    pre_declare_lexical_bindings(&mut cx, &module_lex, span0)?;
+    // §10.2.11 step 30 — top-level function declarations hoist to
+    // the module scope so cross-references work regardless of
+    // source order.
+    hoist_function_declarations(&mut cx, &program.body)?;
 
     for stmt in &program.body {
         compile_statement(&mut cx, stmt)?;
@@ -550,6 +576,7 @@ pub fn compile_module_fragment(
     let ModuleBuilder {
         functions,
         constants,
+        next_private_namespace: _,
     } = Rc::try_unwrap(module)
         .expect("module builder should be uniquely owned at finalize")
         .into_inner();
@@ -739,6 +766,12 @@ fn module_export_name_to_str(name: &oxc_ast::ast::ModuleExportName<'_>) -> Strin
 struct ModuleBuilder {
     functions: Vec<Function>,
     constants: Vec<Constant>,
+    /// Monotonic counter handed out by `compile_class` so each
+    /// lexical class declaration owns a private-field namespace
+    /// distinct from every other class — `class A { #x }` and
+    /// `class B { #x }` mangle to different runtime keys, matching
+    /// §15.7.1 PrivateName uniqueness.
+    next_private_namespace: u32,
 }
 
 /// One lexical scope's binding table. The compiler keeps a stack
@@ -847,6 +880,13 @@ struct FunctionContext {
     /// `LabeledStatement` waiting to be consumed by the next pushed
     /// loop / switch frame. See [`compile_labeled_statement`].
     pending_label: Option<String>,
+    /// Names that the entry-point pre-pass already compiled +
+    /// stored as hoisted function declarations. The
+    /// `Statement::FunctionDeclaration` arm checks this set and
+    /// skips the source-position emission so the function isn't
+    /// recompiled and its closure isn't re-stored.
+    /// <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
+    hoisted_function_names: HashSet<String>,
     /// Names of this function's own bindings that some nested
     /// function references — populated by
     /// [`capture::analyze_function`] before code gen starts. Each
@@ -885,11 +925,32 @@ struct FunctionContext {
 #[derive(Debug)]
 struct Compiler {
     stack: Vec<FunctionContext>,
+    /// Stack of private-field namespace ids — one per enclosing
+    /// class declaration. The top entry is the namespace used to
+    /// mangle every `#name` reference inside the current class
+    /// body. Empty when no class encloses the current expression
+    /// (in which case `#name` references are a syntax error).
+    /// Each entry is the integer suffix of `__priv_<n>_<name>`
+    /// so peers across classes never collide.
+    /// <https://tc39.es/ecma262/#sec-private-names>
+    private_namespaces: Vec<u32>,
 }
 
 impl Compiler {
     fn new(top: FunctionContext) -> Self {
-        Self { stack: vec![top] }
+        Self {
+            stack: vec![top],
+            private_namespaces: Vec::new(),
+        }
+    }
+
+    fn current_private_namespace(&self) -> Option<u32> {
+        self.private_namespaces.last().copied()
+    }
+
+    fn mangle_private(&self, name: &str) -> Option<String> {
+        self.current_private_namespace()
+            .map(|ns| format!("__priv_{ns}_{name}"))
     }
 
     fn top_mut(&mut self) -> &mut FunctionContext {
@@ -995,6 +1056,7 @@ impl FunctionContext {
             scopes: Vec::new(),
             loops: Vec::new(),
             pending_label: None,
+            hoisted_function_names: HashSet::new(),
             captured_names: HashSet::new(),
             own_upvalue_count: 0,
             parent_captures: Vec::new(),
@@ -1127,6 +1189,15 @@ impl FunctionContext {
             }
         }
         None
+    }
+
+    /// Look up `name` only in the *innermost* scope. Used by the
+    /// `let` / `const` arm to detect bindings the lexical pre-pass
+    /// already created at the function / script / module top level.
+    fn lookup_in_current_scope(&self, name: &str) -> Option<BindingInfo> {
+        self.scopes
+            .last()
+            .and_then(|scope| scope.bindings.get(name).copied())
     }
 
     /// Flip a binding's `initialized` flag to `true` once we've
@@ -1498,7 +1569,17 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                 // doesn't pay an extra register copy.
                 if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
                     let name = id.name.as_str().to_string();
-                    let storage = cx.declare_binding(&name, is_const, span)?;
+                    // The entry-point lexical pre-pass already
+                    // declared every top-level `let` / `const` name
+                    // (TDZ until source-position store) so inner
+                    // function declarations could capture them.
+                    // Reuse the existing binding when it's there;
+                    // otherwise (nested block-scoped declaration)
+                    // create a fresh one.
+                    let storage = match cx.lookup_in_current_scope(&name) {
+                        Some(info) => info.storage,
+                        None => cx.declare_binding(&name, is_const, span)?,
+                    };
                     let init_reg = match &declarator.init {
                         Some(init) => compile_expr(cx, init, span)?,
                         None => {
@@ -1676,12 +1757,17 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                     .name
                     .as_str()
                     .to_string();
+            // §10.2.11 step 30 — top-level function declarations
+            // were hoisted at scope entry by
+            // `hoist_function_declarations`. Skip the source-position
+            // re-emit when the name was hoisted; otherwise (nested
+            // block declaration in strict mode) fall through to the
+            // ordinary block-scoped binding path.
+            if cx.hoisted_function_names.contains(&name) {
+                return Ok(None);
+            }
             let (function_id, captures) =
                 compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
-            // Bind the name in the current scope to a register
-            // holding the function value. Foundation slice doesn't
-            // hoist; declarations are evaluated at their lexical
-            // position.
             let storage = cx.declare_binding(&name, false, span)?;
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
@@ -1719,7 +1805,12 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                 .as_str()
                 .to_string();
             let class_reg = compile_class(cx, class, Some(&name))?;
-            let storage = cx.declare_binding(&name, false, span)?;
+            // The lexical pre-pass may have already declared this
+            // class name (TDZ) so inner functions could capture it.
+            let storage = match cx.lookup_in_current_scope(&name) {
+                Some(info) => info.storage,
+                None => cx.declare_binding(&name, false, span)?,
+            };
             cx.emit_store_storage(class_reg, storage, span);
             cx.mark_initialized(&name);
             cx.emit_module_export_mirror(&name, class_reg, span);
@@ -2076,6 +2167,55 @@ fn compile_for_init_decl(
 /// Rest parameters (`...t`) are materialised by the runtime via
 /// [`Op::CollectRest`] reading from the call frame's stashed
 /// trailing argument list.
+/// `true` when any expression at module-top-level (i.e. outside
+/// any function / class body) uses `await`. The compiler upgrades
+/// `<main>` / `<module-init>` to `is_async = true` when this
+/// returns true so `Op::Await` can park the entry frame, matching
+/// §16.2.1.7 `top-level-await` modules.
+fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool {
+    use oxc_ast_visit::Visit;
+    #[derive(Default)]
+    struct AwaitFinder {
+        depth: u32,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for AwaitFinder {
+        fn visit_function(
+            &mut self,
+            it: &oxc_ast::ast::Function<'a>,
+            flags: oxc_syntax::scope::ScopeFlags,
+        ) {
+            self.depth += 1;
+            oxc_ast_visit::walk::walk_function(self, it, flags);
+            self.depth -= 1;
+        }
+        fn visit_arrow_function_expression(
+            &mut self,
+            it: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+            self.depth += 1;
+            oxc_ast_visit::walk::walk_arrow_function_expression(self, it);
+            self.depth -= 1;
+        }
+        fn visit_class(&mut self, it: &oxc_ast::ast::Class<'a>) {
+            self.depth += 1;
+            oxc_ast_visit::walk::walk_class(self, it);
+            self.depth -= 1;
+        }
+        fn visit_await_expression(&mut self, it: &oxc_ast::ast::AwaitExpression<'a>) {
+            if self.depth == 0 {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_await_expression(self, it);
+        }
+    }
+    let mut finder = AwaitFinder::default();
+    for stmt in stmts {
+        finder.visit_statement(stmt);
+    }
+    finder.found
+}
+
 /// Walk `stmts` collecting every `var`-declared name reachable
 /// without crossing a function or class boundary. Per ECMA-262
 /// §8.1.6 VarScopedDeclarations, these names belong to the
@@ -2226,6 +2366,178 @@ fn pre_declare_var_bindings(
     Ok(())
 }
 
+/// Walk `stmts` collecting every top-level lexical declaration name
+/// — `let x`, `const x`, `class C` — that lives at the current
+/// function / script / module scope. Top-level only: nested blocks,
+/// loop bodies, etc., own their own block scope and aren't touched.
+///
+/// Names are returned with their declaration kind so the pre-pass
+/// can call [`Compiler::declare_binding`] with the right `is_const`
+/// flag.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-static-semantics-lexicallydeclarednames>
+fn hoist_lexical_names(stmts: &[Statement<'_>], out: &mut Vec<(String, bool)>) {
+    for stmt in stmts {
+        match stmt {
+            Statement::VariableDeclaration(d)
+                if matches!(
+                    d.kind,
+                    oxc_ast::ast::VariableDeclarationKind::Let
+                        | oxc_ast::ast::VariableDeclarationKind::Const
+                ) =>
+            {
+                let is_const = matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+                for declarator in d.declarations.iter() {
+                    // Only pre-hoist plain identifier bindings;
+                    // destructuring patterns declare each leaf at
+                    // their source position via `destructure_into`.
+                    // A hoisted nested function that captures a
+                    // destructured leaf name is filed as a follow-up.
+                    if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+                        out.push((id.name.as_str().to_string(), is_const));
+                    }
+                }
+            }
+            Statement::ClassDeclaration(c) => {
+                if let Some(id) = &c.id {
+                    out.push((id.name.as_str().to_string(), false));
+                }
+            }
+            // Don't recurse into blocks / control-flow constructs:
+            // those declarations belong to the inner block scope,
+            // not the enclosing function / module body.
+            _ => {}
+        }
+    }
+}
+
+/// Pre-declare each top-level lexical name from
+/// [`hoist_lexical_names`] so inner function declarations (which
+/// hoist *above* the lexical declarations) can resolve their
+/// captures. Bindings start in TDZ — the source-level `let` /
+/// `const` / `class` arm flips them to initialized once the
+/// initialiser stores its value.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
+///   step 33 (CreateMutableBinding for `let`, CreateImmutableBinding
+///   for `const`).
+fn pre_declare_lexical_bindings(
+    cx: &mut Compiler,
+    names: &[(String, bool)],
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    for (name, is_const) in names {
+        if cx.lookup_binding(name).is_some() {
+            // Already pre-declared (parameter, var-hoist clash, …).
+            // §10.2.11 forbids let / const / class from shadowing a
+            // var-hoisted name at the same scope; surface a clear
+            // diagnostic at declaration time rather than here.
+            continue;
+        }
+        cx.declare_binding(name, *is_const, span)?;
+    }
+    Ok(())
+}
+
+/// Hoist top-level `function f() {…}` declarations from `stmts` to
+/// the start of the current function / script / module scope, per
+/// ECMA-262 §10.2.11 FunctionDeclarationInstantiation step 30.
+///
+/// # Algorithm
+/// 1. Find every `FunctionDeclaration` in the *direct* statement
+///    list. Per §10.2.11 step 14 the LAST declaration with a given
+///    name wins — earlier siblings are pre-empted at the binding
+///    site (their bytecode still emits because OXC parses each
+///    independently, but only the last store survives).
+/// 2. For each surviving declaration: pre-declare its name, compile
+///    the function body, materialise the closure value, store it
+///    into the binding, and mark the binding initialised. Record the
+///    name in `cx.hoisted_function_names` so the source-position
+///    arm in `compile_statement` becomes a no-op.
+///
+/// Block-nested `FunctionDeclaration`s (`if (true) { function f(){} }`)
+/// are *not* hoisted by this pass — the foundation models them as
+/// block-scoped per the ES strict-mode rule. Annex B sloppy-mode
+/// extensions are out of scope.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-functiondeclarationinstantiation>
+/// - <https://tc39.es/ecma262/#sec-globaldeclarationinstantiation>
+fn hoist_function_declarations(
+    cx: &mut Compiler,
+    stmts: &[Statement<'_>],
+) -> Result<(), CompileError> {
+    use std::collections::HashMap;
+    // Pass 1 — last-occurrence-wins: identify the surviving
+    // declaration index per name.
+    let mut last_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if let Statement::FunctionDeclaration(f) = stmt
+            && !f.declare
+            && let Some(id) = &f.id
+        {
+            last_idx.insert(id.name.as_str().to_string(), idx);
+        }
+    }
+    // Pass 2 — pre-declare each surviving name in the current scope
+    // so mutual references between hoisted siblings (and forward
+    // references from inner functions) all resolve before any body
+    // is compiled. The binding is initialised to undefined; the
+    // closure value lands in pass 3.
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let Statement::FunctionDeclaration(f) = stmt else {
+            continue;
+        };
+        let Some(id) = &f.id else {
+            continue;
+        };
+        let name = id.name.as_str().to_string();
+        if last_idx.get(&name) != Some(&idx) {
+            continue;
+        }
+        let span = (f.span.start, f.span.end);
+        if cx.lookup_binding(&name).is_none() {
+            let storage = cx.declare_binding(&name, false, span)?;
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+            cx.emit_store_storage(dst, storage, span);
+            cx.mark_initialized(&name);
+        }
+        cx.top_mut().hoisted_function_names.insert(name);
+    }
+    // Pass 3 — compile each surviving function body and store the
+    // resulting closure into the pre-bound slot. With every name
+    // already declared, mutually-recursive declarations bind
+    // correctly regardless of source order.
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let Statement::FunctionDeclaration(f) = stmt else {
+            continue;
+        };
+        let Some(id) = &f.id else {
+            continue;
+        };
+        let name = id.name.as_str().to_string();
+        if last_idx.get(&name) != Some(&idx) {
+            continue;
+        }
+        let span = (f.span.start, f.span.end);
+        let (function_id, captures) =
+            compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
+        let const_idx = cx.intern_function_id(function_id);
+        let tmp = cx.alloc_scratch();
+        emit_make_callable(cx, tmp, const_idx, &captures, false, span);
+        let storage = cx
+            .lookup_binding(&name)
+            .expect("pass 2 pre-declared the binding")
+            .storage;
+        cx.emit_store_storage(tmp, storage, span);
+        cx.emit_module_export_mirror(&name, tmp, span);
+    }
+    Ok(())
+}
+
 fn compile_function(
     parent: &mut Compiler,
     name: &str,
@@ -2297,6 +2609,16 @@ fn compile_function(
         let mut var_names: Vec<String> = Vec::new();
         hoist_var_names(&body.statements, &mut var_names);
         pre_declare_var_bindings(parent, &var_names, span)?;
+        // Pre-declare lexical bindings (TDZ) so hoisted nested
+        // functions can capture forward references.
+        let mut lex_names: Vec<(String, bool)> = Vec::new();
+        hoist_lexical_names(&body.statements, &mut lex_names);
+        pre_declare_lexical_bindings(parent, &lex_names, span)?;
+        // §10.2.11 step 30 — function declarations hoist to the
+        // function scope. Pre-emitting their closure stores here
+        // means calls placed textually above the declaration
+        // resolve correctly.
+        hoist_function_declarations(parent, &body.statements)?;
         for stmt in &body.statements {
             compile_statement(parent, stmt)?;
         }
@@ -2343,6 +2665,55 @@ fn compile_assignment(
     if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
         let obj_reg = compile_expr(cx, &member.object, span)?;
         let name_idx = cx.intern_string_constant(member.property.name.as_str());
+        let new_value = match compound_op {
+            None => compile_expr(cx, &a.right, span)?,
+            Some(op) => {
+                let current = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadProperty,
+                    vec![
+                        Operand::Register(current),
+                        Operand::Register(obj_reg),
+                        Operand::ConstIndex(name_idx),
+                    ],
+                    span,
+                );
+                let rhs = compile_expr(cx, &a.right, span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    op,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(current),
+                        Operand::Register(rhs),
+                    ],
+                    span,
+                );
+                dst
+            }
+        };
+        let store_scratch = cx.alloc_scratch();
+        cx.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(obj_reg),
+                Operand::ConstIndex(name_idx),
+                Operand::Register(new_value),
+                Operand::Register(store_scratch),
+            ],
+            span,
+        );
+        return Ok(new_value);
+    }
+    if let AssignmentTarget::PrivateFieldExpression(member) = &a.left {
+        let mangled =
+            cx.mangle_private(member.field.name.as_str())
+                .ok_or(CompileError::Unsupported {
+                    node: "PrivateFieldExpression assignment outside any class body".to_string(),
+                    span,
+                })?;
+        let obj_reg = compile_expr(cx, &member.object, span)?;
+        let name_idx = cx.intern_string_constant(&mangled);
         let new_value = match compound_op {
             None => compile_expr(cx, &a.right, span)?,
             Some(op) => {
@@ -2894,6 +3265,24 @@ fn compile_expr(
             Ok(dst)
         }
 
+        // §19.1 `globalThis` — when the user hasn't shadowed the
+        // name, return the runtime's per-Interpreter shared
+        // globalThis JsObject.
+        // <https://tc39.es/ecma262/#sec-globalthis>
+        Expression::Identifier(id)
+            if id.name.as_str() == "globalThis"
+                && cx.lookup_binding("globalThis").is_none()
+                && find_module_import_binding(cx, "globalThis").is_none() =>
+        {
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadGlobalThis,
+                vec![Operand::Register(dst)],
+                enclosing_span,
+            );
+            Ok(dst)
+        }
+
         Expression::NullLiteral(lit) => {
             let dst = cx.alloc_scratch();
             cx.emit(
@@ -3358,6 +3747,62 @@ fn compile_expr(
         // <https://tc39.es/ecma262/#sec-optional-chains>
         Expression::ChainExpression(c) => compile_chain_expression(cx, c),
 
+        // §13.3.7 PrivateFieldExpression — `obj.#name`.
+        // <https://tc39.es/ecma262/#sec-makeprivatereference>
+        Expression::PrivateFieldExpression(p) => {
+            let pspan = (p.span.start, p.span.end);
+            let mangled =
+                cx.mangle_private(p.field.name.as_str())
+                    .ok_or(CompileError::Unsupported {
+                        node: "PrivateFieldExpression outside any class body".to_string(),
+                        span: pspan,
+                    })?;
+            let obj_reg = compile_expr(cx, &p.object, pspan)?;
+            let name_idx = cx.intern_string_constant(&mangled);
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                pspan,
+            );
+            Ok(dst)
+        }
+
+        // §13.10.1 — `#name in obj` private-name membership probe.
+        // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+        Expression::PrivateInExpression(p) => {
+            let pspan = (p.span.start, p.span.end);
+            let mangled =
+                cx.mangle_private(p.left.name.as_str())
+                    .ok_or(CompileError::Unsupported {
+                        node: "PrivateInExpression outside any class body".to_string(),
+                        span: pspan,
+                    })?;
+            let key_reg = cx.alloc_scratch();
+            let key_idx = cx.intern_string_constant(&mangled);
+            cx.emit(
+                Op::LoadString,
+                vec![Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
+                pspan,
+            );
+            let obj_reg = compile_expr(cx, &p.right, pspan)?;
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::HasProperty,
+                vec![
+                    Operand::Register(dst),
+                    Operand::Register(key_reg),
+                    Operand::Register(obj_reg),
+                ],
+                pspan,
+            );
+            Ok(dst)
+        }
+
         Expression::BinaryExpression(b) => {
             let span = (b.span.start, b.span.end);
             let lhs = compile_expr(cx, &b.left, span)?;
@@ -3446,6 +3891,27 @@ fn compile_expr(
             // chain. Only valid inside a class method.
             if matches!(m.object, Expression::Super(_)) {
                 return compile_super_member_load(cx, m.property.name.as_str(), span);
+            }
+            // §21.1.1.x Number static constants — `MAX_SAFE_INTEGER`
+            // / `MIN_SAFE_INTEGER` / `MAX_VALUE` / `MIN_VALUE` /
+            // `EPSILON` / `POSITIVE_INFINITY` / `NEGATIVE_INFINITY`
+            // / `NaN`. Inline the literal value at compile time so
+            // the runtime doesn't need a real `Number` global.
+            // <https://tc39.es/ecma262/#sec-properties-of-the-number-constructor>
+            if let Expression::Identifier(id) = &m.object
+                && id.name.as_str() == "Number"
+                && cx.lookup_binding("Number").is_none()
+                && find_module_import_binding(cx, "Number").is_none()
+                && let Some(value) = number_static_constant(m.property.name.as_str())
+            {
+                let dst = cx.alloc_scratch();
+                let const_idx = cx.intern_number_constant(value);
+                cx.emit(
+                    Op::LoadNumber,
+                    vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                    span,
+                );
+                return Ok(dst);
             }
             // `Math.PI` / `Math.E` — lower to MathLoad so the runtime
             // doesn't need a real global object yet. Method-call
@@ -3541,6 +4007,26 @@ fn compile_expr(
                     &new_expr.arguments,
                     new_span,
                 );
+            }
+            // §20.2.1.1 `new Function(arg0, …, body)` — every
+            // argument coerces to a string at runtime; the leading
+            // ones become parameter names and the last one is the
+            // function body. Foundation lowers `Function(...)`
+            // (without `new`) to the same shape per spec.
+            // <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Function"
+                && cx.lookup_binding("Function").is_none()
+                && find_module_import_binding(cx, "Function").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::NewFunction, operands, new_span);
+                return Ok(dst);
             }
             // `new Intl.<Class>(locale?, options?)` — dedicated
             // `Op::NewIntl` lowering. The callee is a static-member
@@ -3865,24 +4351,32 @@ fn compile_expr(
                     span,
                 });
             }
-            let specifier = match unwrap_ts_expr(&imp.source) {
-                Expression::StringLiteral(lit) => lit.value.as_str().to_string(),
-                _ => {
-                    return Err(CompileError::Unsupported {
-                        node:
-                            "MODULE_DYNAMIC_NON_LITERAL: non-literal `import(specifier)` argument"
-                                .to_string(),
-                        span,
-                    });
-                }
-            };
             let ns_dst = cx.alloc_scratch();
-            let spec_const = cx.intern_string_constant(&specifier);
-            cx.emit(
-                Op::ImportNamespace,
-                vec![Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
-                span,
-            );
+            match unwrap_ts_expr(&imp.source) {
+                Expression::StringLiteral(lit) => {
+                    let specifier = lit.value.as_str().to_string();
+                    let spec_const = cx.intern_string_constant(&specifier);
+                    cx.emit(
+                        Op::ImportNamespace,
+                        vec![Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
+                        span,
+                    );
+                }
+                other => {
+                    // Non-literal specifier: evaluate the expression
+                    // at runtime, then resolve through the module
+                    // graph. Specifiers that weren't pre-resolved by
+                    // the linker raise a TypeError at the dispatch
+                    // site (foundation does not yet re-enter the
+                    // compiler for runtime-discovered modules).
+                    let spec_reg = compile_expr(cx, other, span)?;
+                    cx.emit(
+                        Op::ImportNamespaceDynamic,
+                        vec![Operand::Register(ns_dst), Operand::Register(spec_reg)],
+                        span,
+                    );
+                }
+            }
             let promise_dst = cx.alloc_scratch();
             cx.emit(
                 Op::PromiseFulfilledOf,
@@ -4513,6 +5007,37 @@ fn compile_method_call(
     {
         return compile_super_method_call(cx, member.property.name.as_str(), &call.arguments, span);
     }
+    // `import.meta.resolve(specifier)` — sync URL join against the
+    // active module's URL. HTML spec returns a string; foundation
+    // matches that shape via `Op::ImportMetaResolve`.
+    // <https://html.spec.whatwg.org/multipage/webappapis.html#hostmetagetimportmetaproperties>
+    if let Expression::StaticMemberExpression(member) = callee
+        && let Expression::MetaProperty(meta) = &member.object
+        && meta.meta.name.as_str() == "import"
+        && meta.property.name.as_str() == "meta"
+        && member.property.name.as_str() == "resolve"
+    {
+        if call.arguments.len() != 1 {
+            return Err(CompileError::Unsupported {
+                node: format!("import.meta.resolve/{}", call.arguments.len()),
+                span,
+            });
+        }
+        let arg = call.arguments[0]
+            .as_expression()
+            .ok_or(CompileError::Unsupported {
+                node: "import.meta.resolve: spread argument".to_string(),
+                span,
+            })?;
+        let spec_reg = compile_expr(cx, arg, span)?;
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::ImportMetaResolve,
+            vec![Operand::Register(dst), Operand::Register(spec_reg)],
+            span,
+        );
+        return Ok(dst);
+    }
     // Bare `Error("msg")` / `TypeError("msg")` / etc. without
     // `new` is treated like the matching `new <Kind>("msg")` per
     // ES spec §20.5.1.1 — same lowering.
@@ -4672,6 +5197,43 @@ fn compile_method_call(
             cx.emit(Op::SymbolCall, operands, span);
             return Ok(dst);
         }
+        // §21.1.2 Number static surface — `Number.parseInt` /
+        // `Number.parseFloat` are aliases of the global functions
+        // (§21.1.2.13 / §21.1.2.12); `Number.isNaN` /
+        // `Number.isFinite` / `Number.isInteger` /
+        // `Number.isSafeInteger` are the strict variants. All four
+        // shapes route through the same `Op::GlobalCall` entry —
+        // strict variants pass a distinguishing key so
+        // `global_functions::call` can branch.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-number-constructor>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Number"
+            && cx.lookup_binding("Number").is_none()
+            && find_module_import_binding(cx, "Number").is_none()
+        {
+            let method = member.property.name.as_str();
+            let dispatch_name = match method {
+                "parseInt" => Some("parseInt"),
+                "parseFloat" => Some("parseFloat"),
+                "isNaN" => Some("Number.isNaN"),
+                "isFinite" => Some("Number.isFinite"),
+                "isInteger" => Some("Number.isInteger"),
+                "isSafeInteger" => Some("Number.isSafeInteger"),
+                _ => None,
+            };
+            if let Some(name) = dispatch_name {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                let name_idx = cx.intern_string_constant(name);
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::GlobalCall, operands, span);
+                return Ok(dst);
+            }
+        }
     }
     // Bare `Symbol(desc)` — fresh primitive symbol per call. Lower
     // through the same Op::SymbolCall path with the empty-string
@@ -4690,6 +5252,84 @@ fn compile_method_call(
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::SymbolCall, operands, span);
         return Ok(dst);
+    }
+    // §20.2.1.1 — bare `Function(arg0, …, body)` is the same as
+    // `new Function(...)` per spec; lower both shapes through one
+    // path.
+    // <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Function"
+        && cx.lookup_binding("Function").is_none()
+        && find_module_import_binding(cx, "Function").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::NewFunction, operands, span);
+        return Ok(dst);
+    }
+    // §19.4.1 `eval(source)` — bare-identifier interception.
+    // Foundation ships indirect-eval semantics (fresh global
+    // scope) which keeps the implementation tractable while
+    // covering the common use case of running source-string
+    // payloads at runtime.
+    // <https://tc39.es/ecma262/#sec-eval-x>
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "eval"
+        && cx.lookup_binding("eval").is_none()
+        && find_module_import_binding(cx, "eval").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        if arg_regs.is_empty() {
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+            return Ok(dst);
+        }
+        let src_reg = arg_regs[0];
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::Eval,
+            vec![Operand::Register(dst), Operand::Register(src_reg)],
+            span,
+        );
+        return Ok(dst);
+    }
+    // §19.2 global-function interceptions: route bare-identifier
+    // calls like `parseInt(...)` / `isNaN(x)` /
+    // `encodeURIComponent(s)` through a single `Op::GlobalCall`
+    // dispatcher. The user can shadow these names with a local
+    // binding; `lookup_binding` is consulted first so the shadow
+    // wins.
+    // <https://tc39.es/ecma262/#sec-function-properties-of-the-global-object>
+    if let Expression::Identifier(id) = callee {
+        let name = id.name.as_str();
+        if matches!(
+            name,
+            "parseInt"
+                | "parseFloat"
+                | "isNaN"
+                | "isFinite"
+                | "encodeURI"
+                | "encodeURIComponent"
+                | "decodeURI"
+                | "decodeURIComponent"
+        ) && cx.lookup_binding(name).is_none()
+            && find_module_import_binding(cx, name).is_none()
+        {
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(name);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::GlobalCall, operands, span);
+            return Ok(dst);
+        }
     }
     // Bare-identifier interceptions — `queueMicrotask(fn, ...args)`
     // is the only one today. Lives at the call-site layer (not
@@ -4729,6 +5369,26 @@ fn compile_method_call(
         }
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         let name_idx = cx.intern_string_constant(method_name);
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(receiver_reg));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallMethodValue, operands, span);
+        return Ok(dst);
+    }
+    if let Expression::PrivateFieldExpression(member) = callee {
+        let mangled =
+            cx.mangle_private(member.field.name.as_str())
+                .ok_or(CompileError::Unsupported {
+                    node: "PrivateFieldExpression call outside any class body".to_string(),
+                    span,
+                })?;
+        let receiver_reg = compile_expr(cx, &member.object, span)?;
+        let name_idx = cx.intern_string_constant(&mangled);
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
@@ -5055,6 +5715,18 @@ fn compile_class(
 
     cx.enter_scope();
 
+    // Allocate a fresh private-field namespace and push it on the
+    // compiler's class-context stack so every `#name` reference
+    // inside the class body mangles into this class's slot.
+    let private_namespace = {
+        let module = Rc::clone(&cx.top_mut().module);
+        let mut m = module.borrow_mut();
+        let id = m.next_private_namespace;
+        m.next_private_namespace = id.checked_add(1).expect("private-namespace overflow");
+        id
+    };
+    cx.private_namespaces.push(private_namespace);
+
     // Evaluate the parent class first so observable side-effects
     // happen exactly once per declaration, in source order.
     let super_reg = match &class.super_class {
@@ -5150,14 +5822,27 @@ fn compile_class(
                 }
             }
             oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
-                // Field declarations need TDZ + per-instance init
-                // semantics that the foundation slice doesn't model.
-                // Reject explicitly so users aren't surprised.
-                return Err(CompileError::Unsupported {
-                    node: "ClassDeclaration: field declaration (foundation supports methods only)"
-                        .to_string(),
-                    span: (p.span.start, p.span.end),
-                });
+                // §15.7 ClassFieldDefinition. The foundation
+                // accepts public instance fields and public static
+                // fields; private (`#name`), accessor, decorated,
+                // and `declare`-only fields are filed.
+                if p.declare {
+                    // TypeScript `declare x: T` — type-level only.
+                    continue;
+                }
+                if p.computed {
+                    return Err(CompileError::Unsupported {
+                        node: "ClassDeclaration: computed field key".to_string(),
+                        span: (p.span.start, p.span.end),
+                    });
+                }
+                if !p.decorators.is_empty() {
+                    return Err(CompileError::Unsupported {
+                        node: "ClassDeclaration: decorated field".to_string(),
+                        span: (p.span.start, p.span.end),
+                    });
+                }
+                if !p.r#static {}
             }
             oxc_ast::ast::ClassElement::AccessorProperty(p) => {
                 return Err(CompileError::Unsupported {
@@ -5165,37 +5850,70 @@ fn compile_class(
                     span: (p.span.start, p.span.end),
                 });
             }
-            oxc_ast::ast::ClassElement::StaticBlock(s) => {
-                return Err(CompileError::Unsupported {
-                    node: "ClassDeclaration: static initializer block".to_string(),
-                    span: (s.span.start, s.span.end),
-                });
+            oxc_ast::ast::ClassElement::StaticBlock(_) => {
+                // Allowed — runs at class-declaration time after
+                // static fields. See compile_static_block below.
             }
             oxc_ast::ast::ClassElement::TSIndexSignature(_) => {
                 // TypeScript-only — erase silently.
             }
         }
     }
+    // Collect the instance-field initialisers (in source order) so
+    // both user-written and synthetic constructors can prepend them
+    // to the body. §15.7.10 InitializeInstanceElements.
+    let instance_fields: Vec<&oxc_ast::ast::PropertyDefinition<'_>> = class
+        .body
+        .body
+        .iter()
+        .filter_map(|el| match el {
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) if !p.r#static && !p.declare => {
+                Some(&**p)
+            }
+            _ => None,
+        })
+        .collect();
 
     // Compile the constructor body. When the user didn't write one,
     // synthesize the spec defaults: a base class gets an empty body,
     // a derived class gets `constructor(...args) { super(...args); }`.
     let display_name = class_name.unwrap_or("<class>").to_string();
+    let is_derived = super_reg.is_some();
     let (ctor_id, ctor_captures) = match ctor_method {
-        Some(m) => compile_function(
+        Some(m) => compile_class_constructor(
             cx,
             &display_name,
             &m.value.params,
             &m.value.body,
             (m.span.start, m.span.end),
             m.value.r#async,
+            &instance_fields,
+            is_derived,
         )?,
-        None => compile_synthetic_constructor(cx, &display_name, super_reg.is_some(), span)?,
+        None => {
+            compile_synthetic_constructor(cx, &display_name, is_derived, span, &instance_fields)?
+        }
     };
 
     let ctor_const = cx.intern_function_id(ctor_id);
     let ctor_reg = cx.alloc_scratch();
     emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span);
+
+    // Per §10.2.1.4 ClassDefinitionEvaluation step 24, the class
+    // binding becomes initialised *before* the static elements run
+    // so they can reference it (e.g., `static x = C.someStatic`).
+    // The binding's final value (`MakeClass`) lands at the end of
+    // this function — for the early-bind we use the statics object
+    // as a stand-in: static initialisers usually reach the class
+    // for its statics anyway, and the foundation overwrites with
+    // the full class value before any user code outside the class
+    // body can observe it.
+    if let Some(name) = class_name
+        && let Some(info) = cx.lookup_binding(name)
+    {
+        cx.emit_store_storage(statics_reg, info.storage, span);
+        cx.mark_initialized(name);
+    }
 
     // Install methods (instance + static) onto the right side.
     for element in &class.body.body {
@@ -5209,6 +5927,12 @@ fn compile_class(
         let method_name = match &m.key {
             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
             oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+            oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => cx
+                .mangle_private(pid.name.as_str())
+                .ok_or(CompileError::Unsupported {
+                    node: "ClassDeclaration: private method outside class".to_string(),
+                    span: method_span,
+                })?,
             _ => {
                 return Err(CompileError::Unsupported {
                     node: "ClassDeclaration: non-string method key".to_string(),
@@ -5246,6 +5970,71 @@ fn compile_class(
         );
     }
 
+    // §15.7.10 InitializeStaticElements — walk the body in source
+    // order, evaluating static fields and static-init blocks
+    // against the statics object.
+    for element in &class.body.body {
+        match element {
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.r#static && !p.declare => {
+                let pspan = (p.span.start, p.span.end);
+                let key_str = match &p.key {
+                    oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+                    oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                    oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => cx
+                        .mangle_private(pid.name.as_str())
+                        .ok_or(CompileError::Unsupported {
+                            node: "ClassDeclaration: private static field outside class"
+                                .to_string(),
+                            span: pspan,
+                        })?,
+                    _ => {
+                        return Err(CompileError::Unsupported {
+                            node: "ClassDeclaration: non-string static field key".to_string(),
+                            span: pspan,
+                        });
+                    }
+                };
+                let value_reg = match &p.value {
+                    Some(expr) => compile_expr(cx, expr, pspan)?,
+                    None => {
+                        let dst = cx.alloc_scratch();
+                        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], pspan);
+                        dst
+                    }
+                };
+                cx.emit_store_property(statics_reg, &key_str, value_reg, pspan);
+            }
+            oxc_ast::ast::ClassElement::StaticBlock(s) => {
+                // §15.7.4 StaticBlock — a synthesised function with
+                // no params; `this` bound to the statics object.
+                // Compile a closure-less function from the block
+                // body, then invoke it with the statics object as
+                // the receiver via `Op::CallWithThis`.
+                let bspan = (s.span.start, s.span.end);
+                let function_id = compile_static_block(cx, &display_name, &s.body, bspan)?;
+                let const_idx = cx.intern_function_id(function_id);
+                let fn_reg = cx.alloc_scratch();
+                cx.emit(
+                    Op::MakeFunction,
+                    vec![Operand::Register(fn_reg), Operand::ConstIndex(const_idx)],
+                    bspan,
+                );
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::CallWithThis,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(fn_reg),
+                        Operand::Register(statics_reg),
+                        Operand::ConstIndex(0),
+                    ],
+                    bspan,
+                );
+            }
+            _ => {}
+        }
+    }
+
     let class_reg = cx.alloc_scratch();
     cx.emit(
         Op::MakeClass,
@@ -5258,6 +6047,7 @@ fn compile_class(
         span,
     );
 
+    cx.private_namespaces.pop();
     cx.exit_scope();
     Ok(class_reg)
 }
@@ -5274,6 +6064,7 @@ fn compile_synthetic_constructor(
     name: &str,
     is_derived: bool,
     span: (u32, u32),
+    instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
     let child = FunctionContext::new(Rc::clone(&module));
@@ -5316,6 +6107,10 @@ fn compile_synthetic_constructor(
             span,
         );
     }
+    // §15.7.10 InitializeInstanceElements — run instance-field
+    // initialisers with `this` bound to the new instance, after the
+    // super() call has run.
+    emit_instance_field_inits(parent, instance_fields)?;
     parent.emit(Op::ReturnUndefined, vec![], span);
 
     parent.exit_scope();
@@ -5333,6 +6128,246 @@ fn compile_synthetic_constructor(
     slot.code = child.code;
     slot.spans = child.spans;
     Ok((function_id, captures))
+}
+
+/// Compile a user-written class constructor, prepending instance-
+/// field initialisers when present. For base classes the fields run
+/// at the top of the body; for derived classes the foundation
+/// rejects this combination upstream so we never get here.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+/// - <https://tc39.es/ecma262/#sec-initializeinstanceelements>
+#[allow(clippy::too_many_arguments)]
+fn compile_class_constructor(
+    parent: &mut Compiler,
+    name: &str,
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
+    span: (u32, u32),
+    is_async: bool,
+    instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
+    is_derived: bool,
+) -> Result<(u32, Vec<u32>), CompileError> {
+    if instance_fields.is_empty() {
+        return compile_function(parent, name, params, body, span, is_async);
+    }
+    // Compile the function with field-init injection. We mirror
+    // `compile_function` but inject the field stores after the
+    // self-name binding and before the user body. The compiler
+    // doesn't have a public hook for this, so we duplicate the
+    // setup here.
+    let module = Rc::clone(&parent.top_mut().module);
+    let mut child = FunctionContext::new(Rc::clone(&module));
+    if let Some(b) = body {
+        child.captured_names = capture::analyze_function(Some(params), b);
+    }
+    parent.push(child);
+    parent.enter_scope();
+
+    let param_count = u16::try_from(params.items.len()).expect("too many parameters");
+    parent.scratch = param_count;
+    let has_rest = params.rest.is_some();
+
+    let function_id = module.borrow().functions.len() as u32;
+    module.borrow_mut().functions.push(Function {
+        id: function_id,
+        name: name.to_string(),
+        span,
+        ..Default::default()
+    });
+
+    for (ordinal, param) in params.items.iter().enumerate() {
+        compile_formal_parameter(
+            parent,
+            ordinal as u16,
+            &param.pattern,
+            param.initializer.as_deref(),
+            span,
+        )?;
+    }
+    if let Some(rest) = &params.rest {
+        compile_rest_parameter(parent, &rest.rest.argument, span)?;
+    }
+
+    let self_storage = parent.declare_binding(name, false, span)?;
+    let const_idx = parent.intern_function_id(function_id);
+    let tmp = parent.alloc_scratch();
+    parent.emit(
+        Op::MakeFunction,
+        vec![Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+        span,
+    );
+    parent.emit_store_storage(tmp, self_storage, span);
+    parent.mark_initialized(name);
+
+    // §15.7.10 InitializeInstanceElements — base classes run field
+    // initialisers immediately (before the user body); derived
+    // classes run them right after the user-written `super(...)`
+    // call returns, so `this` is already allocated.
+    if !is_derived {
+        emit_instance_field_inits(parent, instance_fields)?;
+    }
+
+    if let Some(body) = body {
+        let mut var_names: Vec<String> = Vec::new();
+        hoist_var_names(&body.statements, &mut var_names);
+        pre_declare_var_bindings(parent, &var_names, span)?;
+        let mut lex_names: Vec<(String, bool)> = Vec::new();
+        hoist_lexical_names(&body.statements, &mut lex_names);
+        pre_declare_lexical_bindings(parent, &lex_names, span)?;
+        hoist_function_declarations(parent, &body.statements)?;
+        let mut fields_emitted = !is_derived;
+        for stmt in &body.statements {
+            compile_statement(parent, stmt)?;
+            // Inject the field initialisers as soon as the user's
+            // first statement-level `super(...)` call has run. This
+            // mirrors the spec's "after the super call returns" rule
+            // for derived constructors. If the user doesn't write a
+            // top-level super-call (defensive shape) we fall through
+            // to the post-body emission below.
+            if !fields_emitted && is_top_level_super_call(stmt) {
+                emit_instance_field_inits(parent, instance_fields)?;
+                fields_emitted = true;
+            }
+        }
+        if !fields_emitted {
+            emit_instance_field_inits(parent, instance_fields)?;
+        }
+    } else if is_derived {
+        // No body at all (degenerate shape) — emit field inits.
+        emit_instance_field_inits(parent, instance_fields)?;
+    }
+    parent.exit_scope();
+    parent.emit(Op::ReturnUndefined, vec![], span);
+
+    let child = parent.pop();
+    let captures = child.parent_captures.clone();
+    let mut module_mut = module.borrow_mut();
+    let slot = module_mut
+        .functions
+        .get_mut(function_id as usize)
+        .expect("reserved function slot");
+    slot.locals = 0;
+    slot.scratch = child.scratch;
+    slot.param_count = param_count;
+    slot.has_rest = has_rest;
+    slot.is_async = is_async;
+    slot.own_upvalue_count = child.own_upvalue_count;
+    slot.code = child.code;
+    slot.spans = child.spans;
+    Ok((function_id, captures))
+}
+
+/// Emit `this.<key> = <init>` for each instance-field declaration.
+/// The initializer expression is evaluated in the current scope
+/// (the constructor's scope, with access to params + outer
+/// upvalues) per §15.7.10 InitializeFieldsForReceiver.
+fn emit_instance_field_inits(
+    cx: &mut Compiler,
+    fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
+) -> Result<(), CompileError> {
+    for p in fields {
+        let pspan = (p.span.start, p.span.end);
+        let key_str = match &p.key {
+            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+            oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => cx
+                .mangle_private(pid.name.as_str())
+                .ok_or(CompileError::Unsupported {
+                    node: "ClassDeclaration: private instance field outside class".to_string(),
+                    span: pspan,
+                })?,
+            _ => {
+                return Err(CompileError::Unsupported {
+                    node: "ClassDeclaration: non-string instance field key".to_string(),
+                    span: pspan,
+                });
+            }
+        };
+        let value_reg = match &p.value {
+            Some(expr) => compile_expr(cx, expr, pspan)?,
+            None => {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], pspan);
+                dst
+            }
+        };
+        let this_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], pspan);
+        cx.emit_store_property(this_reg, &key_str, value_reg, pspan);
+    }
+    Ok(())
+}
+
+/// `true` when `stmt` is `super(...)` at the top level of a
+/// derived-class constructor body — the canonical injection point
+/// for instance-field initialisers per §15.7.10 step 9.
+fn is_top_level_super_call(stmt: &Statement<'_>) -> bool {
+    let Statement::ExpressionStatement(es) = stmt else {
+        return false;
+    };
+    let Expression::CallExpression(call) = &es.expression else {
+        return false;
+    };
+    matches!(call.callee, Expression::Super(_))
+}
+
+/// Compile a `static { … }` block as a synthesised parameterless
+/// function. The block's body is treated like a function body for
+/// scoping; `this` is bound to the statics object by the call site
+/// (`Op::CallWithThis`).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-class-static-block>
+fn compile_static_block(
+    parent: &mut Compiler,
+    class_name: &str,
+    body: &oxc_allocator::Vec<'_, Statement<'_>>,
+    span: (u32, u32),
+) -> Result<u32, CompileError> {
+    let module = Rc::clone(&parent.top_mut().module);
+    let child = FunctionContext::new(Rc::clone(&module));
+    parent.push(child);
+    parent.enter_scope();
+
+    let function_id = module.borrow().functions.len() as u32;
+    module.borrow_mut().functions.push(Function {
+        id: function_id,
+        name: format!("{class_name}.<static-init>"),
+        span,
+        ..Default::default()
+    });
+
+    // Same pre-passes as a regular function body — top-level
+    // `var` / `let` / `function` statements inside a static block
+    // hoist to the block's scope, not the surrounding class.
+    let mut var_names: Vec<String> = Vec::new();
+    hoist_var_names(body, &mut var_names);
+    pre_declare_var_bindings(parent, &var_names, span)?;
+    let mut lex_names: Vec<(String, bool)> = Vec::new();
+    hoist_lexical_names(body, &mut lex_names);
+    pre_declare_lexical_bindings(parent, &lex_names, span)?;
+    hoist_function_declarations(parent, body)?;
+    for stmt in body {
+        compile_statement(parent, stmt)?;
+    }
+    parent.exit_scope();
+    parent.emit(Op::ReturnUndefined, vec![], span);
+
+    let child = parent.pop();
+    let mut module_mut = module.borrow_mut();
+    let slot = module_mut
+        .functions
+        .get_mut(function_id as usize)
+        .expect("reserved static-block slot");
+    slot.locals = 0;
+    slot.scratch = child.scratch;
+    slot.param_count = 0;
+    slot.own_upvalue_count = child.own_upvalue_count;
+    slot.code = child.code;
+    slot.spans = child.spans;
+    Ok(function_id)
 }
 
 /// Synthetic name for the per-method "home object" upvalue that
@@ -5672,6 +6707,33 @@ fn compile_object_builtin(
             span,
         }),
     }
+}
+
+/// §21.1.1 Number static constants. Returns the IEEE-754 value the
+/// compiler inlines via `Op::LoadNumber` when the user reads
+/// `Number.<CONST>` outside any local shadow.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-value-properties-of-the-number-constructor>
+fn number_static_constant(name: &str) -> Option<f64> {
+    Some(match name {
+        // §21.1.1.6
+        "MAX_SAFE_INTEGER" => 9_007_199_254_740_991.0,
+        // §21.1.1.10
+        "MIN_SAFE_INTEGER" => -9_007_199_254_740_991.0,
+        // §21.1.1.4
+        "MAX_VALUE" => f64::MAX,
+        // §21.1.1.7 — smallest positive subnormal.
+        "MIN_VALUE" => 5e-324,
+        // §21.1.1.1 — 2^-52.
+        "EPSILON" => f64::EPSILON,
+        // §21.1.1.11 / §21.1.1.9
+        "POSITIVE_INFINITY" => f64::INFINITY,
+        "NEGATIVE_INFINITY" => f64::NEG_INFINITY,
+        // §21.1.1.8
+        "NaN" => f64::NAN,
+        _ => return None,
+    })
 }
 
 /// Lower a template literal `\`hello ${x} world\`` per §13.2.8 — a
@@ -6569,16 +7631,20 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_import_with_non_literal_argument_is_rejected() {
+    fn dynamic_import_with_non_literal_argument_compiles() {
+        // Non-literal specifiers now lower through
+        // `Op::ImportNamespaceDynamic`. The runtime resolves the
+        // string against the active module's resolution table.
         let src = "let s = \"./x.ts\"; import(s);";
         let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
-        let err = compile_module_fragment(&parsed, &host_info(&[])).unwrap_err();
-        match err {
-            CompileError::Unsupported { node, .. } => {
-                assert!(node.contains("MODULE_DYNAMIC_NON_LITERAL"), "got {node}");
-            }
-            other => panic!("expected MODULE_DYNAMIC_NON_LITERAL, got {other:?}"),
-        }
+        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+        let init = &module.functions[0];
+        let dyn_count = init
+            .code
+            .iter()
+            .filter(|i| matches!(i.op, Op::ImportNamespaceDynamic))
+            .count();
+        assert_eq!(dyn_count, 1, "expected one IMPORT_NAMESPACE_DYNAMIC");
     }
 
     #[test]

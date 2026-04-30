@@ -187,4 +187,26 @@ impl<'a> Visit<'a> for InnerRefCollector {
         // captured-by-inner reference at module top level.
         walk::walk_class(self, it);
     }
+
+    fn visit_property_definition(&mut self, it: &oxc_ast::ast::PropertyDefinition<'a>) {
+        // Field initialisers (`class C { x = expr }`) are emitted by
+        // the compiler inside a synthesised function frame: instance
+        // fields run inside the constructor, static fields run via
+        // `Op::CallWithThis` against the class's statics object.
+        // Treat the value expression as if it were nested so any
+        // outer-scope identifier it references is marked as captured.
+        if let Some(value) = &it.value {
+            self.nested_depth = self.nested_depth.saturating_add(1);
+            self.visit_expression(value);
+            self.nested_depth = self.nested_depth.saturating_sub(1);
+        }
+    }
+
+    fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
+        // §15.7.4 — a static block compiles into a synthesised
+        // parameterless function called via `Op::CallWithThis`.
+        self.nested_depth = self.nested_depth.saturating_add(1);
+        walk::walk_static_block(self, it);
+        self.nested_depth = self.nested_depth.saturating_sub(1);
+    }
 }

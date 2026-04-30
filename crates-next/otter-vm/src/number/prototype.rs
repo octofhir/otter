@@ -145,13 +145,153 @@ fn to_string_radix_i64(value: i64, radix: u32) -> String {
     buf.iter().rev().collect()
 }
 
+/// §21.1.3.3 `Number.prototype.toExponential(fractionDigits?)`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-number.prototype.toexponential>
+fn impl_to_exponential(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = receiver_number(args)?;
+    let value = recv.as_f64();
+    if value.is_nan() {
+        return Ok(Value::String(JsString::from_str("NaN", args.string_heap)?));
+    }
+    if value.is_infinite() {
+        let s = if value.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        };
+        return Ok(Value::String(JsString::from_str(s, args.string_heap)?));
+    }
+    let digits = match args.args.first() {
+        None | Some(Value::Undefined) => None,
+        Some(Value::Number(n)) => {
+            let f = n.as_f64();
+            if !f.is_finite() || !(0.0..=100.0).contains(&f) || f.fract() != 0.0 {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "must be an integer in 0..=100",
+                });
+            }
+            Some(f as usize)
+        }
+        _ => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a number",
+            });
+        }
+    };
+    let formatted = match digits {
+        Some(d) => format!("{value:.*e}", d),
+        None => format!("{value:e}"),
+    };
+    // Rust's `{:e}` emits `1e2`; ECMA-262 wants `1e+2`. Normalise
+    // the exponent sign so output matches spec.
+    let normalised = normalise_exp(&formatted);
+    Ok(Value::String(JsString::from_str(
+        &normalised,
+        args.string_heap,
+    )?))
+}
+
+/// §21.1.3.5 `Number.prototype.toPrecision(precision?)`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-number.prototype.toprecision>
+fn impl_to_precision(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = receiver_number(args)?;
+    if matches!(args.args.first(), None | Some(Value::Undefined)) {
+        // No-precision form is equivalent to ToString.
+        return Ok(Value::String(JsString::from_str(
+            &recv.to_display_string(),
+            args.string_heap,
+        )?));
+    }
+    let value = recv.as_f64();
+    if value.is_nan() {
+        return Ok(Value::String(JsString::from_str("NaN", args.string_heap)?));
+    }
+    if value.is_infinite() {
+        let s = if value.is_sign_positive() {
+            "Infinity"
+        } else {
+            "-Infinity"
+        };
+        return Ok(Value::String(JsString::from_str(s, args.string_heap)?));
+    }
+    let precision = match args.args.first() {
+        Some(Value::Number(n)) => {
+            let f = n.as_f64();
+            if !f.is_finite() || !(1.0..=100.0).contains(&f) || f.fract() != 0.0 {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "must be an integer in 1..=100",
+                });
+            }
+            f as usize
+        }
+        _ => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a number",
+            });
+        }
+    };
+    // §21.1.3.5 step 11 — choose between fixed-decimal and
+    // exponential rendering based on the magnitude vs. precision.
+    let abs = value.abs();
+    let exponent = if abs == 0.0 {
+        0
+    } else {
+        abs.log10().floor() as i32
+    };
+    let rendered = if exponent < -6 || exponent >= precision as i32 {
+        normalise_exp(&format!("{value:.*e}", precision - 1))
+    } else {
+        let after_decimal = (precision as i32 - 1 - exponent).max(0) as usize;
+        format!("{value:.*}", after_decimal)
+    };
+    Ok(Value::String(JsString::from_str(
+        &rendered,
+        args.string_heap,
+    )?))
+}
+
+/// §21.1.3.7 `Number.prototype.valueOf()` — returns the receiver.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-number.prototype.valueof>
+fn impl_value_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    Ok(Value::Number(receiver_number(args)?))
+}
+
+/// Rust's `{:e}` formatter emits `1e2` for positive exponents;
+/// ECMA-262 §21.1.3.3 requires an explicit `+` sign. Mirror the
+/// spec rendering by walking the exponent suffix and inserting `+`
+/// when the exponent has no sign.
+fn normalise_exp(raw: &str) -> String {
+    if let Some(idx) = raw.find('e') {
+        let (mantissa, exp) = raw.split_at(idx);
+        let exp_body = &exp[1..];
+        if exp_body.starts_with('+') || exp_body.starts_with('-') {
+            return raw.to_string();
+        }
+        return format!("{mantissa}e+{exp_body}");
+    }
+    raw.to_string()
+}
+
 /// Declarative `Number.prototype` table.
 pub static NUMBER_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
     std::sync::LazyLock::new(|| {
         crate::intrinsics!(
             Number,
-            "toString" / 1 => impl_to_string,
-            "toFixed"  / 1 => impl_to_fixed,
+            "toString"      / 1 => impl_to_string,
+            "toFixed"       / 1 => impl_to_fixed,
+            "toExponential" / 1 => impl_to_exponential,
+            "toPrecision"   / 1 => impl_to_precision,
+            "valueOf"       / 0 => impl_value_of,
         )
     });
 

@@ -161,6 +161,45 @@ pub struct ErrorClassRegistry {
     eval_error: ClassEntry,
 }
 
+/// §20.5.3.4 Error.prototype.toString — single source of truth for
+/// rendering an Error-shaped value. Reads `name` (default
+/// `"Error"`) and `message` (default empty) off the receiver and
+/// returns:
+///
+/// - `""` when both fields stringify to empty.
+/// - `<name>` when `message` is empty.
+/// - `<message>` when `name` is empty.
+/// - `<name>: <message>` otherwise.
+///
+/// Used by both the user-facing `e.toString()` interception in
+/// `do_call_method_value` and the unwind-diagnostic path that
+/// renders uncaught throws.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
+#[must_use]
+pub fn render_error_to_string(value: &Value) -> String {
+    let Value::Object(obj) = value else {
+        return value.display_string();
+    };
+    let name = match obj.get("name") {
+        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(other) => other.display_string(),
+        None => String::new(),
+    };
+    let message = match obj.get("message") {
+        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::Undefined) | None => String::new(),
+        Some(other) => other.display_string(),
+    };
+    match (name.is_empty(), message.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => name,
+        (true, false) => message,
+        (false, false) => format!("{name}: {message}"),
+    }
+}
+
 impl ErrorClassRegistry {
     /// Build the seven prototypes + constructors and link the
     /// inheritance chains.
@@ -192,6 +231,13 @@ impl ErrorClassRegistry {
         let empty = JsString::from_str("", heap)?;
         error_proto.set("name", Value::String(error_name));
         error_proto.set("message", Value::String(empty));
+        // §20.5.3.4 Error.prototype.toString is intercepted by
+        // `object_prototype_intercept` in the dispatcher when the
+        // receiver's prototype chain includes any error prototype.
+        // The single source of truth lives in
+        // [`render_error_to_string`] below — both `e.toString()`
+        // dispatch and the unwind diagnostic call it.
+        // <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 
         let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);
         // Error itself.

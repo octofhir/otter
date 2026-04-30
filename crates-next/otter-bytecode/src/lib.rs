@@ -809,6 +809,79 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-typedarray-constructors>
     TypedArrayCall,
+    /// `yield r<src>` inside a generator body — pause the running
+    /// frame and surface `r<src>` to the caller's `.next()` /
+    /// iteration step. Operands: `Register(dst), Register(src)`.
+    ///
+    /// `dst` receives the value passed to the matching `.next(arg)`
+    /// (or `undefined` when the iterator was driven by a `for-of`
+    /// loop with no explicit argument). When the generator is
+    /// resumed via `.throw(err)`, the dispatcher routes `err`
+    /// through the surrounding handler stack rather than writing
+    /// it into `dst`.
+    ///
+    /// Only legal inside a function whose
+    /// [`Function::is_generator`] flag is `true`; the compiler
+    /// enforces that.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-yield>
+    Yield,
+    /// `r<dst> = SharedArrayBuffer(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Empty `name` selects the §25.2.1 constructor; otherwise
+    /// dispatches `SharedArrayBuffer.<static>` (none today;
+    /// reserved).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
+    SharedArrayBufferCall,
+    /// `r<dst> = Atomics.<name>(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Routes the §25.4 Atomics surface (load / store / add / sub /
+    /// and / or / xor / exchange / compareExchange / isLockFree)
+    /// through one variadic dispatcher.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-atomics-object>
+    AtomicsCall,
+    /// `r<dst> = Proxy(args...)` / `Proxy.<name>(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Empty `name` selects the §28.2.1 `new Proxy(target, handler)`
+    /// constructor; otherwise the runtime dispatches `revocable`
+    /// per §28.2.2.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-proxy-constructor>
+    ProxyCall,
+    /// `r<dst> = Reflect.<name>(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Routes the §28.1 Reflect static surface through one
+    /// dispatcher.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-reflect-object>
+    ReflectCall,
+    /// `r<dst> = Iterator.<name>(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Routes the iterator-helpers static surface (currently
+    /// `Iterator.from`) through one variadic dispatcher. The
+    /// constructor form (`new Iterator(...)`) is reserved by the
+    /// proposal and lowered to a TypeError when invoked.
+    ///
+    /// # See also
+    /// - <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
+    IteratorCall,
     /// `r<dst> = ToPrimitive(r<src>, hint)`. Operands:
     /// `Register(dst), Register(src), ConstIndex(hint_const)`.
     ///
@@ -952,6 +1025,12 @@ impl Op {
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
             Op::DataViewCall => "DATA_VIEW_CALL",
             Op::TypedArrayCall => "TYPED_ARRAY_CALL",
+            Op::IteratorCall => "ITERATOR_CALL",
+            Op::Yield => "YIELD",
+            Op::ReflectCall => "REFLECT_CALL",
+            Op::ProxyCall => "PROXY_CALL",
+            Op::SharedArrayBufferCall => "SHARED_ARRAY_BUFFER_CALL",
+            Op::AtomicsCall => "ATOMICS_CALL",
         }
     }
 
@@ -1054,27 +1133,33 @@ impl Op {
             // operands.
             Op::NewArray => 2,
             Op::LoadElement | Op::StoreElement | Op::DeleteElement => 3,
-            Op::CallMethodValue => 4, // dst, recv, name_const, argc
-            Op::MathCall => 3,        // dst, name_const, argc — args follow
-            Op::JsonCall => 3,        // dst, name_const, argc — args follow
-            Op::SymbolCall => 3,      // dst, name_const, argc — args follow
-            Op::ObjectCall => 3,      // dst, name_const, argc — args follow
-            Op::ArrayCall => 3,       // dst, name_const, argc — args follow
-            Op::BigIntCall => 3,      // dst, name_const, argc — args follow
-            Op::DateCall => 3,        // dst, name_const, argc — args follow
-            Op::StringCall => 3,      // dst, name_const, argc — args follow
-            Op::GlobalCall => 3,      // dst, name_const, argc — args follow
-            Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
-            Op::DataViewCall => 3,    // dst, name_const, argc — args follow
-            Op::TypedArrayCall => 4,  // dst, kind_const, name_const, argc — args follow
-            Op::NewFunction => 2,     // dst, argc — args follow
-            Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
-            Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
-            Op::QueueMicrotask => 2,  // callee, argc — args follow
-            Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
-            Op::PromiseCall => 3,     // dst, name_const, argc — args follow
-            Op::Call | Op::New => 3,  // dst, callee, argc — args follow
-            Op::MakeClass => 4,       // dst, ctor, prototype, statics
+            Op::CallMethodValue => 4,       // dst, recv, name_const, argc
+            Op::MathCall => 3,              // dst, name_const, argc — args follow
+            Op::JsonCall => 3,              // dst, name_const, argc — args follow
+            Op::SymbolCall => 3,            // dst, name_const, argc — args follow
+            Op::ObjectCall => 3,            // dst, name_const, argc — args follow
+            Op::ArrayCall => 3,             // dst, name_const, argc — args follow
+            Op::BigIntCall => 3,            // dst, name_const, argc — args follow
+            Op::DateCall => 3,              // dst, name_const, argc — args follow
+            Op::StringCall => 3,            // dst, name_const, argc — args follow
+            Op::GlobalCall => 3,            // dst, name_const, argc — args follow
+            Op::ArrayBufferCall => 3,       // dst, name_const, argc — args follow
+            Op::DataViewCall => 3,          // dst, name_const, argc — args follow
+            Op::TypedArrayCall => 4,        // dst, kind_const, name_const, argc — args follow
+            Op::IteratorCall => 3,          // dst, name_const, argc — args follow
+            Op::Yield => 2,                 // dst, src
+            Op::ReflectCall => 3,           // dst, name_const, argc — args follow
+            Op::ProxyCall => 3,             // dst, name_const, argc — args follow
+            Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
+            Op::AtomicsCall => 3,           // dst, name_const, argc — args follow
+            Op::NewFunction => 2,           // dst, argc — args follow
+            Op::TemporalCall => 4,          // dst, class_const, method_const, argc — args follow
+            Op::NewIntl => 4,               // dst, class_const, locale_reg, options_reg
+            Op::QueueMicrotask => 2,        // callee, argc — args follow
+            Op::PromiseNew => 3,            // dst, executor_reg, scratch_dst
+            Op::PromiseCall => 3,           // dst, name_const, argc — args follow
+            Op::Call | Op::New => 3,        // dst, callee, argc — args follow
+            Op::MakeClass => 4,             // dst, ctor, prototype, statics
             // dst, callee, this, argc — args follow.
             Op::CallWithThis | Op::BindFunction => 4,
             // catch_offset, finally_offset, exc_dst.
@@ -1104,6 +1189,7 @@ impl Op {
                 | Op::Throw
                 | Op::EndFinally
                 | Op::Await
+                | Op::Yield
         )
     }
 }
@@ -1192,6 +1278,30 @@ pub struct Function {
     /// the value back into the caller's register.
     #[serde(default)]
     pub is_async: bool,
+    /// `true` when this function was declared with the `*` marker
+    /// (`function*` / generator method / generator class member).
+    /// The runtime treats generator-call entry specially: instead
+    /// of running the body inline, it allocates a fresh
+    /// `Value::Generator` whose paused frame mirrors the function
+    /// call at entry. Subsequent `.next(value)` calls resume the
+    /// paused frame on a sub-stack until either an
+    /// [`Self::Yield`] dispatches (returning `{value, done: false}`)
+    /// or the body returns (returning `{value, done: true}`).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-generator-objects>
+    #[serde(default)]
+    pub is_generator: bool,
+    /// `true` when this function is an `async function*` declaration
+    /// — implies both [`Self::is_async`] and [`Self::is_generator`]
+    /// for compile-time predicates, but the runtime entry path
+    /// keys off this flag to wrap each `.next` / `.return` /
+    /// `.throw` call in a Promise per §27.6.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-asyncgenerator-objects>
+    #[serde(default)]
+    pub is_async_generator: bool,
     /// `true` when this function is the synthesised
     /// `<module-init>` for an ES module fragment. Module-init
     /// functions take two implicit parameters (`module_env`,

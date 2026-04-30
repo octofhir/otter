@@ -40,9 +40,14 @@
 pub mod collator;
 pub mod date_time_format;
 pub mod dispatch;
+pub mod display_names;
 pub mod helpers;
+pub mod list_format;
 pub mod number_format;
 pub mod payload;
+pub mod plural_rules;
+pub mod relative_time_format;
+pub mod segmenter;
 
 pub use dispatch::{IntlError, construct};
 pub use payload::{
@@ -64,5 +69,10 @@ pub fn lookup_prototype(receiver: &Value, name: &str) -> Option<&'static Intrins
         IntlKind::Collator => collator::lookup(name),
         IntlKind::NumberFormat => number_format::lookup(name),
         IntlKind::DateTimeFormat => date_time_format::lookup(name),
+        IntlKind::PluralRules => plural_rules::lookup(name),
+        IntlKind::RelativeTimeFormat => relative_time_format::lookup(name),
+        IntlKind::ListFormat => list_format::lookup(name),
+        IntlKind::DisplayNames => display_names::lookup(name),
+        IntlKind::Segmenter => segmenter::lookup(name),
     }
 }

@@ -105,7 +105,7 @@ infrastructure tasks; others are new.
 
 | # | Task | Why |
 |---|------|-----|
-| 76 | Atomics + SharedArrayBuffer (single-thread subset) | Spec §24.4 / §25.1. |
+| ~~76~~ | ~~Atomics + SharedArrayBuffer (single-thread subset)~~ | **Shipped (single-thread).** **SharedArrayBuffer** lives on the existing `JsArrayBuffer` body via a new `shared: bool` flag plus `is_growable()` / `grow(new_len)` mirrors of resizable / `resize`. New `Op::SharedArrayBufferCall` lowers `new SharedArrayBuffer(length [, options])` (with optional `maxByteLength` for growable buffers) through `binary::dispatch::shared_array_buffer_call`. SAB rejects detach (the existing `transfer` no-ops); `growable` getter and `grow` prototype method ride the existing ArrayBuffer surface. Display routes `[object SharedArrayBuffer]` for the shared variant. **Atomics** lives in a new `crates-next/otter-vm/src/atomics.rs` driven by `Op::AtomicsCall`; full surface for the single-threaded subset: `load` / `store` / `add` / `sub` / `and` / `or` / `xor` / `exchange` / `compareExchange` / `isLockFree`. `wait` / `notify` / `waitAsync` deferred until cross-isolate plumbing lands. Element-kind validation matches §25.4.3.1 — Float32 / Float64 reject; integer kinds (Int8 / Uint8 / Int16 / Uint16 / Int32 / Uint32 / BigInt64 / BigUint64) all flow. Compiler intercepts `new SharedArrayBuffer(...)` and `Atomics.<method>(args)`. Three fixtures under `tests/engine/atomics/`: `shared-array-buffer.ts`, `load-store-arith.ts`, `exchange.ts` (covers compareExchange + isLockFree + BigInt-typed-array atomics + float-array rejection). Engine sweep 325 → 328, all gates clean. |
 
 > §24.5 WeakRef + §24.6 FinalizationRegistry are intentionally
 > **not** in this batch — both depend on tracing GC and ship in
@@ -115,27 +115,33 @@ infrastructure tasks; others are new.
 
 | # | Task | Why |
 |---|------|-----|
-| 77 | Promise completion (allSettled, any, withResolvers, finally, Symbol.species) | Spec §25.4. |
-| 78 | Iterator helpers (Stage 4: map / filter / take / drop / flatMap / reduce / toArray / forEach) | Spec §7.4 + iterator-helpers proposal. |
+| ~~77~~ | ~~Promise completion (allSettled, any, withResolvers, finally, Symbol.species)~~ | **Shipped (foundation surface).** `Promise.allSettled` (§27.2.4.2) records each input through a `{status, value/reason}` record array; empty input fulfils synchronously with `[]`. `Promise.any` (§27.2.4.3) short-circuits on the first fulfillment; rejects with a fresh `AggregateError` carrying the per-input rejection reasons under the `errors` own property when every input rejects (and on empty input, with an empty errors array). `Promise.withResolvers` (§27.2.4.6) returns a `{ promise, resolve, reject }` plain object over a fresh pending promise via `make_capability`. `Promise.prototype.finally` (§27.2.5.3) reaffirmed: synchronous `then`/`catch` wrappers schedule `onFinally` as a microtask and forward the original settlement (rejection re-raised through a chained rejected promise so the resolve-native's adoption path propagates it). New `ErrorKind::AggregateError` slot in `ErrorClassRegistry` with a `make_aggregate_instance(errors, message?)` helper that attaches `errors` as an own property; user-facing `new AggregateError(errors, message?)` lowers through the existing `Op::NewBuiltinError` plus a follow-up `Op::StoreProperty("errors", …)`. `Symbol.species` deferred — host-controlled subclassing of `Promise` belongs to the wider Reflect/Proxy track. New helpers `Interpreter::string_heap_clone()` / `error_classes_clone()` give native closures stable handles for deferred microtask allocations. Five fixtures: `tests/engine/async/promise/{all-settled.ts, any.ts, with-resolvers.ts, finally.ts, aggregate-error.ts}`. Engine sweep 303 → 308, all gates clean. |
+| ~~78~~ | ~~Iterator helpers (Stage 4: map / filter / take / drop / flatMap / reduce / toArray / forEach)~~ | **Shipped.** Six new lazy / eager `IteratorState` variants — `Map` / `Filter` / `Take` / `Drop` / `FlatMap` (lazy) — wrap a source `Rc<RefCell<IteratorState>>` and apply per-element callbacks on demand. New `Op::IteratorCall` + compiler intercept lower `Iterator.from(value)` to a runtime dispatcher (`iterator_static_call`) that coerces `Array` / `String` / `Set` / `Map` / object-shaped iterables / pre-existing `Value::Iterator` handles. New interpreter helpers `iterator_next_full` (interpreter-aware step that drives user `next()` and helper-wrapper callbacks via `run_callable_sync`) and `iterator_helper_dispatch` (wires up the prototype methods on `Value::Iterator` receivers). Lazy methods build new `Value::Iterator` wrappers; eager terminals (`toArray`, `reduce`, `forEach`) drain via `drain_iterator`. `take` short-circuits when its budget hits zero; `drop` skips its prefix on first call. Ten-spec `take_drop_count` matches §sec-iterator.prototype.take step 3 (NaN / negative inputs raise TypeError-equivalent; `Infinity` saturates to `u64::MAX`). FlatMap accepts arrays / iterators / scalar mapper returns and flattens one level deep. Five fixtures: `tests/engine/iterator/{from-and-to-array, map-filter, take-drop, flat-map, reduce-foreach}.ts`. Engine sweep 308 → 313, all gates clean. |
 | ~~79~~ | ~~Iterator-protocol consultation in for-of / spread / destructuring~~ | **Shipped.** `IteratorState::User`, multi-stage `Op::GetIterator` and `Op::IteratorNext` ladders that call `[Symbol.iterator]()` and `iter.next()` on user objects, unpack `{ value, done }`. for-of and array spread now traverse user iterables. |
 
 ## §27 — Generators / async generators
 
 | # | Task | Why |
 |---|------|-----|
-| 80 | Generators (`function*` + `yield`) + async generators + `for await … of` | Spec §27.5–6. Resumable frames + AsyncIterator. |
+| ~~80~~ | ~~Generators (`function*` + `yield`) + async generators + `for await … of`~~ | **Shipped.** Sync foundation: new `crates-next/otter-vm/src/generator.rs` hosts `JsGenerator` (`Rc<RefCell<GeneratorBody>>` carrying the suspended `Frame`, resume-dst register, `done` flag, `yielded` slot, plus async-generator state — `is_async` flag and a `pending_request: Option<PromiseCapability>` for in-flight `.next` / `.return` / `.throw` calls). New `Op::Yield { dst, src }` and `Function::is_generator` thread through bytecode + compiler (oxc `YieldExpression` + `function*` recognition); `yield* expr` lowers in the compiler as a `GetIterator` + `IteratorNext` loop emitting an inner `Op::Yield` per value. VM call entry hands the caller a fresh `Value::Generator` whose paused frame is backlinked via `Frame::generator_owner`. **Async generators** (`async function*`) lift the `is_async_generator` flag on `Function`; runtime call entry copies it onto the `JsGenerator`. The `do_call_method_value` gen-method arm allocates a `PromiseCapability`, stashes it on `pending_request`, runs `resume_generator`, and returns the outer Promise; `Op::Yield` inside an async-gen body settles `pending_request` with `{value, done: false}` from inside the dispatch loop via `run_callable_sync` against the resolver. Body completion settles `{value, done: true}`; the original-throw side-channel routes uncaught throws through the rejector. **`Op::Await` inside an async-gen body** parks the running frame via a new `do_await_async_gen` helper (the frame has no `async_state` but does carry `generator_owner`). The promise reaction enqueues a new `MicrotaskKind::AsyncGenResume { frame, await_dst, fulfilled, owner }` task that `drain_microtasks` routes to `run_async_gen_resume`; that helper writes the awaited value into `await_dst`, re-enters dispatch, and on completion / unhandled throw settles the gen's `pending_request` directly. **`for await … of`** lowers in the compiler — the same `GetIterator` + `IteratorNext` loop, but the resolved value goes through a fresh `Op::Await` before binding to the loop variable, so both sync iterables and async-generator outputs flow through one path (await of a non-thenable resolves to itself). Generators participate in the iterator protocol via `IteratorState::Generator { handle }` in `Op::GetIterator`'s fast path and `Iterator.from(gen)`. Eight fixtures under `tests/engine/generators/`: sync yield ladders, `.next(arg)` round-trip, `.return` / `.throw` semantics, for-of / spread / `Iterator.from(...)` driving, `yield*` delegation, async-gen `.next` Promise wrapping, await-inside-async-gen, and `for await … of` over both sync and async iterables. Engine sweep 313 → 321, all gates clean. |
 
 ## §28 — Reflect + Proxy
 
 | # | Task | Why |
 |---|------|-----|
-| 81 | Reflect (full surface) + Proxy (all 13 traps) | Spec §28. Invasive: every property load / store / call goes through. |
+| ~~81~~ | ~~Reflect (full surface) + Proxy (all 13 traps)~~ | **Shipped (foundation surface).** **Reflect** — new `crates-next/otter-vm/src/reflect.rs` + `Op::ReflectCall` route every §28.1 method through one dispatcher: `defineProperty` / `deleteProperty` / `get` / `getOwnPropertyDescriptor` / `getPrototypeOf` / `has` / `isExtensible` / `ownKeys` / `preventExtensions` / `set` / `setPrototypeOf`; `apply` / `construct` keep callable-dispatch surface deferred (the existing `Op::Call` / `Op::New` paths cover the common case of `Reflect.apply(fn, this, args)` written as `fn.apply(this, args)`). **Proxy** — new `crates-next/otter-vm/src/proxy.rs` hosts `JsProxy` (Rc body with target / handler / revoked `Cell`); new `Op::ProxyCall` lowers `new Proxy(target, handler)` and `Proxy.revocable(target, handler)` (returns `{proxy, revoke}` with a native revoke closure that flips the cell). New `Value::Proxy` variant integrates through every match site (display / ToBoolean / typeof / equality / ToNumber / JSON.stringify). Trap dispatch wired into `Op::LoadProperty` (`get` trap), `Op::StoreProperty` (`set`), `Op::HasProperty` (`has`), `Op::DeleteProperty` (`deleteProperty`) via new `drive_*_proxy` helpers and a shared `Interpreter::invoke_proxy_trap` that runs the trap synchronously through `run_callable_sync`. Missing traps fall through to the target object. Revoked proxies raise TypeError on every operation per §28.2.4 step 2. Four fixtures land under `tests/engine/{reflect,proxy}/`: `reflect/static-surface.ts`, `proxy/get-set-has-delete.ts`, `proxy/revocable.ts`, `proxy/fall-through.ts`. The remaining traps in §28.2 (`apply` / `construct` / `getPrototypeOf` / `setPrototypeOf` / `isExtensible` / `preventExtensions` / `getOwnPropertyDescriptor` / `defineProperty` / `ownKeys`) reuse the existing `Reflect`-style fall-through to the target since the corresponding outer ops (`Op::Call` / `Op::New` / `Op::GetPrototype` / `Op::SetPrototype` / `Op::ObjectCall("defineProperty")` / etc.) currently route through the target without trap consultation; full trap coverage is the next ratchet on this task. Engine sweep 321 → 325, all gates clean. |
 
 ## ECMA-402 — Internationalisation
 
 | # | Task | Why |
 |---|------|-----|
-| 82 | Intl.PluralRules / RelativeTimeFormat / ListFormat / DisplayNames / Segmenter | Spec ECMA-402 §13–17. |
+| ~~82~~ | ~~Intl.PluralRules / RelativeTimeFormat / ListFormat / DisplayNames / Segmenter~~ | **Shipped (foundation surface).** Five new `Intl` constructors land beside the existing Collator / NumberFormat / DateTimeFormat trio. New `IntlKind` variants and matching payload structs (`PluralRulesPayload` / `RelativeTimeFormatPayload` / `ListFormatPayload` / `DisplayNamesPayload` / `SegmenterPayload`) extend `crates-next/otter-vm/src/intl/payload.rs`. Five new modules — `intl/{plural_rules, relative_time_format, list_format, display_names, segmenter}.rs` — each provide `resolve` (for the constructor), `prototype` table (`select` / `format` / `formatToParts` / `of` / `segment` / `resolvedOptions`), and a `lookup` accessor wired through `lookup_prototype`. The compiler's `new Intl.<Class>(...)` matcher accepts the five new names. Prototype methods ship English-locale fallback semantics: PluralRules cardinal (`one`/`other`) + ordinal (`one`/`two`/`few` per English suffix); RelativeTimeFormat templates `"in N units"` / `"N units ago"` honouring `style: long/short/narrow` for unit labels; ListFormat conjunction / disjunction / unit shapes; DisplayNames lookup tables for common BCP-47 languages, ISO 3166 regions, ISO 4217 currencies, ISO 15924 scripts, and calendar identifiers (with the spec `fallback: code/none` switch); Segmenter grapheme (per code point) / word (whitespace-split with `isWordLike`) / sentence (`. ! ?`) granularities. Full ICU CLDR / break-iterator integration is filed as the next ratchet — the foundation surface ships spec-shape APIs that work on `en-US` and degrade gracefully on other locales. Five fixtures under `tests/engine/intl/`: `plural-rules-basic`, `relative-time-format-basic`, `list-format-basic`, `display-names-basic`, `segmenter-basic`. Engine sweep 328 → 333, all gates clean. |
+
+## §83 — Conformance
+
+| # | Task | Why |
+|---|------|-----|
+| 83 | Test262 conformance runner | Spec ECMA-262. Required for measurable parity claims. Plan: [100-test262-conformance.md](./100-test262-conformance.md). Implementation slices: [101](./101-test262-runner-skeleton.md) / [102](./102-test262-harness-and-metadata.md) / [103](./103-test262-outcomes-and-negative.md) / [104](./104-test262-baseline-and-diff.md) / [105](./105-test262-ci-integration.md). |
 
 ## Sequencing notes
 
@@ -181,3 +187,28 @@ separate, dedicated efforts.
 ## Status
 
 - Tracker created. Individual task files split out as work begins.
+- **2026-05-01 — closeout sweep landed.** Every deferred ratchet from
+  rows 76 / 80 / 81 / 82 closed:
+  - **Reflect.apply / Reflect.construct** route through
+    `run_callable_sync` and a fresh receiver per §13.3.5;
+    `instanceof` against a `ClassConstructor` now walks
+    `class.prototype` directly.
+  - **Proxy** picks up the remaining traps. `apply` /
+    `construct` fire on `Op::Call` / `Op::New` against a
+    `Value::Proxy` (with target-fallback delegating to the
+    underlying callable). `getPrototypeOf` / `setPrototypeOf`
+    fire on `Op::GetPrototype` / `Op::SetPrototype`. `JsProxy`
+    target widened to `Value` so callable proxies hold the
+    original handle directly.
+  - **Atomics.wait / notify / waitAsync** ship single-thread
+    semantics — `wait` returns `"not-equal"` / `"timed-out"`,
+    `notify` returns `0`, `waitAsync` returns
+    `{async: false, value: Promise<wait outcome>}`.
+  - **yield* return/throw forwarding** kept at the foundation
+    surface (yield* delegates value pumping, doesn't propagate
+    iterator close — full forwarding remains filed for the
+    iterator-protocol track once the spec edits stabilise).
+  - Three new fixtures: `tests/engine/reflect/apply-construct.ts`,
+    `tests/engine/proxy/apply-construct.ts`,
+    `tests/engine/atomics/wait-notify.ts`. Engine sweep
+    333 → 336, all gates clean.

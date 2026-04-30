@@ -89,6 +89,66 @@ pub struct DateTimeFormatPayload {
     pub second: bool,
 }
 
+/// Resolved option bag for `Intl.PluralRules`.
+#[derive(Debug, Clone)]
+pub struct PluralRulesPayload {
+    /// Spec-resolved BCP-47 locale tag.
+    pub locale: String,
+    /// `type` option (`"cardinal"` / `"ordinal"`).
+    pub kind: String,
+    /// `minimumIntegerDigits`.
+    pub minimum_integer_digits: u8,
+    /// `minimumFractionDigits`.
+    pub minimum_fraction_digits: u8,
+    /// `maximumFractionDigits`.
+    pub maximum_fraction_digits: u8,
+}
+
+/// Resolved option bag for `Intl.RelativeTimeFormat`.
+#[derive(Debug, Clone)]
+pub struct RelativeTimeFormatPayload {
+    /// Spec-resolved BCP-47 locale tag.
+    pub locale: String,
+    /// `style` option (`"long"` / `"short"` / `"narrow"`).
+    pub style: String,
+    /// `numeric` option (`"always"` / `"auto"`).
+    pub numeric: String,
+}
+
+/// Resolved option bag for `Intl.ListFormat`.
+#[derive(Debug, Clone)]
+pub struct ListFormatPayload {
+    /// Spec-resolved BCP-47 locale tag.
+    pub locale: String,
+    /// `type` option (`"conjunction"` / `"disjunction"` / `"unit"`).
+    pub kind: String,
+    /// `style` option (`"long"` / `"short"` / `"narrow"`).
+    pub style: String,
+}
+
+/// Resolved option bag for `Intl.DisplayNames`.
+#[derive(Debug, Clone)]
+pub struct DisplayNamesPayload {
+    /// Spec-resolved BCP-47 locale tag.
+    pub locale: String,
+    /// `type` option (`"language"` / `"region"` / `"script"` /
+    /// `"currency"` / `"calendar"` / `"dateTimeField"`).
+    pub kind: String,
+    /// `style` option (`"long"` / `"short"` / `"narrow"`).
+    pub style: String,
+    /// `fallback` option (`"code"` / `"none"`).
+    pub fallback: String,
+}
+
+/// Resolved option bag for `Intl.Segmenter`.
+#[derive(Debug, Clone)]
+pub struct SegmenterPayload {
+    /// Spec-resolved BCP-47 locale tag.
+    pub locale: String,
+    /// `granularity` option (`"grapheme"` / `"word"` / `"sentence"`).
+    pub granularity: String,
+}
+
 /// One [`crate::Value::Intl`] instance.
 #[derive(Debug, Clone)]
 pub enum IntlPayload {
@@ -98,6 +158,16 @@ pub enum IntlPayload {
     NumberFormat(NumberFormatPayload),
     /// `new Intl.DateTimeFormat(...)` instance.
     DateTimeFormat(DateTimeFormatPayload),
+    /// `new Intl.PluralRules(...)` instance.
+    PluralRules(PluralRulesPayload),
+    /// `new Intl.RelativeTimeFormat(...)` instance.
+    RelativeTimeFormat(RelativeTimeFormatPayload),
+    /// `new Intl.ListFormat(...)` instance.
+    ListFormat(ListFormatPayload),
+    /// `new Intl.DisplayNames(...)` instance.
+    DisplayNames(DisplayNamesPayload),
+    /// `new Intl.Segmenter(...)` instance.
+    Segmenter(SegmenterPayload),
 }
 
 impl IntlPayload {
@@ -108,6 +178,11 @@ impl IntlPayload {
             IntlPayload::Collator(_) => IntlKind::Collator,
             IntlPayload::NumberFormat(_) => IntlKind::NumberFormat,
             IntlPayload::DateTimeFormat(_) => IntlKind::DateTimeFormat,
+            IntlPayload::PluralRules(_) => IntlKind::PluralRules,
+            IntlPayload::RelativeTimeFormat(_) => IntlKind::RelativeTimeFormat,
+            IntlPayload::ListFormat(_) => IntlKind::ListFormat,
+            IntlPayload::DisplayNames(_) => IntlKind::DisplayNames,
+            IntlPayload::Segmenter(_) => IntlKind::Segmenter,
         }
     }
 }
@@ -122,6 +197,16 @@ pub enum IntlKind {
     NumberFormat,
     /// `Intl.DateTimeFormat` instance.
     DateTimeFormat,
+    /// `Intl.PluralRules` instance.
+    PluralRules,
+    /// `Intl.RelativeTimeFormat` instance.
+    RelativeTimeFormat,
+    /// `Intl.ListFormat` instance.
+    ListFormat,
+    /// `Intl.DisplayNames` instance.
+    DisplayNames,
+    /// `Intl.Segmenter` instance.
+    Segmenter,
 }
 
 impl IntlKind {
@@ -132,6 +217,11 @@ impl IntlKind {
             IntlKind::Collator => "Collator",
             IntlKind::NumberFormat => "NumberFormat",
             IntlKind::DateTimeFormat => "DateTimeFormat",
+            IntlKind::PluralRules => "PluralRules",
+            IntlKind::RelativeTimeFormat => "RelativeTimeFormat",
+            IntlKind::ListFormat => "ListFormat",
+            IntlKind::DisplayNames => "DisplayNames",
+            IntlKind::Segmenter => "Segmenter",
         }
     }
 
@@ -142,6 +232,11 @@ impl IntlKind {
             "Collator" => IntlKind::Collator,
             "NumberFormat" => IntlKind::NumberFormat,
             "DateTimeFormat" => IntlKind::DateTimeFormat,
+            "PluralRules" => IntlKind::PluralRules,
+            "RelativeTimeFormat" => IntlKind::RelativeTimeFormat,
+            "ListFormat" => IntlKind::ListFormat,
+            "DisplayNames" => IntlKind::DisplayNames,
+            "Segmenter" => IntlKind::Segmenter,
             _ => return None,
         })
     }

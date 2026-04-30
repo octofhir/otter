@@ -669,8 +669,15 @@ fn compile_export_inner_declaration(
                     .name
                     .as_str()
                     .to_string();
-            let (function_id, captures) =
-                compile_function(cx, &name, &f.params, &f.body, fspan, f.r#async)?;
+            let (function_id, captures) = compile_function_full(
+                cx,
+                &name,
+                &f.params,
+                &f.body,
+                fspan,
+                f.r#async,
+                f.generator,
+            )?;
             let storage = cx.declare_binding(&name, false, fspan)?;
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
@@ -1845,7 +1852,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                 return Ok(None);
             }
             let (function_id, captures) =
-                compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
+                compile_function_full(cx, &name, &f.params, &f.body, span, f.r#async, f.generator)?;
             let storage = cx.declare_binding(&name, false, span)?;
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
@@ -2032,8 +2039,15 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                         f.id.as_ref()
                             .map(|id| id.name.as_str().to_string())
                             .unwrap_or_else(|| "default".to_string());
-                    let (function_id, captures) =
-                        compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
+                    let (function_id, captures) = compile_function_full(
+                        cx,
+                        &name,
+                        &f.params,
+                        &f.body,
+                        span,
+                        f.r#async,
+                        f.generator,
+                    )?;
                     let const_idx = cx.intern_function_id(function_id);
                     let dst = cx.alloc_scratch();
                     emit_make_callable(cx, dst, const_idx, &captures, false, span);
@@ -2602,7 +2616,7 @@ fn hoist_function_declarations(
         }
         let span = (f.span.start, f.span.end);
         let (function_id, captures) =
-            compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
+            compile_function_full(cx, &name, &f.params, &f.body, span, f.r#async, f.generator)?;
         let const_idx = cx.intern_function_id(function_id);
         let tmp = cx.alloc_scratch();
         emit_make_callable(cx, tmp, const_idx, &captures, false, span);
@@ -2624,6 +2638,19 @@ fn compile_function(
     span: (u32, u32),
     is_async: bool,
 ) -> Result<(u32, Vec<u32>), CompileError> {
+    compile_function_full(parent, name, params, body, span, is_async, false)
+}
+
+fn compile_function_full(
+    parent: &mut Compiler,
+    name: &str,
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
+    span: (u32, u32),
+    is_async: bool,
+    is_generator: bool,
+) -> Result<(u32, Vec<u32>), CompileError> {
+    let is_async_generator = is_async && is_generator;
     let module = Rc::clone(&parent.top_mut().module);
     let mut child = FunctionContext::new(Rc::clone(&module));
     if let Some(b) = body {
@@ -2717,6 +2744,8 @@ fn compile_function(
     slot.param_count = param_count;
     slot.has_rest = has_rest;
     slot.is_async = is_async;
+    slot.is_generator = is_generator;
+    slot.is_async_generator = is_async_generator;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;
@@ -4158,6 +4187,24 @@ fn compile_expr(
                 }
                 return Ok(dst);
             }
+            // §25.2.1 `new SharedArrayBuffer(length [, options])`.
+            // <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "SharedArrayBuffer"
+                && cx.lookup_binding("SharedArrayBuffer").is_none()
+                && find_module_import_binding(cx, "SharedArrayBuffer").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let name_idx = cx.intern_string_constant("");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::SharedArrayBufferCall, operands, new_span);
+                return Ok(dst);
+            }
             // §25.1.4 `new ArrayBuffer(length [, options])` — lower
             // through `Op::ArrayBufferCall` with the empty-name
             // sentinel.
@@ -4268,7 +4315,14 @@ fn compile_expr(
                 && id.name.as_str() == "Intl"
                 && matches!(
                     member.property.name.as_str(),
-                    "Collator" | "NumberFormat" | "DateTimeFormat"
+                    "Collator"
+                        | "NumberFormat"
+                        | "DateTimeFormat"
+                        | "PluralRules"
+                        | "RelativeTimeFormat"
+                        | "ListFormat"
+                        | "DisplayNames"
+                        | "Segmenter"
                 )
             {
                 let class = member.property.name.as_str();
@@ -4325,6 +4379,25 @@ fn compile_expr(
                     ],
                     new_span,
                 );
+                return Ok(dst);
+            }
+            // §28.2.1 `new Proxy(target, handler)` — lower through
+            // `Op::ProxyCall` with the empty-name sentinel.
+            // <https://tc39.es/ecma262/#sec-proxy-constructor>
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Proxy"
+                && cx.lookup_binding("Proxy").is_none()
+                && find_module_import_binding(cx, "Proxy").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let name_idx = cx.intern_string_constant("");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::ProxyCall, operands, new_span);
                 return Ok(dst);
             }
             // `new Promise(executor)` lowers to a dedicated
@@ -4509,7 +4582,7 @@ fn compile_expr(
                     .map(|id| id.name.as_str().to_string())
                     .unwrap_or_else(|| "<anonymous>".to_string());
             let (function_id, captures) =
-                compile_function(cx, &name, &f.params, &f.body, span, f.r#async)?;
+                compile_function_full(cx, &name, &f.params, &f.body, span, f.r#async, f.generator)?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
             emit_make_callable(cx, dst, const_idx, &captures, false, span);
@@ -4629,6 +4702,88 @@ fn compile_expr(
             Ok(dst)
         }
 
+        // §15.5 — `yield expr` inside a generator body. Lowered to
+        // [`Op::Yield`]; the result register receives whatever value
+        // the next `.next(arg)` call passes back in. `yield*` is
+        // not yet implemented and surfaces as `Unsupported`.
+        // <https://tc39.es/ecma262/#sec-yield>
+        Expression::YieldExpression(y) => {
+            let span = (y.span.start, y.span.end);
+            // §15.5.5 `yield*` — delegate to an inner iterable. The
+            // foundation lowers it as the canonical for-of-style
+            // pump:
+            //
+            //   const iter = GetIterator(arg);
+            //   while (true) {
+            //     const { value, done } = iter.next();
+            //     if (done) { break; }       // value of yield* is `undefined`
+            //     yield value;
+            //   }
+            //
+            // Spec demands threading the resume value into iter.next
+            // and forwarding `.return` / `.throw` through; both are
+            // filed for a follow-up.
+            // <https://tc39.es/ecma262/#sec-generator-function-definitions-runtime-semantics-evaluation>
+            if y.delegate {
+                let arg = match &y.argument {
+                    Some(a) => a,
+                    None => {
+                        return Err(CompileError::Unsupported {
+                            node: "yield*: missing argument".to_string(),
+                            span,
+                        });
+                    }
+                };
+                let arg_reg = compile_expr(cx, arg, span)?;
+                let iter_reg = cx.alloc_scratch();
+                cx.emit(
+                    Op::GetIterator,
+                    vec![Operand::Register(iter_reg), Operand::Register(arg_reg)],
+                    span,
+                );
+                let value_reg = cx.alloc_scratch();
+                let done_reg = cx.alloc_scratch();
+                let loop_top = cx.next_pc;
+                cx.emit(
+                    Op::IteratorNext,
+                    vec![
+                        Operand::Register(value_reg),
+                        Operand::Register(done_reg),
+                        Operand::Register(iter_reg),
+                    ],
+                    span,
+                );
+                let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+                let yield_dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::Yield,
+                    vec![Operand::Register(yield_dst), Operand::Register(value_reg)],
+                    span,
+                );
+                let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
+                cx.patch_branch(back_jmp, loop_top);
+                cx.patch_branch_to_here(exit_jmp);
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                return Ok(dst);
+            }
+            let src = match &y.argument {
+                Some(arg) => compile_expr(cx, arg, span)?,
+                None => {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    r
+                }
+            };
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::Yield,
+                vec![Operand::Register(dst), Operand::Register(src)],
+                span,
+            );
+            Ok(dst)
+        }
+
         other => Err(CompileError::Unsupported {
             node: format!("Expression ({})", expr_kind_name(other)),
             span: expr_span(other),
@@ -4661,12 +4816,7 @@ fn compile_for_of_statement(
     s: &oxc_ast::ast::ForOfStatement<'_>,
 ) -> Result<Option<u16>, CompileError> {
     let span = (s.span.start, s.span.end);
-    if s.r#await {
-        return Err(CompileError::Unsupported {
-            node: "ForOfStatement: for await".to_string(),
-            span,
-        });
-    }
+    let is_for_await = s.r#await;
 
     // Identify the loop variable up front so we can complain
     // clearly if the head shape exceeds the foundation subset.
@@ -4725,6 +4875,28 @@ fn compile_for_of_statement(
     );
     let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
 
+    // §14.7.5.6 step `for await … of` — per the iteration semantics
+    // for async iterables, the value produced by each step must be
+    // awaited before binding it to the loop variable. The
+    // foundation lowers `Op::IteratorNext` against a `Value::Generator`
+    // synchronously (the helper unwraps the gen's `{value, done}`
+    // record before re-emerging here), so by awaiting the value we
+    // both unwrap any user-yielded Promises and stay
+    // spec-compatible with sync-iterable inputs (await of a
+    // non-thenable resolves to the value itself).
+    // <https://tc39.es/ecma262/#sec-for-in-and-for-of-statements>
+    let bind_source = if is_for_await {
+        let awaited = cx.alloc_scratch();
+        cx.emit(
+            Op::Await,
+            vec![Operand::Register(awaited), Operand::Register(value_reg)],
+            span,
+        );
+        awaited
+    } else {
+        value_reg
+    };
+
     // §14.7.5.6 ForIn/OfBodyEvaluation: `let`/`const` re-bind per
     // iteration in a fresh lexical scope; `var` writes back into
     // the function-scope binding pre-hoisted at function entry.
@@ -4739,7 +4911,7 @@ fn compile_for_of_statement(
     } else {
         cx.declare_binding(&binding_name, is_const, span)?
     };
-    cx.emit_store_storage(value_reg, storage, span);
+    cx.emit_store_storage(bind_source, storage, span);
     cx.mark_initialized(&binding_name);
     compile_statement(cx, &s.body)?;
     cx.exit_scope();
@@ -5305,6 +5477,86 @@ fn compile_method_call(
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::ArrayBufferCall, operands, span);
+            return Ok(dst);
+        }
+        // §28.2.2 `Proxy.revocable(target, handler)` — lower
+        // through `Op::ProxyCall` with the literal method name.
+        // <https://tc39.es/ecma262/#sec-proxy.revocable>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Proxy"
+            && cx.lookup_binding("Proxy").is_none()
+            && find_module_import_binding(cx, "Proxy").is_none()
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::ProxyCall, operands, span);
+            return Ok(dst);
+        }
+        // §25.4 `Atomics.<method>(args)`.
+        // <https://tc39.es/ecma262/#sec-atomics-object>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Atomics"
+            && cx.lookup_binding("Atomics").is_none()
+            && find_module_import_binding(cx, "Atomics").is_none()
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::AtomicsCall, operands, span);
+            return Ok(dst);
+        }
+        // §28.1 `Reflect.<method>(args)` — full static surface.
+        // <https://tc39.es/ecma262/#sec-reflect-object>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Reflect"
+            && cx.lookup_binding("Reflect").is_none()
+            && find_module_import_binding(cx, "Reflect").is_none()
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::ReflectCall, operands, span);
+            return Ok(dst);
+        }
+        // Iterator-helpers proposal — `Iterator.from(iter)` /
+        // future statics. Lower through `Op::IteratorCall`. The
+        // bare-identifier `Iterator` shadow check keeps the
+        // user-facing class binding overridable.
+        // <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Iterator"
+            && cx.lookup_binding("Iterator").is_none()
+            && find_module_import_binding(cx, "Iterator").is_none()
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::IteratorCall, operands, span);
             return Ok(dst);
         }
         // §23.2.2 TypedArray statics — `<T>.from(...)` / `<T>.of(...)`.
@@ -6338,13 +6590,14 @@ fn compile_class(
                 });
             }
         };
-        let (m_id, m_captures) = compile_function(
+        let (m_id, m_captures) = compile_function_full(
             cx,
             &method_name,
             &m.value.params,
             &m.value.body,
             method_span,
             m.value.r#async,
+            m.value.generator,
         )?;
         let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
@@ -6949,6 +7202,7 @@ fn is_builtin_error_class_name(name: &str) -> bool {
             | "ReferenceError"
             | "URIError"
             | "EvalError"
+            | "AggregateError"
     )
 }
 
@@ -6965,6 +7219,71 @@ fn compile_builtin_error_construct(
     arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
+    // §20.5.7.1 — `new AggregateError(errors, message?)` accepts two
+    // arguments. The first is the error iterable; the second is the
+    // optional message. Lower as `NewBuiltinError(message)` followed
+    // by `StoreProperty("errors", errors_arg)`.
+    if kind == "AggregateError" {
+        if arguments.len() > 2 {
+            return Err(CompileError::Unsupported {
+                node: format!("{kind}: more than two arguments"),
+                span,
+            });
+        }
+        let errors_reg = match arguments.first() {
+            None => {
+                let r = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                r
+            }
+            Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
+                return Err(CompileError::Unsupported {
+                    node: format!("{kind}: spread argument"),
+                    span: (s.span.start, s.span.end),
+                });
+            }
+            Some(other) => compile_expr(cx, other.to_expression(), span)?,
+        };
+        let msg_reg = match arguments.get(1) {
+            None => {
+                let r = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                r
+            }
+            Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
+                return Err(CompileError::Unsupported {
+                    node: format!("{kind}: spread argument"),
+                    span: (s.span.start, s.span.end),
+                });
+            }
+            Some(other) => compile_expr(cx, other.to_expression(), span)?,
+        };
+        let dst = cx.alloc_scratch();
+        let kind_idx = cx.intern_string_constant(kind);
+        cx.emit(
+            Op::NewBuiltinError,
+            vec![
+                Operand::Register(dst),
+                Operand::ConstIndex(kind_idx),
+                Operand::Register(msg_reg),
+            ],
+            span,
+        );
+        // Attach `errors` own property on the freshly built instance.
+        let key_idx = cx.intern_string_constant("errors");
+        let scratch = cx.alloc_scratch();
+        cx.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(dst),
+                Operand::ConstIndex(key_idx),
+                Operand::Register(errors_reg),
+                Operand::Register(scratch),
+            ],
+            span,
+        );
+        return Ok(dst);
+    }
     if arguments.len() > 1 {
         return Err(CompileError::Unsupported {
             node: format!("{kind}: more than one argument (foundation accepts only `message`)"),

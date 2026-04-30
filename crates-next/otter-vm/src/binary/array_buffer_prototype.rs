@@ -145,7 +145,33 @@ fn clamp_relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
     }
 }
 
-/// `ArrayBuffer.prototype` table.
+/// §25.2.5.4 — `SharedArrayBuffer.prototype.grow(newByteLength)`.
+fn impl_grow(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let buf = receiver(args)?;
+    if !buf.is_shared() {
+        return Err(IntrinsicError::BadReceiver {
+            expected: "growable shared arraybuffer",
+        });
+    }
+    let new_len = match super::to_index(args.args.first().unwrap_or(&Value::Undefined)) {
+        Some(n) => n as usize,
+        None => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a non-negative integer",
+            });
+        }
+    };
+    if !buf.grow(new_len) {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "cannot grow",
+        });
+    }
+    Ok(Value::Undefined)
+}
+
+/// `ArrayBuffer.prototype` / `SharedArrayBuffer.prototype` table.
 pub static ARRAY_BUFFER_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
     std::sync::LazyLock::new(|| {
         crate::intrinsics!(
@@ -154,6 +180,7 @@ pub static ARRAY_BUFFER_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "resize"                 / 1 => impl_resize,
             "transfer"               / 1 => impl_transfer,
             "transferToFixedLength"  / 1 => impl_transfer_to_fixed_length,
+            "grow"                   / 1 => impl_grow,
         )
     });
 
@@ -173,6 +200,9 @@ pub fn load_property(buf: &JsArrayBuffer, name: &str) -> Value {
         "byteLength" => smi(buf.byte_length() as i32),
         "maxByteLength" => smi(buf.max_byte_length() as i32),
         "resizable" => Value::Boolean(buf.is_resizable()),
+        // §25.2.4.2 — `growable` for SAB; mirrors `resizable` on
+        // ordinary ArrayBuffer.
+        "growable" => Value::Boolean(buf.is_growable()),
         "detached" => Value::Boolean(buf.is_detached()),
         // Diagnostics-only: spec exposes byteLength as 0 when
         // detached but the foundation already does that inside

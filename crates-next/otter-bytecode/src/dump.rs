@@ -67,6 +67,8 @@ mod tests {
                 is_arrow: false,
                 has_rest: false,
                 is_async: false,
+                is_generator: false,
+                is_async_generator: false,
                 is_module: false,
                 module_url: String::new(),
                 code: vec![Instruction {

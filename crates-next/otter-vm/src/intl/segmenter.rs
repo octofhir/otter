@@ -1,0 +1,177 @@
+//! `Intl.Segmenter` — locale-aware text segmentation.
+//!
+//! Foundation surface: grapheme segmentation by Unicode scalar
+//! values (one segment per code point), word segmentation by ASCII
+//! whitespace, sentence segmentation by ASCII `.` / `!` / `?`. ICU
+//! CLDR break-iterator integration is filed for the wider Intl
+//! follow-up.
+//!
+//! # See also
+//! - <https://tc39.es/ecma402/#segmenter-objects>
+
+use std::sync::LazyLock;
+
+use crate::Value;
+use crate::intl::dispatch::IntlError;
+use crate::intl::helpers::{coerce_locale, js_string, options_object, read_string_option};
+use crate::intl::payload::{IntlPayload, SegmenterPayload};
+use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+
+/// Resolve constructor options for this Intl class.
+pub fn resolve(locale: &Value, options: &Value) -> SegmenterPayload {
+    let opts = options_object(Some(options));
+    let opts_ref = opts.as_ref();
+    SegmenterPayload {
+        locale: coerce_locale(Some(locale)),
+        granularity: read_string_option(opts_ref, "granularity", "grapheme"),
+    }
+}
+
+fn require_payload<'a>(
+    args: &'a IntrinsicArgs<'_>,
+) -> Result<&'a SegmenterPayload, IntrinsicError> {
+    match args.receiver {
+        Value::Intl(intl) => match intl.payload() {
+            IntlPayload::Segmenter(p) => Ok(p),
+            _ => Err(IntrinsicError::BadReceiver {
+                expected: "Intl.Segmenter",
+            }),
+        },
+        _ => Err(IntrinsicError::BadReceiver {
+            expected: "Intl.Segmenter",
+        }),
+    }
+}
+
+/// Segment `text` per the granularity. Returns a vector of
+/// `(byte_start, segment)` pairs.
+fn segment(text: &str, granularity: &str) -> Vec<(usize, String)> {
+    match granularity {
+        "word" => {
+            let mut out: Vec<(usize, String)> = Vec::new();
+            let mut start: Option<usize> = None;
+            let bytes = text.as_bytes();
+            for (i, c) in text.char_indices() {
+                if c.is_whitespace() {
+                    if let Some(s) = start.take() {
+                        out.push((s, text[s..i].to_string()));
+                    }
+                    out.push((i, c.to_string()));
+                } else if start.is_none() {
+                    start = Some(i);
+                }
+                let _ = bytes;
+            }
+            if let Some(s) = start {
+                out.push((s, text[s..].to_string()));
+            }
+            out
+        }
+        "sentence" => {
+            let mut out: Vec<(usize, String)> = Vec::new();
+            let mut start = 0usize;
+            for (i, c) in text.char_indices() {
+                if c == '.' || c == '!' || c == '?' {
+                    let end = i + c.len_utf8();
+                    out.push((start, text[start..end].to_string()));
+                    start = end;
+                }
+            }
+            if start < text.len() {
+                out.push((start, text[start..].to_string()));
+            }
+            out
+        }
+        _ => {
+            // grapheme — code-point granularity foundation.
+            text.char_indices()
+                .map(|(i, c)| (i, c.to_string()))
+                .collect()
+        }
+    }
+}
+
+/// §18.5.3 `segment(string)` — returns an array of segment-data
+/// objects. Spec returns a live `Segments` iterator; foundation
+/// returns an array (each element is a `{segment, index, input,
+/// isWordLike?}` plain object) which is iterable through the
+/// existing iterator-protocol path.
+fn impl_segment(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let payload = require_payload(args)?;
+    let text = match args.args.first() {
+        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::Number(n)) => n.to_display_string(),
+        Some(Value::Boolean(b)) => (if *b { "true" } else { "false" }).to_string(),
+        _ => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a string",
+            });
+        }
+    };
+    let segments = segment(&text, &payload.granularity);
+    let input_value = Value::String(crate::string::JsString::from_str(&text, args.string_heap)?);
+    let mut elements: Vec<Value> = Vec::with_capacity(segments.len());
+    for (idx, seg) in segments {
+        let obj = crate::object::JsObject::new();
+        obj.set(
+            "segment",
+            Value::String(crate::string::JsString::from_str(&seg, args.string_heap)?),
+        );
+        obj.set(
+            "index",
+            Value::Number(crate::number::NumberValue::from_i32(idx as i32)),
+        );
+        obj.set("input", input_value.clone());
+        if payload.granularity == "word" {
+            let wordlike = seg.chars().any(char::is_alphanumeric);
+            obj.set("isWordLike", Value::Boolean(wordlike));
+        }
+        elements.push(Value::Object(obj));
+    }
+    Ok(Value::Array(crate::array::JsArray::from_elements(elements)))
+}
+
+fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let payload = require_payload(args)?;
+    let obj = crate::object::JsObject::new();
+    obj.set(
+        "locale",
+        js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?,
+    );
+    obj.set(
+        "granularity",
+        js_string(&payload.granularity, args.string_heap).map_err(intl_to_intrinsic)?,
+    );
+    Ok(Value::Object(obj))
+}
+
+fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
+    match err {
+        IntlError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => IntrinsicError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+        _ => IntrinsicError::BadReceiver {
+            expected: "Intl.Segmenter",
+        },
+    }
+}
+
+/// `Intl.Segmenter.prototype` table.
+pub static SEGMENTER_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
+    crate::intrinsics!(
+        Intl,
+        "segment"          / 1 => impl_segment,
+        "resolvedOptions"  / 0 => impl_resolved_options,
+    )
+});
+
+#[must_use]
+/// Convenience accessor used by [`super::lookup_prototype`].
+pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
+    SEGMENTER_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
+}

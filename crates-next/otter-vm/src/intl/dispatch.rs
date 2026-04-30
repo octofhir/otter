@@ -15,8 +15,13 @@
 use crate::Value;
 use crate::intl::collator;
 use crate::intl::date_time_format;
+use crate::intl::display_names;
+use crate::intl::list_format;
 use crate::intl::number_format;
 use crate::intl::payload::{IntlKind, IntlPayload, JsIntl};
+use crate::intl::plural_rules;
+use crate::intl::relative_time_format;
+use crate::intl::segmenter;
 
 /// Failure modes for `Intl.*` construction / method calls.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -91,6 +96,15 @@ pub fn construct(class: &str, locale: &Value, options: &Value) -> Result<Value, 
         IntlKind::DateTimeFormat => {
             IntlPayload::DateTimeFormat(date_time_format::resolve(locale, options))
         }
+        IntlKind::PluralRules => IntlPayload::PluralRules(plural_rules::resolve(locale, options)),
+        IntlKind::RelativeTimeFormat => {
+            IntlPayload::RelativeTimeFormat(relative_time_format::resolve(locale, options))
+        }
+        IntlKind::ListFormat => IntlPayload::ListFormat(list_format::resolve(locale, options)),
+        IntlKind::DisplayNames => {
+            IntlPayload::DisplayNames(display_names::resolve(locale, options))
+        }
+        IntlKind::Segmenter => IntlPayload::Segmenter(segmenter::resolve(locale, options)),
     };
     Ok(Value::Intl(JsIntl::new(payload)))
 }

@@ -80,6 +80,9 @@ pub fn statics_call(
         "reject" => Ok(Value::Promise(static_reject(args))),
         "all" => Ok(static_all(interp, args)),
         "race" => Ok(static_race(interp, args)),
+        "allSettled" => Ok(static_all_settled(interp, args)),
+        "any" => Ok(static_any(interp, args)),
+        "withResolvers" => Ok(static_with_resolvers()),
         other => Err(NativeError::TypeError {
             name: "Promise",
             reason: format!("static `{other}` is not defined"),
@@ -226,6 +229,226 @@ fn static_race(interp: &mut Interpreter, args: &[Value]) -> Value {
     Value::Promise(result)
 }
 
+/// §27.2.4.2 `Promise.allSettled(iterable)` — settle with an array
+/// of `{status: "fulfilled", value}` / `{status: "rejected",
+/// reason}` records once every input promise settles.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-promise.allsettled>
+fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
+    let entries = match args.first() {
+        Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect::<Vec<_>>(),
+        _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+    };
+    let result = JsPromiseHandle::pending();
+    if entries.is_empty() {
+        let jobs = result.fulfill(Value::Array(crate::JsArray::new()));
+        for j in jobs.jobs {
+            interp.microtasks_mut().enqueue(j);
+        }
+        return Value::Promise(result);
+    }
+    let total = entries.len();
+    let slots: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![None; total]));
+    let remaining: std::rc::Rc<std::cell::Cell<usize>> =
+        std::rc::Rc::new(std::cell::Cell::new(total));
+    let heap = interp.string_heap_clone();
+    for (i, entry) in entries.into_iter().enumerate() {
+        let entry_promise = match entry {
+            Value::Promise(p) => p,
+            other => JsPromiseHandle::fulfilled(other),
+        };
+        let on_fulfill = {
+            let slots = slots.clone();
+            let remaining = remaining.clone();
+            let result = result.clone();
+            let heap = heap.clone();
+            native_value("Promise.allSettled fulfill", move |interp, args| {
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                let record =
+                    build_settled_record(true, v, &heap).map_err(|e| NativeError::TypeError {
+                        name: "Promise",
+                        reason: format!("string allocation failed: {e}"),
+                    })?;
+                finalize_settled(&slots, &remaining, &result, i, record, interp);
+                Ok(Value::Undefined)
+            })
+        };
+        let on_reject = {
+            let slots = slots.clone();
+            let remaining = remaining.clone();
+            let result = result.clone();
+            let heap = heap.clone();
+            native_value("Promise.allSettled reject", move |interp, args| {
+                let r = args.first().cloned().unwrap_or(Value::Undefined);
+                let record =
+                    build_settled_record(false, r, &heap).map_err(|e| NativeError::TypeError {
+                        name: "Promise",
+                        reason: format!("string allocation failed: {e}"),
+                    })?;
+                finalize_settled(&slots, &remaining, &result, i, record, interp);
+                Ok(Value::Undefined)
+            })
+        };
+        attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
+    }
+    Value::Promise(result)
+}
+
+fn build_settled_record(
+    fulfilled: bool,
+    payload: Value,
+    heap: &std::sync::Arc<crate::string::StringHeap>,
+) -> Result<Value, crate::string::StringError> {
+    let obj = crate::object::JsObject::new();
+    let status_text = if fulfilled { "fulfilled" } else { "rejected" };
+    let status = crate::JsString::from_str(status_text, heap)?;
+    obj.set("status", Value::String(status));
+    let key = if fulfilled { "value" } else { "reason" };
+    obj.set(key, payload);
+    Ok(Value::Object(obj))
+}
+
+fn finalize_settled(
+    slots: &std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>>,
+    remaining: &std::rc::Rc<std::cell::Cell<usize>>,
+    result: &JsPromiseHandle,
+    index: usize,
+    record: Value,
+    interp: &mut Interpreter,
+) {
+    let mut s = slots.borrow_mut();
+    if s[index].is_some() {
+        return;
+    }
+    s[index] = Some(record);
+    let count = remaining.get().saturating_sub(1);
+    remaining.set(count);
+    if count == 0 {
+        let collected: Vec<Value> = s
+            .drain(..)
+            .map(|opt| opt.unwrap_or(Value::Undefined))
+            .collect();
+        drop(s);
+        let arr = crate::JsArray::from_elements(collected);
+        let jobs = result.fulfill(Value::Array(arr));
+        for j in jobs.jobs {
+            interp.microtasks_mut().enqueue(j);
+        }
+    }
+}
+
+/// §27.2.4.3 `Promise.any(iterable)` — short-circuits on the first
+/// fulfillment; rejects with `AggregateError` once every input
+/// rejects.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-promise.any>
+fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
+    let entries = match args.first() {
+        Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect::<Vec<_>>(),
+        _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+    };
+    let result = JsPromiseHandle::pending();
+    if entries.is_empty() {
+        // Spec: empty iterable rejects with an AggregateError whose
+        // `errors` array is empty.
+        let agg = match interp.error_classes_clone().make_aggregate_instance(
+            Vec::new(),
+            Some("All promises were rejected"),
+            &interp.string_heap_clone(),
+        ) {
+            Ok(o) => Value::Object(o),
+            Err(_) => Value::Undefined,
+        };
+        let jobs = result.reject(agg);
+        for j in jobs.jobs {
+            interp.microtasks_mut().enqueue(j);
+        }
+        return Value::Promise(result);
+    }
+    let total = entries.len();
+    let errors: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![None; total]));
+    let remaining: std::rc::Rc<std::cell::Cell<usize>> =
+        std::rc::Rc::new(std::cell::Cell::new(total));
+    let heap = interp.string_heap_clone();
+    let registry = interp.error_classes_clone();
+    for (i, entry) in entries.into_iter().enumerate() {
+        let entry_promise = match entry {
+            Value::Promise(p) => p,
+            other => JsPromiseHandle::fulfilled(other),
+        };
+        let on_fulfill = {
+            let result = result.clone();
+            native_value("Promise.any fulfill", move |interp, args| {
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                let jobs = result.fulfill(v);
+                for j in jobs.jobs {
+                    interp.microtasks_mut().enqueue(j);
+                }
+                Ok(Value::Undefined)
+            })
+        };
+        let on_reject = {
+            let errors = errors.clone();
+            let remaining = remaining.clone();
+            let result = result.clone();
+            let heap = heap.clone();
+            let registry = registry.clone();
+            native_value("Promise.any reject", move |interp, args| {
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                let mut errs = errors.borrow_mut();
+                if errs[i].is_some() {
+                    return Ok(Value::Undefined);
+                }
+                errs[i] = Some(reason);
+                let count = remaining.get().saturating_sub(1);
+                remaining.set(count);
+                if count == 0 {
+                    let collected: Vec<Value> = errs
+                        .drain(..)
+                        .map(|opt| opt.unwrap_or(Value::Undefined))
+                        .collect();
+                    drop(errs);
+                    let agg = registry
+                        .make_aggregate_instance(
+                            collected,
+                            Some("All promises were rejected"),
+                            &heap,
+                        )
+                        .map_err(|e| NativeError::TypeError {
+                            name: "Promise",
+                            reason: format!("string allocation failed: {e}"),
+                        })?;
+                    let jobs = result.reject(Value::Object(agg));
+                    for j in jobs.jobs {
+                        interp.microtasks_mut().enqueue(j);
+                    }
+                }
+                Ok(Value::Undefined)
+            })
+        };
+        attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
+    }
+    Value::Promise(result)
+}
+
+/// §27.2.4.6 `Promise.withResolvers()` — returns
+/// `{ promise, resolve, reject }` over a fresh pending promise.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-promise.withResolvers>
+fn static_with_resolvers() -> Value {
+    let cap = make_capability();
+    let obj = crate::object::JsObject::new();
+    obj.set("promise", cap.promise);
+    obj.set("resolve", cap.resolve);
+    obj.set("reject", cap.reject);
+    Value::Object(obj)
+}
+
 // -- prototype methods ---------------------------------------------
 
 fn method_then(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[Value]) -> Value {
@@ -249,14 +472,20 @@ fn method_catch(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[Val
 }
 
 fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[Value]) -> Value {
+    // Spec §27.2.5.3 — when `onFinally` is not callable, fall back
+    // to a no-op `then` that propagates the original settlement.
     let on_finally = match args.first() {
         Some(v) if crate::is_callable_value(v) => v.clone(),
         _ => return perform_then_with_handlers(interp, promise, None, None),
     };
-    // Spec §27.2.5.3: build wrapper handlers that invoke
-    // `on_finally` and then propagate the original outcome. We
-    // synthesise these as native closures that schedule
-    // `on_finally` as a microtask and forward the value/reason.
+    // Build wrapper reactions that:
+    // 1. Invoke `onFinally()` synchronously via a microtask.
+    // 2. Forward the original fulfilment value / rejection reason
+    //    through the chained promise (returning a fresh rejected
+    //    promise re-throws through the resolve adoption path).
+    // Foundation simplification: we don't await onFinally's return
+    // value (the spec calls for that for thenable returns); the
+    // common case of a synchronous cleanup is preserved.
     let then_handler = {
         let on_finally = on_finally.clone();
         native_value("Promise.prototype.finally then", move |interp, args| {
@@ -281,13 +510,10 @@ fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[V
                 result_capability: None,
                 kind: crate::microtask::MicrotaskKind::Call,
             });
-            // Propagate the rejection through the next promise:
-            // returning the reason here would convert it to a
-            // fulfillment, so we wrap a re-throw via a native
-            // closure that synthesises a rejection through its
-            // capability. Simpler: reject via the returned
-            // outcome. Foundation: make this a fulfilment of an
-            // already-rejected promise.
+            // Re-raise the original rejection through the chained
+            // promise. The resolve-native adopts the returned
+            // promise's state, so a rejected handle propagates as
+            // expected.
             Ok(Value::Promise(JsPromiseHandle::rejected(reason)))
         })
     };

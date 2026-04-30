@@ -247,6 +247,12 @@ pub fn is_callable(value: &Value) -> bool {
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
             | Value::ClassConstructor(_)
+            // §28.2.1.1 — a Proxy reports `[[Call]]` when its
+            // handler defines `apply` (or via target inspection in
+            // the wider machinery). Foundation: assume callable; the
+            // dispatcher delegates non-callable targets to a proper
+            // TypeError on actual call.
+            | Value::Proxy(_)
     )
 }
 

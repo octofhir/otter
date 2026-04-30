@@ -43,6 +43,12 @@ pub struct ArrayBufferBody {
     /// `Some(n)` for a resizable buffer; `None` for a fixed-length
     /// buffer. When set, [`Self::bytes`] never grows beyond `n`.
     max_byte_length: Option<usize>,
+    /// `true` for `SharedArrayBuffer` per ECMA-262 §25.2.
+    /// SharedArrayBuffer cannot be detached and exposes `.grow`
+    /// instead of `.resize` per §25.2.5. The single-threaded
+    /// foundation shares storage by `Rc` like an ordinary buffer;
+    /// real cross-isolate sharing arrives with the worker subset.
+    shared: bool,
 }
 
 impl JsArrayBuffer {
@@ -56,6 +62,7 @@ impl JsArrayBuffer {
                 bytes: RefCell::new(vec![0u8; len]),
                 detached: Cell::new(false),
                 max_byte_length: None,
+                shared: false,
             }),
         }
     }
@@ -72,6 +79,7 @@ impl JsArrayBuffer {
                 bytes: RefCell::new(bytes),
                 detached: Cell::new(false),
                 max_byte_length: Some(max_byte_length),
+                shared: false,
             }),
         }
     }
@@ -85,8 +93,75 @@ impl JsArrayBuffer {
                 bytes: RefCell::new(bytes),
                 detached: Cell::new(false),
                 max_byte_length: None,
+                shared: false,
             }),
         }
+    }
+
+    /// Allocate a fixed-length `SharedArrayBuffer`. Cannot be
+    /// detached; differs from an ordinary `ArrayBuffer` only by
+    /// the [`Self::is_shared`] flag in the single-threaded
+    /// foundation surface.
+    #[must_use]
+    pub fn new_shared(len: usize) -> Self {
+        Self {
+            inner: Rc::new(ArrayBufferBody {
+                bytes: RefCell::new(vec![0u8; len]),
+                detached: Cell::new(false),
+                max_byte_length: None,
+                shared: true,
+            }),
+        }
+    }
+
+    /// Allocate a growable shared buffer per §25.2.5 — `length`
+    /// floats up to `max_byte_length` via [`Self::grow`].
+    #[must_use]
+    pub fn new_shared_growable(len: usize, max_byte_length: usize) -> Self {
+        let mut bytes = Vec::with_capacity(max_byte_length);
+        bytes.resize(len, 0u8);
+        Self {
+            inner: Rc::new(ArrayBufferBody {
+                bytes: RefCell::new(bytes),
+                detached: Cell::new(false),
+                max_byte_length: Some(max_byte_length),
+                shared: true,
+            }),
+        }
+    }
+
+    /// `true` for a `SharedArrayBuffer`.
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        self.inner.shared
+    }
+
+    /// `true` for a growable `SharedArrayBuffer` (the SAB
+    /// equivalent of resizable).
+    #[must_use]
+    pub fn is_growable(&self) -> bool {
+        self.inner.shared && self.inner.max_byte_length.is_some()
+    }
+
+    /// §25.2.5.4 — `SharedArrayBuffer.prototype.grow(newByteLength)`.
+    /// Growing only; `new_len < current_len` returns `false`.
+    pub fn grow(&self, new_len: usize) -> bool {
+        if !self.is_growable() {
+            return false;
+        }
+        let max = match self.inner.max_byte_length {
+            Some(m) => m,
+            None => return false,
+        };
+        if new_len > max {
+            return false;
+        }
+        let mut bytes = self.inner.bytes.borrow_mut();
+        if new_len < bytes.len() {
+            return false;
+        }
+        bytes.resize(new_len, 0u8);
+        true
     }
 
     /// Current byte length. `0` for a detached buffer.
@@ -140,8 +215,12 @@ impl JsArrayBuffer {
     }
 
     /// Detach the buffer. Idempotent; subsequent calls are no-ops.
-    /// Drops the byte storage so reads return `0` length.
+    /// `SharedArrayBuffer` rejects detach per §25.2.4.1 step 2 —
+    /// the call is a no-op there.
     pub fn detach(&self) {
+        if self.inner.shared {
+            return;
+        }
         if !self.inner.detached.replace(true) {
             self.inner.bytes.borrow_mut().clear();
         }

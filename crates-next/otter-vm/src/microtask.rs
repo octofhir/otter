@@ -144,6 +144,22 @@ pub enum MicrotaskKind {
         /// `args[0]` as the thrown value.
         fulfilled: bool,
     },
+    /// Resume a parked async-generator body — see ECMA-262 §27.6
+    /// for the spec semantics. Same shape as [`Self::AsyncResume`]
+    /// but also carries the owning generator handle so the drain
+    /// can settle its `pending_request` on completion.
+    AsyncGenResume {
+        /// Frame the drain re-pushes.
+        frame: Box<Frame>,
+        /// Register inside `frame` that receives the awaited
+        /// value on the fulfilled path.
+        await_dst: u16,
+        /// `true` when the awaited promise fulfilled.
+        fulfilled: bool,
+        /// Owning async-generator handle whose `pending_request`
+        /// the drain settles on yield / completion / throw.
+        owner: crate::generator::JsGenerator,
+    },
 }
 
 /// `{resolve, reject}` pair the runtime uses to settle a

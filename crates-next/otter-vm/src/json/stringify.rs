@@ -324,7 +324,9 @@ fn emit_value(
         | Value::Temporal(_)
         | Value::Intl(_)
         | Value::ArrayBuffer(_)
-        | Value::DataView(_) => {
+        | Value::DataView(_)
+        | Value::Generator(_)
+        | Value::Proxy(_) => {
             out.push_str("null");
         }
         // §25.5.2 — TypedArrays serialise like ordinary array-likes:

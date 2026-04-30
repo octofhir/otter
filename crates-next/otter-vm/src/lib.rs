@@ -33,6 +33,7 @@ pub mod abstract_ops;
 pub mod array;
 pub mod array_prototype;
 pub mod array_statics;
+pub mod atomics;
 pub mod bigint;
 pub mod binary;
 pub mod boolean_prototype;
@@ -41,6 +42,7 @@ pub mod collections_prototype;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod error_classes;
+pub mod generator;
 pub mod global_functions;
 pub mod intl;
 pub mod intrinsics;
@@ -53,6 +55,8 @@ pub mod object;
 pub mod object_statics;
 pub mod promise;
 pub mod promise_dispatch;
+pub mod proxy;
+pub mod reflect;
 pub mod regexp;
 pub mod regexp_prototype;
 pub mod string;
@@ -237,6 +241,21 @@ pub enum Value {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-typedarray-objects>
     TypedArray(crate::binary::JsTypedArray),
+    /// Generator object produced by calling a `function*` body. The
+    /// handle owns the suspended frame state; `.next(arg)` /
+    /// `.return(arg)` / `.throw(reason)` resume it.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-generator-objects>
+    Generator(crate::generator::JsGenerator),
+    /// JS Proxy — handler-trapped object surface per ECMA-262 §28.2.
+    /// Property loads / stores / has-tests / call-as-function go
+    /// through the handler's traps when present; otherwise fall
+    /// through to the target.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-proxy-objects>
+    Proxy(crate::proxy::JsProxy),
     /// Class value: the result of evaluating a `class` declaration
     /// or expression. Wraps the underlying constructor callable,
     /// the prototype object that fresh instances inherit from, and
@@ -315,6 +334,63 @@ pub enum IteratorState {
     /// state once it observes `done`, so re-driving an exhausted
     /// iterator is a no-op rather than a re-iteration.
     Exhausted,
+    /// Lazy `Iterator.prototype.map(fn)` wrapper per the
+    /// [iterator-helpers proposal](https://tc39.es/proposal-iterator-helpers/#sec-iteratorprototype.map).
+    /// Pulls from `source` and applies `mapper` on every step.
+    Map {
+        /// Underlying iterator handle.
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        /// Per-element mapper. Must be callable.
+        mapper: Value,
+    },
+    /// Lazy `Iterator.prototype.filter(predicate)` wrapper.
+    /// Skips elements for which `predicate` returns falsey.
+    Filter {
+        /// Underlying iterator handle.
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        /// Per-element predicate. Must be callable.
+        predicate: Value,
+    },
+    /// Lazy `Iterator.prototype.take(n)` wrapper. Yields at most
+    /// `remaining` more elements from `source`.
+    Take {
+        /// Underlying iterator handle.
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        /// Steps still allowed before the wrapper reports `done`.
+        remaining: u64,
+    },
+    /// Lazy `Iterator.prototype.drop(n)` wrapper. Discards the
+    /// first `to_drop` elements of `source` then forwards the rest.
+    Drop {
+        /// Underlying iterator handle.
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        /// Elements still to discard before forwarding kicks in.
+        to_drop: u64,
+    },
+    /// `Value::Generator` driven through the iterator protocol.
+    /// Each step calls `gen.next()` via the runtime's
+    /// [`Interpreter::resume_generator`] helper; once `done` is
+    /// observed, transitions to [`Self::Exhausted`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-generator-prototype-object>
+    Generator {
+        /// Underlying generator handle.
+        handle: crate::generator::JsGenerator,
+    },
+    /// Lazy `Iterator.prototype.flatMap(mapper)` wrapper. Applies
+    /// `mapper` to each source element; the returned value is
+    /// flattened: arrays and iterators contribute their elements,
+    /// other values flow through directly.
+    FlatMap {
+        /// Underlying iterator handle.
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        /// Per-element mapper. Must be callable.
+        mapper: Value,
+        /// Inner iterator currently being drained, when the last
+        /// `mapper` call produced an iterable.
+        inner: Option<std::rc::Rc<std::cell::RefCell<IteratorState>>>,
+    },
 }
 
 /// Storage for `Value::BoundFunction`. Constructed by the
@@ -409,9 +485,17 @@ impl Value {
                 .map(|s| format!("Date({s})"))
                 .unwrap_or_else(|| "Invalid Date".to_string()),
             Value::Intl(i) => format!("[object Intl.{}]", i.kind().class_name()),
-            Value::ArrayBuffer(_) => "[object ArrayBuffer]".to_string(),
+            Value::ArrayBuffer(b) => {
+                if b.is_shared() {
+                    "[object SharedArrayBuffer]".to_string()
+                } else {
+                    "[object ArrayBuffer]".to_string()
+                }
+            }
             Value::DataView(_) => "[object DataView]".to_string(),
             Value::TypedArray(t) => format!("[object {}]", t.kind().name()),
+            Value::Generator(_) => "[object Generator]".to_string(),
+            Value::Proxy(_) => "[object Proxy]".to_string(),
             Value::Object(_) => "[object Object]".to_string(),
             Value::Array(a) => {
                 let body = a.borrow_body();
@@ -460,7 +544,9 @@ impl Value {
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
-            | Value::TypedArray(_) => true,
+            | Value::TypedArray(_)
+            | Value::Generator(_)
+            | Value::Proxy(_) => true,
         }
     }
 
@@ -562,7 +648,9 @@ impl Value {
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
-            | Value::TypedArray(_) => "object",
+            | Value::TypedArray(_)
+            | Value::Generator(_)
+            | Value::Proxy(_) => "object",
         }
     }
 
@@ -622,6 +710,8 @@ impl PartialEq for Value {
             (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(b),
             (Value::DataView(a), Value::DataView(b)) => a.ptr_eq(b),
             (Value::TypedArray(a), Value::TypedArray(b)) => a.ptr_eq(b),
+            (Value::Generator(a), Value::Generator(b)) => a.ptr_eq(b),
+            (Value::Proxy(a), Value::Proxy(b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -762,6 +852,16 @@ pub struct Frame {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-iteratornext>
     pub pending_iterator_next: Option<PendingIteratorNext>,
+    /// `Some(gen)` when this frame is the suspended body of an
+    /// active generator object. [`otter_bytecode::Op::Yield`]
+    /// inspects this slot: if set, the running frame is unspooled
+    /// onto the generator's saved-state slot and the dispatcher
+    /// returns to the calling `.next()` resume site. `None` for
+    /// every other call shape.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-generator-objects>
+    pub generator_owner: Option<crate::generator::JsGenerator>,
 }
 
 /// In-flight state for [`Op::GetIterator`] when the source operand
@@ -967,6 +1067,7 @@ impl Frame {
             pending_to_primitive: None,
             pending_get_iterator: None,
             pending_iterator_next: None,
+            generator_owner: None,
         }
     }
 }
@@ -1209,6 +1310,16 @@ pub struct Interpreter {
     /// can opt out of dynamic code.
     #[allow(clippy::type_complexity)]
     eval_hook: Option<EvalHook>,
+    /// Side-channel for an unhandled JS-level throw originating
+    /// inside a generator body that resumed via
+    /// [`Self::resume_generator`]. The unwind machinery on the
+    /// generator's sub-stack converts the throw into
+    /// [`VmError::Uncaught`] (which loses the original `Value`); we
+    /// preserve the original here so the calling
+    /// [`Op::CallMethodValue`] arm can re-throw it on the outer
+    /// stack and let user-level `try` / `catch` observe the right
+    /// payload.
+    pending_generator_throw: Option<Value>,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -1248,6 +1359,7 @@ impl Interpreter {
             error_classes,
             global_this: build_global_this(),
             eval_hook: None,
+            pending_generator_throw: None,
         }
     }
 
@@ -1272,6 +1384,7 @@ impl Interpreter {
             error_classes,
             global_this: build_global_this(),
             eval_hook: None,
+            pending_generator_throw: None,
         }
     }
 
@@ -1414,6 +1527,23 @@ impl Interpreter {
         &self.string_heap
     }
 
+    /// Clone-out the string heap handle. Used by native closures
+    /// (e.g. `Promise.allSettled`) that need to allocate strings
+    /// from a deferred microtask without re-borrowing the
+    /// interpreter.
+    #[must_use]
+    pub fn string_heap_clone(&self) -> Arc<StringHeap> {
+        self.string_heap.clone()
+    }
+
+    /// Clone-out the error-class registry. Used by native closures
+    /// (e.g. `Promise.any`) that need to build error instances from
+    /// a deferred microtask.
+    #[must_use]
+    pub fn error_classes_clone(&self) -> ErrorClassRegistry {
+        self.error_classes.clone()
+    }
+
     /// Execute `<main>` of `module` and return its completion value.
     ///
     /// # Errors
@@ -1502,6 +1632,16 @@ impl Interpreter {
         {
             let value = task.args.into_iter().next().unwrap_or(Value::Undefined);
             return self.run_async_resume(module, frame, await_dst, fulfilled, value);
+        }
+        if let MicrotaskKind::AsyncGenResume {
+            frame,
+            await_dst,
+            fulfilled,
+            owner,
+        } = task.kind
+        {
+            let value = task.args.into_iter().next().unwrap_or(Value::Undefined);
+            return self.run_async_gen_resume(module, frame, await_dst, fulfilled, value, owner);
         }
         // Resolve callee → function_id + upvalues. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
@@ -1883,6 +2023,50 @@ impl Interpreter {
                     }
                     continue;
                 }
+                // §27.5 generator suspension. Yield reads the value
+                // operand, advances pc past itself, pops the frame
+                // off the active stack, stashes it back onto the
+                // owning [`crate::generator::JsGenerator`], records
+                // the dst register so a future `.next(arg)` can
+                // deposit `arg` there, and returns control to the
+                // resume site (i.e. the enclosing
+                // [`Self::resume_generator`] call).
+                // <https://tc39.es/ecma262/#sec-yield>
+                Op::Yield => {
+                    let dst = register_operand(operands.first())?;
+                    let src = register_operand(operands.get(1))?;
+                    let yielded = read_register(&stack[top_idx], src)?.clone();
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    let owner = frame.generator_owner.clone().ok_or(VmError::TypeMismatch)?;
+                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    let popped = stack.pop().expect("frame present");
+                    let pending_request_resolve = {
+                        let mut body = owner.borrow_mut();
+                        body.frame = Some(popped);
+                        body.resume_dst = dst;
+                        body.yielded = Some(yielded.clone());
+                        if body.is_async {
+                            body.pending_request.take().map(|cap| cap.resolve)
+                        } else {
+                            None
+                        }
+                    };
+                    // §27.6 — async-generator yield settles the
+                    // outer `.next()` promise immediately with
+                    // `{value, done: false}`. Sync generators bubble
+                    // the yielded value out so the `resume_generator`
+                    // caller can shape it.
+                    if let Some(resolve) = pending_request_resolve {
+                        let record = make_iter_result(yielded.clone(), false);
+                        self.run_callable_sync(
+                            module,
+                            &resolve,
+                            Value::Undefined,
+                            smallvec::smallvec![record],
+                        )?;
+                    }
+                    return Ok(yielded);
+                }
                 // ToNumber on an object whose `[Symbol.toPrimitive]`
                 // is callable must invoke that hook (ECMA-262
                 // §7.1.1 OrdinaryToPrimitive). The synchronous path
@@ -1943,6 +2127,33 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
                     if self.drive_store_property(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                // §28.2.4.7 / .10 Proxy.[[HasProperty]] /
+                // [[Delete]] — invoke `has` / `deleteProperty`
+                // traps when the receiver is a Proxy.
+                Op::HasProperty => {
+                    if self.drive_has_property_proxy(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                Op::DeleteProperty => {
+                    if self.drive_delete_property_proxy(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                // §28.2.4.1 / .2 Proxy.[[GetPrototypeOf]] /
+                // [[SetPrototypeOf]] — invoke `getPrototypeOf` /
+                // `setPrototypeOf` traps when the receiver is a
+                // Proxy.
+                Op::GetPrototype => {
+                    if self.drive_get_prototype_proxy(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                Op::SetPrototype => {
+                    if self.drive_set_prototype_proxy(stack, module, &operands)? {
                         continue;
                     }
                 }
@@ -2008,7 +2219,8 @@ impl Interpreter {
                 | Op::New
                 | Op::Throw
                 | Op::EndFinally
-                | Op::Await => {
+                | Op::Await
+                | Op::Yield => {
                     unreachable!("stack-modifying ops handled earlier in this loop")
                 }
                 Op::MakeFunction => {
@@ -2599,6 +2811,11 @@ impl Interpreter {
                                 _ => a.has_in_proto_chain(target),
                             }
                         }
+                        // §13.10.2 — for class values, walk the
+                        // proto chain against `class.prototype`.
+                        (Value::Object(a), Value::ClassConstructor(c)) => {
+                            a.has_in_proto_chain(&c.prototype)
+                        }
                         _ => false,
                     };
                     write_register(frame, dst, Value::Boolean(result))?;
@@ -2789,7 +3006,9 @@ impl Interpreter {
                         | Value::Intl(_)
                         | Value::ArrayBuffer(_)
                         | Value::DataView(_)
-                        | Value::TypedArray(_) => NumberValue::Double(f64::NAN),
+                        | Value::TypedArray(_)
+                        | Value::Generator(_)
+                        | Value::Proxy(_) => NumberValue::Double(f64::NAN),
                         // §21.4.4.45 Date.prototype[@@toPrimitive] —
                         // ToNumber on a Date returns its time value.
                         Value::Date(d) => NumberValue::from_f64(d.time()),
@@ -3091,6 +3310,109 @@ impl Interpreter {
                     let result = binary::dispatch::typed_array_call(kind, &name, &args)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
+                }
+                // Iterator-helpers proposal — `Iterator.from(iter)`
+                // and friends.
+                // <https://tc39.es/proposal-iterator-helpers/>
+                Op::IteratorCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = iterator_static_call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §25.2 SharedArrayBuffer constructor.
+                // <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
+                Op::SharedArrayBufferCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = binary::dispatch::shared_array_buffer_call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §25.4 Atomics namespace dispatcher.
+                // <https://tc39.es/ecma262/#sec-atomics-object>
+                Op::AtomicsCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = atomics::call(&name, &args, &self.string_heap)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §28.2 Proxy constructor + statics — `new Proxy`
+                // and `Proxy.revocable`.
+                // <https://tc39.es/ecma262/#sec-proxy-constructor>
+                Op::ProxyCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = proxy_static_call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §28.1 Reflect static surface — single dispatcher
+                // covering every spec method.
+                // <https://tc39.es/ecma262/#sec-reflect-object>
+                Op::ReflectCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(&stack[top_idx], r)?.clone());
+                    }
+                    // Apply / construct need interp access; advance pc
+                    // first so the sub-dispatch returns to the next op.
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    let heap = self.string_heap.clone();
+                    let result = reflect::call(self, module, &name, &args, &heap)?;
+                    write_register(&mut stack[top_idx], dst, result)?;
+                    continue;
                 }
                 // §23.1.2 Array static dispatch. Routes
                 // `Array.from` / `Array.of` through one entry point.
@@ -3429,6 +3751,19 @@ impl Interpreter {
                                 index: 0,
                             }
                         }
+                        // §27.5 — generator objects are iterable;
+                        // `[@@iterator]()` returns the generator
+                        // itself, and `next()` drives the suspended
+                        // body.
+                        Value::Generator(handle) => IteratorState::Generator { handle },
+                        // Already-an-iterator (from
+                        // `Iterator.from(...)` / a helper wrapper)
+                        // should pass through unchanged.
+                        Value::Iterator(rc) => {
+                            write_register(frame, dst, Value::Iterator(rc))?;
+                            frame.pc += 1;
+                            continue;
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     let iter = std::rc::Rc::new(std::cell::RefCell::new(state));
@@ -3732,6 +4067,31 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
+        // §28.2.4.13 Proxy.[[Call]] — delegate to the `apply`
+        // trap when present; otherwise call through to the
+        // target as a function.
+        if let Value::Proxy(p) = &current {
+            let proxy = p.clone();
+            let argv_array = JsArray::from_elements(effective_args.iter().cloned());
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(),
+                effective_this.clone(),
+                Value::Array(argv_array),
+            ];
+            let result = match self.invoke_proxy_trap(module, &proxy, "apply", trap_args)? {
+                Some(v) => v,
+                None => {
+                    // Fall through to the target's [[Call]] —
+                    // `proxy.target()` returns the original Value,
+                    // which may be a callable directly.
+                    let underlying = proxy.target();
+                    self.run_callable_sync(module, &underlying, effective_this, effective_args)?
+                }
+            };
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(());
+        }
         let (function_id, parent_upvalues, this_for_callee) = match current {
             Value::Function { function_id } => {
                 (function_id, std::rc::Rc::from(Vec::new()), effective_this)
@@ -3800,6 +4160,27 @@ impl Interpreter {
         if function.has_rest && total_args > function.param_count as usize {
             new_frame.rest_args = iter.collect();
         }
+        // §27.5 Generator-call entry: instead of pushing the frame
+        // onto the dispatch stack, hand the caller a paused
+        // [`Value::Generator`] handle that owns the prepared frame.
+        // The body only runs when `.next()` resumes it.
+        if function.is_generator {
+            new_frame.return_register = None;
+            let async_gen = function.is_async_generator;
+            let gen_handle = crate::generator::JsGenerator::new(new_frame);
+            gen_handle.borrow_mut().is_async = async_gen;
+            // Backlink the generator into the frame so `Op::Yield`
+            // can find its owner once execution starts.
+            {
+                let mut body = gen_handle.borrow_mut();
+                if let Some(frame) = body.frame.as_mut() {
+                    frame.generator_owner = Some(gen_handle.clone());
+                }
+            }
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
+            return Ok(());
+        }
         stack.push(new_frame);
         Ok(())
     }
@@ -3846,7 +4227,19 @@ impl Interpreter {
         awaited: Value,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
+        // §27.6 Async-generator body — the running frame has no
+        // `async_state` (it isn't a regular async-function frame),
+        // but it carries a `generator_owner` whose body was flagged
+        // async. Park the frame on a dedicated resume native that
+        // re-enters the generator body and either settles the
+        // outer `pending_request` from a subsequent `Op::Yield` /
+        // completion, or chains another `Op::Await`.
         if stack[top_idx].async_state.is_none() {
+            if let Some(owner) = stack[top_idx].generator_owner.clone() {
+                if owner.borrow().is_async {
+                    return self.do_await_async_gen(stack, dst, awaited, owner);
+                }
+            }
             return Err(VmError::InvalidOperand);
         }
         // Advance past the Await before parking so resumption
@@ -3875,6 +4268,129 @@ impl Interpreter {
             self.microtasks.enqueue(job);
         }
         Ok(())
+    }
+
+    /// §27.6.3 — `Op::Await` inside an async-generator body. Parks
+    /// the running frame and attaches resume / reject reactions
+    /// that re-enter the body when the awaited promise settles. On
+    /// resume, the generator's `pending_request` is settled by a
+    /// subsequent `Op::Yield`, completion, or further `Op::Await`.
+    fn do_await_async_gen(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        dst: u16,
+        awaited: Value,
+        owner: crate::generator::JsGenerator,
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        let parked = stack.pop().expect("top frame existed");
+        let promise = match awaited {
+            Value::Promise(p) => p,
+            other => JsPromiseHandle::fulfilled(other),
+        };
+        let parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>> =
+            std::rc::Rc::new(std::cell::Cell::new(Some(Box::new(parked))));
+        let resume_native =
+            make_async_gen_resume_native(parked_slot.clone(), dst, owner.clone(), true);
+        let reject_native = make_async_gen_resume_native(parked_slot, dst, owner, false);
+        let capability = promise_dispatch::make_capability();
+        let outcome = promise.perform_then(Some(resume_native), Some(reject_native), capability);
+        if let Some(job) = outcome.immediate_job {
+            self.microtasks.enqueue(job);
+        }
+        Ok(())
+    }
+
+    /// Resume an async-generator body whose `Op::Await` parked
+    /// `frame`. Mirrors [`Self::run_async_resume`] but settles the
+    /// generator's `pending_request` on completion / unhandled
+    /// throw rather than the frame's `async_state` promise.
+    fn run_async_gen_resume(
+        &mut self,
+        module: &BytecodeModule,
+        mut frame: Box<Frame>,
+        await_dst: u16,
+        fulfilled: bool,
+        value: Value,
+        owner: crate::generator::JsGenerator,
+    ) -> Result<(), RunError> {
+        if fulfilled {
+            if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
+                *slot = value.clone();
+            } else {
+                return Err(RunError {
+                    error: VmError::InvalidOperand,
+                    frames: Vec::new(),
+                });
+            }
+        }
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(*frame);
+        if !fulfilled {
+            if let Err(error) = self.unwind_throw(&mut stack, value.clone()) {
+                let frames = snapshot_frames(module, &stack);
+                return Err(RunError { error, frames });
+            }
+            if stack.is_empty() {
+                // Throw drained out of the gen body; settle the
+                // pending request as rejected.
+                let req = owner.borrow_mut().pending_request.take();
+                if let Some(req) = req {
+                    if let Err(error) = self.run_callable_sync(
+                        module,
+                        &req.reject,
+                        Value::Undefined,
+                        smallvec::smallvec![value],
+                    ) {
+                        return Err(RunError {
+                            error,
+                            frames: Vec::new(),
+                        });
+                    }
+                }
+                owner.borrow_mut().done = true;
+                return Ok(());
+            }
+        }
+        match self.dispatch_loop(module, &mut stack) {
+            Ok(value) => {
+                let yielded_already = owner.borrow().yielded.is_some();
+                if yielded_already {
+                    // Op::Yield already settled the request and
+                    // saved the frame back to the gen.
+                    owner.borrow_mut().yielded.take();
+                    return Ok(());
+                }
+                // Body completed: settle the pending request with
+                // the final return value as `done: true`.
+                let req = owner.borrow_mut().pending_request.take();
+                if let Some(req) = req {
+                    let record = make_iter_result(value, true);
+                    if let Err(error) = self.run_callable_sync(
+                        module,
+                        &req.resolve,
+                        Value::Undefined,
+                        smallvec::smallvec![record],
+                    ) {
+                        return Err(RunError {
+                            error,
+                            frames: Vec::new(),
+                        });
+                    }
+                }
+                owner.borrow_mut().done = true;
+                owner.borrow_mut().frame = None;
+                Ok(())
+            }
+            Err(error) => {
+                let frames = snapshot_frames(module, &stack);
+                Err(RunError { error, frames })
+            }
+        }
     }
 
     /// Drive a [`MicrotaskKind::AsyncResume`] task: re-push the
@@ -4034,14 +4550,6 @@ impl Interpreter {
         if !is_callable(&callee) {
             return Err(VmError::NotCallable);
         }
-        // Allocate receiver and link its prototype before pushing
-        // the new frame. The constructor might mutate the receiver
-        // immediately, so the prototype link must already be in
-        // place.
-        let receiver = JsObject::new();
-        if let Some(proto) = construct_prototype(&callee) {
-            receiver.set_prototype(Some(proto));
-        }
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
         for i in 0..argc as usize {
             let r = register_operand(operands.get(3 + i))?;
@@ -4051,6 +4559,51 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
+        // §28.2.4.14 Proxy.[[Construct]] — `new <proxy>(args)`
+        // routes through the `construct` trap when present;
+        // otherwise delegates to the target.
+        if let Value::Proxy(p) = &callee {
+            let proxy = p.clone();
+            let argv_array = JsArray::from_elements(args.iter().cloned());
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(),
+                Value::Array(argv_array),
+                Value::Proxy(proxy.clone()),
+            ];
+            let result = match self.invoke_proxy_trap(module, &proxy, "construct", trap_args)? {
+                Some(v) => v,
+                None => {
+                    // Fall through to constructing the underlying
+                    // target.
+                    let underlying = proxy.target();
+                    let receiver = JsObject::new();
+                    if let Some(proto) = construct_prototype(&underlying) {
+                        receiver.set_prototype(Some(proto));
+                    }
+                    let result = self.run_callable_sync(
+                        module,
+                        &underlying,
+                        Value::Object(receiver.clone()),
+                        args,
+                    )?;
+                    match result {
+                        Value::Object(_) => result,
+                        _ => Value::Object(receiver),
+                    }
+                }
+            };
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(());
+        }
+        // Allocate receiver and link its prototype before pushing
+        // the new frame. The constructor might mutate the receiver
+        // immediately, so the prototype link must already be in
+        // place.
+        let receiver = JsObject::new();
+        if let Some(proto) = construct_prototype(&callee) {
+            receiver.set_prototype(Some(proto));
+        }
         let this_value = Value::Object(receiver.clone());
         self.invoke(stack, module, &callee, this_value, args, dst)?;
         // The pushed frame is now on top; mark it so `pop_frame`
@@ -4177,6 +4730,102 @@ impl Interpreter {
         // table so it can drive `self.invoke`.
         if name == "forEach" && matches!(&recv_value, Value::Map(_) | Value::Set(_)) {
             return self.do_collection_for_each(stack, module, &recv_value, &arg_values, dst);
+        }
+
+        // Iterator-helpers proposal — when receiver is an iterator
+        // value, route through the dedicated dispatcher that builds
+        // lazy wrappers / drains for terminals.
+        // <https://tc39.es/proposal-iterator-helpers/>
+        if let Value::Iterator(rc) = &recv_value {
+            let iter_rc = rc.clone();
+            if self.iterator_helper_dispatch(stack, module, &iter_rc, &name, &arg_values, dst)? {
+                return Ok(());
+            }
+        }
+
+        // §27.5.3 Generator.prototype methods — `.next` / `.return`
+        // / `.throw`. The receiver carries the suspended frame; the
+        // resume helper drives a sub-dispatch until the next Yield
+        // or completion.
+        // <https://tc39.es/ecma262/#sec-generator-objects>
+        if let Value::Generator(g) = &recv_value {
+            let kind = match name.as_str() {
+                "next" => Some(GeneratorResumeKind::Next(
+                    arg_values.first().cloned().unwrap_or(Value::Undefined),
+                )),
+                "return" => Some(GeneratorResumeKind::Return(
+                    arg_values.first().cloned().unwrap_or(Value::Undefined),
+                )),
+                "throw" => Some(GeneratorResumeKind::Throw(
+                    arg_values.first().cloned().unwrap_or(Value::Undefined),
+                )),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let g = g.clone();
+                let is_async_gen = g.borrow().is_async;
+                if is_async_gen {
+                    // §27.6.3 — async-generator method calls always
+                    // return a Promise. Allocate the outer
+                    // capability up front and stash it on
+                    // `pending_request` so `Op::Yield` /
+                    // `resume_generator` / the await-resume native
+                    // can settle it from inside the dispatch loop.
+                    let cap = promise_dispatch::make_capability();
+                    let promise = cap.promise.clone();
+                    g.borrow_mut().pending_request = Some(cap.clone());
+                    let outcome = self.resume_generator(module, &g, kind);
+                    match outcome {
+                        Ok(_) => {
+                            // resume_generator drained the request
+                            // — either by Op::Yield, by completion,
+                            // or it left the request pending while
+                            // an `Op::Await` parked the body. In
+                            // any case, the outer promise is the
+                            // user-visible handle.
+                        }
+                        Err(err) => {
+                            if let Some(thrown) = self.pending_generator_throw.take() {
+                                if let Some(req) = g.borrow_mut().pending_request.take() {
+                                    self.run_callable_sync(
+                                        module,
+                                        &req.reject,
+                                        Value::Undefined,
+                                        smallvec::smallvec![thrown],
+                                    )?;
+                                }
+                            } else {
+                                g.borrow_mut().pending_request = None;
+                                return Err(err);
+                            }
+                        }
+                    }
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    write_register(frame, dst, promise)?;
+                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    return Ok(());
+                }
+                match self.resume_generator(module, &g, kind) {
+                    Ok(result) => {
+                        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                        write_register(frame, dst, result)?;
+                        frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        // If the generator body unwound an
+                        // uncaught throw, re-raise the *original*
+                        // value on the caller's frame stack so a
+                        // surrounding `try { gen.throw(x) } catch`
+                        // observes the right payload.
+                        if let Some(thrown) = self.pending_generator_throw.take() {
+                            self.unwind_throw(stack, thrown)?;
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                }
+            }
         }
 
         // §23.1.3 callback-driven Array.prototype methods. The
@@ -4664,7 +5313,7 @@ impl Interpreter {
     ///
     /// Used by collection `forEach` and other host-driven iteration
     /// helpers.
-    fn run_callable_sync(
+    pub fn run_callable_sync(
         &mut self,
         module: &BytecodeModule,
         callee: &Value,
@@ -4743,6 +5392,547 @@ impl Interpreter {
         }
         inner.push(new_frame);
         self.dispatch_loop(module, &mut inner)
+    }
+
+    /// Synchronously advance an iterator one step, with full
+    /// interpreter access so user-iterator `next()` calls and
+    /// helper-wrapper callbacks can run inline. Mirrors the
+    /// fast-path [`step_iterator`] helper but also handles the
+    /// `User` / `Map` / `Filter` / `Take` / `Drop` / `FlatMap`
+    /// variants by driving callbacks through
+    /// [`Self::run_callable_sync`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-iteratornext>
+    /// - <https://tc39.es/proposal-iterator-helpers/>
+    fn iterator_next_full(
+        &mut self,
+        module: &BytecodeModule,
+        iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+    ) -> Result<(Value, bool), VmError> {
+        // First try the fast path; falls through to the
+        // interpreter-aware branch on `User` / wrapper variants.
+        match step_iterator(iter, &self.string_heap) {
+            Ok((value, done)) => Ok((value, done)),
+            Err(_) => self.iterator_next_full_slow(module, iter),
+        }
+    }
+
+    fn iterator_next_full_slow(
+        &mut self,
+        module: &BytecodeModule,
+        iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+    ) -> Result<(Value, bool), VmError> {
+        // Snapshot the current state to avoid holding the borrow
+        // across user-callback dispatch.
+        let snapshot: IteratorStateSnapshot = {
+            let state = iter.borrow();
+            match &*state {
+                IteratorState::User { iterator } => IteratorStateSnapshot::User(iterator.clone()),
+                IteratorState::Generator { handle } => {
+                    IteratorStateSnapshot::Generator(handle.clone())
+                }
+                IteratorState::Map { source, mapper } => IteratorStateSnapshot::Map {
+                    source: source.clone(),
+                    mapper: mapper.clone(),
+                },
+                IteratorState::Filter { source, predicate } => IteratorStateSnapshot::Filter {
+                    source: source.clone(),
+                    predicate: predicate.clone(),
+                },
+                IteratorState::Take { source, remaining } => IteratorStateSnapshot::Take {
+                    source: source.clone(),
+                    remaining: *remaining,
+                },
+                IteratorState::Drop { source, to_drop } => IteratorStateSnapshot::Drop {
+                    source: source.clone(),
+                    to_drop: *to_drop,
+                },
+                IteratorState::FlatMap {
+                    source,
+                    mapper,
+                    inner,
+                } => IteratorStateSnapshot::FlatMap {
+                    source: source.clone(),
+                    mapper: mapper.clone(),
+                    inner: inner.clone(),
+                },
+                _ => return Err(VmError::TypeMismatch),
+            }
+        };
+        match snapshot {
+            IteratorStateSnapshot::Generator(handle) => {
+                let result = self.resume_generator(
+                    module,
+                    &handle,
+                    GeneratorResumeKind::Next(Value::Undefined),
+                )?;
+                let Value::Object(record) = &result else {
+                    return Err(VmError::TypeMismatch);
+                };
+                let value = record.get("value").unwrap_or(Value::Undefined);
+                let done = record.get("done").unwrap_or(Value::Undefined).to_boolean();
+                if done {
+                    *iter.borrow_mut() = IteratorState::Exhausted;
+                }
+                Ok((value, done))
+            }
+            IteratorStateSnapshot::User(iter_value) => {
+                let Value::Object(iter_obj) = &iter_value else {
+                    return Err(VmError::TypeMismatch);
+                };
+                let next_fn = iter_obj.get("next").ok_or(VmError::TypeMismatch)?;
+                if !is_callable(&next_fn) {
+                    return Err(VmError::TypeMismatch);
+                }
+                let result =
+                    self.run_callable_sync(module, &next_fn, iter_value.clone(), SmallVec::new())?;
+                let Value::Object(record) = &result else {
+                    return Err(VmError::TypeMismatch);
+                };
+                let value = record.get("value").unwrap_or(Value::Undefined);
+                let done = record.get("done").unwrap_or(Value::Undefined).to_boolean();
+                if done {
+                    *iter.borrow_mut() = IteratorState::Exhausted;
+                }
+                Ok((value, done))
+            }
+            IteratorStateSnapshot::Map { source, mapper } => {
+                let (v, done) = self.iterator_next_full(module, &source)?;
+                if done {
+                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    return Ok((Value::Undefined, true));
+                }
+                let mapped = self.run_callable_sync(
+                    module,
+                    &mapper,
+                    Value::Undefined,
+                    smallvec::smallvec![v],
+                )?;
+                Ok((mapped, false))
+            }
+            IteratorStateSnapshot::Filter { source, predicate } => loop {
+                let (v, done) = self.iterator_next_full(module, &source)?;
+                if done {
+                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    return Ok((Value::Undefined, true));
+                }
+                let kept = self.run_callable_sync(
+                    module,
+                    &predicate,
+                    Value::Undefined,
+                    smallvec::smallvec![v.clone()],
+                )?;
+                if kept.to_boolean() {
+                    return Ok((v, false));
+                }
+            },
+            IteratorStateSnapshot::Take { source, remaining } => {
+                if remaining == 0 {
+                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    return Ok((Value::Undefined, true));
+                }
+                let (v, done) = self.iterator_next_full(module, &source)?;
+                if done {
+                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    return Ok((Value::Undefined, true));
+                }
+                if let IteratorState::Take { remaining, .. } = &mut *iter.borrow_mut() {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                Ok((v, false))
+            }
+            IteratorStateSnapshot::Drop { source, to_drop } => {
+                for _ in 0..to_drop {
+                    let (_, done) = self.iterator_next_full(module, &source)?;
+                    if done {
+                        *iter.borrow_mut() = IteratorState::Exhausted;
+                        return Ok((Value::Undefined, true));
+                    }
+                }
+                if let IteratorState::Drop { to_drop, .. } = &mut *iter.borrow_mut() {
+                    *to_drop = 0;
+                }
+                let (v, done) = self.iterator_next_full(module, &source)?;
+                if done {
+                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    return Ok((Value::Undefined, true));
+                }
+                Ok((v, false))
+            }
+            IteratorStateSnapshot::FlatMap {
+                source,
+                mapper,
+                mut inner,
+            } => {
+                loop {
+                    if let Some(inner_iter) = inner.take() {
+                        let (v, done) = self.iterator_next_full(module, &inner_iter)?;
+                        if !done {
+                            // `inner_iter` remains the active inner
+                            // iterator for the next call; the FlatMap
+                            // slot still holds it.
+                            return Ok((v, false));
+                        }
+                        if let IteratorState::FlatMap { inner: slot, .. } = &mut *iter.borrow_mut()
+                        {
+                            *slot = None;
+                        }
+                    }
+                    let (v, done) = self.iterator_next_full(module, &source)?;
+                    if done {
+                        *iter.borrow_mut() = IteratorState::Exhausted;
+                        return Ok((Value::Undefined, true));
+                    }
+                    let mapped = self.run_callable_sync(
+                        module,
+                        &mapper,
+                        Value::Undefined,
+                        smallvec::smallvec![v],
+                    )?;
+                    let inner_state = match mapped {
+                        Value::Array(arr) => IteratorState::Array {
+                            array: arr,
+                            index: 0,
+                        },
+                        Value::Iterator(rc) => {
+                            let new_inner = rc.clone();
+                            if let IteratorState::FlatMap { inner: slot, .. } =
+                                &mut *iter.borrow_mut()
+                            {
+                                *slot = Some(new_inner.clone());
+                            }
+                            inner = Some(new_inner);
+                            continue;
+                        }
+                        other => return Ok((other, false)),
+                    };
+                    let new_inner = std::rc::Rc::new(std::cell::RefCell::new(inner_state));
+                    if let IteratorState::FlatMap { inner: slot, .. } = &mut *iter.borrow_mut() {
+                        *slot = Some(new_inner.clone());
+                    }
+                    inner = Some(new_inner);
+                }
+            }
+        }
+    }
+
+    /// Dispatch one of the §27.5 / iterator-helper-proposal methods
+    /// against a [`Value::Iterator`] receiver. Returns `Ok(true)`
+    /// when the call was handled (`dst` written, pc advanced) and
+    /// `Ok(false)` when the receiver does not expose `name`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/proposal-iterator-helpers/>
+    fn iterator_helper_dispatch(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        iter_rc: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        name: &str,
+        args: &SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<bool, VmError> {
+        // Lazy helpers wrap the source in a new IteratorState; the
+        // eager terminals drain via `iterator_next_full`.
+        let result = match name {
+            "map" => {
+                let mapper = require_callable(args.first())?;
+                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                    IteratorState::Map {
+                        source: iter_rc.clone(),
+                        mapper,
+                    },
+                )))
+            }
+            "filter" => {
+                let predicate = require_callable(args.first())?;
+                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                    IteratorState::Filter {
+                        source: iter_rc.clone(),
+                        predicate,
+                    },
+                )))
+            }
+            "take" => {
+                let n = take_drop_count(args.first())?;
+                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                    IteratorState::Take {
+                        source: iter_rc.clone(),
+                        remaining: n,
+                    },
+                )))
+            }
+            "drop" => {
+                let n = take_drop_count(args.first())?;
+                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                    IteratorState::Drop {
+                        source: iter_rc.clone(),
+                        to_drop: n,
+                    },
+                )))
+            }
+            "flatMap" => {
+                let mapper = require_callable(args.first())?;
+                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                    IteratorState::FlatMap {
+                        source: iter_rc.clone(),
+                        mapper,
+                        inner: None,
+                    },
+                )))
+            }
+            "toArray" => {
+                let collected = self.drain_iterator(module, iter_rc)?;
+                Value::Array(JsArray::from_elements(collected))
+            }
+            "forEach" => {
+                let callback = require_callable(args.first())?;
+                let collected = self.drain_iterator(module, iter_rc)?;
+                for v in collected {
+                    self.run_callable_sync(
+                        module,
+                        &callback,
+                        Value::Undefined,
+                        smallvec::smallvec![v],
+                    )?;
+                }
+                Value::Undefined
+            }
+            "reduce" => {
+                let reducer = require_callable(args.first())?;
+                let has_initial = args.len() >= 2;
+                let mut acc = if has_initial {
+                    args[1].clone()
+                } else {
+                    Value::Undefined
+                };
+                let collected = self.drain_iterator(module, iter_rc)?;
+                let mut iter = collected.into_iter();
+                if !has_initial {
+                    acc = match iter.next() {
+                        Some(v) => v,
+                        None => {
+                            // Spec §27.5.x — empty + no initial → TypeError.
+                            return Err(VmError::TypeMismatch);
+                        }
+                    };
+                }
+                for v in iter {
+                    acc = self.run_callable_sync(
+                        module,
+                        &reducer,
+                        Value::Undefined,
+                        smallvec::smallvec![acc, v],
+                    )?;
+                }
+                acc
+            }
+            _ => return Ok(false),
+        };
+        let top_idx = stack.len() - 1;
+        let frame = &mut stack[top_idx];
+        write_register(frame, dst, result)?;
+        frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        Ok(true)
+    }
+
+    fn drain_iterator(
+        &mut self,
+        module: &BytecodeModule,
+        iter_rc: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+    ) -> Result<Vec<Value>, VmError> {
+        let mut out = Vec::new();
+        loop {
+            let (v, done) = self.iterator_next_full(module, iter_rc)?;
+            if done {
+                return Ok(out);
+            }
+            out.push(v);
+        }
+    }
+
+    /// Resume a generator object — drives the saved frame on a
+    /// fresh sub-stack until either an [`otter_bytecode::Op::Yield`]
+    /// pauses it (returning `{value, done: false}`) or the body
+    /// runs to completion (returning `{value: returnValue,
+    /// done: true}`).
+    ///
+    /// `kind` selects the entry behaviour per §27.5.3:
+    /// - `Next(arg)`: write `arg` into the previous yield's dst
+    ///   and continue.
+    /// - `Return(arg)`: act as if the body executed `return arg;`
+    ///   from the current pc — foundation simplification: mark the
+    ///   generator done and surface `{value: arg, done: true}`
+    ///   without running additional finally blocks.
+    /// - `Throw(reason)`: re-enter the body and immediately throw
+    ///   `reason` from the current pc; finally / catch handlers
+    ///   take over per the unwind machinery.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-generator.prototype.next>
+    /// - <https://tc39.es/ecma262/#sec-generator.prototype.return>
+    /// - <https://tc39.es/ecma262/#sec-generator.prototype.throw>
+    pub fn resume_generator(
+        &mut self,
+        module: &BytecodeModule,
+        handle: &crate::generator::JsGenerator,
+        kind: GeneratorResumeKind,
+    ) -> Result<Value, VmError> {
+        // Already-done generators short-circuit per §27.5.1.2.
+        let (frame_opt, resume_dst) = {
+            let body = handle.borrow();
+            (body.frame.is_some(), body.resume_dst)
+        };
+        if !frame_opt {
+            return Ok(make_iter_result(Value::Undefined, true));
+        }
+        // Pull the frame out of the gen body so we can mutate it.
+        let mut frame = match handle.borrow_mut().frame.take() {
+            Some(f) => f,
+            None => return Ok(make_iter_result(Value::Undefined, true)),
+        };
+        // Apply the resume operation to the frame before re-entering
+        // dispatch.
+        let mut throw_value: Option<Value> = None;
+        match &kind {
+            GeneratorResumeKind::Next(arg) => {
+                if frame.pc != 0 {
+                    if let Some(slot) = frame.registers.get_mut(resume_dst as usize) {
+                        *slot = arg.clone();
+                    }
+                }
+            }
+            GeneratorResumeKind::Return(arg) => {
+                // Foundation: mark done and surface arg without
+                // running the body further.
+                handle.borrow_mut().done = true;
+                handle.borrow_mut().frame = None;
+                return Ok(make_iter_result(arg.clone(), true));
+            }
+            GeneratorResumeKind::Throw(reason) => {
+                throw_value = Some(reason.clone());
+            }
+        }
+        let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        sub_stack.push(frame);
+        if let Some(reason) = throw_value {
+            // Preserve the original throw value so the caller can
+            // re-raise it on the outer stack when the gen body
+            // does not catch it (the unwind_throw machinery
+            // converts the value to a string when it surfaces as
+            // VmError::Uncaught, losing the payload).
+            self.pending_generator_throw = Some(reason.clone());
+            match self.unwind_throw(&mut sub_stack, reason) {
+                Ok(_) => {}
+                Err(err) => {
+                    handle.borrow_mut().done = true;
+                    handle.borrow_mut().frame = None;
+                    return Err(err);
+                }
+            }
+            if sub_stack.is_empty() {
+                handle.borrow_mut().done = true;
+                handle.borrow_mut().frame = None;
+                return Err(VmError::Uncaught {
+                    value: "generator-throw".to_string(),
+                });
+            }
+            // A handler caught the throw — clear the side channel.
+            self.pending_generator_throw = None;
+        }
+        let is_async = handle.borrow().is_async;
+        let outcome = self.dispatch_loop(module, &mut sub_stack);
+        match outcome {
+            Ok(value) => {
+                // If a Yield fired, the gen body has the paused
+                // frame back; surface yielded_value as the result.
+                let yielded = handle.borrow_mut().yielded.take();
+                if let Some(v) = yielded {
+                    // Sync generators surface the iter result
+                    // through the return value; async generators
+                    // already settled `pending_request` from inside
+                    // `Op::Yield`.
+                    if is_async {
+                        return Ok(Value::Undefined);
+                    }
+                    return Ok(make_iter_result(v, false));
+                }
+                // Body ran to completion or `Op::Await` parked the
+                // frame. Distinguish by whether the gen still owns
+                // the frame: a parked await leaves the slot empty
+                // (the await microtask owns it) AND `sub_stack` is
+                // empty.
+                let frame_taken_by_await =
+                    handle.borrow().frame.is_some() || sub_stack.is_empty() && is_async;
+                let parked = is_async && handle.borrow().frame.is_none() && {
+                    // The await machinery stored the parked frame
+                    // in its closure, not on the gen handle. Detect
+                    // that case by checking if pending_request is
+                    // still set — if so, it's awaiting.
+                    handle.borrow().pending_request.is_some()
+                };
+                let _ = frame_taken_by_await;
+                if parked {
+                    // Body suspended on `Op::Await`; the resume
+                    // microtask will eventually settle
+                    // `pending_request`.
+                    return Ok(Value::Undefined);
+                }
+                // Body completed.
+                handle.borrow_mut().done = true;
+                handle.borrow_mut().frame = None;
+                if is_async {
+                    if let Some(req) = handle.borrow_mut().pending_request.take() {
+                        let record = make_iter_result(value, true);
+                        self.run_callable_sync(
+                            module,
+                            &req.resolve,
+                            Value::Undefined,
+                            smallvec::smallvec![record],
+                        )?;
+                    }
+                    return Ok(Value::Undefined);
+                }
+                Ok(make_iter_result(value, true))
+            }
+            Err(err) => {
+                handle.borrow_mut().done = true;
+                handle.borrow_mut().frame = None;
+                if is_async {
+                    // Pending request stays alive — the caller
+                    // (do_call_method_value) settles it on the
+                    // pending_generator_throw side-channel.
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// §28.2 — call a Proxy handler trap. When the trap is missing,
+    /// returns `Ok(None)` so the caller can fall through to the
+    /// target's behaviour. When the trap exists, invokes it with
+    /// `(target, ...trap_args)` (per spec each trap takes the
+    /// target as its first explicit argument; subsequent ones come
+    /// from `args`) and returns the result.
+    pub fn invoke_proxy_trap(
+        &mut self,
+        module: &BytecodeModule,
+        proxy: &crate::proxy::JsProxy,
+        trap: &str,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Option<Value>, VmError> {
+        if proxy.is_revoked() {
+            return Err(VmError::TypeMismatch);
+        }
+        let handler = proxy.handler();
+        let trap_fn = match handler.get(trap) {
+            Some(v) if abstract_ops::is_callable(&v) => v,
+            Some(Value::Undefined) | Some(Value::Null) | None => return Ok(None),
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let result = self.run_callable_sync(module, &trap_fn, Value::Object(handler), args)?;
+        Ok(Some(result))
     }
 
     fn dispatch_function_method(
@@ -5298,6 +6488,25 @@ impl Interpreter {
         let name = lookup_string_constant(module, name_idx)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        // §28.2.4.4 Proxy.[[Get]] — invoke the `get` trap when
+        // present; otherwise fall through to target.
+        if let Value::Proxy(p) = &receiver {
+            let proxy = p.clone();
+            let key_str = JsString::from_str(&name, &self.string_heap)?;
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(),
+                Value::String(key_str),
+                Value::Proxy(proxy.clone()),
+            ];
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            let result = match self.invoke_proxy_trap(module, &proxy, "get", trap_args)? {
+                Some(v) => v,
+                None => proxy.target_object().get(&name).unwrap_or(Value::Undefined),
+            };
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(true);
+        }
         let obj = match &receiver {
             Value::Object(o) => o.clone(),
             _ => return Ok(false),
@@ -5352,11 +6561,35 @@ impl Interpreter {
         let name = lookup_string_constant(module, name_idx)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        // §28.2.4.5 Proxy.[[Set]] — invoke the `set` trap when
+        // present; otherwise delegate to the target.
+        if let Value::Proxy(p) = &receiver {
+            let proxy = p.clone();
+            let key_str = JsString::from_str(&name, &self.string_heap)?;
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(),
+                Value::String(key_str),
+                value.clone(),
+                Value::Proxy(proxy.clone()),
+            ];
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.invoke_proxy_trap(module, &proxy, "set", trap_args)? {
+                Some(_) => { /* trap handled the write; spec ignores return value
+                    except for boolean-rejection — foundation accepts. */
+                }
+                None => {
+                    proxy.target_object().set(&name, value);
+                }
+            }
+            let _ = scratch_reg;
+            return Ok(true);
+        }
         let obj = match &receiver {
             Value::Object(o) => o.clone(),
             _ => return Ok(false),
         };
-        let value = read_register(&stack[top_idx], src_reg)?.clone();
         let outcome = obj.resolve_set(&name);
         match outcome {
             object::SetOutcome::AssignData => {
@@ -5385,6 +6618,147 @@ impl Interpreter {
                 Err(VmError::TypeMismatch)
             }
         }
+    }
+
+    /// §28.2.4.7 Proxy.[[HasProperty]] — invoke the `has` trap
+    /// when the rhs of `key in obj` is a Proxy. Returns
+    /// `Ok(true)` when the proxy path handled the op.
+    fn drive_has_property_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let lhs_reg = register_operand(operands.get(1))?;
+        let rhs_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let lhs = read_register(&stack[top_idx], lhs_reg)?.clone();
+        let rhs = read_register(&stack[top_idx], rhs_reg)?.clone();
+        let Value::Proxy(proxy) = rhs else {
+            return Ok(false);
+        };
+        let key_str = match &lhs {
+            Value::String(s) => s.clone(),
+            other => JsString::from_str(&other.display_string(), &self.string_heap)?,
+        };
+        let trap_args: SmallVec<[Value; 8]> =
+            smallvec::smallvec![proxy.target(), Value::String(key_str),];
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        let present = match self.invoke_proxy_trap(module, &proxy, "has", trap_args)? {
+            Some(v) => v.to_boolean(),
+            None => {
+                let key = match &lhs {
+                    Value::String(s) => s.to_lossy_string(),
+                    other => other.display_string(),
+                };
+                !matches!(
+                    proxy.target_object().lookup(&key),
+                    object::PropertyLookup::Absent
+                )
+            }
+        };
+        write_register(&mut stack[top_idx], dst, Value::Boolean(present))?;
+        Ok(true)
+    }
+
+    /// §28.2.4.10 Proxy.[[Delete]] — invoke the `deleteProperty`
+    /// trap when the receiver of `delete obj.x` is a Proxy.
+    fn drive_delete_property_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let obj_reg = register_operand(operands.get(1))?;
+        let name_idx = const_operand(operands.get(2))?;
+        let name = lookup_string_constant(module, name_idx)?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let Value::Proxy(proxy) = receiver else {
+            return Ok(false);
+        };
+        let key_str = JsString::from_str(&name, &self.string_heap)?;
+        let trap_args: SmallVec<[Value; 8]> =
+            smallvec::smallvec![proxy.target(), Value::String(key_str),];
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        let removed = match self.invoke_proxy_trap(module, &proxy, "deleteProperty", trap_args)? {
+            Some(v) => v.to_boolean(),
+            None => proxy.target_object().delete(&name),
+        };
+        write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
+        Ok(true)
+    }
+
+    /// §28.2.4.1 Proxy.[[GetPrototypeOf]] — invoke the
+    /// `getPrototypeOf` trap when the source is a Proxy.
+    fn drive_get_prototype_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let src = register_operand(operands.get(1))?;
+        let top_idx = stack.len() - 1;
+        let value = read_register(&stack[top_idx], src)?.clone();
+        let Value::Proxy(proxy) = value else {
+            return Ok(false);
+        };
+        let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        let result = match self.invoke_proxy_trap(module, &proxy, "getPrototypeOf", trap_args)? {
+            Some(v) => v,
+            None => match proxy.target_object().prototype() {
+                Some(p) => Value::Object(p),
+                None => Value::Null,
+            },
+        };
+        write_register(&mut stack[top_idx], dst, result)?;
+        Ok(true)
+    }
+
+    /// §28.2.4.2 Proxy.[[SetPrototypeOf]] — invoke the
+    /// `setPrototypeOf` trap when the receiver is a Proxy.
+    fn drive_set_prototype_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let obj_reg = register_operand(operands.first())?;
+        let proto_reg = register_operand(operands.get(1))?;
+        let top_idx = stack.len() - 1;
+        let recv = read_register(&stack[top_idx], obj_reg)?.clone();
+        let Value::Proxy(proxy) = recv else {
+            return Ok(false);
+        };
+        let proto_val = read_register(&stack[top_idx], proto_reg)?.clone();
+        let proto_obj = match &proto_val {
+            Value::Object(_) | Value::Null => proto_val.clone(),
+            Value::ClassConstructor(c) => Value::Object(c.statics.clone()),
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let trap_args: SmallVec<[Value; 8]> =
+            smallvec::smallvec![proxy.target(), proto_obj.clone()];
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        match self.invoke_proxy_trap(module, &proxy, "setPrototypeOf", trap_args)? {
+            Some(_) => {}
+            None => {
+                let proto = match proto_obj {
+                    Value::Object(p) => Some(p),
+                    Value::Null => None,
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                proxy.target_object().set_prototype(proto);
+            }
+        }
+        Ok(true)
     }
 
     /// Drive one tick of [`Op::GetIterator`] for user objects.
@@ -5531,6 +6905,49 @@ impl Interpreter {
         let Value::Iterator(iter_rc) = &iter_value else {
             return Err(VmError::TypeMismatch);
         };
+        // §27.5 generator-state path — drive the suspended body
+        // synchronously and write the unpacked `value` / `done`
+        // pair into the caller's destination registers.
+        let gen_handle = match &*iter_rc.borrow() {
+            IteratorState::Generator { handle } => Some(handle.clone()),
+            _ => None,
+        };
+        if let Some(handle) = gen_handle {
+            let result = self.resume_generator(
+                module,
+                &handle,
+                GeneratorResumeKind::Next(Value::Undefined),
+            )?;
+            let Value::Object(obj) = &result else {
+                return Err(VmError::TypeMismatch);
+            };
+            let value = obj.get("value").unwrap_or(Value::Undefined);
+            let done = obj.get("done").unwrap_or(Value::Undefined).to_boolean();
+            if done {
+                *iter_rc.borrow_mut() = IteratorState::Exhausted;
+            }
+            write_register(&mut stack[top_idx], value_dst, value)?;
+            write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(true);
+        }
+        // Helper-wrapper iterator states drive through the
+        // interpreter-aware step path so callbacks can run.
+        let needs_full_step = matches!(
+            &*iter_rc.borrow(),
+            IteratorState::Map { .. }
+                | IteratorState::Filter { .. }
+                | IteratorState::Take { .. }
+                | IteratorState::Drop { .. }
+                | IteratorState::FlatMap { .. }
+        );
+        if needs_full_step {
+            let (value, done) = self.iterator_next_full(module, iter_rc)?;
+            write_register(&mut stack[top_idx], value_dst, value)?;
+            write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(true);
+        }
         // Snapshot the user iterator object out of the inner
         // state so the borrow does not span the `invoke` call
         // below.
@@ -6457,6 +7874,201 @@ fn make_array_iterator_factory(array: JsArray) -> Value {
     })
 }
 
+/// Generator resume entry per ECMA-262 §27.5.3.
+#[derive(Debug, Clone)]
+pub enum GeneratorResumeKind {
+    /// `gen.next(arg)`.
+    Next(Value),
+    /// `gen.return(arg)` — foundation closes the generator without
+    /// running additional finally blocks.
+    Return(Value),
+    /// `gen.throw(reason)` — re-enters the body and unwinds.
+    Throw(Value),
+}
+
+/// Build an `IteratorResult { value, done }` plain object per
+/// §7.4.6 `CreateIterResultObject`.
+fn make_iter_result(value: Value, done: bool) -> Value {
+    let obj = JsObject::new();
+    obj.set("value", value);
+    obj.set("done", Value::Boolean(done));
+    Value::Object(obj)
+}
+
+/// Coerce a `new Proxy(target, ...)` first argument to a
+/// [`JsObject`]. Plain objects pass through; callables (Function /
+/// Closure / NativeFunction / BoundFunction / ClassConstructor)
+/// are wrapped in a fresh JsObject that stashes the callable in a
+/// hidden `__callable` slot so the apply / construct trap fallback
+/// can re-invoke it through `run_callable_sync`.
+fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
+    match arg {
+        Some(v @ Value::Object(_)) => Ok(v.clone()),
+        Some(v) if abstract_ops::is_callable(v) => Ok(v.clone()),
+        _ => Err(VmError::TypeMismatch),
+    }
+}
+
+/// §28.2 Proxy static dispatcher. Empty name = `new Proxy(target,
+/// handler)`; `"revocable"` = `Proxy.revocable(target, handler)`.
+fn proxy_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
+    match name {
+        // §28.2.1.1 — `new Proxy(target, handler)`. Target may be
+        // any object — including callables — wrapped here in a
+        // synthetic JsObject that carries the original value as
+        // `[[ProxyTarget]]`. Foundation simplification: use a
+        // dedicated `__callable` slot when the target is a
+        // function so the apply trap's fallback can re-invoke it.
+        "" => {
+            let target = coerce_proxy_target(args.first())?;
+            let handler = match args.get(1) {
+                Some(Value::Object(o)) => o.clone(),
+                _ => return Err(VmError::TypeMismatch),
+            };
+            Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
+        }
+        // §28.2.2.1 — `Proxy.revocable(target, handler)` returns
+        // `{proxy, revoke}`.
+        "revocable" => {
+            let target = coerce_proxy_target(args.first())?;
+            let handler = match args.get(1) {
+                Some(Value::Object(o)) => o.clone(),
+                _ => return Err(VmError::TypeMismatch),
+            };
+            let proxy = crate::proxy::JsProxy::new(target, handler);
+            let proxy_handle = proxy.clone();
+            let revoke = native_function::native_value("revoke", move |_, _| {
+                proxy_handle.revoke();
+                Ok(Value::Undefined)
+            });
+            let obj = JsObject::new();
+            obj.set("proxy", Value::Proxy(proxy));
+            obj.set("revoke", revoke);
+            Ok(Value::Object(obj))
+        }
+        other => Err(VmError::UnknownIntrinsic {
+            name: format!("Proxy.{other}"),
+        }),
+    }
+}
+
+/// Iterator-helpers proposal §sec-iterator.from — coerce any
+/// iterable / iterator-like value into a [`Value::Iterator`].
+///
+/// Foundation surface accepts `Array` / `String` / `Set` / `Map`
+/// (via their dense iteration form) and existing
+/// [`Value::Iterator`] handles directly. Non-iterable inputs raise
+/// a `TypeMismatch` (surfaced upstream as a `TypeError`).
+///
+/// # See also
+/// - <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
+fn iterator_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
+    match name {
+        // Reserved spec form — the constructor itself isn't
+        // user-callable.
+        "" => Err(VmError::TypeMismatch),
+        "from" => {
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let state = match value {
+                Value::Iterator(rc) => return Ok(Value::Iterator(rc)),
+                Value::Generator(handle) => IteratorState::Generator { handle },
+                Value::Array(arr) => IteratorState::Array {
+                    array: arr,
+                    index: 0,
+                },
+                Value::String(s) => IteratorState::String {
+                    string: s,
+                    index: 0,
+                },
+                Value::Set(s) => {
+                    let snap: SmallVec<[Value; 4]> = s.values().into_iter().collect();
+                    IteratorState::Array {
+                        array: JsArray::from_elements(snap),
+                        index: 0,
+                    }
+                }
+                Value::Map(m) => {
+                    let entries: Vec<Value> = m
+                        .entries()
+                        .into_iter()
+                        .map(|(k, v)| Value::Array(JsArray::from_elements([k, v])))
+                        .collect();
+                    IteratorState::Array {
+                        array: JsArray::from_elements(entries),
+                        index: 0,
+                    }
+                }
+                Value::Object(_) => {
+                    // Foundation: object-shaped iterables go through
+                    // the user-iterator protocol; the value handed in
+                    // is treated as the iterator object itself.
+                    IteratorState::User { iterator: value }
+                }
+                _ => return Err(VmError::TypeMismatch),
+            };
+            Ok(Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                state,
+            ))))
+        }
+        other => Err(VmError::UnknownIntrinsic {
+            name: format!("Iterator.{other}"),
+        }),
+    }
+}
+
+/// Cloned snapshot of an [`IteratorState`] taken before driving a
+/// helper callback so the borrow on `Rc<RefCell<IteratorState>>`
+/// does not span the dispatch.
+enum IteratorStateSnapshot {
+    User(Value),
+    Generator(crate::generator::JsGenerator),
+    Map {
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        mapper: Value,
+    },
+    Filter {
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        predicate: Value,
+    },
+    Take {
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        remaining: u64,
+    },
+    Drop {
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        to_drop: u64,
+    },
+    FlatMap {
+        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        mapper: Value,
+        inner: Option<std::rc::Rc<std::cell::RefCell<IteratorState>>>,
+    },
+}
+
+/// Coerce `take(n)` / `drop(n)` argument to a non-negative integer.
+/// Per the iterator-helpers proposal step 3, NaN / non-integer
+/// inputs raise a RangeError-equivalent (surfaced here as
+/// `TypeMismatch`).
+fn take_drop_count(arg: Option<&Value>) -> Result<u64, VmError> {
+    let n = match arg {
+        None | Some(Value::Undefined) => return Err(VmError::TypeMismatch),
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::Boolean(true)) => 1.0,
+        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
+        _ => return Err(VmError::TypeMismatch),
+    };
+    if n.is_nan() {
+        return Err(VmError::TypeMismatch);
+    }
+    if n.is_infinite() && n.is_sign_positive() {
+        return Ok(u64::MAX);
+    }
+    if n < 0.0 {
+        return Err(VmError::TypeMismatch);
+    }
+    Ok(n.trunc() as u64)
+}
+
 fn step_iterator(
     iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
     string_heap: &StringHeap,
@@ -6495,12 +8107,18 @@ fn step_iterator(
                 None
             }
         }
-        IteratorState::User { .. } => {
-            // The user-iterator protocol requires invoking
-            // `iter.next()` on each step, which mutates the
+        IteratorState::User { .. }
+        | IteratorState::Generator { .. }
+        | IteratorState::Map { .. }
+        | IteratorState::Filter { .. }
+        | IteratorState::Take { .. }
+        | IteratorState::Drop { .. }
+        | IteratorState::FlatMap { .. } => {
+            // The user-iterator + helper-wrapper protocols require
+            // invoking JS callbacks on each step, which mutates the
             // dispatch stack. The synchronous helper cannot push
-            // frames; the dispatcher must take the user path
-            // before reaching `step_iterator`.
+            // frames; the dispatcher must take the interpreter-aware
+            // path (`Interpreter::iterator_next_full`) instead.
             return Err(VmError::TypeMismatch);
         }
         IteratorState::Exhausted => None,
@@ -6640,6 +8258,44 @@ fn make_async_resume_native(
     })
 }
 
+/// Build a resume / reject native for `Op::Await` inside an
+/// async-generator body. The closure runs as a promise reaction;
+/// it enqueues a [`MicrotaskKind::AsyncGenResume`] task that the
+/// drain rebinds back into the gen body with module access.
+fn make_async_gen_resume_native(
+    parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>>,
+    await_dst: u16,
+    owner: crate::generator::JsGenerator,
+    fulfilled: bool,
+) -> Value {
+    let label = if fulfilled {
+        "async-gen await fulfill"
+    } else {
+        "async-gen await reject"
+    };
+    native_function::native_value(label, move |interp, args| {
+        let Some(frame) = parked_slot.take() else {
+            return Ok(Value::Undefined);
+        };
+        let value = args.first().cloned().unwrap_or(Value::Undefined);
+        let mut task_args: SmallVec<[Value; 4]> = SmallVec::new();
+        task_args.push(value);
+        interp.microtasks.enqueue(Microtask {
+            callee: Value::Undefined,
+            this_value: Value::Undefined,
+            args: task_args,
+            result_capability: None,
+            kind: MicrotaskKind::AsyncGenResume {
+                frame,
+                await_dst,
+                fulfilled,
+                owner: owner.clone(),
+            },
+        });
+        Ok(Value::Undefined)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6669,6 +8325,8 @@ mod tests {
                 is_arrow: false,
                 has_rest: false,
                 is_async: false,
+                is_generator: false,
+                is_async_generator: false,
                 is_module: false,
                 module_url: String::new(),
                 code,
@@ -6733,6 +8391,8 @@ mod tests {
             is_arrow: false,
             has_rest: false,
             is_async: false,
+            is_generator: false,
+            is_async_generator: false,
             is_module: false,
             module_url: String::new(),
             code: vec![Instruction {
@@ -6774,6 +8434,8 @@ mod tests {
             is_arrow: false,
             has_rest: false,
             is_async: false,
+            is_generator: false,
+            is_async_generator: false,
             is_module: false,
             module_url: String::new(),
             code: vec![Instruction {
@@ -6843,6 +8505,8 @@ mod tests {
             is_arrow: false,
             has_rest: false,
             is_async: false,
+            is_generator: false,
+            is_async_generator: false,
             is_module: false,
             module_url: String::new(),
             code: vec![Instruction {
@@ -6866,6 +8530,8 @@ mod tests {
             is_arrow: true,
             has_rest: false,
             is_async: false,
+            is_generator: false,
+            is_async_generator: false,
             is_module: false,
             module_url: String::new(),
             code: vec![

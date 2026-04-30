@@ -76,6 +76,14 @@ pub enum ErrorKind {
     /// constructor as a no-op subclass for backward compatibility.
     /// §20.5.5.1.
     EvalError,
+    /// `AggregateError` — wraps a collection of errors per ECMA-262
+    /// §20.5.7. Produced by [`Promise.any`](https://tc39.es/ecma262/#sec-promise.any)
+    /// when every input rejects, and exposed for direct
+    /// construction.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-aggregate-error-objects>
+    AggregateError,
 }
 
 impl ErrorKind {
@@ -93,6 +101,7 @@ impl ErrorKind {
             Self::ReferenceError => "ReferenceError",
             Self::URIError => "URIError",
             Self::EvalError => "EvalError",
+            Self::AggregateError => "AggregateError",
         }
     }
 
@@ -111,6 +120,7 @@ impl ErrorKind {
             "ReferenceError" => Some(Self::ReferenceError),
             "URIError" => Some(Self::URIError),
             "EvalError" => Some(Self::EvalError),
+            "AggregateError" => Some(Self::AggregateError),
             _ => None,
         }
     }
@@ -127,6 +137,7 @@ impl ErrorKind {
             Self::ReferenceError,
             Self::URIError,
             Self::EvalError,
+            Self::AggregateError,
         ]
     }
 }
@@ -159,6 +170,7 @@ pub struct ErrorClassRegistry {
     reference_error: ClassEntry,
     uri_error: ClassEntry,
     eval_error: ClassEntry,
+    aggregate_error: ClassEntry,
 }
 
 /// §20.5.3.4 Error.prototype.toString — single source of truth for
@@ -259,6 +271,7 @@ impl ErrorClassRegistry {
             ErrorKind::ReferenceError,
             ErrorKind::URIError,
             ErrorKind::EvalError,
+            ErrorKind::AggregateError,
         ] {
             let proto = JsObject::new();
             proto.set_prototype(Some(error_proto.clone()));
@@ -290,6 +303,7 @@ impl ErrorClassRegistry {
             reference_error: take(ErrorKind::ReferenceError),
             uri_error: take(ErrorKind::URIError),
             eval_error: take(ErrorKind::EvalError),
+            aggregate_error: take(ErrorKind::AggregateError),
         })
     }
 
@@ -302,6 +316,7 @@ impl ErrorClassRegistry {
             ErrorKind::ReferenceError => &self.reference_error,
             ErrorKind::URIError => &self.uri_error,
             ErrorKind::EvalError => &self.eval_error,
+            ErrorKind::AggregateError => &self.aggregate_error,
         }
     }
 
@@ -355,6 +370,25 @@ impl ErrorClassRegistry {
             let s = JsString::from_str(text, heap)?;
             obj.set("message", Value::String(s));
         }
+        Ok(obj)
+    }
+
+    /// §20.5.7.1 `AggregateError(errors, message?)` — allocate an
+    /// AggregateError with the supplied errors list attached as the
+    /// `errors` own property. The `errors` argument's elements are
+    /// shallow-copied into a fresh `JsArray`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-aggregate-error>
+    pub fn make_aggregate_instance(
+        &self,
+        errors: Vec<Value>,
+        message: Option<&str>,
+        heap: &StringHeap,
+    ) -> Result<JsObject, StringError> {
+        let obj = self.make_instance(ErrorKind::AggregateError, message, heap)?;
+        let arr = crate::array::JsArray::from_elements(errors);
+        obj.set("errors", Value::Array(arr));
         Ok(obj)
     }
 }

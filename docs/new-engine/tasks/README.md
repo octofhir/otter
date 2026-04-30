@@ -353,6 +353,27 @@ individual task files split out as work begins. Headlines:
 > ECMA-262 spec coverage is complete. Don't file or merge tasks for
 > them in this pool.
 
+### Test262 conformance
+
+A fresh task pool sliced out of the spec-gap audit's row 83. The §41
+audit landed every spec gap on the active stack — this pool turns
+the engine's surface into a published, regression-gated number
+against the official [`tc39/test262`](https://github.com/tc39/test262)
+corpus.
+
+| File | One-line goal |
+|---|---|
+| [100-test262-conformance.md](./100-test262-conformance.md) | Master plan — source acquisition, crate skeleton, execution model, outputs, CI, rollout. |
+| [101-test262-runner-skeleton.md](./101-test262-runner-skeleton.md) | New `crates-next/otter-test262` workspace member; `vendor/test262` submodule; walkdir traversal stub. |
+| [102-test262-harness-and-metadata.md](./102-test262-harness-and-metadata.md) | Frontmatter parser; harness preamble (`assert.js` / `sta.js` / `includes`); feature-readiness map. |
+| [103-test262-outcomes-and-negative.md](./103-test262-outcomes-and-negative.md) | Per-test driver; `Outcome` enum; negative-test inversion; heap cap + timeout + `catch_unwind`. |
+| [104-test262-baseline-and-diff.md](./104-test262-baseline-and-diff.md) | JSON + Markdown reports under `docs/new-engine/test262-baseline/`; sharding + merge; `--diff` regression detector. |
+| [105-test262-ci-integration.md](./105-test262-ci-integration.md) | GitHub Actions sweep + PR comment + regression gate; baseline-bump workflow. |
+
+> The legacy `51-test262-curated-subset.md` (curated subset against
+> the old `crates/otter-test262`) supersedes here — once 105 lands,
+> file a deletion task for 51.
+
 ### One-off cleanup follow-ups
 
 | File | One-line goal |

@@ -77,6 +77,48 @@ pub fn array_buffer_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
     }
 }
 
+/// Dispatch `new SharedArrayBuffer(length [, options])` per
+/// §25.2.1. Only the `maxByteLength` option (growable SAB) is
+/// honoured; arbitrary key options are ignored.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
+pub fn shared_array_buffer_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
+    match name {
+        "" => {
+            let length = match args.first() {
+                None | Some(Value::Undefined) => 0u64,
+                Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
+            };
+            let max_byte_length = match args.get(1) {
+                Some(Value::Object(opts)) => {
+                    if let Some(v) = opts.get("maxByteLength") {
+                        Some(to_index(&v).ok_or(VmError::TypeMismatch)?)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let len = length as usize;
+            let buf = match max_byte_length {
+                Some(max) => {
+                    let max = max as usize;
+                    if max < len {
+                        return Err(VmError::TypeMismatch);
+                    }
+                    JsArrayBuffer::new_shared_growable(len, max)
+                }
+                None => JsArrayBuffer::new_shared(len),
+            };
+            Ok(Value::ArrayBuffer(buf))
+        }
+        _ => Err(VmError::UnknownIntrinsic {
+            name: format!("SharedArrayBuffer.{name}"),
+        }),
+    }
+}
+
 // =========================================================================
 // DataView
 // =========================================================================

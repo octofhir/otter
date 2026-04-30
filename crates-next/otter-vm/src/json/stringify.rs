@@ -322,9 +322,38 @@ fn emit_value(
         | Value::WeakMap(_)
         | Value::WeakSet(_)
         | Value::Temporal(_)
-        | Value::Intl(_) => {
+        | Value::Intl(_)
+        | Value::ArrayBuffer(_)
+        | Value::DataView(_) => {
             out.push_str("null");
         }
+        // §25.5.2 — TypedArrays serialise like ordinary array-likes:
+        // their indexed elements emit as a JSON array. Spec §25.5.2.4
+        // SerializeJSONArray treats them through the array branch.
+        Value::TypedArray(ta) => {
+            if stack.len() >= MAX_NESTING_DEPTH {
+                return Err(JsonError::TooDeep {
+                    limit: MAX_NESTING_DEPTH,
+                });
+            }
+            // Snapshot to a transient JsArray so the existing array
+            // walker handles separators uniformly.
+            let snapshot: Vec<Value> = (0..ta.length()).map(|i| ta.get(i)).collect();
+            let arr = crate::array::JsArray::from_elements(snapshot);
+            out.push('[');
+            stack.push(Frame::Array {
+                arr,
+                idx: 0,
+                had_member: false,
+            });
+        }
+        // §25.5.2 Date — emit the ISO-8601 representation as a JSON
+        // string, mirroring `Date.prototype.toJSON`.
+        // <https://tc39.es/ecma262/#sec-date.prototype.tojson>
+        Value::Date(d) => match crate::date::to_iso_string(d.time()) {
+            Some(s) => write_string_literal(out, &s),
+            None => out.push_str("null"),
+        },
     }
     let _ = options;
     Ok(())

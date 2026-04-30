@@ -22,12 +22,27 @@
 use crate::Value;
 use crate::number::{NumberValue, bitwise};
 
-/// Foundation `Math` constants. Each constant is a static `f64` so
-/// the compiler can also fold them at intern time later if it
-/// wants to skip the runtime hop.
+/// Foundation `Math` constants per ECMA-262 §21.3.1. Each constant
+/// is a static `f64` so the compiler can fold them at intern time
+/// when it wants to skip the runtime hop.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-value-properties-of-the-math-object>
 pub const PI: f64 = std::f64::consts::PI;
 /// Base of the natural logarithm.
 pub const E: f64 = std::f64::consts::E;
+/// Natural logarithm of 2.
+pub const LN2: f64 = std::f64::consts::LN_2;
+/// Natural logarithm of 10.
+pub const LN10: f64 = std::f64::consts::LN_10;
+/// Base-2 logarithm of `e`.
+pub const LOG2E: f64 = std::f64::consts::LOG2_E;
+/// Base-10 logarithm of `e`.
+pub const LOG10E: f64 = std::f64::consts::LOG10_E;
+/// Square root of 0.5.
+pub const SQRT1_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
+/// Square root of 2.
+pub const SQRT2: f64 = std::f64::consts::SQRT_2;
 
 /// Failure modes for [`call`].
 #[derive(Debug, Clone, thiserror::Error)]
@@ -53,11 +68,18 @@ pub enum MathError {
 /// a uniform `UnknownMember` diagnostic.
 #[must_use]
 pub fn load_constant(name: &str) -> Option<Value> {
-    match name {
-        "PI" => Some(Value::Number(NumberValue::from_f64(PI))),
-        "E" => Some(Value::Number(NumberValue::from_f64(E))),
-        _ => None,
-    }
+    let v = match name {
+        "PI" => PI,
+        "E" => E,
+        "LN2" => LN2,
+        "LN10" => LN10,
+        "LOG2E" => LOG2E,
+        "LOG10E" => LOG10E,
+        "SQRT1_2" => SQRT1_2,
+        "SQRT2" => SQRT2,
+        _ => return None,
+    };
+    Some(Value::Number(NumberValue::from_f64(v)))
 }
 
 /// Dispatch a `Math.<name>(args...)` call. Returns the result
@@ -181,6 +203,187 @@ fn impl_max(args: &[NumberValue]) -> NumberValue {
     NumberValue::Double(current).canonicalize()
 }
 
+/// §21.3.2 — wrap a unary `f64 → f64` into a Math function impl.
+fn unary(args: &[NumberValue], f: fn(f64) -> f64) -> NumberValue {
+    NumberValue::Double(f(first_or_nan(args).as_f64())).canonicalize()
+}
+
+fn impl_log(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::ln)
+}
+fn impl_log2(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::log2)
+}
+fn impl_log10(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::log10)
+}
+fn impl_log1p(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::ln_1p)
+}
+fn impl_exp(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::exp)
+}
+fn impl_expm1(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::exp_m1)
+}
+fn impl_sin(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::sin)
+}
+fn impl_cos(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::cos)
+}
+fn impl_tan(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::tan)
+}
+fn impl_asin(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::asin)
+}
+fn impl_acos(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::acos)
+}
+fn impl_atan(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::atan)
+}
+fn impl_sinh(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::sinh)
+}
+fn impl_cosh(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::cosh)
+}
+fn impl_tanh(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::tanh)
+}
+fn impl_asinh(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::asinh)
+}
+fn impl_acosh(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::acosh)
+}
+fn impl_atanh(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::atanh)
+}
+fn impl_cbrt(args: &[NumberValue]) -> NumberValue {
+    unary(args, f64::cbrt)
+}
+fn impl_fround(args: &[NumberValue]) -> NumberValue {
+    NumberValue::Double(first_or_nan(args).as_f64() as f32 as f64).canonicalize()
+}
+
+/// §21.3.2.2 Math.atan2(y, x).
+fn impl_atan2(args: &[NumberValue]) -> NumberValue {
+    let y = args
+        .first()
+        .copied()
+        .unwrap_or(NumberValue::Double(f64::NAN))
+        .as_f64();
+    let x = args
+        .get(1)
+        .copied()
+        .unwrap_or(NumberValue::Double(f64::NAN))
+        .as_f64();
+    NumberValue::Double(y.atan2(x)).canonicalize()
+}
+
+/// §21.3.2.18 Math.hypot(...args).
+fn impl_hypot(args: &[NumberValue]) -> NumberValue {
+    if args.is_empty() {
+        return NumberValue::Smi(0);
+    }
+    let mut sum_sq = 0.0f64;
+    let mut any_nan = false;
+    let mut any_inf = false;
+    for v in args {
+        let f = v.as_f64();
+        if f.is_nan() {
+            any_nan = true;
+        } else if f.is_infinite() {
+            any_inf = true;
+        } else {
+            sum_sq += f * f;
+        }
+    }
+    let result = if any_inf {
+        f64::INFINITY
+    } else if any_nan {
+        f64::NAN
+    } else {
+        sum_sq.sqrt()
+    };
+    NumberValue::Double(result).canonicalize()
+}
+
+/// §21.3.2.30 Math.sign(x).
+fn impl_sign(args: &[NumberValue]) -> NumberValue {
+    let f = first_or_nan(args).as_f64();
+    if f.is_nan() {
+        NumberValue::Double(f64::NAN)
+    } else if f == 0.0 {
+        // Preserve `±0` per spec — return the same zero shape.
+        NumberValue::Double(f).canonicalize()
+    } else if f > 0.0 {
+        NumberValue::Smi(1)
+    } else {
+        NumberValue::Smi(-1)
+    }
+}
+
+/// §21.3.2.5 Math.clz32(x) — count leading zeros after ToUint32.
+fn impl_clz32(args: &[NumberValue]) -> NumberValue {
+    let f = first_or_nan(args).as_f64();
+    if !f.is_finite() {
+        return NumberValue::Smi(32);
+    }
+    let n = (f as i64) as u32;
+    NumberValue::Smi(n.leading_zeros() as i32)
+}
+
+/// §21.3.2.20 Math.imul(a, b) — 32-bit integer multiplication.
+fn impl_imul(args: &[NumberValue]) -> NumberValue {
+    let a = args
+        .first()
+        .copied()
+        .unwrap_or(NumberValue::Double(f64::NAN))
+        .as_f64();
+    let b = args
+        .get(1)
+        .copied()
+        .unwrap_or(NumberValue::Double(f64::NAN))
+        .as_f64();
+    let ai = if a.is_finite() { a as i64 as i32 } else { 0 };
+    let bi = if b.is_finite() { b as i64 as i32 } else { 0 };
+    NumberValue::Smi(ai.wrapping_mul(bi))
+}
+
+/// §21.3.2.27 Math.random() — non-cryptographic pseudo-random.
+/// Uses a thread-local linear-congruential generator seeded from
+/// the system clock so foundation runs are reproducible inside a
+/// single VM but vary across processes.
+fn impl_random(_args: &[NumberValue]) -> NumberValue {
+    use std::cell::Cell;
+    thread_local! {
+        static SEED: Cell<u64> = Cell::new({
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0xDEADBEEFu64);
+            now | 1
+        });
+    }
+    SEED.with(|cell| {
+        let mut s = cell.get();
+        // SplitMix64 step.
+        s = s.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        cell.set(s);
+        // Map upper 53 bits into `[0, 1)`.
+        let bits = (z >> 11) as f64 / (1u64 << 53) as f64;
+        NumberValue::Double(bits)
+    })
+}
+
 fn first_or_nan(args: &[NumberValue]) -> NumberValue {
     args.first()
         .copied()
@@ -223,6 +426,110 @@ const FUNCTIONS: &[MathFn] = &[
     MathFn {
         name: "max",
         impl_fn: impl_max,
+    },
+    MathFn {
+        name: "log",
+        impl_fn: impl_log,
+    },
+    MathFn {
+        name: "log2",
+        impl_fn: impl_log2,
+    },
+    MathFn {
+        name: "log10",
+        impl_fn: impl_log10,
+    },
+    MathFn {
+        name: "log1p",
+        impl_fn: impl_log1p,
+    },
+    MathFn {
+        name: "exp",
+        impl_fn: impl_exp,
+    },
+    MathFn {
+        name: "expm1",
+        impl_fn: impl_expm1,
+    },
+    MathFn {
+        name: "sin",
+        impl_fn: impl_sin,
+    },
+    MathFn {
+        name: "cos",
+        impl_fn: impl_cos,
+    },
+    MathFn {
+        name: "tan",
+        impl_fn: impl_tan,
+    },
+    MathFn {
+        name: "asin",
+        impl_fn: impl_asin,
+    },
+    MathFn {
+        name: "acos",
+        impl_fn: impl_acos,
+    },
+    MathFn {
+        name: "atan",
+        impl_fn: impl_atan,
+    },
+    MathFn {
+        name: "atan2",
+        impl_fn: impl_atan2,
+    },
+    MathFn {
+        name: "sinh",
+        impl_fn: impl_sinh,
+    },
+    MathFn {
+        name: "cosh",
+        impl_fn: impl_cosh,
+    },
+    MathFn {
+        name: "tanh",
+        impl_fn: impl_tanh,
+    },
+    MathFn {
+        name: "asinh",
+        impl_fn: impl_asinh,
+    },
+    MathFn {
+        name: "acosh",
+        impl_fn: impl_acosh,
+    },
+    MathFn {
+        name: "atanh",
+        impl_fn: impl_atanh,
+    },
+    MathFn {
+        name: "cbrt",
+        impl_fn: impl_cbrt,
+    },
+    MathFn {
+        name: "fround",
+        impl_fn: impl_fround,
+    },
+    MathFn {
+        name: "hypot",
+        impl_fn: impl_hypot,
+    },
+    MathFn {
+        name: "sign",
+        impl_fn: impl_sign,
+    },
+    MathFn {
+        name: "clz32",
+        impl_fn: impl_clz32,
+    },
+    MathFn {
+        name: "imul",
+        impl_fn: impl_imul,
+    },
+    MathFn {
+        name: "random",
+        impl_fn: impl_random,
     },
 ];
 

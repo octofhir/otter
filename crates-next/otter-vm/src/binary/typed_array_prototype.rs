@@ -1,0 +1,579 @@
+//! `%TypedArray%.prototype.<name>` per ECMA-262 §23.2.3.
+//!
+//! All eleven concrete `TypedArray` constructors share one prototype
+//! at the spec level; the runtime models that with a single
+//! [`IntrinsicReceiver::TypedArray`] table whose impls read the
+//! receiver's [`crate::binary::TypedArrayKind`] off the value to pick
+//! element-type-specific behaviour.
+//!
+//! Callback-driven methods (`map`, `filter`, `forEach`, `every`,
+//! `some`, `find*`, `reduce*`, `sort` with comparator) live in the
+//! interpreter's `typed_array_callback_dispatch` because they need
+//! access to the engine to drive synchronous callbacks. This module
+//! covers the pure-functional surface.
+//!
+//! # See also
+//! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
+
+use crate::Value;
+use crate::array::JsArray;
+use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+
+use super::array_buffer::JsArrayBuffer;
+use super::typed_array::{JsTypedArray, TypedArrayKind};
+use super::{number_value, smi};
+
+fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsTypedArray, IntrinsicError> {
+    match args.receiver {
+        Value::TypedArray(t) => Ok(t.clone()),
+        _ => Err(IntrinsicError::BadReceiver {
+            expected: "typedarray",
+        }),
+    }
+}
+
+fn check_not_detached(t: &JsTypedArray) -> Result<(), IntrinsicError> {
+    if t.buffer().is_detached() {
+        return Err(IntrinsicError::BadReceiver {
+            expected: "non-detached typedarray",
+        });
+    }
+    Ok(())
+}
+
+/// §22.1.3.27 / §23.2.3.34 helper — clamp a relative integer to
+/// `[0, len]` per §7.1.5 ToIntegerOrInfinity then offset-from-end
+/// for negative values.
+fn relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
+    let n = match arg {
+        None | Some(Value::Undefined) => return default,
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::Boolean(true)) => 1.0,
+        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
+        _ => return default,
+    };
+    if n.is_nan() {
+        return 0;
+    }
+    if !n.is_finite() {
+        return if n.is_sign_positive() { len } else { 0 };
+    }
+    let truncated = n.trunc() as i64;
+    if truncated < 0 {
+        (len + truncated).max(0)
+    } else {
+        truncated.min(len)
+    }
+}
+
+fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
+    let n = match arg {
+        None | Some(Value::Undefined) => return default,
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::Boolean(true)) => 1.0,
+        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
+        _ => return default,
+    };
+    if n.is_nan() {
+        return 0;
+    }
+    if !n.is_finite() {
+        return if n.is_sign_positive() {
+            i64::MAX
+        } else {
+            i64::MIN
+        };
+    }
+    n.trunc() as i64
+}
+
+fn copy_view(t: &JsTypedArray) -> Vec<Value> {
+    (0..t.length()).map(|i| t.get(i)).collect()
+}
+
+fn build_subarray(t: &JsTypedArray, start: usize, len: usize) -> Value {
+    let bpe = t.kind().bytes_per_element();
+    Value::TypedArray(JsTypedArray::new(
+        t.buffer().clone(),
+        t.kind(),
+        t.byte_offset() + start * bpe,
+        len,
+    ))
+}
+
+fn build_new_typed_array(kind: TypedArrayKind, values: &[Value]) -> Value {
+    let bpe = kind.bytes_per_element();
+    let buf = JsArrayBuffer::new(values.len() * bpe);
+    let view = JsTypedArray::new(buf, kind, 0, values.len());
+    for (i, v) in values.iter().enumerate() {
+        view.set(i, v);
+    }
+    Value::TypedArray(view)
+}
+
+// ---- pure-functional methods --------------------------------------------
+
+fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    let idx = match args.args.first() {
+        Some(Value::Number(n)) => {
+            let f = n.as_f64();
+            if !f.is_finite() {
+                return Ok(Value::Undefined);
+            }
+            f.trunc() as i64
+        }
+        _ => 0,
+    };
+    let resolved = if idx < 0 { len + idx } else { idx };
+    if resolved < 0 || resolved >= len {
+        return Ok(Value::Undefined);
+    }
+    Ok(t.get(resolved as usize))
+}
+
+fn impl_subarray(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    let len = t.length() as i64;
+    let start = relative_index(args.args.first(), 0, len);
+    let end = relative_index(args.args.get(1), len, len);
+    let final_start = start.clamp(0, len) as usize;
+    let final_end = end.clamp(start, len) as usize;
+    let new_len = final_end.saturating_sub(final_start);
+    Ok(build_subarray(&t, final_start, new_len))
+}
+
+fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    let start = relative_index(args.args.first(), 0, len);
+    let end = relative_index(args.args.get(1), len, len);
+    let final_start = start.clamp(0, len) as usize;
+    let final_end = end.clamp(start, len) as usize;
+    let new_len = final_end.saturating_sub(final_start);
+    let bpe = t.kind().bytes_per_element();
+    let new_buf = JsArrayBuffer::new(new_len * bpe);
+    {
+        let src = t.buffer().borrow_bytes();
+        let mut dst = new_buf.borrow_bytes_mut();
+        let abs_offset = t.byte_offset() + final_start * bpe;
+        dst.copy_from_slice(&src[abs_offset..abs_offset + new_len * bpe]);
+    }
+    Ok(Value::TypedArray(JsTypedArray::new(
+        new_buf,
+        t.kind(),
+        0,
+        new_len,
+    )))
+}
+
+fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    let value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    if t.kind().is_bigint() && !matches!(&value, Value::BigInt(_)) {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a BigInt",
+        });
+    }
+    if !t.kind().is_bigint() && matches!(&value, Value::BigInt(_)) {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a Number",
+        });
+    }
+    let start = relative_index(args.args.get(1), 0, len);
+    let end = relative_index(args.args.get(2), len, len);
+    let s = start.clamp(0, len) as usize;
+    let e = end.clamp(start, len) as usize;
+    for i in s..e {
+        t.set(i, &value);
+    }
+    Ok(Value::TypedArray(t))
+}
+
+fn impl_copy_within(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    let target = relative_index(args.args.first(), 0, len);
+    let start = relative_index(args.args.get(1), 0, len);
+    let end = relative_index(args.args.get(2), len, len);
+    let to = target.clamp(0, len);
+    let from = start.clamp(0, len);
+    let final_end = end.clamp(start, len);
+    let count = (final_end - from).min(len - to).max(0) as usize;
+    if count == 0 {
+        return Ok(Value::TypedArray(t));
+    }
+    // Memmove by raw bytes through the backing buffer to handle
+    // overlap correctly.
+    let bpe = t.kind().bytes_per_element();
+    let mut buf = t.buffer().borrow_bytes_mut();
+    let src_off = t.byte_offset() + from as usize * bpe;
+    let dst_off = t.byte_offset() + to as usize * bpe;
+    let byte_count = count * bpe;
+    buf.copy_within(src_off..src_off + byte_count, dst_off);
+    Ok(Value::TypedArray(t.clone()))
+}
+
+fn impl_reverse(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length();
+    if len > 1 {
+        let mut i = 0usize;
+        let mut j = len - 1;
+        while i < j {
+            let a = t.get(i);
+            let b = t.get(j);
+            t.set(i, &b);
+            t.set(j, &a);
+            i += 1;
+            j -= 1;
+        }
+    }
+    Ok(Value::TypedArray(t))
+}
+
+fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    if len == 0 {
+        return Ok(smi(-1));
+    }
+    let target = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let start = integer_arg(args.args.get(1), 0);
+    let from = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start.min(len)
+    } as usize;
+    for i in from..(len as usize) {
+        if values_equal_strict(&t.get(i), &target) {
+            return Ok(smi(i as i32));
+        }
+    }
+    Ok(smi(-1))
+}
+
+fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    if len == 0 {
+        return Ok(smi(-1));
+    }
+    let target = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let start = integer_arg(args.args.get(1), len - 1);
+    let from = if start < 0 {
+        (len + start).max(-1)
+    } else {
+        start.min(len - 1)
+    };
+    let mut i = from;
+    while i >= 0 {
+        if values_equal_strict(&t.get(i as usize), &target) {
+            return Ok(smi(i as i32));
+        }
+        i -= 1;
+    }
+    Ok(smi(-1))
+}
+
+fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    let target = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let start = integer_arg(args.args.get(1), 0);
+    let from = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start.min(len)
+    } as usize;
+    for i in from..(len as usize) {
+        if values_equal_zero(&t.get(i), &target) {
+            return Ok(Value::Boolean(true));
+        }
+    }
+    Ok(Value::Boolean(false))
+}
+
+fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let separator = match args.args.first() {
+        None | Some(Value::Undefined) => ",".to_string(),
+        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(other) => other.display_string(),
+    };
+    let mut out = String::new();
+    let len = t.length();
+    for i in 0..len {
+        if i > 0 {
+            out.push_str(&separator);
+        }
+        let v = t.get(i);
+        match &v {
+            Value::Undefined | Value::Null => {}
+            other => out.push_str(&other.display_string()),
+        }
+    }
+    Ok(Value::String(JsString::from_str(&out, args.string_heap)?))
+}
+
+fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    impl_join(&IntrinsicArgs {
+        receiver: args.receiver,
+        args: &[],
+        string_heap: args.string_heap,
+    })
+}
+
+fn impl_to_locale_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    // Foundation simplification: locale-aware rendering deferred to
+    // Intl integration. Falls through to `toString`.
+    impl_to_string(args)
+}
+
+fn impl_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let offset = integer_arg(args.args.get(1), 0);
+    if offset < 0 {
+        return Err(IntrinsicError::BadArgument {
+            index: 1,
+            reason: "must be non-negative",
+        });
+    }
+    let off = offset as usize;
+    let source = args.args.first().cloned().unwrap_or(Value::Undefined);
+    match source {
+        Value::TypedArray(src) => {
+            let src_len = src.length();
+            if off + src_len > t.length() {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "source overruns destination",
+                });
+            }
+            // Snapshot first to handle aliasing of the same buffer.
+            let snapshot: Vec<Value> = (0..src_len).map(|i| src.get(i)).collect();
+            for (i, v) in snapshot.iter().enumerate() {
+                t.set(off + i, v);
+            }
+        }
+        Value::Array(arr) => {
+            let src_len = arr.len();
+            if off + src_len > t.length() {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "source overruns destination",
+                });
+            }
+            for i in 0..src_len {
+                t.set(off + i, &arr.get(i));
+            }
+        }
+        _ => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a TypedArray or array-like",
+            });
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn impl_to_reversed(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let mut snapshot = copy_view(&t);
+    snapshot.reverse();
+    Ok(build_new_typed_array(t.kind(), &snapshot))
+}
+
+fn impl_to_sorted_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let mut snapshot = copy_view(&t);
+    sort_default(&mut snapshot, t.kind().is_bigint());
+    Ok(build_new_typed_array(t.kind(), &snapshot))
+}
+
+fn impl_sort_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let mut snapshot = copy_view(&t);
+    sort_default(&mut snapshot, t.kind().is_bigint());
+    for (i, v) in snapshot.iter().enumerate() {
+        t.set(i, v);
+    }
+    Ok(Value::TypedArray(t))
+}
+
+fn impl_with(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length() as i64;
+    let raw_idx = integer_arg(args.args.first(), 0);
+    let resolved = if raw_idx < 0 { len + raw_idx } else { raw_idx };
+    if resolved < 0 || resolved >= len {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "index out of range",
+        });
+    }
+    let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let mut snapshot = copy_view(&t);
+    snapshot[resolved as usize] = value;
+    Ok(build_new_typed_array(t.kind(), &snapshot))
+}
+
+fn impl_keys(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length();
+    let arr = JsArray::from_elements((0..len).map(|i| smi(i as i32)));
+    Ok(Value::Array(arr))
+}
+
+fn impl_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    Ok(Value::Array(JsArray::from_elements(copy_view(&t))))
+}
+
+fn impl_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    let len = t.length();
+    let entries: Vec<Value> = (0..len)
+        .map(|i| Value::Array(JsArray::from_elements([smi(i as i32), t.get(i)])))
+        .collect();
+    Ok(Value::Array(JsArray::from_elements(entries)))
+}
+
+// ---- comparison helpers -------------------------------------------------
+
+fn values_equal_strict(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => crate::number::equals(*x, *y),
+        (Value::BigInt(x), Value::BigInt(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// SameValueZero — like strict equality but `NaN === NaN`.
+fn values_equal_zero(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            if x.is_nan() && y.is_nan() {
+                return true;
+            }
+            crate::number::equals(*x, *y)
+        }
+        (Value::BigInt(x), Value::BigInt(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Default sort: numeric ascending for number kinds, BigInt
+/// ascending for BigInt kinds. Per §23.2.3.30 step 4.
+fn sort_default(values: &mut [Value], bigint_kind: bool) {
+    if bigint_kind {
+        values.sort_by(|a, b| match (a, b) {
+            (Value::BigInt(x), Value::BigInt(y)) => x.as_inner().cmp(y.as_inner()),
+            _ => std::cmp::Ordering::Equal,
+        });
+    } else {
+        values.sort_by(|a, b| {
+            let x = match a {
+                Value::Number(n) => n.as_f64(),
+                _ => 0.0,
+            };
+            let y = match b {
+                Value::Number(n) => n.as_f64(),
+                _ => 0.0,
+            };
+            // NaN sorts to the end per spec; also handles ±0 equal.
+            match (x.is_nan(), y.is_nan()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
+    }
+}
+
+// ---- registration -------------------------------------------------------
+
+/// `%TypedArray%.prototype` table.
+pub static TYPED_ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
+    std::sync::LazyLock::new(|| {
+        crate::intrinsics!(
+            TypedArray,
+            "at"               / 1 => impl_at,
+            "subarray"         / 2 => impl_subarray,
+            "slice"            / 2 => impl_slice,
+            "fill"             / 3 => impl_fill,
+            "copyWithin"       / 3 => impl_copy_within,
+            "reverse"          / 0 => impl_reverse,
+            "indexOf"          / 2 => impl_index_of,
+            "lastIndexOf"      / 2 => impl_last_index_of,
+            "includes"         / 2 => impl_includes,
+            "join"             / 1 => impl_join,
+            "toString"         / 0 => impl_to_string,
+            "toLocaleString"   / 0 => impl_to_locale_string,
+            "set"              / 2 => impl_set,
+            "toReversed"       / 0 => impl_to_reversed,
+            "toSorted"         / 1 => impl_to_sorted_default,
+            "sort"             / 1 => impl_sort_default,
+            "with"             / 2 => impl_with,
+            "keys"             / 0 => impl_keys,
+            "values"           / 0 => impl_values,
+            "entries"          / 0 => impl_entries,
+        )
+    });
+
+/// Convenience accessor.
+#[must_use]
+pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
+    TYPED_ARRAY_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::TypedArray, name)
+}
+
+/// `%TypedArray%.prototype` getter access for `buffer`, `byteLength`,
+/// `byteOffset`, `length`, `BYTES_PER_ELEMENT`, and `Symbol.toStringTag`.
+/// Routed through `Op::LoadProperty`. `BYTES_PER_ELEMENT` is reported as
+/// the receiver's kind value per §23.2.5 step 1.
+#[must_use]
+pub fn load_property(t: &JsTypedArray, name: &str) -> Value {
+    match name {
+        "buffer" => Value::ArrayBuffer(t.buffer().clone()),
+        "byteLength" => smi(t.byte_length() as i32),
+        "byteOffset" => smi(t.byte_offset() as i32),
+        "length" => smi(t.length() as i32),
+        "BYTES_PER_ELEMENT" => smi(t.kind().bytes_per_element() as i32),
+        _ => {
+            let _ = number_value;
+            Value::Undefined
+        }
+    }
+}
+
+/// Build a fresh TypedArray of `kind` containing `values`. Used by
+/// `Array.from` / `from` / `of` paths and by the no-callback subset
+/// of the prototype.
+#[must_use]
+pub fn from_values(kind: TypedArrayKind, values: &[Value]) -> Value {
+    build_new_typed_array(kind, values)
+}

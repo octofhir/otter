@@ -114,7 +114,7 @@ straight to `temporal_rs` so the runtime needs no global object;
 component accessors flow through `Op::LoadProperty`; ISO calendar
 + host time-zone supported, non-ISO calendars / `ZonedDateTime` /
 `PlainYearMonth` / `PlainMonthDay` filed as follow-ups.
-**277/277 engine fixtures pass.**
+**286/286 engine fixtures pass.**
 
 The §7.2 type-check abstract operations have shipped as canonical
 helpers (task 43): `same_value` / `same_value_zero` /

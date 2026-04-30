@@ -56,6 +56,16 @@ pub enum IntrinsicReceiver {
     /// `Number.prototype.<name>`. Receiver is a `Value::Number`
     /// (added in slice 11).
     Number,
+    /// `BigInt.prototype.<name>`. Receiver is a `Value::BigInt`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-properties-of-the-bigint-prototype-object>
+    BigInt,
+    /// `Date.prototype.<name>`. Receiver is a [`crate::Value::Date`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-properties-of-the-date-prototype-object>
+    Date,
     /// `Boolean.prototype.<name>`. Receiver is a `Value::Boolean`
     /// (added in slice 12).
     Boolean,
@@ -108,6 +118,25 @@ pub enum IntrinsicReceiver {
     /// # See also
     /// - <https://tc39.es/ecma402/>
     Intl,
+    /// `ArrayBuffer.prototype.<name>`. Receiver is a
+    /// [`crate::Value::ArrayBuffer`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-properties-of-the-arraybuffer-prototype-object>
+    ArrayBuffer,
+    /// `DataView.prototype.<name>`. Receiver is a
+    /// [`crate::Value::DataView`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-properties-of-the-dataview-prototype-object>
+    DataView,
+    /// `%TypedArray%.prototype.<name>`. Receiver is a
+    /// [`crate::Value::TypedArray`]; the implementation reads the
+    /// receiver's [`crate::binary::TypedArrayKind`] to specialise.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
+    TypedArray,
 }
 
 /// Borrowed call frame for an intrinsic.

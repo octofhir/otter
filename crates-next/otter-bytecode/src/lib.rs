@@ -77,7 +77,7 @@ pub enum Op {
     LoadBigInt,
     /// `r<dst> = constants[k<idx>]` (RegExp constant). The constant
     /// carries the WTF-16 pattern body and the ASCII flag string
-    /// (`"gimsuy"` subset). The runtime compiles the regex once at
+    /// (`"dgimsuvy"` subset). The runtime compiles the regex once at
     /// load time; subsequent loads of the same constant share the
     /// compiled engine via the constant pool slot.
     LoadRegExp,
@@ -707,6 +707,43 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     LoadBuiltinError,
+    /// `r<dst> = String(args...)` / `String.<name>(args...)`.
+    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Variadic. Empty `name` (sentinel) selects the constructor
+    /// form (coerces argument via §7.1.17 ToString); otherwise the
+    /// runtime dispatches `fromCharCode` / `fromCodePoint` via
+    /// [`crate::string_dispatch::call`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-string-constructor>
+    StringCall,
+
+    /// `r<dst> = new Date(args...)` / `Date.<name>(args...)`.
+    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Variadic. Empty `name` (sentinel) selects the constructor
+    /// form; otherwise the runtime dispatches `now` / `parse` /
+    /// `UTC` against [`crate::date::dispatch::call`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-date-objects>
+    DateCall,
+
+    /// `r<dst> = BigInt(args...)` / `BigInt.<name>(args...)`.
+    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Variadic. Empty `name` (sentinel) selects the constructor
+    /// form; otherwise the runtime dispatches against
+    /// [`crate::bigint::dispatch::call`] for `asIntN` / `asUintN`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-bigint-constructor>
+    BigIntCall,
+
     /// `r<dst> = Array.<name>(args...)`. Operands:
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -734,6 +771,44 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
     ObjectCall,
+    /// `r<dst> = ArrayBuffer(args...)` / `ArrayBuffer.<name>(args...)`.
+    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Empty `name` selects the constructor (§25.1.4.1
+    /// `ArrayBuffer(length, options?)`); otherwise the runtime
+    /// dispatches `isView` per §25.1.4.3 against
+    /// [`crate::binary::dispatch::array_buffer_call`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
+    ArrayBufferCall,
+    /// `r<dst> = new DataView(args...)`. Operands:
+    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
+    /// Register(arg0), …`.
+    ///
+    /// Empty `name` selects the constructor (§25.3.1.1
+    /// `DataView(buffer, byteOffset?, byteLength?)`). DataView has
+    /// no spec-defined static methods; non-empty `name` raises
+    /// `UnknownIntrinsic`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-dataview-constructor>
+    DataViewCall,
+    /// `r<dst> = new <T>(args...)` / `<T>.<method>(args...)` for one
+    /// of the eleven concrete TypedArray classes. Operands:
+    /// `Register(dst), ConstIndex(kind), ConstIndex(name),
+    /// ConstIndex(argc), Register(arg0), …`.
+    ///
+    /// `kind` is a string constant naming the concrete class
+    /// (`"Uint8Array"`, `"Int32Array"`, …). Empty `name` selects the
+    /// constructor (§23.2.5); otherwise the runtime dispatches
+    /// `from` / `of` against
+    /// [`crate::binary::dispatch::typed_array_call`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-typedarray-constructors>
+    TypedArrayCall,
     /// `r<dst> = ToPrimitive(r<src>, hint)`. Operands:
     /// `Register(dst), Register(src), ConstIndex(hint_const)`.
     ///
@@ -864,6 +939,9 @@ impl Op {
             Op::LoadBuiltinError => "LOAD_BUILTIN_ERROR",
             Op::ObjectCall => "OBJECT_CALL",
             Op::ArrayCall => "ARRAY_CALL",
+            Op::BigIntCall => "BIGINT_CALL",
+            Op::DateCall => "DATE_CALL",
+            Op::StringCall => "STRING_CALL",
             Op::HasProperty => "HAS_PROPERTY",
             Op::ImportNamespaceDynamic => "IMPORT_NAMESPACE_DYNAMIC",
             Op::ImportMetaResolve => "IMPORT_META_RESOLVE",
@@ -871,6 +949,9 @@ impl Op {
             Op::LoadGlobalThis => "LOAD_GLOBAL_THIS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
+            Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
+            Op::DataViewCall => "DATA_VIEW_CALL",
+            Op::TypedArrayCall => "TYPED_ARRAY_CALL",
         }
     }
 
@@ -979,7 +1060,13 @@ impl Op {
             Op::SymbolCall => 3,      // dst, name_const, argc — args follow
             Op::ObjectCall => 3,      // dst, name_const, argc — args follow
             Op::ArrayCall => 3,       // dst, name_const, argc — args follow
+            Op::BigIntCall => 3,      // dst, name_const, argc — args follow
+            Op::DateCall => 3,        // dst, name_const, argc — args follow
+            Op::StringCall => 3,      // dst, name_const, argc — args follow
             Op::GlobalCall => 3,      // dst, name_const, argc — args follow
+            Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
+            Op::DataViewCall => 3,    // dst, name_const, argc — args follow
+            Op::TypedArrayCall => 4,  // dst, kind_const, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
             Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
             Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
@@ -1179,13 +1266,13 @@ pub enum Constant {
     /// Regular-expression literal `/pattern/flags`. The pattern is
     /// stored as WTF-16 code units to round-trip surrogates through
     /// the JSON dump; flags are restricted to the ASCII subset
-    /// `"gimsuy"`. The runtime compiles the pattern once on first
+    /// `"dgimsuvy"`. The runtime compiles the pattern once on first
     /// load and caches the compiled engine.
     RegExp {
         /// WTF-16 code units of the pattern body (between the
         /// slashes, no flags).
         pattern_utf16: Vec<u16>,
-        /// ASCII flag string (`"gimsuy"` subset). Validated at
+        /// ASCII flag string (`"dgimsuvy"` subset). Validated at
         /// compile time so the runtime can rely on a clean parse.
         flags: String,
     },

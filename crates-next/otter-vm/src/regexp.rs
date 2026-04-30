@@ -20,7 +20,7 @@
 //!   [`RegExpError`] on failure.
 //!
 //! # Invariants
-//! - The flag string is restricted to the ASCII subset `"gimsuy"` —
+//! - The flag string is restricted to the ASCII subset `"dgimsuvy"` —
 //!   the compiler validates this at intern time.
 //! - `last_index` is interior-mutable but never stashed across
 //!   reentrant calls; native methods refresh it before returning.
@@ -48,7 +48,7 @@ pub enum RegExpError {
         /// `regress`-side diagnostic.
         message: String,
     },
-    /// Flag string contained a character outside `"gimsuy"`.
+    /// Flag string contained a character outside `"dgimsuvy"`.
     #[error("invalid regular expression flag `{flag}`")]
     InvalidFlag {
         /// The offending character.
@@ -66,8 +66,13 @@ pub enum RegExpError {
 ///
 /// We keep this tiny so `JsRegExp` stays cheap to clone. The struct
 /// is `Copy`; the bool fields map to the JS-visible accessors.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-get-regexp.prototype.flags>
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegExpFlags {
+    /// `d` — hasIndices. Adds `result.indices` on `exec` matches.
+    pub has_indices: bool,
     /// `g` — global. Stateful; honoured by [`crate::regexp_prototype`]
     /// and the pattern-arg `String.prototype.*` methods.
     pub global: bool,
@@ -81,20 +86,33 @@ pub struct RegExpFlags {
     pub unicode: bool,
     /// `y` — sticky. Match anchored at `lastIndex`.
     pub sticky: bool,
+    /// `v` — unicode-sets. ES2024 set-notation character classes
+    /// and string properties; mutually exclusive with `u`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-patterns-static-semantics-early-errors>
+    pub unicode_sets: bool,
 }
 
 impl RegExpFlags {
     /// Parse the canonical ASCII flag string. Order does not matter;
     /// duplicate flags raise [`RegExpError::DuplicateFlag`].
+    ///
+    /// Supported flags: `d g i m s u v y`. Per §22.2.4
+    /// [`RegExp Pattern Flags`](https://tc39.es/ecma262/#sec-patterns-static-semantics-early-errors)
+    /// `u` and `v` are mutually exclusive; combining them raises a
+    /// SyntaxError at construction time.
     pub fn parse(flags: &str) -> Result<Self, RegExpError> {
         let mut out = Self::default();
         for c in flags.chars() {
             let slot = match c {
+                'd' => &mut out.has_indices,
                 'g' => &mut out.global,
                 'i' => &mut out.ignore_case,
                 'm' => &mut out.multiline,
                 's' => &mut out.dot_all,
                 'u' => &mut out.unicode,
+                'v' => &mut out.unicode_sets,
                 'y' => &mut out.sticky,
                 other => return Err(RegExpError::InvalidFlag { flag: other }),
             };
@@ -103,13 +121,20 @@ impl RegExpFlags {
             }
             *slot = true;
         }
+        if out.unicode && out.unicode_sets {
+            return Err(RegExpError::InvalidFlag { flag: 'v' });
+        }
         Ok(out)
     }
 
-    /// Render as the canonical JS spelling (`gimsuy` order).
+    /// Render as the canonical JS spelling (`dgimsuvy` order — see
+    /// §22.2.6.4 [`get RegExp.prototype.flags`](https://tc39.es/ecma262/#sec-get-regexp.prototype.flags)).
     #[must_use]
     pub fn to_js_string(self) -> String {
-        let mut s = String::with_capacity(6);
+        let mut s = String::with_capacity(7);
+        if self.has_indices {
+            s.push('d');
+        }
         if self.global {
             s.push('g');
         }
@@ -124,6 +149,9 @@ impl RegExpFlags {
         }
         if self.unicode {
             s.push('u');
+        }
+        if self.unicode_sets {
+            s.push('v');
         }
         if self.sticky {
             s.push('y');
@@ -170,6 +198,7 @@ impl JsRegExp {
             multiline: flags.multiline,
             dot_all: flags.dot_all,
             unicode: flags.unicode,
+            unicode_sets: flags.unicode_sets,
             ..Default::default()
         };
         // `g` and `y` are spec-level state that lives above the

@@ -29,6 +29,7 @@ use crate::Value;
 use crate::array::JsArray;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
+use crate::object::JsObject;
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
 
@@ -56,6 +57,12 @@ fn arg_string<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Result<&'a JsStrin
 /// Run a single match attempt and return the resulting JS array
 /// (`[fullMatch, ...captureGroups]`) or `Value::Null` for no match.
 /// Honours the `g` / `y` flag state stored on the receiver.
+///
+/// Per §22.2.7.2 [`RegExpBuiltinExec`](https://tc39.es/ecma262/#sec-regexpbuiltinexec)
+/// the result array also carries `index`, `input`, and `groups`
+/// own properties — and, when the receiver has the `d` flag, an
+/// `indices` companion array (§22.2.7.7
+/// [`MakeMatchIndicesIndexPairArray`](https://tc39.es/ecma262/#sec-makematchindicesindexpairarray)).
 fn exec_once(
     re: &JsRegExp,
     text: &JsString,
@@ -90,6 +97,27 @@ fn exec_once(
         re.set_last_index(m.range.end as u32);
     }
 
+    Ok(Value::Array(build_match_result(
+        &m,
+        &units,
+        text,
+        flags.has_indices,
+        string_heap,
+    )?))
+}
+
+/// §22.2.7.2 steps 26–32 — build the JS-visible match-result array
+/// out of a `regress::Match`. Used by `RegExp.prototype.exec` and
+/// reused by `String.prototype.match` / `.matchAll` so both surfaces
+/// produce identical shapes (full match + capture slots, plus
+/// `index` / `input` / `groups` / optionally `indices`).
+pub(crate) fn build_match_result(
+    m: &regress::Match,
+    units: &[u16],
+    input: &JsString,
+    has_indices: bool,
+    string_heap: &crate::string::StringHeap,
+) -> Result<JsArray, IntrinsicError> {
     let full = JsString::from_utf16_units(&units[m.range.clone()], string_heap)?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
     out.push(Value::String(full));
@@ -102,7 +130,79 @@ fn exec_once(
             None => out.push(Value::Undefined),
         }
     }
-    Ok(Value::Array(JsArray::from_elements(out)))
+    let arr = JsArray::from_elements(out);
+
+    arr.set_named_property(
+        "index",
+        Value::Number(NumberValue::from_i32(m.range.start as i32)),
+    );
+    arr.set_named_property("input", Value::String(input.clone()));
+
+    let mut named_iter = m.named_groups();
+    let first_named = named_iter.next();
+    if let Some((name, range)) = first_named {
+        let groups_obj = JsObject::new();
+        groups_obj.set_prototype(None);
+        let value = match range {
+            Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
+            None => Value::Undefined,
+        };
+        groups_obj.set(name, value);
+        for (name, range) in named_iter {
+            let value = match range {
+                Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
+                None => Value::Undefined,
+            };
+            groups_obj.set(name, value);
+        }
+        arr.set_named_property("groups", Value::Object(groups_obj));
+    } else {
+        arr.set_named_property("groups", Value::Undefined);
+    }
+
+    if has_indices {
+        let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
+        indices_elems.push(pair_array(m.range.start, m.range.end));
+        for cap in &m.captures {
+            match cap {
+                Some(r) => indices_elems.push(pair_array(r.start, r.end)),
+                None => indices_elems.push(Value::Undefined),
+            }
+        }
+        let indices_arr = JsArray::from_elements(indices_elems);
+        let mut named_iter = m.named_groups();
+        let first_named = named_iter.next();
+        if let Some((name, range)) = first_named {
+            let g_obj = JsObject::new();
+            g_obj.set_prototype(None);
+            let v = match range {
+                Some(r) => pair_array(r.start, r.end),
+                None => Value::Undefined,
+            };
+            g_obj.set(name, v);
+            for (name, range) in named_iter {
+                let v = match range {
+                    Some(r) => pair_array(r.start, r.end),
+                    None => Value::Undefined,
+                };
+                g_obj.set(name, v);
+            }
+            indices_arr.set_named_property("groups", Value::Object(g_obj));
+        } else {
+            indices_arr.set_named_property("groups", Value::Undefined);
+        }
+        arr.set_named_property("indices", Value::Array(indices_arr));
+    }
+    Ok(arr)
+}
+
+/// Build a `[start, end]` two-element array used by the `d`-flag
+/// indices companion (§22.2.7.7).
+fn pair_array(start: usize, end: usize) -> Value {
+    Value::Array(JsArray::from_elements([
+        Value::Number(NumberValue::from_i32(start as i32)),
+        Value::Number(NumberValue::from_i32(end as i32)),
+    ]))
 }
 
 fn impl_exec(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -159,12 +259,14 @@ pub fn load_property(re: &JsRegExp, name: &str, string_heap: &crate::string::Str
             Ok(s) => Value::String(s),
             Err(_) => Value::Undefined,
         },
+        "hasIndices" => Value::Boolean(re.flags().has_indices),
         "global" => Value::Boolean(re.flags().global),
         "ignoreCase" => Value::Boolean(re.flags().ignore_case),
         "multiline" => Value::Boolean(re.flags().multiline),
         "dotAll" => Value::Boolean(re.flags().dot_all),
         "unicode" => Value::Boolean(re.flags().unicode),
         "sticky" => Value::Boolean(re.flags().sticky),
+        "unicodeSets" => Value::Boolean(re.flags().unicode_sets),
         "lastIndex" => Value::Number(NumberValue::from_i32(re.last_index() as i32)),
         _ => Value::Undefined,
     }

@@ -34,8 +34,12 @@ pub mod array;
 pub mod array_prototype;
 pub mod array_statics;
 pub mod bigint;
+pub mod binary;
+pub mod boolean_prototype;
 pub mod collections;
 pub mod collections_prototype;
+pub mod date;
+// `date` is a directory module — see `date/mod.rs`.
 pub mod error_classes;
 pub mod global_functions;
 pub mod intl;
@@ -52,6 +56,7 @@ pub mod promise_dispatch;
 pub mod regexp;
 pub mod regexp_prototype;
 pub mod string;
+pub mod string_dispatch;
 pub mod string_prototype;
 pub mod symbol;
 pub mod symbol_dispatch;
@@ -199,12 +204,39 @@ pub enum Value {
     /// # See also
     /// - <https://tc39.es/proposal-temporal/>
     Temporal(JsTemporal),
+    /// JS `Date` — mutable epoch-millisecond timestamp per
+    /// ECMA-262 §21.4. See [`crate::date::JsDate`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-date-objects>
+    Date(crate::date::JsDate),
     /// `Intl.*` value — `Collator` / `NumberFormat` /
     /// `DateTimeFormat`. Backed by ICU 4X. See [`JsIntl`].
     ///
     /// # See also
     /// - <https://tc39.es/ecma402/>
     Intl(JsIntl),
+    /// JS `ArrayBuffer` — heap-shared raw byte storage per
+    /// ECMA-262 §25.1. See [`crate::binary::JsArrayBuffer`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-arraybuffer-objects>
+    ArrayBuffer(crate::binary::JsArrayBuffer),
+    /// JS `DataView` — typed view over an `ArrayBuffer` with
+    /// explicit byte-order control per ECMA-262 §25.3. See
+    /// [`crate::binary::JsDataView`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-dataview-objects>
+    DataView(crate::binary::JsDataView),
+    /// JS `TypedArray` — element-typed view over an `ArrayBuffer`
+    /// per ECMA-262 §23.2. The view's
+    /// [`crate::binary::TypedArrayKind`] selects the element-type
+    /// behaviour shared across all eleven concrete classes.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-typedarray-objects>
+    TypedArray(crate::binary::JsTypedArray),
     /// Class value: the result of evaluating a `class` declaration
     /// or expression. Wraps the underlying constructor callable,
     /// the prototype object that fresh instances inherit from, and
@@ -373,7 +405,13 @@ impl Value {
             Value::WeakMap(_) => "[object WeakMap]".to_string(),
             Value::WeakSet(_) => "[object WeakSet]".to_string(),
             Value::Temporal(t) => format!("[object Temporal.{}]", t.kind().class_name()),
+            Value::Date(d) => date::to_iso_string(d.time())
+                .map(|s| format!("Date({s})"))
+                .unwrap_or_else(|| "Invalid Date".to_string()),
             Value::Intl(i) => format!("[object Intl.{}]", i.kind().class_name()),
+            Value::ArrayBuffer(_) => "[object ArrayBuffer]".to_string(),
+            Value::DataView(_) => "[object DataView]".to_string(),
+            Value::TypedArray(t) => format!("[object {}]", t.kind().name()),
             Value::Object(_) => "[object Object]".to_string(),
             Value::Array(a) => {
                 let body = a.borrow_body();
@@ -418,7 +456,11 @@ impl Value {
             | Value::WeakMap(_)
             | Value::WeakSet(_)
             | Value::Temporal(_)
-            | Value::Intl(_) => true,
+            | Value::Date(_)
+            | Value::Intl(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_) => true,
         }
     }
 
@@ -516,7 +558,11 @@ impl Value {
             | Value::WeakMap(_)
             | Value::WeakSet(_)
             | Value::Temporal(_)
-            | Value::Intl(_) => "object",
+            | Value::Date(_)
+            | Value::Intl(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_) => "object",
         }
     }
 
@@ -573,6 +619,9 @@ impl PartialEq for Value {
             (Value::WeakSet(a), Value::WeakSet(b)) => a.ptr_eq(b),
             (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(b),
             (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(b),
+            (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(b),
+            (Value::DataView(a), Value::DataView(b)) => a.ptr_eq(b),
+            (Value::TypedArray(a), Value::TypedArray(b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -2293,6 +2342,13 @@ impl Interpreter {
                         | Value::WeakMap(_)
                         | Value::WeakSet(_)) => collections_prototype::load_property(v, &name),
                         Value::Temporal(t) => temporal::load_property(t, &name),
+                        Value::ArrayBuffer(b) => {
+                            binary::array_buffer_prototype::load_property(b, &name)
+                        }
+                        Value::DataView(v) => binary::data_view_prototype::load_property(v, &name),
+                        Value::TypedArray(t) => {
+                            binary::typed_array_prototype::load_property(t, &name)
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     write_register(frame, dst, value)?;
@@ -2459,6 +2515,9 @@ impl Interpreter {
                                         Value::String(crate::JsString::empty(&self.string_heap)?)
                                     }
                                 },
+                                // §10.4.5.13 IntegerIndexedElementGet
+                                // <https://tc39.es/ecma262/#sec-integerindexedelementget>
+                                Value::TypedArray(t) => t.get(idx),
                                 _ => return Err(VmError::TypeMismatch),
                             }
                         }
@@ -2485,6 +2544,18 @@ impl Interpreter {
                         // Numeric-indexed array write.
                         (Value::Array(arr), Value::Number(n)) => match n.as_smi() {
                             Some(v) if v >= 0 => arr.set(v as usize, value),
+                            _ => return Err(VmError::TypeMismatch),
+                        },
+                        // §10.4.5.14 IntegerIndexedElementSet — out-of-
+                        // range indices silently no-op; element-type /
+                        // value-type mismatches raise TypeError.
+                        // <https://tc39.es/ecma262/#sec-integerindexedelementset>
+                        (Value::TypedArray(t), Value::Number(n)) => match n.as_smi() {
+                            Some(v) if v >= 0 => {
+                                let coerced =
+                                    binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
+                                t.set(v as usize, &coerced);
+                            }
                             _ => return Err(VmError::TypeMismatch),
                         },
                         _ => return Err(VmError::TypeMismatch),
@@ -2715,7 +2786,13 @@ impl Interpreter {
                         | Value::WeakMap(_)
                         | Value::WeakSet(_)
                         | Value::Temporal(_)
-                        | Value::Intl(_) => NumberValue::Double(f64::NAN),
+                        | Value::Intl(_)
+                        | Value::ArrayBuffer(_)
+                        | Value::DataView(_)
+                        | Value::TypedArray(_) => NumberValue::Double(f64::NAN),
+                        // §21.4.4.45 Date.prototype[@@toPrimitive] —
+                        // ToNumber on a Date returns its time value.
+                        Value::Date(d) => NumberValue::from_f64(d.time()),
                         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
                     };
                     write_register(frame, dst, Value::Number(value))?;
@@ -2894,6 +2971,124 @@ impl Interpreter {
                     }
                     let result =
                         json::call(&name, &args, &self.string_heap).map_err(json_to_vm_error)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §22.1.1 / §22.1.2 String constructor + statics.
+                // <https://tc39.es/ecma262/#sec-string-constructor>
+                Op::StringCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = string_dispatch::call(&name, &args, &self.string_heap)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §21.4 Date constructor + statics.
+                // <https://tc39.es/ecma262/#sec-date-objects>
+                Op::DateCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = date::dispatch::call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §21.2.1 / §21.2.2 BigInt static dispatch.
+                // <https://tc39.es/ecma262/#sec-bigint-constructor>
+                Op::BigIntCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = bigint::dispatch::call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §25.1.4 ArrayBuffer constructor + isView static.
+                // <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
+                Op::ArrayBufferCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = binary::dispatch::array_buffer_call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §25.3 DataView constructor.
+                // <https://tc39.es/ecma262/#sec-dataview-constructor>
+                Op::DataViewCall => {
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let argc = match operands.get(2) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(3 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = binary::dispatch::data_view_call(&name, &args)?;
+                    write_register(frame, dst, result)?;
+                    frame.pc += 1;
+                }
+                // §23.2 TypedArray constructor + statics.
+                // <https://tc39.es/ecma262/#sec-typedarray-constructors>
+                Op::TypedArrayCall => {
+                    let dst = register_operand(operands.first())?;
+                    let kind_idx = const_operand(operands.get(1))?;
+                    let name_idx = const_operand(operands.get(2))?;
+                    let argc = match operands.get(3) {
+                        Some(&Operand::ConstIndex(n)) => n as usize,
+                        _ => return Err(VmError::InvalidOperand),
+                    };
+                    let kind_name = lookup_string_constant(module, kind_idx)?;
+                    let kind = binary::TypedArrayKind::from_name(&kind_name)
+                        .ok_or(VmError::TypeMismatch)?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
+                    for i in 0..argc {
+                        let r = register_operand(operands.get(4 + i))?;
+                        args.push(read_register(frame, r)?.clone());
+                    }
+                    let result = binary::dispatch::typed_array_call(kind, &name, &args)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4015,6 +4210,9 @@ impl Interpreter {
             Value::String(_) => string_prototype::lookup(&name),
             Value::Array(_) => array_prototype::lookup(&name),
             Value::Number(_) => number::prototype_lookup(&name),
+            Value::Boolean(_) => boolean_prototype::lookup(&name),
+            Value::BigInt(_) => bigint::prototype::lookup(&name),
+            Value::Date(_) => date::prototype::lookup(&name),
             Value::RegExp(_) => regexp_prototype::lookup(&name),
             Value::Symbol(_) => symbol_prototype::lookup(&name),
             Value::Map(_) => collections_prototype::lookup_map(&name),
@@ -4023,6 +4221,9 @@ impl Interpreter {
             Value::WeakSet(_) => collections_prototype::lookup_weak_set(&name),
             Value::Temporal(_) => temporal::lookup_prototype(&recv_value, &name),
             Value::Intl(_) => intl::lookup_prototype(&recv_value, &name),
+            Value::ArrayBuffer(_) => binary::array_buffer_prototype::lookup(&name),
+            Value::DataView(_) => binary::data_view_prototype::lookup(&name),
+            Value::TypedArray(_) => binary::typed_array_prototype::lookup(&name),
             _ => None,
         };
         if let Some(entry) = intrinsic {
@@ -6272,9 +6473,23 @@ fn step_iterator(
             }
         }
         IteratorState::String { string, index } => {
+            // §22.1.5.1 [`%StringIteratorPrototype%.next`](
+            // https://tc39.es/ecma262/#sec-%25stringiteratorprototype%25.next
+            // ) — yield code points. A valid surrogate pair (high +
+            // low) combines into a single two-unit string; lone
+            // surrogates are yielded as-is.
             if let Some(unit) = string.char_code_at(*index) {
-                let s = JsString::from_utf16_units(&[unit], string_heap)?;
-                *index += 1;
+                let next_unit = string.char_code_at(*index + 1);
+                let is_pair = (0xD800..=0xDBFF).contains(&unit)
+                    && matches!(next_unit, Some(low) if (0xDC00..=0xDFFF).contains(&low));
+                let s = if is_pair {
+                    let pair = [unit, next_unit.unwrap()];
+                    *index += 2;
+                    JsString::from_utf16_units(&pair, string_heap)?
+                } else {
+                    *index += 1;
+                    JsString::from_utf16_units(&[unit], string_heap)?
+                };
                 Some(Value::String(s))
             } else {
                 None

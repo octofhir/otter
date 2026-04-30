@@ -32,7 +32,9 @@ use std::rc::Rc;
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
+pub mod dispatch;
 pub mod ops;
+pub mod prototype;
 
 /// Heap-shared arbitrary-precision integer. Cheap to clone.
 #[derive(Debug, Clone)]

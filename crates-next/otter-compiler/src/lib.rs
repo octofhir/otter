@@ -727,6 +727,27 @@ fn import_record_synthetic_name(record_uv: u16) -> String {
 
 /// Find the deepest [`ModuleState`] frame that declares an
 /// imported alias matching `name`. Returns the binding info
+/// Whether `name` is one of the eleven canonical TypedArray
+/// constructor names per ECMA-262 Table 71. Used by the compiler to
+/// intercept `new <T>(...)` / `<T>.from(...)` / `<T>.of(...)` and
+/// route through `Op::TypedArrayCall`.
+fn is_typed_array_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Int8Array"
+            | "Uint8Array"
+            | "Uint8ClampedArray"
+            | "Int16Array"
+            | "Uint16Array"
+            | "Int32Array"
+            | "Uint32Array"
+            | "Float32Array"
+            | "Float64Array"
+            | "BigInt64Array"
+            | "BigUint64Array"
+    )
+}
+
 /// alongside the synthetic upvalue name the inner function should
 /// resolve via `resolve_capture` to land at the same record cell.
 fn find_module_import_binding(cx: &Compiler, name: &str) -> Option<(ImportBinding, String)> {
@@ -754,6 +775,53 @@ fn module_export_name_to_str(name: &oxc_ast::ast::ModuleExportName<'_>) -> Strin
         oxc_ast::ast::ModuleExportName::IdentifierReference(id) => id.name.as_str().to_string(),
         oxc_ast::ast::ModuleExportName::StringLiteral(lit) => lit.value.as_str().to_string(),
     }
+}
+
+/// Decode oxc's lossy lone-surrogate encoding back into raw WTF-16
+/// code units. When `StringLiteral::lone_surrogates` is set, oxc
+/// stores each lone surrogate as `\u{FFFD}XXXX` (four lowercase hex
+/// digits) and the literal U+FFFD as `\u{FFFD}fffd`. This decoder
+/// reverses both encodings so the runtime sees the source-fidelity
+/// code units expected by §6.1.4
+/// [`The String Type`](https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type).
+fn decode_lone_surrogate_string(value: &str) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::with_capacity(value.len());
+    let mut iter = value.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\u{FFFD}' {
+            // Followed by four lowercase hex digits encoding a u16.
+            let mut hex = [0u8; 4];
+            let mut count = 0;
+            for slot in &mut hex {
+                match iter.peek() {
+                    Some(&h) if h.is_ascii_hexdigit() => {
+                        *slot = h as u8;
+                        iter.next();
+                        count += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if count == 4 {
+                let s = std::str::from_utf8(&hex).unwrap();
+                let unit = u16::from_str_radix(s, 16).unwrap();
+                out.push(unit);
+                continue;
+            }
+            // Malformed (shouldn't happen if `lone_surrogates`
+            // signal is honoured) — fall back to literal U+FFFD.
+            out.push(0xFFFD);
+            for h in &hex[..count] {
+                out.push(*h as u16);
+            }
+        } else {
+            let mut buf = [0u16; 2];
+            for u in c.encode_utf16(&mut buf).iter() {
+                out.push(*u);
+            }
+        }
+    }
+    out
 }
 
 /// Module-level mutable state shared across nested function
@@ -1309,6 +1377,16 @@ impl FunctionContext {
 
     fn intern_string_constant(&mut self, value: &str) -> u32 {
         let utf16: Vec<u16> = value.encode_utf16().collect();
+        self.intern_utf16_string_constant(utf16)
+    }
+
+    /// Intern a pre-built WTF-16 unit vector. Used for string
+    /// literals that carry lone surrogates: oxc encodes those via
+    /// the §11.8.4 [`StringLiteral`](https://tc39.es/ecma262/#sec-literals-string-literals)
+    /// lossy scheme (`\u{FFFD}XXXX` per lone surrogate, `\u{FFFD}fffd`
+    /// for a literal U+FFFD), so the compiler decodes it into the
+    /// original code-unit sequence before interning.
+    fn intern_utf16_string_constant(&mut self, utf16: Vec<u16>) -> u32 {
         let mut module = self.module.borrow_mut();
         for (i, c) in module.constants.iter().enumerate() {
             if let Constant::String { utf16: existing } = c
@@ -3533,7 +3611,12 @@ fn compile_expr(
 
         Expression::StringLiteral(lit) => {
             let dst = cx.alloc_scratch();
-            let const_idx = cx.intern_string_constant(&lit.value);
+            let const_idx = if lit.lone_surrogates {
+                let utf16 = decode_lone_surrogate_string(&lit.value);
+                cx.intern_utf16_string_constant(utf16)
+            } else {
+                cx.intern_string_constant(&lit.value)
+            };
             cx.emit(
                 Op::LoadString,
                 vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
@@ -3571,17 +3654,27 @@ fn compile_expr(
             // Compile-time validation: feed the pattern + flags to
             // `regress` so we surface a clean `Unsupported` for the
             // few patterns the engine rejects (e.g. unterminated
-            // groups). Mirrors the BigIntLiteral approach. The `g`
-            // and `y` flags live above the matcher per JS spec, so
-            // we strip them before asking `regress` to compile.
+            // groups). Mirrors the BigIntLiteral approach. The `g`,
+            // `y`, and `d` flags live above the matcher per JS spec
+            // (§22.2.6.4 [`get RegExp.prototype.flags`](https://tc39.es/ecma262/#sec-get-regexp.prototype.flags)),
+            // so we strip them before asking `regress` to compile.
             let mut engine_flags = regress::Flags::default();
+            let mut saw_u = false;
+            let mut saw_v = false;
             for c in flags_str.chars() {
                 match c {
-                    'g' | 'y' => {}
+                    'd' | 'g' | 'y' => {}
                     'i' => engine_flags.icase = true,
                     'm' => engine_flags.multiline = true,
                     's' => engine_flags.dot_all = true,
-                    'u' => engine_flags.unicode = true,
+                    'u' => {
+                        engine_flags.unicode = true;
+                        saw_u = true;
+                    }
+                    'v' => {
+                        engine_flags.unicode_sets = true;
+                        saw_v = true;
+                    }
                     other => {
                         return Err(CompileError::Unsupported {
                             node: format!(
@@ -3591,6 +3684,14 @@ fn compile_expr(
                         });
                     }
                 }
+            }
+            if saw_u && saw_v {
+                return Err(CompileError::Unsupported {
+                    node: format!(
+                        "RegExpLiteral `/{pattern_text}/{flags_str}` rejected: flags `u` and `v` are mutually exclusive (§22.2.4)"
+                    ),
+                    span,
+                });
             }
             if let Err(e) = regress::Regex::with_flags(pattern_text, engine_flags) {
                 return Err(CompileError::Unsupported {
@@ -3892,6 +3993,31 @@ fn compile_expr(
             if matches!(m.object, Expression::Super(_)) {
                 return compile_super_member_load(cx, m.property.name.as_str(), span);
             }
+            // §23.2.5 TypedArray-constructor static properties:
+            // `<T>.BYTES_PER_ELEMENT`. Lower the integer value at
+            // compile time so the runtime does not need a real
+            // constructor object.
+            // <https://tc39.es/ecma262/#sec-typedarray.bytes_per_element>
+            if let Expression::Identifier(id) = &m.object
+                && is_typed_array_name(id.name.as_str())
+                && m.property.name.as_str() == "BYTES_PER_ELEMENT"
+                && cx.lookup_binding(id.name.as_str()).is_none()
+                && find_module_import_binding(cx, id.name.as_str()).is_none()
+            {
+                let bpe: i32 = match id.name.as_str() {
+                    "Int8Array" | "Uint8Array" | "Uint8ClampedArray" => 1,
+                    "Int16Array" | "Uint16Array" => 2,
+                    "Int32Array" | "Uint32Array" | "Float32Array" => 4,
+                    _ => 8,
+                };
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadInt32,
+                    vec![Operand::Register(dst), Operand::Imm32(bpe)],
+                    span,
+                );
+                return Ok(dst);
+            }
             // §21.1.1.x Number static constants — `MAX_SAFE_INTEGER`
             // / `MIN_SAFE_INTEGER` / `MAX_VALUE` / `MIN_VALUE` /
             // `EPSILON` / `POSITIVE_INFINITY` / `NEGATIVE_INFINITY`
@@ -4007,6 +4133,111 @@ fn compile_expr(
                     &new_expr.arguments,
                     new_span,
                 );
+            }
+            // §20.3.1 `new Boolean(value)` — foundation aliases to
+            // primitive ToBoolean (no wrapper object).
+            // <https://tc39.es/ecma262/#sec-boolean-constructor>
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Boolean"
+                && cx.lookup_binding("Boolean").is_none()
+                && find_module_import_binding(cx, "Boolean").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let dst = cx.alloc_scratch();
+                match arg_regs.first().copied() {
+                    Some(src) => {
+                        cx.emit(
+                            Op::ToBoolean,
+                            vec![Operand::Register(dst), Operand::Register(src)],
+                            new_span,
+                        );
+                    }
+                    None => {
+                        cx.emit(Op::LoadFalse, vec![Operand::Register(dst)], new_span);
+                    }
+                }
+                return Ok(dst);
+            }
+            // §25.1.4 `new ArrayBuffer(length [, options])` — lower
+            // through `Op::ArrayBufferCall` with the empty-name
+            // sentinel.
+            // <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "ArrayBuffer"
+                && cx.lookup_binding("ArrayBuffer").is_none()
+                && find_module_import_binding(cx, "ArrayBuffer").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let name_idx = cx.intern_string_constant("");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::ArrayBufferCall, operands, new_span);
+                return Ok(dst);
+            }
+            // §25.3.1 `new DataView(buffer, byteOffset?, byteLength?)`.
+            // <https://tc39.es/ecma262/#sec-dataview-constructor>
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "DataView"
+                && cx.lookup_binding("DataView").is_none()
+                && find_module_import_binding(cx, "DataView").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let name_idx = cx.intern_string_constant("");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::DataViewCall, operands, new_span);
+                return Ok(dst);
+            }
+            // §23.2.5 `new <T>(...)` for one of the eleven concrete
+            // TypedArray constructors. Routed through
+            // `Op::TypedArrayCall` with the kind-name in the leading
+            // const slot.
+            // <https://tc39.es/ecma262/#sec-typedarray-constructors>
+            if let Expression::Identifier(id) = callee
+                && is_typed_array_name(id.name.as_str())
+                && cx.lookup_binding(id.name.as_str()).is_none()
+                && find_module_import_binding(cx, id.name.as_str()).is_none()
+            {
+                let kind = id.name.as_str();
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let kind_idx = cx.intern_string_constant(kind);
+                let name_idx = cx.intern_string_constant("");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(kind_idx));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::TypedArrayCall, operands, new_span);
+                return Ok(dst);
+            }
+            // §21.4.2 `new Date(...)` — variadic constructor; lower
+            // through `Op::DateCall` with the empty-name sentinel.
+            // <https://tc39.es/ecma262/#sec-date-constructor>
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Date"
+                && cx.lookup_binding("Date").is_none()
+                && find_module_import_binding(cx, "Date").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let name_idx = cx.intern_string_constant("");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::DateCall, operands, new_span);
+                return Ok(dst);
             }
             // §20.2.1.1 `new Function(arg0, …, body)` — every
             // argument coerces to a string at runtime; the leading
@@ -5056,6 +5287,48 @@ fn compile_method_call(
         return compile_spread_call(cx, callee, &call.arguments, span);
     }
     if let Expression::StaticMemberExpression(member) = callee {
+        // §25.1.4.3 `ArrayBuffer.isView(arg)` — lower through
+        // `Op::ArrayBufferCall`.
+        // <https://tc39.es/ecma262/#sec-arraybuffer.isview>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "ArrayBuffer"
+            && cx.lookup_binding("ArrayBuffer").is_none()
+            && find_module_import_binding(cx, "ArrayBuffer").is_none()
+        {
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::ArrayBufferCall, operands, span);
+            return Ok(dst);
+        }
+        // §23.2.2 TypedArray statics — `<T>.from(...)` / `<T>.of(...)`.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarray%25-intrinsic-object>
+        if let Expression::Identifier(id) = &member.object
+            && is_typed_array_name(id.name.as_str())
+            && cx.lookup_binding(id.name.as_str()).is_none()
+            && find_module_import_binding(cx, id.name.as_str()).is_none()
+        {
+            let kind = id.name.as_str();
+            let method = member.property.name.as_str();
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let kind_idx = cx.intern_string_constant(kind);
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(kind_idx));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::TypedArrayCall, operands, span);
+            return Ok(dst);
+        }
         // Foundation built-ins on the global `Object`: lower a few
         // canonical forms directly to dedicated opcodes so the
         // runtime does not need a host-callable bridge yet.
@@ -5251,6 +5524,131 @@ fn compile_method_call(
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::SymbolCall, operands, span);
+        return Ok(dst);
+    }
+    // §20.3.1 `Boolean(value)` — coerces to boolean. The foundation
+    // ships primitive-only Booleans (no wrapper object), so the
+    // bare-call form is identical to `!!value`.
+    // <https://tc39.es/ecma262/#sec-boolean-constructor>
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Boolean"
+        && cx.lookup_binding("Boolean").is_none()
+        && find_module_import_binding(cx, "Boolean").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        match arg_regs.first().copied() {
+            Some(src) => {
+                cx.emit(
+                    Op::ToBoolean,
+                    vec![Operand::Register(dst), Operand::Register(src)],
+                    span,
+                );
+            }
+            None => {
+                cx.emit(Op::LoadFalse, vec![Operand::Register(dst)], span);
+            }
+        }
+        return Ok(dst);
+    }
+    // §22.1.1 / §22.1.2 String constructor + statics.
+    // `String(value)` (bare) and `String.<fromCharCode|fromCodePoint>(...)`
+    // both lower to `Op::StringCall` with the appropriate name.
+    // <https://tc39.es/ecma262/#sec-string-constructor>
+    if let Expression::StaticMemberExpression(member) = callee
+        && let Expression::Identifier(id) = &member.object
+        && id.name.as_str() == "String"
+        && cx.lookup_binding("String").is_none()
+        && find_module_import_binding(cx, "String").is_none()
+    {
+        let method = member.property.name.as_str();
+        if matches!(method, "fromCharCode" | "fromCodePoint") {
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let name_idx = cx.intern_string_constant(method);
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::StringCall, operands, span);
+            return Ok(dst);
+        }
+    }
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "String"
+        && cx.lookup_binding("String").is_none()
+        && find_module_import_binding(cx, "String").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let name_idx = cx.intern_string_constant("");
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::StringCall, operands, span);
+        return Ok(dst);
+    }
+    // §21.4.3 Date statics — `Date.now` / `Date.parse` / `Date.UTC`
+    // lower through `Op::DateCall` with the literal method name.
+    // <https://tc39.es/ecma262/#sec-properties-of-the-date-constructor>
+    if let Expression::StaticMemberExpression(member) = callee
+        && let Expression::Identifier(id) = &member.object
+        && id.name.as_str() == "Date"
+        && cx.lookup_binding("Date").is_none()
+        && find_module_import_binding(cx, "Date").is_none()
+    {
+        let method = member.property.name.as_str();
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let name_idx = cx.intern_string_constant(method);
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::DateCall, operands, span);
+        return Ok(dst);
+    }
+    // §21.2.1 BigInt(value) / §21.2.2 BigInt.<name>(args).
+    // Bare-identifier and `BigInt.<method>` static-member shapes
+    // both lower to `Op::BigIntCall`; empty-string name signals
+    // the constructor form.
+    // <https://tc39.es/ecma262/#sec-bigint-constructor>
+    if let Expression::StaticMemberExpression(member) = callee
+        && let Expression::Identifier(id) = &member.object
+        && id.name.as_str() == "BigInt"
+        && cx.lookup_binding("BigInt").is_none()
+        && find_module_import_binding(cx, "BigInt").is_none()
+    {
+        let method = member.property.name.as_str();
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let name_idx = cx.intern_string_constant(method);
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::BigIntCall, operands, span);
+        return Ok(dst);
+    }
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "BigInt"
+        && cx.lookup_binding("BigInt").is_none()
+        && find_module_import_binding(cx, "BigInt").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let name_idx = cx.intern_string_constant("");
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::BigIntCall, operands, span);
         return Ok(dst);
     }
     // §20.2.1.1 — bare `Function(arg0, …, body)` is the same as
@@ -6752,15 +7150,23 @@ fn number_static_constant(name: &str) -> Option<f64> {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-template-literals>
+fn intern_template_quasi(cx: &mut Compiler, quasi: &oxc_ast::ast::TemplateElement<'_>) -> u32 {
+    let cooked = quasi.value.cooked.as_deref().unwrap_or("");
+    if quasi.lone_surrogates {
+        cx.intern_utf16_string_constant(decode_lone_surrogate_string(cooked))
+    } else {
+        cx.intern_string_constant(cooked)
+    }
+}
+
 fn compile_template_literal(
     cx: &mut Compiler,
     t: &oxc_ast::ast::TemplateLiteral<'_>,
 ) -> Result<u16, CompileError> {
     let span = (t.span.start, t.span.end);
     if t.expressions.is_empty() && t.quasis.len() == 1 {
-        let cooked = t.quasis[0].value.cooked.as_deref().unwrap_or("");
         let dst = cx.alloc_scratch();
-        let const_idx = cx.intern_string_constant(cooked);
+        let const_idx = intern_template_quasi(cx, &t.quasis[0]);
         cx.emit(
             Op::LoadString,
             vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
@@ -6770,9 +7176,8 @@ fn compile_template_literal(
     }
     // Seed with first cooked quasi.
     let mut acc = {
-        let cooked = t.quasis[0].value.cooked.as_deref().unwrap_or("");
         let dst = cx.alloc_scratch();
-        let const_idx = cx.intern_string_constant(cooked);
+        let const_idx = intern_template_quasi(cx, &t.quasis[0]);
         cx.emit(
             Op::LoadString,
             vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
@@ -6800,10 +7205,11 @@ fn compile_template_literal(
         );
         acc = dst;
         // Append the next cooked quasi.
-        let cooked = t.quasis[i + 1].value.cooked.as_deref().unwrap_or("");
+        let next_quasi = &t.quasis[i + 1];
+        let cooked = next_quasi.value.cooked.as_deref().unwrap_or("");
         if !cooked.is_empty() {
             let quasi_reg = cx.alloc_scratch();
-            let const_idx = cx.intern_string_constant(cooked);
+            let const_idx = intern_template_quasi(cx, next_quasi);
             cx.emit(
                 Op::LoadString,
                 vec![Operand::Register(quasi_reg), Operand::ConstIndex(const_idx)],

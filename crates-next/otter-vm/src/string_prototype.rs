@@ -160,25 +160,16 @@ fn is_ws_code_unit(u: u16) -> bool {
     ) || (0x2000..=0x200A).contains(&u)
 }
 
-/// One regex-match observation, normalised to plain code-unit
-/// ranges. We collect all relevant matches up front so we can free
-/// the iterator's borrow on the haystack before allocating
-/// replacement strings.
-#[derive(Debug, Clone)]
-struct CapturedMatch {
-    range: std::ops::Range<usize>,
-    captures: Vec<Option<std::ops::Range<usize>>>,
-}
-
 /// Run a regex over `text_units` and collect every match. Honours
-/// the `g` flag — without it we stop after the first match.
-fn collect_regex_matches(re: &JsRegExp, text_units: &[u16]) -> Vec<CapturedMatch> {
+/// the `g` flag — without it we stop after the first match. We
+/// collect `regress::Match` directly: it is already owned (owned
+/// `Range<usize>` ranges, owned capture vec, owned group-name table)
+/// so we can release the iterator's borrow on `text_units` before
+/// allocating replacement strings or building result arrays.
+fn collect_regex_matches(re: &JsRegExp, text_units: &[u16]) -> Vec<regress::Match> {
     let mut out = Vec::new();
     for m in re.regex().find_from_utf16(text_units, 0) {
-        out.push(CapturedMatch {
-            range: m.range.clone(),
-            captures: m.captures.clone(),
-        });
+        out.push(m);
         if !re.flags().global {
             break;
         }
@@ -188,7 +179,7 @@ fn collect_regex_matches(re: &JsRegExp, text_units: &[u16]) -> Vec<CapturedMatch
 
 /// `GetSubstitution`-lite: handles `$$`, `$&`, and `$1`–`$9`.
 /// Named groups (`$<name>`) and `$'` / `$\`` are deferred.
-fn apply_substitution(template: &[u16], text_units: &[u16], m: &CapturedMatch) -> Vec<u16> {
+fn apply_substitution(template: &[u16], text_units: &[u16], m: &regress::Match) -> Vec<u16> {
     let mut out = Vec::with_capacity(template.len());
     let mut i = 0;
     while i < template.len() {
@@ -829,16 +820,49 @@ fn regex_split(
     Ok(Value::Array(JsArray::from_elements(out)))
 }
 
-fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = receiver_string(args)?;
-    let re = match args.args.first() {
-        Some(Value::RegExp(r)) => r,
+/// §7.2.8 [`IsRegExp`](https://tc39.es/ecma262/#sec-isregexp): the
+/// foundation surface treats any `Value::RegExp` as regex-shaped.
+/// User objects can opt in via `[Symbol.match]` (a truthy property);
+/// the intrinsic dispatcher does not currently invoke user `@@match`
+/// traps, but the helper lights up the regex path so the rest of
+/// the algorithm follows §22.1.3.13 / .14 / .15 / .17 / .18 / .19.
+fn is_regexp_arg(arg: Option<&Value>) -> bool {
+    matches!(arg, Some(Value::RegExp(_)))
+}
+
+/// §22.1.3.13 step 6 / §22.1.3.14 step 6 / §22.1.3.15 step 4: when
+/// the first argument is not a `RegExp`, ToString-coerce it and run
+/// `RegExpCreate(pattern, flags)`. The string fast-path matters for
+/// idiomatic JS like `"foo".match("o+")` and `"foo".matchAll("o")`.
+fn coerce_pattern_to_regexp(value: &Value, flags: &str) -> Result<JsRegExp, IntrinsicError> {
+    let pattern_units: Vec<u16> = match value {
+        Value::String(s) => s.to_utf16_vec(),
+        Value::Undefined => Vec::new(),
         _ => {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
-                reason: "must be a regular expression",
+                reason: "must be a regular expression or string",
             });
         }
+    };
+    JsRegExp::compile(&pattern_units, flags).map_err(|_| IntrinsicError::BadArgument {
+        index: 0,
+        reason: "is not a valid regular expression pattern",
+    })
+}
+
+fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = receiver_string(args)?;
+    let coerced;
+    let re = if is_regexp_arg(args.args.first()) {
+        match args.args.first() {
+            Some(Value::RegExp(r)) => r,
+            _ => unreachable!(),
+        }
+    } else {
+        let arg0 = args.args.first().unwrap_or(&Value::Undefined);
+        coerced = coerce_pattern_to_regexp(arg0, "")?;
+        &coerced
     };
     let recv_units = recv.to_utf16_vec();
     if re.flags().global {
@@ -854,74 +878,76 @@ fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         return Ok(Value::Array(JsArray::from_elements(out)));
     }
-    // Non-global → mirror `RegExp.prototype.exec`.
+    // Non-global → mirror `RegExp.prototype.exec` (carries
+    // `index` / `input` / `groups` per §22.2.7.2).
     let m = match re.regex().find_from_utf16(&recv_units, 0).next() {
         Some(m) => m,
         None => return Ok(Value::Null),
     };
-    let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-    let full = JsString::from_utf16_units(&recv_units[m.range.clone()], args.string_heap)?;
-    out.push(Value::String(full));
-    for cap in &m.captures {
-        match cap {
-            Some(r) => {
-                let s = JsString::from_utf16_units(&recv_units[r.clone()], args.string_heap)?;
-                out.push(Value::String(s));
-            }
-            None => out.push(Value::Undefined),
-        }
-    }
-    Ok(Value::Array(JsArray::from_elements(out)))
+    let arr = crate::regexp_prototype::build_match_result(
+        &m,
+        &recv_units,
+        recv,
+        re.flags().has_indices,
+        args.string_heap,
+    )?;
+    Ok(Value::Array(arr))
 }
 
 fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let re = match args.args.first() {
-        Some(Value::RegExp(r)) => r,
-        _ => {
+    let coerced;
+    let re = if is_regexp_arg(args.args.first()) {
+        let r = match args.args.first() {
+            Some(Value::RegExp(r)) => r,
+            _ => unreachable!(),
+        };
+        // §22.1.3.14 step 5.b: matchAll requires the global flag on
+        // a RegExp arg; non-global is a TypeError.
+        if !r.flags().global {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
-                reason: "must be a regular expression",
+                reason: "must be a global regular expression",
             });
         }
+        r
+    } else {
+        // §22.1.3.14 step 6.b: when the arg is not a RegExp, the
+        // synthesised regex always has `g` set so the iteration
+        // sweep visits every match.
+        let arg0 = args.args.first().unwrap_or(&Value::Undefined);
+        coerced = coerce_pattern_to_regexp(arg0, "g")?;
+        &coerced
     };
-    if !re.flags().global {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a global regular expression",
-        });
-    }
     let recv_units = recv.to_utf16_vec();
     let matches = collect_regex_matches(re, &recv_units);
+    let has_indices = re.flags().has_indices;
     let mut out: Vec<Value> = Vec::with_capacity(matches.len());
     for m in &matches {
-        let mut group: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-        let full = JsString::from_utf16_units(&recv_units[m.range.clone()], args.string_heap)?;
-        group.push(Value::String(full));
-        for cap in &m.captures {
-            match cap {
-                Some(r) => {
-                    let s = JsString::from_utf16_units(&recv_units[r.clone()], args.string_heap)?;
-                    group.push(Value::String(s));
-                }
-                None => group.push(Value::Undefined),
-            }
-        }
-        out.push(Value::Array(JsArray::from_elements(group)));
+        let arr = crate::regexp_prototype::build_match_result(
+            m,
+            &recv_units,
+            recv,
+            has_indices,
+            args.string_heap,
+        )?;
+        out.push(Value::Array(arr));
     }
     Ok(Value::Array(JsArray::from_elements(out)))
 }
 
 fn impl_search(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let re = match args.args.first() {
-        Some(Value::RegExp(r)) => r,
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a regular expression",
-            });
+    let coerced;
+    let re = if is_regexp_arg(args.args.first()) {
+        match args.args.first() {
+            Some(Value::RegExp(r)) => r,
+            _ => unreachable!(),
         }
+    } else {
+        let arg0 = args.args.first().unwrap_or(&Value::Undefined);
+        coerced = coerce_pattern_to_regexp(arg0, "")?;
+        &coerced
     };
     let recv_units = recv.to_utf16_vec();
     // `search` always starts at index 0 — `lastIndex` is ignored
@@ -952,6 +978,7 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "slice"         / 2 => impl_slice,
             "substring"     / 2 => impl_substring,
             "indexOf"       / 2 => impl_index_of,
+            "lastIndexOf"   / 2 => impl_last_index_of,
             "includes"      / 2 => impl_includes,
             "startsWith"    / 2 => impl_starts_with,
             "endsWith"      / 2 => impl_ends_with,
@@ -970,8 +997,94 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "match"         / 1 => impl_match,
             "matchAll"      / 1 => impl_match_all,
             "search"        / 1 => impl_search,
+            "localeCompare" / 1 => impl_locale_compare,
+            "normalize"     / 1 => impl_normalize,
+            "toString"      / 0 => impl_to_string,
+            "valueOf"       / 0 => impl_to_string,
         )
     });
+
+/// §22.1.3.10 String.prototype.lastIndexOf(search, fromIndex?).
+fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = match args.receiver {
+        Value::String(s) => s.to_lossy_string(),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
+    };
+    let needle = match args.args.first() {
+        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(other) => other.display_string(),
+        None => "undefined".to_string(),
+    };
+    if needle.is_empty() {
+        return Ok(Value::Number(crate::number::NumberValue::from_i32(
+            recv.chars().count() as i32,
+        )));
+    }
+    // Search from end. ECMA-262 walks code-unit positions; the
+    // foundation slice approximates with byte indices.
+    let idx = recv.rfind(&needle).map_or(-1, |b| b as i32);
+    Ok(Value::Number(crate::number::NumberValue::from_i32(idx)))
+}
+
+/// §22.1.3.12 String.prototype.localeCompare. Foundation falls
+/// back to spec-default Unicode code-point comparison; locale-
+/// aware ordering ships through `Intl.Collator`.
+fn impl_locale_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = match args.receiver {
+        Value::String(s) => s.to_lossy_string(),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
+    };
+    let other = match args.args.first() {
+        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(other) => other.display_string(),
+        None => "undefined".to_string(),
+    };
+    let cmp = match recv.cmp(&other) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(Value::Number(crate::number::NumberValue::from_i32(cmp)))
+}
+
+/// §22.1.3.13 String.prototype.normalize(form?). Foundation accepts
+/// `"NFC"` / `"NFD"` / `"NFKC"` / `"NFKD"` (default `"NFC"`) and
+/// returns the receiver string itself — the foundation slice does
+/// not perform full Unicode normalisation but mirrors the spec
+/// surface so call sites that depend on the method existing keep
+/// working. Real normalisation lands alongside the ICU integration
+/// follow-up.
+fn impl_normalize(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = match args.receiver {
+        Value::String(s) => s.clone(),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
+    };
+    let form = match args.args.first() {
+        None | Some(Value::Undefined) => "NFC".to_string(),
+        Some(Value::String(s)) => s.to_lossy_string(),
+        _ => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a string",
+            });
+        }
+    };
+    if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be one of NFC / NFD / NFKC / NFKD",
+        });
+    }
+    Ok(Value::String(recv))
+}
+
+/// §22.1.3.27 String.prototype.toString — returns the primitive.
+fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    match args.receiver {
+        Value::String(s) => Ok(Value::String(s.clone())),
+        _ => Err(IntrinsicError::BadReceiver { expected: "string" }),
+    }
+}
 
 /// Convenience accessor used by the dispatcher.
 #[must_use]

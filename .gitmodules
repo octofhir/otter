@@ -1,3 +1,7 @@
 [submodule "tests/test262"]
 	path = tests/test262
 	url = https://github.com/tc39/test262.git
+[submodule "vendor/test262"]
+	path = vendor/test262
+	url = https://github.com/tc39/test262.git
+	branch = main

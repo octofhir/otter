@@ -4579,6 +4579,64 @@ fn compile_expr(
                     new_span,
                 );
             }
+            // §20.1.1 `new Object()` / `new Object(value)` — bare-
+            // call form lowered to a fresh object via `Op::NewObject`
+            // when no args, or pass-through for object-typed args.
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Object"
+                && cx.lookup_binding("Object").is_none()
+                && find_module_import_binding(cx, "Object").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                if arg_regs.is_empty() {
+                    let dst = cx.alloc_scratch();
+                    cx.emit(Op::NewObject, vec![Operand::Register(dst)], new_span);
+                    return Ok(dst);
+                }
+                return Ok(arg_regs[0]);
+            }
+            // §23.1.1 `new Array(...)` — bare-call form yields a
+            // dense array (foundation simplification: ignores the
+            // single-numeric-length form).
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Array"
+                && cx.lookup_binding("Array").is_none()
+                && find_module_import_binding(cx, "Array").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let name_idx = cx.intern_string_constant("of");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::ArrayCall, operands, new_span);
+                return Ok(dst);
+            }
+            // §21.1.1 `new Number(value)` — foundation aliases to
+            // primitive ToNumber (no wrapper object).
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "Number"
+                && cx.lookup_binding("Number").is_none()
+                && find_module_import_binding(cx, "Number").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let dst = cx.alloc_scratch();
+                match arg_regs.first().copied() {
+                    Some(src) => cx.emit(
+                        Op::ToNumber,
+                        vec![Operand::Register(dst), Operand::Register(src)],
+                        new_span,
+                    ),
+                    None => cx.emit(
+                        Op::LoadInt32,
+                        vec![Operand::Register(dst), Operand::Imm32(0)],
+                        new_span,
+                    ),
+                }
+                return Ok(dst);
+            }
             // §20.3.1 `new Boolean(value)` — foundation aliases to
             // primitive ToBoolean (no wrapper object).
             // <https://tc39.es/ecma262/#sec-boolean-constructor>

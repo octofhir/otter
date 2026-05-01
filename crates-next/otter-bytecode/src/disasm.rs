@@ -102,6 +102,7 @@ mod tests {
                 is_generator: false,
                 is_async_generator: false,
                 is_module: false,
+                needs_arguments: false,
                 module_url: String::new(),
                 code: vec![Instruction {
                     pc: 0,

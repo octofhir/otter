@@ -2276,6 +2276,64 @@ fn compile_for_init_decl(
 /// `<main>` / `<module-init>` to `is_async = true` when this
 /// returns true so `Op::Await` can park the entry frame, matching
 /// §16.2.1.7 `top-level-await` modules.
+/// Walk a non-arrow function body and report whether it references
+/// the `arguments` identifier in a binding that escapes the body's
+/// own arrow / nested-function scopes. Arrow functions inherit
+/// `arguments` lexically per §10.2.1.4 so a reference inside an
+/// arrow within the body still implies the enclosing function
+/// must materialise the object.
+fn body_references_arguments(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+) -> bool {
+    use oxc_ast_visit::Visit;
+    #[derive(Default)]
+    struct ArgsFinder {
+        nested_function_depth: u32,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for ArgsFinder {
+        fn visit_function(
+            &mut self,
+            it: &oxc_ast::ast::Function<'a>,
+            flags: oxc_syntax::scope::ScopeFlags,
+        ) {
+            // Nested non-arrow function — has its own `arguments`.
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_function(self, it, flags);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_class_body(&mut self, it: &oxc_ast::ast::ClassBody<'a>) {
+            // Class methods are functions with their own arguments.
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_class_body(self, it);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
+            if self.nested_function_depth == 0 && id.name.as_str() == "arguments" {
+                self.found = true;
+            }
+        }
+    }
+    let mut finder = ArgsFinder::default();
+    // Param defaults can reference `arguments` (sloppy mode); even
+    // in strict mode, `function f(x = arguments) {}` is valid.
+    for p in &params.items {
+        if let Some(init) = p.initializer.as_deref() {
+            finder.visit_expression(init);
+        }
+    }
+    if let Some(rest) = &params.rest {
+        finder.visit_binding_rest_element(&rest.rest);
+    }
+    if let Some(b) = body {
+        for stmt in &b.statements {
+            finder.visit_statement(stmt);
+        }
+    }
+    finder.found
+}
+
 fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool {
     use oxc_ast_visit::Visit;
     #[derive(Default)]
@@ -2722,6 +2780,18 @@ fn compile_function_full(
     // every `var`-declared name in the body to the function scope
     // and pre-bind it to `undefined`. Reads before the source-level
     // declaration site observe the hoisted `undefined` (no TDZ).
+    let needs_arguments = body_references_arguments(params, body.as_deref());
+    if needs_arguments && parent.lookup_binding("arguments").is_none() {
+        // §10.2.11 FunctionDeclarationInstantiation step 22 — bind
+        // `arguments` in the function scope before any var/lex
+        // declaration so user code reading it gets the array.
+        // Skip if a parameter named `arguments` already exists.
+        let storage = parent.declare_binding("arguments", false, span)?;
+        let tmp = parent.alloc_scratch();
+        parent.emit(Op::CollectArguments, vec![Operand::Register(tmp)], span);
+        parent.emit_store_storage(tmp, storage, span);
+        parent.mark_initialized("arguments");
+    }
     if let Some(body) = body {
         let mut var_names: Vec<String> = Vec::new();
         hoist_var_names(&body.statements, &mut var_names);
@@ -2758,6 +2828,7 @@ fn compile_function_full(
     slot.is_async = is_async;
     slot.is_generator = is_generator;
     slot.is_async_generator = is_async_generator;
+    slot.needs_arguments = needs_arguments;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;

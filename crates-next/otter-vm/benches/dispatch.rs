@@ -47,6 +47,7 @@ fn bench_dispatch(c: &mut Criterion) {
             is_generator: false,
             is_async_generator: false,
             is_module: false,
+            needs_arguments: false,
             module_url: String::new(),
             code,
             spans,

@@ -802,6 +802,13 @@ pub struct Frame {
     /// fresh `JsArray`. Always empty for non-rest callees so the
     /// allocation cost is paid only when needed.
     pub rest_args: SmallVec<[Value; 4]>,
+    /// Full incoming-argument list captured at call entry. Used by
+    /// [`otter_bytecode::Op::CollectArguments`] to materialise an
+    /// `arguments`-style array containing every value the caller
+    /// supplied — including the named parameters. Populated only
+    /// when the callee was compiled with `needs_arguments = true`
+    /// so non-arguments-using functions pay no allocation cost.
+    pub incoming_args: SmallVec<[Value; 4]>,
     /// Async-call state: `Some` when this frame belongs to an
     /// `async` function. The result promise was created at call
     /// entry and written into the caller's destination register
@@ -1062,6 +1069,7 @@ impl Frame {
             pending_throw: None,
             construct_target: None,
             rest_args: SmallVec::new(),
+            incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_str()),
             pending_to_primitive: None,
@@ -3644,6 +3652,18 @@ impl Interpreter {
                     write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
                     frame.pc += 1;
                 }
+                Op::CollectArguments => {
+                    // §10.4.4 Arguments Exotic Objects (foundation
+                    // lowers the unmapped variant — strict mode is
+                    // ADR-0001's default). Wrap the captured argv
+                    // as a fresh JsArray. Drain so the frame's
+                    // copy is released after the (typically
+                    // single) materialisation.
+                    let dst = register_operand(operands.first())?;
+                    let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.incoming_args);
+                    write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
+                    frame.pc += 1;
+                }
                 Op::ImportNamespace => {
                     let dst = register_operand(operands.first())?;
                     let spec_idx = const_operand(operands.get(1))?;
@@ -4270,6 +4290,13 @@ impl Interpreter {
         // stay `Value::Undefined` (matches JS semantics).
         let bind_count = (function.param_count as usize).min(effective_args.len());
         let total_args = effective_args.len();
+        // Snapshot the full argv when the callee body references
+        // `arguments`. Cloning is cheap because effective_args is a
+        // SmallVec; the snapshot is consumed exactly once by
+        // `Op::CollectArguments`.
+        if function.needs_arguments {
+            new_frame.incoming_args = effective_args.iter().cloned().collect();
+        }
         let mut iter = effective_args.into_iter();
         for i in 0..bind_count {
             let value = iter.next().expect("bind_count <= len");
@@ -8552,6 +8579,7 @@ mod tests {
                 is_generator: false,
                 is_async_generator: false,
                 is_module: false,
+                needs_arguments: false,
                 module_url: String::new(),
                 code,
                 spans,
@@ -8618,6 +8646,7 @@ mod tests {
             is_generator: false,
             is_async_generator: false,
             is_module: false,
+            needs_arguments: false,
             module_url: String::new(),
             code: vec![Instruction {
                 pc: 0,
@@ -8661,6 +8690,7 @@ mod tests {
             is_generator: false,
             is_async_generator: false,
             is_module: false,
+            needs_arguments: false,
             module_url: String::new(),
             code: vec![Instruction {
                 pc: 0,
@@ -8732,6 +8762,7 @@ mod tests {
             is_generator: false,
             is_async_generator: false,
             is_module: false,
+            needs_arguments: false,
             module_url: String::new(),
             code: vec![Instruction {
                 pc: 0,
@@ -8757,6 +8788,7 @@ mod tests {
             is_generator: false,
             is_async_generator: false,
             is_module: false,
+            needs_arguments: false,
             module_url: String::new(),
             code: vec![
                 Instruction {

@@ -511,6 +511,18 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-getvalue>
     LoadGlobalOrThrow,
 
+    /// `r<dst> = arguments` — materialise the current frame's
+    /// incoming argument list as a fresh JsArray. Operand:
+    /// `Register(dst)`. The dispatcher populates `frame.incoming_args`
+    /// at call entry only when the callee was compiled with
+    /// `needs_arguments = true`, so this opcode is only emitted
+    /// inside such functions.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-arguments-exotic-objects>
+    /// (foundation lowers the unmapped variant for strict-mode
+    /// scripts).
+    CollectArguments,
+
     /// `r<dst> = globalThis[const<name>]` returning `undefined` when
     /// the binding does not exist. Operands:
     /// `Register(dst), ConstIndex(name)`.
@@ -1051,6 +1063,7 @@ impl Op {
             Op::LoadGlobalThis => "LOAD_GLOBAL_THIS",
             Op::LoadGlobalOrThrow => "LOAD_GLOBAL_OR_THROW",
             Op::LoadGlobalOrUndefined => "LOAD_GLOBAL_OR_UNDEFINED",
+            Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
@@ -1088,6 +1101,7 @@ impl Op {
             | Op::Throw
             | Op::NewObject
             | Op::CollectRest
+            | Op::CollectArguments
             | Op::LoadGlobalThis => 1,
             Op::LoadString
             | Op::LoadNumber
@@ -1350,6 +1364,17 @@ pub struct Function {
     /// have a stable hook.
     #[serde(default)]
     pub is_module: bool,
+    /// `true` when the function body references the `arguments`
+    /// identifier and the function is not an arrow (arrows
+    /// inherit `arguments` lexically per §10.2.1.4 — the foundation
+    /// flags arrows as `false` so their parent frame's
+    /// `incoming_args` is consulted via the upvalue chain).
+    ///
+    /// When set, the call dispatcher stashes the full incoming
+    /// argv into the new frame's `incoming_args` so
+    /// [`Op::CollectArguments`] can wrap it as an Array.
+    #[serde(default)]
+    pub needs_arguments: bool,
     /// The source-module URL this function belongs to (e.g.
     /// `"file:///path/to/other.ts"`), recorded by the linker
     /// during module-fragment merging. The runtime threads this

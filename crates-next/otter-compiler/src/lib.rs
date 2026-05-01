@@ -6420,6 +6420,91 @@ fn compile_method_call(
         cx.emit(Op::StringCall, operands, span);
         return Ok(dst);
     }
+    // §21.1.1 `Number(value)` — coerce to a primitive number per
+    // ToNumber. Bare-call form (no `new`) yields the primitive
+    // result; foundation hands it back via `Op::ToNumber`.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Number"
+        && cx.lookup_binding("Number").is_none()
+        && find_module_import_binding(cx, "Number").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        match arg_regs.first().copied() {
+            Some(src) => cx.emit(
+                Op::ToNumber,
+                vec![Operand::Register(dst), Operand::Register(src)],
+                span,
+            ),
+            None => cx.emit(
+                Op::LoadInt32,
+                vec![Operand::Register(dst), Operand::Imm32(0)],
+                span,
+            ),
+        }
+        return Ok(dst);
+    }
+    // §20.3.1 `Boolean(value)` — primitive ToBoolean.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Boolean"
+        && cx.lookup_binding("Boolean").is_none()
+        && find_module_import_binding(cx, "Boolean").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        match arg_regs.first().copied() {
+            Some(src) => cx.emit(
+                Op::ToBoolean,
+                vec![Operand::Register(dst), Operand::Register(src)],
+                span,
+            ),
+            None => cx.emit(Op::LoadFalse, vec![Operand::Register(dst)], span),
+        }
+        return Ok(dst);
+    }
+    // §23.1.1 `Array(...)` — bare-call form. Foundation routes
+    // through `Op::ArrayCall("of", ...)` which builds a dense
+    // array from the args (matches `Array.of` semantics modulo
+    // the single-numeric-argument length form, which we don't
+    // model yet).
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Array"
+        && cx.lookup_binding("Array").is_none()
+        && find_module_import_binding(cx, "Array").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let name_idx = cx.intern_string_constant("of");
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::ArrayCall, operands, span);
+        return Ok(dst);
+    }
+    // §20.1.1 `Object(value)` — bare-call form. Foundation routes
+    // through `Op::ObjectCall("from", ...)` (a helper that wraps
+    // the value via the existing object-coercion path). For
+    // `undefined` / `null` / no-args, the runtime returns a fresh
+    // empty object.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Object"
+        && cx.lookup_binding("Object").is_none()
+        && find_module_import_binding(cx, "Object").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        // Foundation: when no args, return a fresh object via NewObject.
+        if arg_regs.is_empty() {
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::NewObject, vec![Operand::Register(dst)], span);
+            return Ok(dst);
+        }
+        // With one arg, return the arg unchanged when it's an
+        // object (foundation simplification of §20.1.1.1 OrdinaryToPrimitive).
+        let dst = arg_regs[0];
+        return Ok(dst);
+    }
     // §21.4.3 Date statics — `Date.now` / `Date.parse` / `Date.UTC`
     // lower through `Op::DateCall` with the literal method name.
     // <https://tc39.es/ecma262/#sec-properties-of-the-date-constructor>

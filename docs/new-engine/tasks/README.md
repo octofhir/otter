@@ -221,6 +221,7 @@ Foundation artifacts that stay (not tasks, never deleted):
 - [ADR-0001 — staging directory](../adr/0001-staging-directory.md)
 - [ADR-0002 — OXC frontend](../adr/0002-oxc-frontend.md)
 - [ADR-0003 — public API & CLI](../adr/0003-public-api-and-cli.md)
+- [ADR-0004 — GC crate & unsafe boundary](../adr/0004-gc-crate-and-unsafe-boundary.md)
 - [Spec — `otter test` harness](../specs/otter-test-harness.md)
 - [Spec — bytecode dump / disasm / trace](../specs/bytecode-dump-disasm-trace.md)
 
@@ -348,10 +349,50 @@ individual task files split out as work begins. Headlines:
 | [55-otter-macros-next.md](./55-otter-macros-next.md) | New `otter-macros-next` proc-macro crate (`#[js_method]`, `js_proto!`, `#[js_namespace]`); migrate string / array / number / math / regexp prototype tables. |
 | [56-remove-refcell-from-hot-paths.md](./56-remove-refcell-from-hot-paths.md) | Remove `RefCell` from every hot path in `crates-next/*`; replace with `&mut` field access threaded through `dispatch_loop`. Required before task 35 (async) lands. |
 
-> GC and JIT are explicitly **out of scope** for the current phase.
-> They each get their own architectural plan + dedicated track once
-> ECMA-262 spec coverage is complete. Don't file or merge tasks for
-> them in this pool.
+> JIT is out of scope for the current phase. **GC has now opened**
+> as its own dedicated track (tasks 70–87) — see
+> [70-gc-master-tracker.md](./70-gc-master-tracker.md) and the
+> design doc at
+> [`docs/new-engine/gc-architecture.md`](../gc-architecture.md). Pick
+> tasks in numeric order (70 → 71 → 72 → …) and validate gates per
+> task; do not file new GC work outside that track.
+
+### GC track (tasks 70–87)
+
+Replace `Rc<RefCell<…>>` with a `Gc<T>` handle backed by a
+**production-grade page-based generational tracing GC**, ported as
+new code (under ADR-0001 §6 conventions) from the V8/JSC-shaped
+design in legacy `crates/otter-gc/`. **No path-dep on `crates/*`**;
+**no handle-table interim**; one migration sweep, one
+write-barrier audit. Phase 1 (71–84) ships the full page heap +
+generational scavenger + STW old-gen mark-sweep + write barriers
+and unblocks the test sweep. Phase 2 (86) lights up incremental
+marking on the same barrier insertion sites. Phase 3 (87) is
+deferred indefinitely.
+
+| File | One-line goal |
+|------|---------------|
+| [70-gc-master-tracker.md](./70-gc-master-tracker.md) | Master tracker; all phases checklisted in one place. |
+| ✅ 71 (closed 2026-05-02) | New `crates-next/otter-gc` empty crate; ADR-0004 amends ADR-0001 §5 to lift `forbid(unsafe_code)` for this crate only. |
+| [72-gc-core-heap-and-handles.md](./72-gc-core-heap-and-handles.md) | Page heap: `GcHeader`, `Page`, semispace + old-space + LOS, Cheney scavenger, tri-color marking, generational + insertion barriers, type-tag fn-ptr trace table, `Gc<T>`/`Local<'gc, T>`/`HandleScope<'gc>`. |
+| [73-gc-oom-and-cap-enforcement.md](./73-gc-oom-and-cap-enforcement.md) | `OutOfMemory` + cap enforcement; `Runtime::max_heap_bytes` from informational → load-bearing. |
+| [74-gc-stats-and-snapshot.md](./74-gc-stats-and-snapshot.md) | `GcStats`, `HeapSnapshot`, retained-size walker, `Runtime::heap_stats()`. |
+| [75-gc-root-enumeration.md](./75-gc-root-enumeration.md) | `RuntimeState::trace_roots`: frames, microtask queue, module envs, dynamic-import host, symbol registry. |
+| [76-migrate-upvalue-cell.md](./76-migrate-upvalue-cell.md) | First migration: `UpvalueCell` from `Rc<RefCell<Value>>` to `Gc<UpvalueCellBody>` + barrier on every store. |
+| [77-migrate-jsobject.md](./77-migrate-jsobject.md) | `JsObject` to `Gc<ObjectBody>`; barriers on every property store. |
+| [78-migrate-jsarray.md](./78-migrate-jsarray.md) | `JsArray` to `Gc<ArrayBody>`; barriers on element / named-prop stores. |
+| [79-migrate-jsmap-jsset.md](./79-migrate-jsmap-jsset.md) | `JsMap` / `JsSet` to `Gc<…>`; barriers on entry stores. |
+| [80-migrate-weakmap-weakset-ephemerons.md](./80-migrate-weakmap-weakset-ephemerons.md) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes long-standing "task 57" markers). |
+| [81-weakref-finalization-registry.md](./81-weakref-finalization-registry.md) | Introduce `WeakRef` and `FinalizationRegistry`. |
+| [82-migrate-promise-iterator-generator.md](./82-migrate-promise-iterator-generator.md) | `JsPromiseHandle::Pure`, `IteratorState`, generator-frame state. |
+| [83-migrate-bound-native-regexp.md](./83-migrate-bound-native-regexp.md) | `BoundFunction`, `NativeFunction`, `JsRegExp` — last `Rc`-shared variants. |
+| [84-phase1-closeout-test262-array-sweep.md](./84-phase1-closeout-test262-array-sweep.md) | Phase 1 exit criteria: regression suite + cap-as-`RangeError` + `bash scripts/test262-safe.sh built-ins/Array` end-to-end on a 16 GB host. |
+| [86-gc-incremental-marking.md](./86-gc-incremental-marking.md) | Phase 2 — incremental marking + concurrent sweep + incremental sweep + allocation-site pretenuring. Phase-1 barriers go load-bearing; no new audit sweep. |
+| [88-gc-mark-compact.md](./88-gc-mark-compact.md) | Phase 3 — sliding compactor for old-gen fragmentation. |
+| [89-gc-memory-reducer-idle-gc.md](./89-gc-memory-reducer-idle-gc.md) | Phase 3 — `Runtime::notify_idle` + memory-reducer state machine; matches V8 MemoryReducer. |
+| [90-gc-sticky-mark-bit.md](./90-gc-sticky-mark-bit.md) | Phase 3 — sticky-mark-bit minor cycles; throughput win on steady-state long-running workloads. |
+| [87-gc-concurrent-marking.md](./87-gc-concurrent-marking.md) | Phase 4 — concurrent marking + parallel scavenge. **Deferred indefinitely.** |
+| [91-gc-bench-and-soak-infra.md](./91-gc-bench-and-soak-infra.md) | Cross-cutting — Criterion benches + cargo-fuzz corpus + 24 h soak runner + miri/asan/lsan/tsan CI matrix + V8-parity benchmark suite. Required for any production-grade gate to be verifiable. |
 
 ### Test262 conformance
 

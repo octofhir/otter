@@ -8,6 +8,7 @@ members = [
     "crates-next/otter-bytecode",
     "crates-next/otter-syntax",
     "crates-next/otter-compiler",
+    "crates-next/otter-gc",
     "crates-next/otter-vm",
     "crates-next/otter-runtime",
     "crates-next/otter-test",
@@ -97,6 +98,7 @@ criterion   = { version = "0.8", features = ["html_reports"] }
 otter-bytecode  = { path = "crates-next/otter-bytecode" }
 otter-syntax    = { path = "crates-next/otter-syntax" }
 otter-compiler  = { path = "crates-next/otter-compiler" }
+otter-gc        = { path = "crates-next/otter-gc" }
 otter-vm        = { path = "crates-next/otter-vm" }
 otter-runtime   = { path = "crates-next/otter-runtime" }
 otter-test      = { path = "crates-next/otter-test" }

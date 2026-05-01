@@ -1226,6 +1226,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-gc"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "otter-runtime"
 version = "0.1.0"
 dependencies = [

@@ -2214,39 +2214,51 @@ fn compile_for_init_decl(
     let is_var = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var);
     for declarator in &decl.declarations {
         let span = (declarator.span.start, declarator.span.end);
-        let name = match &declarator.id {
-            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+        match &declarator.id {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
+                let name = id.name.as_str().to_string();
+                // §14.7.4 ForLoopEvaluation — `var` re-uses the
+                // function-scope binding pre-hoisted at function
+                // entry; `let`/`const` declare a fresh per-loop
+                // binding.
+                let storage = if is_var {
+                    cx.lookup_binding(&name)
+                        .ok_or(CompileError::Unsupported {
+                            node: format!("for-init var `{name}` not pre-hoisted"),
+                            span,
+                        })?
+                        .storage
+                } else {
+                    cx.declare_binding(&name, is_const, span)?
+                };
+                let init_reg = match &declarator.init {
+                    Some(init) => compile_expr(cx, init, span)?,
+                    None => {
+                        let dst = cx.alloc_scratch();
+                        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                        dst
+                    }
+                };
+                cx.emit_store_storage(init_reg, storage, span);
+                cx.mark_initialized(&name);
+            }
+            // §14.7.4 — destructuring init: `for (const [a, b] = …; …)`.
+            // The initializer is required (let/const/var destructuring
+            // without an initializer is a SyntaxError; oxc enforces
+            // that).
             _ => {
-                return Err(CompileError::Unsupported {
-                    node: "for-init declarator pattern (non-identifier)".to_string(),
+                let init = declarator.init.as_ref().ok_or(CompileError::Unsupported {
+                    node: "for-init destructuring without initializer".to_string(),
                     span,
-                });
+                })?;
+                let init_reg = compile_expr(cx, init, span)?;
+                if is_var {
+                    destructure_assign(cx, init_reg, &declarator.id, span)?;
+                } else {
+                    destructure_into(cx, init_reg, &declarator.id, span)?;
+                }
             }
-        };
-        // §14.7.4 ForLoopEvaluation — `var` re-uses the function-
-        // scope binding pre-hoisted at function entry; `let`/`const`
-        // declare a fresh per-loop binding. Fail-fast if the var
-        // pre-pass missed a name.
-        let storage = if is_var {
-            cx.lookup_binding(&name)
-                .ok_or(CompileError::Unsupported {
-                    node: format!("for-init var `{name}` not pre-hoisted"),
-                    span,
-                })?
-                .storage
-        } else {
-            cx.declare_binding(&name, is_const, span)?
-        };
-        let init_reg = match &declarator.init {
-            Some(init) => compile_expr(cx, init, span)?,
-            None => {
-                let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
-                dst
-            }
-        };
-        cx.emit_store_storage(init_reg, storage, span);
-        cx.mark_initialized(&name);
+        }
     }
     Ok(())
 }
@@ -3292,7 +3304,12 @@ fn assign_object_pattern(
     value_reg: u16,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
-    use oxc_ast::ast::AssignmentTargetProperty;
+    use oxc_ast::ast::{AssignmentTargetProperty, PropertyKey};
+    enum ExtractedKey {
+        Static(String),
+        Runtime(u16),
+    }
+    let mut extracted_keys: Vec<ExtractedKey> = Vec::new();
     for prop in &obj.properties {
         match prop {
             AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
@@ -3305,47 +3322,111 @@ fn assign_object_pattern(
                     None => val,
                 };
                 store_identifier(cx, &name, final_val, pspan)?;
+                extracted_keys.push(ExtractedKey::Static(name));
             }
             AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
                 let pspan = span;
-                use oxc_ast::ast::PropertyKey;
                 let val = cx.alloc_scratch();
-                match &p.name {
-                    PropertyKey::StaticIdentifier(id) => {
-                        cx.emit_load_property(val, value_reg, id.name.as_str(), pspan);
-                    }
-                    PropertyKey::StringLiteral(lit) => {
-                        cx.emit_load_property(val, value_reg, &lit.value, pspan);
-                    }
-                    other => {
-                        let key_expr =
-                            other
-                                .as_expression()
-                                .ok_or_else(|| CompileError::Unsupported {
-                                    node: "ObjectAssignmentTarget: non-expression key".to_string(),
-                                    span: pspan,
-                                })?;
-                        let key_reg = compile_expr(cx, key_expr, pspan)?;
-                        cx.emit(
-                            Op::LoadElement,
-                            vec![
-                                Operand::Register(val),
-                                Operand::Register(value_reg),
-                                Operand::Register(key_reg),
-                            ],
-                            pspan,
-                        );
-                    }
+                if p.computed {
+                    let key_reg = match &p.name {
+                        PropertyKey::StaticIdentifier(id) => {
+                            let r = cx.alloc_scratch();
+                            let s = cx.intern_string_constant(id.name.as_str());
+                            cx.emit(
+                                Op::LoadString,
+                                vec![Operand::Register(r), Operand::ConstIndex(s)],
+                                pspan,
+                            );
+                            r
+                        }
+                        _ => compile_expr_as_property_key(cx, &p.name, pspan)?,
+                    };
+                    cx.emit(
+                        Op::LoadElement,
+                        vec![
+                            Operand::Register(val),
+                            Operand::Register(value_reg),
+                            Operand::Register(key_reg),
+                        ],
+                        pspan,
+                    );
+                    extracted_keys.push(ExtractedKey::Runtime(key_reg));
+                } else {
+                    let key_str = match &p.name {
+                        PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+                        PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                        PropertyKey::NumericLiteral(lit) => {
+                            numeric_literal_to_property_key(lit.value)
+                        }
+                        PropertyKey::BigIntLiteral(lit) => lit
+                            .raw
+                            .as_ref()
+                            .map(|s| s.as_str())
+                            .unwrap_or("")
+                            .trim_end_matches('n')
+                            .to_string(),
+                        other => {
+                            return Err(CompileError::Unsupported {
+                                node: format!("ObjectAssignmentTarget: non-string key ({other:?})"),
+                                span: pspan,
+                            });
+                        }
+                    };
+                    cx.emit_load_property(val, value_reg, &key_str, pspan);
+                    extracted_keys.push(ExtractedKey::Static(key_str));
                 }
                 assign_maybe_default(cx, &p.binding, val, pspan)?;
             }
         }
     }
-    if let Some(_rest) = obj.rest.as_ref() {
-        return Err(CompileError::Unsupported {
-            node: "ObjectAssignmentTarget: rest element (foundation slice deferred)".to_string(),
+    if let Some(rest) = obj.rest.as_ref() {
+        // §13.15.5 RestObjectAssignment — same shape as the
+        // BindingPattern variant.
+        let rest_obj = cx.alloc_scratch();
+        cx.emit(Op::NewObject, vec![Operand::Register(rest_obj)], span);
+        let assign_const = cx.intern_string_constant("assign");
+        let scratch = cx.alloc_scratch();
+        cx.emit(
+            Op::ObjectCall,
+            vec![
+                Operand::Register(scratch),
+                Operand::ConstIndex(assign_const),
+                Operand::ConstIndex(2),
+                Operand::Register(rest_obj),
+                Operand::Register(value_reg),
+            ],
             span,
-        });
+        );
+        for key in &extracted_keys {
+            match key {
+                ExtractedKey::Static(s) => {
+                    let key_const = cx.intern_string_constant(s);
+                    let del_dst = cx.alloc_scratch();
+                    cx.emit(
+                        Op::DeleteProperty,
+                        vec![
+                            Operand::Register(del_dst),
+                            Operand::Register(rest_obj),
+                            Operand::ConstIndex(key_const),
+                        ],
+                        span,
+                    );
+                }
+                ExtractedKey::Runtime(key_reg) => {
+                    let del_dst = cx.alloc_scratch();
+                    cx.emit(
+                        Op::DeleteElement,
+                        vec![
+                            Operand::Register(del_dst),
+                            Operand::Register(rest_obj),
+                            Operand::Register(*key_reg),
+                        ],
+                        span,
+                    );
+                }
+            }
+        }
+        assign_to_target(cx, &rest.target, rest_obj, span)?;
     }
     Ok(())
 }
@@ -3727,55 +3808,98 @@ fn destructure_object_inner(
     span: (u32, u32),
     assign_existing: bool,
 ) -> Result<(), CompileError> {
-    // §13.15.5 RestObjectAssignment — collect every enumerable own
-    // property of `src` *except* the ones extracted above into a
-    // fresh object, then bind it to the rest target. Foundation
-    // copies via `Object.assign({}, src)` then deletes the named
-    // properties.
-    let mut extracted_keys: Vec<String> = Vec::new();
-    for prop in &pattern.properties {
-        if !prop.computed {
-            if let oxc_ast::ast::PropertyKey::StaticIdentifier(id) = &prop.key {
-                extracted_keys.push(id.name.as_str().to_string());
-            } else if let oxc_ast::ast::PropertyKey::StringLiteral(lit) = &prop.key {
-                extracted_keys.push(lit.value.to_string());
-            }
-        }
+    // Track keys extracted by named/computed properties so the
+    // rest element (`...r`) can exclude them when copying the
+    // remaining own enumerable properties.
+    enum ExtractedKey {
+        Static(String),
+        Runtime(u16),
     }
+    let mut extracted_keys: Vec<ExtractedKey> = Vec::new();
+
     for prop in &pattern.properties {
         let prop_span = (prop.span.start, prop.span.end);
-        if prop.computed {
-            return Err(CompileError::Unsupported {
-                node: "ObjectPattern: computed key".to_string(),
-                span: prop_span,
-            });
-        }
-        let key_str = match &prop.key {
-            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
-            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
-            _ => {
-                return Err(CompileError::Unsupported {
-                    node: "ObjectPattern: non-string key".to_string(),
-                    span: prop_span,
-                });
-            }
-        };
-        let key_const = parent.intern_string_constant(&key_str);
         let value_reg = parent.alloc_scratch();
-        parent.emit(
-            Op::LoadProperty,
-            vec![
-                Operand::Register(value_reg),
-                Operand::Register(src_reg),
-                Operand::ConstIndex(key_const),
-            ],
-            prop_span,
-        );
+        if prop.computed {
+            // §13.15.5 — computed key evaluated at destructuring
+            // time, then `obj[key]` via `Op::LoadElement`.
+            let key_reg = match &prop.key {
+                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
+                    let r = parent.alloc_scratch();
+                    let s = parent.intern_string_constant(id.name.as_str());
+                    parent.emit(
+                        Op::LoadString,
+                        vec![Operand::Register(r), Operand::ConstIndex(s)],
+                        prop_span,
+                    );
+                    r
+                }
+                _ => compile_expr_as_property_key(parent, &prop.key, prop_span)?,
+            };
+            parent.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(value_reg),
+                    Operand::Register(src_reg),
+                    Operand::Register(key_reg),
+                ],
+                prop_span,
+            );
+            extracted_keys.push(ExtractedKey::Runtime(key_reg));
+        } else {
+            // Static identifier / string / numeric / bigint key —
+            // resolved to a string at compile time.
+            let key_str: Option<String> = match &prop.key {
+                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
+                    Some(id.name.as_str().to_string())
+                }
+                oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
+                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
+                    // §6.1.7.1 ToString(Number) — match runtime
+                    // semantics so e.g. `1` and `1.0` both key as
+                    // "1". Foundation defers to Rust f64 → string
+                    // for the integer cases (NumericLiteral parses
+                    // the source form).
+                    Some(numeric_literal_to_property_key(lit.value))
+                }
+                oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
+                    // BigInt literal in property key: ToString
+                    // strips the trailing `n`. oxc preserves the
+                    // raw text including the suffix.
+                    let raw = lit.raw.as_ref().map(|s| s.as_str()).unwrap_or("");
+                    Some(raw.trim_end_matches('n').to_string())
+                }
+                _ => None,
+            };
+            match key_str {
+                Some(s) => {
+                    let key_const = parent.intern_string_constant(&s);
+                    parent.emit(
+                        Op::LoadProperty,
+                        vec![
+                            Operand::Register(value_reg),
+                            Operand::Register(src_reg),
+                            Operand::ConstIndex(key_const),
+                        ],
+                        prop_span,
+                    );
+                    extracted_keys.push(ExtractedKey::Static(s));
+                }
+                None => {
+                    return Err(CompileError::Unsupported {
+                        node: format!("ObjectPattern: non-string key ({:?})", prop.key),
+                        span: prop_span,
+                    });
+                }
+            }
+        }
         destructure_pattern(parent, value_reg, &prop.value, prop_span, assign_existing)?;
     }
+
     if let Some(rest) = pattern.rest.as_ref() {
-        // Build `rest_obj = Object.assign({}, src)` then delete
-        // every extracted key, then bind into the rest target.
+        // §13.15.5 RestObjectAssignment — build a fresh object,
+        // copy every enumerable own property of `src`, then delete
+        // each previously-extracted key.
         let rest_obj = parent.alloc_scratch();
         parent.emit(Op::NewObject, vec![Operand::Register(rest_obj)], span);
         let assign_const = parent.intern_string_constant("assign");
@@ -3792,21 +3916,84 @@ fn destructure_object_inner(
             span,
         );
         for key in &extracted_keys {
-            let key_const = parent.intern_string_constant(key);
-            let del_dst = parent.alloc_scratch();
-            parent.emit(
-                Op::DeleteProperty,
-                vec![
-                    Operand::Register(del_dst),
-                    Operand::Register(rest_obj),
-                    Operand::ConstIndex(key_const),
-                ],
-                span,
-            );
+            match key {
+                ExtractedKey::Static(s) => {
+                    let key_const = parent.intern_string_constant(s);
+                    let del_dst = parent.alloc_scratch();
+                    parent.emit(
+                        Op::DeleteProperty,
+                        vec![
+                            Operand::Register(del_dst),
+                            Operand::Register(rest_obj),
+                            Operand::ConstIndex(key_const),
+                        ],
+                        span,
+                    );
+                }
+                ExtractedKey::Runtime(key_reg) => {
+                    let del_dst = parent.alloc_scratch();
+                    parent.emit(
+                        Op::DeleteElement,
+                        vec![
+                            Operand::Register(del_dst),
+                            Operand::Register(rest_obj),
+                            Operand::Register(*key_reg),
+                        ],
+                        span,
+                    );
+                }
+            }
         }
         destructure_pattern(parent, rest_obj, &rest.argument, span, assign_existing)?;
     }
     Ok(())
+}
+
+/// Format a `NumericLiteral`'s value as a property key per
+/// §6.1.7.1 ToString(Number). Integer values produce the bare
+/// integer string ("1" not "1.0"); other finite numbers go
+/// through Rust's default f64 formatter.
+fn numeric_literal_to_property_key(n: f64) -> String {
+    if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e21 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Lower a non-static `PropertyKey` to a register holding the
+/// runtime key value. Used by destructuring patterns when the
+/// key is a computed expression or a primitive literal that we
+/// need at runtime (e.g. for delete in object-rest exclusion).
+fn compile_expr_as_property_key(
+    cx: &mut Compiler,
+    key: &oxc_ast::ast::PropertyKey<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    use oxc_ast::ast::PropertyKey;
+    if let Some(expr) = key.as_expression() {
+        return compile_expr(cx, expr, span);
+    }
+    match key {
+        PropertyKey::StaticIdentifier(id) => {
+            let r = cx.alloc_scratch();
+            let s = cx.intern_string_constant(id.name.as_str());
+            cx.emit(
+                Op::LoadString,
+                vec![Operand::Register(r), Operand::ConstIndex(s)],
+                span,
+            );
+            Ok(r)
+        }
+        PropertyKey::PrivateIdentifier(_) => Err(CompileError::Unsupported {
+            node: "PrivateIdentifier as property key in pattern".to_string(),
+            span,
+        }),
+        _ => Err(CompileError::Unsupported {
+            node: format!("PropertyKey ({key:?}) in pattern"),
+            span,
+        }),
+    }
 }
 
 /// Compile an arrow function. Two body shapes share the same
@@ -6264,18 +6451,19 @@ fn compile_catch_clause(
 ) -> Result<(), CompileError> {
     cx.enter_scope();
     if let Some(param) = &handler.param {
-        let pname = match &param.pattern {
-            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
-            _ => {
-                return Err(CompileError::Unsupported {
-                    node: "CatchClause: destructuring binding".to_string(),
-                    span,
-                });
+        match &param.pattern {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
+                let pname = id.name.as_str().to_string();
+                let storage = cx.declare_binding(&pname, false, span)?;
+                cx.emit_store_storage(exc_reg, storage, span);
+                cx.mark_initialized(&pname);
             }
-        };
-        let storage = cx.declare_binding(&pname, false, span)?;
-        cx.emit_store_storage(exc_reg, storage, span);
-        cx.mark_initialized(&pname);
+            // §14.15 Catch — `catch (pattern) { … }` accepts a
+            // BindingPattern. Destructure the exception value into
+            // freshly-declared lexical bindings.
+            // <https://tc39.es/ecma262/#sec-runtime-semantics-catchclauseevaluation>
+            _ => destructure_into(cx, exc_reg, &param.pattern, span)?,
+        }
     }
     for inner in &handler.body.body {
         compile_statement(cx, inner)?;

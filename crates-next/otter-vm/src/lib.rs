@@ -2079,6 +2079,10 @@ impl Interpreter {
                     self.do_construct(stack, module, &operands)?;
                     continue;
                 }
+                Op::NewSpread => {
+                    self.do_construct_spread(stack, module, &operands)?;
+                    continue;
+                }
                 Op::Throw => {
                     let src = register_operand(operands.first())?;
                     let value = stack[top_idx]
@@ -2304,6 +2308,7 @@ impl Interpreter {
                 | Op::CallMethodValue
                 | Op::CallSpread
                 | Op::New
+                | Op::NewSpread
                 | Op::Throw
                 | Op::EndFinally
                 | Op::Await
@@ -4711,6 +4716,44 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
+        self.dispatch_construct(stack, module, callee, args, dst)
+    }
+
+    fn do_construct_spread(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let callee_reg = register_operand(operands.get(1))?;
+        let args_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        if !is_callable(&callee) {
+            return Err(VmError::NotCallable);
+        }
+        let args_value = read_register(&stack[top_idx], args_reg)?.clone();
+        let arr = match args_value {
+            Value::Array(a) => a,
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let args: SmallVec<[Value; 8]> = arr.borrow_body().iter().cloned().collect();
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        self.dispatch_construct(stack, module, callee, args, dst)
+    }
+
+    fn dispatch_construct(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        callee: Value,
+        args: SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
         // §28.2.4.14 Proxy.[[Construct]] — `new <proxy>(args)`
         // routes through the `construct` trap when present;
         // otherwise delegates to the target.

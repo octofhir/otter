@@ -338,6 +338,12 @@ pub enum Op {
     /// matching the spec's `OrdinaryCreateFromConstructor` behavior
     /// stripped down for the foundation slice.
     New,
+    /// Construct call with spread arguments. Operands:
+    /// `Register(dst), Register(callee), Register(args)`. The args
+    /// register holds a `Value::Array` whose elements become the
+    /// constructor arguments, in order. Mirrors [`Self::CallSpread`]
+    /// for `new C(...args)` style invocations.
+    NewSpread,
     /// `r<dst> = ClassConstructor { ctor, prototype, statics }`.
     /// Operands: `Register(dst), Register(ctor), Register(prototype),
     /// Register(statics)`. Used by class lowering to package the
@@ -980,6 +986,7 @@ impl Op {
             Op::ArrayPush => "ARRAY_PUSH",
             Op::CallSpread => "CALL_SPREAD",
             Op::New => "NEW",
+            Op::NewSpread => "NEW_SPREAD",
             Op::MakeClass => "MAKE_CLASS",
             Op::CollectRest => "COLLECT_REST",
             Op::MathLoad => "MATH_LOAD",
@@ -1173,6 +1180,7 @@ impl Op {
             Op::IteratorNext => 3,
             Op::NewCollection => 3,
             Op::CallSpread => 4,
+            Op::NewSpread => 3,
             // dst, name_const, src, scratch_dst.
             Op::StoreProperty => 4,
             // `NewArray` is variadic: `dst, count, elems...`. The

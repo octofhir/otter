@@ -1637,13 +1637,14 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                     }
                     // Destructuring `var [a, b] = x`. Spec-correct
                     // semantics: every name was already hoisted —
-                    // we walk the pattern and assign each component.
+                    // we walk the pattern and assign each component
+                    // into the pre-existing var binding.
                     let init = declarator.init.as_ref().ok_or(CompileError::Unsupported {
                         node: "var destructuring requires an initializer".to_string(),
                         span,
                     })?;
                     let init_reg = compile_expr(cx, init, span)?;
-                    destructure_into(cx, init_reg, &declarator.id, span)?;
+                    destructure_assign(cx, init_reg, &declarator.id, span)?;
                 }
                 return Ok(None);
             }
@@ -5439,7 +5440,28 @@ fn compile_expr(
                 );
                 return Ok(dst);
             }
+            // §13.3.5 NewExpression — `new C(...args)` may include
+            // SpreadElement arguments. Route those through
+            // `Op::NewSpread` (mirrors `Op::CallSpread` for calls).
+            let has_spread = new_expr
+                .arguments
+                .iter()
+                .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
             let callee_reg = compile_expr(cx, callee, new_span)?;
+            if has_spread {
+                let args_reg = compile_spread_call_args(cx, &new_expr.arguments, new_span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::NewSpread,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(callee_reg),
+                        Operand::Register(args_reg),
+                    ],
+                    new_span,
+                );
+                return Ok(dst);
+            }
             let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
@@ -5866,8 +5888,79 @@ fn compile_expr(
         // <https://tc39.es/ecma262/#sec-update-expressions>
         Expression::UpdateExpression(u) => {
             let span = (u.span.start, u.span.end);
-            let id = match &u.argument {
-                SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id,
+            // §13.4 UpdateExpression — applies to identifiers,
+            // static / computed member access, and (private-field
+            // access — deferred). Refactor: compute a load + store
+            // closure pair so the increment / decrement loop is
+            // shared across target shapes.
+            // <https://tc39.es/ecma262/#sec-update-expressions>
+            let old = cx.alloc_scratch();
+            // Storage closure result: a function the store path
+            // reads to write `next` back to the same target.
+            enum UpdateTarget<'b, 'c> {
+                Identifier {
+                    name: String,
+                    storage: Option<BindingStorage>,
+                },
+                StaticMember {
+                    obj_reg: u16,
+                    name: &'b str,
+                },
+                ComputedMember {
+                    obj_reg: u16,
+                    key_reg: u16,
+                    _phantom: std::marker::PhantomData<&'c ()>,
+                },
+            }
+            let target = match &u.argument {
+                SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    let name = id.name.as_str().to_string();
+                    let storage = match cx.lookup_binding(&name) {
+                        Some(info) if info.is_const => {
+                            return Err(CompileError::Unsupported {
+                                node: format!("update on const `{name}`"),
+                                span,
+                            });
+                        }
+                        Some(info) => Some(info.storage),
+                        None => cx
+                            .resolve_capture(&name)
+                            .map(|idx| BindingStorage::Upvalue { idx }),
+                    };
+                    match storage {
+                        Some(s) => cx.emit_load_storage(old, s, span),
+                        None => {
+                            let global = cx.alloc_scratch();
+                            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                            cx.emit_load_property(old, global, &name, span);
+                        }
+                    }
+                    UpdateTarget::Identifier { name, storage }
+                }
+                SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                    let obj_reg = compile_expr(cx, &member.object, span)?;
+                    let name = member.property.name.as_str();
+                    cx.emit_load_property(old, obj_reg, name, span);
+                    UpdateTarget::StaticMember { obj_reg, name }
+                }
+                SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                    let obj_reg = compile_expr(cx, &member.object, span)?;
+                    let key_reg = compile_expr(cx, &member.expression, span)?;
+                    cx.emit(
+                        Op::LoadElement,
+                        vec![
+                            Operand::Register(old),
+                            Operand::Register(obj_reg),
+                            Operand::Register(key_reg),
+                        ],
+                        span,
+                    );
+                    UpdateTarget::ComputedMember {
+                        obj_reg,
+                        key_reg,
+                        _phantom: std::marker::PhantomData,
+                    }
+                }
                 _ => {
                     return Err(CompileError::Unsupported {
                         node: "UpdateExpression on non-identifier operand".to_string(),
@@ -5875,48 +5968,22 @@ fn compile_expr(
                     });
                 }
             };
-            let name = id.name.as_str().to_string();
-            let storage = match cx.lookup_binding(&name) {
-                Some(info) if info.is_const => {
-                    return Err(CompileError::Unsupported {
-                        node: format!("update on const `{name}`"),
-                        span,
-                    });
-                }
-                Some(info) => Some(info.storage),
-                // Update on an undeclared identifier — globalThis
-                // fallback (§10.2.4.1 PutValue, sloppy mode).
-                None => cx
-                    .resolve_capture(&name)
-                    .map(|idx| BindingStorage::Upvalue { idx }),
-            };
 
-            // Step 1 — load the old value.
-            let old = cx.alloc_scratch();
-            match storage {
-                Some(s) => cx.emit_load_storage(old, s, span),
-                None => {
-                    let global = cx.alloc_scratch();
-                    cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
-                    cx.emit_load_property(old, global, &name, span);
-                }
-            }
-            // Step 2 — coerce to number (§13.4.2.1 step 3 / 13.4.3.1
-            // step 3) so increments behave like spec.
+            // §13.4 step 3 — coerce to number (or BigInt via
+            // ToNumeric). The shared run-numeric path now handles
+            // primitives so `cur` can flow through Add/Sub directly.
             let cur = cx.alloc_scratch();
             cx.emit(
                 Op::ToNumber,
                 vec![Operand::Register(cur), Operand::Register(old)],
                 span,
             );
-            // Step 3 — load constant 1.
             let one = cx.alloc_scratch();
             cx.emit(
                 Op::LoadInt32,
                 vec![Operand::Register(one), Operand::Imm32(1)],
                 span,
             );
-            // Step 4 — Add / Sub.
             let next = cx.alloc_scratch();
             let op = match u.operator {
                 UpdateOperator::Increment => Op::Add,
@@ -5931,18 +5998,33 @@ fn compile_expr(
                 ],
                 span,
             );
-            // Step 5 — store back.
-            match storage {
-                Some(s) => cx.emit_store_storage(next, s, span),
-                None => {
-                    let global = cx.alloc_scratch();
-                    cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
-                    let name_idx = cx.intern_string_constant(&name);
+            match target {
+                UpdateTarget::Identifier { name, storage } => match storage {
+                    Some(s) => cx.emit_store_storage(next, s, span),
+                    None => {
+                        let global = cx.alloc_scratch();
+                        cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                        let name_idx = cx.intern_string_constant(&name);
+                        let scratch = cx.alloc_scratch();
+                        cx.emit(
+                            Op::StoreProperty,
+                            vec![
+                                Operand::Register(global),
+                                Operand::ConstIndex(name_idx),
+                                Operand::Register(next),
+                                Operand::Register(scratch),
+                            ],
+                            span,
+                        );
+                    }
+                },
+                UpdateTarget::StaticMember { obj_reg, name } => {
+                    let name_idx = cx.intern_string_constant(name);
                     let scratch = cx.alloc_scratch();
                     cx.emit(
                         Op::StoreProperty,
                         vec![
-                            Operand::Register(global),
+                            Operand::Register(obj_reg),
                             Operand::ConstIndex(name_idx),
                             Operand::Register(next),
                             Operand::Register(scratch),
@@ -5950,9 +6032,23 @@ fn compile_expr(
                         span,
                     );
                 }
+                UpdateTarget::ComputedMember {
+                    obj_reg, key_reg, ..
+                } => {
+                    cx.emit(
+                        Op::StoreElement,
+                        vec![
+                            Operand::Register(obj_reg),
+                            Operand::Register(key_reg),
+                            Operand::Register(next),
+                        ],
+                        span,
+                    );
+                }
             }
-            // Step 6 — Postfix returns pre-update value (post-
-            // ToNumber); prefix returns the new value.
+            // §13.4.2.1 / 13.4.3.1 — postfix returns the pre-
+            // update value (post-ToNumber); prefix returns the
+            // new value.
             Ok(if u.prefix { next } else { cur })
         }
 

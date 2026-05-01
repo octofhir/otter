@@ -5013,6 +5013,29 @@ impl Interpreter {
                 }
             }
         }
+        // Functions / closures inherit Object.prototype-style
+        // methods. Foundation routes the call through the user-
+        // properties bag attached to the compiled function.
+        if let Value::Function { function_id } | Value::Closure { function_id, .. } = &recv_value
+            && matches!(
+                name.as_str(),
+                "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
+            )
+        {
+            let bag = self
+                .function_user_props
+                .entry(*function_id)
+                .or_default()
+                .clone();
+            if let Some(result) =
+                object_prototype_intercept(&bag, &name, &arg_values, &self.string_heap)?
+            {
+                let frame = &mut stack[top_idx];
+                write_register(frame, dst, result)?;
+                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                return Ok(());
+            }
+        }
 
         // §20.2.3 Function.prototype canonical methods —
         // `call` / `apply` / `bind` / `toString`. They are

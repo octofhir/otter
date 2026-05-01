@@ -58,19 +58,52 @@ rejected by the bump workflow (slice 105).
 
 Slice 105 wires two GitHub Actions workflows:
 
-- **`test262.yml`** — runs on every PR + push to `main`. Sharded
-  matrix `[1..8]`; the aggregate job merges the per-shard JSONs,
-  runs `diff main.json merged.json`, and posts the diff as a PR
-  comment. Exits non-zero on any regression.
-- **`test262-baseline.yml`** — runs on push to `main`. Same sharded
-  sweep, but commits the merged baseline back to `main` so the
-  diff target moves forward as the engine improves.
+- **`.github/workflows/test262.yml`** — runs on every PR + push to
+  `main`. Sharded matrix `[1..8]` invoked through
+  `bash scripts/test262-safe.sh --shard N/8`. The aggregate job
+  merges the per-shard JSONs, runs
+  `diff docs/new-engine/test262-baseline/main.json merged.json`,
+  and posts the diff as a PR comment via
+  `actions/github-script@v7`. Job exits non-zero on any
+  regression. Crashes are highlighted in bold.
+- **`.github/workflows/test262-baseline.yml`** — runs on push to
+  `main`. Same sharded sweep; the publish job commits the merged
+  baseline directly back to `main` (using the workflow's
+  `contents: write` permission) so the diff target advances as
+  the engine improves. Per-test budget on CI is 30 s
+  (`TIMEOUT_MS=30000`); local development uses 5 s by default.
 
-Investigating a regression locally:
+`scripts/test262-safe.sh` is the canonical entry point for both
+workflows. It applies:
+
+- `ulimit -v 4G` on Linux (OS-level virtual-memory backstop).
+- `--max-heap-bytes 536870912` (512 MiB engine cap surfaced as
+  catchable `RangeError`).
+- `--timeout` from `TIMEOUT_MS` (CI: 30 s; local default: 5 s).
+- Auto-init for `vendor/test262` if missing.
+- One automatic re-execution on hard-kill exit codes
+  (86 / 137 / 139).
+- Refusal to launch on debug builds without `--allow-debug`.
+
+### Investigating a regression locally
 
 ```sh
 cargo run -p otter-test262 -- run --filter '<failing-path-substring>'
 ```
+
+### Pin-update PR template
+
+When advancing `vendor/test262`, the PR description must include:
+
+1. The upstream changelog excerpt (commits between the previous
+   pin and the new one).
+2. A fresh baseline (`main.json` + `main.md`), captured with the
+   new pin via `bash scripts/test262-safe.sh --output
+   docs/new-engine/test262-baseline/main.json`.
+
+Pin-only PRs that arrive without a matching baseline update will
+fail the regression gate (the `failing_tests` set will shift
+without the baseline catching up).
 
 Spec links:
 

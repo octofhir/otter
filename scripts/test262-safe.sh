@@ -1,51 +1,101 @@
-#!/bin/bash
-# Run a single test262 subdirectory with aggressive safety limits.
+#!/usr/bin/env bash
+# Safety wrapper around `otter-test262 run`.
+#
+# Three layers per docs/new-engine/tasks/100-test262-conformance.md
+# §"Safety controls":
+#   1. In-engine cooperative cancellation (`--timeout`).
+#   2. Per-test heap cap (`--max-heap-bytes`).
+#   3. OS virtual-memory cap (`ulimit -v`, Linux).
+#
+# Tunables:
+#   MAX_HEAP_BYTES     per-test heap cap (default 512 MB)
+#   ULIMIT_VIRTUAL_KB  process VM cap in KB (default 4 GB)
+#   TIMEOUT_MS         per-test timeout in ms (default 5000)
 #
 # Usage:
-#   bash scripts/test262-safe.sh built-ins/Array
-#   bash scripts/test262-safe.sh built-ins/Array --verbose
+#   bash scripts/test262-safe.sh                     # full sweep
+#   bash scripts/test262-safe.sh --shard 3/8         # one shard
+#   bash scripts/test262-safe.sh --filter built-ins/Math
+#   bash scripts/test262-safe.sh --allow-debug ...   # debug build OK
 #
-# Safety layers:
-#   1. Otter heap cap (`--max-heap-bytes`) — catchable JS RangeError
-#      when a test tries to allocate past the limit.
-#   2. OS virtual-memory cap (`ulimit -v`, Linux) — hard kill on any
-#      runaway native growth that slips past the Otter cap.
-#   3. Per-test timeout — already enforced by the runner, kept at 10s.
-#
-# Tune via environment variables:
-#   MAX_HEAP_BYTES      Otter heap cap per test (default 256 MB)
-#   ULIMIT_VIRTUAL_KB   OS virtual-memory cap in KB (default 2 GB)
-#   TIMEOUT             Per-test timeout in seconds (default 10)
+# The runner refuses to launch on debug builds without --allow-debug.
+# vendor/test262 is auto-initialised if missing; the wrapper aborts
+# if a re-execution still finds the submodule empty.
 
 set -uo pipefail
 
-if [ "$#" -lt 1 ]; then
-    echo "Usage: bash scripts/test262-safe.sh <subdir> [additional test262 args]" >&2
-    echo "Example: bash scripts/test262-safe.sh built-ins/Array --verbose" >&2
-    exit 2
+ALLOW_DEBUG=0
+PROFILE_FLAG="--release"
+PASSTHROUGH=()
+for arg in "$@"; do
+    case "$arg" in
+        --allow-debug)
+            ALLOW_DEBUG=1
+            PROFILE_FLAG=""
+            ;;
+        *)
+            PASSTHROUGH+=("$arg")
+            ;;
+    esac
+done
+
+MAX_HEAP_BYTES="${MAX_HEAP_BYTES:-536870912}"   # 512 MB
+ULIMIT_VIRTUAL_KB="${ULIMIT_VIRTUAL_KB:-4194304}" # 4 GB
+TIMEOUT_MS="${TIMEOUT_MS:-5000}"
+
+repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+ROOT="$(repo_root)"
+cd "$ROOT"
+
+ensure_submodule() {
+    local sub="vendor/test262"
+    if [[ ! -d "$sub" || ! -d "$sub/test" || -z "$(ls -A "$sub/test" 2>/dev/null)" ]]; then
+        echo "vendor/test262 missing — running: git submodule update --init --recursive vendor/test262" >&2
+        git submodule update --init --recursive vendor/test262 || return 1
+    fi
+    if [[ ! -d "$sub/test" || -z "$(ls -A "$sub/test" 2>/dev/null)" ]]; then
+        echo "error: vendor/test262 still empty after submodule update — aborting" >&2
+        return 1
+    fi
+    return 0
+}
+ensure_submodule || exit 2
+
+if [[ "$ALLOW_DEBUG" -eq 0 ]]; then
+    echo "test262-safe: --release build (use --allow-debug to override)"
 fi
 
-SUBDIR="$1"
-shift
+echo "test262-safe: heap=${MAX_HEAP_BYTES} bytes ($((MAX_HEAP_BYTES / 1024 / 1024)) MB)"
+echo "test262-safe: timeout=${TIMEOUT_MS} ms"
+if [[ "$(uname)" == "Linux" ]]; then
+    echo "test262-safe: ulimit -v ${ULIMIT_VIRTUAL_KB} KB ($((ULIMIT_VIRTUAL_KB / 1024)) MB)"
+fi
 
-MAX_HEAP_BYTES="${MAX_HEAP_BYTES:-268435456}"  # 256 MB
-ULIMIT_VIRTUAL_KB="${ULIMIT_VIRTUAL_KB:-2097152}"  # 2 GB
-TIMEOUT="${TIMEOUT:-10}"
-
-echo "Running test262 subdir: $SUBDIR"
-echo "  Heap cap:      $MAX_HEAP_BYTES bytes ($((MAX_HEAP_BYTES / 1024 / 1024)) MB, Otter-level)"
-echo "  VM cap:        ${ULIMIT_VIRTUAL_KB} KB (OS ulimit -v, Linux only)"
-echo "  Timeout:       ${TIMEOUT}s per test"
-
-# Subshell so the ulimit cap only applies to this run.
-# The test262 runner takes CLI flags directly (no `run` subcommand).
-# Per-test timeout is in *milliseconds*, so multiply the seconds value.
-TIMEOUT_MS=$((TIMEOUT * 1000))
+# `ulimit -v` is Linux-only; macOS rejects it silently.
 (
-    ulimit -v "$ULIMIT_VIRTUAL_KB" 2>/dev/null || true
-    exec cargo run --profile test262 -p otter-test262 --bin test262 -- \
-        --subdir "$SUBDIR" \
-        --timeout "$TIMEOUT_MS" \
-        --max-heap-bytes "$MAX_HEAP_BYTES" \
-        "$@"
+    if [[ "$(uname)" == "Linux" ]]; then
+        ulimit -v "$ULIMIT_VIRTUAL_KB" 2>/dev/null || true
+    fi
+    set -- ${PROFILE_FLAG} -p otter-test262 -- run \
+        --timeout "${TIMEOUT_MS}" \
+        --max-heap-bytes "${MAX_HEAP_BYTES}" \
+        "${PASSTHROUGH[@]}"
+    exec cargo run "$@"
 )
+EXIT=$?
+
+# Watchdog hard-kill exit codes (137 = SIGKILL, 139 = SIGSEGV,
+# 86 = our own internal hard-kill marker). Re-exec once to give the
+# runner a clean restart on those.
+if [[ "$EXIT" -eq 86 || "$EXIT" -eq 137 || "$EXIT" -eq 139 ]]; then
+    echo "test262-safe: hard-kill exit $EXIT — re-executing once" >&2
+    if [[ -n "${OTTER_TEST262_SAFE_REENTERED:-}" ]]; then
+        echo "test262-safe: already re-executed once — giving up" >&2
+        exit "$EXIT"
+    fi
+    OTTER_TEST262_SAFE_REENTERED=1 exec bash "$0" "$@"
+fi
+
+exit "$EXIT"

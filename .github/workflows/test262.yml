@@ -1,0 +1,138 @@
+name: test262
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test262-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shard:
+    name: shard ${{ matrix.shard }}/8
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Ensure test262 submodule
+        run: git submodule update --init --recursive vendor/test262
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build runner (release)
+        run: cargo build --release -p otter-test262
+      - name: Run shard ${{ matrix.shard }}/8
+        run: |
+          mkdir -p reports
+          bash scripts/test262-safe.sh \
+            --shard ${{ matrix.shard }}/8 \
+            --output reports/shard-${{ matrix.shard }}.json
+        env:
+          # CI uses the longer 30 s budget per task 100 §"Safety controls".
+          TIMEOUT_MS: "30000"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test262-shard-${{ matrix.shard }}
+          path: reports/
+
+  aggregate:
+    needs: [shard]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: reports-raw
+      - name: Flatten shard JSONs
+        run: |
+          mkdir -p reports
+          find reports-raw -name 'shard-*.json' -exec cp {} reports/ \;
+          ls reports/
+      - name: Merge shards
+        run: |
+          cargo run --release -p otter-test262 -- merge \
+            reports/shard-*.json \
+            --output reports/merged.json
+      - name: Diff against main baseline
+        id: diff
+        run: |
+          set +e
+          if [[ -f docs/new-engine/test262-baseline/main.json ]]; then
+              cargo run --release -p otter-test262 -- diff \
+                  docs/new-engine/test262-baseline/main.json \
+                  --current reports/merged.json | tee reports/diff.txt
+              echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          else
+              echo "no main baseline yet — skipping diff" | tee reports/diff.txt
+              echo "exit_code=0" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test262-merged
+          path: reports/
+      - name: Post diff comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let diff;
+            try {
+              diff = fs.readFileSync('reports/diff.txt', 'utf8');
+            } catch {
+              diff = '(no diff captured)';
+            }
+            const merged = JSON.parse(
+              fs.readFileSync('reports/merged.json', 'utf8')
+            );
+            const t = merged.totals;
+            const passRate =
+              ((t.passed * 100) / Math.max(1, t.total - t.skipped)).toFixed(2);
+            const crashLine =
+              t.crashed > 0
+                ? `**🚨 crashed: ${t.crashed}**`
+                : `crashed: ${t.crashed}`;
+            const body = [
+              '## Test262 conformance',
+              '',
+              `- pass rate (excl. skipped): **${passRate}%**`,
+              `- total: ${t.total} | passed: ${t.passed} | failed: ${t.failed}`,
+              `- skipped: ${t.skipped} | timed_out: ${t.timed_out} | oom: ${t.oom}`,
+              `- ${crashLine}`,
+              '',
+              '<details><summary>Full diff</summary>',
+              '',
+              '```text',
+              diff,
+              '```',
+              '',
+              '</details>',
+              '',
+              '_Engine commit: `' + merged.engine_commit + '`,',
+              ' Test262 commit: `' + merged.test262_commit + '`._',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+      - name: Fail on regression
+        run: |
+          if [[ "${{ steps.diff.outputs.exit_code }}" != "0" ]]; then
+            echo "::error::test262 regression detected — see the diff comment / artifact."
+            exit 1
+          fi

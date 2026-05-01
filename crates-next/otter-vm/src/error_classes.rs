@@ -252,9 +252,13 @@ impl ErrorClassRegistry {
         // <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 
         let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);
-        // Error itself.
+        // Error itself. §20.5.3 — `Error.prototype.constructor`
+        // is the Error constructor, with attribute
+        // `[[Configurable]]: true`, `[[Writable]]: true`,
+        // `[[Enumerable]]: false`.
         let error_ctor = JsObject::new();
         error_ctor.set("prototype", Value::Object(error_proto.clone()));
+        error_proto.set("constructor", Value::Object(error_ctor.clone()));
         entries.push((
             ErrorKind::Error,
             ClassEntry {
@@ -263,7 +267,9 @@ impl ErrorClassRegistry {
             },
         ));
 
-        // Subclasses.
+        // Subclasses. §20.5.6 — each `<NativeError>.prototype`
+        // has a `constructor` own data property pointing back
+        // to its constructor, mirroring the Error case.
         for &kind in &[
             ErrorKind::TypeError,
             ErrorKind::RangeError,
@@ -279,6 +285,7 @@ impl ErrorClassRegistry {
             proto.set("name", Value::String(class_name));
             let ctor = JsObject::new();
             ctor.set("prototype", Value::Object(proto.clone()));
+            proto.set("constructor", Value::Object(ctor.clone()));
             entries.push((
                 kind,
                 ClassEntry {

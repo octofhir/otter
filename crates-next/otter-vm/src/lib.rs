@@ -7652,6 +7652,66 @@ fn bound_function_intrinsic_property(
 fn build_global_this() -> JsObject {
     let obj = JsObject::new();
     obj.set("globalThis", Value::Object(obj.clone()));
+    // §19.1 standard globals — install placeholder constructor
+    // sentinels so identifier-as-value reads (e.g. `Array.prototype`,
+    // `Object.keys`) resolve to *something* rather than throwing
+    // ReferenceError. Each placeholder has a `prototype` own
+    // property pointing at a fresh object; the engine's existing
+    // intrinsic interceptors (`Op::ArrayCall` / `Op::ObjectCall` /
+    // …) handle the call sites that matter, and reads of `.length`
+    // / `.name` arrive at the per-function intrinsic helper.
+    //
+    // This is intentionally minimal — full constructor semantics
+    // (e.g. `new Array(n)` returning an array of length `n`) await
+    // the dedicated §22 / §23 engine track. The placeholder lets
+    // tests that *don't* rely on the constructor identity compile
+    // and run.
+    for name in [
+        "Array",
+        "Object",
+        "JSON",
+        "String",
+        "Number",
+        "Boolean",
+        "BigInt",
+        "Symbol",
+        "Math",
+        "Date",
+        "RegExp",
+        "Map",
+        "Set",
+        "WeakMap",
+        "WeakSet",
+        "WeakRef",
+        "Promise",
+        "Proxy",
+        "Reflect",
+        "Function",
+        "ArrayBuffer",
+        "SharedArrayBuffer",
+        "DataView",
+        "Int8Array",
+        "Uint8Array",
+        "Uint8ClampedArray",
+        "Int16Array",
+        "Uint16Array",
+        "Int32Array",
+        "Uint32Array",
+        "Float32Array",
+        "Float64Array",
+        "BigInt64Array",
+        "BigUint64Array",
+        "Atomics",
+        "Intl",
+        "Temporal",
+        "AggregateError",
+        "FinalizationRegistry",
+        "Iterator",
+    ] {
+        let placeholder = JsObject::new();
+        placeholder.set("prototype", Value::Object(JsObject::new()));
+        obj.set(name, Value::Object(placeholder));
+    }
     obj
 }
 

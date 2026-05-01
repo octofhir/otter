@@ -42,3 +42,6 @@ thiserror   = { workspace = true }
 # Module-flagged tests need an on-disk entry; we stage them in a
 # scratch directory.
 tempfile    = "3"
+
+# RFC-3339 timestamps for baseline `ran_at` field.
+chrono      = { version = "0.4", default-features = false, features = ["clock", "serde"] }

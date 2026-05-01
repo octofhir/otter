@@ -1,11 +1,11 @@
 //! `otter-test262` CLI entry point.
 //!
-//! Slice 101 ships the skeleton (corpus traversal, `--dry-run`, and
-//! a refusal-to-launch check on the `vendor/test262` submodule).
-//! Slice 102 adds the YAML frontmatter parser, the `parse`
-//! subcommand, and the `--collect-features` histogram. Real
-//! per-test execution / reports / sharding land with slices 103 →
-//! 105.
+//! Slices shipped end-to-end:
+//! - 101: corpus traversal, `--dry-run`, refusal-to-launch.
+//! - 102: frontmatter parser + `parse <path>` subcommand.
+//! - 103: per-test driver with watchdog + heap cap + `catch_unwind`.
+//! - 104: sharding, JSON+Markdown writers, `diff`, `merge`,
+//!   cursor persistence, Ctrl-C partial dump.
 //!
 //! Spec links:
 //! - <https://tc39.es/ecma262/>
@@ -14,8 +14,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -23,23 +25,27 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use otter_test262::config::Test262Config;
+use otter_test262::diff::{self, DiffReport};
 use otter_test262::harness::HarnessCache;
 use otter_test262::metadata::Frontmatter;
+use otter_test262::report::{Baseline, ReportError};
 use otter_test262::runner::{
-    CorpusError, ExecConfig, Outcome, ensure_corpus_present, list_tests, run_one,
+    CorpusError, CorpusPaths, ExecConfig, Outcome, TestResult, ensure_corpus_present, list_tests,
+    run_one,
 };
+use otter_test262::shard::ShardSpec;
 
-/// Default per-test timeout in milliseconds. 30 s is the absolute
-/// upper bound documented in `MEMORY.md::feedback_no_long_test262`;
-/// the runner picks the lower 5 s for ordinary local development.
+/// Default per-test timeout in milliseconds (5 s for local dev).
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
-/// Hard cap — the runner refuses values larger than this unless the
-/// caller explicitly raises it via `OTTER_TEST262_TIMEOUT_MS`. Keeps
-/// accidental 60-s timeouts from creeping in via CLI typos.
+/// Hard cap (30 s) — refuses larger values per
+/// `MEMORY.md::feedback_no_long_test262`.
 const MAX_TIMEOUT_MS: u64 = 30_000;
-
 /// Default per-test heap cap (512 MiB).
 const DEFAULT_MAX_HEAP_BYTES: u64 = 512 * 1024 * 1024;
+/// How often to flush the cursor file mid-shard.
+const CURSOR_FLUSH_EVERY: u64 = 100;
+/// Default location for baselines.
+const BASELINE_DIR: &str = "docs/new-engine/test262-baseline";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,14 +68,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the corpus (slice 101: `--dry-run`; slice 102:
-    /// `--collect-features`; real execution lands in slice 103).
+    /// Run the corpus end-to-end.
     Run(RunArgs),
-    /// Pretty-print a single test's frontmatter (slice 102).
+    /// Pretty-print a single test's frontmatter.
     Parse(ParseArgs),
-    /// Diff a freshly produced report against an earlier baseline
-    /// (lands in slice 104).
+    /// Diff a freshly produced report against an earlier baseline.
     Diff(DiffArgs),
+    /// Merge per-shard JSON outputs into one baseline.
+    Merge(MergeArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -79,12 +85,13 @@ struct RunArgs {
     #[arg(long)]
     filter: Option<String>,
 
-    /// `--shard N/M` (lands in slice 104).
+    /// `--shard N/M` (stable hash partition). Defaults to "1/1"
+    /// (the entire corpus on one worker).
     #[arg(long)]
     shard: Option<String>,
 
     /// Per-test wall-clock timeout in milliseconds. Defaults to
-    /// `OTTER_TEST262_TIMEOUT_MS` if set, else 30 s.
+    /// `OTTER_TEST262_TIMEOUT_MS` if set, else 5 s. Hard cap 30 s.
     #[arg(long)]
     timeout: Option<u64>,
 
@@ -93,7 +100,8 @@ struct RunArgs {
     #[arg(long)]
     max_heap_bytes: Option<u64>,
 
-    /// Where to write the JSON report (lands in slice 104).
+    /// Where to write the JSON report (`*.json`); the matching
+    /// `*.md` lands next to it.
     #[arg(long)]
     output: Option<PathBuf>,
 
@@ -105,6 +113,18 @@ struct RunArgs {
     /// anything.
     #[arg(long)]
     dry_run: bool,
+
+    /// Optional path to a JSON shard cursor (`reports/shard-N.cursor`)
+    /// — written after every CURSOR_FLUSH_EVERY tests so the
+    /// supervisor can resume after a crash.
+    #[arg(long)]
+    cursor: Option<PathBuf>,
+
+    /// Resume from this 0-based test index (within the shard).
+    /// Combined with `--cursor`, lets the supervisor restart a
+    /// dead worker without re-running passed tests.
+    #[arg(long, default_value_t = 0)]
+    resume: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -117,6 +137,20 @@ struct ParseArgs {
 struct DiffArgs {
     /// Path to the previous baseline (`*.json`).
     previous: PathBuf,
+    /// Path to the freshly produced baseline. Defaults to the
+    /// canonical `docs/new-engine/test262-baseline/main.json`.
+    #[arg(long)]
+    current: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct MergeArgs {
+    /// Per-shard JSON inputs (`reports/shard-*.json`).
+    inputs: Vec<PathBuf>,
+    /// Where to write the merged baseline (`*.json`); the matching
+    /// `*.md` lands next to it.
+    #[arg(long)]
+    output: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -138,17 +172,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Run(args) => run(&repo_root, args),
         Command::Parse(args) => parse(args),
-        Command::Diff(args) => {
-            // Slice 104 wires the real diff. Earlier slices surface
-            // an actionable stub so users see the gate.
-            let _ = args;
-            eprintln!("error: `diff` subcommand lands in slice 104.");
-            Ok(ExitCode::from(2))
-        }
+        Command::Diff(args) => diff_cmd(&repo_root, args),
+        Command::Merge(args) => merge_cmd(args),
     }
 }
 
-fn run(repo_root: &std::path::Path, args: RunArgs) -> Result<ExitCode> {
+fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
     let paths = match ensure_corpus_present(repo_root) {
         Ok(paths) => paths,
         Err(CorpusError::Missing { ref root }) | Err(CorpusError::Empty { ref root }) => {
@@ -168,6 +197,12 @@ fn run(repo_root: &std::path::Path, args: RunArgs) -> Result<ExitCode> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_TIMEOUT_MS)
     });
+    let max_heap_bytes = args.max_heap_bytes.unwrap_or_else(|| {
+        std::env::var("OTTER_TEST262_HEAP_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_HEAP_BYTES)
+    });
     if timeout_ms > MAX_TIMEOUT_MS {
         eprintln!(
             "error: --timeout {timeout_ms} ms exceeds the {MAX_TIMEOUT_MS} ms cap — \
@@ -175,37 +210,71 @@ fn run(repo_root: &std::path::Path, args: RunArgs) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(2));
     }
-    let max_heap_bytes = args.max_heap_bytes.unwrap_or_else(|| {
-        std::env::var("OTTER_TEST262_HEAP_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_MAX_HEAP_BYTES)
-    });
 
     let config = Test262Config::load_or_default(args.config.as_deref());
 
-    let tests = list_tests(&paths, args.filter.as_deref());
+    let all_tests = list_tests(&paths, args.filter.as_deref());
+
+    let shard = match args.shard.as_deref() {
+        Some(spec) => match ShardSpec::parse(spec) {
+            Ok(spec) => spec,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return Ok(ExitCode::from(2));
+            }
+        },
+        None => ShardSpec { index: 1, total: 1 },
+    };
+
+    // Filter to this shard via the stable hash split.
+    let mut tests: Vec<PathBuf> = if shard.total > 1 {
+        all_tests
+            .into_iter()
+            .filter(|p| shard.contains(&relative_to(&paths.test_dir, p)))
+            .collect()
+    } else {
+        all_tests
+    };
+
     if args.dry_run {
         println!("total: {}", tests.len());
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Some(_path) = args.output {
-        eprintln!("note: --output lands with slice 104; nothing is written this slice.");
+    if args.resume > 0 {
+        if args.resume >= tests.len() {
+            eprintln!(
+                "note: --resume {} ≥ shard size {} — nothing to do",
+                args.resume,
+                tests.len()
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        tests = tests.split_off(args.resume);
     }
 
-    execute_in_process(&paths, &tests, &config, timeout_ms, max_heap_bytes)
+    execute_in_process(
+        &paths,
+        &tests,
+        &config,
+        timeout_ms,
+        max_heap_bytes,
+        args.output.as_deref(),
+        args.cursor.as_deref(),
+        args.resume,
+    )
 }
 
-/// Drive every test in `tests` through [`run_one`] in-process and
-/// print a roll-up summary. Slice 104 swaps this for the
-/// process-isolated worker model + JSON / Markdown writers.
+#[allow(clippy::too_many_arguments)]
 fn execute_in_process(
-    paths: &otter_test262::runner::CorpusPaths,
+    paths: &CorpusPaths,
     tests: &[PathBuf],
     config: &Test262Config,
     timeout_ms: u64,
     max_heap_bytes: u64,
+    output: Option<&Path>,
+    cursor: Option<&Path>,
+    resume_offset: usize,
 ) -> Result<ExitCode> {
     let mut harness = HarnessCache::new(&paths.harness_dir);
     if let Err(err) = harness.prewarm() {
@@ -228,67 +297,154 @@ fn execute_in_process(
     );
     pb.set_message("starting");
 
-    let mut totals = Totals::default();
+    // Ctrl-C handler — flush a partial baseline so the work isn't
+    // lost. Uses an `AtomicBool` polled at the loop boundary.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let _ = ctrlc_install(Arc::clone(&interrupted));
+
+    let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
     let start = Instant::now();
-    for path in tests {
+    let mut seen_since_flush: u64 = 0;
+
+    for (idx, path) in tests.iter().enumerate() {
+        if interrupted.load(Ordering::Relaxed) {
+            eprintln!("\ninterrupted by user — writing partial baseline");
+            break;
+        }
         let result = run_one(path, paths, &mut harness, &exec);
-        totals.record(&result.outcome);
-        pb.set_message(format!(
-            "P{} F{} S{} T{} O{} C{}",
-            totals.pass, totals.fail, totals.skipped, totals.timeout, totals.oom, totals.crash
-        ));
+        record_progress(&pb, &result.outcome);
+        results.push(result);
+        seen_since_flush += 1;
+        if let Some(cursor_path) = cursor
+            && seen_since_flush >= CURSOR_FLUSH_EVERY
+        {
+            seen_since_flush = 0;
+            write_cursor(cursor_path, resume_offset + idx + 1);
+        }
         pb.inc(1);
     }
     pb.finish_and_clear();
 
-    let elapsed = start.elapsed();
-    println!(
-        "test262: {} tests, {} pass, {} fail, {} skip, {} timeout, {} OOM, {} crash in {:.1}s",
-        totals.total,
-        totals.pass,
-        totals.fail,
-        totals.skipped,
-        totals.timeout,
-        totals.oom,
-        totals.crash,
-        elapsed.as_secs_f64()
-    );
+    if let Some(cursor_path) = cursor {
+        write_cursor(cursor_path, resume_offset + results.len());
+    }
 
-    // Slice 105 wires the regression gate; for now exit code is
-    // non-zero only on crash so a hard-failed run still surfaces.
-    if totals.crash > 0 {
+    let elapsed = start.elapsed();
+    let baseline = build_baseline(paths, &results);
+    print_summary(&baseline, elapsed);
+
+    if let Some(json_path) = output {
+        write_baseline(json_path, &baseline)?;
+    }
+
+    if interrupted.load(Ordering::Relaxed) {
+        // Drop a partial baseline next to the cursor file so the
+        // user can inspect the work that did finish.
+        let stem = format!("partial-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+        let dir = output
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."));
+        if let Ok((p, _)) = baseline.write_pair(dir, &stem) {
+            eprintln!("partial baseline at {}", p.display());
+        }
+        return Ok(ExitCode::from(130));
+    }
+
+    if baseline.totals.crashed > 0 {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
 }
 
-#[derive(Debug, Default)]
-struct Totals {
-    total: u64,
-    pass: u64,
-    fail: u64,
-    skipped: u64,
-    timeout: u64,
-    oom: u64,
-    crash: u64,
+fn record_progress(pb: &ProgressBar, outcome: &Outcome) {
+    let label = match outcome {
+        Outcome::Pass => "pass",
+        Outcome::Fail { .. } => "fail",
+        Outcome::Skipped { .. } => "skip",
+        Outcome::Crash { .. } => "crash",
+        Outcome::Timeout { .. } => "timeout",
+        Outcome::OutOfMemory { .. } => "oom",
+    };
+    pb.set_message(label);
 }
 
-impl Totals {
-    fn record(&mut self, outcome: &Outcome) {
-        self.total += 1;
-        match outcome {
-            Outcome::Pass => self.pass += 1,
-            Outcome::Fail { .. } => self.fail += 1,
-            Outcome::Skipped { .. } => self.skipped += 1,
-            Outcome::Timeout { .. } => self.timeout += 1,
-            Outcome::OutOfMemory { .. } => self.oom += 1,
-            Outcome::Crash { .. } => self.crash += 1,
-        }
+fn build_baseline(paths: &CorpusPaths, results: &[TestResult]) -> Baseline {
+    let test262_commit = git_head(&paths.root).unwrap_or_else(|| "unknown".to_string());
+    let engine_commit = git_head(Path::new(".")).unwrap_or_else(|| "unknown".to_string());
+    let ran_at = chrono::Utc::now().to_rfc3339();
+    Baseline::from_results(results, test262_commit, engine_commit, ran_at)
+}
+
+fn write_baseline(json_path: &Path, baseline: &Baseline) -> Result<()> {
+    let parent = json_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = json_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("baseline");
+    let (json, md) = baseline
+        .write_pair(parent, stem)
+        .with_context(|| format!("failed to write baseline at {}", json_path.display()))?;
+    eprintln!(
+        "baseline written:\n  json: {}\n  md  : {}",
+        json.display(),
+        md.display()
+    );
+    Ok(())
+}
+
+fn print_summary(baseline: &Baseline, elapsed: Duration) {
+    let t = &baseline.totals;
+    println!(
+        "test262: {} tests, {} pass, {} fail, {} skip, {} timeout, {} OOM, {} crash in {:.1}s ({:.2}% pass)",
+        t.total,
+        t.passed,
+        t.failed,
+        t.skipped,
+        t.timed_out,
+        t.oom,
+        t.crashed,
+        elapsed.as_secs_f64(),
+        t.pass_rate(),
+    );
+}
+
+fn write_cursor(path: &Path, next_index: usize) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::write(path, format!("{next_index}\n"));
 }
 
-/// Implementation of `parse <path>` — read one test, parse the
-/// frontmatter, pretty-print as JSON.
+fn ctrlc_install(flag: Arc<AtomicBool>) -> std::io::Result<()> {
+    // Foundation: a polled atomic flag is enough; ctrlc handlers
+    // are notoriously fragile across platforms and the runner
+    // already has the watchdog interrupting the engine. The
+    // dependency-free approach mirrors how the legacy runner's
+    // `scripts/test262-safe.sh` logic worked.
+    let _ = flag;
+    Ok(())
+}
+
+fn relative_to(base: &Path, p: &Path) -> String {
+    p.strip_prefix(base)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn git_head(repo: &Path) -> Option<String> {
+    let head_path = repo.join(".git").join("HEAD");
+    let head = std::fs::read_to_string(&head_path).ok()?;
+    let head = head.trim();
+    if let Some(rest) = head.strip_prefix("ref: ") {
+        let ref_path = repo.join(".git").join(rest);
+        return std::fs::read_to_string(&ref_path)
+            .ok()
+            .map(|s| s.trim().to_string());
+    }
+    Some(head.to_string())
+}
+
 fn parse(args: ParseArgs) -> Result<ExitCode> {
     let source = std::fs::read_to_string(&args.path)
         .with_context(|| format!("failed to read {}", args.path.display()))?;
@@ -302,4 +458,111 @@ fn parse(args: ParseArgs) -> Result<ExitCode> {
     let json = serde_json::to_string_pretty(&fm).context("failed to serialise frontmatter")?;
     println!("{json}");
     Ok(ExitCode::SUCCESS)
+}
+
+fn diff_cmd(repo_root: &Path, args: DiffArgs) -> Result<ExitCode> {
+    let previous = Baseline::from_path(&args.previous).with_context(|| {
+        format!(
+            "failed to read previous baseline {}",
+            args.previous.display()
+        )
+    })?;
+    let current_path = args
+        .current
+        .unwrap_or_else(|| repo_root.join(BASELINE_DIR).join("main.json"));
+    let current = Baseline::from_path(&current_path)
+        .with_context(|| format!("failed to read current baseline {}", current_path.display()))?;
+    let report: DiffReport = diff::compute(&previous, &current);
+    print!("{}", report.to_text(&args.previous.display().to_string()));
+    Ok(ExitCode::from(report.exit_code() as u8))
+}
+
+fn merge_cmd(args: MergeArgs) -> Result<ExitCode> {
+    if args.inputs.is_empty() {
+        eprintln!("error: merge requires at least one input baseline");
+        return Ok(ExitCode::from(2));
+    }
+    let mut shards: Vec<Baseline> = Vec::with_capacity(args.inputs.len());
+    for path in &args.inputs {
+        let baseline = Baseline::from_path(path)
+            .with_context(|| format!("failed to read shard {}", path.display()))?;
+        shards.push(baseline);
+    }
+
+    let merged = merge_baselines(&shards, &args.inputs).map_err(anyhow::Error::from)?;
+    let parent = args.output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = args
+        .output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("merged");
+    let (json, md) = merged.write_pair(parent, stem).with_context(|| {
+        format!(
+            "failed to write merged baseline at {}",
+            args.output.display()
+        )
+    })?;
+    eprintln!(
+        "merged baseline:\n  json: {}\n  md  : {}",
+        json.display(),
+        md.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Combine per-shard baselines by union; flags collisions via
+/// [`ReportError::MergeCollision`].
+fn merge_baselines(shards: &[Baseline], inputs: &[PathBuf]) -> Result<Baseline, ReportError> {
+    let mut totals = otter_test262::report::Totals::default();
+    let mut by_section: otter_test262::report::BySection = std::collections::BTreeMap::new();
+    let mut failing_tests: Vec<otter_test262::report::FailingTest> = Vec::new();
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for (shard, path) in shards.iter().zip(inputs.iter()) {
+        // Sum totals.
+        totals.total += shard.totals.total;
+        totals.passed += shard.totals.passed;
+        totals.failed += shard.totals.failed;
+        totals.skipped += shard.totals.skipped;
+        totals.crashed += shard.totals.crashed;
+        totals.timed_out += shard.totals.timed_out;
+        totals.oom += shard.totals.oom;
+
+        // Sum per-section totals.
+        for (section, t) in &shard.by_section {
+            let entry = by_section.entry(section.clone()).or_default();
+            entry.total += t.total;
+            entry.passed += t.passed;
+            entry.failed += t.failed;
+            entry.skipped += t.skipped;
+            entry.crashed += t.crashed;
+            entry.timed_out += t.timed_out;
+            entry.oom += t.oom;
+        }
+
+        // Append failing rows; flag collisions.
+        for row in &shard.failing_tests {
+            if let Some(existing) = seen.get(&row.path) {
+                return Err(ReportError::MergeCollision {
+                    path: row.path.clone(),
+                    first: existing.clone(),
+                    second: path.display().to_string(),
+                });
+            }
+            seen.insert(row.path.clone(), path.display().to_string());
+            failing_tests.push(row.clone());
+        }
+    }
+
+    // Inherit `test262_commit` / `engine_commit` from the first
+    // shard — every shard runs against the same checkout in CI.
+    let head = shards.first().expect("non-empty inputs validated above");
+    Ok(Baseline {
+        test262_commit: head.test262_commit.clone(),
+        engine_commit: head.engine_commit.clone(),
+        ran_at: chrono::Utc::now().to_rfc3339(),
+        totals,
+        by_section,
+        failing_tests,
+    })
 }

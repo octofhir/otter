@@ -7149,15 +7149,22 @@ impl Interpreter {
         bigint_op: BigIntBinop,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
-        let result = match (&lhs, &rhs) {
-            (Value::Number(a), Value::Number(b)) => Value::Number(op(*a, *b)),
-            (Value::BigInt(a), Value::BigInt(b)) => {
-                Value::BigInt(bigint_op(a, b).map_err(bigint_to_vm_error)?)
+        // §13.15.3 ApplyStringOrNumericBinaryOperator step 5/6:
+        // non-additive numeric ops apply ToNumeric to each operand
+        // (the compiler emits ToPrimitive(number) ahead of these
+        // ops so by the time we get here only primitives remain).
+        // A non-bigint operand becomes Number; bigint stays BigInt.
+        // <https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator>
+        let lnum = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
+        let rnum = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
+        let result = match (lnum, rnum) {
+            (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
+                Value::Number(op(a, b))
+            }
+            (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
+                Value::BigInt(bigint_op(&a, &b).map_err(bigint_to_vm_error)?)
             }
             // Mixed Number/BigInt is a spec TypeError.
-            (Value::Number(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Number(_)) => {
-                return Err(VmError::TypeMismatch);
-            }
             _ => return Err(VmError::TypeMismatch),
         };
         write_register(frame, dst, result)?;

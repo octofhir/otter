@@ -497,22 +497,27 @@ pub fn abstract_relational_comparison(x: &Value, y: &Value) -> RelationalOutcome
     }
 }
 
-/// Internal numeric union used only by
-/// [`abstract_relational_comparison`].
-enum NumericKind {
+/// Numeric union used by
+/// [`abstract_relational_comparison`] and the binary-op runtime
+/// in `lib.rs`. The two variants reflect §7.1.4 ToNumeric's
+/// product type — Number for everything except BigInt.
+pub enum NumericKind {
+    /// Operand reduced to a Number (covers `Number`, `String`,
+    /// `Boolean`, `null`, `undefined`).
     Num(NumberValue),
+    /// Operand reduced to a BigInt.
     Big(BigIntValue),
 }
 
-/// Coerce a primitive operand to a numeric kind for the
-/// `<`/`<=`/`>`/`>=` comparison algorithm.
+/// §7.1.4 ToNumeric over an already-primitive Value. Mirrors
+/// the spec's per-type table: Number passes through, BigInt
+/// passes through, String parses via `to_number_from_string`,
+/// Boolean folds to 0/1, null → 0, undefined → NaN. Symbols
+/// and any non-primitive variant return `None` so the caller
+/// can surface a TypeError.
 ///
-/// Mirrors `ToNumeric` (§7.1.4) over already-primitive values:
-/// strings parse via `to_number_from_string`, booleans fold to
-/// `0` / `1`, `null` → `0`, `undefined` → `NaN`, BigInt stays a
-/// BigInt. Symbols and any unexpected variant fall through to
-/// `None` so the caller can surface `Undefined`.
-fn to_numeric_for_compare(value: &Value) -> Option<NumericKind> {
+/// Spec: <https://tc39.es/ecma262/#sec-tonumeric>
+pub fn to_numeric_kind(value: &Value) -> Option<NumericKind> {
     match value {
         Value::Number(n) => Some(NumericKind::Num(*n)),
         Value::BigInt(b) => Some(NumericKind::Big(b.clone())),
@@ -526,6 +531,10 @@ fn to_numeric_for_compare(value: &Value) -> Option<NumericKind> {
         Value::Symbol(_) => None,
         _ => None,
     }
+}
+
+fn to_numeric_for_compare(value: &Value) -> Option<NumericKind> {
+    to_numeric_kind(value)
 }
 
 #[cfg(test)]

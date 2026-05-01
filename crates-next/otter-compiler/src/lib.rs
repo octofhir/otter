@@ -4827,6 +4827,26 @@ fn compile_expr(
                     let r = emit_to_primitive(cx, rhs, "number", span);
                     (l, r)
                 }
+                // §13.15.3 ApplyStringOrNumericBinaryOperator —
+                // non-additive numeric and bitwise/shift ops apply
+                // ToPrimitive(number) to each operand before
+                // ToNumeric. Pre-coerce here so the runtime never
+                // sees a non-primitive operand.
+                Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::Pow
+                | Op::BitwiseAnd
+                | Op::BitwiseOr
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr => {
+                    let l = emit_to_primitive(cx, lhs, "number", span);
+                    let r = emit_to_primitive(cx, rhs, "number", span);
+                    (l, r)
+                }
                 _ => (lhs, rhs),
             };
             let dst = cx.alloc_scratch();

@@ -3606,33 +3606,61 @@ fn destructure_into(
     pattern: &oxc_ast::ast::BindingPattern<'_>,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
+    destructure_pattern(parent, src_reg, pattern, span, false)
+}
+
+/// Mirror of [`destructure_into`] for `var` destructuring heads —
+/// each leaf identifier resolves to an *existing* binding (the
+/// var-hoist pass populated it at function entry) and is stored
+/// rather than re-declared. Used by `for (var [a, b] of …)` etc.
+fn destructure_assign(
+    parent: &mut Compiler,
+    src_reg: u16,
+    pattern: &oxc_ast::ast::BindingPattern<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    destructure_pattern(parent, src_reg, pattern, span, true)
+}
+
+fn destructure_pattern(
+    parent: &mut Compiler,
+    src_reg: u16,
+    pattern: &oxc_ast::ast::BindingPattern<'_>,
+    span: (u32, u32),
+    assign_existing: bool,
+) -> Result<(), CompileError> {
     match pattern {
         oxc_ast::ast::BindingPattern::BindingIdentifier(id) => {
-            let name = id.name.as_str().to_string();
-            let storage = parent.declare_binding(&name, false, span)?;
-            parent.emit_store_storage(src_reg, storage, span);
-            parent.mark_initialized(&name);
-            Ok(())
+            let name = id.name.as_str();
+            if assign_existing {
+                store_identifier(parent, name, src_reg, span)
+            } else {
+                let storage = parent.declare_binding(name, false, span)?;
+                parent.emit_store_storage(src_reg, storage, span);
+                parent.mark_initialized(name);
+                Ok(())
+            }
         }
         oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) => {
             let asgn_span = (asgn.span.start, asgn.span.end);
             apply_default_into(parent, src_reg, &asgn.right, asgn_span)?;
-            destructure_into(parent, src_reg, &asgn.left, span)
+            destructure_pattern(parent, src_reg, &asgn.left, span, assign_existing)
         }
         oxc_ast::ast::BindingPattern::ArrayPattern(arr) => {
-            destructure_array(parent, src_reg, arr, span)
+            destructure_array_inner(parent, src_reg, arr, span, assign_existing)
         }
         oxc_ast::ast::BindingPattern::ObjectPattern(obj) => {
-            destructure_object(parent, src_reg, obj, span)
+            destructure_object_inner(parent, src_reg, obj, span, assign_existing)
         }
     }
 }
 
-fn destructure_array(
+fn destructure_array_inner(
     parent: &mut Compiler,
     src_reg: u16,
     pattern: &oxc_ast::ast::ArrayPattern<'_>,
     span: (u32, u32),
+    assign_existing: bool,
 ) -> Result<(), CompileError> {
     let iter_reg = parent.alloc_scratch();
     parent.emit(
@@ -3656,7 +3684,7 @@ fn destructure_array(
         let Some(inner) = elem else {
             continue;
         };
-        destructure_into(parent, value_reg, inner, span)?;
+        destructure_pattern(parent, value_reg, inner, span, assign_existing)?;
     }
     if let Some(rest) = &pattern.rest {
         // Drain the rest of the iterator into a fresh array.
@@ -3687,16 +3715,17 @@ fn destructure_array(
         let back = parent.emit_branch_placeholder(Op::Jump, None, span);
         parent.patch_branch(back, loop_top);
         parent.patch_branch_to_here(exit);
-        destructure_into(parent, arr_reg, &rest.argument, span)?;
+        destructure_pattern(parent, arr_reg, &rest.argument, span, assign_existing)?;
     }
     Ok(())
 }
 
-fn destructure_object(
+fn destructure_object_inner(
     parent: &mut Compiler,
     src_reg: u16,
     pattern: &oxc_ast::ast::ObjectPattern<'_>,
     span: (u32, u32),
+    assign_existing: bool,
 ) -> Result<(), CompileError> {
     // §13.15.5 RestObjectAssignment — collect every enumerable own
     // property of `src` *except* the ones extracted above into a
@@ -3742,7 +3771,7 @@ fn destructure_object(
             ],
             prop_span,
         );
-        destructure_into(parent, value_reg, &prop.value, prop_span)?;
+        destructure_pattern(parent, value_reg, &prop.value, prop_span, assign_existing)?;
     }
     if let Some(rest) = pattern.rest.as_ref() {
         // Build `rest_obj = Object.assign({}, src)` then delete
@@ -3775,7 +3804,7 @@ fn destructure_object(
                 span,
             );
         }
-        destructure_into(parent, rest_obj, &rest.argument, span)?;
+        destructure_pattern(parent, rest_obj, &rest.argument, span, assign_existing)?;
     }
     Ok(())
 }
@@ -5790,19 +5819,16 @@ fn bind_for_in_of_head(
                 }
                 _ => {
                     if is_var {
-                        return Err(CompileError::Unsupported {
-                            node: "for-of var destructuring head".to_string(),
-                            span,
-                        });
+                        // §14.7.5.6 step 6.b — for `var` heads, the
+                        // pattern leaves were already var-hoisted
+                        // at function entry; per iteration we just
+                        // assign into those existing bindings.
+                        destructure_assign(cx, src_reg, &declarator.id, span)
+                    } else {
+                        // For let/const heads, declare each leaf
+                        // per iteration in the fresh scope.
+                        destructure_into(cx, src_reg, &declarator.id, span)
                     }
-                    // §14.7.5.6 step 6.b — for let/const heads, the
-                    // pattern leaves are declared per iteration.
-                    // `destructure_into` defaults to `let` (mutable).
-                    // For `const` heads, declare each leaf as const
-                    // by re-walking after declaration; the foundation
-                    // accepts mutating let here as a temporary
-                    // approximation.
-                    destructure_into(cx, src_reg, &declarator.id, span)
                 }
             }
         }

@@ -6444,6 +6444,30 @@ impl Interpreter {
                             args,
                         );
                     }
+                    // Fallback: when the prototype chain has no
+                    // own / inherited callable for `method`, fall
+                    // back to the synthetic Object.prototype
+                    // intercept (the same one the call dispatcher
+                    // routes plain `obj.valueOf()` / `obj.toString()`
+                    // through). This keeps behaviour consistent
+                    // for plain object literals which never receive
+                    // a real Object.prototype linkage.
+                    if let Value::Object(o) = &obj {
+                        let no_args: SmallVec<[Value; 8]> = SmallVec::new();
+                        if let Some(v) =
+                            object_prototype_intercept(o, method, &no_args, &self.string_heap)?
+                            && abstract_ops::is_primitive(&v)
+                        {
+                            let top_idx = stack.len() - 1;
+                            stack[top_idx].pending_to_primitive = None;
+                            write_register(&mut stack[top_idx], dst, v)?;
+                            stack[top_idx].pc = stack[top_idx]
+                                .pc
+                                .checked_add(1)
+                                .ok_or(VmError::InvalidOperand)?;
+                            return Ok(false);
+                        }
+                    }
                     stage = ToPrimitiveStage::OrdinarySecond;
                 }
                 ToPrimitiveStage::OrdinarySecond => {
@@ -6473,6 +6497,27 @@ impl Interpreter {
                             obj.clone(),
                             args,
                         );
+                    }
+                    // Same prototype-intercept fallback as
+                    // OrdinaryFirst above — runs the second method
+                    // (`toString` for hint=number, `valueOf` for
+                    // hint=string) when the chain has nothing
+                    // callable.
+                    if let Value::Object(o) = &obj {
+                        let no_args: SmallVec<[Value; 8]> = SmallVec::new();
+                        if let Some(v) =
+                            object_prototype_intercept(o, method, &no_args, &self.string_heap)?
+                            && abstract_ops::is_primitive(&v)
+                        {
+                            let top_idx = stack.len() - 1;
+                            stack[top_idx].pending_to_primitive = None;
+                            write_register(&mut stack[top_idx], dst, v)?;
+                            stack[top_idx].pc = stack[top_idx]
+                                .pc
+                                .checked_add(1)
+                                .ok_or(VmError::InvalidOperand)?;
+                            return Ok(false);
+                        }
                     }
                     stage = ToPrimitiveStage::Exhausted;
                 }

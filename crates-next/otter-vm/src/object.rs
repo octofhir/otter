@@ -1107,6 +1107,13 @@ impl<'a> Properties<'a> {
         self.body.shape.keys().map(String::as_str)
     }
 
+    /// Iterate symbol-keyed own properties in insertion order.
+    /// Used by `Object.getOwnPropertySymbols` (§20.1.2.13) and
+    /// `Reflect.ownKeys` (§28.1.16) to surface symbol keys.
+    pub fn symbol_keys(&self) -> impl Iterator<Item = JsSymbol> + '_ {
+        self.body.symbol_props.iter().map(|(k, _)| k.clone())
+    }
+
     /// Iterate `(key, data-value)` pairs, skipping accessor and
     /// non-enumerable slots. Used by JSON.stringify and `for…in`
     /// once it lands.

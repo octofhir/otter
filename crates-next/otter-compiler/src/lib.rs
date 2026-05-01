@@ -6522,22 +6522,44 @@ fn compile_labeled_statement(
             span,
         });
     }
-    // Stash a sentinel pending label so the next-pushed loop /
-    // switch frame picks it up.
-    let prev_pending = cx.pending_label.replace(label);
-    let result = compile_statement(cx, &s.body);
-    // If the inner statement consumed the label (pushed a frame),
-    // `pending_label` is already cleared. Otherwise (e.g., the
-    // label wraps an expression statement) the label has no
-    // attachment point — restore the previous pending and complain.
-    if cx.pending_label.is_some() {
+    // §14.13.4 — labels may wrap any Statement. Three cases:
+    //
+    // 1. The body is a loop / switch: stash the label as
+    //    `pending_label`; the loop's frame consumes it on push.
+    // 2. The body is a Block / If / Try / etc.: push a synthetic
+    //    "labeled-block" frame so `break label;` from the body
+    //    can branch past the block. `continue label;` is a
+    //    SyntaxError for non-iteration labels per §13.8.1
+    //    (foundation surfaces it at runtime via the loop walk).
+    // 3. The body is a plain statement (`a: 1`): nothing to do
+    //    after compiling the body.
+    use oxc_ast::ast::Statement;
+    let body_takes_loop_label = matches!(
+        &s.body,
+        Statement::ForStatement(_)
+            | Statement::ForInStatement(_)
+            | Statement::ForOfStatement(_)
+            | Statement::WhileStatement(_)
+            | Statement::DoWhileStatement(_)
+            | Statement::SwitchStatement(_)
+    );
+    if body_takes_loop_label {
+        let prev_pending = cx.pending_label.replace(label);
+        let result = compile_statement(cx, &s.body);
         cx.pending_label = prev_pending;
-        return Err(CompileError::Unsupported {
-            node: "LabeledStatement: label must wrap a loop or switch in this slice".to_string(),
-            span,
-        });
+        return result;
     }
-    cx.pending_label = prev_pending;
+    // Synthetic labeled block — push a non-loop frame so
+    // `break label;` from inside the body has somewhere to land.
+    let mut frame = LoopFrame::switch_body();
+    frame.label = Some(label);
+    cx.push_loop_frame(frame);
+    let result = compile_statement(cx, &s.body);
+    let frame = cx.loops.pop().expect("labeled-block frame");
+    for pc in frame.break_patches {
+        cx.patch_branch_to_here(pc);
+    }
+    let _ = span;
     result
 }
 
@@ -8894,7 +8916,8 @@ fn compile_object_builtin(
             | "assign"
             | "fromEntries"
             | "hasOwn"
-            | "getOwnPropertyNames",
+            | "getOwnPropertyNames"
+            | "getOwnPropertySymbols",
             _,
         ) => {
             let name_idx = cx.intern_string_constant(method);

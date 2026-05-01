@@ -338,6 +338,19 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
             }
             Ok(Value::Array(JsArray::from_elements(names)))
         }
+        // §20.1.2.13 Object.getOwnPropertySymbols(O) — every own
+        // symbol-keyed property. Foundation property bag is
+        // string-keyed today; symbol keys are tracked in a parallel
+        // table inside JsObject.
+        // <https://tc39.es/ecma262/#sec-object.getownpropertysymbols>
+        "getOwnPropertySymbols" => {
+            let target = expect_object(args.first())?;
+            let mut syms: Vec<Value> = Vec::new();
+            for sym in target.borrow_props().symbol_keys() {
+                syms.push(Value::Symbol(sym));
+            }
+            Ok(Value::Array(JsArray::from_elements(syms)))
+        }
         _ => Err(VmError::UnknownIntrinsic {
             name: format!("Object.{name}"),
         }),

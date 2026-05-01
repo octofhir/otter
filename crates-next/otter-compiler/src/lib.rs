@@ -8814,6 +8814,27 @@ fn compile_object_builtin(
             );
             Ok(dst)
         }
+        // §20.1.2.2 `Object.create(O, Properties)` — proto + initial
+        // descriptor object form. Routes through the runtime's
+        // `Object.create` handler so descriptor coercion stays
+        // alongside `defineProperties`.
+        // <https://tc39.es/ecma262/#sec-object.create>
+        ("create", 2) => {
+            let name_idx = cx.intern_string_constant("create");
+            let dst = cx.alloc_scratch();
+            cx.emit(
+                Op::ObjectCall,
+                vec![
+                    Operand::Register(dst),
+                    Operand::ConstIndex(name_idx),
+                    Operand::ConstIndex(2),
+                    Operand::Register(arg_regs[0]),
+                    Operand::Register(arg_regs[1]),
+                ],
+                span,
+            );
+            Ok(dst)
+        }
         ("getPrototypeOf", 1) => {
             let obj_reg = arg_regs[0];
             let dst = cx.alloc_scratch();
@@ -8856,7 +8877,8 @@ fn compile_object_builtin(
         // Routed through one variadic `Op::ObjectCall` opcode.
         // <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
         (
-            "defineProperty"
+            "create"
+            | "defineProperty"
             | "defineProperties"
             | "getOwnPropertyDescriptor"
             | "getOwnPropertyDescriptors"

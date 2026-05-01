@@ -46,6 +46,42 @@ use crate::{Value, VmError};
 /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
 pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Value, VmError> {
     match name {
+        // §20.1.2.2 Object.create(O, Properties)
+        // <https://tc39.es/ecma262/#sec-object.create>
+        "create" => {
+            let proto = args.first().cloned().unwrap_or(Value::Undefined);
+            let proto_obj = match proto {
+                Value::Object(o) => Some(o),
+                Value::Null => None,
+                _ => return Err(VmError::TypeMismatch),
+            };
+            let obj = JsObject::new();
+            obj.set_prototype(proto_obj);
+            if let Some(props_arg) = args.get(1)
+                && !matches!(props_arg, Value::Undefined)
+            {
+                let props = match props_arg {
+                    Value::Object(o) => o.clone(),
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                let entries: Vec<(String, Value)> = props
+                    .borrow_props()
+                    .enumerable_data_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+                for (key, desc_value) in entries {
+                    let desc_obj = match desc_value {
+                        Value::Object(o) => o,
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let descriptor = coerce_to_descriptor(&desc_obj)?;
+                    if !obj.define_own_property(&key, descriptor) {
+                        return Err(VmError::TypeMismatch);
+                    }
+                }
+            }
+            Ok(Value::Object(obj))
+        }
         // §20.1.2.4 Object.defineProperty(O, P, Attributes)
         // <https://tc39.es/ecma262/#sec-object.defineproperty>
         "defineProperty" => {

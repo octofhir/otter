@@ -1116,6 +1116,13 @@ pub enum VmError {
     },
     /// Tried to call a value that is not callable.
     NotCallable,
+    /// `LoadGlobalOrThrow` (or another lookup site) hit an
+    /// unbound free identifier in strict mode. Convertible to a
+    /// real `ReferenceError` instance via `vm_error_to_throwable`.
+    UndefinedIdentifier {
+        /// Name of the unbound identifier.
+        name: String,
+    },
     /// A user `throw` (or a re-throw from `finally`) walked the
     /// entire frame stack without finding a matching handler. The
     /// payload is the JS value that was thrown, rendered for
@@ -1169,6 +1176,7 @@ impl std::fmt::Display for VmError {
                 write!(f, "maximum call stack size exceeded (limit {limit})")
             }
             VmError::NotCallable => write!(f, "value is not a function"),
+            VmError::UndefinedIdentifier { name } => write!(f, "{name} is not defined"),
             VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
             VmError::InvalidRegExp { message } => write!(f, "{message}"),
             VmError::JsonError { message, .. } => write!(f, "{message}"),
@@ -1951,6 +1959,7 @@ impl Interpreter {
     /// `Error` instance. Returns `None` for variants that should
     /// keep propagating as host errors (StackOverflow, etc.).
     fn vm_error_to_throwable(&self, err: &VmError) -> Option<Value> {
+        let dynamic_message: String;
         let (kind, message) = match err {
             VmError::TypeMismatch => (error_classes::ErrorKind::TypeError, "operand type mismatch"),
             VmError::NotCallable => (
@@ -1961,6 +1970,13 @@ impl Interpreter {
                 error_classes::ErrorKind::ReferenceError,
                 "cannot access binding before initialization",
             ),
+            VmError::UndefinedIdentifier { name } => {
+                dynamic_message = format!("{name} is not defined");
+                (
+                    error_classes::ErrorKind::ReferenceError,
+                    dynamic_message.as_str(),
+                )
+            }
             VmError::UnknownIntrinsic { .. } => (
                 error_classes::ErrorKind::TypeError,
                 "unknown intrinsic method",
@@ -3646,14 +3662,10 @@ impl Interpreter {
                         write_register(frame, dst, value)?;
                         frame.pc += 1;
                     } else {
-                        // Format the throwable so the standard
-                        // `name: message` shape (§20.5.3.4
-                        // Error.prototype.toString) survives into
-                        // the runner's diagnostic and the negative-
-                        // test inversion can match on the name.
-                        return Err(VmError::Uncaught {
-                            value: format!("ReferenceError: {name} is not defined"),
-                        });
+                        // Throw a real `ReferenceError` instance so
+                        // `e instanceof ReferenceError` checks
+                        // observe the spec-correct shape.
+                        return Err(VmError::UndefinedIdentifier { name });
                     }
                 }
                 Op::GlobalCall => {

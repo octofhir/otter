@@ -4614,6 +4614,25 @@ fn compile_expr(
                 cx.emit(Op::ArrayCall, operands, new_span);
                 return Ok(dst);
             }
+            // §22.1.1 `new String(value)` — foundation aliases to
+            // the primitive string (no wrapper object). Lower
+            // through Op::StringCall like the bare form.
+            if let Expression::Identifier(id) = callee
+                && id.name.as_str() == "String"
+                && cx.lookup_binding("String").is_none()
+                && find_module_import_binding(cx, "String").is_none()
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let name_idx = cx.intern_string_constant("");
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::StringCall, operands, new_span);
+                return Ok(dst);
+            }
             // §21.1.1 `new Number(value)` — foundation aliases to
             // primitive ToNumber (no wrapper object).
             if let Expression::Identifier(id) = callee

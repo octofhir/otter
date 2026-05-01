@@ -3668,6 +3668,17 @@ impl Interpreter {
                         return Err(VmError::UndefinedIdentifier { name });
                     }
                 }
+                Op::LoadGlobalOrUndefined => {
+                    // §13.5.3 typeof — IsUnresolvableReference path:
+                    // a free identifier with no global binding
+                    // resolves to `undefined` rather than throwing.
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    let value = self.global_this.get(&name).unwrap_or(Value::Undefined);
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
                 Op::GlobalCall => {
                     // §19.2 global functions — parseInt / parseFloat /
                     // isNaN / isFinite / encodeURI* / decodeURI*.

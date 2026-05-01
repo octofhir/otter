@@ -4412,6 +4412,40 @@ fn compile_expr(
                 cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
                 return Ok(dst);
             }
+            // §13.5.3 `typeof Identifier` — IsUnresolvableReference
+            // returns `"undefined"` rather than throwing
+            // ReferenceError. Re-route the global-fallback step to
+            // `LoadGlobalOrUndefined` so an unbound free identifier
+            // never throws under `typeof`.
+            // <https://tc39.es/ecma262/#sec-typeof-operator>
+            if matches!(u.operator, UnaryOperator::Typeof) {
+                if let Expression::Identifier(id) = &u.argument {
+                    let name = id.name.as_str();
+                    if cx.lookup_binding(name).is_none()
+                        && find_module_import_binding(cx, name).is_none()
+                        && cx.resolve_capture(name).is_none()
+                        && !is_builtin_error_class_name(name)
+                        && name != "NaN"
+                        && name != "Infinity"
+                        && name != "undefined"
+                    {
+                        let value_reg = cx.alloc_scratch();
+                        let name_idx = cx.intern_string_constant(name);
+                        cx.emit(
+                            Op::LoadGlobalOrUndefined,
+                            vec![Operand::Register(value_reg), Operand::ConstIndex(name_idx)],
+                            span,
+                        );
+                        let dst = cx.alloc_scratch();
+                        cx.emit(
+                            Op::TypeOf,
+                            vec![Operand::Register(dst), Operand::Register(value_reg)],
+                            span,
+                        );
+                        return Ok(dst);
+                    }
+                }
+            }
             let inner = compile_expr(cx, &u.argument, span)?;
             let dst = cx.alloc_scratch();
             let op = match u.operator {

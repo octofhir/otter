@@ -511,6 +511,19 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-getvalue>
     LoadGlobalOrThrow,
 
+    /// `r<dst> = globalThis[const<name>]` returning `undefined` when
+    /// the binding does not exist. Operands:
+    /// `Register(dst), ConstIndex(name)`.
+    ///
+    /// Used by `typeof` on a free identifier so that
+    /// `typeof Float16Array === "undefined"` evaluates to `true` per
+    /// §13.5.3 (IsUnresolvableReference returns "undefined" rather
+    /// than throwing).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-typeof-operator>
+    LoadGlobalOrUndefined,
+
     /// `r<dst> = import.meta.resolve(r<spec>)`. Operands:
     /// `Register(dst), Register(specifier_reg)`.
     ///
@@ -1037,6 +1050,7 @@ impl Op {
             Op::GlobalCall => "GLOBAL_CALL",
             Op::LoadGlobalThis => "LOAD_GLOBAL_THIS",
             Op::LoadGlobalOrThrow => "LOAD_GLOBAL_OR_THROW",
+            Op::LoadGlobalOrUndefined => "LOAD_GLOBAL_OR_UNDEFINED",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
@@ -1106,7 +1120,8 @@ impl Op {
             | Op::TemporalLoad
             | Op::IsArray
             | Op::LoadBuiltinError
-            | Op::LoadGlobalOrThrow => 2,
+            | Op::LoadGlobalOrThrow
+            | Op::LoadGlobalOrUndefined => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub

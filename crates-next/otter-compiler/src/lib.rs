@@ -2912,27 +2912,37 @@ fn compile_assignment(
             });
         }
     };
-    let storage = if let Some(info) = cx.lookup_binding(&name) {
-        if info.is_const {
+    let storage = match cx.lookup_binding(&name) {
+        Some(info) if info.is_const => {
             return Err(CompileError::Unsupported {
                 node: format!("assignment to const `{name}`"),
                 span,
             });
         }
-        info.storage
-    } else if let Some(idx) = cx.resolve_capture(&name) {
-        BindingStorage::Upvalue { idx }
-    } else {
-        return Err(CompileError::Unsupported {
-            node: format!("assignment to undeclared `{name}`"),
-            span,
-        });
+        Some(info) => Some(info.storage),
+        // §10.2.4.1 PutValue fallback — assignment to an undeclared
+        // identifier in sloppy mode creates a property on the
+        // global object. Foundation lowers this as a `StoreProperty`
+        // against `globalThis` so harness-style code that pre-
+        // populates globals (e.g. `assert.sameValue = function …`
+        // before the first reference) keeps working.
+        // <https://tc39.es/ecma262/#sec-putvalue>
+        None => cx
+            .resolve_capture(&name)
+            .map(|idx| BindingStorage::Upvalue { idx }),
     };
     let value = match compound_op {
         None => compile_expr(cx, &a.right, span)?,
         Some(op) => {
             let current = cx.alloc_scratch();
-            cx.emit_load_storage(current, storage, span);
+            match storage {
+                Some(s) => cx.emit_load_storage(current, s, span),
+                None => {
+                    let global = cx.alloc_scratch();
+                    cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                    cx.emit_load_property(current, global, &name, span);
+                }
+            }
             let rhs = compile_expr(cx, &a.right, span)?;
             let dst = cx.alloc_scratch();
             cx.emit(
@@ -2947,9 +2957,30 @@ fn compile_assignment(
             dst
         }
     };
-    cx.emit_store_storage(value, storage, span);
-    cx.mark_initialized(&name);
-    cx.emit_module_export_mirror(&name, value, span);
+    match storage {
+        Some(s) => {
+            cx.emit_store_storage(value, s, span);
+            cx.mark_initialized(&name);
+            cx.emit_module_export_mirror(&name, value, span);
+        }
+        None => {
+            // Store to the globalThis property table.
+            let global = cx.alloc_scratch();
+            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+            let name_idx = cx.intern_string_constant(&name);
+            let scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(global),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(value),
+                    Operand::Register(scratch),
+                ],
+                span,
+            );
+        }
+    }
     Ok(value)
 }
 
@@ -3533,10 +3564,21 @@ fn compile_expr(
                 );
                 return Ok(dst);
             }
-            Err(CompileError::Unsupported {
-                node: format!("unresolved identifier `{}`", id.name),
-                span,
-            })
+            // §10.2.4.1 ResolveBinding fallback — an unbound free
+            // identifier resolves against the global environment
+            // record (foundation: `globalThis`). The compiler has
+            // exhausted local / upvalue / module-import / known-
+            // intrinsic resolution; lower as a property read on
+            // `globalThis` so harness-style references like
+            // `Array.prototype` / `Object.prototype` work without
+            // forcing every test to declare them.
+            //
+            // <https://tc39.es/ecma262/#sec-resolvebinding>
+            let global = cx.alloc_scratch();
+            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+            let dst = cx.alloc_scratch();
+            cx.emit_load_property(dst, global, id.name.as_str(), span);
+            Ok(dst)
         }
 
         Expression::LogicalExpression(l) => {
@@ -4802,26 +4844,31 @@ fn compile_expr(
                 }
             };
             let name = id.name.as_str().to_string();
-            let storage = if let Some(info) = cx.lookup_binding(&name) {
-                if info.is_const {
+            let storage = match cx.lookup_binding(&name) {
+                Some(info) if info.is_const => {
                     return Err(CompileError::Unsupported {
                         node: format!("update on const `{name}`"),
                         span,
                     });
                 }
-                info.storage
-            } else if let Some(idx) = cx.resolve_capture(&name) {
-                BindingStorage::Upvalue { idx }
-            } else {
-                return Err(CompileError::Unsupported {
-                    node: format!("update on undeclared `{name}`"),
-                    span,
-                });
+                Some(info) => Some(info.storage),
+                // Update on an undeclared identifier — globalThis
+                // fallback (§10.2.4.1 PutValue, sloppy mode).
+                None => cx
+                    .resolve_capture(&name)
+                    .map(|idx| BindingStorage::Upvalue { idx }),
             };
 
             // Step 1 — load the old value.
             let old = cx.alloc_scratch();
-            cx.emit_load_storage(old, storage, span);
+            match storage {
+                Some(s) => cx.emit_load_storage(old, s, span),
+                None => {
+                    let global = cx.alloc_scratch();
+                    cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                    cx.emit_load_property(old, global, &name, span);
+                }
+            }
             // Step 2 — coerce to number (§13.4.2.1 step 3 / 13.4.3.1
             // step 3) so increments behave like spec.
             let cur = cx.alloc_scratch();
@@ -4852,8 +4899,26 @@ fn compile_expr(
                 ],
                 span,
             );
-            // Step 5 — store back to the binding.
-            cx.emit_store_storage(next, storage, span);
+            // Step 5 — store back.
+            match storage {
+                Some(s) => cx.emit_store_storage(next, s, span),
+                None => {
+                    let global = cx.alloc_scratch();
+                    cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                    let name_idx = cx.intern_string_constant(&name);
+                    let scratch = cx.alloc_scratch();
+                    cx.emit(
+                        Op::StoreProperty,
+                        vec![
+                            Operand::Register(global),
+                            Operand::ConstIndex(name_idx),
+                            Operand::Register(next),
+                            Operand::Register(scratch),
+                        ],
+                        span,
+                    );
+                }
+            }
             // Step 6 — Postfix returns pre-update value (post-
             // ToNumber); prefix returns the new value.
             Ok(if u.prefix { next } else { cur })

@@ -7872,9 +7872,44 @@ fn emit_instance_field_inits(
 ) -> Result<(), CompileError> {
     for p in fields {
         let pspan = (p.span.start, p.span.end);
+        let value_reg = match &p.value {
+            Some(expr) => compile_expr(cx, expr, pspan)?,
+            None => {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], pspan);
+                dst
+            }
+        };
+        let this_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], pspan);
+        if p.computed {
+            // §15.7.10 — computed-key field. Evaluate the key
+            // expression at constructor-run time and write via
+            // `Op::StoreElement`.
+            let key_expr = p
+                .key
+                .as_expression()
+                .ok_or_else(|| CompileError::Unsupported {
+                    node: "ClassDeclaration: non-expression computed instance field key"
+                        .to_string(),
+                    span: pspan,
+                })?;
+            let key_reg = compile_expr(cx, key_expr, pspan)?;
+            cx.emit(
+                Op::StoreElement,
+                vec![
+                    Operand::Register(this_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(value_reg),
+                ],
+                pspan,
+            );
+            continue;
+        }
         let key_str = match &p.key {
             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
             oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+            oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
             oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => cx
                 .mangle_private(pid.name.as_str())
                 .ok_or(CompileError::Unsupported {
@@ -7888,16 +7923,6 @@ fn emit_instance_field_inits(
                 });
             }
         };
-        let value_reg = match &p.value {
-            Some(expr) => compile_expr(cx, expr, pspan)?,
-            None => {
-                let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], pspan);
-                dst
-            }
-        };
-        let this_reg = cx.alloc_scratch();
-        cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], pspan);
         cx.emit_store_property(this_reg, &key_str, value_reg, pspan);
     }
     Ok(())

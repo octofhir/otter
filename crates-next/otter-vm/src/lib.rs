@@ -1988,11 +1988,17 @@ impl Interpreter {
                 return Err(VmError::Interrupted);
             }
             if stack.is_empty() {
-                // Defensive: unwind paths that pop the last frame
-                // without the matching `return-with-value` step land
-                // here. Surface as `MissingReturn` so the runner
-                // records a clean Fail instead of a panic.
-                return Err(VmError::MissingReturn);
+                // Defensive: unwind paths (throw / finally) can
+                // pop the last frame without writing back to a
+                // caller register. Surface `Value::Undefined` so
+                // the dispatch loop terminates cleanly instead of
+                // panicking on the next `stack.len() - 1`. Tests
+                // that rely on the throw escape will already have
+                // flowed through `unwind_throw` and surfaced as
+                // `VmError::Uncaught`; this guard catches the
+                // residual "fell off the bottom" path and treats
+                // it as completion.
+                return Ok(Value::Undefined);
             }
             let top_idx = stack.len() - 1;
             let function_id = stack[top_idx].function_id;

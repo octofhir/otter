@@ -4677,9 +4677,21 @@ fn compile_expr(
                     });
                 }
             };
+            // §13.5.4–13.5.7 — unary `+`, `-`, `~` apply
+            // ToPrimitive(number) before ToNumeric so an object
+            // operand goes through `[Symbol.toPrimitive]` /
+            // `valueOf` / `toString`. LogicalNot and TypeOf do
+            // not coerce; they take their argument as-is.
+            // <https://tc39.es/ecma262/#sec-unary-operators>
+            let inner_in = match op {
+                Op::Neg | Op::ToNumber | Op::BitwiseNot => {
+                    emit_to_primitive(cx, inner, "number", span)
+                }
+                _ => inner,
+            };
             cx.emit(
                 op,
-                vec![Operand::Register(dst), Operand::Register(inner)],
+                vec![Operand::Register(dst), Operand::Register(inner_in)],
                 span,
             );
             Ok(dst)

@@ -3018,12 +3018,16 @@ impl Interpreter {
                     self.run_numeric(&operands, frame, number::shr_arith, bigint::ops::shr)?;
                 }
                 Op::Ushr => {
-                    // `>>>` on BigInt is a spec TypeError — only the
-                    // Number path is allowed here.
+                    // §13.10 `>>>` — BigInt operands raise TypeError;
+                    // every other primitive is coerced via
+                    // ToNumber. Compiler ToPrimitive(number) ahead.
+                    // <https://tc39.es/ecma262/#sec-unsigned-right-shift-operator>
                     let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let result = match (&lhs, &rhs) {
-                        (Value::Number(a), Value::Number(b)) => {
-                            Value::Number(number::shr_logical(*a, *b))
+                    let lk = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
+                    let rk = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
+                    let result = match (lk, rk) {
+                        (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
+                            Value::Number(number::shr_logical(a, b))
                         }
                         _ => return Err(VmError::TypeMismatch),
                     };
@@ -3031,29 +3035,38 @@ impl Interpreter {
                     frame.pc += 1;
                 }
                 Op::Neg => {
+                    // §13.5.6 unary `-`: ToNumeric, then negate.
+                    // Compiler emits ToPrimitive(number) ahead of
+                    // this op so we only see primitives.
+                    // <https://tc39.es/ecma262/#sec-unary-minus-operator>
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
-                    let value = match read_register(frame, src)? {
-                        Value::Number(n) => Value::Number(number::neg(*n)),
-                        Value::BigInt(b) => Value::BigInt(bigint::ops::neg(b)),
-                        _ => return Err(VmError::TypeMismatch),
+                    let v = read_register(frame, src)?.clone();
+                    let value = match abstract_ops::to_numeric_kind(&v)
+                        .ok_or(VmError::TypeMismatch)?
+                    {
+                        abstract_ops::NumericKind::Num(n) => Value::Number(number::neg(n)),
+                        abstract_ops::NumericKind::Big(b) => Value::BigInt(bigint::ops::neg(&b)),
                     };
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
                 Op::BitwiseNot => {
+                    // §13.5.7 unary `~`: ToNumeric, then bitwise
+                    // not. BigInt stays BigInt; otherwise Number.
+                    // <https://tc39.es/ecma262/#sec-bitwise-not-operator>
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
-                    if let Value::BigInt(b) = read_register(frame, src)?.clone() {
-                        let value = Value::BigInt(bigint::ops::bitwise_not(&b));
-                        write_register(frame, dst, value)?;
-                        frame.pc += 1;
-                        continue;
-                    }
-                    let n = read_register(frame, src)?
-                        .as_number()
-                        .ok_or(VmError::TypeMismatch)?;
-                    write_register(frame, dst, Value::Number(number::bitwise_not(n)))?;
+                    let v = read_register(frame, src)?.clone();
+                    let value = match abstract_ops::to_numeric_kind(&v)
+                        .ok_or(VmError::TypeMismatch)?
+                    {
+                        abstract_ops::NumericKind::Num(n) => Value::Number(number::bitwise_not(n)),
+                        abstract_ops::NumericKind::Big(b) => {
+                            Value::BigInt(bigint::ops::bitwise_not(&b))
+                        }
+                    };
+                    write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
                 Op::ToNumber => {

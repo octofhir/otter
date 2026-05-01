@@ -1,19 +1,39 @@
-//! Corpus traversal for the Test262 runner.
+//! Corpus traversal + per-test execution driver for the Test262
+//! runner.
 //!
-//! Slice 101 ships only the bare walk: locate the
-//! `vendor/test262/test/` tree, refuse to launch when it is missing,
-//! and count `.js` files (excluding `_FIXTURE.js` per
-//! [INTERPRETING §test files](https://github.com/tc39/test262/blob/main/INTERPRETING.md#test-files)).
+//! Slice 101 shipped the bare walk; slice 103 layers the per-test
+//! [`Outcome`] taxonomy and [`run_one`] driver on top. The driver:
 //!
-//! Slices 102 / 103 / 104 layer the metadata parser, per-test
-//! driver, and shard supervisor on top of [`list_tests`].
+//! 1. Skip via `test262_config.toml` (`known_panics`,
+//!    `ignored_tests`).
+//! 2. Parse frontmatter; on parse failure → [`Outcome::Fail`].
+//! 3. Skip via `skip_features` (config-driven).
+//! 4. Skip `flags: [noStrict]`-only tests
+//!    (foundation is always strict per ADR-0001).
+//! 5. Build a fresh `Runtime` with the configured heap cap.
+//! 6. Compile + run the harness preamble (cached per-worker).
+//! 7. Compile + run the test body. `flags: [module]` routes through
+//!    [`otter_runtime::Runtime::run_module`]; everything else
+//!    through [`otter_runtime::Runtime::run_script`].
+//! 8. Map the engine outcome onto [`Outcome`] per ECMA-262 +
+//!    test262 INTERPRETING.md negative-test rules.
 //!
-//! Spec link: <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
+//! Spec: <https://tc39.es/ecma262/>
+//! Spec: <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ignore::WalkBuilder;
+use otter_runtime::{Diagnostic, DiagnosticKind, OtterError, Runtime, SourceInput};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::config::Test262Config;
+use crate::feature_map::FeatureMap;
+use crate::harness::HarnessCache;
+use crate::isolation::{WatchdogOutcome, fresh_runtime, run_with_watchdog};
+use crate::metadata::{Frontmatter, FrontmatterError, NegativePhase};
 
 /// Resolved on-disk paths for a test262 checkout.
 #[derive(Debug, Clone)]
@@ -27,11 +47,6 @@ pub struct CorpusPaths {
 }
 
 /// Locate the test262 corpus on disk.
-///
-/// Per task 100 §"Source acquisition", `vendor/test262` is a
-/// `git submodule`. Slice 101 refuses to run when the submodule is
-/// missing or empty so the user gets an actionable error instead of
-/// a near-empty baseline.
 ///
 /// # Errors
 /// - [`CorpusError::Missing`] when `vendor/test262` does not exist.
@@ -64,18 +79,9 @@ pub fn ensure_corpus_present(repo_root: &Path) -> Result<CorpusPaths, CorpusErro
 /// Walk the test262 `test/` tree and return every test path.
 ///
 /// `_FIXTURE.js` files are excluded per
-/// [INTERPRETING.md](https://github.com/tc39/test262/blob/main/INTERPRETING.md#test-files):
-/// they are import targets used by other tests, not standalone
-/// tests in their own right.
-///
-/// The walker honours `.gitignore` patterns inside the corpus via
-/// [`ignore::WalkBuilder`] so newly-vendored fixtures cannot accidentally
-/// blow up the count.
-///
+/// [INTERPRETING.md](https://github.com/tc39/test262/blob/main/INTERPRETING.md#test-files).
 /// `filter` (when supplied) is a substring match on the path
-/// relative to `paths.test_dir` — slice 101's CLI only wires the
-/// `--filter <glob>` flag through as a substring; richer glob
-/// support lands with slice 104.
+/// relative to `paths.test_dir`.
 pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let walker = WalkBuilder::new(&paths.test_dir)
@@ -115,10 +121,494 @@ pub fn list_tests(paths: &CorpusPaths, filter: Option<&str>) -> Vec<PathBuf> {
     out
 }
 
-/// Convenience: same as [`list_tests`] but only returns the count.
+/// Same as [`list_tests`] but only returns the count.
 #[must_use]
 pub fn count_tests(paths: &CorpusPaths, filter: Option<&str>) -> usize {
     list_tests(paths, filter).len()
+}
+
+/// The per-test outcome taxonomy. Mirrors task 100 §"Outcome
+/// taxonomy".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    /// Test body returned normally (or threw the spec-required
+    /// negative error).
+    Pass,
+    /// Test failed conformance.
+    Fail {
+        /// Human-readable reason (rendered into the report).
+        reason: String,
+        /// Optional engine stack trace.
+        stack: Option<String>,
+    },
+    /// Test was skipped — config / strict-mode policy / unsupported
+    /// feature.
+    Skipped {
+        /// What was skipped (`<feature>` / `"foundation-always-strict"` /
+        /// `"ignored by config"` / `"known panic"`).
+        feature: String,
+    },
+    /// Engine panicked while running the test.
+    Crash {
+        /// Panic payload (rendered).
+        panic: String,
+    },
+    /// Per-test wall-clock budget exceeded.
+    Timeout {
+        /// Configured budget that fired (ms).
+        ms: u64,
+    },
+    /// Engine heap cap fired.
+    OutOfMemory {
+        /// Bytes the engine reported as "requested at cap".
+        bytes: u64,
+    },
+}
+
+/// Per-test result record consumed by the report writer (slice 104).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestResult {
+    /// Test path relative to `vendor/test262/test/`.
+    pub path: String,
+    /// `esid:` from the frontmatter (if any).
+    pub esid: Option<String>,
+    /// Decoded `features:` for the test.
+    pub features: Vec<String>,
+    /// Final outcome.
+    pub outcome: Outcome,
+    /// Wall-clock duration.
+    pub wall_ms: u64,
+}
+
+/// Configuration shared across all `run_one` calls in a sweep.
+#[derive(Debug, Clone)]
+pub struct ExecConfig {
+    /// Per-test wall-clock budget.
+    pub timeout: Duration,
+    /// Per-test heap cap (bytes); `0` disables.
+    pub max_heap_bytes: u64,
+    /// Loaded `test262_config.toml` (drives skip lists).
+    pub config: Test262Config,
+}
+
+impl ExecConfig {
+    /// Build the in-memory feature map from the loaded config.
+    #[must_use]
+    pub fn feature_map(&self) -> FeatureMap {
+        FeatureMap::from_skip_features(self.config.skip_features.clone())
+    }
+}
+
+/// Run a single test through the foundation-phase driver. The
+/// driver allocates a fresh `Runtime` per test, applies the
+/// timeout + heap cap, and never panics — engine panics surface
+/// as [`Outcome::Crash`] so a single bad test cannot derail the
+/// sweep.
+///
+/// `paths` must be a fresh [`CorpusPaths`] (typically from
+/// [`ensure_corpus_present`]). `harness` is shared across tests so
+/// the `assert.js` / `sta.js` / `includes` reads are paid once per
+/// worker.
+pub fn run_one(
+    test_path: &Path,
+    paths: &CorpusPaths,
+    harness: &mut HarnessCache,
+    exec: &ExecConfig,
+) -> TestResult {
+    let start = std::time::Instant::now();
+    let rel_path = relative_path(test_path, &paths.test_dir);
+
+    // 1. Skip via config (no fs read needed). Cheap and lets us
+    //    short-circuit known-bad files.
+    if exec.config.is_known_panic(&rel_path) {
+        return result_with(
+            rel_path,
+            None,
+            Vec::new(),
+            Outcome::Skipped {
+                feature: "known panic".to_string(),
+            },
+            start,
+        );
+    }
+    if exec.config.is_ignored(&rel_path) {
+        return result_with(
+            rel_path,
+            None,
+            Vec::new(),
+            Outcome::Skipped {
+                feature: "ignored by config".to_string(),
+            },
+            start,
+        );
+    }
+
+    // 2. Read the source.
+    let source = match std::fs::read_to_string(test_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return result_with(
+                rel_path,
+                None,
+                Vec::new(),
+                Outcome::Fail {
+                    reason: format!("failed to read test file: {err}"),
+                    stack: None,
+                },
+                start,
+            );
+        }
+    };
+
+    // 3. Refuse oversize inputs (defence in depth — the corpus
+    //    has no >2 MB tests today).
+    if source.len() > 2 * 1024 * 1024 {
+        return result_with(
+            rel_path,
+            None,
+            Vec::new(),
+            Outcome::Skipped {
+                feature: "source too large".to_string(),
+            },
+            start,
+        );
+    }
+
+    // 4. Parse frontmatter.
+    let frontmatter = match Frontmatter::parse(&source) {
+        Ok(fm) => fm,
+        Err(FrontmatterError::MissingBlock) => {
+            return result_with(
+                rel_path,
+                None,
+                Vec::new(),
+                Outcome::Skipped {
+                    feature: "no frontmatter".to_string(),
+                },
+                start,
+            );
+        }
+        Err(err) => {
+            return result_with(
+                rel_path,
+                None,
+                Vec::new(),
+                Outcome::Fail {
+                    reason: format!("frontmatter parse failed: {err}"),
+                    stack: None,
+                },
+                start,
+            );
+        }
+    };
+
+    let features = frontmatter.features.clone();
+    let esid = frontmatter.esid.clone();
+
+    // 5. Skip via feature_map.
+    let feature_map = exec.feature_map();
+    if let Some(feat) = feature_map.first_skipped(&features).map(str::to_string) {
+        return result_with(
+            rel_path,
+            esid,
+            features,
+            Outcome::Skipped { feature: feat },
+            start,
+        );
+    }
+
+    // 6. Strict-mode policy. Foundation is always strict per
+    //    ADR-0001 — `noStrict`-only tests skip.
+    if frontmatter.is_no_strict() && !frontmatter.is_only_strict() && !frontmatter.is_module() {
+        return result_with(
+            rel_path,
+            esid,
+            features,
+            Outcome::Skipped {
+                feature: "foundation-always-strict".to_string(),
+            },
+            start,
+        );
+    }
+
+    // 7. Build harness preamble.
+    let preamble = match harness.preamble_for(&frontmatter) {
+        Ok(text) => text,
+        Err(err) => {
+            return result_with(
+                rel_path,
+                esid,
+                features,
+                Outcome::Fail {
+                    reason: format!("harness load failed: {err}"),
+                    stack: None,
+                },
+                start,
+            );
+        }
+    };
+
+    // 8. Build the per-test source.
+    let body = Frontmatter::body_of(&source);
+    let combined = if frontmatter.is_module() {
+        // Module-flagged tests run via run_module; the harness +
+        // body need to live in a temp file. Implemented later in
+        // this slice.
+        let mut buf = preamble;
+        buf.push_str(body);
+        buf
+    } else {
+        let mut buf = preamble;
+        buf.push_str(body);
+        buf
+    };
+
+    // 9. Allocate fresh runtime + run.
+    let mut runtime = match fresh_runtime(exec.timeout, exec.max_heap_bytes) {
+        Ok(rt) => rt,
+        Err(err) => {
+            return result_with(
+                rel_path,
+                esid,
+                features,
+                Outcome::Crash {
+                    panic: format!("runtime construction failed: {err}"),
+                },
+                start,
+            );
+        }
+    };
+
+    let outcome = if frontmatter.is_module() {
+        run_module_test(&mut runtime, &combined, exec.timeout)
+    } else {
+        run_script_test(&mut runtime, &combined, &rel_path, exec.timeout)
+    };
+
+    // 10. Apply negative-test inversion if the frontmatter expects
+    //     an error.
+    let mapped = invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout);
+
+    result_with(rel_path, esid, features, mapped, start)
+}
+
+fn run_script_test(
+    runtime: &mut Runtime,
+    source: &str,
+    rel_path: &str,
+    timeout: Duration,
+) -> Outcome {
+    let outcome = run_with_watchdog(runtime, timeout, |rt| {
+        rt.run_script(SourceInput::from_javascript(source.to_string()), rel_path)
+    });
+    map_watchdog_outcome(outcome)
+}
+
+fn run_module_test(runtime: &mut Runtime, source: &str, timeout: Duration) -> Outcome {
+    // Module entry must live on disk (the loader uses the parent
+    // directory as the resolution base). Stage the combined source
+    // in a tempfile under the system temp dir.
+    let dir = match tempfile_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            return Outcome::Fail {
+                reason: format!("tempdir creation failed: {err}"),
+                stack: None,
+            };
+        }
+    };
+    let entry = dir.path().join("entry.mjs");
+    if let Err(err) = std::fs::write(&entry, source) {
+        return Outcome::Fail {
+            reason: format!("tempfile write failed: {err}"),
+            stack: None,
+        };
+    }
+    let outcome = run_with_watchdog(runtime, timeout, |rt| rt.run_module(&entry));
+    let mapped = map_watchdog_outcome(outcome);
+    drop(dir); // explicit; the temp dir auto-cleans on drop anyway
+    mapped
+}
+
+fn tempfile_dir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().prefix("otter-test262-").tempdir()
+}
+
+fn map_watchdog_outcome(outcome: WatchdogOutcome) -> Outcome {
+    match outcome {
+        WatchdogOutcome::Ok(_) => Outcome::Pass,
+        WatchdogOutcome::Timeout { wall_ms } => Outcome::Timeout { ms: wall_ms },
+        WatchdogOutcome::Panic(payload) => Outcome::Crash { panic: payload },
+        WatchdogOutcome::Err(err) => map_otter_error(err),
+    }
+}
+
+fn map_otter_error(err: OtterError) -> Outcome {
+    match err {
+        OtterError::Interrupted => Outcome::Timeout { ms: 0 },
+        OtterError::OutOfMemory {
+            requested_bytes, ..
+        } => Outcome::OutOfMemory {
+            bytes: requested_bytes,
+        },
+        OtterError::Timeout { elapsed_ms } => Outcome::Timeout { ms: elapsed_ms },
+        OtterError::Compile { diagnostics } => Outcome::Fail {
+            reason: render_compile_diagnostics(&diagnostics),
+            stack: None,
+        },
+        OtterError::Runtime { diagnostic } => Outcome::Fail {
+            reason: render_runtime_diagnostic(&diagnostic),
+            stack: render_stack(&diagnostic),
+        },
+        OtterError::Internal { code, message } => Outcome::Crash {
+            panic: format!("engine internal error ({code}): {message}"),
+        },
+        other => Outcome::Fail {
+            reason: format!("unmapped engine error: {other}"),
+            stack: None,
+        },
+    }
+}
+
+fn invert_negative(
+    outcome: Outcome,
+    negative: Option<&crate::metadata::Negative>,
+    _timeout: Duration,
+) -> Outcome {
+    let Some(negative) = negative else {
+        return outcome;
+    };
+    let phase = negative.phase.canonical();
+    let want_type = negative.type_.as_str();
+    match (&outcome, phase) {
+        // Spec-correct: parse-phase test threw at compile time.
+        (Outcome::Fail { reason, stack: _ }, NegativePhase::Parse)
+            if reason.starts_with("compile:") =>
+        {
+            // Compile diagnostic carries the wanted type when the
+            // engine can identify it; otherwise we accept any
+            // compile failure for `phase: parse`.
+            if reason_carries_type(reason, want_type) || want_type == "SyntaxError" {
+                Outcome::Pass
+            } else {
+                Outcome::Fail {
+                    reason: format!("negative phase=parse expected {want_type}, got: {reason}"),
+                    stack: None,
+                }
+            }
+        }
+        (Outcome::Fail { reason, stack: _ }, NegativePhase::Resolution)
+            if reason.starts_with("compile:") =>
+        {
+            // Foundation: linker/resolution errors surface as
+            // compile diagnostics. Accept any compile failure for
+            // `phase: resolution`.
+            if reason_carries_type(reason, want_type) || want_type == "SyntaxError" {
+                Outcome::Pass
+            } else {
+                Outcome::Fail {
+                    reason: format!(
+                        "negative phase=resolution expected {want_type}, got: {reason}"
+                    ),
+                    stack: None,
+                }
+            }
+        }
+        (Outcome::Fail { reason, stack: _ }, NegativePhase::Runtime)
+            if reason.starts_with("runtime:") =>
+        {
+            if reason_carries_type(reason, want_type) {
+                Outcome::Pass
+            } else {
+                Outcome::Fail {
+                    reason: format!("negative phase=runtime expected {want_type}, got: {reason}"),
+                    stack: None,
+                }
+            }
+        }
+        // Negative test that returned normally (no error).
+        (Outcome::Pass, _) => Outcome::Fail {
+            reason: format!(
+                "negative phase={phase:?} expected {want_type} but execution completed normally"
+            ),
+            stack: None,
+        },
+        // Pass-through for skipped / crashed / timeout / OOM —
+        // these are *not* spec-equivalent successes.
+        (other, _) => other.clone(),
+    }
+}
+
+fn reason_carries_type(reason: &str, want_type: &str) -> bool {
+    // Engine renders the diagnostic with the JS error name in the
+    // message. Substring match is sufficient — spec-correct
+    // matchers can refine later.
+    reason.contains(want_type)
+}
+
+fn render_compile_diagnostics(diags: &[Diagnostic]) -> String {
+    let codes: Vec<String> = diags.iter().map(|d| d.code.clone()).collect();
+    let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+    format!(
+        "compile: codes=[{}] messages=[{}]",
+        codes.join(", "),
+        messages.join(" | ")
+    )
+}
+
+fn render_runtime_diagnostic(diag: &Diagnostic) -> String {
+    let kind_label = match diag.kind {
+        DiagnosticKind::Type => "TypeError",
+        DiagnosticKind::Reference => "ReferenceError",
+        DiagnosticKind::Range => "RangeError",
+        DiagnosticKind::Syntax => "SyntaxError",
+        DiagnosticKind::OutOfMemory => "RangeError",
+        DiagnosticKind::Timeout => "Timeout",
+        DiagnosticKind::Capability => "CapabilityError",
+        DiagnosticKind::Internal => "InternalError",
+        // `DiagnosticKind` is `#[non_exhaustive]`; treat any
+        // future variants as a generic Error so the runner
+        // remains forward-compatible.
+        _ => "Error",
+    };
+    format!("runtime: {kind_label} ({}) {}", diag.code, diag.message)
+}
+
+fn render_stack(diag: &Diagnostic) -> Option<String> {
+    if diag.frames.is_empty() {
+        return None;
+    }
+    let joined: Vec<String> = diag
+        .frames
+        .iter()
+        .map(|f| format!("  at {} ({})", f.function, f.module))
+        .collect();
+    Some(joined.join("\n"))
+}
+
+fn relative_path(test_path: &Path, test_dir: &Path) -> String {
+    test_path
+        .strip_prefix(test_dir)
+        .unwrap_or(test_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn result_with(
+    path: String,
+    esid: Option<String>,
+    features: Vec<String>,
+    outcome: Outcome,
+    start: std::time::Instant,
+) -> TestResult {
+    TestResult {
+        path,
+        esid,
+        features,
+        outcome,
+        wall_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }
 }
 
 /// Errors raised by [`ensure_corpus_present`].

@@ -39,5 +39,6 @@ indicatif   = "0.18"
 anyhow      = "1"
 thiserror   = { workspace = true }
 
-[dev-dependencies]
-tempfile = "3"
+# Module-flagged tests need an on-disk entry; we stage them in a
+# scratch directory.
+tempfile    = "3"

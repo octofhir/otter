@@ -495,6 +495,22 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-globalthis>
     LoadGlobalThis,
 
+    /// `r<dst> = globalThis[const<name>]` with §10.2.4.1
+    /// ResolveBinding semantics: throw `ReferenceError` when the
+    /// global has no own property under that name. Operands:
+    /// `Register(dst), ConstIndex(name)`.
+    ///
+    /// The compiler emits this for free-identifier reads that did
+    /// not resolve to a local / upvalue / module import / known
+    /// intrinsic. Strict-mode behaviour (every test262 test runs
+    /// strict per ADR-0001) is the only mode the foundation
+    /// supports.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-resolvebinding>
+    /// - <https://tc39.es/ecma262/#sec-getvalue>
+    LoadGlobalOrThrow,
+
     /// `r<dst> = import.meta.resolve(r<spec>)`. Operands:
     /// `Register(dst), Register(specifier_reg)`.
     ///
@@ -1020,6 +1036,7 @@ impl Op {
             Op::ImportMetaResolve => "IMPORT_META_RESOLVE",
             Op::GlobalCall => "GLOBAL_CALL",
             Op::LoadGlobalThis => "LOAD_GLOBAL_THIS",
+            Op::LoadGlobalOrThrow => "LOAD_GLOBAL_OR_THROW",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
@@ -1088,7 +1105,8 @@ impl Op {
             | Op::TypeOf
             | Op::TemporalLoad
             | Op::IsArray
-            | Op::LoadBuiltinError => 2,
+            | Op::LoadBuiltinError
+            | Op::LoadGlobalOrThrow => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub

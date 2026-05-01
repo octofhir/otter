@@ -1987,6 +1987,13 @@ impl Interpreter {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
             }
+            if stack.is_empty() {
+                // Defensive: unwind paths that pop the last frame
+                // without the matching `return-with-value` step land
+                // here. Surface as `MissingReturn` so the runner
+                // records a clean Fail instead of a panic.
+                return Err(VmError::MissingReturn);
+            }
             let top_idx = stack.len() - 1;
             let function_id = stack[top_idx].function_id;
             let function = module
@@ -3620,6 +3627,28 @@ impl Interpreter {
                     let value = Value::Object(self.global_this.clone());
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
+                }
+                Op::LoadGlobalOrThrow => {
+                    // §10.2.4.1 ResolveBinding + §10.2.4.5 GetValue:
+                    // when the global env has no binding for `name`,
+                    // throw a `ReferenceError`. Foundation lowers
+                    // free-identifier reads to this opcode.
+                    let dst = register_operand(operands.first())?;
+                    let name_idx = const_operand(operands.get(1))?;
+                    let name = lookup_string_constant(module, name_idx)?;
+                    if let Some(value) = self.global_this.get(&name) {
+                        write_register(frame, dst, value)?;
+                        frame.pc += 1;
+                    } else {
+                        // Format the throwable so the standard
+                        // `name: message` shape (§20.5.3.4
+                        // Error.prototype.toString) survives into
+                        // the runner's diagnostic and the negative-
+                        // test inversion can match on the name.
+                        return Err(VmError::Uncaught {
+                            value: format!("ReferenceError: {name} is not defined"),
+                        });
+                    }
                 }
                 Op::GlobalCall => {
                     // §19.2 global functions — parseInt / parseFloat /

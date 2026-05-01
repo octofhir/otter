@@ -3564,20 +3564,22 @@ fn compile_expr(
                 );
                 return Ok(dst);
             }
-            // §10.2.4.1 ResolveBinding fallback — an unbound free
-            // identifier resolves against the global environment
-            // record (foundation: `globalThis`). The compiler has
-            // exhausted local / upvalue / module-import / known-
-            // intrinsic resolution; lower as a property read on
-            // `globalThis` so harness-style references like
-            // `Array.prototype` / `Object.prototype` work without
-            // forcing every test to declare them.
+            // §10.2.4.1 ResolveBinding + §10.2.4.5 GetValue
+            // fallback — an unbound free identifier resolves
+            // against the global environment record (foundation:
+            // `globalThis`). When the global has no own property
+            // under that name, the runtime throws a
+            // `ReferenceError` per the spec.
             //
             // <https://tc39.es/ecma262/#sec-resolvebinding>
-            let global = cx.alloc_scratch();
-            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+            // <https://tc39.es/ecma262/#sec-getvalue>
             let dst = cx.alloc_scratch();
-            cx.emit_load_property(dst, global, id.name.as_str(), span);
+            let name_idx = cx.intern_string_constant(id.name.as_str());
+            cx.emit(
+                Op::LoadGlobalOrThrow,
+                vec![Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                span,
+            );
             Ok(dst)
         }
 

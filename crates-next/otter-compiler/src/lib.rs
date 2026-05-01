@@ -2902,6 +2902,18 @@ fn compile_assignment(
         );
         return Ok(new_value);
     }
+    // §13.15.5 DestructuringAssignmentEvaluation — array / object
+    // destructuring assignment targets recurse through the helper.
+    if let AssignmentTarget::ArrayAssignmentTarget(arr) = &a.left {
+        let value_reg = compile_expr(cx, &a.right, span)?;
+        assign_array_pattern(cx, arr, value_reg, span)?;
+        return Ok(value_reg);
+    }
+    if let AssignmentTarget::ObjectAssignmentTarget(o) = &a.left {
+        let value_reg = compile_expr(cx, &a.right, span)?;
+        assign_object_pattern(cx, o, value_reg, span)?;
+        return Ok(value_reg);
+    }
     // `name = value` — local or captured-upvalue store.
     let name = match &a.left {
         AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str().to_string(),
@@ -2982,6 +2994,324 @@ fn compile_assignment(
         }
     }
     Ok(value)
+}
+
+/// §13.15.5 DestructuringAssignmentEvaluation — recurse into a
+/// destructuring assignment target and store the relevant slices
+/// of `value_reg` into each leaf.
+///
+/// Foundation handles the common shapes used across the test262
+/// corpus: simple identifier leaves, nested array / object
+/// destructuring, defaults via `=`, and rest elements (collected
+/// via `Op::CollectRest`). Computed property keys recurse through
+/// the runtime.
+fn assign_to_target(
+    cx: &mut Compiler,
+    target: &oxc_ast::ast::AssignmentTarget<'_>,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    use oxc_ast::ast::AssignmentTarget;
+    match target {
+        AssignmentTarget::ArrayAssignmentTarget(arr) => {
+            assign_array_pattern(cx, arr, value_reg, span)
+        }
+        AssignmentTarget::ObjectAssignmentTarget(obj) => {
+            assign_object_pattern(cx, obj, value_reg, span)
+        }
+        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+            let name = id.name.as_str().to_string();
+            store_identifier(cx, &name, value_reg, span)
+        }
+        AssignmentTarget::StaticMemberExpression(member) => {
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            let name_idx = cx.intern_string_constant(member.property.name.as_str());
+            let scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(value_reg),
+                    Operand::Register(scratch),
+                ],
+                span,
+            );
+            Ok(())
+        }
+        AssignmentTarget::ComputedMemberExpression(member) => {
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            let key_reg = compile_expr(cx, &member.expression, span)?;
+            cx.emit(
+                Op::StoreElement,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(value_reg),
+                ],
+                span,
+            );
+            Ok(())
+        }
+        other => Err(CompileError::Unsupported {
+            node: format!("AssignmentTarget ({other:?})"),
+            span,
+        }),
+    }
+}
+
+/// Apply `value_reg` to a `ArrayAssignmentTarget`. Walks each
+/// element, reads `value[i]` via `Op::LoadElement`, and recurses
+/// into the element's target. Defaults (`= expr`) substitute when
+/// the element is `undefined`. Rest elements (`...rest`) collect
+/// the trailing slice via `Op::CollectRest`.
+fn assign_array_pattern(
+    cx: &mut Compiler,
+    arr: &oxc_ast::ast::ArrayAssignmentTarget<'_>,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    for (idx, element) in arr.elements.iter().enumerate() {
+        let Some(element) = element else { continue };
+        let elem_span = span;
+        let idx_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadInt32,
+            vec![Operand::Register(idx_reg), Operand::Imm32(idx as i32)],
+            elem_span,
+        );
+        let val_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadElement,
+            vec![
+                Operand::Register(val_reg),
+                Operand::Register(value_reg),
+                Operand::Register(idx_reg),
+            ],
+            elem_span,
+        );
+        assign_maybe_default(cx, element, val_reg, elem_span)?;
+    }
+    if let Some(rest) = arr.rest.as_ref() {
+        // Foundation: collect the trailing slice via CollectRest
+        // (already used by parameter rest binding) into a fresh
+        // array, then assign into the rest target.
+        let start_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadInt32,
+            vec![
+                Operand::Register(start_reg),
+                Operand::Imm32(arr.elements.len() as i32),
+            ],
+            span,
+        );
+        let collected = cx.alloc_scratch();
+        cx.emit(
+            Op::CollectRest,
+            vec![
+                Operand::Register(collected),
+                Operand::Register(value_reg),
+                Operand::Register(start_reg),
+            ],
+            span,
+        );
+        assign_to_target(cx, &rest.target, collected, span)?;
+    }
+    Ok(())
+}
+
+/// Apply `value_reg` to an `ObjectAssignmentTarget`.
+fn assign_object_pattern(
+    cx: &mut Compiler,
+    obj: &oxc_ast::ast::ObjectAssignmentTarget<'_>,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    use oxc_ast::ast::AssignmentTargetProperty;
+    for prop in &obj.properties {
+        match prop {
+            AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                let pspan = span;
+                let name = p.binding.name.as_str().to_string();
+                let val = cx.alloc_scratch();
+                cx.emit_load_property(val, value_reg, &name, pspan);
+                let final_val = match p.init.as_ref() {
+                    Some(default) => apply_default(cx, val, default, pspan)?,
+                    None => val,
+                };
+                store_identifier(cx, &name, final_val, pspan)?;
+            }
+            AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                let pspan = span;
+                use oxc_ast::ast::PropertyKey;
+                let val = cx.alloc_scratch();
+                match &p.name {
+                    PropertyKey::StaticIdentifier(id) => {
+                        cx.emit_load_property(val, value_reg, id.name.as_str(), pspan);
+                    }
+                    PropertyKey::StringLiteral(lit) => {
+                        cx.emit_load_property(val, value_reg, &lit.value, pspan);
+                    }
+                    other => {
+                        let key_expr =
+                            other
+                                .as_expression()
+                                .ok_or_else(|| CompileError::Unsupported {
+                                    node: "ObjectAssignmentTarget: non-expression key".to_string(),
+                                    span: pspan,
+                                })?;
+                        let key_reg = compile_expr(cx, key_expr, pspan)?;
+                        cx.emit(
+                            Op::LoadElement,
+                            vec![
+                                Operand::Register(val),
+                                Operand::Register(value_reg),
+                                Operand::Register(key_reg),
+                            ],
+                            pspan,
+                        );
+                    }
+                }
+                assign_maybe_default(cx, &p.binding, val, pspan)?;
+            }
+        }
+    }
+    if let Some(_rest) = obj.rest.as_ref() {
+        return Err(CompileError::Unsupported {
+            node: "ObjectAssignmentTarget: rest element (foundation slice deferred)".to_string(),
+            span,
+        });
+    }
+    Ok(())
+}
+
+fn assign_maybe_default(
+    cx: &mut Compiler,
+    target: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    use oxc_ast::ast::AssignmentTargetMaybeDefault;
+    match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+            let resolved = apply_default(cx, value_reg, &d.init, span)?;
+            assign_to_target(cx, &d.binding, resolved, span)
+        }
+        other => {
+            let inner = other
+                .as_assignment_target()
+                .ok_or_else(|| CompileError::Unsupported {
+                    node: format!("AssignmentTargetMaybeDefault ({other:?})"),
+                    span,
+                })?;
+            assign_to_target(cx, inner, value_reg, span)
+        }
+    }
+}
+
+/// `value_reg === undefined ? init : value_reg`. Foundation
+/// emits the conditional load via JumpIfFalse on
+/// `typeof value_reg === "undefined"`.
+fn apply_default(
+    cx: &mut Compiler,
+    value_reg: u16,
+    init: &oxc_ast::ast::Expression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    // Test `value_reg !== undefined` and pick.
+    let tag_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::TypeOf,
+        vec![Operand::Register(tag_reg), Operand::Register(value_reg)],
+        span,
+    );
+    let undef_str_reg = cx.alloc_scratch();
+    let undef_const = cx.intern_string_constant("undefined");
+    cx.emit(
+        Op::LoadString,
+        vec![
+            Operand::Register(undef_str_reg),
+            Operand::ConstIndex(undef_const),
+        ],
+        span,
+    );
+    let is_undef = cx.alloc_scratch();
+    cx.emit(
+        Op::Equal,
+        vec![
+            Operand::Register(is_undef),
+            Operand::Register(tag_reg),
+            Operand::Register(undef_str_reg),
+        ],
+        span,
+    );
+    let result = cx.alloc_scratch();
+    // Default branch: if !is_undef (i.e. value defined) jump to
+    // the "use value" arm; fall through into "use init".
+    let jump_to_use_value = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_undef), span);
+    let init_val = compile_expr(cx, init, span)?;
+    cx.emit(
+        Op::StoreLocal,
+        vec![Operand::Register(init_val), Operand::Imm32(result as i32)],
+        span,
+    );
+    let jump_to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
+    cx.patch_branch_to_here(jump_to_use_value);
+    cx.emit(
+        Op::StoreLocal,
+        vec![Operand::Register(value_reg), Operand::Imm32(result as i32)],
+        span,
+    );
+    cx.patch_branch_to_here(jump_to_end);
+    Ok(result)
+}
+
+/// Store `value_reg` into the binding (or globalThis) for `name`.
+/// Mirrors the identifier-store branch of `compile_assignment` but
+/// without the compound-op handling.
+fn store_identifier(
+    cx: &mut Compiler,
+    name: &str,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let storage = match cx.lookup_binding(name) {
+        Some(info) if info.is_const => {
+            return Err(CompileError::Unsupported {
+                node: format!("destructuring assignment to const `{name}`"),
+                span,
+            });
+        }
+        Some(info) => Some(info.storage),
+        None => cx
+            .resolve_capture(name)
+            .map(|idx| BindingStorage::Upvalue { idx }),
+    };
+    match storage {
+        Some(s) => {
+            cx.emit_store_storage(value_reg, s, span);
+            cx.mark_initialized(name);
+            cx.emit_module_export_mirror(name, value_reg, span);
+        }
+        None => {
+            // §10.2.4.1 PutValue fallback to globalThis.
+            let global = cx.alloc_scratch();
+            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+            let name_idx = cx.intern_string_constant(name);
+            let scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(global),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(value_reg),
+                    Operand::Register(scratch),
+                ],
+                span,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Map a compound `AssignmentOperator` to the bytecode binop used
@@ -3203,11 +3533,20 @@ fn destructure_object(
     pattern: &oxc_ast::ast::ObjectPattern<'_>,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
-    if pattern.rest.is_some() {
-        return Err(CompileError::Unsupported {
-            node: "ObjectPattern: rest element (foundation slice deferred)".to_string(),
-            span,
-        });
+    // §13.15.5 RestObjectAssignment — collect every enumerable own
+    // property of `src` *except* the ones extracted above into a
+    // fresh object, then bind it to the rest target. Foundation
+    // copies via `Object.assign({}, src)` then deletes the named
+    // properties.
+    let mut extracted_keys: Vec<String> = Vec::new();
+    for prop in &pattern.properties {
+        if !prop.computed {
+            if let oxc_ast::ast::PropertyKey::StaticIdentifier(id) = &prop.key {
+                extracted_keys.push(id.name.as_str().to_string());
+            } else if let oxc_ast::ast::PropertyKey::StringLiteral(lit) = &prop.key {
+                extracted_keys.push(lit.value.to_string());
+            }
+        }
     }
     for prop in &pattern.properties {
         let prop_span = (prop.span.start, prop.span.end);
@@ -3239,6 +3578,39 @@ fn destructure_object(
             prop_span,
         );
         destructure_into(parent, value_reg, &prop.value, prop_span)?;
+    }
+    if let Some(rest) = pattern.rest.as_ref() {
+        // Build `rest_obj = Object.assign({}, src)` then delete
+        // every extracted key, then bind into the rest target.
+        let rest_obj = parent.alloc_scratch();
+        parent.emit(Op::NewObject, vec![Operand::Register(rest_obj)], span);
+        let assign_const = parent.intern_string_constant("assign");
+        let scratch = parent.alloc_scratch();
+        parent.emit(
+            Op::ObjectCall,
+            vec![
+                Operand::Register(scratch),
+                Operand::ConstIndex(assign_const),
+                Operand::ConstIndex(2),
+                Operand::Register(rest_obj),
+                Operand::Register(src_reg),
+            ],
+            span,
+        );
+        for key in &extracted_keys {
+            let key_const = parent.intern_string_constant(key);
+            let del_dst = parent.alloc_scratch();
+            parent.emit(
+                Op::DeleteProperty,
+                vec![
+                    Operand::Register(del_dst),
+                    Operand::Register(rest_obj),
+                    Operand::ConstIndex(key_const),
+                ],
+                span,
+            );
+        }
+        destructure_into(parent, rest_obj, &rest.argument, span)?;
     }
     Ok(())
 }

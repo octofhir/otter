@@ -1320,6 +1320,14 @@ pub struct Interpreter {
     /// stack and let user-level `try` / `catch` observe the right
     /// payload.
     pending_generator_throw: Option<Value>,
+    /// Per-function user-property bag (§20.2.4 Function-instance
+    /// properties + ordinary [[Set]] semantics for callables).
+    /// `function_id` → `JsObject` carrying anything the user wrote
+    /// via `f.foo = bar` / `Ctor.prototype.x = …` / etc. Lazily
+    /// allocated on first write. Closures share the bag with their
+    /// underlying function so writes through any closure handle
+    /// land on the same place.
+    function_user_props: std::collections::HashMap<u32, JsObject>,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -1360,6 +1368,7 @@ impl Interpreter {
             global_this: build_global_this(),
             eval_hook: None,
             pending_generator_throw: None,
+            function_user_props: std::collections::HashMap::new(),
         }
     }
 
@@ -1385,7 +1394,48 @@ impl Interpreter {
             global_this: build_global_this(),
             eval_hook: None,
             pending_generator_throw: None,
+            function_user_props: std::collections::HashMap::new(),
         }
+    }
+
+    /// Resolve a property read on a `Value::Function` /
+    /// `Value::Closure`. Honours user-installed properties via the
+    /// `function_user_props` side table, lazily allocates
+    /// `Function.prototype` on first access (§9.2.10
+    /// MakeConstructor), and falls back to `name` / `length`
+    /// intrinsics. Unknown names return `undefined` per §10.1.8
+    /// OrdinaryGet step 4.
+    fn function_property_get(
+        &mut self,
+        module: &BytecodeModule,
+        function_id: u32,
+        name: &str,
+    ) -> Result<Value, VmError> {
+        if let Some(bag) = self.function_user_props.get(&function_id)
+            && let Some(v) = bag.get(name)
+        {
+            return Ok(v);
+        }
+        if name == "prototype" {
+            // §9.2.10 — function instances expose a writable,
+            // non-configurable `.prototype` that auto-allocates as
+            // a fresh ordinary object on first access. We don't
+            // wire `prototype.constructor` back to the function
+            // here (foundation gap; matches the §41 audit closeout
+            // priorities).
+            let bag = self.function_user_props.entry(function_id).or_default();
+            if let Some(existing) = bag.get("prototype") {
+                return Ok(existing);
+            }
+            let proto = JsObject::new();
+            let proto_value = Value::Object(proto);
+            bag.set("prototype", proto_value.clone());
+            return Ok(proto_value);
+        }
+        if name == "name" || name == "length" {
+            return function_intrinsic_property(module, function_id, name, &self.string_heap);
+        }
+        Ok(Value::Undefined)
     }
 
     /// Borrow the per-interpreter table of well-known symbol
@@ -2508,25 +2558,19 @@ impl Interpreter {
                         }
                         Value::Array(a) => a.get_named_property(&name).unwrap_or(Value::Undefined),
                         // §20.2.4 Function-instance properties — every
-                        // callable carries `.name` / `.length`.
+                        // callable carries `.name` / `.length` /
+                        // `.prototype`; user writes through the side
+                        // table take precedence per ordinary [[Get]]
+                        // semantics, and `.prototype` auto-allocates
+                        // on first access (§9.2.10 MakeConstructor).
                         // <https://tc39.es/ecma262/#sec-function-instances>
-                        Value::Function { function_id } if name == "name" || name == "length" => {
-                            function_intrinsic_property(
-                                module,
-                                *function_id,
-                                &name,
-                                &self.string_heap,
-                            )?
+                        Value::Function { function_id } => {
+                            let fid = *function_id;
+                            self.function_property_get(module, fid, &name)?
                         }
-                        Value::Closure { function_id, .. }
-                            if name == "name" || name == "length" =>
-                        {
-                            function_intrinsic_property(
-                                module,
-                                *function_id,
-                                &name,
-                                &self.string_heap,
-                            )?
+                        Value::Closure { function_id, .. } => {
+                            let fid = *function_id;
+                            self.function_property_get(module, fid, &name)?
                         }
                         Value::NativeFunction(native) if name == "name" || name == "length" => {
                             if name == "name" {
@@ -2587,6 +2631,16 @@ impl Interpreter {
                             // bag. `length` writes are filed.
                             a.set_named_property(&name, value.clone());
                             None
+                        }
+                        // §9.2 Function-instance ordinary [[Set]]:
+                        // `f.foo = 1`, `Ctor.prototype = obj`, etc.
+                        // The function-property side table (keyed
+                        // by function_id) is shared across closure
+                        // handles for the same compiled function so
+                        // every closure observes the same bag.
+                        Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                            let fid = *function_id;
+                            Some(self.function_user_props.entry(fid).or_default().clone())
                         }
                         _ => return Err(VmError::TypeMismatch),
                     };
@@ -4950,6 +5004,15 @@ impl Interpreter {
             } else {
                 c.statics.get(&name).unwrap_or(Value::Undefined)
             }),
+            // §10.1.8 OrdinaryGet on a callable receiver — user
+            // properties (e.g. `assert.sameValue = function(){}`)
+            // resolve via the function-properties side table; the
+            // fallback to `Function.prototype.{call,apply,bind}`
+            // happens below if we hand back `Undefined`.
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let fid = *function_id;
+                Some(self.function_property_get(module, fid, &name)?)
+            }
             _ => None,
         };
         if let Some(method) = lookup_via_property {

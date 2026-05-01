@@ -52,8 +52,8 @@ use otter_bytecode::{
 };
 use otter_syntax::{Parsed, SourceKind as SyntaxSourceKind};
 use oxc_ast::ast::{
-    AssignmentOperator, AssignmentTarget, BinaryOperator, Expression, LogicalOperator, Statement,
-    UnaryOperator,
+    AssignmentOperator, AssignmentTarget, BinaryOperator, Expression, LogicalOperator,
+    SimpleAssignmentTarget, Statement, UnaryOperator, UpdateOperator,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -4782,6 +4782,81 @@ fn compile_expr(
                 span,
             );
             Ok(dst)
+        }
+
+        // §13.4 Postfix / Prefix update — `i++` / `++i` / `i--` /
+        // `--i`. Foundation handles Identifier targets only; member
+        // and computed-member operands fall through to Unsupported
+        // (a subsequent slice covers them when test262 surfaces a
+        // matching gap).
+        // <https://tc39.es/ecma262/#sec-update-expressions>
+        Expression::UpdateExpression(u) => {
+            let span = (u.span.start, u.span.end);
+            let id = match &u.argument {
+                SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id,
+                _ => {
+                    return Err(CompileError::Unsupported {
+                        node: "UpdateExpression on non-identifier operand".to_string(),
+                        span,
+                    });
+                }
+            };
+            let name = id.name.as_str().to_string();
+            let storage = if let Some(info) = cx.lookup_binding(&name) {
+                if info.is_const {
+                    return Err(CompileError::Unsupported {
+                        node: format!("update on const `{name}`"),
+                        span,
+                    });
+                }
+                info.storage
+            } else if let Some(idx) = cx.resolve_capture(&name) {
+                BindingStorage::Upvalue { idx }
+            } else {
+                return Err(CompileError::Unsupported {
+                    node: format!("update on undeclared `{name}`"),
+                    span,
+                });
+            };
+
+            // Step 1 — load the old value.
+            let old = cx.alloc_scratch();
+            cx.emit_load_storage(old, storage, span);
+            // Step 2 — coerce to number (§13.4.2.1 step 3 / 13.4.3.1
+            // step 3) so increments behave like spec.
+            let cur = cx.alloc_scratch();
+            cx.emit(
+                Op::ToNumber,
+                vec![Operand::Register(cur), Operand::Register(old)],
+                span,
+            );
+            // Step 3 — load constant 1.
+            let one = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadInt32,
+                vec![Operand::Register(one), Operand::Imm32(1)],
+                span,
+            );
+            // Step 4 — Add / Sub.
+            let next = cx.alloc_scratch();
+            let op = match u.operator {
+                UpdateOperator::Increment => Op::Add,
+                UpdateOperator::Decrement => Op::Sub,
+            };
+            cx.emit(
+                op,
+                vec![
+                    Operand::Register(next),
+                    Operand::Register(cur),
+                    Operand::Register(one),
+                ],
+                span,
+            );
+            // Step 5 — store back to the binding.
+            cx.emit_store_storage(next, storage, span);
+            // Step 6 — Postfix returns pre-update value (post-
+            // ToNumber); prefix returns the new value.
+            Ok(if u.prefix { next } else { cur })
         }
 
         other => Err(CompileError::Unsupported {

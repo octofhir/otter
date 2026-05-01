@@ -2764,10 +2764,15 @@ fn compile_assignment(
     let span = (a.span.start, a.span.end);
     let compound_op = compound_assign_op(a.operator);
     if a.operator.is_logical() {
-        return Err(CompileError::Unsupported {
-            node: format!("AssignmentExpression ({:?})", a.operator),
-            span,
-        });
+        // §13.15.4 LogicalAssignment — `x &&= y`, `x ||= y`, `x ??= y`.
+        // Lowered to the desugared form:
+        //   `x &&= y` → if (cur) x = y;
+        //   `x ||= y` → if (!cur) x = y;
+        //   `x ??= y` → if (cur is null/undefined) x = y;
+        // Foundation handles the identifier-target fast path here;
+        // member / computed-member targets fall through to the
+        // existing assignment branches via a synthesised plain-`=`.
+        return compile_logical_assignment(cx, a, span);
     }
     if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
         let obj_reg = compile_expr(cx, &member.object, span)?;
@@ -2994,6 +2999,166 @@ fn compile_assignment(
         }
     }
     Ok(value)
+}
+
+/// §13.15.4 LogicalAssignment — `x &&= y`, `x ||= y`, `x ??= y`.
+fn compile_logical_assignment(
+    cx: &mut Compiler,
+    a: &oxc_ast::ast::AssignmentExpression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    use oxc_ast::ast::AssignmentOperator;
+    // Read current value of the target (load only; no store yet).
+    let cur = match &a.left {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+            let name = id.name.as_str().to_string();
+            let load = cx.alloc_scratch();
+            if let Some(info) = cx.lookup_binding(&name) {
+                cx.emit_load_storage(load, info.storage, span);
+            } else if let Some(idx) = cx.resolve_capture(&name) {
+                cx.emit_load_storage(load, BindingStorage::Upvalue { idx }, span);
+            } else {
+                let global = cx.alloc_scratch();
+                cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                cx.emit_load_property(load, global, &name, span);
+            }
+            load
+        }
+        AssignmentTarget::StaticMemberExpression(m) => {
+            let obj_reg = compile_expr(cx, &m.object, span)?;
+            let name_idx = cx.intern_string_constant(m.property.name.as_str());
+            let load = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(load),
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            load
+        }
+        AssignmentTarget::ComputedMemberExpression(m) => {
+            let obj_reg = compile_expr(cx, &m.object, span)?;
+            let key_reg = compile_expr(cx, &m.expression, span)?;
+            let load = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadElement,
+                vec![
+                    Operand::Register(load),
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            load
+        }
+        other => {
+            return Err(CompileError::Unsupported {
+                node: format!("LogicalAssignment target ({other:?})"),
+                span,
+            });
+        }
+    };
+    // Compute the test condition. For `&&=`, jump-if-false skips
+    // the assignment. For `||=`, the `!` inverts so we use
+    // jump-if-true. For `??=`, test "cur is null or undefined".
+    let test_reg = match a.operator {
+        AssignmentOperator::LogicalAnd => {
+            // `&&=` — assign only when cur is truthy. Test is cur.
+            let bool_r = cx.alloc_scratch();
+            cx.emit(
+                Op::ToBoolean,
+                vec![Operand::Register(bool_r), Operand::Register(cur)],
+                span,
+            );
+            bool_r
+        }
+        AssignmentOperator::LogicalOr => {
+            // `||=` — assign only when cur is falsy. Test is !cur.
+            let bool_r = cx.alloc_scratch();
+            cx.emit(
+                Op::ToBoolean,
+                vec![Operand::Register(bool_r), Operand::Register(cur)],
+                span,
+            );
+            let not_r = cx.alloc_scratch();
+            cx.emit(
+                Op::LogicalNot,
+                vec![Operand::Register(not_r), Operand::Register(bool_r)],
+                span,
+            );
+            not_r
+        }
+        AssignmentOperator::LogicalNullish => {
+            // `??=` — assign only when cur is null/undefined.
+            // Compare cur === null || cur === undefined.
+            let undef_r = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, vec![Operand::Register(undef_r)], span);
+            let null_r = cx.alloc_scratch();
+            cx.emit(Op::LoadNull, vec![Operand::Register(null_r)], span);
+            let eq_undef = cx.alloc_scratch();
+            cx.emit(
+                Op::Equal,
+                vec![
+                    Operand::Register(eq_undef),
+                    Operand::Register(cur),
+                    Operand::Register(undef_r),
+                ],
+                span,
+            );
+            let eq_null = cx.alloc_scratch();
+            cx.emit(
+                Op::Equal,
+                vec![
+                    Operand::Register(eq_null),
+                    Operand::Register(cur),
+                    Operand::Register(null_r),
+                ],
+                span,
+            );
+            // OR them via boolean-logic: if eq_undef → true; else
+            // result = eq_null. We use a register-merge pattern.
+            let merged = cx.alloc_scratch();
+            cx.emit(
+                Op::ToBoolean,
+                vec![Operand::Register(merged), Operand::Register(eq_undef)],
+                span,
+            );
+            // `merged = merged || eq_null`. The simplest is a
+            // sequence: jump if merged true; else copy eq_null.
+            let jump_if_true = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(merged), span);
+            cx.emit(
+                Op::StoreLocal,
+                vec![Operand::Register(eq_null), Operand::Imm32(merged as i32)],
+                span,
+            );
+            cx.patch_branch_to_here(jump_if_true);
+            merged
+        }
+        _ => unreachable!("non-logical operator in compile_logical_assignment"),
+    };
+    // result = cur initially. Skip the assignment when test is
+    // false.
+    let result = cx.alloc_scratch();
+    cx.emit(
+        Op::StoreLocal,
+        vec![Operand::Register(cur), Operand::Imm32(result as i32)],
+        span,
+    );
+    let skip = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(test_reg), span);
+    // Assignment branch: synthesize a plain-`=` and re-enter
+    // assign_to_target.
+    let new_value = compile_expr(cx, &a.right, span)?;
+    assign_to_target(cx, &a.left, new_value, span)?;
+    cx.emit(
+        Op::StoreLocal,
+        vec![Operand::Register(new_value), Operand::Imm32(result as i32)],
+        span,
+    );
+    cx.patch_branch_to_here(skip);
+    Ok(result)
 }
 
 /// §13.15.5 DestructuringAssignmentEvaluation — recurse into a

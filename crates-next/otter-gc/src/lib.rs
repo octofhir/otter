@@ -1,68 +1,73 @@
 //! Production-grade page-based generational tracing GC for the Otter
 //! new-engine VM.
 //!
-//! This crate is the home of the tracing garbage collector that
-//! replaces `Rc<RefCell<…>>` across `crates-next/otter-vm` value
-//! types. The architecture is V8 Orinoco / JSC Riptide shaped as of
-//! 2026 — page-based heap with a 4 GiB pointer-compression cage,
-//! semispace young-gen scavenger, tri-color mark-sweep old-gen,
-//! generational + Dijkstra insertion write barriers, type-tag
-//! function-pointer trace dispatch, RAII handle scopes.
-//!
-//! # Status
-//!
-//! Foundation slice for task 71 — the crate skeleton lands here so
-//! task 72 (`72-gc-core-heap-and-handles.md`) has a build target.
-//! No GC implementation in this commit; only the crate exists with
-//! its module-level docstring, Cargo metadata, and the
-//! [`_placeholder`] sentinel.
+//! Page-based heap with a 4 GiB pointer-compression cage, semispace
+//! young-gen scavenger (Cheney BFS), tri-color mark-sweep old-gen,
+//! generational + Dijkstra-insertion write barriers, type-tag
+//! function-pointer trace dispatch, RAII handle scopes, Chrome
+//! DevTools `.heapsnapshot` export. V8 Orinoco / JSC Riptide
+//! shaped, 2026.
 //!
 //! # Contents
 //!
-//! - [`_placeholder`] — sentinel function so the crate builds and
-//!   participates in `cargo test --workspace` before task 72 lands
-//!   any real types.
+//! - [`compressed`] — pointer compression: cage + `Gc<T>`.
+//! - [`header`] — 8-byte `GcHeader`.
+//! - [`page`] — 256 KiB pages, card table.
+//! - [`space`] — `NewSpace`, `OldSpace`, `LargeObjectSpace`.
+//! - [`trace`] — `TraceTable`, `Traceable` trait.
+//! - [`marking`] — tri-color worklist.
+//! - [`scavenger`] — Cheney BFS scavenger.
+//! - [`barrier`] — write barriers.
+//! - [`handle`] — `Local`, `HandleScope`, `GlobalHandle`.
+//! - [`heap`] — `GcHeap` orchestrator.
+//! - [`oom`] — `OutOfMemory` error.
+//! - [`devtools_snapshot`] — Chrome `.heapsnapshot` writer.
 //!
 //! # Invariants
 //!
-//! - `unsafe_code` is permitted only inside this crate (per ADR-0004,
-//!   amending ADR-0001 §5). Every other `crates-next/*` crate keeps
-//!   the workspace `forbid(unsafe_code)` ban.
-//! - Every `unsafe` block landing in subsequent slices must carry a
-//!   `// SAFETY:` comment; every public `unsafe fn` must document
-//!   preconditions in a `# Safety` docstring section; every
-//!   non-trivial unsafe block must have a corresponding
-//!   `cargo +nightly miri test` regression.
-//! - No path-dep on `crates/otter-gc/` — the legacy GC crate is
-//!   design reference only (ADR-0001 §Working rules 1–2). All code
-//!   here is rewritten under new conventions.
+//! - `unsafe_code` is permitted only inside this crate (per
+//!   ADR-0004); every other `crates-next/*` crate keeps the
+//!   workspace `forbid(unsafe_code)`.
+//! - Every `unsafe` block carries a `// SAFETY:` comment; every
+//!   public `unsafe fn` documents preconditions in a `# Safety`
+//!   docstring section.
+//! - Pointer compression: every `Gc<T>` is a `u32` offset within a
+//!   single process-global cage; `Gc::null()` decompresses to the
+//!   reserved page-0 area, never to a real allocation.
+//! - One isolate = one thread; `GcHeap` is `!Sync`, the cage is
+//!   shared across heaps in the same process.
 //!
 //! # See also
 //!
 //! - [GC architecture plan](../../../docs/new-engine/gc-architecture.md)
-//! - [ADR-0001 — staging directory](../../../docs/new-engine/adr/0001-staging-directory.md)
-//! - [ADR-0004 — GC crate & unsafe boundary](../../../docs/new-engine/adr/0004-gc-crate-and-unsafe-boundary.md)
-//! - [Task 71 — crate skeleton](../../../docs/new-engine/tasks/71-gc-crate-skeleton.md)
-//! - [Task 72 — core heap and handles](../../../docs/new-engine/tasks/72-gc-core-heap-and-handles.md)
+//! - [ADR-0001](../../../docs/new-engine/adr/0001-staging-directory.md)
+//!   — staging directory
+//! - [ADR-0004](../../../docs/new-engine/adr/0004-gc-crate-and-unsafe-boundary.md)
+//!   — GC crate & unsafe boundary
+//! - Task 72 — core heap and handles.
 
-/// Sentinel placeholder so the crate builds and tests run before
-/// task 72 lands real types. Removed in the first task-72 commit.
-pub fn _placeholder() {
-    // SAFETY: `mem::zeroed::<u8>()` is sound because `u8` admits the
-    // all-zero bit pattern. The call is only here to ensure the
-    // ADR-0004 lift of `forbid(unsafe_code)` takes effect on this
-    // crate; if the lint override regresses, the build fails. The
-    // sentinel is removed in the first task-72 commit when real
-    // unsafe lands.
-    let _: u8 = unsafe { core::mem::zeroed() };
-}
+/// Object alignment used everywhere in the GC. Every payload
+/// starts at a multiple of this; cell size in bump alloc is the
+/// same.
+pub const OBJECT_ALIGNMENT: usize = 8;
 
-#[cfg(test)]
-mod tests {
-    use super::_placeholder;
+pub mod barrier;
+pub mod compressed;
+pub mod devtools_snapshot;
+pub mod handle;
+pub mod header;
+pub mod heap;
+pub mod marking;
+pub mod oom;
+pub mod page;
+pub mod scavenger;
+pub mod space;
+pub mod trace;
 
-    #[test]
-    fn placeholder_is_callable() {
-        _placeholder();
-    }
-}
+pub use compressed::{Gc, RawGc, cage_base, cage_size, init_cage_with_size};
+pub use handle::{GlobalHandle, GlobalHandleTable, HandleScope, HandleStack, Local};
+pub use header::{GcHeader, MarkColor};
+pub use heap::{EmptyRoots, GcHeap, HeapStats, Roots};
+pub use oom::OutOfMemory;
+pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
+pub use trace::{SlotVisitor, TraceFn, TraceTable, Traceable};

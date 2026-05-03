@@ -1229,6 +1229,11 @@ dependencies = [
 name = "otter-gc"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "smallvec",
  "thiserror",
 ]
 

@@ -4,6 +4,7 @@
 
 - [ ] Phase 1 — page-based generational GC + pointer compression + card table + black alloc + DevTools snapshot + per-type migration (tasks 71–84)
   - [x] 71 — crate skeleton + ADR-0004 (closed 2026-05-02)
+  - [x] 72 — core heap and handles (closed 2026-05-04)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
 - [ ] Phase 4 (deferred indefinitely) — concurrent marking + parallel scavenge (task 87)
@@ -41,7 +42,7 @@ later tasks assume earlier ones have landed.
 | # | File | One-line goal |
 |---|------|---------------|
 | 71 | ✅ closed (2026-05-02) | New `crates-next/otter-gc` crate; ADR-0004 amends ADR-0001 §5 to lift `forbid(unsafe_code)` for this crate only. |
-| 72 | [72-gc-core-heap-and-handles.md](./72-gc-core-heap-and-handles.md) | Page heap: `GcHeader`, `Page`, `NewSpace`/`OldSpace`/`LargeObjectSpace`, scavenger, marking, barriers, trace table, `Gc<T>` + `Local<'gc, T>` + `HandleScope<'gc>`. |
+| 72 | ✅ closed (2026-05-04) | Page heap: `GcHeader`, `Page`, `NewSpace`/`OldSpace`/`LargeObjectSpace`, scavenger, marking, barriers, trace table, `Gc<T>` + `Local<'gc, T>` + `HandleScope<'gc>`. |
 | 73 | [73-gc-oom-and-cap-enforcement.md](./73-gc-oom-and-cap-enforcement.md) | `OutOfMemory` + cap enforcement; `Runtime::max_heap_bytes` from informational → load-bearing. |
 | 74 | [74-gc-stats-and-snapshot.md](./74-gc-stats-and-snapshot.md) | `GcStats`, `HeapSnapshot`, retained-size walker, `Runtime::heap_stats()`. |
 | 75 | [75-gc-root-enumeration.md](./75-gc-root-enumeration.md) | `RuntimeState::trace_roots`: frames, microtask queue, module envs, dynamic-import host, symbol registry; smoke tests. |

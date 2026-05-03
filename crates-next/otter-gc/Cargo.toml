@@ -18,3 +18,29 @@ all = { level = "deny", priority = -1 }
 
 [dependencies]
 thiserror = { workspace = true }
+smallvec = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+criterion = { workspace = true }
+
+# Criterion benches — listed explicitly so the custom main
+# takes precedence over libtest.
+[[bench]]
+name = "bench_alloc_young_bump"
+harness = false
+
+[[bench]]
+name = "bench_alloc_with_barrier"
+harness = false
+
+[[bench]]
+name = "bench_scavenge_4mb"
+harness = false
+
+[[bench]]
+name = "bench_collect_full_256mb"
+harness = false

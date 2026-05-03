@@ -374,7 +374,7 @@ deferred indefinitely.
 |------|---------------|
 | [70-gc-master-tracker.md](./70-gc-master-tracker.md) | Master tracker; all phases checklisted in one place. |
 | ✅ 71 (closed 2026-05-02) | New `crates-next/otter-gc` empty crate; ADR-0004 amends ADR-0001 §5 to lift `forbid(unsafe_code)` for this crate only. |
-| [72-gc-core-heap-and-handles.md](./72-gc-core-heap-and-handles.md) | Page heap: `GcHeader`, `Page`, semispace + old-space + LOS, Cheney scavenger, tri-color marking, generational + insertion barriers, type-tag fn-ptr trace table, `Gc<T>`/`Local<'gc, T>`/`HandleScope<'gc>`. |
+| ✅ 72 (closed 2026-05-04) | Page heap: `GcHeader`, `Page`, semispace + old-space + LOS, Cheney scavenger, tri-color marking, generational + insertion barriers, type-tag fn-ptr trace table, `Gc<T>`/`Local<'gc, T>`/`HandleScope<'gc>`. |
 | [73-gc-oom-and-cap-enforcement.md](./73-gc-oom-and-cap-enforcement.md) | `OutOfMemory` + cap enforcement; `Runtime::max_heap_bytes` from informational → load-bearing. |
 | [74-gc-stats-and-snapshot.md](./74-gc-stats-and-snapshot.md) | `GcStats`, `HeapSnapshot`, retained-size walker, `Runtime::heap_stats()`. |
 | [75-gc-root-enumeration.md](./75-gc-root-enumeration.md) | `RuntimeState::trace_roots`: frames, microtask queue, module envs, dynamic-import host, symbol registry. |

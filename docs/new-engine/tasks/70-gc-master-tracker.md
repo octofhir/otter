@@ -7,6 +7,8 @@
   - [x] 72 — core heap and handles (closed 2026-05-04)
   - [x] 73 — OOM + cap enforcement; `Runtime::max_heap_bytes` load-bearing (closed 2026-05-04)
   - [x] 74 — `GcStats` + `HeapSnapshot` + retained-size walker + `Runtime::heap_stats` / `heap_snapshot` / `force_gc` (closed 2026-05-04)
+  - [x] 75 — `RuntimeState::trace_roots` + `GcTrace` stubs on every future-`Gc` type + `Runtime::force_gc` wiring + per-root smoke-test scaffold (closed 2026-05-04)
+  - [x] 76 — `UpvalueCell` migrated to `Gc<UpvalueCellBody>` + `SafeTraceable` trait + `alloc_old` / `with_payload` / `read_payload` / `write_barrier_raw` GC APIs + `GcHeap` moved into `Interpreter` + `Frame::for_function_with_heap` / `Frame::build_upvalues` + `Value::trace_value_slots` for closure-spine walk + upvalue smoke test un-ignored + `counter_closure_no_leak` regression (closed 2026-05-04)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
 - [ ] Phase 4 (deferred indefinitely) — concurrent marking + parallel scavenge (task 87)

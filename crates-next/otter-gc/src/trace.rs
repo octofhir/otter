@@ -60,6 +60,12 @@ pub type TraceFn = unsafe fn(header: *mut GcHeader, visitor: &mut SlotVisitor<'_
 /// [`crate::heap::GcHeap::register_traceable`], which wires
 /// `T::TRACE_FN` into a [`TraceTable`] slot keyed by
 /// `T::TYPE_TAG`.
+///
+/// **Downstream crates that keep `forbid(unsafe_code)`** (every
+/// `crates-next/*` crate except `otter-gc` itself) cannot impl
+/// this trait directly — `trace_slots` is `unsafe fn`. Such
+/// crates impl [`SafeTraceable`] instead; a blanket impl below
+/// lifts that into a `Traceable`.
 pub trait Traceable: 'static {
     /// Unique 8-bit type tag — the table index. Implementations
     /// must coordinate to avoid collisions.
@@ -76,6 +82,45 @@ pub trait Traceable: 'static {
     /// - not retain references to the visitor,
     /// - not read past the object's payload.
     unsafe fn trace_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>);
+}
+
+/// Safe-only counterpart of [`Traceable`] — the trait downstream
+/// crates that keep `forbid(unsafe_code)` (e.g. `otter-vm`) impl
+/// to register a GC-managed type.
+///
+/// The blanket impl below converts every `SafeTraceable` into a
+/// `Traceable`, so types only need to spell one trait. The
+/// unsafe-fn body lives entirely in this crate.
+pub trait SafeTraceable: 'static {
+    /// Unique 8-bit type tag — the table index. Implementations
+    /// must coordinate to avoid collisions.
+    const TYPE_TAG: u8;
+
+    /// Walk every outgoing GC reference owned by `self`,
+    /// yielding the slot's address (`*mut RawGc`) to `visitor`.
+    /// Must not allocate or retain the visitor (same contract
+    /// as [`Traceable::trace_slots`], minus the pointer-validity
+    /// precondition).
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>);
+}
+
+impl<T: SafeTraceable> Traceable for T {
+    const TYPE_TAG: u8 = <Self as SafeTraceable>::TYPE_TAG;
+
+    /// Bridge from the safe trait to the unsafe-fn `Traceable`.
+    ///
+    /// # Safety
+    ///
+    /// Inherits the [`Traceable::trace_slots`] contract — the
+    /// caller (the GC's mark / scavenge dispatch) upholds it.
+    unsafe fn trace_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>) {
+        // SAFETY: per the Traceable contract, `this` references
+        // a fully-constructed `Self`; we re-borrow as `&Self`
+        // for the duration of the safe call.
+        unsafe {
+            (*this).trace_slots_safe(visitor);
+        }
+    }
 }
 
 /// A 256-entry array of [`TraceFn`] pointers, indexed by

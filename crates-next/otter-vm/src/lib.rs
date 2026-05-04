@@ -42,6 +42,7 @@ pub mod collections_prototype;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod error_classes;
+pub mod gc_trace;
 pub mod generator;
 pub mod global_functions;
 pub mod intl;
@@ -59,6 +60,7 @@ pub mod proxy;
 pub mod reflect;
 pub mod regexp;
 pub mod regexp_prototype;
+pub mod runtime_state;
 pub mod string;
 pub mod string_dispatch;
 pub mod string_prototype;
@@ -415,38 +417,158 @@ pub struct BoundFunction {
 /// so multiple closures + the original outer scope all see
 /// mutations through it.
 ///
-/// Inside the foundation slice the cell stores a plain `Value`
-/// behind `Rc<RefCell<>>` — once a real GC ships, this becomes a
-/// GC handle.
-#[derive(Debug, Clone)]
-pub struct UpvalueCell(std::rc::Rc<std::cell::RefCell<Value>>);
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
+/// [`UpvalueCellBody`].
+pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
 
-impl UpvalueCell {
-    /// Construct a fresh cell pre-populated with `value`.
-    #[must_use]
-    pub fn new(value: Value) -> Self {
-        Self(std::rc::Rc::new(std::cell::RefCell::new(value)))
+/// GC-allocated payload backing every [`UpvalueCell`] handle.
+///
+/// Holds a single captured `Value`. Mutation flows through
+/// [`store_upvalue`]; reads through [`read_upvalue`]; allocation
+/// through [`alloc_upvalue`].
+///
+/// # Layout
+///
+/// One `Value` field. After task 76 the body is the only place
+/// the captured value lives — every closure handle stores a
+/// `Gc<UpvalueCellBody>` (4-byte compressed offset) instead of
+/// the previous `Rc<RefCell<Value>>` (8-byte pointer +
+/// allocation overhead).
+///
+/// # Spec
+///
+/// Captured-binding semantics — ECMA-262
+/// §9.1.1.1.4 (CreateMutableBinding) + §9.1.1.1.5
+/// (InitializeBinding); the closure spine that holds these
+/// cells is built by `Op::MakeClosure` per §15.2.5
+/// (FunctionDeclarationInstantiation). Upvalue migration
+/// rationale lives in
+/// `docs/new-engine/gc-architecture.md` §4.1, §6.3.
+pub struct UpvalueCellBody {
+    /// Captured `Value`. Phase 1: arbitrary `Value`; once
+    /// `Value` carries `Gc<…>` variants (tasks 77+),
+    /// [`store_upvalue`] fires
+    /// [`otter_gc::GcHeap::write_barrier`] for every store
+    /// whose RHS holds a GC handle.
+    pub value: Value,
+}
+
+impl otter_gc::SafeTraceable for UpvalueCellBody {
+    const TYPE_TAG: u8 = UPVALUE_CELL_TYPE_TAG;
+
+    /// Walk the inner `Value` for any outgoing GC reference.
+    ///
+    /// Phase 1: `Value` carries no direct `Gc<…>` variants yet,
+    /// but [`Value::Closure`] holds an `Rc<[UpvalueCell]>` whose
+    /// elements are GC handles — those slots get yielded via
+    /// [`Value::trace_value_slots`]. Each subsequent migration
+    /// task (77–83) adds its variant arm there and the trace
+    /// here picks it up automatically.
+    fn trace_slots_safe(&self, v: &mut otter_gc::SlotVisitor<'_>) {
+        self.value.trace_value_slots(v);
     }
+}
 
-    /// Read the captured value (clones the payload).
-    #[must_use]
-    pub fn get(&self) -> Value {
-        self.0.borrow().clone()
-    }
+/// Compressed handle to an [`UpvalueCellBody`] — replaces the
+/// pre-task-76 `Rc<RefCell<Value>>`. `Copy + Eq + Hash`
+/// (inherited from [`otter_gc::Gc`]); identity comparison via
+/// `cell == other`.
+pub type UpvalueCell = otter_gc::Gc<UpvalueCellBody>;
 
-    /// Write a new value. Visible through every clone of this cell.
-    pub fn set(&self, value: Value) {
-        *self.0.borrow_mut() = value;
-    }
+/// Allocate a fresh [`UpvalueCell`] pre-populated with
+/// `value` on the GC heap.
+///
+/// Routes through [`otter_gc::GcHeap::alloc_old`] so the body
+/// is allocated directly in old-space — Phase-1 closure spines
+/// (`Rc<[UpvalueCell]>`) cannot yet be rewritten by the
+/// scavenger, and old-space objects do not move. Phase 2 may
+/// switch back to [`otter_gc::GcHeap::alloc`] once the
+/// scavenger walks every closure spine slot.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim; runtime callers
+/// translate it into [`VmError::OutOfMemory`].
+pub fn alloc_upvalue(
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+) -> Result<UpvalueCell, otter_gc::OutOfMemory> {
+    heap.alloc_old(UpvalueCellBody { value })
+}
 
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        std::rc::Rc::ptr_eq(&self.0, &other.0)
+/// Read the captured value of `cell` (clones the payload).
+#[must_use]
+pub fn read_upvalue(heap: &otter_gc::GcHeap, cell: UpvalueCell) -> Value {
+    heap.read_payload(cell, |body| body.value.clone())
+}
+
+/// Write `value` into `cell`, firing the generational write
+/// barrier so the scavenger sees any newly-established
+/// old → young pointer.
+///
+/// Phase 1: the barrier call is structurally present but
+/// semantically a no-op for non-`Gc`-bearing `Value` variants.
+/// As tasks 77+ add `Gc<…>` arms to [`Value`], the barrier
+/// becomes load-bearing without changes to this call site.
+pub fn store_upvalue(heap: &mut otter_gc::GcHeap, cell: UpvalueCell, value: Value) {
+    let child_raw = value.as_gc_raw();
+    heap.with_payload(cell, |body| {
+        body.value = value;
+    });
+    if let Some(child) = child_raw {
+        // Slot pointer = base of payload; payload's first (and
+        // only) field is `value`. Pointer arithmetic is safe
+        // (raw casts), provenance flows from `as_header_ptr`.
+        let body_base = cell.as_header_ptr() as *mut u8;
+        let value_slot = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
+            as *mut otter_gc::RawGc;
+        heap.write_barrier_raw(cell, value_slot, child);
     }
 }
 
 impl Value {
+    /// If `self` directly carries a `Gc<…>` handle (post-task-77
+    /// variants), return its compressed offset for write-barrier
+    /// dispatch. Phase 1: every variant returns `None` — `Value`
+    /// holds only `Rc`-shared or POD payloads — so all stores
+    /// route through the no-op-barrier path.
+    ///
+    /// Each per-type GC migration task adds its variant arm
+    /// here so [`store_upvalue`] (and any future barrier
+    /// caller) starts firing automatically.
+    #[must_use]
+    pub fn as_gc_raw(&self) -> Option<otter_gc::RawGc> {
+        // Phase-1 stub. Migrations 77+ pattern-match the new
+        // variants and return `Some(handle.raw())`.
+        None
+    }
+
+    /// Walk every `Gc<…>` slot held directly inside `self` and
+    /// yield its slot pointer to `visitor`.
+    ///
+    /// Phase-1 special case: even though no `Value` variant
+    /// carries a direct `Gc<…>` handle yet, [`Value::Closure`]
+    /// holds an `Rc<[UpvalueCell]>` whose elements are
+    /// `Gc<UpvalueCellBody>` handles (task 76). Each slot is
+    /// surfaced through the visitor so the GC can mark every
+    /// upvalue body reachable from this closure.
+    ///
+    /// # Safety contract for callers
+    ///
+    /// Implementations cast `&self` field addresses to
+    /// `*mut RawGc` (raw cast, safe). The visitor is the GC's
+    /// slot visitor — it does not need to write through the
+    /// pointer for old-space objects (no movement), but Phase 2
+    /// scavenger may rewrite slots.
+    pub fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        if let Value::Closure { upvalues, .. } = self {
+            for slot in upvalues.iter() {
+                let p = slot as *const UpvalueCell as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+        }
+    }
+
     /// Convenience: shared empty-string constant. Allocates only on
     /// first call per heap.
     pub fn empty_string(heap: &StringHeap) -> Result<Self, StringError> {
@@ -993,48 +1115,93 @@ pub struct TryHandler {
 
 impl Frame {
     /// Allocate a frame for `function`. Registers are pre-filled
-    /// with `Value::Undefined`. Used for `<main>` (return register
-    /// = `None`, `this` = `undefined`).
+    /// with `Value::Undefined`. Used for test-side construction
+    /// of trivial functions.
+    ///
+    /// **Precondition (since task 76):** `function.own_upvalue_count
+    /// == 0`. Functions with own upvalues route through
+    /// [`Self::for_function_with_heap`] (production path) or
+    /// [`Self::build_upvalues`] + [`Self::with_return_upvalues_and_this`].
     #[must_use]
     pub fn for_function(function: &Function) -> Self {
+        debug_assert_eq!(
+            function.own_upvalue_count, 0,
+            "Frame::for_function requires zero own upvalues — use for_function_with_heap or build_upvalues + with_return_upvalues_and_this"
+        );
         Self::with_return(function, None)
     }
 
-    /// Allocate a frame whose return value should land in the
-    /// caller's register `return_register`.
-    #[must_use]
-    pub fn with_return(function: &Function, return_register: Option<u16>) -> Self {
-        Self::with_return_and_upvalues(function, return_register, std::rc::Rc::from(Vec::new()))
+    /// Allocate a frame for `function`, allocating
+    /// `function.own_upvalue_count` cells on the GC heap.
+    /// The production entry path uses this for the `<main>`
+    /// frame so any top-level `let n = 0; () => n` style upvalue
+    /// has a backing cell from the moment dispatch starts.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn for_function_with_heap(
+        function: &Function,
+        heap: &mut otter_gc::GcHeap,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let upvalues = Self::build_upvalues(heap, function, std::rc::Rc::from(Vec::new()))?;
+        Ok(Self::with_return_upvalues_and_this(
+            function,
+            None,
+            upvalues,
+            Value::Undefined,
+        ))
     }
 
-    /// Allocate a frame and bind captured upvalues. `this` is left
-    /// at the foundation default (`Value::Undefined`); call sites
-    /// that need a non-default receiver use
-    /// [`Self::with_return_upvalues_and_this`].
+    /// Allocate a frame whose return value should land in the
+    /// caller's register `return_register`. Same precondition as
+    /// [`Self::for_function`] — zero own upvalues.
     #[must_use]
-    pub fn with_return_and_upvalues(
-        function: &Function,
-        return_register: Option<u16>,
-        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
-    ) -> Self {
+    pub fn with_return(function: &Function, return_register: Option<u16>) -> Self {
         Self::with_return_upvalues_and_this(
             function,
             return_register,
-            parent_upvalues,
+            std::rc::Rc::from(Vec::new()),
             Value::Undefined,
         )
     }
 
+    /// Build the captured-upvalue spine for `function`, allocating
+    /// `function.own_upvalue_count` fresh
+    /// [`UpvalueCellBody`] cells on the GC heap and prepending them
+    /// to `parent_upvalues` (per the §15.2.5 capture layout).
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn build_upvalues(
+        heap: &mut otter_gc::GcHeap,
+        function: &Function,
+        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+    ) -> Result<std::rc::Rc<[UpvalueCell]>, otter_gc::OutOfMemory> {
+        let own = function.own_upvalue_count as usize;
+        if own == 0 {
+            return Ok(parent_upvalues);
+        }
+        let mut cells: Vec<UpvalueCell> = Vec::with_capacity(own + parent_upvalues.len());
+        for _ in 0..own {
+            cells.push(alloc_upvalue(heap, Value::Undefined)?);
+        }
+        cells.extend(parent_upvalues.iter().copied());
+        Ok(std::rc::Rc::from(cells))
+    }
+
     /// Full constructor used by call sites that need to bind a
-    /// non-default `this`. The function's own captured locals are
-    /// appended after the inherited parent upvalues — see
-    /// [`Op::MakeClosure`](otter_bytecode::Op::MakeClosure) for the
-    /// layout.
+    /// non-default `this`. The caller is responsible for
+    /// pre-building `upvalues` via [`Self::build_upvalues`] (or
+    /// passing `Rc::from(Vec::new())` when the function has none).
+    /// See [`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)
+    /// for the layout.
     #[must_use]
     pub fn with_return_upvalues_and_this(
         function: &Function,
         return_register: Option<u16>,
-        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+        upvalues: std::rc::Rc<[UpvalueCell]>,
         this_value: Value,
     ) -> Self {
         let total = function
@@ -1043,21 +1210,10 @@ impl Frame {
             .saturating_add(function.scratch) as usize;
         let mut registers: SmallVec<[Value; 8]> = SmallVec::with_capacity(total);
         registers.resize(total, Value::Undefined);
-        let own = function.own_upvalue_count as usize;
-        // Layout: [own_caps..., parent_caps...]. Own slots come
-        // first so the compiler can assign stable indices `0..own`
-        // at declaration time before knowing how many parent
-        // captures will be added during the body's compilation.
-        let upvalues: std::rc::Rc<[UpvalueCell]> = if own == 0 {
-            parent_upvalues
-        } else {
-            let mut cells: Vec<UpvalueCell> = Vec::with_capacity(own + parent_upvalues.len());
-            for _ in 0..own {
-                cells.push(UpvalueCell::new(Value::Undefined));
-            }
-            cells.extend(parent_upvalues.iter().cloned());
-            std::rc::Rc::from(cells)
-        };
+        debug_assert!(
+            upvalues.len() >= function.own_upvalue_count as usize,
+            "frame upvalues must include the function's own cells"
+        );
         Self {
             function_id: function.id,
             pc: 0,
@@ -1208,6 +1364,15 @@ impl From<StringError> for VmError {
     }
 }
 
+impl From<otter_gc::OutOfMemory> for VmError {
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        VmError::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
+        }
+    }
+}
+
 /// Default JS call-stack depth limit. Catchable via
 /// [`VmError::StackOverflow`].
 pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
@@ -1271,6 +1436,12 @@ impl std::error::Error for RunError {}
 pub struct Interpreter {
     interrupt: InterruptFlag,
     string_heap: Arc<StringHeap>,
+    /// Per-isolate GC heap. Owned here so allocator-bearing
+    /// opcodes (e.g. `Op::MakeClosure`'s upvalue alloc since
+    /// task 76) reach it through `&mut self`. The `Runtime`
+    /// layer delegates `gc_heap` / `heap_stats` /
+    /// `heap_snapshot` / `force_gc` accessors here.
+    gc_heap: otter_gc::GcHeap,
     max_stack_depth: u32,
     /// Per-interpreter microtask queue. Plain field — accessed
     /// only through `&mut self`. The dispatch loop threads
@@ -1363,33 +1534,16 @@ pub type EvalHook = std::rc::Rc<dyn Fn(&str) -> Result<BytecodeModule, String>>;
 
 impl Interpreter {
     /// Construct a fresh interpreter with its own interrupt flag,
-    /// a no-cap string heap, and the default stack-depth limit.
+    /// a no-cap string heap, the default stack-depth limit, and a
+    /// fresh GC heap.
     #[must_use]
     pub fn new() -> Self {
-        let string_heap = Arc::new(StringHeap::default());
-        let well_known_symbols = WellKnownSymbols::new(&string_heap)
-            .expect("populating well-known symbols on a fresh heap cannot fail");
-        let error_classes = ErrorClassRegistry::new(&string_heap)
-            .expect("populating error class prototypes on a fresh heap cannot fail");
-        Self {
-            interrupt: InterruptFlag::new(),
-            string_heap,
-            max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
-            microtasks: MicrotaskQueue::new(),
-            module_environments: std::collections::HashMap::new(),
-            module_resolution_cache: std::collections::HashMap::new(),
-            well_known_symbols,
-            symbol_registry: SymbolRegistry::new(),
-            error_classes,
-            global_this: build_global_this(),
-            eval_hook: None,
-            pending_generator_throw: None,
-            function_user_props: std::collections::HashMap::new(),
-        }
+        Self::with_string_heap_cap(0)
     }
 
     /// Construct an interpreter with a string heap cap (`0` =
-    /// unlimited).
+    /// unlimited). The same cap is honoured by the interpreter's
+    /// GC heap.
     #[must_use]
     pub fn with_string_heap_cap(cap_bytes: u64) -> Self {
         let string_heap = Arc::new(StringHeap::with_cap(cap_bytes));
@@ -1397,9 +1551,12 @@ impl Interpreter {
             .expect("well-known symbol descriptions fit within any positive cap");
         let error_classes = ErrorClassRegistry::new(&string_heap)
             .expect("error class prototypes fit within any positive cap");
+        let gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
+            .expect("GcHeap construction never fails on the default cage");
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
+            gc_heap,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
@@ -1610,6 +1767,97 @@ impl Interpreter {
         self.error_classes.clone()
     }
 
+    /// Borrow the shared `globalThis` object. Used by the GC
+    /// root walker (task 75) and by any embedder reading the
+    /// foundation seed identity (`globalThis.globalThis ===
+    /// globalThis`).
+    #[must_use]
+    pub fn global_this(&self) -> &JsObject {
+        &self.global_this
+    }
+
+    /// Iterator over every `module_env` object in the per-run
+    /// module-environment registry. Used by the GC root
+    /// walker (task 75) — values are `JsObject`s holding
+    /// live module bindings.
+    pub fn module_environments_for_trace(&self) -> impl Iterator<Item = &JsObject> {
+        self.module_environments.values()
+    }
+
+    /// Borrow the well-known symbol singleton table. Used by
+    /// the GC root walker (task 75).
+    #[must_use]
+    pub fn well_known_symbols_for_trace(&self) -> &WellKnownSymbols {
+        &self.well_known_symbols
+    }
+
+    /// Borrow the error-class registry. Used by the GC root
+    /// walker (task 75); embedder-facing reads should prefer
+    /// [`Self::error_classes_clone`].
+    #[must_use]
+    pub fn error_classes_for_trace(&self) -> &ErrorClassRegistry {
+        &self.error_classes
+    }
+
+    /// Borrow the symbol registry. Used by the GC root walker
+    /// (task 75); see also [`Self::symbol_registry`] which is
+    /// the older spelling kept for back-compat.
+    #[must_use]
+    pub fn symbol_registry_for_trace(&self) -> &SymbolRegistry {
+        &self.symbol_registry
+    }
+
+    /// Iterator over every per-function user-property bag.
+    /// Used by the GC root walker (task 75) — each value is a
+    /// `JsObject` carrying user-side `f.foo = bar` writes.
+    pub fn function_user_props_for_trace(&self) -> impl Iterator<Item = &JsObject> {
+        self.function_user_props.values()
+    }
+
+    /// Borrow the pending-generator-throw side-channel slot.
+    /// Used by the GC root walker (task 75); the body of the
+    /// trace stays empty until task 76 (when `Value` carries
+    /// its first `Gc<…>`-shaped variant).
+    #[must_use]
+    pub fn pending_generator_throw_for_trace(&self) -> Option<&Value> {
+        self.pending_generator_throw.as_ref()
+    }
+
+    /// Borrow the per-isolate GC heap (read-only).
+    #[must_use]
+    pub fn gc_heap(&self) -> &otter_gc::GcHeap {
+        &self.gc_heap
+    }
+
+    /// Mutable borrow of the per-isolate GC heap.
+    #[must_use]
+    pub fn gc_heap_mut(&mut self) -> &mut otter_gc::GcHeap {
+        &mut self.gc_heap
+    }
+
+    /// Force a full GC cycle. Pre-collects every root slot via
+    /// [`crate::runtime_state::RuntimeState::trace_roots`] before
+    /// handing them to [`otter_gc::GcHeap::collect_full`] — so
+    /// the same `&mut self` borrow can satisfy both the heap
+    /// (mutably) and the root walker (immutably) without
+    /// resorting to unsafe split-borrow tricks.
+    ///
+    /// **Debug / test only** — production embedders let the GC
+    /// trigger itself.
+    pub fn force_gc(&mut self) {
+        let mut roots: Vec<*mut otter_gc::RawGc> = Vec::new();
+        {
+            let state = crate::runtime_state::RuntimeState::new(self);
+            state.trace_roots(&mut |slot| roots.push(slot));
+        }
+        let mut visit = |sv: &mut dyn FnMut(*mut otter_gc::RawGc)| {
+            for &p in &roots {
+                sv(p);
+            }
+        };
+        self.gc_heap.collect_full(&mut visit);
+    }
+
     /// Execute `<main>` of `module` and return its completion value.
     ///
     /// # Errors
@@ -1803,10 +2051,19 @@ impl Interpreter {
                 });
             }
         };
+        let upvalues = match Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues) {
+            Ok(u) => u,
+            Err(oom) => {
+                return Err(RunError {
+                    error: VmError::from(oom),
+                    frames: Vec::new(),
+                });
+            }
+        };
         let mut new_frame = Frame::with_return_upvalues_and_this(
             function,
             None, // top-level — no return register
-            parent_upvalues,
+            upvalues,
             this_for_callee,
         );
         let bind_count = (function.param_count as usize).min(effective_args.len());
@@ -1880,7 +2137,8 @@ impl Interpreter {
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
         let main = module.main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut entry = Frame::for_function(main);
+        let mut entry = Frame::for_function_with_heap(main, &mut self.gc_heap)
+            .map_err(|oom| (VmError::from(oom), Vec::new()))?;
         // §16.2.1.7 ModuleDeclarationInstantiation step 5 — when the
         // entry function carries top-level await, wire up an async
         // result promise so `Op::Await` can park / resume normally.
@@ -2342,10 +2600,9 @@ impl Interpreter {
                             Some(&Operand::Imm32(n)) if n >= 0 => n as usize,
                             _ => return Err(VmError::InvalidOperand),
                         };
-                        let cell = frame
+                        let cell = *frame
                             .upvalues
                             .get(parent_idx)
-                            .cloned()
                             .ok_or(VmError::InvalidOperand)?;
                         cells.push(cell);
                     }
@@ -2380,11 +2637,11 @@ impl Interpreter {
                     if idx < 0 {
                         return Err(VmError::InvalidOperand);
                     }
-                    let value = frame
+                    let cell = *frame
                         .upvalues
                         .get(idx as usize)
-                        .ok_or(VmError::InvalidOperand)?
-                        .get();
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = read_upvalue(&self.gc_heap, cell);
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
@@ -2395,11 +2652,11 @@ impl Interpreter {
                         return Err(VmError::InvalidOperand);
                     }
                     let value = read_register(frame, src)?.clone();
-                    frame
+                    let cell = *frame
                         .upvalues
                         .get(idx as usize)
-                        .ok_or(VmError::InvalidOperand)?
-                        .set(value);
+                        .ok_or(VmError::InvalidOperand)?;
+                    store_upvalue(&mut self.gc_heap, cell, value);
                     frame.pc += 1;
                 }
                 Op::LoadString => {
@@ -4284,10 +4541,11 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
+        let upvalues = Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues)?;
         let mut new_frame = Frame::with_return_upvalues_and_this(
             function,
             return_register,
-            parent_upvalues,
+            upvalues,
             this_for_callee,
         );
         new_frame.async_state = async_state;
@@ -5600,9 +5858,10 @@ impl Interpreter {
             .functions
             .get(function_id as usize)
             .ok_or(VmError::InvalidOperand)?;
+        let upvalues = Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues)?;
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
-            Frame::with_return_upvalues_and_this(function, None, parent_upvalues, this_for_callee);
+            Frame::with_return_upvalues_and_this(function, None, upvalues, this_for_callee);
         let bind_count = (function.param_count as usize).min(effective_args.len());
         let total_args = effective_args.len();
         let mut arg_iter = effective_args.into_iter();
@@ -6585,7 +6844,7 @@ impl Interpreter {
         let module = self.compile_eval_source(&source)?;
         let main = module.main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut entry = Frame::for_function(main);
+        let mut entry = Frame::for_function_with_heap(main, &mut self.gc_heap)?;
         let entry_promise = if main.is_async {
             let result = JsPromiseHandle::pending();
             entry.async_state = Some(AsyncFrameState {
@@ -6650,7 +6909,10 @@ impl Interpreter {
         // returned native can replay calls against the right
         // bytecode.
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        stack.push(Frame::for_function(module.main()));
+        stack.push(Frame::for_function_with_heap(
+            module.main(),
+            &mut self.gc_heap,
+        )?);
         let value = self.dispatch_loop(&module, &mut stack)?;
         let function_id = match &value {
             Value::Function { function_id } => *function_id,
@@ -6694,12 +6956,10 @@ impl Interpreter {
             .functions
             .get(function_id as usize)
             .ok_or(VmError::InvalidOperand)?;
-        let mut frame = Frame::with_return_upvalues_and_this(
-            function,
-            None,
-            std::rc::Rc::from(Vec::new()),
-            Value::Undefined,
-        );
+        let upvalues =
+            Frame::build_upvalues(&mut self.gc_heap, function, std::rc::Rc::from(Vec::new()))?;
+        let mut frame =
+            Frame::with_return_upvalues_and_this(function, None, upvalues, Value::Undefined);
         // Bind args to parameter slots; extras drop, missing stay
         // `Value::Undefined` (matches §10.2.1.4 step 22.b).
         let bind_count = (function.param_count as usize).min(args.len());

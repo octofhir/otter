@@ -442,6 +442,115 @@ impl GcHeap {
         Ok(unsafe { Gc::from_offset(offset) })
     }
 
+    /// Allocate a `T` directly in old-space, bypassing
+    /// young-gen entirely.
+    ///
+    /// Phase-1 escape hatch for callers that hold long-lived
+    /// references through `Rc<…>` containers the GC can't yet
+    /// rewrite (e.g. `Rc<[Gc<T>]>` upvalue spines from task 76).
+    /// Old-space objects do not move, so a slot stored in an
+    /// `Rc`-shared container stays valid across collections.
+    /// Migrations that wire frame-stack tracing (Phase 2,
+    /// task 86) may switch back to [`Self::alloc`] once the
+    /// scavenger can fix up every container slot.
+    ///
+    /// # Errors
+    ///
+    /// - [`OutOfMemory::HeapCapExceeded`] — cap was exceeded
+    ///   and emergency full GC could not reclaim enough.
+    /// - [`OutOfMemory::CageExhausted`] — cage cannot satisfy
+    ///   a fresh page request.
+    #[inline]
+    pub fn alloc_old<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
+        if self.trace_table.get(T::TYPE_TAG).is_none() {
+            self.trace_table.register::<T>();
+        }
+        let total = std::mem::size_of::<GcHeader>() + std::mem::size_of::<T>();
+        let aligned = align_up(total, CELL_SIZE);
+        debug_assert!(
+            aligned <= u32::MAX as usize,
+            "object size exceeds u32 limit"
+        );
+        if self.max_heap_bytes != 0 {
+            self.account_or_collect(aligned as u64)?;
+        }
+        let is_marking = self.marking.is_marking();
+        let offset = if aligned > LARGE_OBJECT_THRESHOLD {
+            self.large_space.alloc(aligned)?
+        } else {
+            self.old_space.alloc(aligned)?
+        };
+        // SAFETY: offset is a fresh in-cage allocation.
+        let header_ptr = unsafe { cage_base().add(offset as usize) as *mut GcHeader };
+        let payload_ptr =
+            unsafe { cage_base().add(offset as usize + std::mem::size_of::<GcHeader>()) as *mut T };
+        // SAFETY: freshly-alloc-ed cage region inside a page
+        // we own; bytes are zeroed by alloc_zeroed at cage init.
+        unsafe {
+            let header = if is_marking {
+                let h = GcHeader::new(T::TYPE_TAG, aligned as u32);
+                h.set_mark_color(MarkColor::Black);
+                h
+            } else {
+                GcHeader::new(T::TYPE_TAG, aligned as u32)
+            };
+            std::ptr::write(header_ptr, header);
+            std::ptr::write(payload_ptr, value);
+        }
+        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
+        row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
+        // SAFETY: offset references a fresh `T` payload.
+        Ok(unsafe { Gc::from_offset(offset) })
+    }
+
+    /// Read-only access to the payload of a heap-allocated
+    /// value. The closure receives `&T`; never holds the
+    /// reference past return.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `handle.is_null()`.
+    #[inline]
+    pub fn read_payload<T: Traceable, R>(&self, handle: Gc<T>, f: impl FnOnce(&T) -> R) -> R {
+        debug_assert!(!handle.is_null(), "read_payload on null handle");
+        // SAFETY: handle was issued by `alloc` / `alloc_old`;
+        // payload lives immediately after the header at the
+        // same allocation; single-mutator GC (no concurrent
+        // mutator).
+        unsafe {
+            let payload = (handle.as_header_ptr() as *mut u8).add(std::mem::size_of::<GcHeader>())
+                as *const T;
+            f(&*payload)
+        }
+    }
+
+    /// Mutable access to the payload of a heap-allocated value.
+    ///
+    /// **Caller is responsible for [`Self::write_barrier`]** on
+    /// every new outgoing GC reference established inside the
+    /// closure. The closure runs under the same single-mutator
+    /// GC contract as [`Self::alloc`].
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `handle.is_null()`.
+    #[inline]
+    pub fn with_payload<T: Traceable, R>(
+        &mut self,
+        handle: Gc<T>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        debug_assert!(!handle.is_null(), "with_payload on null handle");
+        // SAFETY: same contract as [`Self::read_payload`]; the
+        // exclusive `&mut self` upholds payload uniqueness.
+        unsafe {
+            let payload =
+                (handle.as_header_ptr() as *mut u8).add(std::mem::size_of::<GcHeader>()) as *mut T;
+            f(&mut *payload)
+        }
+    }
+
     /// Run a minor GC (Cheney scavenge).
     pub fn collect_minor(&mut self, _roots: EmptyRoots) {
         let empty: fn(&mut dyn FnMut(*mut RawGc)) = |_| {};
@@ -688,6 +797,31 @@ impl GcHeap {
                 parent_header,
                 slot_addr as *mut u8,
                 child.raw(),
+                &mut self.marking,
+            );
+        }
+    }
+
+    /// Type-erased write barrier for callers that hold the
+    /// child as a [`RawGc`] rather than a typed `Gc<U>`.
+    /// Equivalent to [`Self::write_barrier`] otherwise.
+    pub fn write_barrier_raw<T: ?Sized>(
+        &mut self,
+        parent: Gc<T>,
+        slot_addr: *mut RawGc,
+        child: RawGc,
+    ) {
+        if parent.is_null() {
+            return;
+        }
+        let parent_header = parent.as_header_ptr();
+        // SAFETY: parent is non-null; slot_addr is inside the
+        // parent payload as required by the barrier contract.
+        unsafe {
+            crate::barrier::write_barrier(
+                parent_header,
+                slot_addr as *mut u8,
+                child,
                 &mut self.marking,
             );
         }

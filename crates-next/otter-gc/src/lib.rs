@@ -79,4 +79,4 @@ pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use snapshot::{HeapSnapshot, SnapshotObject};
 pub use stats::{GcStats, TYPE_TAG_COUNT, TypeStats};
-pub use trace::{SlotVisitor, TraceFn, TraceTable, Traceable};
+pub use trace::{SafeTraceable, SlotVisitor, TraceFn, TraceTable, Traceable};

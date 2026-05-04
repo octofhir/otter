@@ -1316,6 +1316,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "otter-bytecode",
+ "otter-gc",
  "regress",
  "serde",
  "smallvec",

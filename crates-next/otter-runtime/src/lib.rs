@@ -623,17 +623,9 @@ impl RuntimeBuilder {
                 },
             });
         }
-        // GC heap honours the same cap. The Phase-1 interpreter
-        // does not yet allocate through it (per-type migrations
-        // start at task 76), but the heap is constructed up-front
-        // so the cap is load-bearing the moment the first
-        // migration lands. Runtime tests already exercise the
-        // string-heap cap.
-        let gc_heap = GcHeap::with_max_heap_bytes(self.config.max_heap_bytes)
-            .map_err(OtterError::from_gc_oom)?;
-        // Phase-1 string heap continues to enforce the cap on
-        // string allocations, so script-driven OOM surfaces today
-        // even before the GC migrations.
+        // The interpreter owns the per-isolate GC heap (since
+        // task 76); both the string heap and the GC heap honour
+        // the configured cap.
         let mut interp = Interpreter::with_string_heap_cap(self.config.max_heap_bytes);
         interp.set_max_stack_depth(self.config.max_stack_depth);
         // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
@@ -648,7 +640,6 @@ impl RuntimeBuilder {
         interp.set_eval_hook(Some(hook));
         Ok(Runtime {
             interp,
-            gc_heap,
             config: self.config,
         })
     }
@@ -658,7 +649,6 @@ impl RuntimeBuilder {
 #[derive(Debug)]
 pub struct Runtime {
     interp: Interpreter,
-    gc_heap: GcHeap,
     config: RuntimeConfig,
 }
 
@@ -696,22 +686,18 @@ impl Runtime {
         self.config.max_heap_bytes
     }
 
-    /// Borrow the runtime's GC heap. Today the heap is owned by
-    /// the runtime and observes the configured cap; per-type
-    /// migrations (tasks 76+) wire the interpreter's value model
-    /// into it.
+    /// Borrow the runtime's GC heap. Owned by the interpreter
+    /// since task 76; this accessor delegates.
     #[must_use]
     pub fn gc_heap(&self) -> &GcHeap {
-        &self.gc_heap
+        self.interp.gc_heap()
     }
 
-    /// Mutable borrow of the runtime's GC heap. Reserved for
-    /// embedders that want to allocate auxiliary GC-managed
-    /// objects (e.g. host-side state); the interpreter itself
-    /// does not yet route through this handle.
+    /// Mutable borrow of the runtime's GC heap. Owned by the
+    /// interpreter since task 76; this accessor delegates.
     #[must_use]
     pub fn gc_heap_mut(&mut self) -> &mut GcHeap {
-        &mut self.gc_heap
+        self.interp.gc_heap_mut()
     }
 
     /// Per-heap GC counters: live objects / live bytes / per-
@@ -725,7 +711,7 @@ impl Runtime {
     /// under `by_type` — Phase 1 only sees host-side
     /// allocations through [`Self::gc_heap_mut`].
     pub fn heap_stats(&mut self) -> &GcStats {
-        self.gc_heap.gc_stats()
+        self.interp.gc_heap_mut().gc_stats()
     }
 
     /// Snapshot the live object graph plus a caller-supplied
@@ -744,7 +730,7 @@ impl Runtime {
     /// interpreter; per-type migrations widen the typical root
     /// set as they land.
     pub fn heap_snapshot(&mut self, roots: &[otter_gc::RawGc]) -> HeapSnapshot {
-        self.gc_heap.snapshot(roots)
+        self.interp.gc_heap().snapshot(roots)
     }
 
     /// Force a full GC cycle (scavenge + old-gen mark-sweep).
@@ -754,9 +740,13 @@ impl Runtime {
     /// pressure, and a forced cycle perturbs those metrics.
     /// Tests use this to assert "after dropping these handles
     /// and forcing a GC, live counts return to baseline".
+    ///
+    /// The walker delegates to
+    /// [`otter_vm::runtime_state::RuntimeState::trace_roots`]
+    /// (task 75) via [`otter_vm::Interpreter::force_gc`], which
+    /// owns the heap and does the split-borrow internally.
     pub fn force_gc(&mut self) {
-        let mut noop = |_visitor: &mut dyn FnMut(*mut otter_gc::RawGc)| {};
-        self.gc_heap.collect_full(&mut noop);
+        self.interp.force_gc();
     }
 
     /// Configured stack-depth cap.

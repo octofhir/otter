@@ -588,15 +588,21 @@ mod tests {
 
     #[test]
     fn is_array_recognises_array_only() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         assert!(is_array(&Value::Array(crate::JsArray::new())));
-        assert!(!is_array(&Value::Object(crate::JsObject::new())));
+        assert!(!is_array(&Value::Object(
+            crate::object::alloc_object(&mut heap).unwrap()
+        )));
         assert!(!is_array(&Value::Undefined));
     }
 
     #[test]
     fn is_callable_recognises_call_shapes() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         assert!(is_callable(&Value::Function { function_id: 0 }));
-        assert!(!is_callable(&Value::Object(crate::JsObject::new())));
+        assert!(!is_callable(&Value::Object(
+            crate::object::alloc_object(&mut heap).unwrap()
+        )));
         assert!(!is_callable(&Value::Undefined));
     }
 }

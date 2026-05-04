@@ -315,11 +315,19 @@ fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(),
     };
+    join_into_string(&t, &separator, args.string_heap)
+}
+
+fn join_into_string(
+    t: &crate::binary::JsTypedArray,
+    separator: &str,
+    string_heap: &crate::string::StringHeap,
+) -> Result<Value, IntrinsicError> {
     let mut out = String::new();
     let len = t.length();
     for i in 0..len {
         if i > 0 {
-            out.push_str(&separator);
+            out.push_str(separator);
         }
         let v = t.get(i);
         match &v {
@@ -327,15 +335,13 @@ fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             other => out.push_str(&other.display_string()),
         }
     }
-    Ok(Value::String(JsString::from_str(&out, args.string_heap)?))
+    Ok(Value::String(JsString::from_str(&out, string_heap)?))
 }
 
 fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    impl_join(&IntrinsicArgs {
-        receiver: args.receiver,
-        args: &[],
-        string_heap: args.string_heap,
-    })
+    let t = receiver(args)?;
+    check_not_detached(&t)?;
+    join_into_string(&t, ",", args.string_heap)
 }
 
 fn impl_to_locale_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

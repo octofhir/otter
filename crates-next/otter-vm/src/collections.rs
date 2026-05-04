@@ -40,7 +40,6 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use crate::Value;
-use crate::object::JsObject;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
 
@@ -109,7 +108,7 @@ impl MapKey {
             Value::BigInt(b) => MapKey::BigInt(b.clone()),
             Value::String(s) => MapKey::String(s.clone()),
             Value::Symbol(s) => MapKey::Symbol(s.clone()),
-            Value::Object(o) => MapKey::ObjectPtr(o.identity_addr()),
+            Value::Object(o) => MapKey::ObjectPtr(o.as_header_ptr() as *const ()),
             Value::Array(a) => MapKey::ObjectPtr(a.identity_addr()),
             Value::RegExp(r) => MapKey::ObjectPtr(r.identity_addr()),
             Value::Promise(_) => {
@@ -536,7 +535,7 @@ impl Default for JsWeakSet {
 /// use as a `WeakMap`/`WeakSet` key.
 fn object_identity(value: &Value) -> Result<*const (), CollectionError> {
     match value {
-        Value::Object(o) => Ok(o.identity_addr()),
+        Value::Object(o) => Ok(o.as_header_ptr() as *const ()),
         Value::Array(a) => Ok(a.identity_addr()),
         Value::RegExp(r) => Ok(r.identity_addr()),
         _ => Err(CollectionError::NonObjectKey),
@@ -562,11 +561,6 @@ impl JsSet {
     pub fn borrow_values(&self) -> Ref<'_, IndexMap<MapKey, Value>> {
         Ref::map(self.inner.borrow(), |b| &b.entries)
     }
-}
-
-impl JsObject {
-    // Symbol-keyed access already lives on JsObject; nothing to add
-    // for collections beyond the borrow helpers above.
 }
 
 #[cfg(test)]
@@ -626,12 +620,13 @@ mod tests {
 
     #[test]
     fn weakmap_object_key_roundtrips() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let wm = JsWeakMap::new();
-        let obj = Value::Object(JsObject::new());
+        let obj = Value::Object(crate::object::alloc_object(&mut heap).unwrap());
         wm.set(obj.clone(), n(42)).unwrap();
         assert!(wm.has(&obj).unwrap());
         assert_eq!(wm.get(&obj).unwrap(), Some(n(42)));
-        let other = Value::Object(JsObject::new());
+        let other = Value::Object(crate::object::alloc_object(&mut heap).unwrap());
         assert!(!wm.has(&other).unwrap());
     }
 

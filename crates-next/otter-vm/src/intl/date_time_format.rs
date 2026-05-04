@@ -23,14 +23,18 @@ use crate::number::NumberValue;
 use crate::temporal::TemporalPayload;
 
 /// Resolve the constructor option bag.
-pub fn resolve(locale: &Value, options: &Value) -> DateTimeFormatPayload {
+pub fn resolve(
+    locale: &Value,
+    options: &Value,
+    gc_heap: &otter_gc::GcHeap,
+) -> DateTimeFormatPayload {
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     // Default option bag follows ECMA-402 §11.1.2 step 6: when no
     // date-time component options are present, fall back to
     // `{ year: "numeric", month: "numeric", day: "numeric" }`.
     let component_present =
-        |name: &str| -> bool { !read_string_option(opts_ref, name, "").is_empty() };
+        |name: &str| -> bool { !read_string_option(opts_ref, name, "", gc_heap).is_empty() };
     let mut year = component_present("year");
     let mut month = component_present("month");
     let mut day = component_present("day");
@@ -104,8 +108,6 @@ fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_date_time(args)?;
-    let obj = crate::object::JsObject::new();
-    obj.set("locale", js_string_value(&payload.locale, args)?);
     let component = |present: bool| {
         if present {
             "numeric".to_string()
@@ -113,31 +115,63 @@ fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
             "".to_string()
         }
     };
-    if payload.year {
-        obj.set("year", js_string_value(&component(true), args)?);
+    let locale_value = js_string_value(&payload.locale, args)?;
+    let yr = if payload.year {
+        Some(js_string_value(&component(true), args)?)
+    } else {
+        None
+    };
+    let mo = if payload.month {
+        Some(js_string_value(&component(true), args)?)
+    } else {
+        None
+    };
+    let da = if payload.day {
+        Some(js_string_value(&component(true), args)?)
+    } else {
+        None
+    };
+    let hr = if payload.hour {
+        Some(js_string_value(&component(true), args)?)
+    } else {
+        None
+    };
+    let mi = if payload.minute {
+        Some(js_string_value(&component(true), args)?)
+    } else {
+        None
+    };
+    let se = if payload.second {
+        Some(js_string_value(&component(true), args)?)
+    } else {
+        None
+    };
+    let calendar = Value::String(crate::string::JsString::from_str(
+        "iso8601",
+        args.string_heap,
+    )?);
+    let mut heap = args.gc_heap.borrow_mut();
+    let obj = crate::object::alloc_object(*heap)?;
+    crate::object::set(obj, *heap, "locale", locale_value);
+    if let Some(v) = yr {
+        crate::object::set(obj, *heap, "year", v);
     }
-    if payload.month {
-        obj.set("month", js_string_value(&component(true), args)?);
+    if let Some(v) = mo {
+        crate::object::set(obj, *heap, "month", v);
     }
-    if payload.day {
-        obj.set("day", js_string_value(&component(true), args)?);
+    if let Some(v) = da {
+        crate::object::set(obj, *heap, "day", v);
     }
-    if payload.hour {
-        obj.set("hour", js_string_value(&component(true), args)?);
+    if let Some(v) = hr {
+        crate::object::set(obj, *heap, "hour", v);
     }
-    if payload.minute {
-        obj.set("minute", js_string_value(&component(true), args)?);
+    if let Some(v) = mi {
+        crate::object::set(obj, *heap, "minute", v);
     }
-    if payload.second {
-        obj.set("second", js_string_value(&component(true), args)?);
+    if let Some(v) = se {
+        crate::object::set(obj, *heap, "second", v);
     }
-    obj.set(
-        "calendar",
-        Value::String(crate::string::JsString::from_str(
-            "iso8601",
-            args.string_heap,
-        )?),
-    );
+    crate::object::set(obj, *heap, "calendar", calendar);
     let _ = NumberValue::from_i32; // keep import live
     Ok(Value::Object(obj))
 }

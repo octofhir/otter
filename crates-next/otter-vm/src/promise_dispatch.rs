@@ -82,7 +82,7 @@ pub fn statics_call(
         "race" => Ok(static_race(interp, args)),
         "allSettled" => Ok(static_all_settled(interp, args)),
         "any" => Ok(static_any(interp, args)),
-        "withResolvers" => Ok(static_with_resolvers()),
+        "withResolvers" => Ok(static_with_resolvers(interp)),
         other => Err(NativeError::TypeError {
             name: "Promise",
             reason: format!("static `{other}` is not defined"),
@@ -266,8 +266,8 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
             let heap = heap.clone();
             native_value("Promise.allSettled fulfill", move |interp, args| {
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let record =
-                    build_settled_record(true, v, &heap).map_err(|e| NativeError::TypeError {
+                let record = build_settled_record(true, v, &heap, interp.gc_heap_for_cx_mut())
+                    .map_err(|e| NativeError::TypeError {
                         name: "Promise",
                         reason: format!("string allocation failed: {e}"),
                     })?;
@@ -282,8 +282,8 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
             let heap = heap.clone();
             native_value("Promise.allSettled reject", move |interp, args| {
                 let r = args.first().cloned().unwrap_or(Value::Undefined);
-                let record =
-                    build_settled_record(false, r, &heap).map_err(|e| NativeError::TypeError {
+                let record = build_settled_record(false, r, &heap, interp.gc_heap_for_cx_mut())
+                    .map_err(|e| NativeError::TypeError {
                         name: "Promise",
                         reason: format!("string allocation failed: {e}"),
                     })?;
@@ -300,13 +300,19 @@ fn build_settled_record(
     fulfilled: bool,
     payload: Value,
     heap: &std::sync::Arc<crate::string::StringHeap>,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, crate::string::StringError> {
-    let obj = crate::object::JsObject::new();
     let status_text = if fulfilled { "fulfilled" } else { "rejected" };
     let status = crate::JsString::from_str(status_text, heap)?;
-    obj.set("status", Value::String(status));
     let key = if fulfilled { "value" } else { "reason" };
-    obj.set(key, payload);
+    let obj = crate::object::alloc_object(gc_heap).map_err(|_| {
+        crate::string::StringError::OutOfMemory {
+            requested_bytes: 0,
+            heap_limit_bytes: 0,
+        }
+    })?;
+    crate::object::set(obj, gc_heap, "status", Value::String(status));
+    crate::object::set(obj, gc_heap, key, payload);
     Ok(Value::Object(obj))
 }
 
@@ -354,13 +360,18 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
     if entries.is_empty() {
         // Spec: empty iterable rejects with an AggregateError whose
         // `errors` array is empty.
-        let agg = match interp.error_classes_clone().make_aggregate_instance(
-            Vec::new(),
-            Some("All promises were rejected"),
-            &interp.string_heap_clone(),
-        ) {
-            Ok(o) => Value::Object(o),
-            Err(_) => Value::Undefined,
+        let agg = {
+            let registry = interp.error_classes_clone();
+            let string_heap = interp.string_heap_clone();
+            match registry.make_aggregate_instance(
+                Vec::new(),
+                Some("All promises were rejected"),
+                &string_heap,
+                interp.gc_heap_for_cx_mut(),
+            ) {
+                Ok(o) => Value::Object(o),
+                Err(_) => Value::Undefined,
+            }
         };
         let jobs = result.reject(agg);
         for j in jobs.jobs {
@@ -417,6 +428,7 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
                             collected,
                             Some("All promises were rejected"),
                             &heap,
+                            interp.gc_heap_for_cx_mut(),
                         )
                         .map_err(|e| NativeError::TypeError {
                             name: "Promise",
@@ -440,12 +452,16 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.withResolvers>
-fn static_with_resolvers() -> Value {
+fn static_with_resolvers(interp: &mut Interpreter) -> Value {
     let cap = make_capability();
-    let obj = crate::object::JsObject::new();
-    obj.set("promise", cap.promise);
-    obj.set("resolve", cap.resolve);
-    obj.set("reject", cap.reject);
+    let gc_heap = interp.gc_heap_for_cx_mut();
+    let obj = match crate::object::alloc_object(gc_heap) {
+        Ok(o) => o,
+        Err(_) => return Value::Undefined,
+    };
+    crate::object::set(obj, gc_heap, "promise", cap.promise);
+    crate::object::set(obj, gc_heap, "resolve", cap.resolve);
+    crate::object::set(obj, gc_heap, "reject", cap.reject);
     Value::Object(obj)
 }
 

@@ -561,9 +561,14 @@ impl Value {
     /// caller) starts firing automatically.
     #[must_use]
     pub fn as_gc_raw(&self) -> Option<otter_gc::RawGc> {
-        // Phase-1 stub. Migrations 77+ pattern-match the new
-        // variants and return `Some(handle.raw())`.
-        None
+        match self {
+            // Task 77 — `JsObject` is a `Gc<ObjectBody>` handle.
+            Value::Object(o) => Some(o.raw()),
+            // Phase-1 stub for the rest. Subsequent migrations
+            // (78+) add variant arms here as their handle types
+            // move to `Gc<…>`.
+            _ => None,
+        }
     }
 
     /// Walk every `Gc<…>` slot held directly inside `self` and
@@ -584,11 +589,22 @@ impl Value {
     /// pointer for old-space objects (no movement), but Phase 2
     /// scavenger may rewrite slots.
     pub fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
-        if let Value::Closure { upvalues, .. } = self {
-            for slot in upvalues.iter() {
-                let p = slot as *const UpvalueCell as *mut otter_gc::RawGc;
+        match self {
+            Value::Closure { upvalues, .. } => {
+                for slot in upvalues.iter() {
+                    let p = slot as *const UpvalueCell as *mut otter_gc::RawGc;
+                    visitor(p);
+                }
+            }
+            // Task 77 — `JsObject` is a `Gc<ObjectBody>` handle.
+            // Yield the slot's storage address so the scavenger
+            // can rewrite the offset in place when the body
+            // moves (Phase 2; today old-space objects pinned).
+            Value::Object(o) => {
+                let p = o as *const JsObject as *mut otter_gc::RawGc;
                 visitor(p);
             }
+            _ => {}
         }
     }
 
@@ -825,7 +841,7 @@ impl PartialEq for Value {
             // `Symbol("x")` calls compare unequal even with matching
             // descriptions.
             (Value::Symbol(a), Value::Symbol(b)) => a.ptr_eq(b),
-            (Value::Object(a), Value::Object(b)) => a.ptr_eq(b),
+            (Value::Object(a), Value::Object(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => a.ptr_eq(b),
             (Value::Function { function_id: a }, Value::Function { function_id: b }) => a == b,
             (
@@ -1572,10 +1588,12 @@ impl Interpreter {
         let string_heap = Arc::new(StringHeap::with_cap(cap_bytes));
         let well_known_symbols = WellKnownSymbols::new(&string_heap)
             .expect("well-known symbol descriptions fit within any positive cap");
-        let error_classes = ErrorClassRegistry::new(&string_heap)
-            .expect("error class prototypes fit within any positive cap");
-        let gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
+        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
             .expect("GcHeap construction never fails on the default cage");
+        let error_classes = ErrorClassRegistry::new(&string_heap, &mut gc_heap)
+            .expect("error class prototypes fit within any positive cap");
+        let global_this =
+            build_global_this(&mut gc_heap).expect("global_this fits within any positive cap");
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
@@ -1587,7 +1605,7 @@ impl Interpreter {
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
             error_classes,
-            global_this: build_global_this(),
+            global_this,
             eval_hook: None,
             pending_generator_throw: None,
             function_user_props: std::collections::HashMap::new(),
@@ -1607,8 +1625,8 @@ impl Interpreter {
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
-        if let Some(bag) = self.function_user_props.get(&function_id)
-            && let Some(v) = bag.get(name)
+        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+            && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
         {
             return Ok(v);
         }
@@ -1619,13 +1637,20 @@ impl Interpreter {
             // wire `prototype.constructor` back to the function
             // here (foundation gap; matches the §41 audit closeout
             // priorities).
-            let bag = self.function_user_props.entry(function_id).or_default();
-            if let Some(existing) = bag.get("prototype") {
+            let bag = match self.function_user_props.get(&function_id).copied() {
+                Some(b) => b,
+                None => {
+                    let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                    self.function_user_props.insert(function_id, new_bag);
+                    new_bag
+                }
+            };
+            if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
                 return Ok(existing);
             }
-            let proto = JsObject::new();
+            let proto = crate::object::alloc_object(&mut self.gc_heap)?;
             let proto_value = Value::Object(proto);
-            bag.set("prototype", proto_value.clone());
+            crate::object::set(bag, &mut self.gc_heap, "prototype", proto_value.clone());
             return Ok(proto_value);
         }
         if name == "name" || name == "length" {
@@ -2262,7 +2287,7 @@ impl Interpreter {
     /// Convert a `VmError` raised by a dispatch step into a thrown
     /// `Error` instance. Returns `None` for variants that should
     /// keep propagating as host errors (StackOverflow, etc.).
-    fn vm_error_to_throwable(&self, err: &VmError) -> Option<Value> {
+    fn vm_error_to_throwable(&mut self, err: &VmError) -> Option<Value> {
         let dynamic_message: String;
         let (kind, message) = match err {
             VmError::TypeMismatch => (error_classes::ErrorKind::TypeError, "operand type mismatch"),
@@ -2291,10 +2316,15 @@ impl Interpreter {
             _ => return None,
         };
         let proto = self.error_classes.prototype(kind);
-        let obj = JsObject::new();
-        obj.set_prototype(Some(proto));
+        let obj = crate::object::alloc_object(&mut self.gc_heap).ok()?;
+        crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         let message_str = JsString::from_str(message, &self.string_heap).ok()?;
-        obj.set("message", Value::String(message_str));
+        crate::object::set(
+            obj,
+            &mut self.gc_heap,
+            "message",
+            Value::String(message_str),
+        );
         Some(Value::Object(obj))
     }
 
@@ -2444,7 +2474,7 @@ impl Interpreter {
                     // the yielded value out so the `resume_generator`
                     // caller can shape it.
                     if let Some(resolve) = pending_request_resolve {
-                        let record = make_iter_result(yielded.clone(), false);
+                        let record = make_iter_result(yielded.clone(), false, &mut self.gc_heap)?;
                         self.run_callable_sync(
                             module,
                             &resolve,
@@ -2852,7 +2882,8 @@ impl Interpreter {
                 }
                 Op::NewObject => {
                     let dst = register_operand(operands.first())?;
-                    write_register(frame, dst, Value::Object(JsObject::new()))?;
+                    let obj = crate::object::alloc_object(&mut self.gc_heap)?;
+                    write_register(frame, dst, Value::Object(obj))?;
                     frame.pc += 1;
                 }
                 Op::LoadProperty => {
@@ -2861,12 +2892,14 @@ impl Interpreter {
                     let name_idx = const_operand(operands.get(2))?;
                     let name = lookup_string_constant(module, name_idx)?;
                     let value = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => o.get(&name).unwrap_or(Value::Undefined),
+                        Value::Object(o) => {
+                            crate::object::get(*o, &self.gc_heap, &name).unwrap_or(Value::Undefined)
+                        }
                         Value::ClassConstructor(c) => {
                             if name == "prototype" {
-                                Value::Object(c.prototype.clone())
+                                Value::Object(c.prototype)
                             } else {
-                                match c.statics.get(&name) {
+                                match crate::object::get(c.statics, &self.gc_heap, &name) {
                                     Some(v) => v,
                                     None if name == "name" || name == "length" => {
                                         // Fall back to the underlying
@@ -2954,8 +2987,8 @@ impl Interpreter {
                     let name = lookup_string_constant(module, name_idx)?;
                     let value = read_register(frame, src)?.clone();
                     let target = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => Some(o.clone()),
-                        Value::ClassConstructor(c) => Some(c.statics.clone()),
+                        Value::Object(o) => Some(*o),
+                        Value::ClassConstructor(c) => Some(c.statics),
                         Value::RegExp(r) => {
                             regexp_prototype::store_property(r, &name, &value);
                             None
@@ -2977,12 +3010,20 @@ impl Interpreter {
                         // every closure observes the same bag.
                         Value::Function { function_id } | Value::Closure { function_id, .. } => {
                             let fid = *function_id;
-                            Some(self.function_user_props.entry(fid).or_default().clone())
+                            let bag = match self.function_user_props.get(&fid).copied() {
+                                Some(b) => b,
+                                None => {
+                                    let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                                    self.function_user_props.insert(fid, new_bag);
+                                    new_bag
+                                }
+                            };
+                            Some(bag)
                         }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     if let Some(target) = target {
-                        target.set(&name, value);
+                        crate::object::set(target, &mut self.gc_heap, &name, value);
                     }
                     frame.pc += 1;
                 }
@@ -2992,10 +3033,10 @@ impl Interpreter {
                     let name_idx = const_operand(operands.get(2))?;
                     let name = lookup_string_constant(module, name_idx)?;
                     let obj = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => o.clone(),
+                        Value::Object(o) => *o,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let removed = obj.delete(&name);
+                    let removed = crate::object::delete(obj, &mut self.gc_heap, &name);
                     write_register(frame, dst, Value::Boolean(removed))?;
                     frame.pc += 1;
                 }
@@ -3003,7 +3044,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
                     let result = match read_register(frame, src)? {
-                        Value::Object(o) => match o.prototype() {
+                        Value::Object(o) => match crate::object::prototype(*o, &self.gc_heap) {
                             Some(p) => Value::Object(p),
                             None => Value::Null,
                         },
@@ -3016,7 +3057,7 @@ impl Interpreter {
                     let obj_reg = register_operand(operands.first())?;
                     let proto_reg = register_operand(operands.get(1))?;
                     let obj = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => o.clone(),
+                        Value::Object(o) => *o,
                         _ => return Err(VmError::TypeMismatch),
                     };
                     // Class values chain through their statics
@@ -3025,12 +3066,12 @@ impl Interpreter {
                     // `D.staticMethod` walks up to `C.staticMethod`
                     // through the existing prototype lookup.
                     let proto = match read_register(frame, proto_reg)? {
-                        Value::Object(p) => Some(p.clone()),
-                        Value::ClassConstructor(c) => Some(c.statics.clone()),
+                        Value::Object(p) => Some(*p),
+                        Value::ClassConstructor(c) => Some(c.statics),
                         Value::Null => None,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    obj.set_prototype(proto);
+                    crate::object::set_prototype(obj, &mut self.gc_heap, proto);
                     frame.pc += 1;
                 }
                 Op::NewArray => {
@@ -3062,13 +3103,15 @@ impl Interpreter {
                         // store too once the well-known iterator
                         // exposes a callable (see below).
                         (Value::Object(obj), Value::Symbol(sym)) => {
-                            obj.get_symbol(sym).unwrap_or(Value::Undefined)
+                            crate::object::get_symbol(*obj, &self.gc_heap, sym)
+                                .unwrap_or(Value::Undefined)
                         }
                         // String-keyed access on objects with
                         // computed names: `obj["foo"]` — falls back
                         // to the string property table.
                         (Value::Object(obj), Value::String(key)) => {
-                            obj.get(&key.to_lossy_string()).unwrap_or(Value::Undefined)
+                            crate::object::get(*obj, &self.gc_heap, &key.to_lossy_string())
+                                .unwrap_or(Value::Undefined)
                         }
                         // `arr[Symbol.iterator]` — return a native
                         // callable producing the foundation
@@ -3138,11 +3181,16 @@ impl Interpreter {
                     match (&recv, &idx_value) {
                         // Symbol-keyed write on an object.
                         (Value::Object(obj), Value::Symbol(sym)) => {
-                            obj.set_symbol(sym.clone(), value);
+                            crate::object::set_symbol(*obj, &mut self.gc_heap, sym.clone(), value);
                         }
                         // Computed string-key write (`obj["k"] = …`).
                         (Value::Object(obj), Value::String(key)) => {
-                            obj.set(&key.to_lossy_string(), value);
+                            crate::object::set(
+                                *obj,
+                                &mut self.gc_heap,
+                                &key.to_lossy_string(),
+                                value,
+                            );
                         }
                         // Numeric-indexed array write.
                         (Value::Array(arr), Value::Number(n)) => match n.as_smi() {
@@ -3197,15 +3245,17 @@ impl Interpreter {
                             // chain against `target` directly so
                             // older fixtures that pass a prototype
                             // object as rhs still work.
-                            match target.get("prototype") {
-                                Some(Value::Object(proto)) => a.has_in_proto_chain(&proto),
-                                _ => a.has_in_proto_chain(target),
+                            match crate::object::get(*target, &self.gc_heap, "prototype") {
+                                Some(Value::Object(proto)) => {
+                                    crate::object::has_in_proto_chain(*a, &self.gc_heap, proto)
+                                }
+                                _ => crate::object::has_in_proto_chain(*a, &self.gc_heap, *target),
                             }
                         }
                         // §13.10.2 — for class values, walk the
                         // proto chain against `class.prototype`.
                         (Value::Object(a), Value::ClassConstructor(c)) => {
-                            a.has_in_proto_chain(&c.prototype)
+                            crate::object::has_in_proto_chain(*a, &self.gc_heap, c.prototype)
                         }
                         _ => false,
                     };
@@ -3222,18 +3272,29 @@ impl Interpreter {
                     let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
                     let present = match &rhs {
                         Value::Object(obj) => match &lhs {
-                            Value::Symbol(s) => obj.get_symbol(s).is_some(),
+                            Value::Symbol(s) => {
+                                crate::object::get_symbol(*obj, &self.gc_heap, s).is_some()
+                            }
                             Value::String(s) => {
                                 let key = s.to_lossy_string();
-                                !matches!(obj.lookup(&key), object::PropertyLookup::Absent)
+                                !matches!(
+                                    crate::object::lookup(*obj, &self.gc_heap, &key),
+                                    object::PropertyLookup::Absent
+                                )
                             }
                             Value::Number(n) => {
                                 let key = n.to_display_string();
-                                !matches!(obj.lookup(&key), object::PropertyLookup::Absent)
+                                !matches!(
+                                    crate::object::lookup(*obj, &self.gc_heap, &key),
+                                    object::PropertyLookup::Absent
+                                )
                             }
                             other => {
                                 let key = other.display_string();
-                                !matches!(obj.lookup(&key), object::PropertyLookup::Absent)
+                                !matches!(
+                                    crate::object::lookup(*obj, &self.gc_heap, &key),
+                                    object::PropertyLookup::Absent
+                                )
                             }
                         },
                         Value::Array(arr) => match &lhs {
@@ -3263,7 +3324,11 @@ impl Interpreter {
                             match &lhs {
                                 Value::String(s) if s.to_lossy_string() == "prototype" => true,
                                 Value::String(s) => !matches!(
-                                    c.statics.lookup(&s.to_lossy_string()),
+                                    crate::object::lookup(
+                                        c.statics,
+                                        &self.gc_heap,
+                                        &s.to_lossy_string()
+                                    ),
                                     object::PropertyLookup::Absent
                                 ),
                                 _ => false,
@@ -3498,11 +3563,16 @@ impl Interpreter {
                         Value::String(s) => Some(s.to_lossy_string()),
                         other => Some(other.display_string()),
                     };
-                    let obj = self.error_classes.make_instance(
-                        ErrorKind::Error,
-                        owned_message.as_deref(),
-                        &self.string_heap,
-                    )?;
+                    let obj = {
+                        let string_heap = self.string_heap.clone();
+                        let registry = self.error_classes.clone();
+                        registry.make_instance(
+                            ErrorKind::Error,
+                            owned_message.as_deref(),
+                            &string_heap,
+                            &mut self.gc_heap,
+                        )?
+                    };
                     write_register(frame, dst, Value::Object(obj))?;
                     frame.pc += 1;
                 }
@@ -3527,11 +3597,16 @@ impl Interpreter {
                         Value::String(s) => Some(s.to_lossy_string()),
                         other => Some(other.display_string()),
                     };
-                    let obj = self.error_classes.make_instance(
-                        kind,
-                        owned_message.as_deref(),
-                        &self.string_heap,
-                    )?;
+                    let obj = {
+                        let string_heap = self.string_heap.clone();
+                        let registry = self.error_classes.clone();
+                        registry.make_instance(
+                            kind,
+                            owned_message.as_deref(),
+                            &string_heap,
+                            &mut self.gc_heap,
+                        )?
+                    };
                     write_register(frame, dst, Value::Object(obj))?;
                     frame.pc += 1;
                 }
@@ -3592,8 +3667,8 @@ impl Interpreter {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result =
-                        json::call(&name, &args, &self.string_heap).map_err(json_to_vm_error)?;
+                    let result = json::call(&name, &args, &self.string_heap, &mut self.gc_heap)
+                        .map_err(json_to_vm_error)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3669,7 +3744,7 @@ impl Interpreter {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = binary::dispatch::array_buffer_call(&name, &args)?;
+                    let result = binary::dispatch::array_buffer_call(&name, &args, &self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3711,7 +3786,8 @@ impl Interpreter {
                         let r = register_operand(operands.get(4 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = binary::dispatch::typed_array_call(kind, &name, &args)?;
+                    let result =
+                        binary::dispatch::typed_array_call(kind, &name, &args, &self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3750,7 +3826,8 @@ impl Interpreter {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = binary::dispatch::shared_array_buffer_call(&name, &args)?;
+                    let result =
+                        binary::dispatch::shared_array_buffer_call(&name, &args, &self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3769,7 +3846,10 @@ impl Interpreter {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = atomics::call(&name, &args, &self.string_heap)?;
+                    let result = {
+                        let string_heap = self.string_heap.clone();
+                        atomics::call(&name, &args, &string_heap, &mut self.gc_heap)?
+                    };
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3789,7 +3869,7 @@ impl Interpreter {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = proxy_static_call(&name, &args)?;
+                    let result = proxy_static_call(&name, &args, &mut self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3862,7 +3942,8 @@ impl Interpreter {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = object_statics::call(&name, &args, &self.string_heap)?;
+                    let result =
+                        object_statics::call(&name, &args, &self.string_heap, &mut self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3979,7 +4060,7 @@ impl Interpreter {
                 }
                 Op::LoadGlobalThis => {
                     let dst = register_operand(operands.first())?;
-                    let value = Value::Object(self.global_this.clone());
+                    let value = Value::Object(self.global_this);
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
@@ -3991,7 +4072,8 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let name = lookup_string_constant(module, name_idx)?;
-                    if let Some(value) = self.global_this.get(&name) {
+                    if let Some(value) = crate::object::get(self.global_this, &self.gc_heap, &name)
+                    {
                         write_register(frame, dst, value)?;
                         frame.pc += 1;
                     } else {
@@ -4008,7 +4090,8 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let name = lookup_string_constant(module, name_idx)?;
-                    let value = self.global_this.get(&name).unwrap_or(Value::Undefined);
+                    let value = crate::object::get(self.global_this, &self.gc_heap, &name)
+                        .unwrap_or(Value::Undefined);
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
@@ -4088,11 +4171,11 @@ impl Interpreter {
                         return Err(VmError::NotCallable);
                     }
                     let prototype = match read_register(frame, proto_reg)? {
-                        Value::Object(o) => o.clone(),
+                        Value::Object(o) => *o,
                         _ => return Err(VmError::TypeMismatch),
                     };
                     let statics = match read_register(frame, statics_reg)? {
-                        Value::Object(o) => o.clone(),
+                        Value::Object(o) => *o,
                         _ => return Err(VmError::TypeMismatch),
                     };
                     let class = std::rc::Rc::new(ClassConstructor {
@@ -4280,14 +4363,20 @@ impl Interpreter {
                     let obj_reg = register_operand(operands.get(1))?;
                     let idx_reg = register_operand(operands.get(2))?;
                     let obj = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => o.clone(),
+                        Value::Object(o) => *o,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let removed = match read_register(frame, idx_reg)? {
-                        Value::Symbol(sym) => obj.delete_symbol(sym),
-                        Value::String(s) => obj.delete(&s.to_lossy_string()),
+                    let removed = match read_register(frame, idx_reg)?.clone() {
+                        Value::Symbol(sym) => {
+                            crate::object::delete_symbol(obj, &mut self.gc_heap, &sym)
+                        }
+                        Value::String(s) => {
+                            crate::object::delete(obj, &mut self.gc_heap, &s.to_lossy_string())
+                        }
                         Value::Number(n) => match n.as_smi() {
-                            Some(v) if v >= 0 => obj.delete(&v.to_string()),
+                            Some(v) if v >= 0 => {
+                                crate::object::delete(obj, &mut self.gc_heap, &v.to_string())
+                            }
                             _ => false,
                         },
                         _ => return Err(VmError::TypeMismatch),
@@ -4320,8 +4409,14 @@ impl Interpreter {
                         let r = register_operand(operands.get(4 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = temporal::call_static(&self.string_heap, &class, &method, &args)
-                        .map_err(temporal_to_vm_error)?;
+                    let result = temporal::call_static(
+                        &self.string_heap,
+                        &self.gc_heap,
+                        &class,
+                        &method,
+                        &args,
+                    )
+                    .map_err(temporal_to_vm_error)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4341,8 +4436,8 @@ impl Interpreter {
                     let class = lookup_string_constant(module, class_idx)?;
                     let locale = read_register(frame, locale_reg)?.clone();
                     let options = read_register(frame, options_reg)?.clone();
-                    let value =
-                        intl::construct(&class, &locale, &options).map_err(intl_to_vm_error)?;
+                    let value = intl::construct(&class, &locale, &options, &self.gc_heap)
+                        .map_err(intl_to_vm_error)?;
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
@@ -4822,7 +4917,8 @@ impl Interpreter {
                 // the final return value as `done: true`.
                 let req = owner.borrow_mut().pending_request.take();
                 if let Some(req) = req {
-                    let record = make_iter_result(value, true);
+                    let record =
+                        make_iter_result(value, true, &mut self.gc_heap).map_err(RunError::bare)?;
                     if let Err(error) = self.run_callable_sync(
                         module,
                         &req.resolve,
@@ -4938,7 +5034,7 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
     ) -> Result<(), VmError> {
-        let display = render_thrown_value(&value);
+        let display = render_thrown_value(&value, &self.gc_heap);
         let payload = value;
         loop {
             let Some(frame) = stack.last_mut() else {
@@ -5067,16 +5163,13 @@ impl Interpreter {
                     // Fall through to constructing the underlying
                     // target.
                     let underlying = proxy.target();
-                    let receiver = JsObject::new();
-                    if let Some(proto) = construct_prototype(&underlying) {
-                        receiver.set_prototype(Some(proto));
+                    let proto = construct_prototype(&underlying, &self.gc_heap);
+                    let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
+                    if let Some(proto) = proto {
+                        crate::object::set_prototype(receiver, &mut self.gc_heap, Some(proto));
                     }
-                    let result = self.run_callable_sync(
-                        module,
-                        &underlying,
-                        Value::Object(receiver.clone()),
-                        args,
-                    )?;
+                    let result =
+                        self.run_callable_sync(module, &underlying, Value::Object(receiver), args)?;
                     match result {
                         Value::Object(_) => result,
                         _ => Value::Object(receiver),
@@ -5091,11 +5184,12 @@ impl Interpreter {
         // the new frame. The constructor might mutate the receiver
         // immediately, so the prototype link must already be in
         // place.
-        let receiver = JsObject::new();
-        if let Some(proto) = construct_prototype(&callee) {
-            receiver.set_prototype(Some(proto));
+        let proto = construct_prototype(&callee, &self.gc_heap);
+        let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
+        if let Some(proto) = proto {
+            crate::object::set_prototype(receiver, &mut self.gc_heap, Some(proto));
         }
-        let this_value = Value::Object(receiver.clone());
+        let this_value = Value::Object(receiver);
         self.invoke(stack, module, &callee, this_value, args, dst)?;
         // The pushed frame is now on top; mark it so `pop_frame`
         // can substitute the receiver for any non-object return.
@@ -5368,12 +5462,17 @@ impl Interpreter {
         };
         if let Some(entry) = intrinsic {
             let small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
-            let result = (entry.impl_fn)(&IntrinsicArgs {
-                receiver: &recv_value,
-                args: &small_args,
-                string_heap: &self.string_heap,
-            })
-            .map_err(intrinsic_to_vm_error)?;
+            let result = {
+                let string_heap = self.string_heap.clone();
+                let gc_heap = std::cell::RefCell::new(&mut self.gc_heap);
+                (entry.impl_fn)(&IntrinsicArgs {
+                    receiver: &recv_value,
+                    args: &small_args,
+                    string_heap: &string_heap,
+                    gc_heap,
+                })
+                .map_err(intrinsic_to_vm_error)?
+            };
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
             frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -5392,10 +5491,17 @@ impl Interpreter {
             // method via an own / inherited data property. This
             // keeps `Object.create({hasOwnProperty: () => 'shadow'})`
             // observable.
-            if matches!(obj.lookup(&name), crate::object::PropertyLookup::Absent) {
-                if let Some(result) =
-                    object_prototype_intercept(obj, &name, &arg_values, &self.string_heap)?
-                {
+            if matches!(
+                crate::object::lookup(*obj, &self.gc_heap, &name),
+                crate::object::PropertyLookup::Absent
+            ) {
+                if let Some(result) = object_prototype_intercept(
+                    obj,
+                    &name,
+                    &arg_values,
+                    &self.string_heap,
+                    &self.gc_heap,
+                )? {
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -5412,14 +5518,21 @@ impl Interpreter {
                 "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
             )
         {
-            let bag = self
-                .function_user_props
-                .entry(*function_id)
-                .or_default()
-                .clone();
-            if let Some(result) =
-                object_prototype_intercept(&bag, &name, &arg_values, &self.string_heap)?
-            {
+            let bag = match self.function_user_props.get(function_id).copied() {
+                Some(b) => b,
+                None => {
+                    let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                    self.function_user_props.insert(*function_id, new_bag);
+                    new_bag
+                }
+            };
+            if let Some(result) = object_prototype_intercept(
+                &bag,
+                &name,
+                &arg_values,
+                &self.string_heap,
+                &self.gc_heap,
+            )? {
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, result)?;
                 frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -5458,11 +5571,13 @@ impl Interpreter {
         // properties surface as `NotCallable` so callers see the
         // same error as `obj.notFn()`.
         let lookup_via_property = match &recv_value {
-            Value::Object(obj) => Some(obj.get(&name).unwrap_or(Value::Undefined)),
+            Value::Object(obj) => {
+                Some(crate::object::get(*obj, &self.gc_heap, &name).unwrap_or(Value::Undefined))
+            }
             Value::ClassConstructor(c) => Some(if name == "prototype" {
-                Value::Object(c.prototype.clone())
+                Value::Object(c.prototype)
             } else {
-                c.statics.get(&name).unwrap_or(Value::Undefined)
+                crate::object::get(c.statics, &self.gc_heap, &name).unwrap_or(Value::Undefined)
             }),
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties (e.g. `assert.sameValue = function(){}`)
@@ -5994,8 +6109,11 @@ impl Interpreter {
                 let Value::Object(record) = &result else {
                     return Err(VmError::TypeMismatch);
                 };
-                let value = record.get("value").unwrap_or(Value::Undefined);
-                let done = record.get("done").unwrap_or(Value::Undefined).to_boolean();
+                let value =
+                    crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+                let done = crate::object::get(*record, &self.gc_heap, "done")
+                    .unwrap_or(Value::Undefined)
+                    .to_boolean();
                 if done {
                     *iter.borrow_mut() = IteratorState::Exhausted;
                 }
@@ -6005,7 +6123,8 @@ impl Interpreter {
                 let Value::Object(iter_obj) = &iter_value else {
                     return Err(VmError::TypeMismatch);
                 };
-                let next_fn = iter_obj.get("next").ok_or(VmError::TypeMismatch)?;
+                let next_fn = crate::object::get(*iter_obj, &self.gc_heap, "next")
+                    .ok_or(VmError::TypeMismatch)?;
                 if !is_callable(&next_fn) {
                     return Err(VmError::TypeMismatch);
                 }
@@ -6014,8 +6133,11 @@ impl Interpreter {
                 let Value::Object(record) = &result else {
                     return Err(VmError::TypeMismatch);
                 };
-                let value = record.get("value").unwrap_or(Value::Undefined);
-                let done = record.get("done").unwrap_or(Value::Undefined).to_boolean();
+                let value =
+                    crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+                let done = crate::object::get(*record, &self.gc_heap, "done")
+                    .unwrap_or(Value::Undefined)
+                    .to_boolean();
                 if done {
                     *iter.borrow_mut() = IteratorState::Exhausted;
                 }
@@ -6309,12 +6431,12 @@ impl Interpreter {
             (body.frame.is_some(), body.resume_dst)
         };
         if !frame_opt {
-            return Ok(make_iter_result(Value::Undefined, true));
+            return make_iter_result(Value::Undefined, true, &mut self.gc_heap);
         }
         // Pull the frame out of the gen body so we can mutate it.
         let mut frame = match handle.borrow_mut().frame.take() {
             Some(f) => f,
-            None => return Ok(make_iter_result(Value::Undefined, true)),
+            None => return make_iter_result(Value::Undefined, true, &mut self.gc_heap),
         };
         // Apply the resume operation to the frame before re-entering
         // dispatch.
@@ -6332,7 +6454,7 @@ impl Interpreter {
                 // running the body further.
                 handle.borrow_mut().done = true;
                 handle.borrow_mut().frame = None;
-                return Ok(make_iter_result(arg.clone(), true));
+                return make_iter_result(arg.clone(), true, &mut self.gc_heap);
             }
             GeneratorResumeKind::Throw(reason) => {
                 throw_value = Some(reason.clone());
@@ -6380,7 +6502,7 @@ impl Interpreter {
                     if is_async {
                         return Ok(Value::Undefined);
                     }
-                    return Ok(make_iter_result(v, false));
+                    return make_iter_result(v, false, &mut self.gc_heap);
                 }
                 // Body ran to completion or `Op::Await` parked the
                 // frame. Distinguish by whether the gen still owns
@@ -6408,7 +6530,7 @@ impl Interpreter {
                 handle.borrow_mut().frame = None;
                 if is_async {
                     if let Some(req) = handle.borrow_mut().pending_request.take() {
-                        let record = make_iter_result(value, true);
+                        let record = make_iter_result(value, true, &mut self.gc_heap)?;
                         self.run_callable_sync(
                             module,
                             &req.resolve,
@@ -6418,7 +6540,7 @@ impl Interpreter {
                     }
                     return Ok(Value::Undefined);
                 }
-                Ok(make_iter_result(value, true))
+                make_iter_result(value, true, &mut self.gc_heap)
             }
             Err(err) => {
                 handle.borrow_mut().done = true;
@@ -6450,7 +6572,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         }
         let handler = proxy.handler();
-        let trap_fn = match handler.get(trap) {
+        let trap_fn = match crate::object::get(handler, &self.gc_heap, trap) {
             Some(v) if abstract_ops::is_callable(&v) => v,
             Some(Value::Undefined) | Some(Value::Null) | None => return Ok(None),
             _ => return Err(VmError::TypeMismatch),
@@ -6562,7 +6684,7 @@ impl Interpreter {
             return Ok(None);
         };
         let to_primitive_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let Some(callee) = obj.get_symbol(&to_primitive_sym) else {
+        let Some(callee) = crate::object::get_symbol(*obj, &self.gc_heap, &to_primitive_sym) else {
             return Ok(None);
         };
         if !is_callable(&callee) {
@@ -6682,7 +6804,9 @@ impl Interpreter {
                 ToPrimitiveStage::SymbolToPrim => {
                     let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
                     let callee = match &obj {
-                        Value::Object(o) => o.get_symbol(&to_prim_sym),
+                        Value::Object(o) => {
+                            crate::object::get_symbol(*o, &self.gc_heap, &to_prim_sym)
+                        }
                         _ => None,
                     };
                     if let Some(callee) = callee
@@ -6720,7 +6844,7 @@ impl Interpreter {
                 ToPrimitiveStage::OrdinaryFirst => {
                     let method = ordinary_method_for(hint, stage);
                     let callee = match &obj {
-                        Value::Object(o) => o.get(method),
+                        Value::Object(o) => crate::object::get(*o, &self.gc_heap, method),
                         _ => None,
                     };
                     if let Some(callee) = callee
@@ -6751,9 +6875,13 @@ impl Interpreter {
                     // a real Object.prototype linkage.
                     if let Value::Object(o) = &obj {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        if let Some(v) =
-                            object_prototype_intercept(o, method, &no_args, &self.string_heap)?
-                            && abstract_ops::is_primitive(&v)
+                        if let Some(v) = object_prototype_intercept(
+                            o,
+                            method,
+                            &no_args,
+                            &self.string_heap,
+                            &self.gc_heap,
+                        )? && abstract_ops::is_primitive(&v)
                         {
                             let top_idx = stack.len() - 1;
                             stack[top_idx].pending_to_primitive = None;
@@ -6770,7 +6898,7 @@ impl Interpreter {
                 ToPrimitiveStage::OrdinarySecond => {
                     let method = ordinary_method_for(hint, stage);
                     let callee = match &obj {
-                        Value::Object(o) => o.get(method),
+                        Value::Object(o) => crate::object::get(*o, &self.gc_heap, method),
                         _ => None,
                     };
                     if let Some(callee) = callee
@@ -6802,9 +6930,13 @@ impl Interpreter {
                     // callable.
                     if let Value::Object(o) = &obj {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        if let Some(v) =
-                            object_prototype_intercept(o, method, &no_args, &self.string_heap)?
-                            && abstract_ops::is_primitive(&v)
+                        if let Some(v) = object_prototype_intercept(
+                            o,
+                            method,
+                            &no_args,
+                            &self.string_heap,
+                            &self.gc_heap,
+                        )? && abstract_ops::is_primitive(&v)
                         {
                             let top_idx = stack.len() - 1;
                             stack[top_idx].pending_to_primitive = None;
@@ -7072,16 +7204,19 @@ impl Interpreter {
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             let result = match self.invoke_proxy_trap(module, &proxy, "get", trap_args)? {
                 Some(v) => v,
-                None => proxy.target_object().get(&name).unwrap_or(Value::Undefined),
+                None => {
+                    let target = proxy.target_object(&mut self.gc_heap);
+                    object::get(target, &self.gc_heap, &name).unwrap_or(Value::Undefined)
+                }
             };
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(true);
         }
         let obj = match &receiver {
-            Value::Object(o) => o.clone(),
+            Value::Object(o) => *o,
             _ => return Ok(false),
         };
-        match obj.lookup(&name) {
+        match crate::object::lookup(obj, &self.gc_heap, &name) {
             object::PropertyLookup::Accessor { getter, .. } => {
                 let pc = stack[top_idx].pc;
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -7150,17 +7285,18 @@ impl Interpreter {
                     except for boolean-rejection — foundation accepts. */
                 }
                 None => {
-                    proxy.target_object().set(&name, value);
+                    let target = proxy.target_object(&mut self.gc_heap);
+                    object::set(target, &mut self.gc_heap, &name, value);
                 }
             }
             let _ = scratch_reg;
             return Ok(true);
         }
         let obj = match &receiver {
-            Value::Object(o) => o.clone(),
+            Value::Object(o) => *o,
             _ => return Ok(false),
         };
-        let outcome = obj.resolve_set(&name);
+        let outcome = crate::object::resolve_set(obj, &self.gc_heap, &name);
         match outcome {
             object::SetOutcome::AssignData => {
                 // Fall through to the in-frame data-write path so
@@ -7223,8 +7359,9 @@ impl Interpreter {
                     Value::String(s) => s.to_lossy_string(),
                     other => other.display_string(),
                 };
+                let target = proxy.target_object(&mut self.gc_heap);
                 !matches!(
-                    proxy.target_object().lookup(&key),
+                    object::lookup(target, &self.gc_heap, &key),
                     object::PropertyLookup::Absent
                 )
             }
@@ -7257,7 +7394,10 @@ impl Interpreter {
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let removed = match self.invoke_proxy_trap(module, &proxy, "deleteProperty", trap_args)? {
             Some(v) => v.to_boolean(),
-            None => proxy.target_object().delete(&name),
+            None => {
+                let target = proxy.target_object(&mut self.gc_heap);
+                object::delete(target, &mut self.gc_heap, &name)
+            }
         };
         write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
         Ok(true)
@@ -7283,10 +7423,13 @@ impl Interpreter {
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let result = match self.invoke_proxy_trap(module, &proxy, "getPrototypeOf", trap_args)? {
             Some(v) => v,
-            None => match proxy.target_object().prototype() {
-                Some(p) => Value::Object(p),
-                None => Value::Null,
-            },
+            None => {
+                let target = proxy.target_object(&mut self.gc_heap);
+                match object::prototype(target, &self.gc_heap) {
+                    Some(p) => Value::Object(p),
+                    None => Value::Null,
+                }
+            }
         };
         write_register(&mut stack[top_idx], dst, result)?;
         Ok(true)
@@ -7310,7 +7453,7 @@ impl Interpreter {
         let proto_val = read_register(&stack[top_idx], proto_reg)?.clone();
         let proto_obj = match &proto_val {
             Value::Object(_) | Value::Null => proto_val.clone(),
-            Value::ClassConstructor(c) => Value::Object(c.statics.clone()),
+            Value::ClassConstructor(c) => Value::Object(c.statics),
             _ => return Err(VmError::TypeMismatch),
         };
         let trap_args: SmallVec<[Value; 8]> =
@@ -7325,7 +7468,8 @@ impl Interpreter {
                     Value::Null => None,
                     _ => return Err(VmError::TypeMismatch),
                 };
-                proxy.target_object().set_prototype(proto);
+                let target = proxy.target_object(&mut self.gc_heap);
+                object::set_prototype(target, &mut self.gc_heap, proto);
             }
         }
         Ok(true)
@@ -7395,7 +7539,7 @@ impl Interpreter {
             return Ok(false);
         };
         let iter_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
-        let Some(callee) = obj.get_symbol(&iter_sym) else {
+        let Some(callee) = crate::object::get_symbol(*obj, &self.gc_heap, &iter_sym) else {
             // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
             return Err(VmError::TypeMismatch);
         };
@@ -7455,8 +7599,10 @@ impl Interpreter {
                 stack[top_idx].pending_iterator_next = None;
                 return Err(VmError::TypeMismatch);
             };
-            let value = obj.get("value").unwrap_or(Value::Undefined);
-            let done_value = obj.get("done").unwrap_or(Value::Undefined);
+            let value =
+                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+            let done_value =
+                crate::object::get(*obj, &self.gc_heap, "done").unwrap_or(Value::Undefined);
             let done = done_value.to_boolean();
             if done {
                 if let Value::Iterator(rc) = &state.iterator {
@@ -7491,8 +7637,11 @@ impl Interpreter {
             let Value::Object(obj) = &result else {
                 return Err(VmError::TypeMismatch);
             };
-            let value = obj.get("value").unwrap_or(Value::Undefined);
-            let done = obj.get("done").unwrap_or(Value::Undefined).to_boolean();
+            let value =
+                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+            let done = crate::object::get(*obj, &self.gc_heap, "done")
+                .unwrap_or(Value::Undefined)
+                .to_boolean();
             if done {
                 *iter_rc.borrow_mut() = IteratorState::Exhausted;
             }
@@ -7535,7 +7684,8 @@ impl Interpreter {
         let Value::Object(iter_obj) = &user_iter_value else {
             return Err(VmError::TypeMismatch);
         };
-        let next_fn = iter_obj.get("next").ok_or(VmError::TypeMismatch)?;
+        let next_fn =
+            crate::object::get(*iter_obj, &self.gc_heap, "next").ok_or(VmError::TypeMismatch)?;
         if !is_callable(&next_fn) {
             return Err(VmError::TypeMismatch);
         }
@@ -8006,15 +8156,15 @@ fn apply_branch(frame: &mut Frame, offset: i32, interrupt: &InterruptFlag) -> Re
 /// Error-shaped objects through [`error_classes::render_error_to_string`]
 /// so the unwind printout matches what `e.toString()` returns at
 /// the JS surface (§20.5.3.4).
-fn render_thrown_value(value: &Value) -> String {
+fn render_thrown_value(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
     if let Value::Object(obj) = value {
         // Treat anything with both `name` and `message` data slots
         // as an Error instance. Plain objects fall through to
         // `[object Object]` via `display_string`.
-        let has_name = obj.get("name").is_some();
-        let has_message = obj.get("message").is_some();
+        let has_name = crate::object::get(*obj, gc_heap, "name").is_some();
+        let has_message = crate::object::get(*obj, gc_heap, "message").is_some();
         if has_name || has_message {
-            let rendered = error_classes::render_error_to_string(value);
+            let rendered = error_classes::render_error_to_string(value, gc_heap);
             if !rendered.is_empty() {
                 return rendered;
             }
@@ -8134,9 +8284,9 @@ fn bound_function_intrinsic_property(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-globalthis>
-fn build_global_this() -> JsObject {
-    let obj = JsObject::new();
-    obj.set("globalThis", Value::Object(obj.clone()));
+fn build_global_this(gc_heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let obj = crate::object::alloc_object(gc_heap)?;
+    crate::object::set(obj, gc_heap, "globalThis", Value::Object(obj));
     // §19.1 standard globals — install placeholder constructor
     // sentinels so identifier-as-value reads (e.g. `Array.prototype`,
     // `Object.keys`) resolve to *something* rather than throwing
@@ -8193,11 +8343,12 @@ fn build_global_this() -> JsObject {
         "FinalizationRegistry",
         "Iterator",
     ] {
-        let placeholder = JsObject::new();
-        placeholder.set("prototype", Value::Object(JsObject::new()));
-        obj.set(name, Value::Object(placeholder));
+        let placeholder = crate::object::alloc_object(gc_heap)?;
+        let proto = crate::object::alloc_object(gc_heap)?;
+        crate::object::set(placeholder, gc_heap, "prototype", Value::Object(proto));
+        crate::object::set(obj, gc_heap, name, Value::Object(placeholder));
     }
-    obj
+    Ok(obj)
 }
 
 /// Resolve `specifier` against `referrer`, mirroring the WHATWG URL
@@ -8275,20 +8426,24 @@ fn object_prototype_intercept(
     name: &str,
     args: &SmallVec<[Value; 8]>,
     string_heap: &string::StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Option<Value>, VmError> {
     match name {
         // §20.1.3.2 Object.prototype.hasOwnProperty(V)
         // <https://tc39.es/ecma262/#sec-object.prototype.hasownproperty>
         "hasOwnProperty" => {
             let key = property_key_from_arg(args.first())?;
-            let present = !matches!(obj.lookup_own(&key), object::PropertyLookup::Absent);
+            let present = !matches!(
+                object::lookup_own(*obj, gc_heap, &key),
+                object::PropertyLookup::Absent
+            );
             Ok(Some(Value::Boolean(present)))
         }
         // §20.1.3.4 Object.prototype.propertyIsEnumerable(V)
         // <https://tc39.es/ecma262/#sec-object.prototype.propertyisenumerable>
         "propertyIsEnumerable" => {
             let key = property_key_from_arg(args.first())?;
-            let result = match obj.lookup_own(&key) {
+            let result = match object::lookup_own(*obj, gc_heap, &key) {
                 object::PropertyLookup::Data { flags, .. } => flags.enumerable(),
                 object::PropertyLookup::Accessor { flags, .. } => flags.enumerable(),
                 object::PropertyLookup::Absent => false,
@@ -8299,7 +8454,7 @@ fn object_prototype_intercept(
         // <https://tc39.es/ecma262/#sec-object.prototype.isprototypeof>
         "isPrototypeOf" => {
             let result = match args.first() {
-                Some(Value::Object(other)) => other.has_in_proto_chain(obj),
+                Some(Value::Object(other)) => object::has_in_proto_chain(*other, gc_heap, *obj),
                 _ => false,
             };
             Ok(Some(Value::Boolean(result)))
@@ -8314,10 +8469,11 @@ fn object_prototype_intercept(
         // <https://tc39.es/ecma262/#sec-object.prototype.tostring>
         // <https://tc39.es/ecma262/#sec-error.prototype.tostring>
         "toString" => {
-            let recv_value = Value::Object(obj.clone());
-            let has_error_shape = obj.get("name").is_some() || obj.get("message").is_some();
+            let recv_value = Value::Object(*obj);
+            let has_error_shape = object::get(*obj, gc_heap, "name").is_some()
+                || object::get(*obj, gc_heap, "message").is_some();
             let display = if has_error_shape {
-                let rendered = error_classes::render_error_to_string(&recv_value);
+                let rendered = error_classes::render_error_to_string(&recv_value, gc_heap);
                 if rendered.is_empty() {
                     "[object Object]".to_string()
                 } else {
@@ -8331,7 +8487,7 @@ fn object_prototype_intercept(
         }
         // §20.1.3.7 Object.prototype.valueOf() — returns the receiver.
         // <https://tc39.es/ecma262/#sec-object.prototype.valueof>
-        "valueOf" => Ok(Some(Value::Object(obj.clone()))),
+        "valueOf" => Ok(Some(Value::Object(*obj))),
         _ => Ok(None),
     }
 }
@@ -8525,11 +8681,15 @@ pub enum GeneratorResumeKind {
 
 /// Build an `IteratorResult { value, done }` plain object per
 /// §7.4.6 `CreateIterResultObject`.
-fn make_iter_result(value: Value, done: bool) -> Value {
-    let obj = JsObject::new();
-    obj.set("value", value);
-    obj.set("done", Value::Boolean(done));
-    Value::Object(obj)
+fn make_iter_result(
+    value: Value,
+    done: bool,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, VmError> {
+    let obj = crate::object::alloc_object(gc_heap)?;
+    crate::object::set(obj, gc_heap, "value", value);
+    crate::object::set(obj, gc_heap, "done", Value::Boolean(done));
+    Ok(Value::Object(obj))
 }
 
 /// Coerce a `new Proxy(target, ...)` first argument to a
@@ -8548,7 +8708,11 @@ fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
 
 /// §28.2 Proxy static dispatcher. Empty name = `new Proxy(target,
 /// handler)`; `"revocable"` = `Proxy.revocable(target, handler)`.
-fn proxy_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
+fn proxy_static_call(
+    name: &str,
+    args: &[Value],
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     match name {
         // §28.2.1.1 — `new Proxy(target, handler)`. Target may be
         // any object — including callables — wrapped here in a
@@ -8559,7 +8723,7 @@ fn proxy_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
         "" => {
             let target = coerce_proxy_target(args.first())?;
             let handler = match args.get(1) {
-                Some(Value::Object(o)) => o.clone(),
+                Some(Value::Object(o)) => *o,
                 _ => return Err(VmError::TypeMismatch),
             };
             Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
@@ -8569,7 +8733,7 @@ fn proxy_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
         "revocable" => {
             let target = coerce_proxy_target(args.first())?;
             let handler = match args.get(1) {
-                Some(Value::Object(o)) => o.clone(),
+                Some(Value::Object(o)) => *o,
                 _ => return Err(VmError::TypeMismatch),
             };
             let proxy = crate::proxy::JsProxy::new(target, handler);
@@ -8578,9 +8742,9 @@ fn proxy_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
                 proxy_handle.revoke();
                 Ok(Value::Undefined)
             });
-            let obj = JsObject::new();
-            obj.set("proxy", Value::Proxy(proxy));
-            obj.set("revoke", revoke);
+            let obj = crate::object::alloc_object(gc_heap)?;
+            crate::object::set(obj, gc_heap, "proxy", Value::Proxy(proxy));
+            crate::object::set(obj, gc_heap, "revoke", revoke);
             Ok(Value::Object(obj))
         }
         other => Err(VmError::UnknownIntrinsic {
@@ -8786,14 +8950,14 @@ fn step_iterator(
 /// constructor object reference (the constructor itself is held in
 /// a register, with `prototype` set via `obj.prototype = …` style
 /// dispatch only on the rare path).
-fn construct_prototype(callee: &Value) -> Option<JsObject> {
+fn construct_prototype(callee: &Value, gc_heap: &otter_gc::GcHeap) -> Option<JsObject> {
     match callee {
-        Value::ClassConstructor(c) => Some(c.prototype.clone()),
-        Value::Object(obj) => match obj.get("prototype") {
+        Value::ClassConstructor(c) => Some(c.prototype),
+        Value::Object(obj) => match crate::object::get(*obj, gc_heap, "prototype") {
             Some(Value::Object(p)) => Some(p),
             _ => None,
         },
-        Value::BoundFunction(b) => construct_prototype(&b.target),
+        Value::BoundFunction(b) => construct_prototype(&b.target, gc_heap),
         _ => None,
     }
 }
@@ -9120,7 +9284,10 @@ mod tests {
         });
         assert!(is_callable(&Value::BoundFunction(bound)));
         assert!(!is_callable(&Value::Number(NumberValue::Smi(1))));
-        assert!(!is_callable(&Value::Object(JsObject::new())));
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        assert!(!is_callable(&Value::Object(
+            crate::object::alloc_object(&mut heap).unwrap()
+        )));
     }
 
     #[test]

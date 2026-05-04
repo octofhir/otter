@@ -14,24 +14,22 @@
 //!
 //! # Why explicit context?
 //!
-//! Pre-task-76A the GC heap was reachable through
-//! [`otter_gc::GcHeap::with_thread_default`]. That helper is
-//! transitional — it cannot prove which isolate owns a handle once
-//! Tokio worker migration enters the picture, and it hides borrow
-//! boundaries from the type system. Per ADR-0005, every read /
-//! write / write-barrier path must know which isolate owns the
-//! object. The explicit-context types are the type-level expression
-//! of that rule.
+//! Pre-task-76A the GC heap was reachable through a thread-default
+//! escape hatch on `GcHeap`. That helper could not prove which
+//! isolate owns a handle once Tokio worker migration enters the
+//! picture, and it hid borrow boundaries from the type system. Per
+//! ADR-0005, every read / write / write-barrier path must know
+//! which isolate owns the object. The explicit-context types are
+//! the type-level expression of that rule.
 //!
-//! # Status (task 76A / 77)
+//! # Status (task 77C)
 //!
-//! The types defined here are the **target shape**. Tasks 77-83
-//! migrate the actual call surface (object / array / map / proxy /
-//! native bindings) to take `&mut RuntimeCx` / `&NativeCtx<'_>`
-//! arguments and drop the thread-default helpers. Until that
-//! migration completes, [`otter_gc::GcHeap::with_thread_default`]
-//! and friends remain in the heap as `#[doc(hidden)]` transitional
-//! shims, marked with a clear deprecation note.
+//! The thread-default escape hatch on `GcHeap` was removed in
+//! task 77C; every caller now threads `&GcHeap` / `&mut GcHeap` (or
+//! `&NativeCtx<'_>` / `&mut NativeCtx<'_>` for native bindings)
+//! explicitly. Tasks 78-83 widen the migrated surface to
+//! `JsArray` / `JsMap` / promise / iterator / generator and the
+//! native-binding entry points.
 //!
 //! # Spec
 //!

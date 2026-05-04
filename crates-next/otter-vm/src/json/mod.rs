@@ -126,25 +126,34 @@ pub fn call(
     name: &str,
     args: &[Value],
     string_heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, JsonError> {
     match name {
-        "stringify" => json_stringify(args, string_heap),
-        "parse" => json_parse(args, string_heap),
+        "stringify" => json_stringify(args, string_heap, gc_heap),
+        "parse" => json_parse(args, string_heap, gc_heap),
         _ => Err(JsonError::UnknownMember(name.to_string())),
     }
 }
 
-fn json_stringify(args: &[Value], heap: &crate::string::StringHeap) -> Result<Value, JsonError> {
+fn json_stringify(
+    args: &[Value],
+    heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, JsonError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let space = args.get(2).cloned().unwrap_or(Value::Undefined);
     let opts = StringifyOptions::from_space(&space)?;
-    match stringify_with_options(&value, &opts)? {
+    match stringify_with_options(&value, &opts, gc_heap)? {
         Some(text) => Ok(Value::String(JsString::from_str(&text, heap)?)),
         None => Ok(Value::Undefined),
     }
 }
 
-fn json_parse(args: &[Value], heap: &crate::string::StringHeap) -> Result<Value, JsonError> {
+fn json_parse(
+    args: &[Value],
+    heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, JsonError> {
     let text = match args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
         _ => {
@@ -155,7 +164,7 @@ fn json_parse(args: &[Value], heap: &crate::string::StringHeap) -> Result<Value,
             });
         }
     };
-    let value = parse(&text, heap)?;
+    let value = parse(&text, heap, gc_heap)?;
     Ok(value)
 }
 
@@ -163,51 +172,62 @@ fn json_parse(args: &[Value], heap: &crate::string::StringHeap) -> Result<Value,
 mod tests {
     use super::*;
     use crate::number::NumberValue;
-    use crate::object::JsObject;
     use crate::string::StringHeap;
 
     fn n(v: i32) -> Value {
         Value::Number(NumberValue::from_i32(v))
     }
 
+    fn make_heap() -> otter_gc::GcHeap {
+        otter_gc::GcHeap::new().expect("gc heap")
+    }
+
     #[test]
     fn stringify_primitives() {
-        assert_eq!(stringify(&Value::Null).unwrap().unwrap(), "null");
-        assert_eq!(stringify(&Value::Boolean(true)).unwrap().unwrap(), "true");
-        assert_eq!(stringify(&n(42)).unwrap().unwrap(), "42");
+        let heap = make_heap();
+        assert_eq!(stringify(&Value::Null, &heap).unwrap().unwrap(), "null");
+        assert_eq!(
+            stringify(&Value::Boolean(true), &heap).unwrap().unwrap(),
+            "true"
+        );
+        assert_eq!(stringify(&n(42), &heap).unwrap().unwrap(), "42");
         // Undefined → omitted (returns None).
-        assert!(stringify(&Value::Undefined).unwrap().is_none());
+        assert!(stringify(&Value::Undefined, &heap).unwrap().is_none());
     }
 
     #[test]
     fn stringify_nan_and_infinity_become_null() {
+        let heap = make_heap();
         let nan = Value::Number(NumberValue::Double(f64::NAN));
         let inf = Value::Number(NumberValue::Double(f64::INFINITY));
-        assert_eq!(stringify(&nan).unwrap().unwrap(), "null");
-        assert_eq!(stringify(&inf).unwrap().unwrap(), "null");
+        assert_eq!(stringify(&nan, &heap).unwrap().unwrap(), "null");
+        assert_eq!(stringify(&inf, &heap).unwrap().unwrap(), "null");
     }
 
     #[test]
     fn stringify_object_preserves_insertion_order() {
-        let obj = JsObject::new();
-        obj.set("b", n(1));
-        obj.set("a", n(2));
-        let s = stringify(&Value::Object(obj)).unwrap().unwrap();
+        let mut heap = make_heap();
+        let obj = crate::object::alloc_object(&mut heap).unwrap();
+        crate::object::set(obj, &mut heap, "b", n(1));
+        crate::object::set(obj, &mut heap, "a", n(2));
+        let s = stringify(&Value::Object(obj), &heap).unwrap().unwrap();
         assert_eq!(s, "{\"b\":1,\"a\":2}");
     }
 
     #[test]
     fn stringify_rejects_bigint() {
+        let heap = make_heap();
         let bi = Value::BigInt(crate::bigint::BigIntValue::from_decimal("1").unwrap());
-        assert!(matches!(stringify(&bi), Err(JsonError::BigInt)));
+        assert!(matches!(stringify(&bi, &heap), Err(JsonError::BigInt)));
     }
 
     #[test]
     fn parse_round_trip() {
-        let heap = StringHeap::default();
-        let v = parse("{\"x\":[1,2,3]}", &heap).unwrap();
+        let mut heap = make_heap();
+        let sheap = StringHeap::default();
+        let v = parse("{\"x\":[1,2,3]}", &sheap, &mut heap).unwrap();
         if let Value::Object(o) = v {
-            if let Some(Value::Array(arr)) = o.get("x") {
+            if let Some(Value::Array(arr)) = crate::object::get(o, &heap, "x") {
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr.get(1).display_string(), "2");
             } else {
@@ -222,9 +242,10 @@ mod tests {
     fn error_messages_are_specific() {
         // Cyclic — no path walk (cheap identity-pointer set on the
         // hot path; full path tracking can layer on later).
-        let obj = JsObject::new();
-        obj.set("self", Value::Object(obj.clone()));
-        let err = stringify(&Value::Object(obj)).unwrap_err();
+        let mut heap = make_heap();
+        let obj = crate::object::alloc_object(&mut heap).unwrap();
+        crate::object::set(obj, &mut heap, "self", Value::Object(obj));
+        let err = stringify(&Value::Object(obj), &heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
         assert_eq!(
             err.to_string(),
@@ -233,15 +254,16 @@ mod tests {
 
         // BigInt.
         let bi = Value::BigInt(crate::bigint::BigIntValue::from_decimal("1").unwrap());
-        let err = stringify(&bi).unwrap_err();
+        let err = stringify(&bi, &heap).unwrap_err();
         assert_eq!(
             err.to_string(),
             "JSON.stringify cannot serialize BigInt values.",
         );
 
         // Parse with byte position.
-        let heap = StringHeap::default();
-        let err = parse("[1, 2,]", &heap).unwrap_err();
+        let mut gc_heap = make_heap();
+        let sheap = StringHeap::default();
+        let err = parse("[1, 2,]", &sheap, &mut gc_heap).unwrap_err();
         assert_eq!(err.position, 6);
         assert_eq!(err.message, "trailing comma");
     }

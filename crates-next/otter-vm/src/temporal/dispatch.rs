@@ -98,6 +98,7 @@ impl From<crate::string::StringError> for TemporalError {
 /// - <https://tc39.es/proposal-temporal/#sec-temporal-instant-objects>
 pub fn call(
     string_heap: &crate::string::StringHeap,
+    gc_heap: &otter_gc::GcHeap,
     class: &str,
     method: &str,
     args: &[Value],
@@ -112,7 +113,7 @@ pub fn call(
         })?;
     match kind {
         TemporalKind::Instant => instant::dispatch_static(string_heap, method, args),
-        TemporalKind::Duration => duration::dispatch_static(string_heap, method, args),
+        TemporalKind::Duration => duration::dispatch_static(string_heap, gc_heap, method, args),
         TemporalKind::PlainDate => plain_date::dispatch_static(string_heap, method, args),
         TemporalKind::PlainTime => plain_time::dispatch_static(string_heap, method, args),
         TemporalKind::PlainDateTime => plain_date_time::dispatch_static(string_heap, method, args),

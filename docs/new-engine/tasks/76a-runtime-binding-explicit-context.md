@@ -7,10 +7,11 @@
 - [x] Product code no longer calls `GcHeap::with_thread_default*` —
       audit `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src crates-next/otter-runtime/src`
       returns only doc-comment hits in `runtime_cx.rs`.
-- [~] `GcHeap` thread-default helpers retained as `#[doc(hidden)]`
-      transitional shims (heap.rs §`enter_thread_default` etc.). Each
-      method carries a clear migration note pointing at this task.
-      They will be deleted once tasks 77-83 finish caller migration.
+- [x] `GcHeap` thread-default escape hatch deleted (`enter_thread_default`,
+      `install_thread_default`, `with_thread_default`, `with_thread_default_mut`,
+      `has_thread_default`, `ThreadDefaultGuard`, `THREAD_HEAP`,
+      `THREAD_HEAP_BORROWED`) in task 77C (2026-05-05). Every caller now
+      threads `&GcHeap` / `&mut GcHeap` (or `&NativeCtx<'_>`) explicitly.
 - [x] `Gc<T>`, `Local<'gc, T>`, `GcHeap`, `HandleScope`, `Interpreter`,
       `NativeCtx<'_>` proven `!Send + !Sync` via `static_assertions::assert_not_impl_any!`
       in `crates-next/otter-gc/src/lib.rs` and `crates-next/otter-vm/src/lib.rs`.

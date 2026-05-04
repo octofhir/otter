@@ -48,15 +48,20 @@ pub fn coerce_locale(arg: Option<&Value>) -> String {
 #[must_use]
 pub fn options_object(arg: Option<&Value>) -> Option<JsObject> {
     match arg {
-        Some(Value::Object(obj)) => Some(obj.clone()),
+        Some(Value::Object(obj)) => Some(*obj),
         _ => None,
     }
 }
 
 /// Read an optional string field with default fallback.
-pub fn read_string_option(options: Option<&JsObject>, name: &str, default: &str) -> String {
+pub fn read_string_option(
+    options: Option<&JsObject>,
+    name: &str,
+    default: &str,
+    gc_heap: &otter_gc::GcHeap,
+) -> String {
     options
-        .and_then(|o| match o.get(name) {
+        .and_then(|o| match crate::object::get(*o, gc_heap, name) {
             Some(Value::String(s)) => Some(s.to_lossy_string()),
             _ => None,
         })
@@ -64,9 +69,14 @@ pub fn read_string_option(options: Option<&JsObject>, name: &str, default: &str)
 }
 
 /// Read an optional bool field with default fallback.
-pub fn read_bool_option(options: Option<&JsObject>, name: &str, default: bool) -> bool {
+pub fn read_bool_option(
+    options: Option<&JsObject>,
+    name: &str,
+    default: bool,
+    gc_heap: &otter_gc::GcHeap,
+) -> bool {
     options
-        .and_then(|o| match o.get(name) {
+        .and_then(|o| match crate::object::get(*o, gc_heap, name) {
             Some(Value::Boolean(b)) => Some(b),
             _ => None,
         })
@@ -74,9 +84,16 @@ pub fn read_bool_option(options: Option<&JsObject>, name: &str, default: bool) -
 }
 
 /// Read an optional integer field clamped to `[lo, hi]`.
-pub fn read_u8_option(options: Option<&JsObject>, name: &str, default: u8, lo: u8, hi: u8) -> u8 {
+pub fn read_u8_option(
+    options: Option<&JsObject>,
+    name: &str,
+    default: u8,
+    lo: u8,
+    hi: u8,
+    gc_heap: &otter_gc::GcHeap,
+) -> u8 {
     let v = options
-        .and_then(|o| match o.get(name) {
+        .and_then(|o| match crate::object::get(*o, gc_heap, name) {
             Some(Value::Number(n)) => Some(n.as_f64() as i64),
             _ => None,
         })

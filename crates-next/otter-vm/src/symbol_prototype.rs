@@ -101,12 +101,14 @@ mod tests {
     #[test]
     fn to_string_renders_descriptive_form() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let sym = JsSymbol::new(Some(JsString::from_str("ok", &heap).unwrap()));
         let entry = lookup("toString").unwrap();
         let result = (entry.impl_fn)(&IntrinsicArgs {
             receiver: &Value::Symbol(sym),
             args: &[],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap();
         assert_eq!(result.display_string(), "Symbol(ok)");

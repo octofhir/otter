@@ -306,43 +306,64 @@ mod tests {
     use super::*;
     use crate::string::StringHeap;
 
-    fn args<'a>(recv: &'a Value, args: &'a [Value], heap: &'a StringHeap) -> IntrinsicArgs<'a> {
+    fn args<'a>(
+        recv: &'a Value,
+        args: &'a [Value],
+        heap: &'a StringHeap,
+        gc_heap: &'a mut otter_gc::GcHeap,
+    ) -> IntrinsicArgs<'a> {
         IntrinsicArgs {
             receiver: recv,
             args,
             string_heap: heap,
+            gc_heap: std::cell::RefCell::new(gc_heap),
         }
     }
 
     #[test]
     fn to_string_default_radix_is_10() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::Number(NumberValue::Smi(255));
         let entry = lookup("toString").unwrap();
-        let out = (entry.impl_fn)(&args(&recv, &[], &heap)).unwrap();
+        let out = (entry.impl_fn)(&args(&recv, &[], &heap, &mut gc_heap)).unwrap();
         assert_eq!(out.display_string(), "255");
     }
 
     #[test]
     fn to_string_hex_radix() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::Number(NumberValue::Smi(255));
         let radix = Value::Number(NumberValue::Smi(16));
         let entry = lookup("toString").unwrap();
-        let out = (entry.impl_fn)(&args(&recv, std::slice::from_ref(&radix), &heap)).unwrap();
+        let out = (entry.impl_fn)(&args(
+            &recv,
+            std::slice::from_ref(&radix),
+            &heap,
+            &mut gc_heap,
+        ))
+        .unwrap();
         assert_eq!(out.display_string(), "ff");
     }
 
     #[test]
     fn to_fixed_two_decimals() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         // 3.5 / 2.0 = 1.75 — pick a value that doesn't trip the
         // `approx_constant` lint while still proving fixed-decimal
         // formatting end-to-end.
         let recv = Value::Number(NumberValue::Double(1.75));
         let two = Value::Number(NumberValue::Smi(2));
         let entry = lookup("toFixed").unwrap();
-        let out = (entry.impl_fn)(&args(&recv, std::slice::from_ref(&two), &heap)).unwrap();
+        let out = (entry.impl_fn)(&args(
+            &recv,
+            std::slice::from_ref(&two),
+            &heap,
+            &mut gc_heap,
+        ))
+        .unwrap();
         assert_eq!(out.display_string(), "1.75");
     }
 }

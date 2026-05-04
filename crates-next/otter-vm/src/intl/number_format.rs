@@ -32,25 +32,31 @@ use crate::number::NumberValue;
 /// # Errors
 /// - `BadArgument` when `style == "currency"` is requested without a
 ///   `currency` option.
-pub fn resolve(locale: &Value, options: &Value) -> Result<NumberFormatPayload, IntlError> {
+pub fn resolve(
+    locale: &Value,
+    options: &Value,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<NumberFormatPayload, IntlError> {
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
-    let style = read_string_option(opts_ref, "style", "decimal");
+    let style = read_string_option(opts_ref, "style", "decimal", gc_heap);
     let currency = match style.as_str() {
-        "currency" => match opts_ref.and_then(|o| match o.get("currency") {
-            Some(Value::String(s)) => Some(s.to_lossy_string().to_uppercase()),
-            _ => None,
-        }) {
-            Some(c) => Some(c),
-            None => {
-                return Err(IntlError::BadArgument {
-                    class: "NumberFormat",
-                    method: "constructor",
-                    index: 1,
-                    reason: "currency style requires a `currency` option",
-                });
+        "currency" => {
+            match opts_ref.and_then(|o| match crate::object::get(*o, gc_heap, "currency") {
+                Some(Value::String(s)) => Some(s.to_lossy_string().to_uppercase()),
+                _ => None,
+            }) {
+                Some(c) => Some(c),
+                None => {
+                    return Err(IntlError::BadArgument {
+                        class: "NumberFormat",
+                        method: "constructor",
+                        index: 1,
+                        reason: "currency style requires a `currency` option",
+                    });
+                }
             }
-        },
+        }
         _ => None,
     };
     let (default_min, default_max) = match style.as_str() {
@@ -58,16 +64,23 @@ pub fn resolve(locale: &Value, options: &Value) -> Result<NumberFormatPayload, I
         "percent" => (0, 0),
         _ => (0, 3),
     };
-    let minimum_fraction_digits =
-        read_u8_option(opts_ref, "minimumFractionDigits", default_min, 0, 20);
+    let minimum_fraction_digits = read_u8_option(
+        opts_ref,
+        "minimumFractionDigits",
+        default_min,
+        0,
+        20,
+        gc_heap,
+    );
     let maximum_fraction_digits = read_u8_option(
         opts_ref,
         "maximumFractionDigits",
         default_max.max(minimum_fraction_digits),
         minimum_fraction_digits,
         20,
+        gc_heap,
     );
-    let use_grouping = read_bool_option(opts_ref, "useGrouping", true);
+    let use_grouping = read_bool_option(opts_ref, "useGrouping", true, gc_heap);
     Ok(NumberFormatPayload {
         locale: coerce_locale(Some(locale)),
         style,
@@ -115,25 +128,35 @@ fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_number_format(args)?;
-    let obj = crate::object::JsObject::new();
-    obj.set("locale", js_string_value(&payload.locale, args)?);
-    obj.set("style", js_string_value(&payload.style, args)?);
-    if let Some(c) = &payload.currency {
-        obj.set("currency", js_string_value(c, args)?);
+    let locale = js_string_value(&payload.locale, args)?;
+    let style = js_string_value(&payload.style, args)?;
+    let currency_val = match &payload.currency {
+        Some(c) => Some(js_string_value(c, args)?),
+        None => None,
+    };
+    let min_fd = payload.minimum_fraction_digits as i32;
+    let max_fd = payload.maximum_fraction_digits as i32;
+    let use_grouping = payload.use_grouping;
+    let mut heap = args.gc_heap.borrow_mut();
+    let obj = crate::object::alloc_object(*heap)?;
+    crate::object::set(obj, *heap, "locale", locale);
+    crate::object::set(obj, *heap, "style", style);
+    if let Some(c) = currency_val {
+        crate::object::set(obj, *heap, "currency", c);
     }
-    obj.set(
+    crate::object::set(
+        obj,
+        *heap,
         "minimumFractionDigits",
-        Value::Number(NumberValue::from_i32(
-            payload.minimum_fraction_digits as i32,
-        )),
+        Value::Number(NumberValue::from_i32(min_fd)),
     );
-    obj.set(
+    crate::object::set(
+        obj,
+        *heap,
         "maximumFractionDigits",
-        Value::Number(NumberValue::from_i32(
-            payload.maximum_fraction_digits as i32,
-        )),
+        Value::Number(NumberValue::from_i32(max_fd)),
     );
-    obj.set("useGrouping", Value::Boolean(payload.use_grouping));
+    crate::object::set(obj, *heap, "useGrouping", Value::Boolean(use_grouping));
     Ok(Value::Object(obj))
 }
 

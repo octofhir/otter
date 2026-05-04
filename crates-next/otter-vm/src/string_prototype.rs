@@ -884,12 +884,16 @@ fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(m) => m,
         None => return Ok(Value::Null),
     };
+    let recv_clone = recv.clone();
+    let has_indices = re.flags().has_indices;
+    let mut heap = args.gc_heap.borrow_mut();
     let arr = crate::regexp_prototype::build_match_result(
         &m,
         &recv_units,
-        recv,
-        re.flags().has_indices,
+        &recv_clone,
+        has_indices,
         args.string_heap,
+        *heap,
     )?;
     Ok(Value::Array(arr))
 }
@@ -922,14 +926,17 @@ fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv_units = recv.to_utf16_vec();
     let matches = collect_regex_matches(re, &recv_units);
     let has_indices = re.flags().has_indices;
+    let recv_clone = recv.clone();
+    let mut heap = args.gc_heap.borrow_mut();
     let mut out: Vec<Value> = Vec::with_capacity(matches.len());
     for m in &matches {
         let arr = crate::regexp_prototype::build_match_result(
             m,
             &recv_units,
-            recv,
+            &recv_clone,
             has_indices,
             args.string_heap,
+            *heap,
         )?;
         out.push(Value::Array(arr));
     }
@@ -1103,6 +1110,7 @@ mod tests {
     /// to keep the existing test cases readable.
     fn call(method: &str, recv: &str, args: &[&str]) -> String {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv_v = Value::String(JsString::from_str(recv, &heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
@@ -1116,6 +1124,7 @@ mod tests {
             receiver: &recv_v,
             args: &arg_vs,
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap();
         result.display_string()
@@ -1167,11 +1176,13 @@ mod tests {
     #[test]
     fn bad_receiver_rejects() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = lookup("length").unwrap();
         let err = (entry.impl_fn)(&IntrinsicArgs {
             receiver: &Value::Undefined,
             args: &[],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadReceiver { .. }));
@@ -1188,6 +1199,7 @@ mod tests {
     /// outputs (booleans, numbers, arrays).
     fn call_v(method: &str, recv: &str, args: &[A]) -> Value {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv_v = Value::String(JsString::from_str(recv, &heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
@@ -1201,6 +1213,7 @@ mod tests {
             receiver: &recv_v,
             args: &arg_vs,
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap()
     }
@@ -1235,12 +1248,14 @@ mod tests {
     #[test]
     fn concat_rejects_non_string_args() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("a", &heap).unwrap());
         let entry = lookup("concat").unwrap();
         let err = (entry.impl_fn)(&IntrinsicArgs {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(3))],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadArgument { .. }));
@@ -1256,12 +1271,14 @@ mod tests {
     #[test]
     fn repeat_rejects_negative() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("abc", &heap).unwrap());
         let entry = lookup("repeat").unwrap();
         let err = (entry.impl_fn)(&IntrinsicArgs {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(-1))],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadArgument { .. }));
@@ -1319,6 +1336,7 @@ mod tests {
     fn code_point_at_combines_surrogates() {
         // U+10000 = '𐀀' = 0xD800 0xDC00
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let units: [u16; 3] = [0xD800, 0xDC00, b'a' as u16];
         let recv = Value::String(JsString::from_utf16_units(&units, &heap).unwrap());
         let entry = lookup("codePointAt").unwrap();
@@ -1326,6 +1344,7 @@ mod tests {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(0))],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap();
         assert_eq!(r.display_string(), "65536");
@@ -1334,6 +1353,7 @@ mod tests {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(1))],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap();
         assert_eq!(r2.display_string(), "56320");
@@ -1350,10 +1370,12 @@ mod tests {
         let units: [u16; 3] = [0x00C9, b'a' as u16, b'b' as u16]; // 'É' + "ab"
         let recv = Value::String(JsString::from_utf16_units(&units, &heap).unwrap());
         let entry = lookup("toLowerCase").unwrap();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let r = (entry.impl_fn)(&IntrinsicArgs {
             receiver: &recv,
             args: &[],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap();
         // 'É' should stay (ASCII-only fold), 'a','b' lowercase.
@@ -1485,12 +1507,14 @@ mod tests {
     fn split_undefined_separator_returns_singleton() {
         // "abc".split() === ["abc"]
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("abc", &heap).unwrap());
         let entry = lookup("split").unwrap();
         let r = (entry.impl_fn)(&IntrinsicArgs {
             receiver: &recv,
             args: &[],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap();
         match r {

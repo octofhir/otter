@@ -29,7 +29,6 @@ use crate::Value;
 use crate::array::JsArray;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
-use crate::object::JsObject;
 use crate::regexp::JsRegExp;
 use crate::string::JsString;
 
@@ -67,6 +66,7 @@ fn exec_once(
     re: &JsRegExp,
     text: &JsString,
     string_heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, IntrinsicError> {
     let units = text.to_utf16_vec();
     let len = units.len();
@@ -103,6 +103,7 @@ fn exec_once(
         text,
         flags.has_indices,
         string_heap,
+        gc_heap,
     )?))
 }
 
@@ -117,6 +118,7 @@ pub(crate) fn build_match_result(
     input: &JsString,
     has_indices: bool,
     string_heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<JsArray, IntrinsicError> {
     let full = JsString::from_utf16_units(&units[m.range.clone()], string_heap)?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
@@ -141,19 +143,19 @@ pub(crate) fn build_match_result(
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
     if let Some((name, range)) = first_named {
-        let groups_obj = JsObject::new();
-        groups_obj.set_prototype(None);
+        let groups_obj = crate::object::alloc_object(gc_heap)?;
+        crate::object::set_prototype(groups_obj, gc_heap, None);
         let value = match range {
             Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
             None => Value::Undefined,
         };
-        groups_obj.set(name, value);
+        crate::object::set(groups_obj, gc_heap, name, value);
         for (name, range) in named_iter {
             let value = match range {
                 Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
                 None => Value::Undefined,
             };
-            groups_obj.set(name, value);
+            crate::object::set(groups_obj, gc_heap, name, value);
         }
         arr.set_named_property("groups", Value::Object(groups_obj));
     } else {
@@ -173,19 +175,19 @@ pub(crate) fn build_match_result(
         let mut named_iter = m.named_groups();
         let first_named = named_iter.next();
         if let Some((name, range)) = first_named {
-            let g_obj = JsObject::new();
-            g_obj.set_prototype(None);
+            let g_obj = crate::object::alloc_object(gc_heap)?;
+            crate::object::set_prototype(g_obj, gc_heap, None);
             let v = match range {
                 Some(r) => pair_array(r.start, r.end),
                 None => Value::Undefined,
             };
-            g_obj.set(name, v);
+            crate::object::set(g_obj, gc_heap, name, v);
             for (name, range) in named_iter {
                 let v = match range {
                     Some(r) => pair_array(r.start, r.end),
                     None => Value::Undefined,
                 };
-                g_obj.set(name, v);
+                crate::object::set(g_obj, gc_heap, name, v);
             }
             indices_arr.set_named_property("groups", Value::Object(g_obj));
         } else {
@@ -207,14 +209,18 @@ fn pair_array(start: usize, end: usize) -> Value {
 
 fn impl_exec(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
-    let text = arg_string(args, 0)?;
-    exec_once(re, text, args.string_heap)
+    let text = arg_string(args, 0)?.clone();
+    let re_clone = re.clone();
+    let mut heap = args.gc_heap.borrow_mut();
+    exec_once(&re_clone, &text, args.string_heap, *heap)
 }
 
 fn impl_test(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
-    let text = arg_string(args, 0)?;
-    let result = exec_once(re, text, args.string_heap)?;
+    let text = arg_string(args, 0)?.clone();
+    let re_clone = re.clone();
+    let mut heap = args.gc_heap.borrow_mut();
+    let result = exec_once(&re_clone, &text, args.string_heap, *heap)?;
     Ok(Value::Boolean(!matches!(result, Value::Null)))
 }
 
@@ -304,11 +310,13 @@ mod tests {
 
     fn call(method: &str, recv: &Value, args: &[Value]) -> Value {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = lookup(method).unwrap();
         (entry.impl_fn)(&IntrinsicArgs {
             receiver: recv,
             args,
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap()
     }

@@ -85,26 +85,35 @@ impl From<crate::string::StringError> for IntlError {
 }
 
 /// Dispatch `new Intl.<class>(locale?, options?)`.
-pub fn construct(class: &str, locale: &Value, options: &Value) -> Result<Value, IntlError> {
+pub fn construct(
+    class: &str,
+    locale: &Value,
+    options: &Value,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Value, IntlError> {
     let kind = IntlKind::from_class_name(class)
         .ok_or_else(|| IntlError::UnknownClass(class.to_string()))?;
     let payload = match kind {
-        IntlKind::Collator => IntlPayload::Collator(collator::resolve(locale, options)),
+        IntlKind::Collator => IntlPayload::Collator(collator::resolve(locale, options, gc_heap)),
         IntlKind::NumberFormat => {
-            IntlPayload::NumberFormat(number_format::resolve(locale, options)?)
+            IntlPayload::NumberFormat(number_format::resolve(locale, options, gc_heap)?)
         }
         IntlKind::DateTimeFormat => {
-            IntlPayload::DateTimeFormat(date_time_format::resolve(locale, options))
+            IntlPayload::DateTimeFormat(date_time_format::resolve(locale, options, gc_heap))
         }
-        IntlKind::PluralRules => IntlPayload::PluralRules(plural_rules::resolve(locale, options)),
+        IntlKind::PluralRules => {
+            IntlPayload::PluralRules(plural_rules::resolve(locale, options, gc_heap))
+        }
         IntlKind::RelativeTimeFormat => {
-            IntlPayload::RelativeTimeFormat(relative_time_format::resolve(locale, options))
+            IntlPayload::RelativeTimeFormat(relative_time_format::resolve(locale, options, gc_heap))
         }
-        IntlKind::ListFormat => IntlPayload::ListFormat(list_format::resolve(locale, options)),
+        IntlKind::ListFormat => {
+            IntlPayload::ListFormat(list_format::resolve(locale, options, gc_heap))
+        }
         IntlKind::DisplayNames => {
-            IntlPayload::DisplayNames(display_names::resolve(locale, options))
+            IntlPayload::DisplayNames(display_names::resolve(locale, options, gc_heap))
         }
-        IntlKind::Segmenter => IntlPayload::Segmenter(segmenter::resolve(locale, options)),
+        IntlKind::Segmenter => IntlPayload::Segmenter(segmenter::resolve(locale, options, gc_heap)),
     };
     Ok(Value::Intl(JsIntl::new(payload)))
 }

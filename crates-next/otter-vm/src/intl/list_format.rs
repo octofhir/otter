@@ -17,13 +17,13 @@ use crate::intl::payload::{IntlPayload, ListFormatPayload};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 
 /// Resolve constructor options for this Intl class.
-pub fn resolve(locale: &Value, options: &Value) -> ListFormatPayload {
+pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> ListFormatPayload {
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     ListFormatPayload {
         locale: coerce_locale(Some(locale)),
-        kind: read_string_option(opts_ref, "type", "conjunction"),
-        style: read_string_option(opts_ref, "style", "long"),
+        kind: read_string_option(opts_ref, "type", "conjunction", gc_heap),
+        style: read_string_option(opts_ref, "style", "long", gc_heap),
     }
 }
 
@@ -112,15 +112,14 @@ fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// §13.5.4 `formatToParts(list)` — single-literal-part fallback.
 fn impl_format_to_parts(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = impl_format(args)?;
-    let part = crate::object::JsObject::new();
-    part.set(
-        "type",
-        Value::String(crate::string::JsString::from_str(
-            "literal",
-            args.string_heap,
-        )?),
-    );
-    part.set("value", s);
+    let literal = Value::String(crate::string::JsString::from_str(
+        "literal",
+        args.string_heap,
+    )?);
+    let mut heap = args.gc_heap.borrow_mut();
+    let part = crate::object::alloc_object(*heap)?;
+    crate::object::set(part, *heap, "type", literal);
+    crate::object::set(part, *heap, "value", s);
     Ok(Value::Array(crate::array::JsArray::from_elements([
         Value::Object(part),
     ])))
@@ -128,19 +127,14 @@ fn impl_format_to_parts(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let obj = crate::object::JsObject::new();
-    obj.set(
-        "locale",
-        js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
-    obj.set(
-        "type",
-        js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
-    obj.set(
-        "style",
-        js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
+    let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
+    let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
+    let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
+    let mut heap = args.gc_heap.borrow_mut();
+    let obj = crate::object::alloc_object(*heap)?;
+    crate::object::set(obj, *heap, "locale", locale);
+    crate::object::set(obj, *heap, "type", kind);
+    crate::object::set(obj, *heap, "style", style);
     Ok(Value::Object(obj))
 }
 

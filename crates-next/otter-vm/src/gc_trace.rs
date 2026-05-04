@@ -85,8 +85,26 @@ pub trait GcTrace {
 // paths).
 
 impl GcTrace for JsObject {
-    /// Stub — body lands with task 77 (JsObject migration).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    ///
+    /// `JsObject` is `otter_gc::Gc<ObjectBody>` —
+    /// `#[repr(transparent)]` over a 4-byte cage offset. The
+    /// scavenger may rewrite that offset in place when
+    /// `ObjectBody` moves, so we hand it the field's storage
+    /// address (cast to `*mut RawGc`). The full ObjectBody
+    /// graph (prototype, slot values, symbol-keyed values) is
+    /// walked by [`crate::object::ObjectBody`]'s
+    /// [`otter_gc::SafeTraceable`] impl during marking — this
+    /// trait only has to surface the *root* slot.
+    ///
+    /// # See also
+    ///
+    /// - [`crate::object::ObjectBody::trace_slots_safe`].
+    /// - GC architecture plan §4.2 (root sources).
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsObject as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for JsArray {

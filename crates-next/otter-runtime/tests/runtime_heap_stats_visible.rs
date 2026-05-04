@@ -51,6 +51,12 @@ fn runtime_heap_stats_reflect_host_alloc_after_run_script() {
 fn force_gc_resets_live_count_when_no_roots() {
     let mut rt = Runtime::builder().build().expect("runtime");
     rt.gc_heap_mut().register_traceable::<OpaqueLeaf>();
+    // Establish a baseline AFTER intrinsics + globalThis are
+    // wired so we measure only the OpaqueLeaf row, which is
+    // unaffected by the post-task-77 root walker.
+    rt.force_gc();
+    let baseline_leaf = rt.heap_stats().by_type[OpaqueLeaf::TYPE_TAG as usize].live_bytes;
+    let baseline_cycles = rt.heap_stats().gc_cycles;
     for i in 0..10u64 {
         let _ = rt
             .gc_heap_mut()
@@ -59,6 +65,10 @@ fn force_gc_resets_live_count_when_no_roots() {
     }
     rt.force_gc();
     let stats = rt.heap_stats();
-    assert_eq!(stats.live_objects, 0);
-    assert_eq!(stats.gc_cycles, 1);
+    assert_eq!(
+        stats.by_type[OpaqueLeaf::TYPE_TAG as usize].live_bytes,
+        baseline_leaf,
+        "unrooted OpaqueLeaf row must return to baseline"
+    );
+    assert_eq!(stats.gc_cycles, baseline_cycles + 1);
 }

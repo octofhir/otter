@@ -25,16 +25,16 @@ use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, Intrin
 use crate::number::NumberValue;
 
 /// Resolve the constructor option bag.
-pub fn resolve(locale: &Value, options: &Value) -> CollatorPayload {
+pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> CollatorPayload {
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     CollatorPayload {
         locale: coerce_locale(Some(locale)),
-        usage: read_string_option(opts_ref, "usage", "sort"),
-        sensitivity: read_string_option(opts_ref, "sensitivity", "variant"),
-        ignore_punctuation: read_bool_option(opts_ref, "ignorePunctuation", false),
-        numeric: read_bool_option(opts_ref, "numeric", false),
-        case_first: read_string_option(opts_ref, "caseFirst", "false"),
+        usage: read_string_option(opts_ref, "usage", "sort", gc_heap),
+        sensitivity: read_string_option(opts_ref, "sensitivity", "variant", gc_heap),
+        ignore_punctuation: read_bool_option(opts_ref, "ignorePunctuation", false, gc_heap),
+        numeric: read_bool_option(opts_ref, "numeric", false, gc_heap),
+        case_first: read_string_option(opts_ref, "caseFirst", "false", gc_heap),
     }
 }
 
@@ -74,16 +74,25 @@ fn impl_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_collator(args)?;
-    let obj = crate::object::JsObject::new();
-    obj.set("locale", js_string_value(&payload.locale, args)?);
-    obj.set("usage", js_string_value(&payload.usage, args)?);
-    obj.set("sensitivity", js_string_value(&payload.sensitivity, args)?);
-    obj.set(
+    let locale = js_string_value(&payload.locale, args)?;
+    let usage = js_string_value(&payload.usage, args)?;
+    let sensitivity = js_string_value(&payload.sensitivity, args)?;
+    let case_first = js_string_value(&payload.case_first, args)?;
+    let ignore_punctuation = payload.ignore_punctuation;
+    let numeric = payload.numeric;
+    let mut heap = args.gc_heap.borrow_mut();
+    let obj = crate::object::alloc_object(*heap)?;
+    crate::object::set(obj, *heap, "locale", locale);
+    crate::object::set(obj, *heap, "usage", usage);
+    crate::object::set(obj, *heap, "sensitivity", sensitivity);
+    crate::object::set(
+        obj,
+        *heap,
         "ignorePunctuation",
-        Value::Boolean(payload.ignore_punctuation),
+        Value::Boolean(ignore_punctuation),
     );
-    obj.set("numeric", Value::Boolean(payload.numeric));
-    obj.set("caseFirst", js_string_value(&payload.case_first, args)?);
+    crate::object::set(obj, *heap, "numeric", Value::Boolean(numeric));
+    crate::object::set(obj, *heap, "caseFirst", case_first);
     Ok(Value::Object(obj))
 }
 

@@ -18,14 +18,14 @@ use crate::intl::payload::{DisplayNamesPayload, IntlPayload};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 
 /// Resolve constructor options for this Intl class.
-pub fn resolve(locale: &Value, options: &Value) -> DisplayNamesPayload {
+pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> DisplayNamesPayload {
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     DisplayNamesPayload {
         locale: coerce_locale(Some(locale)),
-        kind: read_string_option(opts_ref, "type", "language"),
-        style: read_string_option(opts_ref, "style", "long"),
-        fallback: read_string_option(opts_ref, "fallback", "code"),
+        kind: read_string_option(opts_ref, "type", "language", gc_heap),
+        style: read_string_option(opts_ref, "style", "long", gc_heap),
+        fallback: read_string_option(opts_ref, "fallback", "code", gc_heap),
     }
 }
 
@@ -165,23 +165,16 @@ fn impl_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let obj = crate::object::JsObject::new();
-    obj.set(
-        "locale",
-        js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
-    obj.set(
-        "type",
-        js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
-    obj.set(
-        "style",
-        js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
-    obj.set(
-        "fallback",
-        js_string(&payload.fallback, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
+    let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
+    let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
+    let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
+    let fallback = js_string(&payload.fallback, args.string_heap).map_err(intl_to_intrinsic)?;
+    let mut heap = args.gc_heap.borrow_mut();
+    let obj = crate::object::alloc_object(*heap)?;
+    crate::object::set(obj, *heap, "locale", locale);
+    crate::object::set(obj, *heap, "type", kind);
+    crate::object::set(obj, *heap, "style", style);
+    crate::object::set(obj, *heap, "fallback", fallback);
     Ok(Value::Object(obj))
 }
 

@@ -151,6 +151,19 @@ pub struct IntrinsicArgs<'a> {
     pub args: &'a [Value],
     /// String heap for any allocation an intrinsic performs.
     pub string_heap: &'a StringHeap,
+    /// GC heap for object allocations the intrinsic must perform
+    /// (RegExp `groups` / `indices` accessor objects in §22.2.7.7
+    /// MakeMatchIndicesIndexPairArray, JSON reviver wrappers,
+    /// boxed-primitive method receivers, …). Wrapped in
+    /// [`std::cell::RefCell`] so a `fn(&IntrinsicArgs)` impl can
+    /// upgrade to a unique borrow for the duration of an
+    /// allocation; the underlying `&'a mut GcHeap` itself is the
+    /// one and only mutator. The dispatch site is single-threaded
+    /// and the runtime borrow is scoped to a single
+    /// `[[Call]]`-shaped intrinsic body so re-entrancy can't strike
+    /// here. Threaded explicitly per ADR-0005 §3 and task 76A — no
+    /// thread-local heap lookup.
+    pub gc_heap: std::cell::RefCell<&'a mut otter_gc::GcHeap>,
 }
 
 /// The intrinsic implementation function pointer.
@@ -266,6 +279,15 @@ impl From<crate::string::StringError> for IntrinsicError {
     }
 }
 
+impl From<otter_gc::OutOfMemory> for IntrinsicError {
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
+        }
+    }
+}
+
 /// Declarative intrinsic table builder.
 ///
 /// Usage:
@@ -357,6 +379,7 @@ mod tests {
     #[test]
     fn intrinsic_runs_with_string_receiver() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("ab", &heap).unwrap());
         let arg = Value::String(JsString::from_str("cd", &heap).unwrap());
         let entry = STRING_TABLE
@@ -366,6 +389,7 @@ mod tests {
             receiver: &recv,
             args: &[arg],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap();
         assert_eq!(result.display_string(), "abcd");
@@ -374,6 +398,7 @@ mod tests {
     #[test]
     fn intrinsic_rejects_bad_receiver() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = STRING_TABLE
             .lookup(IntrinsicReceiver::String, "length")
             .unwrap();
@@ -381,6 +406,7 @@ mod tests {
             receiver: &Value::Undefined,
             args: &[],
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadReceiver { .. }));

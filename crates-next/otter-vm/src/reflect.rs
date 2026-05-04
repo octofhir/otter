@@ -68,15 +68,21 @@ pub fn call(
             };
             // Foundation: build a fresh receiver from the
             // constructor's `prototype` chain and run the body via
-            // run_callable_sync. The third `newTarget` arg is
-            // honoured implicitly when target is a ClassConstructor
-            // (the body handles `new.target` itself).
-            let receiver = JsObject::new();
-            if let Some(proto) = construct_prototype(&target) {
-                receiver.set_prototype(Some(proto));
-            }
+            // run_callable_sync.
+            let proto = {
+                let heap = interp.gc_heap();
+                construct_prototype(&target, heap)
+            };
+            let receiver = {
+                let heap = interp.gc_heap_mut();
+                let receiver = crate::object::alloc_object(heap).map_err(VmError::from)?;
+                if let Some(proto) = proto {
+                    crate::object::set_prototype(receiver, heap, Some(proto));
+                }
+                receiver
+            };
             let result =
-                interp.run_callable_sync(module, &target, Value::Object(receiver.clone()), argv)?;
+                interp.run_callable_sync(module, &target, Value::Object(receiver), argv)?;
             // Per §13.3.5 — non-object return is replaced with the
             // freshly-allocated receiver.
             match result {
@@ -90,8 +96,12 @@ pub fn call(
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let desc_obj = expect_object(args.get(2))?;
-            let descriptor = coerce_to_descriptor(&desc_obj)?;
-            let ok = target.define_own_property(&key, descriptor);
+            let descriptor = {
+                let heap = interp.gc_heap();
+                coerce_to_descriptor(&desc_obj, heap)?
+            };
+            let heap = interp.gc_heap_mut();
+            let ok = crate::object::define_own_property(target, heap, &key, descriptor);
             Ok(Value::Boolean(ok))
         }
         // §28.1.5 Reflect.deleteProperty(target, propertyKey)
@@ -99,7 +109,8 @@ pub fn call(
         "deleteProperty" => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
-            Ok(Value::Boolean(target.delete(&key)))
+            let heap = interp.gc_heap_mut();
+            Ok(Value::Boolean(crate::object::delete(target, heap, &key)))
         }
         // §28.1.6 Reflect.get(target, propertyKey[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.get>
@@ -109,21 +120,32 @@ pub fn call(
             // Foundation: `receiver` is honoured by accessor
             // dispatch elsewhere; the simple data-property surface
             // here ignores the third argument.
-            Ok(target.get(&key).unwrap_or(Value::Undefined))
+            let heap = interp.gc_heap();
+            Ok(crate::object::get(target, heap, &key).unwrap_or(Value::Undefined))
         }
         // §28.1.7 Reflect.getOwnPropertyDescriptor(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.getownpropertydescriptor>
         "getOwnPropertyDescriptor" => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
-            match target.lookup_own(&key) {
+            let lookup = {
+                let heap = interp.gc_heap();
+                crate::object::lookup_own(target, heap, &key)
+            };
+            match lookup {
                 PropertyLookup::Absent => Ok(Value::Undefined),
                 PropertyLookup::Data { value, flags } => {
-                    let obj = JsObject::new();
-                    obj.set("value", value);
-                    obj.set("writable", Value::Boolean(flags.writable()));
-                    obj.set("enumerable", Value::Boolean(flags.enumerable()));
-                    obj.set("configurable", Value::Boolean(flags.configurable()));
+                    let heap = interp.gc_heap_mut();
+                    let obj = crate::object::alloc_object(heap).map_err(VmError::from)?;
+                    crate::object::set(obj, heap, "value", value);
+                    crate::object::set(obj, heap, "writable", Value::Boolean(flags.writable()));
+                    crate::object::set(obj, heap, "enumerable", Value::Boolean(flags.enumerable()));
+                    crate::object::set(
+                        obj,
+                        heap,
+                        "configurable",
+                        Value::Boolean(flags.configurable()),
+                    );
                     Ok(Value::Object(obj))
                 }
                 PropertyLookup::Accessor {
@@ -131,11 +153,17 @@ pub fn call(
                     setter,
                     flags,
                 } => {
-                    let obj = JsObject::new();
-                    obj.set("get", getter.unwrap_or(Value::Undefined));
-                    obj.set("set", setter.unwrap_or(Value::Undefined));
-                    obj.set("enumerable", Value::Boolean(flags.enumerable()));
-                    obj.set("configurable", Value::Boolean(flags.configurable()));
+                    let heap = interp.gc_heap_mut();
+                    let obj = crate::object::alloc_object(heap).map_err(VmError::from)?;
+                    crate::object::set(obj, heap, "get", getter.unwrap_or(Value::Undefined));
+                    crate::object::set(obj, heap, "set", setter.unwrap_or(Value::Undefined));
+                    crate::object::set(obj, heap, "enumerable", Value::Boolean(flags.enumerable()));
+                    crate::object::set(
+                        obj,
+                        heap,
+                        "configurable",
+                        Value::Boolean(flags.configurable()),
+                    );
                     Ok(Value::Object(obj))
                 }
             }
@@ -144,15 +172,19 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.getprototypeof>
         "getPrototypeOf" => {
             let target = expect_object(args.first())?;
-            Ok(target.prototype().map(Value::Object).unwrap_or(Value::Null))
+            let heap = interp.gc_heap();
+            Ok(crate::object::prototype(target, heap)
+                .map(Value::Object)
+                .unwrap_or(Value::Null))
         }
         // §28.1.9 Reflect.has(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.has>
         "has" => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
+            let heap = interp.gc_heap();
             Ok(Value::Boolean(!matches!(
-                target.lookup(&key),
+                crate::object::lookup(target, heap, &key),
                 PropertyLookup::Absent
             )))
         }
@@ -160,29 +192,31 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>
         "isExtensible" => {
             let target = expect_object(args.first())?;
-            Ok(Value::Boolean(target.is_extensible()))
+            let heap = interp.gc_heap();
+            Ok(Value::Boolean(crate::object::is_extensible(target, heap)))
         }
         // §28.1.11 Reflect.ownKeys(target)
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
         "ownKeys" => {
             let target = expect_object(args.first())?;
-            let body = target.borrow_props();
-            let keys: Vec<Value> = body
-                .keys()
-                .map(|k| {
-                    JsString::from_str(k, string_heap)
-                        .map(Value::String)
-                        .unwrap_or(Value::Undefined)
-                })
-                .collect();
-            drop(body);
+            let heap = interp.gc_heap();
+            let keys: Vec<Value> = crate::object::with_properties(target, heap, |p| {
+                p.keys()
+                    .map(|k| {
+                        JsString::from_str(k, string_heap)
+                            .map(Value::String)
+                            .unwrap_or(Value::Undefined)
+                    })
+                    .collect()
+            });
             Ok(Value::Array(crate::array::JsArray::from_elements(keys)))
         }
         // §28.1.12 Reflect.preventExtensions(target)
         // <https://tc39.es/ecma262/#sec-reflect.preventextensions>
         "preventExtensions" => {
             let target = expect_object(args.first())?;
-            target.prevent_extensions();
+            let heap = interp.gc_heap_mut();
+            crate::object::prevent_extensions(target, heap);
             Ok(Value::Boolean(true))
         }
         // §28.1.13 Reflect.set(target, propertyKey, V[, receiver])
@@ -191,7 +225,8 @@ pub fn call(
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let value = args.get(2).cloned().unwrap_or(Value::Undefined);
-            target.set(&key, value);
+            let heap = interp.gc_heap_mut();
+            crate::object::set(target, heap, &key, value);
             Ok(Value::Boolean(true))
         }
         // §28.1.14 Reflect.setPrototypeOf(target, prototype)
@@ -199,11 +234,12 @@ pub fn call(
         "setPrototypeOf" => {
             let target = expect_object(args.first())?;
             let proto = match args.get(1) {
-                Some(Value::Object(p)) => Some(p.clone()),
+                Some(Value::Object(p)) => Some(*p),
                 Some(Value::Null) | None => None,
                 _ => return Err(VmError::TypeMismatch),
             };
-            target.set_prototype(proto);
+            let heap = interp.gc_heap_mut();
+            crate::object::set_prototype(target, heap, proto);
             Ok(Value::Boolean(true))
         }
         other => Err(VmError::UnknownIntrinsic {
@@ -215,21 +251,21 @@ pub fn call(
 /// Pull the `prototype` own property off a callable. Mirrors the
 /// existing `Op::New` lookup so `Reflect.construct` builds
 /// instances with the same chain.
-fn construct_prototype(callee: &Value) -> Option<JsObject> {
+fn construct_prototype(callee: &Value, heap: &otter_gc::GcHeap) -> Option<JsObject> {
     match callee {
-        Value::ClassConstructor(c) => Some(c.prototype.clone()),
-        Value::Object(obj) => match obj.get("prototype") {
+        Value::ClassConstructor(c) => Some(c.prototype),
+        Value::Object(obj) => match crate::object::get(*obj, heap, "prototype") {
             Some(Value::Object(p)) => Some(p),
             _ => None,
         },
-        Value::BoundFunction(b) => construct_prototype(&b.target),
+        Value::BoundFunction(b) => construct_prototype(&b.target, heap),
         _ => None,
     }
 }
 
 fn expect_object(arg: Option<&Value>) -> Result<JsObject, VmError> {
     match arg {
-        Some(Value::Object(o)) => Ok(o.clone()),
+        Some(Value::Object(o)) => Ok(*o),
         _ => Err(VmError::TypeMismatch),
     }
 }

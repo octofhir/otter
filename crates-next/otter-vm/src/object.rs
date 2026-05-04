@@ -5,8 +5,25 @@
 //! `(writable, enumerable, configurable)` plus a body that is either
 //! a `[[Value]]` (data property) or a `([[Get]], [[Set]])` accessor
 //! pair. The `Shape`-based hidden-class model stays — keys are still
-//! shared across literals — and a per-slot [`PropertySlot`] now sits
-//! alongside the `Value` slot the foundation used in earlier slices.
+//! shared across literals — but as of task 77 the per-object body
+//! (slots, prototype, symbol props, extensibility) lives on the
+//! tracing GC heap as a [`Gc<ObjectBody>`] payload.
+//!
+//! # Storage
+//!
+//! Pre-77 the body lived behind an `Rc<RefCell<…>>` envelope and
+//! callers reached for the value through interior mutability. As of
+//! task 77 (per [GC architecture plan §4.1, §6.3] and ADR-0005 §3
+//! "Async Runtime Binding"), every read / write / write-barrier
+//! path takes an explicit `&otter_gc::GcHeap` (or `&mut`) so the
+//! single-mutator invariant is visible in the type system. Method
+//! signatures are now of the shape `obj.get(heap, key)` and
+//! `obj.set(heap, key, value)` — the heap is **not** thread-local.
+//! No thread-local heap lookup is permitted in this module
+//! (per ADR-0005 §3 / task 76A).
+//!
+//! `JsObject` is therefore a 4-byte compressed offset
+//! ([`otter_gc::Gc<ObjectBody>`]); cloning a handle is `Copy`.
 //!
 //! # Contents
 //! - [`PropertyFlags`] — packed `(writable, enumerable, configurable)`
@@ -18,9 +35,10 @@
 //! - [`SetOutcome`] — what the runtime should do after a property
 //!   write resolved through the prototype chain (write data, invoke
 //!   setter, or reject).
-//! - [`JsObject`] / [`Shape`] / [`Properties`] — the public object
-//!   handle, its hidden class, and the read-only view used by JSON
-//!   serialisation and `Object.keys` enumeration.
+//! - [`JsObject`] / [`Shape`] / [`ObjectBody`] / [`Properties`] —
+//!   the public object handle, its hidden class, the GC-allocated
+//!   storage, and the read-only view used by JSON serialisation and
+//!   `Object.keys` enumeration.
 //!
 //! # Invariants
 //! - Insertion order is encoded by the shape's key vector and shared
@@ -32,14 +50,20 @@
 //!   object is non-extensible (writable may still be true).
 //! - Accessor descriptors never carry a `writable` bit — its slot is
 //!   reused as a discriminator (always `false`).
+//! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
+//!   prototype assignment, and every symbol-property write fires
+//!   [`otter_gc::GcHeap::write_barrier_raw`] inline so the
+//!   generational and incremental marker observe the new pointer.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-property-attributes>
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
 //! - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
 //! - <https://tc39.es/ecma262/#sec-ordinaryset>
+//! - [GC architecture plan §4.1, §6.3](../../../docs/new-engine/gc-architecture.md)
+//! - [ADR-0005 — async runtime binding](../../../docs/new-engine/adr/0005-async-runtime-binding.md)
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -377,15 +401,37 @@ impl PropertySlot {
 /// A hidden-class node. Shapes form a tree rooted at the empty
 /// shape; each non-root shape records the parent plus the single
 /// key added to reach it.
-#[derive(Debug)]
+///
+/// Shapes are immutable after construction. Two cache fields use
+/// interior mutability:
+/// - `offsets` — a write-once [`OnceCell`] populated lazily by
+///   [`Self::offset_of`].
+/// - `transitions` — a [`Cell`]-wrapped `HashMap` that records
+///   shared child shapes by added key. Mutations swap the map out,
+///   modify, and swap it back — there is no `RefCell`-style
+///   borrow checker here because nothing observes a partial write
+///   (the call is single-threaded and re-entrancy is impossible:
+///   neither path calls back into shape mutation).
+///
+/// Per the GC architecture plan §4.1 shapes are NOT GC-managed —
+/// they are `Rc`-shared leaf metadata and the [`ObjectBody`] tracer
+/// deliberately does not walk into them.
 pub struct Shape {
     #[allow(dead_code)]
     parent: Option<Rc<Shape>>,
     #[allow(dead_code)]
     key: Option<String>,
     keys: Vec<String>,
-    offsets: RefCell<Option<HashMap<String, u16>>>,
-    transitions: RefCell<HashMap<String, Rc<Shape>>>,
+    offsets: OnceCell<HashMap<String, u16>>,
+    transitions: Cell<HashMap<String, Rc<Shape>>>,
+}
+
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shape")
+            .field("len", &self.keys.len())
+            .finish()
+    }
 }
 
 impl Shape {
@@ -396,8 +442,8 @@ impl Shape {
             parent: None,
             key: None,
             keys: Vec::new(),
-            offsets: RefCell::new(None),
-            transitions: RefCell::new(HashMap::new()),
+            offsets: OnceCell::new(),
+            transitions: Cell::new(HashMap::new()),
         })
     }
 
@@ -413,20 +459,18 @@ impl Shape {
         self.keys.is_empty()
     }
 
-    /// Look up a property's slot offset.
+    /// Look up a property's slot offset. Lazily builds the
+    /// keys → offset cache on first call.
     #[must_use]
     pub fn offset_of(&self, key: &str) -> Option<u16> {
-        let mut cache = self.offsets.borrow_mut();
-        if cache.is_none() {
-            let map: HashMap<String, u16> = self
-                .keys
+        let cache = self.offsets.get_or_init(|| {
+            self.keys
                 .iter()
                 .enumerate()
                 .map(|(i, k)| (k.clone(), i as u16))
-                .collect();
-            *cache = Some(map);
-        }
-        cache.as_ref().and_then(|m| m.get(key).copied())
+                .collect()
+        });
+        cache.get(key).copied()
     }
 
     /// Iterate keys in insertion order.
@@ -436,10 +480,19 @@ impl Shape {
 
     /// Append `key` and return the resulting child shape, sharing
     /// it with prior callers when possible.
+    ///
+    /// Mutates the parent's transition table by swapping the
+    /// `Cell`-stored map out, inserting, and swapping it back —
+    /// safe because nothing observes the swap window (single
+    /// mutator, no re-entrancy from the called code).
     #[must_use]
     pub fn add_property(self_rc: &Rc<Shape>, key: &str) -> Rc<Shape> {
-        if let Some(existing) = self_rc.transitions.borrow().get(key) {
-            return Rc::clone(existing);
+        // Probe for an existing transition.
+        let mut transitions = self_rc.transitions.take();
+        if let Some(existing) = transitions.get(key) {
+            let hit = Rc::clone(existing);
+            self_rc.transitions.set(transitions);
+            return hit;
         }
         let mut keys = self_rc.keys.clone();
         keys.push(key.to_string());
@@ -447,13 +500,11 @@ impl Shape {
             parent: Some(Rc::clone(self_rc)),
             key: Some(key.to_string()),
             keys,
-            offsets: RefCell::new(None),
-            transitions: RefCell::new(HashMap::new()),
+            offsets: OnceCell::new(),
+            transitions: Cell::new(HashMap::new()),
         });
-        self_rc
-            .transitions
-            .borrow_mut()
-            .insert(key.to_string(), Rc::clone(&child));
+        transitions.insert(key.to_string(), Rc::clone(&child));
+        self_rc.transitions.set(transitions);
         child
     }
 }
@@ -465,73 +516,446 @@ thread_local! {
 
 // ---------- JsObject ------------------------------------------------------
 
-/// Heap-shared object handle. Cloning shares storage.
-#[derive(Debug, Clone)]
-pub struct JsObject {
-    inner: Rc<RefCell<ObjectBody>>,
-}
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ObjectBody`].
+///
+/// Distinct from `UPVALUE_CELL_TYPE_TAG = 0x10` (task 76).
+pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 
-#[derive(Debug)]
-struct ObjectBody {
+/// GC-allocated storage backing every [`JsObject`] handle.
+///
+/// Per ECMA-262 §10.1, ordinary objects carry a hidden-class
+/// [`Shape`], an aligned slot table, an optional `[[Prototype]]`,
+/// a list of symbol-keyed own properties, and an `[[Extensible]]`
+/// flag. All of those fields live here directly — task 77 retired
+/// the pre-77 `Rc<RefCell<…>>` envelope. Mutation flows through
+/// [`otter_gc::GcHeap::with_payload`] (writers) and reads through
+/// [`otter_gc::GcHeap::read_payload`] (readers). Every store of a
+/// `Gc<…>`-bearing field fires
+/// [`otter_gc::GcHeap::write_barrier_raw`] inline.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
+/// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
+pub struct ObjectBody {
+    /// Hidden class. `Rc`-shared because shapes are immutable
+    /// post-transition; per architecture plan §4.1 shapes are NOT
+    /// GC-managed.
     shape: Rc<Shape>,
+    /// Slot table aligned with [`Shape::keys`].
     slots: SmallVec<[PropertySlot; 4]>,
-    prototype: Option<JsObject>,
+    /// `[[Prototype]]` — [`otter_gc::Gc::null()`] encodes JS
+    /// `null` (no prototype). Stored as a bare `JsObject` rather
+    /// than `Option<JsObject>` so the slot has a stable address
+    /// the GC can yield to its scavenger / marker (`Option<u32>`
+    /// has no niche and the discriminant offset would not give a
+    /// `RawGc`-aligned slot).
+    prototype: JsObject,
     /// Symbol-keyed own data properties. Symbol-keyed accessors are
-    /// not modelled in the foundation slice — `Object.defineProperty`
-    /// only accepts string keys today.
+    /// not modelled in this slice — `Object.defineProperty` only
+    /// accepts string keys today.
     symbol_props: Vec<(JsSymbol, Value)>,
     /// `[[Extensible]]` internal slot. New keys are rejected when
-    /// this is `false`. Toggled by
-    /// [`JsObject::prevent_extensions`] / [`JsObject::seal`] /
-    /// [`JsObject::freeze`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
+    /// this is `false`.
     extensible: bool,
 }
+
+impl std::fmt::Debug for ObjectBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectBody")
+            .field("shape_len", &self.shape.len())
+            .field("slot_count", &self.slots.len())
+            .field("has_prototype", &!self.prototype.is_null())
+            .field("symbol_props", &self.symbol_props.len())
+            .field("extensible", &self.extensible)
+            .finish()
+    }
+}
+
+impl otter_gc::SafeTraceable for ObjectBody {
+    const TYPE_TAG: u8 = OBJECT_BODY_TYPE_TAG;
+
+    /// Walk every outgoing GC reference held by `self`:
+    /// - the `[[Prototype]]` handle (if any);
+    /// - every `Value` inside a data slot or accessor pair;
+    /// - every `Value` inside symbol-keyed own properties.
+    ///
+    /// Shape keys are interned `String` leaves and their containing
+    /// [`Shape`] is `Rc`-shared, not GC-managed, so they are not
+    /// traced — see the type doc on [`ObjectBody`].
+    fn trace_slots_safe(&self, v: &mut otter_gc::SlotVisitor<'_>) {
+        // Prototype: `Gc<ObjectBody>` (null ≡ no prototype).
+        // `Gc<T>` is `#[repr(transparent)]` over `u32`, so the
+        // field's storage address is a `*mut RawGc` slot the
+        // scavenger may rewrite.
+        if !self.prototype.is_null() {
+            let p = &self.prototype as *const JsObject as *mut otter_gc::RawGc;
+            v(p);
+        }
+        // Property slots.
+        for slot in self.slots.iter() {
+            match &slot.body {
+                SlotBody::Data { value } => value.trace_value_slots(v),
+                SlotBody::Accessor { getter, setter } => {
+                    if let Some(g) = getter {
+                        g.trace_value_slots(v);
+                    }
+                    if let Some(s) = setter {
+                        s.trace_value_slots(v);
+                    }
+                }
+            }
+        }
+        // Symbol-keyed own properties.
+        for (_sym, val) in self.symbol_props.iter() {
+            val.trace_value_slots(v);
+        }
+    }
+}
+
+/// Heap-shared object handle.
+///
+/// As of task 77 this is a 4-byte compressed
+/// [`otter_gc::Gc<ObjectBody>`]. The handle is `Copy + Eq + Hash`
+/// (inherited from [`otter_gc::Gc`]); identity comparison is the
+/// default `==`.
+///
+/// Every method that reads or mutates the body takes an explicit
+/// `&otter_gc::GcHeap` (read) or `&mut otter_gc::GcHeap` (mutate).
+/// There is no thread-local heap lookup in this module; per
+/// ADR-0005 §3 and task 76A every borrow path threads the heap.
+pub type JsObject = otter_gc::Gc<ObjectBody>;
 
 /// Maximum prototype-chain hops a property lookup will follow.
 pub const PROTO_CHAIN_HARD_CAP: usize = 1024;
 
-impl JsObject {
-    /// Allocate a fresh empty extensible object on the root shape.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// Allocate a fresh empty extensible object on the root shape.
+///
+/// Routes through [`otter_gc::GcHeap::alloc_old`] so the body is
+/// allocated directly in old-space — Phase-1 callers may still hold
+/// raw `JsObject` slots inside `Rc`-shared containers that the
+/// young-gen scavenger cannot rewrite. Phase 2 may switch back to
+/// [`otter_gc::GcHeap::alloc`] once every container slot is walked.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim; runtime callers
+/// translate it into [`crate::VmError::OutOfMemory`].
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryobjectcreate>
+pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let shape = ROOT_SHAPE.with(Rc::clone);
+    heap.alloc_old(ObjectBody {
+        shape,
+        slots: SmallVec::new(),
+        prototype: otter_gc::Gc::null(),
+        symbol_props: Vec::new(),
+        extensible: true,
+    })
+}
 
-    /// Number of own properties.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.borrow().shape.len()
+/// Allocate a fresh empty object whose prototype is `proto`.
+///
+/// Convenience wrapper around [`alloc_object`] that fires the
+/// generational write barrier on the freshly-installed prototype
+/// link.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryobjectcreate>
+pub fn alloc_object_with_proto(
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<JsObject>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let obj = alloc_object(heap)?;
+    if let Some(p) = proto {
+        set_prototype(obj, heap, Some(p));
     }
+    Ok(obj)
+}
 
-    /// `true` when there are no own properties.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+// ---------- read accessors -----------------------------------------------
+
+/// Number of own (string-keyed) properties.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryownpropertykeys>
+#[must_use]
+pub fn len(obj: JsObject, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(obj, |body| body.shape.len())
+}
+
+/// `true` when the object has no string-keyed own properties.
+#[must_use]
+pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    len(obj, heap) == 0
+}
+
+/// Read an **own** property with an accessor short-circuit:
+/// returns `Some(value)` for data slots, `Some(undefined)` for
+/// accessor slots (callers that need to invoke the getter must
+/// use [`lookup_own`] / [`get_own_descriptor`]).
+#[must_use]
+pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        body.shape
+            .offset_of(key)
+            .map(|offset| match &body.slots[offset as usize].body {
+                SlotBody::Data { value } => value.clone(),
+                SlotBody::Accessor { .. } => Value::Undefined,
+            })
+    })
+}
+
+/// Read a property, walking the prototype chain on miss.
+/// Accessors collapse to `undefined` here for backward-compat
+/// with construction-time call sites; the dispatch loop's
+/// `LoadProperty` handler invokes accessors through [`lookup`]
+/// instead.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryget>
+#[must_use]
+pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
+    match lookup(obj, heap, key) {
+        PropertyLookup::Absent => None,
+        PropertyLookup::Data { value, .. } => Some(value),
+        PropertyLookup::Accessor { .. } => Some(Value::Undefined),
     }
+}
 
-    /// Set or overwrite an own property as a default-attributes data
-    /// slot (`writable / enumerable / configurable` all `true`).
-    /// This is the construction-time path used by object literals,
-    /// runtime intrinsics, and prototype scaffolding — it bypasses
-    /// the §10.1.9 [[Set]] ladder entirely.
-    ///
-    /// # Algorithm
-    /// 1. If the key already lives on this object, overwrite the
-    ///    slot's value, preserving the slot's existing flags. This
-    ///    matches the `O[k] = v` shape for an existing data property
-    ///    that has not been re-configured by `defineProperty`.
-    /// 2. Otherwise, append a new default-attributes data slot.
-    ///
-    /// Construction-time callers do not respect the extensibility
-    /// flag: this path is only used by code that owns the object and
-    /// is allowed to seed it (`Error.prototype.message`, etc.).
-    pub fn set(&self, key: &str, value: Value) {
-        let mut body = self.inner.borrow_mut();
+/// Probe for an own property (no proto-chain walk). The result
+/// distinguishes data, accessor, and absent.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinarygetownproperty>
+#[must_use]
+pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
+    heap.read_payload(obj, |body| match body.shape.offset_of(key) {
+        Some(offset) => body.slots[offset as usize].to_lookup(),
+        None => PropertyLookup::Absent,
+    })
+}
+
+/// Probe for a property with full prototype-chain walk. Returns
+/// the first hit's descriptor body; useful for the LoadProperty
+/// dispatch path which needs to know whether to invoke a getter
+/// at any depth.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryget>
+#[must_use]
+pub fn lookup(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
+    match lookup_own(obj, heap, key) {
+        PropertyLookup::Absent => {}
+        hit => return hit,
+    }
+    let mut current = prototype(obj, heap);
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if hops >= PROTO_CHAIN_HARD_CAP {
+            return PropertyLookup::Absent;
+        }
+        hops += 1;
+        match lookup_own(proto, heap, key) {
+            PropertyLookup::Absent => {}
+            hit => return hit,
+        }
+        current = prototype(proto, heap);
+    }
+    PropertyLookup::Absent
+}
+
+/// Read the descriptor for an own property.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinarygetownproperty>
+#[must_use]
+pub fn get_own_descriptor(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: &str,
+) -> Option<PropertyDescriptor> {
+    heap.read_payload(obj, |body| {
+        body.shape
+            .offset_of(key)
+            .map(|offset| body.slots[offset as usize].to_descriptor())
+    })
+}
+
+/// Borrow the current prototype, if any.
+///
+/// Returns `None` when the stored handle is [`otter_gc::Gc::null()`]
+/// (the in-payload encoding for JS `null`).
+#[must_use]
+pub fn prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
+    heap.read_payload(obj, |body| {
+        if body.prototype.is_null() {
+            None
+        } else {
+            Some(body.prototype)
+        }
+    })
+}
+
+/// `true` when `obj` has `target` somewhere in its prototype chain.
+/// Used by `instanceof`.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryhasinstance>
+#[must_use]
+pub fn has_in_proto_chain(obj: JsObject, heap: &otter_gc::GcHeap, target: JsObject) -> bool {
+    let mut current = prototype(obj, heap);
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if hops >= PROTO_CHAIN_HARD_CAP {
+            return false;
+        }
+        hops += 1;
+        if proto == target {
+            return true;
+        }
+        current = prototype(proto, heap);
+    }
+    false
+}
+
+/// Look up by a [`JsString`] key. Convenience for dispatcher
+/// sites that already hold the WTF-16 form.
+#[must_use]
+pub fn get_jsstring(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsString) -> Option<Value> {
+    let utf8 = key.to_lossy_string();
+    get(obj, heap, &utf8)
+}
+
+/// Look up an **own** symbol-keyed property.
+#[must_use]
+pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        body.symbol_props
+            .iter()
+            .find(|(k, _)| k.ptr_eq(key))
+            .map(|(_, v)| v.clone())
+    })
+}
+
+/// Look up a symbol-keyed property with prototype-chain walk.
+#[must_use]
+pub fn get_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Option<Value> {
+    if let Some(v) = get_own_symbol(obj, heap, key) {
+        return Some(v);
+    }
+    let mut current = prototype(obj, heap);
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if hops >= PROTO_CHAIN_HARD_CAP {
+            return None;
+        }
+        hops += 1;
+        if let Some(v) = get_own_symbol(proto, heap, key) {
+            return Some(v);
+        }
+        current = prototype(proto, heap);
+    }
+    None
+}
+
+/// Borrow the current hidden class.
+#[must_use]
+pub fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> Rc<Shape> {
+    heap.read_payload(obj, |body| Rc::clone(&body.shape))
+}
+
+/// `[[IsExtensible]]` — `false` after [`prevent_extensions`] /
+/// [`seal`] / [`freeze`].
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryisextensible>
+#[must_use]
+pub fn is_extensible(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| body.extensible)
+}
+
+/// `Object.isSealed(o)` — `true` when the object is non-extensible
+/// and every own property is non-configurable.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-testintegritylevel>
+#[must_use]
+pub fn is_sealed(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| {
+        if body.extensible {
+            return false;
+        }
+        body.slots.iter().all(|s| !s.flags.configurable())
+    })
+}
+
+/// `Object.isFrozen(o)` — `true` when the object is sealed and
+/// every data slot is non-writable.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-testintegritylevel>
+#[must_use]
+pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| {
+        if body.extensible {
+            return false;
+        }
+        for slot in body.slots.iter() {
+            if slot.flags.configurable() {
+                return false;
+            }
+            if let SlotBody::Data { .. } = slot.body {
+                if slot.flags.writable() {
+                    return false;
+                }
+            }
+        }
+        true
+    })
+}
+
+// ---------- mutation -----------------------------------------------------
+
+/// Set or overwrite an own property as a default-attributes data
+/// slot (`writable / enumerable / configurable` all `true`).
+/// This is the construction-time path used by object literals,
+/// runtime intrinsics, and prototype scaffolding — it bypasses
+/// the §10.1.9 [[Set]] ladder entirely.
+///
+/// # Algorithm
+/// 1. If the key already lives on this object, overwrite the
+///    slot's value, preserving the slot's existing flags. This
+///    matches the `O[k] = v` shape for an existing data property
+///    that has not been re-configured by `defineProperty`.
+/// 2. Otherwise, append a new default-attributes data slot.
+///
+/// Construction-time callers do not respect the extensibility
+/// flag: this path is only used by code that owns the object and
+/// is allowed to seed it (`Error.prototype.message`, etc.).
+///
+/// Fires the GC write barrier when `value` carries a `Gc<…>`
+/// handle so the marker / scavenger see the new edge.
+pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
+    let child_raw = value.as_gc_raw();
+    heap.with_payload(obj, |body| {
         if let Some(offset) = body.shape.offset_of(key) {
-            // Preserve flags but write into the data body.
             let slot = &mut body.slots[offset as usize];
             slot.body = SlotBody::Data { value };
             return;
@@ -539,130 +963,51 @@ impl JsObject {
         let new_shape = Shape::add_property(&body.shape, key);
         body.shape = new_shape;
         body.slots.push(PropertySlot::data_default(value));
+    });
+    if let Some(child) = child_raw {
+        // We do not have a stable slot address inside the SmallVec
+        // (the vector may have reallocated above). Pass the body
+        // base as the slot address — the barrier only uses it for
+        // card-bit derivation, and the body lives at a fixed
+        // offset behind the header.
+        let body_base = obj.as_header_ptr() as *mut u8;
+        let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
+            as *mut otter_gc::RawGc;
+        heap.write_barrier_raw(obj, slot_ptr, child);
     }
+}
 
-    /// Read an **own** property with an accessor short-circuit:
-    /// returns `Some(value)` for data slots, `Some(undefined)` for
-    /// accessor slots (callers that need to invoke the getter must
-    /// use [`Self::lookup_own`] / [`Self::get_own_descriptor`]).
-    #[must_use]
-    pub fn get_own(&self, key: &str) -> Option<Value> {
-        let body = self.inner.borrow();
-        body.shape
-            .offset_of(key)
-            .map(|offset| match &body.slots[offset as usize].body {
-                SlotBody::Data { value } => value.clone(),
-                SlotBody::Accessor { .. } => Value::Undefined,
-            })
+/// Replace the prototype. `None` detaches the chain (encoded as
+/// [`otter_gc::Gc::null()`] inside the body).
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinarysetprototypeof>
+pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<JsObject>) {
+    let new_proto = proto.unwrap_or_else(otter_gc::Gc::null);
+    heap.with_payload(obj, |body| {
+        body.prototype = new_proto;
+    });
+    if !new_proto.is_null() {
+        let body_base = obj.as_header_ptr() as *mut u8;
+        // Slot pointer = base of payload; sufficient for the
+        // barrier's card-bit derivation.
+        let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
+            as *mut otter_gc::RawGc;
+        heap.write_barrier_raw(obj, slot_ptr, new_proto.raw());
     }
+}
 
-    /// Read a property, walking the prototype chain on miss.
-    /// Accessors collapse to `undefined` here for backward-compat
-    /// with construction-time call sites; the dispatch loop's
-    /// `LoadProperty` handler invokes accessors through
-    /// [`Self::lookup`] instead.
-    #[must_use]
-    pub fn get(&self, key: &str) -> Option<Value> {
-        match self.lookup(key) {
-            PropertyLookup::Absent => None,
-            PropertyLookup::Data { value, .. } => Some(value),
-            PropertyLookup::Accessor { .. } => Some(Value::Undefined),
-        }
-    }
-
-    /// Probe for an own property (no proto-chain walk). The result
-    /// distinguishes data, accessor, and absent.
-    #[must_use]
-    pub fn lookup_own(&self, key: &str) -> PropertyLookup {
-        let body = self.inner.borrow();
-        match body.shape.offset_of(key) {
-            Some(offset) => body.slots[offset as usize].to_lookup(),
-            None => PropertyLookup::Absent,
-        }
-    }
-
-    /// Probe for a property with full prototype-chain walk. Returns
-    /// the first hit's descriptor body; useful for the LoadProperty
-    /// dispatch path which needs to know whether to invoke a getter
-    /// at any depth.
-    #[must_use]
-    pub fn lookup(&self, key: &str) -> PropertyLookup {
-        match self.lookup_own(key) {
-            PropertyLookup::Absent => {}
-            hit => return hit,
-        }
-        let mut current = self.prototype();
-        let mut hops = 0;
-        while let Some(proto) = current {
-            if hops >= PROTO_CHAIN_HARD_CAP {
-                return PropertyLookup::Absent;
-            }
-            hops += 1;
-            match proto.lookup_own(key) {
-                PropertyLookup::Absent => {}
-                hit => return hit,
-            }
-            current = proto.prototype();
-        }
-        PropertyLookup::Absent
-    }
-
-    /// Read the descriptor for an own property.
-    #[must_use]
-    pub fn get_own_descriptor(&self, key: &str) -> Option<PropertyDescriptor> {
-        let body = self.inner.borrow();
-        body.shape
-            .offset_of(key)
-            .map(|offset| body.slots[offset as usize].to_descriptor())
-    }
-
-    /// Borrow the current prototype, if any.
-    #[must_use]
-    pub fn prototype(&self) -> Option<JsObject> {
-        self.inner.borrow().prototype.clone()
-    }
-
-    /// Replace the prototype. `None` detaches the chain.
-    pub fn set_prototype(&self, proto: Option<JsObject>) {
-        self.inner.borrow_mut().prototype = proto;
-    }
-
-    /// `true` when this object has `target` somewhere in its
-    /// prototype chain. Used by `instanceof`.
-    #[must_use]
-    pub fn has_in_proto_chain(&self, target: &JsObject) -> bool {
-        let mut current = self.prototype();
-        let mut hops = 0;
-        while let Some(proto) = current {
-            if hops >= PROTO_CHAIN_HARD_CAP {
-                return false;
-            }
-            hops += 1;
-            if proto.ptr_eq(target) {
-                return true;
-            }
-            current = proto.prototype();
-        }
-        false
-    }
-
-    /// Look up by a [`JsString`] key. Convenience for dispatcher
-    /// sites that already hold the WTF-16 form.
-    #[must_use]
-    pub fn get_jsstring(&self, key: &JsString) -> Option<Value> {
-        let utf8 = key.to_lossy_string();
-        self.get(&utf8)
-    }
-
-    /// Remove an own property. Per ECMA-262 §10.1.10 OrdinaryDelete:
-    /// returns `true` when the property is absent or successfully
-    /// removed; returns `false` only when the property exists and is
-    /// non-configurable.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-ordinarydelete>
-    pub fn delete(&self, key: &str) -> bool {
-        let mut body = self.inner.borrow_mut();
+/// Remove an own property. Per ECMA-262 §10.1.10 OrdinaryDelete:
+/// returns `true` when the property is absent or successfully
+/// removed; returns `false` only when the property exists and is
+/// non-configurable.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinarydelete>
+pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
+    heap.with_payload(obj, |body| {
         let Some(offset) = body.shape.offset_of(key) else {
             // Spec step 2: missing → true.
             return true;
@@ -677,47 +1022,20 @@ impl JsObject {
             parent: None,
             key: None,
             keys: new_keys,
-            offsets: RefCell::new(None),
-            transitions: RefCell::new(HashMap::new()),
+            offsets: OnceCell::new(),
+            transitions: Cell::new(HashMap::new()),
         });
         true
-    }
+    })
+}
 
-    /// Look up an **own** symbol-keyed property.
-    #[must_use]
-    pub fn get_own_symbol(&self, key: &JsSymbol) -> Option<Value> {
-        self.inner
-            .borrow()
-            .symbol_props
-            .iter()
-            .find(|(k, _)| k.ptr_eq(key))
-            .map(|(_, v)| v.clone())
-    }
-
-    /// Look up a symbol-keyed property with prototype-chain walk.
-    #[must_use]
-    pub fn get_symbol(&self, key: &JsSymbol) -> Option<Value> {
-        if let Some(v) = self.get_own_symbol(key) {
-            return Some(v);
-        }
-        let mut current = self.prototype();
-        let mut hops = 0;
-        while let Some(proto) = current {
-            if hops >= PROTO_CHAIN_HARD_CAP {
-                return None;
-            }
-            hops += 1;
-            if let Some(v) = proto.get_own_symbol(key) {
-                return Some(v);
-            }
-            current = proto.prototype();
-        }
-        None
-    }
-
-    /// Set or overwrite a symbol-keyed own property.
-    pub fn set_symbol(&self, key: JsSymbol, value: Value) {
-        let mut body = self.inner.borrow_mut();
+/// Set or overwrite a symbol-keyed own property.
+///
+/// Fires the GC write barrier when `value` carries a `Gc<…>`
+/// handle.
+pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, value: Value) {
+    let child_raw = value.as_gc_raw();
+    heap.with_payload(obj, |body| {
         for (existing_key, slot) in body.symbol_props.iter_mut() {
             if existing_key.ptr_eq(&key) {
                 *slot = value;
@@ -725,79 +1043,65 @@ impl JsObject {
             }
         }
         body.symbol_props.push((key, value));
+    });
+    if let Some(child) = child_raw {
+        let body_base = obj.as_header_ptr() as *mut u8;
+        let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
+            as *mut otter_gc::RawGc;
+        heap.write_barrier_raw(obj, slot_ptr, child);
     }
+}
 
-    /// Remove a symbol-keyed own property.
-    pub fn delete_symbol(&self, key: &JsSymbol) -> bool {
-        let mut body = self.inner.borrow_mut();
+/// Remove a symbol-keyed own property.
+pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &JsSymbol) -> bool {
+    heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
             body.symbol_props.remove(pos);
             true
         } else {
             false
         }
-    }
+    })
+}
 
-    /// Borrow a read-only view of the property table.
-    #[must_use]
-    pub fn borrow_props(&self) -> Properties<'_> {
-        Properties {
-            body: self.inner.borrow(),
-        }
-    }
+// ---------- descriptor surface --------------------------------------------
 
-    /// Borrow a mutable view (rarely needed outside the VM core).
-    #[must_use]
-    pub fn borrow_props_mut(&self) -> PropertiesMut<'_> {
-        PropertiesMut {
-            body: self.inner.borrow_mut(),
-        }
-    }
-
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
-    }
-
-    /// Raw `Rc` data-pointer for use as a hash key in cycle detection.
-    #[must_use]
-    pub fn identity_addr(&self) -> *const () {
-        Rc::as_ptr(&self.inner).cast()
-    }
-
-    /// Borrow the current hidden class.
-    #[must_use]
-    pub fn shape(&self) -> Rc<Shape> {
-        Rc::clone(&self.inner.borrow().shape)
-    }
-
-    // ---------- descriptor surface ----------------------------------------
-
-    /// `Object.defineProperty` core — performs §10.1.6
-    /// OrdinaryDefineOwnProperty, returning `true` on success and
-    /// `false` when the request is rejected (non-configurable
-    /// re-definition, etc.).
-    ///
-    /// # Algorithm
-    /// Per ECMA-262 §10.1.6.3 ValidateAndApplyPropertyDescriptor:
-    /// 1. If the property is absent and the object is non-extensible
-    ///    return `false`.
-    /// 2. If absent and extensible, install the descriptor (filling
-    ///    in default attribute bits with `false`).
-    /// 3. If present, validate against the existing descriptor:
-    ///    - Same descriptor → no-op success.
-    ///    - Existing non-configurable rejects: configurable→true,
-    ///      enumerable change, kind change, or (data) writable→true
-    ///      / value change while non-writable.
-    ///    - Otherwise overwrite the slot with the merged result of
-    ///      the supplied + existing descriptors.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
-    /// - <https://tc39.es/ecma262/#sec-validateandapplypropertydescriptor>
-    pub fn define_own_property(&self, key: &str, descriptor: PropertyDescriptor) -> bool {
-        let mut body = self.inner.borrow_mut();
+/// `Object.defineProperty` core — performs §10.1.6
+/// OrdinaryDefineOwnProperty, returning `true` on success and
+/// `false` when the request is rejected (non-configurable
+/// re-definition, etc.).
+///
+/// # Algorithm
+/// Per ECMA-262 §10.1.6.3 ValidateAndApplyPropertyDescriptor:
+/// 1. If the property is absent and the object is non-extensible
+///    return `false`.
+/// 2. If absent and extensible, install the descriptor (filling
+///    in default attribute bits with `false`).
+/// 3. If present, validate against the existing descriptor:
+///    - Same descriptor → no-op success.
+///    - Existing non-configurable rejects: configurable→true,
+///      enumerable change, kind change, or (data) writable→true
+///      / value change while non-writable.
+///    - Otherwise overwrite the slot with the merged result of
+///      the supplied + existing descriptors.
+///
+/// Fires the GC write barrier on every stored `Value` carrying a
+/// `Gc<…>` handle.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
+/// - <https://tc39.es/ecma262/#sec-validateandapplypropertydescriptor>
+pub fn define_own_property(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    // Compute child raws *before* the `with_payload` borrow because
+    // the barrier needs the heap mutable, but `as_gc_raw` is a pure
+    // read.
+    let raws = descriptor_gc_children(&descriptor);
+    let success = heap.with_payload(obj, |body| {
         if let Some(offset) = body.shape.offset_of(key) {
             let existing = body.slots[offset as usize].clone();
             match validate_and_apply(&existing, &descriptor) {
@@ -816,26 +1120,96 @@ impl JsObject {
             body.slots.push(PropertySlot::from_descriptor(descriptor));
             true
         }
+    });
+    if success {
+        // Fire one barrier per outgoing GC reference established
+        // by the new slot (data value, getter, setter). The slot
+        // address is approximated by the body base — sufficient
+        // for card-bit derivation.
+        for child in raws {
+            let body_base = obj.as_header_ptr() as *mut u8;
+            let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
+                as *mut otter_gc::RawGc;
+            heap.write_barrier_raw(obj, slot_ptr, child);
+        }
     }
+    success
+}
 
-    /// Resolve a `[[Set]]` against this receiver — walks the
-    /// prototype chain to detect inherited accessors and
-    /// non-writable shadows, but writes happen on `self` (the
-    /// receiver) only. Per §10.1.9 OrdinarySet.
-    ///
-    /// Returns a [`SetOutcome`] describing the action the dispatch
-    /// loop should take.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-ordinaryset>
-    /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
-    pub fn resolve_set(&self, key: &str) -> SetOutcome {
-        // Walk own + prototype chain looking for an accessor or a
-        // non-writable shadow.
-        let own = self.lookup_own(key);
-        match own {
+/// Collect every `Gc<…>` raw offset that `descriptor` would
+/// install. Used by [`define_own_property`] to drive the write
+/// barrier without holding `&mut body` and `&mut heap`
+/// simultaneously.
+fn descriptor_gc_children(desc: &PropertyDescriptor) -> SmallVec<[otter_gc::RawGc; 3]> {
+    let mut out = SmallVec::new();
+    match &desc.kind {
+        DescriptorKind::Data { value } => {
+            if let Some(c) = value.as_gc_raw() {
+                out.push(c);
+            }
+        }
+        DescriptorKind::Accessor { getter, setter } => {
+            if let Some(g) = getter.as_ref().and_then(Value::as_gc_raw) {
+                out.push(g);
+            }
+            if let Some(s) = setter.as_ref().and_then(Value::as_gc_raw) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a `[[Set]]` against `obj` as receiver — walks the
+/// prototype chain to detect inherited accessors and
+/// non-writable shadows, but writes happen on `obj` (the
+/// receiver) only. Per §10.1.9 OrdinarySet.
+///
+/// Returns a [`SetOutcome`] describing the action the dispatch
+/// loop should take.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-ordinaryset>
+/// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
+pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutcome {
+    // Walk own + prototype chain looking for an accessor or a
+    // non-writable shadow.
+    let own = lookup_own(obj, heap, key);
+    match own {
+        PropertyLookup::Data { flags, .. } => {
+            if flags.writable() {
+                return SetOutcome::AssignData;
+            }
+            return SetOutcome::Reject {
+                reason: SetRejectReason::NonWritable,
+            };
+        }
+        PropertyLookup::Accessor { setter, .. } => {
+            return match setter {
+                Some(setter) => SetOutcome::InvokeSetter { setter },
+                None => SetOutcome::Reject {
+                    reason: SetRejectReason::AccessorWithoutSetter,
+                },
+            };
+        }
+        PropertyLookup::Absent => {}
+    }
+    // Walk prototype chain.
+    let mut current = prototype(obj, heap);
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if hops >= PROTO_CHAIN_HARD_CAP {
+            break;
+        }
+        hops += 1;
+        match lookup_own(proto, heap, key) {
             PropertyLookup::Data { flags, .. } => {
                 if flags.writable() {
+                    if !is_extensible(obj, heap) {
+                        return SetOutcome::Reject {
+                            reason: SetRejectReason::NonExtensible,
+                        };
+                    }
                     return SetOutcome::AssignData;
                 }
                 return SetOutcome::Reject {
@@ -852,85 +1226,48 @@ impl JsObject {
             }
             PropertyLookup::Absent => {}
         }
-        // Walk prototype chain.
-        let mut current = self.prototype();
-        let mut hops = 0;
-        while let Some(proto) = current {
-            if hops >= PROTO_CHAIN_HARD_CAP {
-                break;
-            }
-            hops += 1;
-            match proto.lookup_own(key) {
-                PropertyLookup::Data { flags, .. } => {
-                    if flags.writable() {
-                        // Inherited writable data — receiver gets a
-                        // shadow; honour receiver extensibility.
-                        if !self.is_extensible() {
-                            return SetOutcome::Reject {
-                                reason: SetRejectReason::NonExtensible,
-                            };
-                        }
-                        return SetOutcome::AssignData;
-                    }
-                    return SetOutcome::Reject {
-                        reason: SetRejectReason::NonWritable,
-                    };
-                }
-                PropertyLookup::Accessor { setter, .. } => {
-                    return match setter {
-                        Some(setter) => SetOutcome::InvokeSetter { setter },
-                        None => SetOutcome::Reject {
-                            reason: SetRejectReason::AccessorWithoutSetter,
-                        },
-                    };
-                }
-                PropertyLookup::Absent => {}
-            }
-            current = proto.prototype();
-        }
-        // Nothing on the chain — install a fresh data slot.
-        if !self.is_extensible() {
-            return SetOutcome::Reject {
-                reason: SetRejectReason::NonExtensible,
-            };
-        }
-        SetOutcome::AssignData
+        current = prototype(proto, heap);
     }
-
-    /// `[[IsExtensible]]` — `false` after
-    /// [`Self::prevent_extensions`] / [`Self::seal`] / [`Self::freeze`].
-    #[must_use]
-    pub fn is_extensible(&self) -> bool {
-        self.inner.borrow().extensible
+    // Nothing on the chain — install a fresh data slot.
+    if !is_extensible(obj, heap) {
+        return SetOutcome::Reject {
+            reason: SetRejectReason::NonExtensible,
+        };
     }
+    SetOutcome::AssignData
+}
 
-    /// `Object.preventExtensions(o)` core — clears the
-    /// `[[Extensible]]` slot. Always succeeds for ordinary objects.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
-    pub fn prevent_extensions(&self) {
-        self.inner.borrow_mut().extensible = false;
-    }
+/// `Object.preventExtensions(o)` core — clears the
+/// `[[Extensible]]` slot. Always succeeds for ordinary objects.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
+pub fn prevent_extensions(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(obj, |body| body.extensible = false);
+}
 
-    /// `Object.seal(o)` core — clears `[[Extensible]]` and toggles
-    /// `[[Configurable]]` to `false` on every own property.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-setintegritylevel>
-    pub fn seal(&self) {
-        let mut body = self.inner.borrow_mut();
+/// `Object.seal(o)` core — clears `[[Extensible]]` and toggles
+/// `[[Configurable]]` to `false` on every own property.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-setintegritylevel>
+pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(obj, |body| {
         body.extensible = false;
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
         }
-    }
+    });
+}
 
-    /// `Object.freeze(o)` core — clears `[[Extensible]]`, then for
-    /// every own property: data slots become non-writable and
-    /// non-configurable; accessor slots become non-configurable.
-    pub fn freeze(&self) {
-        let mut body = self.inner.borrow_mut();
+/// `Object.freeze(o)` core — clears `[[Extensible]]`, then for
+/// every own property: data slots become non-writable and
+/// non-configurable; accessor slots become non-configurable.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-setintegritylevel>
+pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(obj, |body| {
         body.extensible = false;
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
@@ -938,54 +1275,92 @@ impl JsObject {
                 slot.flags = slot.flags.with_writable(false);
             }
         }
+    });
+}
+
+// ---------- iteration view -----------------------------------------------
+
+/// Read-only snapshot of an object's properties in insertion
+/// order. Used by debug rendering, JSON serialisation, and
+/// `Object.keys`.
+///
+/// Built by [`with_properties`] under a `read_payload` borrow so
+/// callers can iterate without copying the slot vector. The view
+/// borrows from a transient `&ObjectBody` reference; it cannot
+/// outlive the closure scope.
+pub struct Properties<'a> {
+    body: &'a ObjectBody,
+}
+
+impl<'a> Properties<'a> {
+    /// Iterate every `(key, data-value)` pair in insertion order,
+    /// regardless of enumerability. Accessor slots are surfaced as
+    /// the sentinel `Value::Undefined` — callers that need accessor
+    /// fidelity must consult [`get_own_descriptor`] directly.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
+        self.body
+            .shape
+            .keys()
+            .zip(self.body.slots.iter())
+            .map(|(k, slot)| {
+                let value = match &slot.body {
+                    SlotBody::Data { value } => value.clone(),
+                    SlotBody::Accessor { .. } => Value::Undefined,
+                };
+                (k.as_str(), value)
+            })
     }
 
-    /// `Object.isSealed(o)` — `true` when the object is
-    /// non-extensible and every own property is non-configurable.
-    #[must_use]
-    pub fn is_sealed(&self) -> bool {
-        let body = self.inner.borrow();
-        if body.extensible {
-            return false;
-        }
-        body.slots.iter().all(|s| !s.flags.configurable())
+    /// Iterate keys in insertion order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.body.shape.keys().map(String::as_str)
     }
 
-    /// `Object.isFrozen(o)` — `true` when the object is sealed and
-    /// every data slot is non-writable.
-    #[must_use]
-    pub fn is_frozen(&self) -> bool {
-        let body = self.inner.borrow();
-        if body.extensible {
-            return false;
-        }
-        for slot in body.slots.iter() {
-            if slot.flags.configurable() {
-                return false;
-            }
-            if let SlotBody::Data { .. } = slot.body {
-                if slot.flags.writable() {
-                    return false;
+    /// Iterate symbol-keyed own properties in insertion order.
+    /// Used by `Object.getOwnPropertySymbols` (§20.1.2.13) and
+    /// `Reflect.ownKeys` (§28.1.16) to surface symbol keys.
+    pub fn symbol_keys(&self) -> impl Iterator<Item = JsSymbol> + '_ {
+        self.body.symbol_props.iter().map(|(k, _)| k.clone())
+    }
+
+    /// Iterate `(key, data-value)` pairs, skipping accessor and
+    /// non-enumerable slots. Used by JSON.stringify and `for…in`
+    /// once it lands.
+    pub fn enumerable_data_iter(&self) -> impl Iterator<Item = (&str, Value)> {
+        self.body
+            .shape
+            .keys()
+            .zip(self.body.slots.iter())
+            .filter_map(|(k, slot)| {
+                if !slot.flags.enumerable() {
+                    return None;
                 }
-            }
-        }
-        true
+                match &slot.body {
+                    SlotBody::Data { value } => Some((k.as_str(), value.clone())),
+                    SlotBody::Accessor { .. } => None,
+                }
+            })
+    }
+
+    /// Iterate enumerable own-key names (string-keyed only).
+    pub fn enumerable_keys(&self) -> impl Iterator<Item = &str> {
+        self.body
+            .shape
+            .keys()
+            .zip(self.body.slots.iter())
+            .filter_map(|(k, slot)| slot.flags.enumerable().then_some(k.as_str()))
     }
 }
 
-impl Default for JsObject {
-    fn default() -> Self {
-        let shape = ROOT_SHAPE.with(Rc::clone);
-        Self {
-            inner: Rc::new(RefCell::new(ObjectBody {
-                shape,
-                slots: SmallVec::new(),
-                prototype: None,
-                symbol_props: Vec::new(),
-                extensible: true,
-            })),
-        }
-    }
+/// Run `f` with a [`Properties`] snapshot of `obj`'s string-keyed
+/// and symbol-keyed own properties. The view does not escape the
+/// closure scope.
+pub fn with_properties<R>(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    f: impl FnOnce(Properties<'_>) -> R,
+) -> R {
+    heap.read_payload(obj, |body| f(Properties { body }))
 }
 
 // ---------- ValidateAndApplyPropertyDescriptor ----------------------------
@@ -1074,182 +1449,122 @@ fn same_value(a: &Value, b: &Value) -> bool {
     crate::abstract_ops::same_value(a, b)
 }
 
-// ---------- read-only iteration ------------------------------------------
-
-/// Read-only iteration over an object's properties in insertion
-/// order. Used by debug rendering, JSON serialisation, and
-/// `Object.keys`.
-pub struct Properties<'a> {
-    body: Ref<'a, ObjectBody>,
-}
-
-impl<'a> Properties<'a> {
-    /// Iterate every `(key, data-value)` pair in insertion order,
-    /// regardless of enumerability. Accessor slots are surfaced as
-    /// the sentinel `Value::Undefined` — callers that need accessor
-    /// fidelity must consult `JsObject::get_own_descriptor` directly.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        self.body
-            .shape
-            .keys()
-            .zip(self.body.slots.iter())
-            .map(|(k, slot)| {
-                let value = match &slot.body {
-                    SlotBody::Data { value } => value.clone(),
-                    SlotBody::Accessor { .. } => Value::Undefined,
-                };
-                (k.as_str(), value)
-            })
-    }
-
-    /// Iterate keys in insertion order.
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.body.shape.keys().map(String::as_str)
-    }
-
-    /// Iterate symbol-keyed own properties in insertion order.
-    /// Used by `Object.getOwnPropertySymbols` (§20.1.2.13) and
-    /// `Reflect.ownKeys` (§28.1.16) to surface symbol keys.
-    pub fn symbol_keys(&self) -> impl Iterator<Item = JsSymbol> + '_ {
-        self.body.symbol_props.iter().map(|(k, _)| k.clone())
-    }
-
-    /// Iterate `(key, data-value)` pairs, skipping accessor and
-    /// non-enumerable slots. Used by JSON.stringify and `for…in`
-    /// once it lands.
-    pub fn enumerable_data_iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        self.body
-            .shape
-            .keys()
-            .zip(self.body.slots.iter())
-            .filter_map(|(k, slot)| {
-                if !slot.flags.enumerable() {
-                    return None;
-                }
-                match &slot.body {
-                    SlotBody::Data { value } => Some((k.as_str(), value.clone())),
-                    SlotBody::Accessor { .. } => None,
-                }
-            })
-    }
-
-    /// Iterate enumerable own-key names (string-keyed only).
-    pub fn enumerable_keys(&self) -> impl Iterator<Item = &str> {
-        self.body
-            .shape
-            .keys()
-            .zip(self.body.slots.iter())
-            .filter_map(|(k, slot)| slot.flags.enumerable().then_some(k.as_str()))
-    }
-}
-
-/// Mutable view; rarely used outside the VM core.
-pub struct PropertiesMut<'a> {
-    #[allow(dead_code)]
-    body: RefMut<'a, ObjectBody>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otter_gc::GcHeap;
+
+    fn fresh_heap() -> GcHeap {
+        GcHeap::new().expect("init heap")
+    }
 
     #[test]
     fn empty_object_starts_with_zero_props() {
-        let o = JsObject::new();
-        assert!(o.is_empty());
-        assert_eq!(o.len(), 0);
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        assert!(is_empty(o, &heap));
+        assert_eq!(len(o, &heap), 0);
     }
 
     #[test]
     fn set_then_get_roundtrip() {
-        let o = JsObject::new();
-        o.set("x", Value::Boolean(true));
-        assert_eq!(o.get("x"), Some(Value::Boolean(true)));
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "x", Value::Boolean(true));
+        assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(true))));
     }
 
     #[test]
     fn missing_key_is_none() {
-        let o = JsObject::new();
-        assert!(o.get("missing").is_none());
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        assert!(get(o, &heap, "missing").is_none());
     }
 
     #[test]
     fn insertion_order_is_preserved() {
-        let o = JsObject::new();
-        o.set("a", Value::Boolean(true));
-        o.set("b", Value::Boolean(false));
-        o.set("c", Value::Null);
-        let props = o.borrow_props();
-        let keys: Vec<&str> = props.keys().collect();
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "a", Value::Boolean(true));
+        set(o, &mut heap, "b", Value::Boolean(false));
+        set(o, &mut heap, "c", Value::Null);
+        let keys: Vec<String> =
+            with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
         assert_eq!(keys, vec!["a", "b", "c"]);
     }
 
     #[test]
     fn delete_removes_property() {
-        let o = JsObject::new();
-        o.set("x", Value::Boolean(true));
-        assert!(o.delete("x"));
-        assert!(o.get("x").is_none());
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "x", Value::Boolean(true));
+        assert!(delete(o, &mut heap, "x"));
+        assert!(get(o, &heap, "x").is_none());
         // §10.1.10 — deleting a missing property still reports
         // success (returns true).
-        assert!(o.delete("x"));
+        assert!(delete(o, &mut heap, "x"));
     }
 
     #[test]
-    fn cloning_shares_storage() {
-        let a = JsObject::new();
-        let b = a.clone();
-        a.set("x", Value::Boolean(true));
-        assert!(b.ptr_eq(&a));
-        assert_eq!(b.get("x"), Some(Value::Boolean(true)));
+    fn handle_copy_shares_storage() {
+        let mut heap = fresh_heap();
+        let a = alloc_object(&mut heap).unwrap();
+        let b = a; // Copy
+        set(a, &mut heap, "x", Value::Boolean(true));
+        assert_eq!(a, b);
+        assert!(matches!(get(b, &heap, "x"), Some(Value::Boolean(true))));
     }
 
     #[test]
     fn two_literals_share_shape() {
-        let a = JsObject::new();
-        a.set("x", Value::Boolean(true));
-        a.set("y", Value::Null);
-        let b = JsObject::new();
-        b.set("x", Value::Boolean(false));
-        b.set("y", Value::Undefined);
-        assert!(Rc::ptr_eq(&a.shape(), &b.shape()));
-        let c = JsObject::new();
-        c.set("y", Value::Null);
-        c.set("x", Value::Boolean(true));
-        assert!(!Rc::ptr_eq(&a.shape(), &c.shape()));
+        let mut heap = fresh_heap();
+        let a = alloc_object(&mut heap).unwrap();
+        set(a, &mut heap, "x", Value::Boolean(true));
+        set(a, &mut heap, "y", Value::Null);
+        let b = alloc_object(&mut heap).unwrap();
+        set(b, &mut heap, "x", Value::Boolean(false));
+        set(b, &mut heap, "y", Value::Undefined);
+        assert!(Rc::ptr_eq(&shape(a, &heap), &shape(b, &heap)));
+        let c = alloc_object(&mut heap).unwrap();
+        set(c, &mut heap, "y", Value::Null);
+        set(c, &mut heap, "x", Value::Boolean(true));
+        assert!(!Rc::ptr_eq(&shape(a, &heap), &shape(c, &heap)));
     }
 
     #[test]
     fn overwrite_does_not_grow_shape() {
-        let o = JsObject::new();
-        o.set("x", Value::Boolean(true));
-        let s1 = o.shape();
-        o.set("x", Value::Null);
-        let s2 = o.shape();
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "x", Value::Boolean(true));
+        let s1 = shape(o, &heap);
+        set(o, &mut heap, "x", Value::Null);
+        let s2 = shape(o, &heap);
         assert!(Rc::ptr_eq(&s1, &s2));
-        assert_eq!(o.len(), 1);
+        assert_eq!(len(o, &heap), 1);
     }
 
     #[test]
     fn delete_switches_to_dictionary_shape() {
-        let o = JsObject::new();
-        o.set("a", Value::Boolean(true));
-        o.set("b", Value::Null);
-        let before = o.shape();
-        o.delete("a");
-        let after = o.shape();
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "a", Value::Boolean(true));
+        set(o, &mut heap, "b", Value::Null);
+        let before = shape(o, &heap);
+        delete(o, &mut heap, "a");
+        let after = shape(o, &heap);
         assert!(!Rc::ptr_eq(&before, &after));
-        assert_eq!(o.len(), 1);
-        assert!(o.get("a").is_none());
-        assert_eq!(o.get("b"), Some(Value::Null));
+        assert_eq!(len(o, &heap), 1);
+        assert!(get(o, &heap, "a").is_none());
+        assert!(matches!(get(o, &heap, "b"), Some(Value::Null)));
     }
 
     #[test]
     fn define_property_with_default_attrs() {
-        let o = JsObject::new();
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
         let desc = PropertyDescriptor::data(Value::Boolean(true), false, false, false);
-        assert!(o.define_own_property("x", desc));
-        let got = o.get_own_descriptor("x").unwrap();
+        assert!(define_own_property(o, &mut heap, "x", desc));
+        let got = get_own_descriptor(o, &heap, "x").unwrap();
         assert!(got.is_data());
         assert!(!got.writable());
         assert!(!got.enumerable());
@@ -1258,28 +1573,32 @@ mod tests {
 
     #[test]
     fn define_property_rejects_non_configurable_kind_change() {
-        let o = JsObject::new();
-        o.define_own_property(
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        define_own_property(
+            o,
+            &mut heap,
             "x",
             PropertyDescriptor::data(Value::Boolean(true), true, true, false),
         );
         // Try to switch the data slot to an accessor — must fail.
         let accessor = PropertyDescriptor::accessor(None, None, true, false);
-        assert!(!o.define_own_property("x", accessor));
+        assert!(!define_own_property(o, &mut heap, "x", accessor));
     }
 
     #[test]
     fn freeze_makes_object_non_writable() {
-        let o = JsObject::new();
-        o.set("x", Value::Boolean(true));
-        o.freeze();
-        assert!(o.is_frozen());
-        assert!(o.is_sealed());
-        assert!(!o.is_extensible());
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "x", Value::Boolean(true));
+        freeze(o, &mut heap);
+        assert!(is_frozen(o, &heap));
+        assert!(is_sealed(o, &heap));
+        assert!(!is_extensible(o, &heap));
         // `set` is the construction-time path that doesn't honour
         // attribute flags, so it doesn't apply here. The dispatch
         // layer reaches this through `resolve_set`.
-        match o.resolve_set("x") {
+        match resolve_set(o, &heap, "x") {
             SetOutcome::Reject {
                 reason: SetRejectReason::NonWritable,
             } => {}
@@ -1289,12 +1608,13 @@ mod tests {
 
     #[test]
     fn seal_blocks_new_properties() {
-        let o = JsObject::new();
-        o.set("a", Value::Null);
-        o.seal();
-        assert!(o.is_sealed());
-        assert!(!o.is_frozen());
-        match o.resolve_set("b") {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "a", Value::Null);
+        seal(o, &mut heap);
+        assert!(is_sealed(o, &heap));
+        assert!(!is_frozen(o, &heap));
+        match resolve_set(o, &heap, "b") {
             SetOutcome::Reject {
                 reason: SetRejectReason::NonExtensible,
             } => {}
@@ -1304,12 +1624,15 @@ mod tests {
 
     #[test]
     fn delete_respects_configurable() {
-        let o = JsObject::new();
-        o.define_own_property(
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        define_own_property(
+            o,
+            &mut heap,
             "x",
             PropertyDescriptor::data(Value::Boolean(true), true, true, false),
         );
-        assert!(!o.delete("x"));
-        assert!(o.get("x").is_some());
+        assert!(!delete(o, &mut heap, "x"));
+        assert!(get(o, &heap, "x").is_some());
     }
 }

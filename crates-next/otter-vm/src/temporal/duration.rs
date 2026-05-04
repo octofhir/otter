@@ -38,13 +38,14 @@ use crate::temporal::payload::{JsTemporal, TemporalPayload};
 /// Dispatch `Temporal.Duration.<method>(args...)`.
 pub fn dispatch_static(
     string_heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
     method: &str,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
     let _ = string_heap;
     match method {
-        "from" => from(args),
-        "compare" => compare(args),
+        "from" => from(args, gc_heap),
+        "compare" => compare(args, gc_heap),
         other => Err(TemporalError::UnknownMember {
             class: "Duration".to_string(),
             method: other.to_string(),
@@ -53,7 +54,7 @@ pub fn dispatch_static(
 }
 
 /// Spec §7.2.1 `Temporal.Duration.from`.
-fn from(args: &[Value]) -> Result<Value, TemporalError> {
+fn from(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalError> {
     let dur = match args.first() {
         Some(Value::String(s)) => temporal_rs::Duration::from_utf8(s.to_lossy_string().as_bytes())
             .map_err(|e| TemporalError::Engine {
@@ -62,7 +63,7 @@ fn from(args: &[Value]) -> Result<Value, TemporalError> {
                 message: e.to_string(),
             })?,
         Some(Value::Object(obj)) => {
-            partial_from_object(obj).map_err(|e| TemporalError::Engine {
+            partial_from_object(obj, gc_heap).map_err(|e| TemporalError::Engine {
                 class: "Duration",
                 method: "from",
                 message: e.to_string(),
@@ -94,9 +95,9 @@ fn from(args: &[Value]) -> Result<Value, TemporalError> {
 /// Spec §7.2.2 `Temporal.Duration.compare(a, b, options?)`. The
 /// foundation skips the `relativeTo` option (only date-only or
 /// time-only durations compare without it).
-fn compare(args: &[Value]) -> Result<Value, TemporalError> {
-    let a = expect_duration(args, 0)?;
-    let b = expect_duration(args, 1)?;
+fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalError> {
+    let a = expect_duration(args, 0, gc_heap)?;
+    let b = expect_duration(args, 1, gc_heap)?;
     let cmp = a.compare(&b, None).map_err(|e| TemporalError::Engine {
         class: "Duration",
         method: "compare",
@@ -110,7 +111,11 @@ fn compare(args: &[Value]) -> Result<Value, TemporalError> {
     Ok(Value::Number(NumberValue::from_i32(n)))
 }
 
-fn expect_duration(args: &[Value], index: u16) -> Result<temporal_rs::Duration, TemporalError> {
+fn expect_duration(
+    args: &[Value],
+    index: u16,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::Duration, TemporalError> {
     match args.get(index as usize) {
         Some(Value::Temporal(t)) => match t.payload() {
             TemporalPayload::Duration(d) => Ok(*d),
@@ -127,11 +132,13 @@ fn expect_duration(args: &[Value], index: u16) -> Result<temporal_rs::Duration, 
                 method: "compare",
                 message: e.to_string(),
             }),
-        Some(Value::Object(obj)) => partial_from_object(obj).map_err(|e| TemporalError::Engine {
-            class: "Duration",
-            method: "compare",
-            message: e.to_string(),
-        }),
+        Some(Value::Object(obj)) => {
+            partial_from_object(obj, gc_heap).map_err(|e| TemporalError::Engine {
+                class: "Duration",
+                method: "compare",
+                message: e.to_string(),
+            })
+        }
         _ => Err(TemporalError::BadArgument {
             class: "Duration",
             method: "compare",
@@ -147,43 +154,48 @@ fn expect_duration(args: &[Value], index: u16) -> Result<temporal_rs::Duration, 
 /// argument is a plain object.
 pub fn partial_from_object(
     obj: &JsObject,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Duration, temporal_rs::TemporalError> {
     let mut partial = temporal_rs::partial::PartialDuration::empty();
-    if let Some(v) = optional_field(obj, "years")? {
+    if let Some(v) = optional_field(obj, "years", gc_heap)? {
         partial = partial.with_years(v);
     }
-    if let Some(v) = optional_field(obj, "months")? {
+    if let Some(v) = optional_field(obj, "months", gc_heap)? {
         partial = partial.with_months(v);
     }
-    if let Some(v) = optional_field(obj, "weeks")? {
+    if let Some(v) = optional_field(obj, "weeks", gc_heap)? {
         partial = partial.with_weeks(v);
     }
-    if let Some(v) = optional_field(obj, "days")? {
+    if let Some(v) = optional_field(obj, "days", gc_heap)? {
         partial = partial.with_days(v);
     }
-    if let Some(v) = optional_field(obj, "hours")? {
+    if let Some(v) = optional_field(obj, "hours", gc_heap)? {
         partial = partial.with_hours(v);
     }
-    if let Some(v) = optional_field(obj, "minutes")? {
+    if let Some(v) = optional_field(obj, "minutes", gc_heap)? {
         partial = partial.with_minutes(v);
     }
-    if let Some(v) = optional_field(obj, "seconds")? {
+    if let Some(v) = optional_field(obj, "seconds", gc_heap)? {
         partial = partial.with_seconds(v);
     }
-    if let Some(v) = optional_field(obj, "milliseconds")? {
+    if let Some(v) = optional_field(obj, "milliseconds", gc_heap)? {
         partial = partial.with_milliseconds(v);
     }
-    if let Some(v) = optional_field(obj, "microseconds")? {
+    if let Some(v) = optional_field(obj, "microseconds", gc_heap)? {
         partial = partial.with_microseconds(v as i128);
     }
-    if let Some(v) = optional_field(obj, "nanoseconds")? {
+    if let Some(v) = optional_field(obj, "nanoseconds", gc_heap)? {
         partial = partial.with_nanoseconds(v as i128);
     }
     temporal_rs::Duration::from_partial_duration(partial)
 }
 
-fn optional_field(obj: &JsObject, name: &str) -> Result<Option<i64>, temporal_rs::TemporalError> {
-    match obj.get(name) {
+fn optional_field(
+    obj: &JsObject,
+    name: &str,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Option<i64>, temporal_rs::TemporalError> {
+    match crate::object::get(*obj, gc_heap, name) {
         None | Some(Value::Undefined) => Ok(None),
         Some(Value::Number(n)) => Ok(Some(match n.as_smi() {
             Some(v) => v as i64,
@@ -258,7 +270,11 @@ fn impl_total(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         reason: "must be { unit: '<unit>' } options",
     })?;
     let _ = read_i64_field;
-    let unit_name = read_string_field(opts, "unit").ok_or(IntrinsicError::BadArgument {
+    let unit_name = {
+        let heap = args.gc_heap.borrow();
+        read_string_field(opts, "unit", &heap)
+    }
+    .ok_or(IntrinsicError::BadArgument {
         index: 0,
         reason: "options must include a `unit` string",
     })?;
@@ -287,7 +303,8 @@ fn duration_arg(
             }),
         },
         Some(Value::Object(obj)) => {
-            partial_from_object(obj).map_err(|_| IntrinsicError::BadArgument {
+            let heap = args.gc_heap.borrow();
+            partial_from_object(obj, &heap).map_err(|_| IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration partial",
             })

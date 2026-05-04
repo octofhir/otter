@@ -31,7 +31,12 @@ use crate::{Value, VmError};
 /// - [`VmError::TypeMismatch`] for unsupported element kinds /
 ///   non-TypedArray receivers / out-of-range indices.
 /// - [`VmError::UnknownIntrinsic`] for unrecognised method names.
-pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Value, VmError> {
+pub fn call(
+    name: &str,
+    args: &[Value],
+    string_heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     match name {
         // §25.4.13 Atomics.isLockFree(size) — true for the four
         // sizes the spec mandates (1, 2, 4, 8).
@@ -140,9 +145,9 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
             };
             let promise =
                 JsPromiseHandle::fulfilled(Value::String(JsString::from_str(label, string_heap)?));
-            let result = crate::object::JsObject::new();
-            result.set("async", Value::Boolean(false));
-            result.set("value", Value::Promise(promise));
+            let result = crate::object::alloc_object(gc_heap)?;
+            crate::object::set(result, gc_heap, "async", Value::Boolean(false));
+            crate::object::set(result, gc_heap, "value", Value::Promise(promise));
             Ok(Value::Object(result))
         }
         other => Err(VmError::UnknownIntrinsic {

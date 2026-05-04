@@ -9,6 +9,8 @@
   - [x] 74 — `GcStats` + `HeapSnapshot` + retained-size walker + `Runtime::heap_stats` / `heap_snapshot` / `force_gc` (closed 2026-05-04)
   - [x] 75 — `RuntimeState::trace_roots` + `GcTrace` stubs on every future-`Gc` type + `Runtime::force_gc` wiring + per-root smoke-test scaffold (closed 2026-05-04)
   - [x] 76 — `UpvalueCell` migrated to `Gc<UpvalueCellBody>` + `SafeTraceable` trait + `alloc_old` / `with_payload` / `read_payload` / `write_barrier_raw` GC APIs + `GcHeap` moved into `Interpreter` + `Frame::for_function_with_heap` / `Frame::build_upvalues` + `Value::trace_value_slots` for closure-spine walk + upvalue smoke test un-ignored + `counter_closure_no_leak` regression (closed 2026-05-04)
+  - [x] 76A — `RuntimeCx`/`NativeCtx`, `!Send + !Sync` static assertions, trybuild compile-fail fixtures (closed 2026-05-05)
+  - [x] 77 — `JsObject` → `Gc<ObjectBody>` (split 77A → 77B → 77C; closed 2026-05-05)
 - [ ] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
 - [ ] Workers / isolate pools (task 92)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
@@ -53,8 +55,11 @@ later tasks assume earlier ones have landed.
 | 74 | [74-gc-stats-and-snapshot.md](./74-gc-stats-and-snapshot.md) | `GcStats`, `HeapSnapshot`, retained-size walker, `Runtime::heap_stats()`. |
 | 75 | [75-gc-root-enumeration.md](./75-gc-root-enumeration.md) | `RuntimeState::trace_roots`: frames, microtask queue, module envs, dynamic-import host, symbol registry; smoke tests. |
 | 76 | [76-migrate-upvalue-cell.md](./76-migrate-upvalue-cell.md) | `UpvalueCell` from `Rc<RefCell<Value>>` → `Gc<UpvalueCellBody>` + write-barrier wiring on every upvalue store. |
-| 76A | ✅ structural pieces landed (2026-05-04); thread-default helpers retained as transitional shims pending tasks 77-83 | `RuntimeCx<'rt>` / `NativeCtx<'rt>` types in `crates-next/otter-vm/src/runtime_cx.rs`; `!Send + !Sync` static assertions on `GcHeap` / `Gc<T>` / `Local<'gc, T>` / `HandleScope` / `Interpreter` / `NativeCtx<'_>`; trybuild compile-fail fixtures rejecting `Gc<T>` / `Local<'gc, T>` / `GcHeap` captured into `Send` futures (`crates-next/otter-vm/tests/compile_fail/`). |
-| 77 | [77-migrate-jsobject.md](./77-migrate-jsobject.md) | `JsObject` → `Gc<ObjectBody>`; the heart of the leak surface; write barriers on every property store. |
+| 76A | ✅ closed (2026-05-05) | `RuntimeCx<'rt>` / `NativeCtx<'rt>` types in `crates-next/otter-vm/src/runtime_cx.rs`; `!Send + !Sync` static assertions on `GcHeap` / `Gc<T>` / `Local<'gc, T>` / `HandleScope` / `Interpreter` / `NativeCtx<'_>`; trybuild compile-fail fixtures rejecting `Gc<T>` / `Local<'gc, T>` / `GcHeap` captured into `Send` futures (`crates-next/otter-vm/tests/compile_fail/`). Thread-default escape hatch deleted in 77C. |
+| 77 | ✅ closed (2026-05-05) | `JsObject` → `Gc<ObjectBody>`; the heart of the leak surface; write barriers on every property store. Split into 77A/77B/77C. |
+| 77A | ✅ closed (2026-05-04) | Body type swap + `SafeTraceable` impl + explicit-`&[mut] GcHeap` API inside `object.rs`. Workspace build expected red until 77B. |
+| 77B | ✅ closed (2026-05-05) | Mechanical caller sweep across `crates-next/otter-vm/src/` — thread `&[mut] gc_heap` through every site. Workspace build green at the end. |
+| 77C | ✅ closed (2026-05-05) | Un-ignore root smoke tests, add `proto_cycle_reaped` regression, delete `#[doc(hidden)]` thread-default shims from `heap.rs`, tighten 76A's third box to `[x]`. |
 | 78 | [78-migrate-jsarray.md](./78-migrate-jsarray.md) | `JsArray` → `Gc<ArrayBody>`; write barriers on element / named-prop stores. |
 | 79 | [79-migrate-jsmap-jsset.md](./79-migrate-jsmap-jsset.md) | `JsMap` / `JsSet` → `Gc<…>`; write barriers on entry stores. |
 | 80 | [80-migrate-weakmap-weakset-ephemerons.md](./80-migrate-weakmap-weakset-ephemerons.md) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes "task 57" markers). |

@@ -905,7 +905,7 @@ impl Runtime {
         let mut module = linked.module;
         let entry_url = linked.entry_url.clone();
         for init in &module.module_inits {
-            let env = otter_vm::JsObject::new();
+            let env = otter_vm::object::alloc_object(self.interp.gc_heap_mut())?;
             self.interp
                 .register_module_env(std::rc::Rc::from(init.url.as_str()), env);
             // Self-loop edge: <entry>'s referrer is the entry's URL

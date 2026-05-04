@@ -409,11 +409,13 @@ mod tests {
 
     fn call(method: &str, recv: Value, args: &[Value]) -> Value {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = lookup(method).unwrap();
         (entry.impl_fn)(&IntrinsicArgs {
             receiver: &recv,
             args,
             string_heap: &heap,
+            gc_heap: std::cell::RefCell::new(&mut gc_heap),
         })
         .unwrap()
     }

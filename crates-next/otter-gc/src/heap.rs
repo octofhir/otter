@@ -25,8 +25,6 @@
 //!
 //! - GC architecture plan §6.1 (unsafe boundary).
 
-use std::cell::Cell;
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -876,129 +874,6 @@ impl GcHeap {
     pub fn page_header_size() -> usize {
         PAGE_HEADER_SIZE
     }
-
-    /// **TRANSITIONAL** — register `self` as the current thread's
-    /// default heap for the duration of `f`.
-    ///
-    /// Per ADR-0005 §3 and task 76A, the explicit-context API
-    /// (`RuntimeCx<'rt>` / `NativeCtx<'rt>` / `&mut GcHeap`) is the
-    /// architectural answer; this helper exists only because tasks
-    /// 77-83 are migrating callers incrementally. Once every
-    /// `JsObject` / `JsArray` / `JsMap` / native-binding caller has
-    /// been threaded with explicit `&mut GcHeap`, this helper and
-    /// its companions are removed entirely (gate in 76A §3).
-    ///
-    /// New callers MUST take `&GcHeap` / `&mut GcHeap` directly.
-    /// Search `crates-next/` for `with_thread_default` to track the
-    /// remaining migration surface.
-    ///
-    /// # See also
-    /// - [`docs/new-engine/tasks/76a-runtime-binding-explicit-context.md`].
-    /// - [`docs/new-engine/adr/0005-async-runtime-binding.md`] §3.
-    #[doc(hidden)]
-    pub fn enter_thread_default<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let _guard = self.install_thread_default();
-        f(self)
-    }
-
-    /// **TRANSITIONAL** — see [`Self::enter_thread_default`].
-    ///
-    /// Register `self` as the current thread's default heap and
-    /// return a guard that restores the previous registration on
-    /// drop.
-    #[doc(hidden)]
-    pub fn install_thread_default(&mut self) -> ThreadDefaultGuard {
-        let prev = THREAD_HEAP.with(|cell| cell.replace(Some(NonNull::from(&mut *self))));
-        ThreadDefaultGuard { prev }
-    }
-
-    /// **TRANSITIONAL** — see [`Self::enter_thread_default`].
-    ///
-    /// Run `f` with shared access to the current thread's default
-    /// heap. Panics if no heap is registered or if the heap is
-    /// already mutably borrowed.
-    #[doc(hidden)]
-    pub fn with_thread_default<R>(f: impl FnOnce(&Self) -> R) -> R {
-        let ptr = THREAD_HEAP.with(Cell::get).expect(
-            "no GcHeap registered for this thread (call GcHeap::enter_thread_default first)",
-        );
-        let count = THREAD_HEAP_BORROWED.with(Cell::get);
-        assert!(
-            count != usize::MAX,
-            "GcHeap::with_thread_default while heap is mutably borrowed"
-        );
-        THREAD_HEAP_BORROWED.with(|c| c.set(count.wrapping_add(1)));
-        struct Guard;
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                THREAD_HEAP_BORROWED.with(|c| c.set(c.get().wrapping_sub(1)));
-            }
-        }
-        let _guard = Guard;
-        // SAFETY: `ptr` was registered via `enter_thread_default`,
-        // which holds an exclusive `&mut` to the heap for the
-        // duration of `f`. The borrow counter ensures no
-        // concurrent mutable borrow exists.
-        f(unsafe { ptr.as_ref() })
-    }
-
-    /// **TRANSITIONAL** — see [`Self::enter_thread_default`].
-    ///
-    /// Run `f` with exclusive access to the current thread's
-    /// default heap. Panics if no heap is registered or if the
-    /// heap is already borrowed.
-    #[doc(hidden)]
-    pub fn with_thread_default_mut<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        let mut ptr = THREAD_HEAP.with(Cell::get).expect(
-            "no GcHeap registered for this thread (call GcHeap::enter_thread_default first)",
-        );
-        let count = THREAD_HEAP_BORROWED.with(Cell::get);
-        assert!(
-            count == 0,
-            "GcHeap::with_thread_default_mut while heap is already borrowed"
-        );
-        THREAD_HEAP_BORROWED.with(|c| c.set(usize::MAX));
-        struct Guard;
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                THREAD_HEAP_BORROWED.with(|c| c.set(0));
-            }
-        }
-        let _guard = Guard;
-        // SAFETY: `ptr` was registered via `enter_thread_default`,
-        // which holds an exclusive `&mut` to the heap for the
-        // duration of `f`. The borrow counter ensures no
-        // concurrent borrow exists.
-        f(unsafe { ptr.as_mut() })
-    }
-
-    /// **TRANSITIONAL** — `true` when this thread has a registered
-    /// default heap. See [`Self::enter_thread_default`].
-    #[doc(hidden)]
-    pub fn has_thread_default() -> bool {
-        THREAD_HEAP.with(Cell::get).is_some()
-    }
-}
-
-/// **TRANSITIONAL** — RAII guard returned by
-/// [`GcHeap::install_thread_default`]. See that method for the
-/// migration story.
-#[doc(hidden)]
-pub struct ThreadDefaultGuard {
-    prev: Option<NonNull<GcHeap>>,
-}
-
-impl Drop for ThreadDefaultGuard {
-    fn drop(&mut self) {
-        THREAD_HEAP.with(|cell| cell.set(self.prev));
-    }
-}
-
-thread_local! {
-    /// Currently-registered default heap pointer for this thread.
-    static THREAD_HEAP: Cell<Option<NonNull<GcHeap>>> = const { Cell::new(None) };
-    /// Borrow counter modelled on [`std::cell::RefCell`].
-    static THREAD_HEAP_BORROWED: Cell<usize> = const { Cell::new(0) };
 }
 
 impl std::fmt::Debug for GcHeap {

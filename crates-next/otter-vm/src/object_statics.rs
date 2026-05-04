@@ -17,7 +17,7 @@
 //! - All names match ECMA-262 spelling exactly.
 //! - Reads of the descriptor object's `value / writable / enumerable
 //!   / configurable / get / set` slots use direct own-data reads
-//!   ([`JsObject::get_own`]). User-installed accessors / inherited
+//!   ([`crate::object::lookup_own`]). User-installed accessors / inherited
 //!   descriptor fields are intentionally ignored in this slice; the
 //!   spec uses the full `[[Get]]` ladder, but the ergonomic surface
 //!   (`Object.defineProperty(o, 'k', { value: 1 })`) doesn't depend
@@ -44,7 +44,12 @@ use crate::{Value, VmError};
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
-pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Value, VmError> {
+pub fn call(
+    name: &str,
+    args: &[Value],
+    string_heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     match name {
         // §20.1.2.2 Object.create(O, Properties)
         // <https://tc39.es/ecma262/#sec-object.create>
@@ -55,27 +60,28 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
                 Value::Null => None,
                 _ => return Err(VmError::TypeMismatch),
             };
-            let obj = JsObject::new();
-            obj.set_prototype(proto_obj);
+            let obj = crate::object::alloc_object(gc_heap)?;
+            crate::object::set_prototype(obj, gc_heap, proto_obj);
             if let Some(props_arg) = args.get(1)
                 && !matches!(props_arg, Value::Undefined)
             {
                 let props = match props_arg {
-                    Value::Object(o) => o.clone(),
+                    Value::Object(o) => *o,
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let entries: Vec<(String, Value)> = props
-                    .borrow_props()
-                    .enumerable_data_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect();
+                let entries: Vec<(String, Value)> =
+                    crate::object::with_properties(props, gc_heap, |p| {
+                        p.enumerable_data_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect()
+                    });
                 for (key, desc_value) in entries {
                     let desc_obj = match desc_value {
                         Value::Object(o) => o,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let descriptor = coerce_to_descriptor(&desc_obj)?;
-                    if !obj.define_own_property(&key, descriptor) {
+                    let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
+                    if !crate::object::define_own_property(obj, gc_heap, &key, descriptor) {
                         return Err(VmError::TypeMismatch);
                     }
                 }
@@ -88,8 +94,8 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let desc_obj = expect_object(args.get(2))?;
-            let descriptor = coerce_to_descriptor(&desc_obj)?;
-            if !target.define_own_property(&key, descriptor) {
+            let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
+            if !crate::object::define_own_property(target, gc_heap, &key, descriptor) {
                 return Err(VmError::TypeMismatch);
             }
             Ok(Value::Object(target))
@@ -101,18 +107,19 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
             let props = expect_object(args.get(1))?;
             // Walk enumerable own keys of `props`. Each value is a
             // descriptor object that we coerce + apply.
-            let entries: Vec<(String, Value)> = props
-                .borrow_props()
-                .enumerable_data_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
+            let entries: Vec<(String, Value)> =
+                crate::object::with_properties(props, gc_heap, |p| {
+                    p.enumerable_data_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect()
+                });
             for (key, desc_value) in entries {
                 let desc_obj = match desc_value {
                     Value::Object(o) => o,
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let descriptor = coerce_to_descriptor(&desc_obj)?;
-                if !target.define_own_property(&key, descriptor) {
+                let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
+                if !crate::object::define_own_property(target, gc_heap, &key, descriptor) {
                     return Err(VmError::TypeMismatch);
                 }
             }
@@ -123,8 +130,8 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         "getOwnPropertyDescriptor" => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
-            match target.get_own_descriptor(&key) {
-                Some(desc) => Ok(Value::Object(descriptor_to_object(&desc))),
+            match crate::object::get_own_descriptor(target, gc_heap, &key) {
+                Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
                 None => Ok(Value::Undefined),
             }
         }
@@ -132,17 +139,16 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptors>
         "getOwnPropertyDescriptors" => {
             let target = expect_object(args.first())?;
-            let result = JsObject::new();
+            let result = crate::object::alloc_object(gc_heap)?;
             // Walk every own string key (enumerable or not) — spec
             // says all own keys.
-            let keys: Vec<String> = target
-                .borrow_props()
-                .keys()
-                .map(|s| s.to_string())
-                .collect();
+            let keys: Vec<String> = crate::object::with_properties(target, gc_heap, |p| {
+                p.keys().map(|s| s.to_string()).collect()
+            });
             for key in keys {
-                if let Some(desc) = target.get_own_descriptor(&key) {
-                    result.set(&key, Value::Object(descriptor_to_object(&desc)));
+                if let Some(desc) = crate::object::get_own_descriptor(target, gc_heap, &key) {
+                    let value = Value::Object(descriptor_to_object(&desc, gc_heap)?);
+                    crate::object::set(result, gc_heap, &key, value);
                 }
             }
             Ok(Value::Object(result))
@@ -152,7 +158,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         "freeze" => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             if let Value::Object(o) = &arg {
-                o.freeze();
+                crate::object::freeze(*o, gc_heap);
             }
             // Spec: returns the argument unchanged (non-objects pass
             // through).
@@ -162,7 +168,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         "seal" => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             if let Value::Object(o) = &arg {
-                o.seal();
+                crate::object::seal(*o, gc_heap);
             }
             Ok(arg)
         }
@@ -170,7 +176,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         "preventExtensions" => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             if let Value::Object(o) = &arg {
-                o.prevent_extensions();
+                crate::object::prevent_extensions(*o, gc_heap);
             }
             Ok(arg)
         }
@@ -179,7 +185,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             // Per spec, `Object.isFrozen(non_object) === true`.
             let result = match arg {
-                Value::Object(o) => o.is_frozen(),
+                Value::Object(o) => crate::object::is_frozen(o, gc_heap),
                 _ => true,
             };
             Ok(Value::Boolean(result))
@@ -188,7 +194,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         "isSealed" => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             let result = match arg {
-                Value::Object(o) => o.is_sealed(),
+                Value::Object(o) => crate::object::is_sealed(o, gc_heap),
                 _ => true,
             };
             Ok(Value::Boolean(result))
@@ -198,7 +204,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             // Spec: `Object.isExtensible(non_object) === false`.
             let result = match arg {
-                Value::Object(o) => o.is_extensible(),
+                Value::Object(o) => crate::object::is_extensible(o, gc_heap),
                 _ => false,
             };
             Ok(Value::Boolean(result))
@@ -207,11 +213,9 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         // <https://tc39.es/ecma262/#sec-object.keys>
         "keys" => {
             let target = expect_object(args.first())?;
-            let owned: Vec<String> = target
-                .borrow_props()
-                .enumerable_keys()
-                .map(|k| k.to_string())
-                .collect();
+            let owned: Vec<String> = crate::object::with_properties(target, gc_heap, |p| {
+                p.enumerable_keys().map(|k| k.to_string()).collect()
+            });
             let mut names: Vec<Value> = Vec::with_capacity(owned.len());
             for k in owned {
                 names.push(string_value(&k, string_heap)?);
@@ -222,11 +226,9 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         // <https://tc39.es/ecma262/#sec-object.values>
         "values" => {
             let target = expect_object(args.first())?;
-            let values: Vec<Value> = target
-                .borrow_props()
-                .enumerable_data_iter()
-                .map(|(_, v)| v)
-                .collect();
+            let values: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
+                p.enumerable_data_iter().map(|(_, v)| v).collect()
+            });
             Ok(Value::Array(JsArray::from_elements(values)))
         }
         // §20.1.2.5 Object.entries(O) — `[key, value]` pairs in
@@ -234,11 +236,11 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         // <https://tc39.es/ecma262/#sec-object.entries>
         "entries" => {
             let target = expect_object(args.first())?;
-            let raw: Vec<(String, Value)> = target
-                .borrow_props()
-                .enumerable_data_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
+            let raw: Vec<(String, Value)> = crate::object::with_properties(target, gc_heap, |p| {
+                p.enumerable_data_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect()
+            });
             let mut pairs: Vec<Value> = Vec::with_capacity(raw.len());
             for (k, v) in raw {
                 let key = string_value(&k, string_heap)?;
@@ -264,13 +266,14 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
                     // skipped silently.
                     Value::Undefined | Value::Null => continue,
                     Value::Object(o) => {
-                        let entries: Vec<(String, Value)> = o
-                            .borrow_props()
-                            .enumerable_data_iter()
-                            .map(|(k, v)| (k.to_string(), v))
-                            .collect();
+                        let entries: Vec<(String, Value)> =
+                            crate::object::with_properties(*o, gc_heap, |p| {
+                                p.enumerable_data_iter()
+                                    .map(|(k, v)| (k.to_string(), v))
+                                    .collect()
+                            });
                         for (k, v) in entries {
-                            target.set(&k, v);
+                            crate::object::set(target, gc_heap, &k, v);
                         }
                     }
                     _ => return Err(VmError::TypeMismatch),
@@ -285,7 +288,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         // <https://tc39.es/ecma262/#sec-object.fromentries>
         "fromEntries" => {
             let iter = args.first().cloned().unwrap_or(Value::Undefined);
-            let result = JsObject::new();
+            let result = crate::object::alloc_object(gc_heap)?;
             match iter {
                 Value::Array(arr) => {
                     // Snapshot to avoid holding the array's RefCell
@@ -297,7 +300,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
                                 let key = pair.get(0);
                                 let value = pair.get(1);
                                 let key_str = property_key_from_value(&key)?;
-                                result.set(&key_str, value);
+                                crate::object::set(result, gc_heap, &key_str, value);
                             }
                             _ => return Err(VmError::TypeMismatch),
                         }
@@ -306,7 +309,7 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
                 Value::Map(m) => {
                     for (key, value) in m.entries() {
                         let key_str = property_key_from_value(&key)?;
-                        result.set(&key_str, value);
+                        crate::object::set(result, gc_heap, &key_str, value);
                     }
                 }
                 _ => return Err(VmError::TypeMismatch),
@@ -319,7 +322,10 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         "hasOwn" => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
-            let present = !matches!(target.lookup_own(&key), PropertyLookup::Absent);
+            let present = !matches!(
+                crate::object::lookup_own(target, gc_heap, &key),
+                PropertyLookup::Absent
+            );
             Ok(Value::Boolean(present))
         }
         // §20.1.2.12 Object.getOwnPropertyNames(O) — every own
@@ -327,11 +333,9 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         // <https://tc39.es/ecma262/#sec-object.getownpropertynames>
         "getOwnPropertyNames" => {
             let target = expect_object(args.first())?;
-            let owned: Vec<String> = target
-                .borrow_props()
-                .keys()
-                .map(|k| k.to_string())
-                .collect();
+            let owned: Vec<String> = crate::object::with_properties(target, gc_heap, |p| {
+                p.keys().map(|k| k.to_string()).collect()
+            });
             let mut names: Vec<Value> = Vec::with_capacity(owned.len());
             for k in owned {
                 names.push(string_value(&k, string_heap)?);
@@ -345,10 +349,9 @@ pub fn call(name: &str, args: &[Value], string_heap: &StringHeap) -> Result<Valu
         // <https://tc39.es/ecma262/#sec-object.getownpropertysymbols>
         "getOwnPropertySymbols" => {
             let target = expect_object(args.first())?;
-            let mut syms: Vec<Value> = Vec::new();
-            for sym in target.borrow_props().symbol_keys() {
-                syms.push(Value::Symbol(sym));
-            }
+            let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
+                p.symbol_keys().map(Value::Symbol).collect()
+            });
             Ok(Value::Array(JsArray::from_elements(syms)))
         }
         _ => Err(VmError::UnknownIntrinsic {
@@ -377,15 +380,18 @@ fn string_value(s: &str, heap: &StringHeap) -> Result<Value, VmError> {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
-pub fn coerce_to_descriptor(desc_obj: &JsObject) -> Result<PropertyDescriptor, VmError> {
+pub fn coerce_to_descriptor(
+    desc_obj: &JsObject,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<PropertyDescriptor, VmError> {
     // Direct own-data probes — accessors on the descriptor object
     // itself are ignored for the slice.
-    let value = desc_obj.lookup_own("value");
-    let writable = desc_obj.lookup_own("writable");
-    let enumerable = desc_obj.lookup_own("enumerable");
-    let configurable = desc_obj.lookup_own("configurable");
-    let getter = desc_obj.lookup_own("get");
-    let setter = desc_obj.lookup_own("set");
+    let value = crate::object::lookup_own(*desc_obj, gc_heap, "value");
+    let writable = crate::object::lookup_own(*desc_obj, gc_heap, "writable");
+    let enumerable = crate::object::lookup_own(*desc_obj, gc_heap, "enumerable");
+    let configurable = crate::object::lookup_own(*desc_obj, gc_heap, "configurable");
+    let getter = crate::object::lookup_own(*desc_obj, gc_heap, "get");
+    let setter = crate::object::lookup_own(*desc_obj, gc_heap, "set");
 
     let has_value = !matches!(value, PropertyLookup::Absent);
     let has_writable = !matches!(writable, PropertyLookup::Absent);
@@ -435,21 +441,44 @@ pub fn coerce_to_descriptor(desc_obj: &JsObject) -> Result<PropertyDescriptor, V
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-frompropertydescriptor>
-fn descriptor_to_object(desc: &PropertyDescriptor) -> JsObject {
-    let result = JsObject::new();
+fn descriptor_to_object(
+    desc: &PropertyDescriptor,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<JsObject, VmError> {
+    let result = crate::object::alloc_object(gc_heap)?;
     match &desc.kind {
         DescriptorKind::Data { value } => {
-            result.set("value", value.clone());
-            result.set("writable", Value::Boolean(desc.writable()));
+            crate::object::set(result, gc_heap, "value", value.clone());
+            crate::object::set(result, gc_heap, "writable", Value::Boolean(desc.writable()));
         }
         DescriptorKind::Accessor { getter, setter } => {
-            result.set("get", getter.clone().unwrap_or(Value::Undefined));
-            result.set("set", setter.clone().unwrap_or(Value::Undefined));
+            crate::object::set(
+                result,
+                gc_heap,
+                "get",
+                getter.clone().unwrap_or(Value::Undefined),
+            );
+            crate::object::set(
+                result,
+                gc_heap,
+                "set",
+                setter.clone().unwrap_or(Value::Undefined),
+            );
         }
     }
-    result.set("enumerable", Value::Boolean(desc.enumerable()));
-    result.set("configurable", Value::Boolean(desc.configurable()));
-    result
+    crate::object::set(
+        result,
+        gc_heap,
+        "enumerable",
+        Value::Boolean(desc.enumerable()),
+    );
+    crate::object::set(
+        result,
+        gc_heap,
+        "configurable",
+        Value::Boolean(desc.configurable()),
+    );
+    Ok(result)
 }
 
 fn lookup_to_optional_bool(lookup: &PropertyLookup) -> Option<bool> {
@@ -475,7 +504,7 @@ fn lookup_to_optional_value(lookup: &PropertyLookup) -> Result<Option<Value>, Vm
 
 fn expect_object(arg: Option<&Value>) -> Result<JsObject, VmError> {
     match arg {
-        Some(Value::Object(o)) => Ok(o.clone()),
+        Some(Value::Object(o)) => Ok(*o),
         _ => Err(VmError::TypeMismatch),
     }
 }

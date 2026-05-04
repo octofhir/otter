@@ -61,8 +61,13 @@ pub fn optional_object_arg<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Optio
 /// Read a numeric field from a partial-record object. Returns the
 /// default when the property is missing or `undefined`. Coerces
 /// `Value::Number` only; non-numeric values fail.
-pub fn read_i64_field(obj: &JsObject, name: &str, default: i64) -> Result<i64, IntrinsicError> {
-    match obj.get(name) {
+pub fn read_i64_field(
+    obj: &JsObject,
+    name: &str,
+    default: i64,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<i64, IntrinsicError> {
+    match crate::object::get(*obj, gc_heap, name) {
         None | Some(Value::Undefined) => Ok(default),
         Some(Value::Number(n)) => match n.as_smi() {
             Some(v) => Ok(v as i64),
@@ -76,8 +81,8 @@ pub fn read_i64_field(obj: &JsObject, name: &str, default: i64) -> Result<i64, I
 }
 
 /// Read an optional string field (`{ unit: "minutes" }`).
-pub fn read_string_field(obj: &JsObject, name: &str) -> Option<String> {
-    match obj.get(name) {
+pub fn read_string_field(obj: &JsObject, name: &str, gc_heap: &otter_gc::GcHeap) -> Option<String> {
+    match crate::object::get(*obj, gc_heap, name) {
         Some(Value::String(s)) => Some(s.to_lossy_string()),
         _ => None,
     }

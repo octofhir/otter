@@ -23,7 +23,6 @@
 use crate::Value;
 use crate::array::JsArray;
 use crate::number::NumberValue;
-use crate::object::JsObject;
 use crate::string::{JsString, StringHeap};
 
 use super::MAX_NESTING_DEPTH;
@@ -67,12 +66,17 @@ enum Builder {
 }
 
 /// Strict `JSON.parse`. The `heap` is needed only to allocate
-/// resulting `JsString` values.
-pub fn parse(text: &str, heap: &StringHeap) -> Result<Value, ParseError> {
+/// resulting `JsString` values; `gc_heap` is needed to allocate
+/// `JsObject`s for parsed JSON objects.
+pub fn parse(
+    text: &str,
+    heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, ParseError> {
     let bytes = text.as_bytes();
     let mut cursor = Cursor { bytes, pos: 0 };
     cursor.skip_ws();
-    let value = read_value(&mut cursor, heap)?;
+    let value = read_value(&mut cursor, heap, gc_heap)?;
     cursor.skip_ws();
     if cursor.pos != bytes.len() {
         return Err(ParseError::at(cursor.pos, "unexpected trailing content"));
@@ -117,13 +121,17 @@ impl Cursor<'_> {
 
 /// Drive the iterative parser. The input is a single value
 /// (primitive or compound); compound builders live on `stack`.
-fn read_value(cursor: &mut Cursor<'_>, heap: &StringHeap) -> Result<Value, ParseError> {
+fn read_value(
+    cursor: &mut Cursor<'_>,
+    heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, ParseError> {
     let mut stack: Vec<Builder> = Vec::with_capacity(8);
-    let result = read_step(cursor, &mut stack, heap)?;
+    let result = read_step(cursor, &mut stack, heap, gc_heap)?;
     let mut current = result;
     while stack.last().is_some() {
         cursor.skip_ws();
-        current = continue_container(cursor, &mut stack, current, heap)?;
+        current = continue_container(cursor, &mut stack, current, heap, gc_heap)?;
     }
     Ok(current)
 }
@@ -135,6 +143,7 @@ fn read_step(
     cursor: &mut Cursor<'_>,
     stack: &mut Vec<Builder>,
     heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, ParseError> {
     cursor.skip_ws();
     let b = cursor
@@ -156,7 +165,7 @@ fn read_step(
             if cursor.peek() == Some(b'}') {
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
-                return Ok(finish_builder(frame));
+                return finish_builder(frame, gc_heap, cursor.pos);
             }
             // Otherwise read the first key.
             let key = read_object_key(cursor)?;
@@ -167,7 +176,7 @@ fn read_step(
             cursor.expect(b':', "':' after object key")?;
             cursor.skip_ws();
             // Recurse into the value.
-            read_step(cursor, stack, heap)
+            read_step(cursor, stack, heap, gc_heap)
         }
         b'[' => {
             cursor.pos += 1;
@@ -182,9 +191,9 @@ fn read_step(
             if cursor.peek() == Some(b']') {
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
-                return Ok(finish_builder(frame));
+                return finish_builder(frame, gc_heap, cursor.pos);
             }
-            read_step(cursor, stack, heap)
+            read_step(cursor, stack, heap, gc_heap)
         }
         b'"' => Ok(Value::String(read_string(cursor, heap)?)),
         b't' => {
@@ -214,6 +223,7 @@ fn continue_container(
     stack: &mut Vec<Builder>,
     just_read: Value,
     heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, ParseError> {
     let frame = stack.last_mut().expect("non-empty stack");
     match frame {
@@ -231,12 +241,12 @@ fn continue_container(
                     if matches!(cursor.peek(), Some(b']')) {
                         return Err(ParseError::at(cursor.pos, "trailing comma"));
                     }
-                    read_step(cursor, stack, heap)
+                    read_step(cursor, stack, heap, gc_heap)
                 }
                 Some(b']') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
-                    Ok(finish_builder(frame))
+                    finish_builder(frame, gc_heap, cursor.pos)
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -270,12 +280,12 @@ fn continue_container(
                     cursor.skip_ws();
                     cursor.expect(b':', "':' after object key")?;
                     cursor.skip_ws();
-                    read_step(cursor, stack, heap)
+                    read_step(cursor, stack, heap, gc_heap)
                 }
                 Some(b'}') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
-                    Ok(finish_builder(frame))
+                    finish_builder(frame, gc_heap, cursor.pos)
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -287,15 +297,20 @@ fn continue_container(
     }
 }
 
-fn finish_builder(builder: Builder) -> Value {
+fn finish_builder(
+    builder: Builder,
+    gc_heap: &mut otter_gc::GcHeap,
+    pos: usize,
+) -> Result<Value, ParseError> {
     match builder {
-        Builder::Array { elements, .. } => Value::Array(JsArray::from_elements(elements)),
+        Builder::Array { elements, .. } => Ok(Value::Array(JsArray::from_elements(elements))),
         Builder::Object { entries, .. } => {
-            let obj = JsObject::new();
+            let obj = crate::object::alloc_object(gc_heap)
+                .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
             for (k, v) in entries {
-                obj.set(&k, v);
+                crate::object::set(obj, gc_heap, &k, v);
             }
-            Value::Object(obj)
+            Ok(Value::Object(obj))
         }
     }
 }
@@ -543,7 +558,13 @@ mod tests {
 
     fn parse_str(s: &str) -> Result<Value, ParseError> {
         let heap = StringHeap::default();
-        parse(s, &heap)
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        parse(s, &heap, &mut gc_heap)
+    }
+
+    fn parse_str_with_heap(s: &str, gc_heap: &mut otter_gc::GcHeap) -> Result<Value, ParseError> {
+        let heap = StringHeap::default();
+        parse(s, &heap, gc_heap)
     }
 
     #[test]
@@ -577,9 +598,10 @@ mod tests {
 
     #[test]
     fn parses_array_and_object() {
-        let v = parse_str("{\"x\":[1,2,3]}").unwrap();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = parse_str_with_heap("{\"x\":[1,2,3]}", &mut gc_heap).unwrap();
         let Value::Object(obj) = v else { panic!() };
-        let Some(Value::Array(arr)) = obj.get("x") else {
+        let Some(Value::Array(arr)) = crate::object::get(obj, &gc_heap, "x") else {
             panic!()
         };
         assert_eq!(arr.len(), 3);
@@ -613,14 +635,20 @@ mod tests {
 
     #[test]
     fn nested_object_round_trip() {
-        let v = parse_str("{\"a\":{\"b\":{\"c\":42}}}").unwrap();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = parse_str_with_heap("{\"a\":{\"b\":{\"c\":42}}}", &mut gc_heap).unwrap();
         let Value::Object(o) = v else { panic!() };
-        let Some(Value::Object(o2)) = o.get("a") else {
+        let Some(Value::Object(o2)) = crate::object::get(o, &gc_heap, "a") else {
             panic!()
         };
-        let Some(Value::Object(o3)) = o2.get("b") else {
+        let Some(Value::Object(o3)) = crate::object::get(o2, &gc_heap, "b") else {
             panic!()
         };
-        assert_eq!(o3.get("c").unwrap().display_string(), "42");
+        assert_eq!(
+            crate::object::get(o3, &gc_heap, "c")
+                .unwrap()
+                .display_string(),
+            "42"
+        );
     }
 }

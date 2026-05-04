@@ -2,41 +2,16 @@
 
 ## Status
 
-- [ ] `JsObject = Gc<ObjectBody>`
-- [ ] `Rc<RefCell<ObjectBody>>` removed from `object.rs`
-- [ ] `Traceable` impl traces shape keys + property values + prototype + named properties
-- [ ] every `borrow()` / `borrow_mut()` on `ObjectBody` replaced
-- [ ] object APIs take `RuntimeCx` / `NativeCtx` / `&mut GcHeap`
+- [x] `JsObject = Gc<ObjectBody>`
+- [x] `Rc<RefCell<ObjectBody>>` removed from `object.rs`
+- [x] `Traceable` impl traces shape keys + property values + prototype + named properties
+- [x] every `borrow()` / `borrow_mut()` on `ObjectBody` replaced
+- [x] object APIs take `RuntimeCx` / `NativeCtx` / `&mut GcHeap`
       explicitly; no thread-local heap lookup
-- [ ] `gc_roots.rs` smoke tests for globals / module env / `this` un-ignored
-- [ ] gates green
+- [x] `gc_roots.rs` smoke tests for globals / module env / `this` un-ignored
+- [x] gates green
 
-## Open work (post-76A)
-
-Task 76A landed the structural pieces (`RuntimeCx<'rt>` / `NativeCtx<'rt>`
-types, `!Send + !Sync` static assertions, compile-fail trybuild fixtures)
-and audited the product surface. A minimal foundation is in place;
-this task still needs:
-
-- **API rewrite of `object.rs`** — every `JsObject` method that touches
-  `ObjectBody` storage takes `&otter_gc::GcHeap` / `&mut otter_gc::GcHeap`
-  (or `&NativeCtx<'_>` / `&mut NativeCtx<'_>` once the public binding
-  surface lands). Today the methods still flow through
-  `Rc<RefCell<ObjectBody>>` (pre-task-76 storage); the pre-WIP rewrite
-  to `Gc<ObjectBody>` was reverted because the caller-side migration
-  (~400 sites across ~29 files) does not fit a single session.
-- **Caller migration** — every call site in `crates-next/otter-vm/src/`
-  (lib.rs ~71 sites, object_statics.rs ~31, reflect.rs ~15, plus many
-  smaller files) needs to thread `&self.gc_heap` / `&mut self.gc_heap`
-  through the call chain. This is mechanical but bulky.
-- **`Value::trace_value_slots` `Object` arm** — the WIP draft is
-  preserved in the task spec; it lands in lockstep with the
-  `Gc<ObjectBody>` migration above.
-- **Un-ignore root smoke tests** — the `tests/gc_roots.rs::globals_*`
-  / `module_env_*` cases stay `#[ignore]` until `Value::Object` walks
-  through a real `Gc<ObjectBody>` slot.
-- **Regression test** — `tests/gc_object_cycle.rs::proto_cycle_reaped`
-  per the validation gate below.
+Closed 2026-05-05 (split into 77A/77B/77C; see master tracker).
 
 ## Goal
 

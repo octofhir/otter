@@ -198,7 +198,8 @@ fn arg_as_duration(
             }),
         },
         Some(Value::Object(obj)) => {
-            crate::temporal::duration::partial_from_object(obj).map_err(|_| {
+            let heap = args.gc_heap.borrow();
+            crate::temporal::duration::partial_from_object(obj, &heap).map_err(|_| {
                 IntrinsicError::BadArgument {
                     index,
                     reason: "must be a Temporal.Duration partial",

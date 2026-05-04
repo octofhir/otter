@@ -79,8 +79,8 @@ impl StringifyOptions {
 }
 
 /// Convenience entry: serialises with no indent.
-pub fn stringify(value: &Value) -> Result<Option<String>, JsonError> {
-    stringify_with_options(value, &StringifyOptions::default())
+pub fn stringify(value: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Option<String>, JsonError> {
+    stringify_with_options(value, &StringifyOptions::default(), gc_heap)
 }
 
 /// Full entry. Returns `Some(text)` for a serialisable root value,
@@ -88,6 +88,7 @@ pub fn stringify(value: &Value) -> Result<Option<String>, JsonError> {
 pub fn stringify_with_options(
     value: &Value,
     options: &StringifyOptions,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Option<String>, JsonError> {
     if !is_serialisable(value) {
         return Ok(None);
@@ -95,8 +96,8 @@ pub fn stringify_with_options(
     let mut out = String::new();
     let mut visit = VisitSet::default();
     let mut stack: Vec<Frame> = Vec::with_capacity(8);
-    emit_value(value, &mut out, &mut stack, &mut visit, options)?;
-    drive(&mut out, &mut stack, &mut visit, options)?;
+    emit_value(value, &mut out, &mut stack, &mut visit, options, gc_heap)?;
+    drive(&mut out, &mut stack, &mut visit, options, gc_heap)?;
     Ok(Some(out))
 }
 
@@ -108,7 +109,7 @@ struct VisitSet {
 
 impl VisitSet {
     fn enter_object(&mut self, obj: &JsObject) -> Result<(), JsonError> {
-        let key = obj.identity_addr();
+        let key = obj.as_header_ptr() as *const ();
         if self.objects.contains(&key) {
             return Err(JsonError::Cyclic);
         }
@@ -156,6 +157,7 @@ fn drive(
     stack: &mut Vec<Frame>,
     visit: &mut VisitSet,
     options: &StringifyOptions,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<(), JsonError> {
     loop {
         let depth = stack.len();
@@ -192,7 +194,7 @@ fn drive(
                     out.push_str("null");
                     continue;
                 }
-                emit_value(&elem, out, stack, visit, options)?;
+                emit_value(&elem, out, stack, visit, options, gc_heap)?;
             }
             Frame::Object {
                 entries,
@@ -233,7 +235,7 @@ fn drive(
                 if options.pretty() {
                     out.push(' ');
                 }
-                emit_value(&value, out, stack, visit, options)?;
+                emit_value(&value, out, stack, visit, options, gc_heap)?;
             }
         }
     }
@@ -247,6 +249,7 @@ fn emit_value(
     stack: &mut Vec<Frame>,
     visit: &mut VisitSet,
     options: &StringifyOptions,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<(), JsonError> {
     match value {
         Value::Null => out.push_str("null"),
@@ -288,16 +291,17 @@ fn emit_value(
             // getters during serialisation requires interpreter
             // access and is filed as a follow-up.
             // <https://tc39.es/ecma262/#sec-serializejsonobject>
-            let entries: Vec<(String, Value)> = obj
-                .borrow_props()
-                .enumerable_data_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
+            let entries: Vec<(String, Value)> =
+                crate::object::with_properties(*obj, gc_heap, |p| {
+                    p.enumerable_data_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect()
+                });
             stack.push(Frame::Object {
                 entries,
                 idx: 0,
                 had_member: false,
-                _root: obj.clone(),
+                _root: *obj,
             });
         }
         // Symbols are silently dropped by `JSON.stringify` per
@@ -444,7 +448,6 @@ fn write_indent(out: &mut String, indent: &[u8], depth: usize) {
 mod tests {
     use super::*;
     use crate::number::NumberValue;
-    use crate::object::JsObject;
 
     #[test]
     fn options_space_clamped_to_ten() {
@@ -478,9 +481,10 @@ mod tests {
 
     #[test]
     fn cycle_detection_handles_self_reference() {
-        let obj = JsObject::new();
-        obj.set("self", Value::Object(obj.clone()));
-        let err = stringify(&Value::Object(obj)).unwrap_err();
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let obj = crate::object::alloc_object(&mut heap).unwrap();
+        crate::object::set(obj, &mut heap, "self", Value::Object(obj));
+        let err = stringify(&Value::Object(obj), &heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
     }
 }

@@ -29,7 +29,11 @@ use super::{to_index, typed_array_prototype};
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
-pub fn array_buffer_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
+pub fn array_buffer_call(
+    name: &str,
+    args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     match name {
         // §25.1.4 `new ArrayBuffer(length [, options])`. The second
         // argument is an options bag with an optional `maxByteLength`
@@ -41,7 +45,7 @@ pub fn array_buffer_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
             };
             let max_byte_length = match args.get(1) {
                 Some(Value::Object(opts)) => {
-                    if let Some(v) = opts.get("maxByteLength") {
+                    if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
                         Some(to_index(&v).ok_or(VmError::TypeMismatch)?)
                     } else {
                         None
@@ -83,7 +87,11 @@ pub fn array_buffer_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
-pub fn shared_array_buffer_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
+pub fn shared_array_buffer_call(
+    name: &str,
+    args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     match name {
         "" => {
             let length = match args.first() {
@@ -92,7 +100,7 @@ pub fn shared_array_buffer_call(name: &str, args: &[Value]) -> Result<Value, VmE
             };
             let max_byte_length = match args.get(1) {
                 Some(Value::Object(opts)) => {
-                    if let Some(v) = opts.get("maxByteLength") {
+                    if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
                         Some(to_index(&v).ok_or(VmError::TypeMismatch)?)
                     } else {
                         None
@@ -182,10 +190,11 @@ pub fn typed_array_call(
     kind: TypedArrayKind,
     name: &str,
     args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     match name {
-        "" => construct_typed_array(kind, args),
-        "from" => from_static(kind, args),
+        "" => construct_typed_array(kind, args, gc_heap),
+        "from" => from_static(kind, args, gc_heap),
         "of" => of_static(kind, args),
         // BYTES_PER_ELEMENT is read on the constructor object as a
         // property — the compiler routes that through LoadProperty
@@ -198,7 +207,11 @@ pub fn typed_array_call(
     }
 }
 
-fn construct_typed_array(kind: TypedArrayKind, args: &[Value]) -> Result<Value, VmError> {
+fn construct_typed_array(
+    kind: TypedArrayKind,
+    args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     let bpe = kind.bytes_per_element();
     match args.first() {
         // §23.2.5.1.1 `new T()` / `new T(undefined)` — zero-length view.
@@ -294,12 +307,14 @@ fn construct_typed_array(kind: TypedArrayKind, args: &[Value]) -> Result<Value, 
         // Generic object — read `.length` then index 0..length per the
         // array-like path.
         Some(Value::Object(obj)) => {
-            let length_value = obj.get("length").unwrap_or(Value::Undefined);
+            let length_value =
+                crate::object::get(*obj, gc_heap, "length").unwrap_or(Value::Undefined);
             let len = to_index(&length_value).ok_or(VmError::TypeMismatch)? as usize;
             let new_buf = JsArrayBuffer::new(len * bpe);
             let view = JsTypedArray::new(new_buf, kind, 0, len);
             for i in 0..len {
-                let v = obj.get(&i.to_string()).unwrap_or(Value::Undefined);
+                let v =
+                    crate::object::get(*obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
                 let coerced = coerce_for_kind(kind, &v)?;
                 view.set(i, &coerced);
             }
@@ -312,7 +327,11 @@ fn construct_typed_array(kind: TypedArrayKind, args: &[Value]) -> Result<Value, 
 /// §23.2.2.1 `%TypedArray%.from(source)` — synchronous, no map fn.
 /// Map function and `thisArg` are filed for the callback-driven
 /// dispatcher in `lib.rs::typed_array_callback_dispatch`.
-fn from_static(kind: TypedArrayKind, args: &[Value]) -> Result<Value, VmError> {
+fn from_static(
+    kind: TypedArrayKind,
+    args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     let source = args.first().cloned().unwrap_or(Value::Undefined);
     match source {
         Value::TypedArray(src) => {
@@ -354,11 +373,12 @@ fn from_static(kind: TypedArrayKind, args: &[Value]) -> Result<Value, VmError> {
             Ok(typed_array_prototype::from_values(kind, &chars))
         }
         Value::Object(obj) => {
-            let len_value = obj.get("length").unwrap_or(Value::Undefined);
+            let len_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::Undefined);
             let len = to_index(&len_value).ok_or(VmError::TypeMismatch)? as usize;
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
-                let v = obj.get(&i.to_string()).unwrap_or(Value::Undefined);
+                let v =
+                    crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
                 values.push(coerce_for_kind(kind, &v)?);
             }
             Ok(typed_array_prototype::from_values(kind, &values))

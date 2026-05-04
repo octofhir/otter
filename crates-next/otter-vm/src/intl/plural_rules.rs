@@ -25,15 +25,29 @@ use crate::intl::payload::{IntlPayload, PluralRulesPayload};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 
 /// §15.2.1 — resolve constructor options.
-pub fn resolve(locale: &Value, options: &Value) -> PluralRulesPayload {
+pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> PluralRulesPayload {
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     PluralRulesPayload {
         locale: coerce_locale(Some(locale)),
-        kind: read_string_option(opts_ref, "type", "cardinal"),
-        minimum_integer_digits: read_u8_option(opts_ref, "minimumIntegerDigits", 1, 1, 21),
-        minimum_fraction_digits: read_u8_option(opts_ref, "minimumFractionDigits", 0, 0, 20),
-        maximum_fraction_digits: read_u8_option(opts_ref, "maximumFractionDigits", 3, 0, 20),
+        kind: read_string_option(opts_ref, "type", "cardinal", gc_heap),
+        minimum_integer_digits: read_u8_option(opts_ref, "minimumIntegerDigits", 1, 1, 21, gc_heap),
+        minimum_fraction_digits: read_u8_option(
+            opts_ref,
+            "minimumFractionDigits",
+            0,
+            0,
+            20,
+            gc_heap,
+        ),
+        maximum_fraction_digits: read_u8_option(
+            opts_ref,
+            "maximumFractionDigits",
+            3,
+            0,
+            20,
+            gc_heap,
+        ),
     }
 }
 
@@ -71,32 +85,32 @@ fn impl_select(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// §15.5.5 — `Intl.PluralRules.prototype.resolvedOptions()`.
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let obj = crate::object::JsObject::new();
-    obj.set(
-        "locale",
-        js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
-    obj.set(
-        "type",
-        js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?,
-    );
-    obj.set(
+    let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
+    let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
+    let mid = payload.minimum_integer_digits as i32;
+    let mfd = payload.minimum_fraction_digits as i32;
+    let xfd = payload.maximum_fraction_digits as i32;
+    let mut heap = args.gc_heap.borrow_mut();
+    let obj = crate::object::alloc_object(*heap)?;
+    crate::object::set(obj, *heap, "locale", locale);
+    crate::object::set(obj, *heap, "type", kind);
+    crate::object::set(
+        obj,
+        *heap,
         "minimumIntegerDigits",
-        Value::Number(crate::number::NumberValue::from_i32(
-            payload.minimum_integer_digits as i32,
-        )),
+        Value::Number(crate::number::NumberValue::from_i32(mid)),
     );
-    obj.set(
+    crate::object::set(
+        obj,
+        *heap,
         "minimumFractionDigits",
-        Value::Number(crate::number::NumberValue::from_i32(
-            payload.minimum_fraction_digits as i32,
-        )),
+        Value::Number(crate::number::NumberValue::from_i32(mfd)),
     );
-    obj.set(
+    crate::object::set(
+        obj,
+        *heap,
         "maximumFractionDigits",
-        Value::Number(crate::number::NumberValue::from_i32(
-            payload.maximum_fraction_digits as i32,
-        )),
+        Value::Number(crate::number::NumberValue::from_i32(xfd)),
     );
     Ok(Value::Object(obj))
 }

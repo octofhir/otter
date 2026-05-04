@@ -33,8 +33,12 @@
 use otter_vm::Interpreter;
 use otter_vm::runtime_state::RuntimeState;
 
-/// Sanity check: the walker compiles, runs, and emits zero
-/// slot pointers under Phase 1 (every stub is empty).
+/// Sanity check: the walker compiles and runs. As of task 77
+/// the `JsObject` arm of [`GcTrace`] emits its slot pointer,
+/// so a fresh interpreter yields at least one slot —
+/// `globalThis`. The exact count is not load-bearing; what
+/// matters is that the walker terminates without panicking
+/// and emits *some* roots once the JsObject migration lands.
 #[test]
 fn root_walker_runs_with_empty_state() {
     let interp = Interpreter::default();
@@ -43,7 +47,10 @@ fn root_walker_runs_with_empty_state() {
     state.trace_roots(&mut |_slot| {
         count = count.wrapping_add(1);
     });
-    assert_eq!(count, 0, "Phase-1 stubs must emit zero slot pointers");
+    assert!(
+        count >= 1,
+        "post-task-77 walker must surface at least globalThis (got {count})"
+    );
 }
 
 #[test]
@@ -105,11 +112,103 @@ fn active_frame_local_root_survives_force_gc() {
     // suspend mid-frame, force_gc, assert local readable.
 }
 
+/// Globals act as a strong root: an object stamped onto
+/// `globalThis` survives a forced full GC even after every
+/// host-side handle is dropped.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-global-object>
+/// Walker root source: GC architecture plan §4.2.
 #[test]
-#[ignore = "un-ignore in task 77 (JsObject migration)"]
-fn global_object_root_survives_force_gc() {
-    // task 77: assign through globalThis, drop handle, force_gc,
-    // assert global property readable.
+fn globals_keep_object_alive() {
+    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+
+    let mut interp = Interpreter::new();
+
+    // Allocate a fresh object and stash it on globalThis under
+    // a unique key. From this point the only path to the body
+    // is through globalThis → property slot → ObjectBody.
+    let baseline =
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    let stashed = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc_object");
+    let global = *interp.global_this();
+    otter_vm::object::set(
+        global,
+        interp.gc_heap_mut(),
+        "__gc_roots_test_stash",
+        otter_vm::Value::Object(stashed),
+    );
+    let after_alloc =
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    assert!(
+        after_alloc > baseline,
+        "alloc_object + set must bump live_bytes (baseline={baseline}, after={after_alloc})"
+    );
+
+    // Drop the local handle. `JsObject` is `Copy` (compressed
+    // offset); `let _ = stashed` documents intent — the only
+    // remaining root is globalThis itself.
+    let _ = stashed;
+
+    // Force GC. With `GcTrace for JsObject` emitting the slot
+    // and `ObjectBody::trace_slots_safe` walking property
+    // values, the global's property must still resolve.
+    interp.force_gc();
+    let resolved = otter_vm::object::get(global, interp.gc_heap(), "__gc_roots_test_stash")
+        .expect("globalThis property survives force_gc");
+    match resolved {
+        otter_vm::Value::Object(_) => {}
+        other => panic!("expected Value::Object after force_gc, got {other:?}"),
+    }
+}
+
+/// Module-environment registry acts as a strong root: an
+/// object stamped onto a registered module env survives a
+/// forced full GC even after every host-side handle is dropped.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-module-environment-records>
+/// Walker root source: GC architecture plan §4.2.
+#[test]
+fn module_env_keeps_object_alive() {
+    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+
+    let mut interp = Interpreter::new();
+
+    // Register a fresh empty `module_env` object under a
+    // synthetic URL. Then stash a property on it whose value
+    // is a freshly-allocated object. The body of the stashed
+    // object is now reachable only through:
+    //   module_environments[url] → module_env → property slot.
+    let baseline =
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    let module_env = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc_object");
+    let url: std::rc::Rc<str> = std::rc::Rc::from("file:///gc_roots_test.js");
+    interp.register_module_env(std::rc::Rc::clone(&url), module_env);
+
+    let stashed = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc_object");
+    otter_vm::object::set(
+        module_env,
+        interp.gc_heap_mut(),
+        "stash",
+        otter_vm::Value::Object(stashed),
+    );
+    let after_alloc =
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    assert!(
+        after_alloc > baseline,
+        "alloc_object + set must bump live_bytes (baseline={baseline}, after={after_alloc})"
+    );
+
+    let _ = stashed;
+    interp.force_gc();
+    let env_handle = interp
+        .module_env(&url)
+        .expect("module env still registered");
+    let resolved = otter_vm::object::get(env_handle, interp.gc_heap(), "stash")
+        .expect("module-env property survives force_gc");
+    match resolved {
+        otter_vm::Value::Object(_) => {}
+        other => panic!("expected Value::Object after force_gc, got {other:?}"),
+    }
 }
 
 #[test]

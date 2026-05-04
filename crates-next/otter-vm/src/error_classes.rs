@@ -190,16 +190,16 @@ pub struct ErrorClassRegistry {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 #[must_use]
-pub fn render_error_to_string(value: &Value) -> String {
+pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
     let Value::Object(obj) = value else {
         return value.display_string();
     };
-    let name = match obj.get("name") {
+    let name = match crate::object::get(*obj, gc_heap, "name") {
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(),
         None => String::new(),
     };
-    let message = match obj.get("message") {
+    let message = match crate::object::get(*obj, gc_heap, "message") {
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(Value::Undefined) | None => String::new(),
         Some(other) => other.display_string(),
@@ -237,12 +237,16 @@ impl ErrorClassRegistry {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-    pub fn new(heap: &StringHeap) -> Result<Self, StringError> {
-        let error_proto = JsObject::new();
+    pub fn new(heap: &StringHeap, gc_heap: &mut otter_gc::GcHeap) -> Result<Self, StringError> {
+        let error_proto =
+            crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
+                requested_bytes: 0,
+                heap_limit_bytes: 0,
+            })?;
         let error_name = JsString::from_str("Error", heap)?;
         let empty = JsString::from_str("", heap)?;
-        error_proto.set("name", Value::String(error_name));
-        error_proto.set("message", Value::String(empty));
+        crate::object::set(error_proto, gc_heap, "name", Value::String(error_name));
+        crate::object::set(error_proto, gc_heap, "message", Value::String(empty));
         // §20.5.3.4 Error.prototype.toString is intercepted by
         // `object_prototype_intercept` in the dispatcher when the
         // receiver's prototype chain includes any error prototype.
@@ -256,13 +260,22 @@ impl ErrorClassRegistry {
         // is the Error constructor, with attribute
         // `[[Configurable]]: true`, `[[Writable]]: true`,
         // `[[Enumerable]]: false`.
-        let error_ctor = JsObject::new();
-        error_ctor.set("prototype", Value::Object(error_proto.clone()));
-        error_proto.set("constructor", Value::Object(error_ctor.clone()));
+        let error_ctor =
+            crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
+                requested_bytes: 0,
+                heap_limit_bytes: 0,
+            })?;
+        crate::object::set(error_ctor, gc_heap, "prototype", Value::Object(error_proto));
+        crate::object::set(
+            error_proto,
+            gc_heap,
+            "constructor",
+            Value::Object(error_ctor),
+        );
         entries.push((
             ErrorKind::Error,
             ClassEntry {
-                prototype: error_proto.clone(),
+                prototype: error_proto,
                 constructor: error_ctor,
             },
         ));
@@ -279,13 +292,21 @@ impl ErrorClassRegistry {
             ErrorKind::EvalError,
             ErrorKind::AggregateError,
         ] {
-            let proto = JsObject::new();
-            proto.set_prototype(Some(error_proto.clone()));
+            let proto =
+                crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
+                    requested_bytes: 0,
+                    heap_limit_bytes: 0,
+                })?;
+            crate::object::set_prototype(proto, gc_heap, Some(error_proto));
             let class_name = JsString::from_str(kind.class_name(), heap)?;
-            proto.set("name", Value::String(class_name));
-            let ctor = JsObject::new();
-            ctor.set("prototype", Value::Object(proto.clone()));
-            proto.set("constructor", Value::Object(ctor.clone()));
+            crate::object::set(proto, gc_heap, "name", Value::String(class_name));
+            let ctor =
+                crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
+                    requested_bytes: 0,
+                    heap_limit_bytes: 0,
+                })?;
+            crate::object::set(ctor, gc_heap, "prototype", Value::Object(proto));
+            crate::object::set(proto, gc_heap, "constructor", Value::Object(ctor));
             entries.push((
                 kind,
                 ClassEntry {
@@ -332,7 +353,7 @@ impl ErrorClassRegistry {
     /// real constructor with a `prototype` own property.
     #[must_use]
     pub fn constructor(&self, kind: ErrorKind) -> JsObject {
-        self.entry(kind).constructor.clone()
+        self.entry(kind).constructor
     }
 
     /// Borrow the `prototype` object for `kind`. Exposed for
@@ -341,7 +362,7 @@ impl ErrorClassRegistry {
     /// later slice).
     #[must_use]
     pub fn prototype(&self, kind: ErrorKind) -> JsObject {
-        self.entry(kind).prototype.clone()
+        self.entry(kind).prototype
     }
 
     /// Allocate a fresh error instance of the given kind with the
@@ -370,12 +391,16 @@ impl ErrorClassRegistry {
         kind: ErrorKind,
         message: Option<&str>,
         heap: &StringHeap,
+        gc_heap: &mut otter_gc::GcHeap,
     ) -> Result<JsObject, StringError> {
-        let obj = JsObject::new();
-        obj.set_prototype(Some(self.prototype(kind)));
+        let obj = crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
+            requested_bytes: 0,
+            heap_limit_bytes: 0,
+        })?;
+        crate::object::set_prototype(obj, gc_heap, Some(self.prototype(kind)));
         if let Some(text) = message {
             let s = JsString::from_str(text, heap)?;
-            obj.set("message", Value::String(s));
+            crate::object::set(obj, gc_heap, "message", Value::String(s));
         }
         Ok(obj)
     }
@@ -392,10 +417,11 @@ impl ErrorClassRegistry {
         errors: Vec<Value>,
         message: Option<&str>,
         heap: &StringHeap,
+        gc_heap: &mut otter_gc::GcHeap,
     ) -> Result<JsObject, StringError> {
-        let obj = self.make_instance(ErrorKind::AggregateError, message, heap)?;
+        let obj = self.make_instance(ErrorKind::AggregateError, message, heap, gc_heap)?;
         let arr = crate::array::JsArray::from_elements(errors);
-        obj.set("errors", Value::Array(arr));
+        crate::object::set(obj, gc_heap, "errors", Value::Array(arr));
         Ok(obj)
     }
 }

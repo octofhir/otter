@@ -6,6 +6,7 @@
   - [x] 71 — crate skeleton + ADR-0004 (closed 2026-05-02)
   - [x] 72 — core heap and handles (closed 2026-05-04)
   - [x] 73 — OOM + cap enforcement; `Runtime::max_heap_bytes` load-bearing (closed 2026-05-04)
+  - [x] 74 — `GcStats` + `HeapSnapshot` + retained-size walker + `Runtime::heap_stats` / `heap_snapshot` / `force_gc` (closed 2026-05-04)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
 - [ ] Phase 4 (deferred indefinitely) — concurrent marking + parallel scavenge (task 87)

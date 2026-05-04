@@ -21,6 +21,10 @@
 //! - [`handle`] — `Local`, `HandleScope`, `GlobalHandle`.
 //! - [`heap`] — `GcHeap` orchestrator.
 //! - [`oom`] — `OutOfMemory` error.
+//! - [`stats`] — per-heap counters and per-type rows.
+//! - [`snapshot`] — Rust-side heap snapshot + retained-size walker.
+//! - [`test_support`] — public Traceable helpers for downstream
+//!   tests that keep `forbid(unsafe_code)`.
 //! - [`devtools_snapshot`] — Chrome `.heapsnapshot` writer.
 //!
 //! # Invariants
@@ -61,7 +65,10 @@ pub mod marking;
 pub mod oom;
 pub mod page;
 pub mod scavenger;
+pub mod snapshot;
 pub mod space;
+pub mod stats;
+pub mod test_support;
 pub mod trace;
 
 pub use compressed::{Gc, RawGc, cage_base, cage_size, init_cage_with_size};
@@ -70,4 +77,6 @@ pub use header::{GcHeader, MarkColor};
 pub use heap::{EmptyRoots, GcHeap, HeapStats, Roots};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
+pub use snapshot::{HeapSnapshot, SnapshotObject};
+pub use stats::{GcStats, TYPE_TAG_COUNT, TypeStats};
 pub use trace::{SlotVisitor, TraceFn, TraceTable, Traceable};

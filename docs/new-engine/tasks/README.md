@@ -376,7 +376,7 @@ deferred indefinitely.
 | ✅ 71 (closed 2026-05-02) | New `crates-next/otter-gc` empty crate; ADR-0004 amends ADR-0001 §5 to lift `forbid(unsafe_code)` for this crate only. |
 | ✅ 72 (closed 2026-05-04) | Page heap: `GcHeader`, `Page`, semispace + old-space + LOS, Cheney scavenger, tri-color marking, generational + insertion barriers, type-tag fn-ptr trace table, `Gc<T>`/`Local<'gc, T>`/`HandleScope<'gc>`. |
 | ✅ 73 (closed 2026-05-04) | `OutOfMemory::HeapCapExceeded` payload + `GcHeap::with_max_heap_bytes` + retry-once-then-fail emergency-collect path; `Runtime::max_heap_bytes` plumbed end-to-end. |
-| [74-gc-stats-and-snapshot.md](./74-gc-stats-and-snapshot.md) | `GcStats`, `HeapSnapshot`, retained-size walker, `Runtime::heap_stats()`. |
+| ✅ 74 (closed 2026-05-04) | `GcStats` per-tag counters fused into the alloc fast path + sweep walk; `HeapSnapshot` + retained-size walker + `group_by_type`; `Runtime::heap_stats` / `heap_snapshot` / `force_gc` API. |
 | [75-gc-root-enumeration.md](./75-gc-root-enumeration.md) | `RuntimeState::trace_roots`: frames, microtask queue, module envs, dynamic-import host, symbol registry. |
 | [76-migrate-upvalue-cell.md](./76-migrate-upvalue-cell.md) | First migration: `UpvalueCell` from `Rc<RefCell<Value>>` to `Gc<UpvalueCellBody>` + barrier on every store. |
 | [77-migrate-jsobject.md](./77-migrate-jsobject.md) | `JsObject` to `Gc<ObjectBody>`; barriers on every property store. |

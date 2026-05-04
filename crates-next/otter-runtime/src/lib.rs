@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use otter_bytecode::BytecodeModule;
 use otter_compiler::compile;
-use otter_gc::GcHeap;
+use otter_gc::{GcHeap, GcStats, HeapSnapshot};
 use otter_syntax::{SourceKind, detect_source_kind, parse};
 use otter_vm::{Interpreter, InterruptFlag, Value};
 use serde::{Deserialize, Serialize};
@@ -712,6 +712,51 @@ impl Runtime {
     #[must_use]
     pub fn gc_heap_mut(&mut self) -> &mut GcHeap {
         &mut self.gc_heap
+    }
+
+    /// Per-heap GC counters: live objects / live bytes / per-
+    /// `type_tag` rows / last-GC pause / cycle counter.
+    ///
+    /// Takes `&mut self` because the aggregate `live_objects` /
+    /// `live_bytes` fields are derived lazily from the per-tag
+    /// rows (the alloc fast path only updates the per-tag
+    /// counters, see [`otter_gc::GcHeap::gc_stats`]). Per-type
+    /// GC migrations (tasks 76–83) widen the surface populated
+    /// under `by_type` — Phase 1 only sees host-side
+    /// allocations through [`Self::gc_heap_mut`].
+    pub fn heap_stats(&mut self) -> &GcStats {
+        self.gc_heap.gc_stats()
+    }
+
+    /// Snapshot the live object graph plus a caller-supplied
+    /// root set, returning a Rust-side [`HeapSnapshot`].
+    ///
+    /// Distinct from
+    /// [`otter_gc::devtools_snapshot::write_heap_snapshot`],
+    /// which produces a Chrome DevTools JSON payload — that
+    /// writer is the production-debug path; this snapshot is
+    /// for Rust assertions and per-root retained-size queries
+    /// (e.g. migration tasks proving cycles return to baseline).
+    ///
+    /// `roots` are the root slot values to attribute retained
+    /// size to. Phase 1 callers typically pass an empty slice
+    /// when the heap holds nothing reachable from the
+    /// interpreter; per-type migrations widen the typical root
+    /// set as they land.
+    pub fn heap_snapshot(&mut self, roots: &[otter_gc::RawGc]) -> HeapSnapshot {
+        self.gc_heap.snapshot(roots)
+    }
+
+    /// Force a full GC cycle (scavenge + old-gen mark-sweep).
+    ///
+    /// **Debug / test only.** Production code must never call
+    /// this — the GC's own triggers are tuned to allocation
+    /// pressure, and a forced cycle perturbs those metrics.
+    /// Tests use this to assert "after dropping these handles
+    /// and forcing a GC, live counts return to baseline".
+    pub fn force_gc(&mut self) {
+        let mut noop = |_visitor: &mut dyn FnMut(*mut otter_gc::RawGc)| {};
+        self.gc_heap.collect_full(&mut noop);
     }
 
     /// Configured stack-depth cap.

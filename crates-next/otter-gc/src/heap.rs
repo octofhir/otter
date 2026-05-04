@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::handle::{GlobalHandle, GlobalHandleTable, HandleStack};
@@ -37,6 +38,7 @@ use crate::page::{CELL_SIZE, align_up};
 use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, Page, page_base_from_offset};
 use crate::scavenger::ScavengeStats;
 use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
+use crate::stats::{GcStats, TYPE_TAG_COUNT};
 use crate::trace::{TraceTable, Traceable};
 
 /// Type alias for the higher-order visitor closure used by the
@@ -126,6 +128,7 @@ pub struct GcHeap {
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
     stats: HeapStats,
+    gc_stats: GcStats,
     /// Cooperative-cancellation flag; flipped to `true` when the
     /// cap rejects an allocation. Watchdogs may poll this between
     /// safepoints to short-circuit, but the **primary** OOM signal
@@ -172,6 +175,7 @@ impl GcHeap {
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
             stats: HeapStats::default(),
+            gc_stats: GcStats::default(),
             max_heap_bytes: cap,
             tracked_bytes: 0,
             reserved_bytes: 0,
@@ -423,6 +427,16 @@ impl GcHeap {
             std::ptr::write(header_ptr, header);
             std::ptr::write(payload_ptr, value);
         }
+        // Counter wiring inlined to keep the alloc fast path
+        // tight. Only the per-tag row is touched (one cache
+        // line, fixed offset since `T::TYPE_TAG` is const); the
+        // aggregate `live_objects` / `live_bytes` are derived in
+        // [`Self::gc_stats`] / [`Self::reconcile_live_counts`].
+        // Wrapping arithmetic — overflow is unreachable in
+        // practice (≥ 1.8 × 10¹⁹ allocs).
+        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
+        row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
         // SAFETY: offset is the cage offset of a freshly-alloc-ed
         // T payload; type tag matches `T::TYPE_TAG`.
         Ok(unsafe { Gc::from_offset(offset) })
@@ -465,6 +479,14 @@ impl GcHeap {
             )
         };
         self.stats.last_scavenge = stats;
+        // Per-tag counters drift between scavenges (young
+        // allocations counted at alloc-time but never
+        // decremented when the scavenger reclaims them); the
+        // drift is corrected on the next full GC via
+        // [`Self::reconcile_live_counts`]. Scavenge keeps the
+        // hot path tight by not walking the live set just for
+        // stats — see `bench_scavenge_4mb` for the cost of
+        // adding a walk here.
     }
 
     /// Run a full GC (young-gen scavenge + old-gen mark-sweep).
@@ -472,6 +494,7 @@ impl GcHeap {
     /// `external_visit` is invoked once for marking; it must
     /// yield every external root slot.
     pub fn collect_full(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+        let pause_start = Instant::now();
         // 1) Scavenge first so survivors are in old / to-space.
         self.collect_minor_internal(external_visit);
 
@@ -531,27 +554,60 @@ impl GcHeap {
         // garbage we can drop at next scavenge but right now we
         // simply reset the whole thing — the next mutator alloc
         // path needs an empty from-space.
+        //
+        // The same walk also accumulates per-tag live counts
+        // for [`crate::stats::GcStats`] reconciliation — fused
+        // into one pass over the heap so the GC pause cost
+        // stays bounded by the existing sweep work.
         // SAFETY: STW pause.
         let mut reclaimed = 0usize;
+        let mut per_tag_live_count = [0u64; TYPE_TAG_COUNT];
+        let mut per_tag_live_bytes = [0usize; TYPE_TAG_COUNT];
         unsafe {
-            // Drop in-place + free per dead old-space object.
+            // Drop in-place + free per dead old-space object;
+            // accumulate live counts in the same pass.
             for page in self.old_space.pages() {
                 page.for_each_object(|h, _| {
+                    let tag = (*h).type_tag() as usize;
+                    let size = (*h).size_bytes() as usize;
                     if !(*h).is_marked() {
                         if let Some(drop_fn) = self.trace_table.get_drop((*h).type_tag()) {
                             drop_fn(h);
                         }
-                        reclaimed += (*h).size_bytes() as usize;
+                        reclaimed += size;
+                    } else {
+                        per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
+                        per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
                     }
                 });
             }
             for page in self.large_space.pages() {
                 page.for_each_object(|h, _| {
+                    let tag = (*h).type_tag() as usize;
+                    let size = (*h).size_bytes() as usize;
                     if !(*h).is_marked() {
                         if let Some(drop_fn) = self.trace_table.get_drop((*h).type_tag()) {
                             drop_fn(h);
                         }
-                        reclaimed += (*h).size_bytes() as usize;
+                        reclaimed += size;
+                    } else {
+                        per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
+                        per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
+                    }
+                });
+            }
+            // Young from-space is recycled at next scavenge but
+            // any survivor still in to-space (after the
+            // pre-sweep scavenge flip) belongs to the live set.
+            // After the flip, those survivors live in
+            // `from_pages()` of the new orientation.
+            for page in self.new_space.from_pages() {
+                page.for_each_object(|h, _| {
+                    if (*h).is_marked() {
+                        let tag = (*h).type_tag() as usize;
+                        let size = (*h).size_bytes() as usize;
+                        per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
+                        per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
                     }
                 });
             }
@@ -562,6 +618,41 @@ impl GcHeap {
 
         self.marking.finish_cycle();
         self.stats.last_full_reclaimed = reclaimed;
+        self.gc_stats.last_gc_reclaimed_bytes = reclaimed;
+        self.gc_stats.gc_cycles = self.gc_stats.gc_cycles.saturating_add(1);
+        let elapsed = pause_start.elapsed();
+        self.gc_stats.last_gc_pause_ms = elapsed.as_secs_f32() * 1000.0;
+        // Commit the per-tag counters gathered during the sweep
+        // pass — replaces the standalone `reconcile_live_counts`
+        // walk so the full GC pays for at most one heap walk.
+        for tag in 0..TYPE_TAG_COUNT {
+            let row = &mut self.gc_stats.by_type[tag];
+            row.live_bytes = per_tag_live_bytes[tag];
+            row.free_count_total = row
+                .alloc_count_total
+                .saturating_sub(per_tag_live_count[tag]);
+        }
+    }
+
+    /// Per-heap GC counters (alloc / live / free, per-type
+    /// breakdown). The alloc fast path only updates the per-tag
+    /// rows; the aggregates `live_objects` / `live_bytes` are
+    /// derived from those rows here, so the returned snapshot
+    /// is always consistent.
+    pub fn gc_stats(&mut self) -> &GcStats {
+        let mut live_objects = 0usize;
+        let mut live_bytes = 0usize;
+        for row in &self.gc_stats.by_type {
+            // Live count per tag = alloc_count_total -
+            // free_count_total; live_bytes is already maintained
+            // per-tag by alloc + reconcile.
+            let live_count = row.alloc_count_total.saturating_sub(row.free_count_total);
+            live_objects = live_objects.wrapping_add(live_count as usize);
+            live_bytes = live_bytes.wrapping_add(row.live_bytes);
+        }
+        self.gc_stats.live_objects = live_objects;
+        self.gc_stats.live_bytes = live_bytes;
+        &self.gc_stats
     }
 
     /// Construct a [`GlobalHandle`] from a `Gc<T>`. Note: the

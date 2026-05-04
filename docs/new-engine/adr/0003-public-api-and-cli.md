@@ -8,6 +8,7 @@
     §"Architecture Rules" #13–#14, §M1
   - [`docs/new-engine/adr/0001-staging-directory.md`](./0001-staging-directory.md)
   - [`docs/new-engine/adr/0002-oxc-frontend.md`](./0002-oxc-frontend.md)
+  - [`docs/new-engine/adr/0005-async-runtime-binding.md`](./0005-async-runtime-binding.md)
   - [task 04](../tasks/04-adr-public-api-cli-shape.md)
 
 ## Context
@@ -81,12 +82,12 @@ external consumer.
 
 ### 2. Crates that own the public API
 
-- `crates-next/otter-runtime` — owns `Runtime`, `RuntimeBuilder`,
+- `crates-next/otter-runtime` — owns `Otter`, `RuntimeHandle`,
+  `EventLoop`, `TokioEventLoop`, `Runtime`, `RuntimeBuilder`,
   `SourceInput`, `ExecutionResult`, `Diagnostic`, `CapabilitySet`,
   `OtterError`, `ConfigError`, `IoErrorKind`,
-  `InterruptHandle`, `ModuleLoader`, `Console`,
-  `TraceSink`, `ProfilingConfig`. This is the crate embedders depend
-  on.
+  `InterruptHandle`, `ModuleLoader`, `Console`, `TraceSink`,
+  `ProfilingConfig`. This is the crate embedders depend on.
 - `crates-next/otter-cli` — owns the `otter` binary. Depends only on
   `otter-runtime` (no direct dependency on `otter-vm`,
   `otter-bytecode`, `otter-compiler`, `otter-syntax`).
@@ -97,45 +98,64 @@ foundation phase keeps everything in `otter-runtime`.
 
 ### 3. Public Rust API
 
-The API has **two layers**:
+This ADR originally described a sync-first public surface. ADR-0005
+supersedes that part: the product surface is now handle-first and
+Tokio-first. The low-level isolate remains local and `!Send`; the public
+facade is async-friendly and `Send + Sync`.
 
-- **Layer A — `Otter`**: zero-configuration entry point. Use this
-  when you "just want to run a script". One type, one constructor,
-  five methods. Sensible defaults. No traits to implement.
-- **Layer B — `Runtime` + `RuntimeBuilder`**: opt-in advanced layer.
+The API has **three layers**:
+
+- **Layer A — `Otter`**: zero-configuration `Clone + Send + Sync`
+  facade. Use this when you "just want to run a script" from the CLI,
+  tests, or Tokio tasks.
+- **Layer B — `RuntimeHandle` + `EventLoop`**: async embedder layer.
+  Commands cross this boundary; VM and GC handles do not.
+- **Layer C — `Runtime` + `RuntimeBuilder`**: local isolate layer.
   Use this when you need custom capabilities, custom module loading,
-  trace sinks, profiling, or fine-grained resource limits. Layer A
-  is implemented on top of Layer B.
+  trace sinks, profiling, fine-grained resource limits, or direct
+  single-mutator control. Layer A is implemented on top of Layer B,
+  which drives Layer C inside an isolate runner.
 
-Embedders new to Otter never need to look at Layer B. The CLI uses
-Layer B internally; it does so via the same entry points
-documented below — no private surface.
+Embedders new to Otter never need to look below Layer A. The CLI uses
+Layer A / B internally; it does so via the same entry points documented
+below — no private VM surface.
 
 #### Layer A: `Otter` (zero-config)
 
 - tier: **stable**
 - purpose: the obvious starting point. One type, one constructor,
   one method per common task.
-- public surface:
+- public surface after ADR-0005:
 
   | Method | Tier | Purpose |
   | --- | --- | --- |
-  | `Otter::new() -> Otter` | stable | Construct with safe defaults: deny-all capabilities, 256 MiB heap cap, 30 s timeout, default module loader (`file://` only), stdout/stderr console. |
-  | `run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError>` | stable | Read the file, detect kind by extension (`.js`/`.mjs`/`.cjs`/`.ts`/`.mts`/`.cts`), execute it. The vast majority of programs need only this. |
-  | `run_script(&mut self, source: &str) -> Result<ExecutionResult, OtterError>` | stable | Run a string of JavaScript. |
-  | `run_typescript(&mut self, source: &str) -> Result<ExecutionResult, OtterError>` | stable | Run a string of TypeScript. |
-  | `eval(&mut self, source: &str) -> Result<ExecutionResult, OtterError>` | stable | Evaluate a single expression / statement and return its completion value. |
+  | `Otter::new() -> Otter` | stable | Construct with safe defaults and the default `TokioEventLoop`. Reuses the current Tokio runtime when present; otherwise owns one. |
+  | `run_file(&self, path: impl AsRef<Path>) -> impl Future<Output = Result<ExecutionResult, OtterError>>` | stable | Read the file, detect kind by extension (`.js`/`.mjs`/`.cjs`/`.ts`/`.mts`/`.cts`), execute it through `RuntimeHandle`. |
+  | `run_script(&self, source: &str) -> impl Future<Output = Result<ExecutionResult, OtterError>>` | stable | Run a string of JavaScript. |
+  | `run_typescript(&self, source: &str) -> impl Future<Output = Result<ExecutionResult, OtterError>>` | stable | Run a string of TypeScript. |
+  | `eval(&self, source: &str) -> impl Future<Output = Result<ExecutionResult, OtterError>>` | stable | Evaluate a single expression / statement and return its completion value. |
   | `interrupt(&self)` | stable | Cooperative cancellation. Cheap, callable from any thread. |
 
 That is the entire surface for the simple case. No `Box<dyn ...>` to
 construct, no builder to chain, no traits to implement.
 
-#### Layer B: `Runtime` + `RuntimeBuilder` (advanced)
+#### Layer B: `RuntimeHandle` + `EventLoop` (async embedder)
 
-When Layer A is not enough, drop down to Layer B. `Otter` is a thin
-wrapper around `Runtime` and you can switch at any time without
-re-architecting your code: every Layer A method has a Layer B
-equivalent that takes more arguments.
+- tier: **stable** for `RuntimeHandle`, **experimental** for custom
+  `EventLoop` implementations until at least one non-Tokio backend ships.
+- purpose: a `Send + Sync` command surface that can be cloned into Tokio
+  tasks without moving VM / GC state.
+- default event loop: `TokioEventLoop`.
+
+`RuntimeHandle` is the only public async boundary. It returns owned /
+serialized `ExecutionResult` data and never exposes internal `Value`,
+`Gc<T>`, `Local<'gc, T>`, `Frame`, `RuntimeState`, or `NativeCtx`.
+
+#### Layer C: `Runtime` + `RuntimeBuilder` (advanced local isolate)
+
+When Layer A/B are not enough, drop down to Layer C. This is the local
+isolate API used by the isolate runner. It is not thread-safe and should
+not be moved into `tokio::spawn`.
 
 ##### `Runtime`
 
@@ -591,10 +611,10 @@ For contributors:
 ## Alternatives considered
 
 - **One mega-crate.** Rejected: hides the internal/external boundary.
-- **Async public API (`async fn run_script`).** Rejected for the
-  foundation phase: the runtime is single-threaded and the timer
-  queue is internal. A future amendment may add an async wrapper
-  crate (`otter-runtime-async`) without touching this surface.
+- **Async public API (`async fn run_script`).** Originally rejected for
+  the foundation phase. Superseded by ADR-0005: the public facade is
+  async-first, while the local isolate remains single-mutator and
+  `!Send`.
 - **A `Value` type exposed publicly from day one.** Rejected: the
   value representation will evolve heavily through slices `09`–`13`.
   Embedders use accessors (`as_string()`, `as_number()`, …) until the
@@ -618,7 +638,18 @@ For contributors:
 - **Reason:** user request — the Deno per-permission model is a
   better fit than a flat capability bag and matches contemporary
   user expectations for runtime permission flags.
-- **Linked task:** [task 07](../tasks/07-vm-harness-minimal-interpreter.md).
+
+### 2026-05-04 — Tokio-first async runtime binding
+
+- **Change:** ADR-0005 supersedes the sync-only public surface. `Otter`
+  becomes a `Clone + Send + Sync` facade over `RuntimeHandle`.
+  `EventLoop` becomes part of `otter-runtime`, and `TokioEventLoop` is
+  the required default implementation. The local `Runtime` / VM / GC core
+  remains `!Send + !Sync` and is driven by an isolate runner.
+- **Reason:** the product runtime must be convenient for standalone JS,
+  CLI usage, Tokio tests, and embedded async applications without
+  weakening GC ownership or letting VM references cross `.await`.
+- **Linked task:** [task 85](../tasks/85-tokio-event-loop-runtime-handle.md).
 
 ### 2026-04-26 — UX-first defaults and `--sandbox`
 

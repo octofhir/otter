@@ -60,6 +60,7 @@ pub mod proxy;
 pub mod reflect;
 pub mod regexp;
 pub mod regexp_prototype;
+pub mod runtime_cx;
 pub mod runtime_state;
 pub mod string;
 pub mod string_dispatch;
@@ -94,6 +95,28 @@ pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
 pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
+
+pub use runtime_cx::NativeCtx;
+
+// ---------------------------------------------------------------------------
+// `!Send + !Sync` static assertions for the new-engine VM.
+//
+// Per ADR-0005 §3 ("VM and GC stay explicit-context and
+// single-mutator") and task 76A, the interpreter, every GC handle,
+// and every borrowed-context type must be `!Send + !Sync` so the
+// compile-fail tests under `tests/compile_fail/` reject any future
+// edit that accidentally moves a VM handle into `tokio::spawn` or
+// holds a `&mut RuntimeCx` across `.await`.
+//
+// Spec:
+// - <https://tc39.es/ecma262/#sec-agents>
+// ---------------------------------------------------------------------------
+static_assertions::assert_not_impl_any!(Interpreter: Send, Sync);
+static_assertions::assert_not_impl_any!(crate::runtime_cx::NativeCtx<'static>: Send, Sync);
+// `RuntimeCx<'_>` is `pub(crate)` so we cannot name it directly in
+// a `pub`-visible macro. The bound is enforced transitively because
+// `RuntimeCx<'rt>` holds `&'rt mut Interpreter`, and `Interpreter`
+// is `!Send + !Sync` per the assertion above.
 
 /// Foundation runtime value.
 ///
@@ -1832,6 +1855,21 @@ impl Interpreter {
     /// Mutable borrow of the per-isolate GC heap.
     #[must_use]
     pub fn gc_heap_mut(&mut self) -> &mut otter_gc::GcHeap {
+        &mut self.gc_heap
+    }
+
+    /// `pub(crate)` alias used by [`crate::runtime_cx::RuntimeCx`]
+    /// to forward the heap borrow without rebinding through a
+    /// public method. Tracks the explicit-context migration in
+    /// task 76A.
+    #[must_use]
+    pub(crate) fn gc_heap_for_cx(&self) -> &otter_gc::GcHeap {
+        &self.gc_heap
+    }
+
+    /// `pub(crate)` mutable alias — see [`Self::gc_heap_for_cx`].
+    #[must_use]
+    pub(crate) fn gc_heap_for_cx_mut(&mut self) -> &mut otter_gc::GcHeap {
         &mut self.gc_heap
     }
 

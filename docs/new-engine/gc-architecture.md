@@ -103,7 +103,7 @@
 | NF2 | **Allocation throughput:** ≤ 10 ns per young-gen `alloc()` in the bump fast path. ≤ 30 ns including barrier-needing pointer field initialisation. | bump alloc + `NonNull<GcHeader>` write; matches V8 inline-cache path within 2× |
 | NF3 | **Peak RSS:** every test sees the configured `max_heap_bytes_per_test` cap (default 512 MB) **honoured**, OOM surfaces as `OtterError::OutOfMemory`. Parent process never exceeds 4 GB RSS during full test262 sweep. **Steady-state RSS bloat (24 h embedder):** ≤ 1.5× live-set size. | unblocks tests; production embedder bar |
 | NF4 | **Determinism:** Reachability is deterministic — a value reachable through any documented strong root survives at least one collection. Finalisers run on a deterministic phase boundary (post-sweep, before next mutator step). Cycle timing is best-effort. | matches V8/JSC |
-| NF5 | **Single-thread isolate.** One isolate = one thread. All GC state is `!Sync`; the cap-enforcement flag and (Phase 2) sweeper hand-off queue are the only `Sync` surfaces. | matches MEMORY.md |
+| NF5 | **Single-mutator isolate.** One isolate owns one mutator at a time. `RuntimeCore`, `RuntimeState`, `GcHeap`, `Gc<T>`, `Local<'gc, T>`, and native contexts are `!Send + !Sync`. Public `Otter` / `RuntimeHandle` may be `Send + Sync` only because they send commands to an isolate runner and never expose VM / GC references. The cap-enforcement flag, command queues, event-loop wakeups, and (Phase 2) sweeper hand-off queue are the only `Sync` surfaces. | matches MEMORY.md + ADR-0005 |
 | NF6 | **Diagnostic surface:** `gc.heap_snapshot() -> HeapSnapshot`; `gc.write_devtools_snapshot(path)` (Chrome DevTools format); per-type retained-byte counters; deterministic `gc.collect_full()` for repro tests; `gc.stats()` exposes pause-time histogram + allocation rate + GC cycle count. | required for production debugging |
 | NF7 | **Memory safety bar.** Every `unsafe` block annotated with `// SAFETY:`; every public `unsafe fn` documents `# Safety`; every non-trivial unsafe block has a miri test; **`cargo +nightly miri test -p otter-gc` green** on every PR that touches `crates-next/otter-gc/`. **`cargo asan test`** (AddressSanitizer) green nightly. | production-grade hygiene; matches V8 / JSC fuzz-testing bar |
 | NF8 | **Stress-test endurance.** Phase-1 closeout (task 84) includes: (a) 24 h continuous test262 loop without OOM / crash / RSS drift; (b) `loom` model-checking pass on the (Phase 2) concurrent sweep hand-off; (c) `cargo fuzz` corpus on the heap API surviving 10 M iterations no-panic. | production-grade endurance; not negotiable |
@@ -424,12 +424,24 @@ single audit point owns the policy.
 ### 6.2 `Drop`, `Send`, `Sync`
 
 - `Gc<T>: Copy` — no `Drop`. Cheap clone (u32+u8).
+- `Gc<T>`, `Local<'gc, T>`, `HandleScope<'gc>`, `RuntimeState`,
+  `NativeCtx<'_>`, and `GcHeap` are not `Send` or `Sync`. They never
+  cross `.await`, `tokio::spawn`, worker boundaries, or public
+  `RuntimeHandle` replies.
 - The heap (`GcHeap`) owns all `Box<dyn>` payloads. Sweep drops them,
   invoking each payload type's `Drop` impl. This is how the legacy
   `WeakRef` / `FinalizationRegistry` callbacks fire — by registering
   a Drop-time hook on the slot.
-- `GcHeap: !Sync, !Send`. One isolate = one thread (matches
-  MEMORY.md). The cap-enforcement `oom_flag` is the only `Arc<AtomicBool>`.
+- `GcHeap: !Sync, !Send`. One isolate has one mutator. In the product
+  API this is enforced by running the heap inside an isolate runner and
+  exposing only `Otter` / `RuntimeHandle` command surfaces to Tokio
+  worker threads.
+- Thread-local heap lookup (`GcHeap::with_thread_default*`) is not an
+  architecture primitive. Product VM / runtime / native-binding code
+  passes `RuntimeCx` / `NativeCtx` / `&mut GcHeap` explicitly so every
+  allocation, dereference, and write barrier knows which isolate owns
+  the handle. Any remaining thread-local helper is hidden test
+  scaffolding only.
 - Trace functions (`Traceable::trace_handles`) take `&self` and a
   visitor — never `&mut`. This prevents reentry-into-self during a
   trace.
@@ -449,10 +461,12 @@ GcHeap::get_mut<T>(&mut self, gc: Gc<T>) -> &mut T;   // exclusive heap borrow
 ```
 
 The interpreter already threads `&mut RuntimeState` (task 56 —
-`56-remove-refcell-from-hot-paths.md` — calls this out). So borrow
-discipline is `&mut self.heap → &mut T` exclusively. Reentry (a native
-intrinsic that re-enters the interpreter) needs to release the borrow
-before re-entry; this is the same constraint the legacy crate
+`56-remove-refcell-from-hot-paths.md` — calls this out). Task 76A makes
+that explicit through `RuntimeCx` / `NativeCtx`, and tasks 77-83 must use
+that context rather than a thread-local heap. Borrow discipline is
+`&mut cx.heap → &mut T` exclusively. Reentry (a native intrinsic that
+re-enters the interpreter) needs to release the borrow before re-entry;
+this is the same constraint the legacy crate
 identifies as "ObjectCell zero-cost UnsafeCell pattern" (MEMORY.md §
 "Key Decisions"). For the new engine, we surface this via
 `heap.with_mut::<T, R>(gc, |t: &mut T| -> R)` to prevent the borrow
@@ -636,9 +650,10 @@ allocation-heavy benchmarks.
 
 ### Phase 4 (deferred indefinitely) — Concurrent marking + parallel scavenge
 
-Single-threaded isolate (one isolate = one thread) makes concurrent
-marking expensive in complexity for marginal pause-time win. Defer
-until production embedders demand it.
+Single-mutator isolates make concurrent marking expensive in complexity
+for marginal pause-time win. The public `RuntimeHandle` may be used from
+many Tokio workers, but it still feeds one mutator per isolate. Defer
+concurrent marking until production embedders demand it.
 
 ---
 

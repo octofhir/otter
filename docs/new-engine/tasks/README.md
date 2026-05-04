@@ -348,16 +348,17 @@ individual task files split out as work begins. Headlines:
 | [54-harness-richer-assertions.md](./54-harness-richer-assertions.md) | Wire spec-already-defined `expect.value` / `expect.stdout_contains` / `expect.throws` into the engine-suite runner so fixtures stop relying on the `undefined.x` fail-trick. |
 | [55-otter-macros-next.md](./55-otter-macros-next.md) | New `otter-macros-next` proc-macro crate (`#[js_method]`, `js_proto!`, `#[js_namespace]`); migrate string / array / number / math / regexp prototype tables. |
 | [56-remove-refcell-from-hot-paths.md](./56-remove-refcell-from-hot-paths.md) | Remove `RefCell` from every hot path in `crates-next/*`; replace with `&mut` field access threaded through `dispatch_loop`. Required before task 35 (async) lands. |
+| [76a-runtime-binding-explicit-context.md](./76a-runtime-binding-explicit-context.md) | Runtime binding cleanup before the remaining GC migrations: explicit `RuntimeCx` / `NativeCtx`, no product-code thread-local heap lookup, compile-fail tests for VM / GC handles across `tokio::spawn`. |
 
 > JIT is out of scope for the current phase. **GC has now opened**
-> as its own dedicated track (tasks 70–87) — see
+> as its own dedicated track (tasks 70–91) — see
 > [70-gc-master-tracker.md](./70-gc-master-tracker.md) and the
 > design doc at
 > [`docs/new-engine/gc-architecture.md`](../gc-architecture.md). Pick
 > tasks in numeric order (70 → 71 → 72 → …) and validate gates per
 > task; do not file new GC work outside that track.
 
-### GC track (tasks 70–87)
+### GC track (tasks 70–91)
 
 Replace `Rc<RefCell<…>>` with a `Gc<T>` handle backed by a
 **production-grade page-based generational tracing GC**, ported as
@@ -379,6 +380,7 @@ deferred indefinitely.
 | ✅ 74 (closed 2026-05-04) | `GcStats` per-tag counters fused into the alloc fast path + sweep walk; `HeapSnapshot` + retained-size walker + `group_by_type`; `Runtime::heap_stats` / `heap_snapshot` / `force_gc` API. |
 | ✅ 75 (closed 2026-05-04) | `RuntimeState::trace_roots` central walker; `GcTrace` stubs on every future-`Gc` value-model type (UpvalueCell / JsObject / JsArray / JsMap+Set / JsWeakMap+Set / JsPromiseHandle / IteratorState / JsGenerator / BoundFunction / NativeFunction / JsRegExp / Frame / AsyncFrameState / Microtask / JsSymbol / SymbolRegistry / WellKnownSymbols / ErrorClassRegistry); `Runtime::force_gc` invokes the walker; per-root `#[ignore]` smoke-test scaffold in `crates-next/otter-vm/tests/gc_roots.rs`. |
 | ✅ 76 (closed 2026-05-04) | First per-type migration: `UpvalueCell` is now `Gc<UpvalueCellBody>` (4-byte compressed offset, `Copy`) backed by `otter_gc::SafeTraceable`; new GC APIs `alloc_old` / `with_payload` / `read_payload` / `write_barrier_raw`; `GcHeap` moved into `Interpreter` (Runtime delegates); `Frame::for_function_with_heap` + `Frame::build_upvalues` for the entry / call paths; `Op::MakeClosure` / `Op::LoadUpvalue` / `Op::StoreUpvalue` route through `alloc_upvalue` / `read_upvalue` / `store_upvalue`; `Value::trace_value_slots` walks closure upvalue spines; upvalue smoke test un-ignored; `gc_upvalue_cycle::counter_closure_no_leak_after_force_gc` regression. |
+| [76a-runtime-binding-explicit-context.md](./76a-runtime-binding-explicit-context.md) | Blocking cleanup before 77: explicit context for heap/barrier/native access; thread-local heap lookup is not a product-code API. |
 | [77-migrate-jsobject.md](./77-migrate-jsobject.md) | `JsObject` to `Gc<ObjectBody>`; barriers on every property store. |
 | [78-migrate-jsarray.md](./78-migrate-jsarray.md) | `JsArray` to `Gc<ArrayBody>`; barriers on element / named-prop stores. |
 | [79-migrate-jsmap-jsset.md](./79-migrate-jsmap-jsset.md) | `JsMap` / `JsSet` to `Gc<…>`; barriers on entry stores. |
@@ -393,6 +395,18 @@ deferred indefinitely.
 | [90-gc-sticky-mark-bit.md](./90-gc-sticky-mark-bit.md) | Phase 3 — sticky-mark-bit minor cycles; throughput win on steady-state long-running workloads. |
 | [87-gc-concurrent-marking.md](./87-gc-concurrent-marking.md) | Phase 4 — concurrent marking + parallel scavenge. **Deferred indefinitely.** |
 | [91-gc-bench-and-soak-infra.md](./91-gc-bench-and-soak-infra.md) | Cross-cutting — Criterion benches + cargo-fuzz corpus + 24 h soak runner + miri/asan/lsan/tsan CI matrix + V8-parity benchmark suite. Required for any production-grade gate to be verifiable. |
+
+### Runtime / async binding track
+
+This track is product-critical, not optional embedder polish. The public
+runtime is handle-first and Tokio-first: `Otter` / `RuntimeHandle` are
+`Send + Sync`, while the isolate, VM, and GC remain single-mutator and
+`!Send + !Sync`.
+
+| File | One-line goal |
+|------|---------------|
+| [85-tokio-event-loop-runtime-handle.md](./85-tokio-event-loop-runtime-handle.md) | `EventLoop` trait + required `TokioEventLoop` default; public async `Otter` facade; isolate runner; cancellation, timeout, backpressure, and leak diagnostics. |
+| [92-worker-isolates-and-structured-clone.md](./92-worker-isolates-and-structured-clone.md) | Workers and isolate pools. Each worker owns its own heap; communication crosses workers only through structured clone / transferables. |
 
 ### Test262 conformance
 

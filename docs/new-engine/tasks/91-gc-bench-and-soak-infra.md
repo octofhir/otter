@@ -7,6 +7,7 @@
 - [ ] 24 h soak-test runner script
 - [ ] miri / asan / lsan / tsan CI jobs
 - [ ] V8-parity benchmark suite
+- [ ] runtime-handle leak / stress diagnostics integrated with GC soak
 - [ ] gates green
 
 ## Why this exists
@@ -14,8 +15,11 @@
 Phase 1 closeout (task 84) and Phase 2 closeout (task 86) carry
 production-grade gates that **measure** the GC: pause histograms,
 throughput parity vs. V8, soak-test endurance, sanitizer
-cleanliness, fuzz corpus survival. These gates need infrastructure
-to run against. Without this task, the gates cannot be checked.
+cleanliness, fuzz corpus survival. ADR-0005 also requires early
+detection for public async handles: leaked host ops, timers, command
+waiters, global handles, and stress-GC around async completion. These
+gates need infrastructure to run against. Without this task, the gates
+cannot be checked.
 
 This task is the foundation of "production-grade" as a verifiable
 claim, not a self-assessment.
@@ -93,11 +97,25 @@ JS programs run **both** under Otter and under Node.js LTS:
 - Closure chain (1 M nested closures, captured upvalues).
 - JSON parse (1 GB JSON document).
 - Async/await pipeline (10 K parallel awaits).
+- RuntimeHandle stress (many concurrent `Otter::run_*` calls through
+  Tokio multi-thread executor).
 - Property-store loop (steady-state pointer writes triggering
   barriers).
 
 Runner reports Otter time / Node time ratio. Gates per
 architecture doc §1.2 NF10.
+
+### 91.6 — Runtime-handle leak and stress diagnostics
+
+Add reusable test utilities for task 85 and later server surfaces:
+
+- forced GC at every allocation / safepoint / async completion;
+- runtime-drop leak reports for global handles, open handle scopes,
+  pending host ops, live timers, queued commands, and unresolved
+  host-created promises;
+- bounded queue pressure tests;
+- cancellation/timeout soak tests where waiters are dropped while the
+  isolate continues to a safepoint.
 
 ## Validation gates
 
@@ -109,6 +127,7 @@ architecture doc §1.2 NF10.
   RSS drift, zero panics.
 - [ ] 91.4 CI workflow merged and green.
 - [ ] 91.5 V8-parity numbers checked into baseline.
+- [ ] 91.6 stress utilities are used by task 85 validation tests.
 
 ## Closing
 

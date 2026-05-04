@@ -80,3 +80,22 @@ pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use snapshot::{HeapSnapshot, SnapshotObject};
 pub use stats::{GcStats, TYPE_TAG_COUNT, TypeStats};
 pub use trace::{SafeTraceable, SlotVisitor, TraceFn, TraceTable, Traceable};
+
+// ---------------------------------------------------------------------------
+// `!Send + !Sync` static assertions.
+//
+// Per ADR-0005 §3 and the GC architecture plan §6.2, every GC primitive
+// is bound to a single mutator thread. These compile-time checks make
+// the single-mutator invariant visible to the type system: any future
+// edit that accidentally adds `Send`/`Sync` to one of these handles
+// will fail to compile, and `tokio::spawn` callers cannot capture them
+// in `Send` futures (see compile-fail fixtures under
+// `crates-next/otter-vm/tests/compile_fail/`).
+//
+// Spec:
+// - <https://tc39.es/ecma262/#sec-agents> (one mutator per agent)
+// ---------------------------------------------------------------------------
+static_assertions::assert_not_impl_any!(GcHeap: Send, Sync);
+static_assertions::assert_not_impl_any!(Gc<()>: Send, Sync);
+static_assertions::assert_not_impl_any!(Local<'static, ()>: Send, Sync);
+static_assertions::assert_not_impl_any!(HandleScope<'static>: Send, Sync);

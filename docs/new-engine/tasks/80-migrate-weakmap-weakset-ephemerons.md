@@ -7,6 +7,8 @@
 - [ ] `GcHeap::collect_full` exposes `mark_phase` / `mark_additional` / `sweep_phase` split
 - [ ] post-mark fixpoint passes ephemeron values into worklist
 - [ ] dead-key entry sweep before slot sweep
+- [ ] ephemeron mutation and fixpoint APIs use explicit runtime / heap
+      context; no thread-local heap lookup
 - [ ] `task 57` markers in `collections.rs` removed
 - [ ] gates green
 
@@ -53,7 +55,10 @@ Reference impl: legacy `crates/otter-gc/src/typed.rs`
    `WeakMap`/`WeakSet`, for each entry whose key is `is_marked`, call
    `mark_additional([value])`. Iterate until no new objects mark
    (fixed point). Then sweep dead-key entries from each weak
-   collection's table before the heap sweep runs.
+   collection's table before the heap sweep runs. The fixpoint driver is
+   called by the isolate mutator while holding explicit `RuntimeCx` /
+   `&mut GcHeap`; it is not an async task and never runs from Tokio
+   worker threads.
 4. **`WeakMapBody` / `WeakSetBody`** become `EphemeronTable`-backed.
    Their `Traceable::trace` is **a no-op** (the GC consults the
    ephemeron table separately during fixpoint).
@@ -73,6 +78,7 @@ Reference impl: legacy `crates/otter-gc/src/typed.rs`
 ## Validation gates
 
 - [ ] All existing collection fixtures pass.
+- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/collections.rs crates-next/otter-gc/src/ephemeron.rs` returns no product-code hits.
 - [ ] Regression test `tests/gc_weakmap_eviction.rs`: hold a key
   briefly, drop it, force GC, assert the WeakMap entry is gone and
   the value object is reaped.

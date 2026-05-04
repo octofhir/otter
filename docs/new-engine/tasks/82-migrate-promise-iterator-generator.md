@@ -7,6 +7,7 @@
 - [ ] generator-frame state migrated to `Gc<…>`
 - [ ] `Rc<RefCell<…>>` removed from `promise.rs`, iterator paths, generator path
 - [ ] parked async/generator frames trace correctly
+- [ ] no parked JS frame or VM handle can be captured by a Rust host future
 - [ ] gates green
 
 ## Goal
@@ -46,7 +47,10 @@ bodies.
 5. **Parked-frame trace.** In task 75 we stubbed
    `RuntimeState::trace_roots` to walk parked frames. Now make those
    stubs functional: a parked async frame holds locals + register
-   values that may include `Gc<…>` handles; trace each.
+   values that may include `Gc<…>` handles; trace each. Parked JS
+   frames are isolate-owned roots, not Rust futures. Host async work
+   receives only copied owned data and an op id; completion posts an
+   owned message back to the isolate.
 
 ## Out of scope
 
@@ -59,6 +63,8 @@ bodies.
 
 - [ ] No `Rc<RefCell<IteratorState>>` / `Rc<RefCell<PurePromiseBody>>`
   remaining.
+- [ ] Compile-fail test proves `Frame`, `Value`, `Gc<T>`, and
+  `Local<'gc, T>` cannot be captured by a `tokio::spawn` host future.
 - [ ] All Promise / async / iterator / generator engine fixtures
   pass.
 - [ ] Regression test `tests/gc_promise_chain.rs`: build a 100k-deep

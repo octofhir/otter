@@ -6,8 +6,37 @@
 - [ ] `Rc<RefCell<ObjectBody>>` removed from `object.rs`
 - [ ] `Traceable` impl traces shape keys + property values + prototype + named properties
 - [ ] every `borrow()` / `borrow_mut()` on `ObjectBody` replaced
+- [ ] object APIs take `RuntimeCx` / `NativeCtx` / `&mut GcHeap`
+      explicitly; no thread-local heap lookup
 - [ ] `gc_roots.rs` smoke tests for globals / module env / `this` un-ignored
 - [ ] gates green
+
+## Open work (post-76A)
+
+Task 76A landed the structural pieces (`RuntimeCx<'rt>` / `NativeCtx<'rt>`
+types, `!Send + !Sync` static assertions, compile-fail trybuild fixtures)
+and audited the product surface. A minimal foundation is in place;
+this task still needs:
+
+- **API rewrite of `object.rs`** — every `JsObject` method that touches
+  `ObjectBody` storage takes `&otter_gc::GcHeap` / `&mut otter_gc::GcHeap`
+  (or `&NativeCtx<'_>` / `&mut NativeCtx<'_>` once the public binding
+  surface lands). Today the methods still flow through
+  `Rc<RefCell<ObjectBody>>` (pre-task-76 storage); the pre-WIP rewrite
+  to `Gc<ObjectBody>` was reverted because the caller-side migration
+  (~400 sites across ~29 files) does not fit a single session.
+- **Caller migration** — every call site in `crates-next/otter-vm/src/`
+  (lib.rs ~71 sites, object_statics.rs ~31, reflect.rs ~15, plus many
+  smaller files) needs to thread `&self.gc_heap` / `&mut self.gc_heap`
+  through the call chain. This is mechanical but bulky.
+- **`Value::trace_value_slots` `Object` arm** — the WIP draft is
+  preserved in the task spec; it lands in lockstep with the
+  `Gc<ObjectBody>` migration above.
+- **Un-ignore root smoke tests** — the `tests/gc_roots.rs::globals_*`
+  / `module_env_*` cases stay `#[ignore]` until `Value::Object` walks
+  through a real `Gc<ObjectBody>` slot.
+- **Regression test** — `tests/gc_object_cycle.rs::proto_cycle_reaped`
+  per the validation gate below.
 
 ## Goal
 
@@ -46,14 +75,15 @@ test sweep.
    ```
 2. **API change** — public methods on `JsObject` like `get`, `set`,
    `define_own_property`, `prototype`, etc. that today take `&self`
-   and call `self.inner.borrow()` now need `&GcHeap` (read) or `&mut
-   GcHeap` (mutate) threaded through. Two options:
-   - **Free functions** that take `&mut GcHeap`. Cleanest; matches
-     §6.3 of architecture doc.
-   - **Methods on `ObjectBody`** taking `&mut self`, called via
-     `heap.with_mut(obj, |body| body.set(…))`. Slightly more
-     ergonomic when chained; same borrow discipline.
-   Pick one and apply uniformly.
+   and call `self.inner.borrow()` now take explicit context. This is no
+   longer optional after ADR-0005 / task 76A:
+   - read paths take `&RuntimeCx` / `&GcHeap` as appropriate;
+   - mutation paths take `&mut RuntimeCx` / `&mut GcHeap`;
+   - write barriers run through that same context;
+   - do not use `GcHeap::with_thread_default*` or any raw
+     thread-local heap pointer.
+   Method-style wrappers are acceptable only when the context is an
+   explicit parameter, e.g. `obj.get(&mut cx, key)`.
 3. **Trace the `Value` arm for `Object`** — extend the `trace_value`
    helper from task 76 to dispatch on `Value::Object(o)` to `v(o.raw())`.
 4. **Un-ignore** root smoke tests for globals, module env, and `this`
@@ -80,6 +110,7 @@ test sweep.
 ## Validation gates
 
 - [ ] No `Rc<RefCell<ObjectBody>>` anywhere.
+- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/object.rs crates-next/otter-vm/src` returns no object-path product-code hits.
 - [ ] All existing engine fixtures still pass.
 - [ ] New regression test `tests/gc_object_cycle.rs::proto_cycle_reaped`:
   `let a = {}; let b = { __proto__: a }; a.__proto__ = b; … drop;

@@ -6,6 +6,7 @@
 - [ ] `Rc<RefCell<ArrayBody>>` removed from `array.rs`
 - [ ] `Traceable` impl traces dense elements + named properties
 - [ ] all element / named-prop accesses go through `GcHeap`
+- [ ] all array APIs take explicit context; no thread-local heap lookup
 - [ ] `reserve_bytes` / `release_bytes` wired to `elements` capacity changes
 - [ ] gates green
 
@@ -45,7 +46,9 @@ unaccounted heap user in the legacy engine
 2. **Off-slot accounting hook.** Wrap `elements` mutation through a
    helper that calls `heap.reserve_bytes(delta)` before grow and
    `heap.release_bytes(delta)` after shrink/free. The helper must be
-   the *only* path that resizes `elements`; grep audit in PR.
+   the *only* path that resizes `elements`; grep audit in PR. The
+   helper receives `&mut RuntimeCx` / `&mut GcHeap` explicitly and must
+   not resolve the heap through thread-local state.
 3. **Trace the `Value` arm for `Array`** — one new `match` arm in
    `trace_value`.
 4. **Update `Value::Array(JsArray)` clone semantics** — handle is
@@ -62,6 +65,7 @@ unaccounted heap user in the legacy engine
 ## Validation gates
 
 - [ ] No `Rc<RefCell<ArrayBody>>`.
+- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/array* crates-next/otter-vm/src` returns no array-path product-code hits.
 - [ ] All existing engine fixtures pass.
 - [ ] New regression test `tests/gc_array_cap_kicks_in.rs`: configure
   cap = 4 MiB; run `Array.from({length: 1<<20})`; assert `Err(OtterError::OutOfMemory)`.

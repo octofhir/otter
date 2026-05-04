@@ -19,11 +19,13 @@ table row "concurrent marking — deferred indefinitely":
 > Multi-threaded marking implies tri-color CAS plus a parking-mutator
 > protocol. Not justified at our heap sizes.
 
-One isolate = one thread (MEMORY.md). Concurrent marking buys
-single-digit-ms pause headroom; the complexity cost (parking
-protocol, atomic mark CAS, race-windows in barrier paths) is large.
-Pick up when *production* embedders observe Phase-2 incremental
-pauses are still over budget under sustained load — not before.
+One isolate = one mutator (ADR-0005 / NF5). Public `RuntimeHandle`
+clones may be used from many Tokio worker threads, but that does not
+permit those workers to touch the heap. Concurrent marking buys
+single-digit-ms pause headroom; the complexity cost (parking protocol,
+atomic mark CAS, race-windows in barrier paths) is large. Pick up when
+*production* embedders observe Phase-2 incremental pauses are still over
+budget under sustained load — not before.
 
 Compaction similarly deferred: relevant only after months of
 production use surface real fragmentation.
@@ -37,7 +39,8 @@ production use surface real fragmentation.
    single-threaded; concurrent marking exposes the parent/child
    load ordering).
 4. Old-gen compaction with forwarding tables.
-5. ADR-0005 if any new public API or unsafe surface lands.
+5. ADR-0005 amendment if any new public API, thread-affinity rule, or
+   unsafe surface lands.
 
 ## Closing
 

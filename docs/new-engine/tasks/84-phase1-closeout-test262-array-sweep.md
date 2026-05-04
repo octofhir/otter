@@ -6,6 +6,7 @@
 - [ ] cap-as-`RangeError` JS surface
 - [ ] `bash scripts/test262-safe.sh built-ins/Array` runs to completion on a 16 GB host
 - [ ] full `cargo test --workspace` green
+- [ ] runtime binding safety gates from task 76A remain green
 - [ ] documentation updates
 - [ ] gates green
 
@@ -53,14 +54,22 @@ NF3, §7.4 (repro harness), §8 Phase 1 exit criteria.
    [`docs/new-engine/tasks/README.md`](./README.md), record the
    completed Phase 1 in the same shape as Phases A–G ("✅ Phase
    complete — see Phase 2 master ticket"). Link to task 85 as the
-   next scheduled work.
+   next runtime-binding work and task 86 as the next GC phase.
 6. **Remove the long-standing `task 57` reference** in
    `lib.rs:194` if any survived (should already be gone after task
    80).
+7. **Runtime binding audit.** Confirm the Phase 1 GC surface is
+   compatible with ADR-0005:
+   - no product-code `GcHeap::with_thread_default*`;
+   - no internal `Value` / `Gc<T>` / `Local<'gc, T>` exposed through
+     public async results;
+   - compile-fail tests from task 76A still cover Tokio capture cases;
+   - GC stress modes can run at allocation, safepoint, and async
+     completion boundaries once task 85 is active.
 
 ## Out of scope
 
-- Phase 2+ work. Task 85 onward is its own track.
+- Runtime async binding (task 85) and Phase 2+ GC work (task 86 onward).
 - Performance benchmarking. The Phase 1 deliverable is correctness
   and survivability, not speed. A `cargo bench` baseline before /
   after is welcome but not gating.
@@ -82,6 +91,10 @@ NF3, §7.4 (repro harness), §8 Phase 1 exit criteria.
 - [ ] No `Rc<RefCell<…>>` survives in `crates-next/otter-vm/src`
   inside any `Value`-variant body (`grep -rn "Rc<RefCell" crates-next/otter-vm/src`
   zero relevant hits; Shape / module URL strings exempted).
+- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm crates-next/otter-runtime` returns no product-code hits.
+- [ ] Compile-fail suite proves `Gc<T>`, `Local<'gc, T>`, `NativeCtx`,
+  `RuntimeState`, `Frame`, and internal `Value` cannot cross
+  `tokio::spawn` / `.await`.
 
 ### Memory safety (NF7)
 
@@ -126,6 +139,9 @@ NF3, §7.4 (repro harness), §8 Phase 1 exit criteria.
   panel. Manual smoke test documented.
 - [ ] `Runtime::heap_stats()` exposes pause-time histogram,
   allocation rate, GC cycle count.
+- [ ] Runtime drop diagnostics report live global handles, open handle
+  scopes, pending host ops, live timers, and queued commands when
+  present.
 
 ### Pointer-compression invariants (NF9)
 

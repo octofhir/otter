@@ -6,6 +6,8 @@
 - [ ] `NativeFunction` body migrated to `Gc<…>`
 - [ ] `JsRegExp` body migrated to `Gc<…>`
 - [ ] last `Rc<…>` removed from public `Value` variants
+- [ ] native function signature uses explicit `NativeCtx`; async host
+      ops do not capture VM / GC references
 - [ ] gates green
 
 ## Goal
@@ -31,7 +33,12 @@ variant carries a non-leaf `Rc` or `RefCell`.
    ```
    Trace traverses `target` + `bound_this` + each `prefix` element.
 2. **`NativeFunction`** — body holds a Rust closure plus optional
-   captured `Value`s. Trace traverses captures.
+   captured `Value`s. Trace traverses captures. The call signature
+   takes an explicit `NativeCtx` / runtime context. Async host functions
+   are represented by the ADR-0005 host-op bridge: sync validation on the
+   isolate, owned data sent to `EventLoop`, completion posted back by op
+   id. Do not store an `async fn` closure that can retain `NativeCtx`,
+   `Value`, `Gc<T>`, or `Local<'gc, T>` across `.await`.
 3. **`JsRegExp`** — leaf as far as the GC is concerned: the
    `regress::Regex` is owned by the body, has no GC children. Trace
    is empty. (Documented explicitly per architecture-doc §10.2 Q4 —
@@ -54,6 +61,8 @@ variant carries a non-leaf `Rc` or `RefCell`.
 - [ ] `grep -rn "Rc<RefCell\|Rc<.*Body" crates-next/otter-vm/src` returns
   zero hits inside `Value`-variant bodies (Shape and other
   immutable-shared types still allowed).
+- [ ] Compile-fail test proves a native host future cannot capture
+  `NativeCtx<'_>`, internal `Value`, `Gc<T>`, or `Local<'gc, T>`.
 - [ ] All existing engine fixtures pass.
 - [ ] `cargo clippy --workspace -- -D warnings` clean.
 

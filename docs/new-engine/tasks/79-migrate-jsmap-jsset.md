@@ -6,6 +6,8 @@
 - [ ] `JsSet = Gc<SetBody>`
 - [ ] `Rc<RefCell<…Body>>` removed from `collections.rs`
 - [ ] `Traceable` impls trace keys + values
+- [ ] Map / Set mutation APIs take explicit context for barriers and
+      off-slot accounting
 - [ ] gates green
 
 ## Goal
@@ -41,7 +43,9 @@ a value, a Set containing an object that points back).
    primitive variants are leaves.
 3. **`trace_value` extension** — arms for `Value::Map` and `Value::Set`.
 4. **`reserve_bytes` hook** on `IndexMap` capacity changes (same
-   pattern as task 78's array elements).
+   pattern as task 78's array elements). Every mutation helper receives
+   `&mut RuntimeCx` / `&mut GcHeap` explicitly; no thread-local heap
+   lookup is allowed.
 
 ## Out of scope
 
@@ -53,6 +57,7 @@ a value, a Set containing an object that points back).
 ## Validation gates
 
 - [ ] No `Rc<RefCell<MapBody>>` / `Rc<RefCell<SetBody>>`.
+- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/collections.rs` returns no Map / Set product-code hits.
 - [ ] All existing engine fixtures pass.
 - [ ] Regression test `tests/gc_map_self_value.rs`: `let m = new Map();
   m.set("k", m); … drop; collect; assert no live Map`.

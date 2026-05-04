@@ -9,6 +9,8 @@
   - [x] 74 — `GcStats` + `HeapSnapshot` + retained-size walker + `Runtime::heap_stats` / `heap_snapshot` / `force_gc` (closed 2026-05-04)
   - [x] 75 — `RuntimeState::trace_roots` + `GcTrace` stubs on every future-`Gc` type + `Runtime::force_gc` wiring + per-root smoke-test scaffold (closed 2026-05-04)
   - [x] 76 — `UpvalueCell` migrated to `Gc<UpvalueCellBody>` + `SafeTraceable` trait + `alloc_old` / `with_payload` / `read_payload` / `write_barrier_raw` GC APIs + `GcHeap` moved into `Interpreter` + `Frame::for_function_with_heap` / `Frame::build_upvalues` + `Value::trace_value_slots` for closure-spine walk + upvalue smoke test un-ignored + `counter_closure_no_leak` regression (closed 2026-05-04)
+- [ ] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
+- [ ] Workers / isolate pools (task 92)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
 - [ ] Phase 4 (deferred indefinitely) — concurrent marking + parallel scavenge (task 87)
@@ -51,6 +53,7 @@ later tasks assume earlier ones have landed.
 | 74 | [74-gc-stats-and-snapshot.md](./74-gc-stats-and-snapshot.md) | `GcStats`, `HeapSnapshot`, retained-size walker, `Runtime::heap_stats()`. |
 | 75 | [75-gc-root-enumeration.md](./75-gc-root-enumeration.md) | `RuntimeState::trace_roots`: frames, microtask queue, module envs, dynamic-import host, symbol registry; smoke tests. |
 | 76 | [76-migrate-upvalue-cell.md](./76-migrate-upvalue-cell.md) | `UpvalueCell` from `Rc<RefCell<Value>>` → `Gc<UpvalueCellBody>` + write-barrier wiring on every upvalue store. |
+| 76A | ✅ structural pieces landed (2026-05-04); thread-default helpers retained as transitional shims pending tasks 77-83 | `RuntimeCx<'rt>` / `NativeCtx<'rt>` types in `crates-next/otter-vm/src/runtime_cx.rs`; `!Send + !Sync` static assertions on `GcHeap` / `Gc<T>` / `Local<'gc, T>` / `HandleScope` / `Interpreter` / `NativeCtx<'_>`; trybuild compile-fail fixtures rejecting `Gc<T>` / `Local<'gc, T>` / `GcHeap` captured into `Send` futures (`crates-next/otter-vm/tests/compile_fail/`). |
 | 77 | [77-migrate-jsobject.md](./77-migrate-jsobject.md) | `JsObject` → `Gc<ObjectBody>`; the heart of the leak surface; write barriers on every property store. |
 | 78 | [78-migrate-jsarray.md](./78-migrate-jsarray.md) | `JsArray` → `Gc<ArrayBody>`; write barriers on element / named-prop stores. |
 | 79 | [79-migrate-jsmap-jsset.md](./79-migrate-jsmap-jsset.md) | `JsMap` / `JsSet` → `Gc<…>`; write barriers on entry stores. |
@@ -59,6 +62,13 @@ later tasks assume earlier ones have landed.
 | 82 | [82-migrate-promise-iterator-generator.md](./82-migrate-promise-iterator-generator.md) | `JsPromiseHandle::Pure`, `IteratorState`, generator state; parked frame trace bodies. |
 | 83 | [83-migrate-bound-native-regexp.md](./83-migrate-bound-native-regexp.md) | `BoundFunction`, `NativeFunction`, `JsRegExp` — last `Rc`-shared variants. |
 | 84 | [84-phase1-closeout-test262-array-sweep.md](./84-phase1-closeout-test262-array-sweep.md) | Phase 1 exit criteria: regression suite + cap-as-`RangeError` + `bash scripts/test262-safe.sh built-ins/Array` end-to-end on a 16 GB host. |
+
+## Runtime / async binding
+
+| # | File | One-line goal |
+|---|------|---------------|
+| 85 | [85-tokio-event-loop-runtime-handle.md](./85-tokio-event-loop-runtime-handle.md) | Tokio-first `EventLoop` trait + default `TokioEventLoop`; public `Otter` / `RuntimeHandle` are `Send + Sync`; isolate runner owns the `!Send` VM and GC. |
+| 92 | [92-worker-isolates-and-structured-clone.md](./92-worker-isolates-and-structured-clone.md) | Worker isolates and isolate pools; no GC handle crosses worker boundaries; communication via structured clone / transferables. |
 
 ## Phase 2 — incremental marking + concurrent sweep + pretenuring
 
@@ -89,6 +99,9 @@ later tasks assume earlier ones have landed.
 ## Working rules for this track
 
 - One `Rc<RefCell<…>>` removed per migration task. No bundling.
+- Task 76A's explicit-context rule is binding for tasks 77–83: no
+  product-code `GcHeap::with_thread_default*` or raw thread-local heap
+  lookup.
 - Write barriers wired at every pointer store **as part of the
   migration that adds the store** — not as a follow-up sweep.
 - After each migration: full `cargo test --workspace` green and
@@ -111,6 +124,6 @@ later tasks assume earlier ones have landed.
 
 ## Closing this tracker
 
-When all Phase 1 tasks (71–84) are ticked, leave this tracker alive
-and collapse 71–84 entries into a single ✅ row pointing at the
+When all Phase 1 tasks (71–84) and blocker task 76A are ticked, leave
+this tracker alive and collapse 71–84 entries into a single ✅ row pointing at the
 test262 baseline snapshot.

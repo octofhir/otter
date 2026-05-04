@@ -3,6 +3,8 @@
 ## Status
 
 - [ ] open after Phase 1 (task 84) closes; do not pick up before that
+- [ ] task 85 event-loop / isolate-runner design reviewed before
+      choosing step scheduling hooks
 
 ## Goal
 
@@ -38,15 +40,20 @@ and brings sweep off the mutator thread.
   to worklist.
 - Each back-edge: `marking.drain_with_budget(budget)`. Returns
   `true` when worklist empty.
+- Event-loop integration: ADR-0005's isolate runner may also call the
+  same budgeted step at safe runtime turns (timer wake, host-op
+  completion, command boundary). The marker still runs on the isolate
+  mutator; Tokio worker threads never touch `GcHeap`.
 - Cycle finish: STW finalisation pass to drain straggler grays
   (insertion barrier guarantees no live whites remain), schedule
   sweep.
 
 ### 86.2 — Concurrent sweeping
 
-- Background sweeper thread launched at `GcHeap::new`. Spec-shape
-  (tokio is workspace-allowed; std `thread` works for a dedicated
-  GC thread).
+- Background sweeper thread launched at `GcHeap::new`. Tokio exists in
+  the product runtime, but the sweeper must remain a narrow GC-owned
+  Sync surface; std `thread` or a dedicated blocking task is acceptable
+  if the ownership contract is explicit.
 - After mark-finalisation, mutator hands the swept-page list to the
   sweeper via a lock-free queue.
 - Foreground alloc parks on the alloc fast path **only** when it
@@ -110,6 +117,9 @@ and brings sweep off the mutator thread.
 
 - [ ] No regression in cycle reclamation / WeakMap eviction /
   WeakRef / FinalizationRegistry tests from Phase 1.
+- [ ] No Tokio task, `RuntimeHandle`, or host-op future can call into
+  `GcHeap` directly; incremental marker entrypoints are reachable only
+  from the isolate runner / mutator or the dedicated sweeper hand-off.
 - [ ] **`loom` model-checking pass** on the concurrent-sweeper
   hand-off queue and the alloc-fast-path / sweeper-park
   interaction. No race conditions.

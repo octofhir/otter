@@ -5,6 +5,8 @@
 - [ ] `WeakRef` value variant + intrinsic
 - [ ] `FinalizationRegistry` value variant + intrinsic
 - [ ] post-sweep finaliser dispatch through microtask queue
+- [ ] finaliser enqueueing is isolate-local and uses explicit runtime
+      context
 - [ ] gates green
 
 ## Goal
@@ -48,6 +50,9 @@ F2/F3, §6.2 (Drop semantics during sweep), §10.2 Q3.
    - For each `FinalizationRegistry`, find cells whose `target` got
      swept, queue their `held_value` to the registry's callback via
      `MicrotaskKind::FinalizationCallback`.
+   The callback is queued on the isolate's microtask queue and runs on a
+   later mutator turn. Do not run JS callbacks during sweep, and do not
+   enqueue through a Tokio worker or thread-local heap lookup.
 5. **Spec links** in module docstrings:
    `https://tc39.es/ecma262/#sec-weak-ref-objects`,
    `https://tc39.es/ecma262/#sec-finalization-registry-objects`.
@@ -62,6 +67,7 @@ F2/F3, §6.2 (Drop semantics during sweep), §10.2 Q3.
 
 - [ ] `WeakRef.prototype.deref` returns the target while live;
   returns `undefined` after the target is reaped.
+- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm crates-next/otter-gc/src/finalize.rs` returns no WeakRef / finalisation product-code hits.
 - [ ] `FinalizationRegistry` callback fires *exactly once* per cell
   whose target is reaped.
 - [ ] Cycle test: registry holds a callback that captures itself

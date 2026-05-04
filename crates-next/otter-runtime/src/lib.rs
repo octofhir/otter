@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use otter_bytecode::BytecodeModule;
 use otter_compiler::compile;
+use otter_gc::GcHeap;
 use otter_syntax::{SourceKind, detect_source_kind, parse};
 use otter_vm::{Interpreter, InterruptFlag, Value};
 use serde::{Deserialize, Serialize};
@@ -622,7 +623,18 @@ impl RuntimeBuilder {
                 },
             });
         }
-        let mut interp = Interpreter::new();
+        // GC heap honours the same cap. The Phase-1 interpreter
+        // does not yet allocate through it (per-type migrations
+        // start at task 76), but the heap is constructed up-front
+        // so the cap is load-bearing the moment the first
+        // migration lands. Runtime tests already exercise the
+        // string-heap cap.
+        let gc_heap = GcHeap::with_max_heap_bytes(self.config.max_heap_bytes)
+            .map_err(OtterError::from_gc_oom)?;
+        // Phase-1 string heap continues to enforce the cap on
+        // string allocations, so script-driven OOM surfaces today
+        // even before the GC migrations.
+        let mut interp = Interpreter::with_string_heap_cap(self.config.max_heap_bytes);
         interp.set_max_stack_depth(self.config.max_stack_depth);
         // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
         // `new Function(...)` reach a real parse + compile path.
@@ -636,6 +648,7 @@ impl RuntimeBuilder {
         interp.set_eval_hook(Some(hook));
         Ok(Runtime {
             interp,
+            gc_heap,
             config: self.config,
         })
     }
@@ -645,6 +658,7 @@ impl RuntimeBuilder {
 #[derive(Debug)]
 pub struct Runtime {
     interp: Interpreter,
+    gc_heap: GcHeap,
     config: RuntimeConfig,
 }
 
@@ -668,11 +682,36 @@ impl Runtime {
         self.config.timeout
     }
 
-    /// Configured heap cap (currently informational; the foundation
-    /// slice does not yet enforce heap caps).
+    /// Configured heap cap in bytes (`0` = disabled).
+    ///
+    /// The cap is **load-bearing** as of task 73:
+    /// allocations against the [`otter_gc::GcHeap`] and string
+    /// allocations against the interpreter's string heap that
+    /// would overshoot the cap surface as
+    /// [`OtterError::OutOfMemory`]. Per-type GC migrations
+    /// (tasks 76–83) progressively widen the set of script
+    /// allocations subject to the cap.
     #[must_use]
     pub fn max_heap_bytes(&self) -> u64 {
         self.config.max_heap_bytes
+    }
+
+    /// Borrow the runtime's GC heap. Today the heap is owned by
+    /// the runtime and observes the configured cap; per-type
+    /// migrations (tasks 76+) wire the interpreter's value model
+    /// into it.
+    #[must_use]
+    pub fn gc_heap(&self) -> &GcHeap {
+        &self.gc_heap
+    }
+
+    /// Mutable borrow of the runtime's GC heap. Reserved for
+    /// embedders that want to allocate auxiliary GC-managed
+    /// objects (e.g. host-side state); the interpreter itself
+    /// does not yet route through this handle.
+    #[must_use]
+    pub fn gc_heap_mut(&mut self) -> &mut GcHeap {
+        &mut self.gc_heap
     }
 
     /// Configured stack-depth cap.

@@ -1243,6 +1243,7 @@ version = "0.1.0"
 dependencies = [
  "otter-bytecode",
  "otter-compiler",
+ "otter-gc",
  "otter-syntax",
  "otter-vm",
  "oxc_allocator",

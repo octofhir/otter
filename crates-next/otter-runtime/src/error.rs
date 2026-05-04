@@ -119,6 +119,17 @@ impl OtterError {
         }
     }
 
+    /// Map an [`otter_gc::OutOfMemory`] onto the public
+    /// [`OtterError::OutOfMemory`] variant. Cage exhaustion and
+    /// per-heap cap rejections both surface here.
+    #[must_use]
+    pub fn from_gc_oom(err: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
+        }
+    }
+
     /// Serialize to stable JSON wire format
     /// (see ADR-0003 §3.7).
     ///
@@ -160,6 +171,12 @@ impl OtterError {
             OtterError::Interrupted => 130,
             OtterError::Internal { .. } => 64,
         }
+    }
+}
+
+impl From<otter_gc::OutOfMemory> for OtterError {
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        Self::from_gc_oom(err)
     }
 }
 

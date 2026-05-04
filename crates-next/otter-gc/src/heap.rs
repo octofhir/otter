@@ -25,6 +25,9 @@
 //!
 //! - GC architecture plan §6.1 (unsafe boundary).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::handle::{GlobalHandle, GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
@@ -85,11 +88,36 @@ pub struct HeapStats {
     pub last_scavenge: ScavengeStats,
     /// Bytes reclaimed by the most recent full GC.
     pub last_full_reclaimed: usize,
+    /// Bytes currently tracked against the configured cap (sum
+    /// of slot allocations + outstanding [`GcHeap::reserve_bytes`]
+    /// reservations). `0` until the first allocation.
+    pub tracked_bytes: u64,
+    /// Configured heap cap in bytes (`0` = disabled).
+    pub max_heap_bytes: u64,
 }
 
 /// Orchestrator. Owned by the runtime; passed by `&mut` to every
 /// allocation / barrier / GC call.
+///
+/// Field order is **load-bearing for hot-path performance**:
+/// `max_heap_bytes` and `tracked_bytes` lead so the alloc cap
+/// check shares a cache line with `new_space`'s bump cursor,
+/// avoiding a second cache miss in the steady-state allocation
+/// loop.
 pub struct GcHeap {
+    /// Configured per-heap soft cap (`0` = disabled). Front-of-
+    /// struct so the alloc fast-path's "is the cap enabled?"
+    /// check shares a cache line with [`Self::new_space`].
+    max_heap_bytes: u64,
+    /// Bytes currently tracked against [`Self::max_heap_bytes`].
+    /// Sum of slot allocations + [`Self::reserve_bytes`]
+    /// reservations, recomputed from the live spaces after every
+    /// emergency full GC. Always `0` for an empty heap.
+    tracked_bytes: u64,
+    /// Outstanding [`Self::reserve_bytes`] reservations. Tracked
+    /// separately from slot allocations so emergency-GC
+    /// reconciliation does not lose them.
+    reserved_bytes: u64,
     new_space: NewSpace,
     old_space: OldSpace,
     large_space: LargeObjectSpace,
@@ -98,17 +126,41 @@ pub struct GcHeap {
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
     stats: HeapStats,
+    /// Cooperative-cancellation flag; flipped to `true` when the
+    /// cap rejects an allocation. Watchdogs may poll this between
+    /// safepoints to short-circuit, but the **primary** OOM signal
+    /// is the `Err(OutOfMemory)` returned from [`Self::alloc`] —
+    /// the alloc is **never** materialised on a cap miss
+    /// (architecture plan §2.1 caveat).
+    oom_flag: Arc<AtomicBool>,
 }
 
 impl GcHeap {
-    /// Build a fresh heap. Initialises the cage with the default
-    /// size if it has not been initialised already.
+    /// Build a fresh heap with no cap. Equivalent to
+    /// `Self::with_max_heap_bytes(0)`.
     ///
     /// # Errors
     ///
     /// Returns [`OutOfMemory`] if the cage cannot be initialised
     /// (cage exhausted or alloc failed).
     pub fn new() -> Result<Self, OutOfMemory> {
+        Self::with_max_heap_bytes(0)
+    }
+
+    /// Build a fresh heap honouring a per-heap byte cap.
+    ///
+    /// `cap == 0` disables the cap; allocations succeed until the
+    /// cage is exhausted. `cap > 0` is **load-bearing**: an
+    /// allocation that would overshoot the cap triggers one
+    /// emergency full GC and, if the cap is still exceeded, is
+    /// refused with [`OutOfMemory::HeapCapExceeded`]. The slot is
+    /// never materialised (architecture plan §2.1 caveat).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutOfMemory`] when the cage cannot satisfy the
+    /// initial new-space.
+    pub fn with_max_heap_bytes(cap: u64) -> Result<Self, OutOfMemory> {
         Cage::ensure_default().map_err(|_| OutOfMemory::CageExhausted)?;
         let new_space = NewSpace::new(crate::space::DEFAULT_NEW_SPACE_PAGES)?;
         Ok(Self {
@@ -120,7 +172,110 @@ impl GcHeap {
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
             stats: HeapStats::default(),
+            max_heap_bytes: cap,
+            tracked_bytes: 0,
+            reserved_bytes: 0,
+            oom_flag: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Configured per-heap cap in bytes (`0` = disabled).
+    pub fn max_heap_bytes(&self) -> u64 {
+        self.max_heap_bytes
+    }
+
+    /// Bytes currently tracked against the cap (slot allocations
+    /// + outstanding [`Self::reserve_bytes`] reservations).
+    pub fn tracked_bytes(&self) -> u64 {
+        self.tracked_bytes
+    }
+
+    /// Cooperative-cancellation OOM flag. Cloned cheaply; safe to
+    /// share with watchdogs / interrupt threads. Never the
+    /// **primary** OOM signal — see [`Self::alloc`].
+    pub fn oom_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.oom_flag)
+    }
+
+    /// Reserve `bytes` against the cap without materialising a
+    /// slot (off-slot accounting — e.g. `Vec` capacity inside a
+    /// payload).
+    ///
+    /// On overshoot: one emergency full GC, then retry once. If
+    /// still over → [`OutOfMemory::HeapCapExceeded`] and the
+    /// reservation is **not** booked.
+    ///
+    /// # Errors
+    ///
+    /// [`OutOfMemory::HeapCapExceeded`] when the cap is enabled
+    /// and the reservation cannot be satisfied even after an
+    /// emergency full GC.
+    pub fn reserve_bytes(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+        if self.max_heap_bytes == 0 {
+            return Ok(());
+        }
+        self.account_or_collect(bytes)?;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Release `bytes` previously booked via [`Self::reserve_bytes`].
+    /// Saturates at zero if the caller overshoots — not an error;
+    /// keeps the counter monotone-correct under arithmetic edge
+    /// cases.
+    pub fn release_bytes(&mut self, bytes: u64) {
+        if self.max_heap_bytes == 0 {
+            return;
+        }
+        let actual = bytes.min(self.reserved_bytes);
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(actual);
+        self.tracked_bytes = self.tracked_bytes.saturating_sub(actual);
+    }
+
+    /// Account `bytes` against the cap. Outlined so the alloc
+    /// hot path adds only a single cap-enabled branch when the
+    /// cap is disabled. On overshoot: one emergency full GC,
+    /// retry once, otherwise refuse.
+    ///
+    /// Caller pre-checks `self.max_heap_bytes != 0`; this
+    /// function is not invoked when the cap is disabled, so the
+    /// disabled-cap branch never executes here.
+    #[cold]
+    #[inline(never)]
+    fn account_or_collect(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+        let cap = self.max_heap_bytes;
+        let projected = self.tracked_bytes.saturating_add(bytes);
+        if projected <= cap {
+            self.tracked_bytes = projected;
+            return Ok(());
+        }
+        // External root visitor is empty — the handle stack and
+        // global handle table are walked from inside
+        // `collect_full`, and the embedder has no opportunity to
+        // re-enter the heap during a refused allocation.
+        let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        self.collect_full(&mut noop);
+        self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
+        let projected = self.tracked_bytes.saturating_add(bytes);
+        if projected <= cap {
+            self.tracked_bytes = projected;
+            return Ok(());
+        }
+        self.oom_flag.store(true, Ordering::Relaxed);
+        Err(OutOfMemory::HeapCapExceeded {
+            requested_bytes: bytes,
+            heap_limit_bytes: cap,
+        })
+    }
+
+    /// Sum of allocated bytes across new + old + LOS. Counts
+    /// post-collect retained-page slack as well as live objects;
+    /// strict liveness arrives with task 86's incremental sweep.
+    fn live_bytes_total(&self) -> u64 {
+        let new = self.new_space.allocated_bytes() as u64;
+        let old = self.old_space.allocated_bytes() as u64;
+        let los = self.large_space.allocated_bytes() as u64;
+        new.saturating_add(old).saturating_add(los)
     }
 
     /// Register a [`Traceable`] type so allocations of `T` can be
@@ -177,10 +332,13 @@ impl GcHeap {
         let mut s = self.stats;
         s.new_allocated_bytes = self.new_space.allocated_bytes();
         s.old_allocated_bytes = self.old_space.allocated_bytes();
-        s.allocated_bytes = s.new_allocated_bytes + s.old_allocated_bytes;
+        s.allocated_bytes =
+            s.new_allocated_bytes + s.old_allocated_bytes + self.large_space.allocated_bytes();
         s.page_count = self.new_space.from_page_count() * 2
             + self.old_space.page_count()
             + self.large_space.page_count();
+        s.tracked_bytes = self.tracked_bytes;
+        s.max_heap_bytes = self.max_heap_bytes;
         s
     }
 
@@ -192,8 +350,12 @@ impl GcHeap {
     ///
     /// # Errors
     ///
+    /// - [`OutOfMemory::HeapCapExceeded`] — the configured per-heap
+    ///   cap was exceeded and an emergency full GC could not free
+    ///   enough room. The slot is **not** materialised.
     /// - [`OutOfMemory::CageExhausted`] — the cage cannot satisfy
     ///   a fresh page request.
+    #[inline]
     pub fn alloc<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
         // Lazy register so callers never forget. Idempotent.
         if self.trace_table.get(T::TYPE_TAG).is_none() {
@@ -205,6 +367,15 @@ impl GcHeap {
             aligned <= u32::MAX as usize,
             "object size exceeds u32 limit"
         );
+
+        // Cap check — runs before any slot is carved (architecture
+        // §2.1 caveat). When the cap is disabled (`max_heap_bytes
+        // == 0`), the hot path adds one load + branch and skips
+        // accounting entirely; the cap-enabled path is outlined
+        // under [`Self::account_or_collect`].
+        if self.max_heap_bytes != 0 {
+            self.account_or_collect(aligned as u64)?;
+        }
 
         let is_marking = self.marking.is_marking();
 

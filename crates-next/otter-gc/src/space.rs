@@ -261,6 +261,13 @@ impl LargeObjectSpace {
         &self.pages
     }
 
+    /// Bytes allocated across all LOS pages. One LOS page holds
+    /// exactly one object whose size is the page header's
+    /// `allocated_bytes`, so this is just a sum.
+    pub fn allocated_bytes(&self) -> usize {
+        self.pages.iter().map(|p| p.header().allocated_bytes).sum()
+    }
+
     /// Drop LOS pages whose object is unreachable after the
     /// mark phase.
     pub fn reap_dead_pages(&mut self) -> usize {

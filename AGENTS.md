@@ -6,7 +6,7 @@ Guidance for coding agents (Claude Code / Codex CLI / etc.) when working in this
 
 Otter is an embeddable TypeScript/JavaScript engine for Rust applications built on a custom bytecode VM. It provides a safe runtime for executing TypeScript/JavaScript code with native Rust integration, plus a standalone CLI.
 
-**Workspace naming:** the workspace crate is `otterjs`, but it builds the `otter` binary (`crates/otterjs/Cargo.toml`).
+**Workspace naming:** the active CLI crate is `otter-cli` under `crates-next/`; legacy `crates/*` paths are reference-only unless a task explicitly says otherwise.
 
 > **Note:** The VM is under active development. Some features (full Web APIs) are being added incrementally.
 
@@ -14,10 +14,10 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 
 The active runtime stack is:
 
-- `crates/otter-gc`
-- `crates/otter-vm`
-- `crates/otter-runtime`
-- `crates/otter-jit`
+- `crates-next/otter-gc`
+- `crates-next/otter-vm`
+- `crates-next/otter-runtime`
+- product crates under `crates-next/*`
 
 Do not introduce parallel engine/runtime stacks through copied modules, renamed
 crates, or path dependencies.
@@ -45,18 +45,16 @@ Repository rules:
 ## Repository Map (where to change what)
 
 ### Core Runtime Crates
-- `crates/otter-gc`: garbage collector.
-- `crates/otter-vm`: VM, interpreter, value model, intrinsics, source compiler.
-- `crates/otter-runtime`: public runtime and embedding surface.
+- `crates-next/otter-gc`: garbage collector.
+- `crates-next/otter-vm`: VM, interpreter, value model, intrinsics, source compiler.
+- `crates-next/otter-runtime`: public runtime and embedding surface.
 
 ### Supporting crates
-- `crates/otter-jit`: JIT pipeline for the VM.
-- `crates/otter-macros`: descriptor-driven proc-macros for JS classes, namespaces, native bindings, host-owned object surfaces, and hosted modules.
-- `crates/otter-nodejs`: parked Node.js compatibility shim kept compileable until a real runtime-native port lands.
-- `crates/otter-pm`: package management + bundled type definitions (`@types/otter`).
-- `crates/otter-modules`: active home for otter-specific hosted modules (`otter:kv`, `otter:sql`, `otter:ffi`, and similar surfaces).
-- `crates/otter-web`: active home for standards-facing Web API surfaces (`TextEncoder`, `TextDecoder`, future `URL`, `fetch`, etc.).
-- `crates/otterjs`: CLI (`otter`) and config (`otter.toml`).
+- `crates-next/otter-bytecode`: bytecode representation and disassembly.
+- `crates-next/otter-syntax` / `crates-next/otter-compiler`: frontend and lowering.
+- `crates-next/otter-test` / `crates-next/otter-test262`: active test harnesses.
+- `crates-next/otter-cli`: CLI (`otter`).
+- Future macro / module / Web API crates must be added under `crates-next/*`, not under legacy `crates/*`.
 
 ### Parked Compatibility Shims
 - `crates/otter-nodejs`
@@ -84,11 +82,13 @@ This separation:
 
 ### Intrinsic and Bootstrap Pattern
 
-New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the descriptor/builder/bootstrap flow described in `OTTER_VM_SPEC_PLAN.md`.
+New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the post-GC descriptor/spec/builder/bootstrap flow tracked in `docs/new-engine/tasks/96-production-js-surface-builders.md`.
 
-- Add new bootstrap work in `crates/otter-vm` / `crates/otter-runtime`.
+- Add new bootstrap work in `crates-next/otter-vm` / `crates-next/otter-runtime`.
 - Keep global installation centralized; do not scatter ad-hoc global mutation across unrelated modules.
-- Prefer descriptor/builder style APIs over one-off registration functions when exposing JS-visible constructors, prototypes, and namespaces.
+- Prefer static specs plus mutator-bound builders over one-off registration functions when exposing JS-visible constructors, prototypes, and namespaces.
+- High-level APIs must compile down to the same runtime shape as handwritten static specs: no per-call allocation, runtime metadata parsing, or hot-path dynamic registry.
+- Contributor-facing workflow docs belong in `docs/book/`; task files are implementation history.
 - If a feature exists only in parked code, port or redesign it; do not grow the parked surface.
 
 ## Development Philosophy
@@ -104,25 +104,27 @@ New ECMAScript builtins, global namespaces, Web API globals, and extension-visib
 
 ### Macro usage
 
-Canonical active macros:
+Macros are planned as zero-cost contributor ergonomics after the task-96 static spec / builder backend lands. Do not add macro-first APIs that bypass the builder/bootstrap layer.
+
+Initial post-task-96 macro scope:
 
 - `#[js_class]` for constructor-backed JS classes
 - `#[js_namespace]` for namespace-style JS objects
-- `#[dive]` for single native bindings
-- `raft!` for grouped bindings on one install target
+- `raft!` or equivalent grouped static-spec declaration
+
+Deferred until their backend APIs are stable:
+
+- `#[dive]` / async native binding sugar
 - `burrow!` for host-owned object surfaces
-- `lodge!` for `HostedNativeModuleLoader` declarations
+- `lodge!` for hosted module declarations
+- GC trace derive macros
 
 Rules:
 
-- Prefer `#[js_class]` and `#[js_namespace]` over hand-written descriptor assembly when the JS surface is class/namespace shaped.
-- Prefer `#[dive]` for simple native bindings with the active runtime signature.
-  `#[dive]` is sync by default; use `#[dive(deep)]` for the async variant of the same macro.
-- Prefer `raft!` over hand-written `vec![*_binding(...)]` boilerplate.
-- Prefer `burrow!` plus `RuntimeState::install_burrow(...)` over repeated local `install_method` / `install_getter` helpers on native objects.
-- Prefer `lodge!` over hand-written `HostedNativeModuleLoader` impls for active hosted modules.
+- Macros must generate static specs plus normal Rust functions; they are syntax sugar over task-96 builders, not a parallel runtime registry.
+- Generated builtins should use the static native function-pointer path by default.
 - Keep exported JS names and arity explicit in the macro declaration. Do not hide API shape in unrelated helper code.
-- If a macro-based API surface changes, update tests and `.d.ts` declarations in the same patch when applicable.
+- If a macro-based API surface changes, update tests, `.d.ts` declarations, and mdBook docs in the same patch when applicable.
 
 Keep code manual when:
 
@@ -222,18 +224,17 @@ otter-vm
 otter-gc
 ```
 
-Supporting crates:
-- `otter-macros` - descriptor-driven proc-macros for classes, namespaces, native bindings, host-owned objects, and hosted modules
-- `otter-nodejs` / `otter-modules` - parked or active support crates around the runtime
-- `otter-pm` - NPM package manager integration
+Supporting crates should live under `crates-next/*`. Legacy crates under
+`crates/*` are reference-only and must not be added to the active build
+graph.
 
 ### Key Architectural Constraints
 
 1. **GC Safety**: Values must be properly rooted when stored across GC boundaries. Use the active GC/reference types and rooting patterns.
 
-2. **Value Representation**: The value model lives in `crates/otter-vm/src/value.rs`.
+2. **Value Representation**: The value model lives in `crates-next/otter-vm/src/value.rs`.
 
-3. **Object Model**: The object model lives in `crates/otter-vm/src/object.rs`.
+3. **Object Model**: The object model lives in `crates-next/otter-vm/src/object.rs`.
 
 4. **Async ops require Tokio**: async ops are scheduled onto a Tokio runtime handle (thread-local).
 

@@ -80,7 +80,15 @@ later tasks assume earlier ones have landed.
 | 92 | [92-worker-isolates-and-structured-clone.md](./92-worker-isolates-and-structured-clone.md) | Worker isolates and isolate pools; no GC handle crosses worker boundaries; communication via structured clone / transferables. |
 | 93 | [93-gc-branded-session-api.md](./93-gc-branded-session-api.md) | Compile-time-branded GC session/root/weak API inspired by Oscars/gc-arena: cross-isolate and stale-GC-context misuse should fail to compile, not rely on runtime discipline. |
 | 94 | [94-gc-contributor-api-surface.md](./94-gc-contributor-api-surface.md) | Clean safe GC/VM API for engine contributors and extension authors: V8-style handle tiers, Boa-style derive ergonomics, Otter-branded safety, and narrow unsafe internals. |
-| 95 | [95-contributor-book-and-extension-guides.md](./95-contributor-book-and-extension-guides.md) | mdBook-or-equivalent contributor guide covering engine architecture, GC API, hosted modules, future plugin system, and macro authoring. |
+| 95 | [95-contributor-book-and-extension-guides.md](./95-contributor-book-and-extension-guides.md) | mdBook contributor guide covering engine architecture, GC API, hosted modules, JS surface builders, startup performance, future plugin system, and macros. |
+
+## Post-GC production API / startup
+
+| # | File | One-line goal |
+|---|------|---------------|
+| 96 | [96-production-js-surface-builders.md](./96-production-js-surface-builders.md) | Static JS surface specs + mutator-bound builders + centralized bootstrap registry; high-level contributor API without runtime hot-path overhead. |
+| 97 | [97-zero-cost-js-surface-macros.md](./97-zero-cost-js-surface-macros.md) | Macros generate static specs and normal Rust functions over task 96; no runtime registry, per-call allocation, or hidden control flow. |
+| 98 | [98-startup-bootstrap-performance.md](./98-startup-bootstrap-performance.md) | Startup/first-run benchmark ratchets, bootstrap telemetry, tiered/lazy init evaluation, and startup snapshot/code-cache decision. |
 
 ## Phase 2 — incremental marking + concurrent sweep + pretenuring
 
@@ -131,8 +139,9 @@ later tasks assume earlier ones have landed.
   behind explicit `unsafe` contracts and tests.
 - Documentation rule: contributor-facing APIs are not complete until
   the book has buildable examples and docs for them. Task 95 is the
-  home for the mdBook-or-equivalent guide; tasks 93/94 must update it
-  when branded sessions, plugin APIs, or macros change.
+  home for the mdBook guide; tasks 93/94 and post-GC production API
+  tasks 96-98 must update it when branded sessions, plugin APIs,
+  builders, macros, bootstrap, or startup-performance workflows change.
 - Write barriers wired at every pointer store **as part of the
   migration that adds the store** — not as a follow-up sweep.
 - After each migration: full `cargo test --workspace` green and
@@ -140,8 +149,9 @@ later tasks assume earlier ones have landed.
 - Every PR cites the architecture-doc section it implements.
 - Breaking API changes are allowed inside `crates-next/*` when they
   remove unsoundness risk, runtime-only checks, thread-local coupling,
-  or compatibility shims. Do not preserve an interim API just because
-  downstream code already adapted to it.
+  startup regressions, hot-path overhead, or compatibility shims. Do not
+  preserve an interim API just because downstream code already adapted to
+  it.
 - Every task ends with the gates in [Closing a task](./README.md#closing-a-task).
 - `unsafe` is permitted **only** in `crates-next/otter-gc/`; every
   other `crates-next/*` crate keeps `#![forbid(unsafe_code)]`.

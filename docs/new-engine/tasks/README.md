@@ -346,7 +346,7 @@ individual task files split out as work begins. Headlines:
 | [52-trace-events-emission.md](./52-trace-events-emission.md) | Wire `vm.instruction` / `vm.call` / `vm.return` events through the trace sink. |
 | [53-recreate-es-conformance.md](./53-recreate-es-conformance.md) | Recreate `ES_CONFORMANCE.md` once the curated test262 subset reports a stable baseline. |
 | [54-harness-richer-assertions.md](./54-harness-richer-assertions.md) | Wire spec-already-defined `expect.value` / `expect.stdout_contains` / `expect.throws` into the engine-suite runner so fixtures stop relying on the `undefined.x` fail-trick. |
-| [55-otter-macros-next.md](./55-otter-macros-next.md) | New `otter-macros-next` proc-macro crate (`#[js_method]`, `js_proto!`, `#[js_namespace]`); migrate string / array / number / math / regexp prototype tables. |
+| [55-otter-macros-next.md](./55-otter-macros-next.md) | Superseded by tasks 96-98. Do not pursue macro-first work; production builders/static specs land first, macros become zero-cost syntax sugar over that backend. |
 | [56-remove-refcell-from-hot-paths.md](./56-remove-refcell-from-hot-paths.md) | Remove `RefCell` from every hot path in `crates-next/*`; replace with `&mut` field access threaded through `dispatch_loop`. Required before task 35 (async) lands. |
 | [76a-runtime-binding-explicit-context.md](./76a-runtime-binding-explicit-context.md) | Runtime binding cleanup before the remaining GC migrations: explicit `RuntimeCx` / `NativeCtx`, no product-code thread-local heap lookup, compile-fail tests for VM / GC handles across `tokio::spawn`. |
 
@@ -395,6 +395,31 @@ deferred indefinitely.
 | [90-gc-sticky-mark-bit.md](./90-gc-sticky-mark-bit.md) | Phase 3 — sticky-mark-bit minor cycles; throughput win on steady-state long-running workloads. |
 | [87-gc-concurrent-marking.md](./87-gc-concurrent-marking.md) | Phase 4 — concurrent marking + parallel scavenge. **Deferred indefinitely.** |
 | [91-gc-bench-and-soak-infra.md](./91-gc-bench-and-soak-infra.md) | Cross-cutting — Criterion benches + cargo-fuzz corpus + 24 h soak runner + miri/asan/lsan/tsan CI matrix + V8-parity benchmark suite. Required for any production-grade gate to be verifiable. |
+
+### Production API, macro, and startup track (post-GC)
+
+This track starts after the GC Phase 1 migrations are closed and task 91
+provides usable benchmark gates. Breaking Rust API changes inside
+`crates-next/*` are allowed here: production readiness, fast startup,
+steady-state performance, and simple safety invariants win over preserving
+interim APIs.
+
+The order is intentional:
+
+1. build the static spec / builder / centralized bootstrap backend;
+2. add macros only as zero-cost syntax sugar over that backend;
+3. ratchet startup and first-run performance so convenience does not hide
+   cold-start regressions.
+
+Contributor-facing documentation for this track belongs in `docs/book/`.
+Task files capture implementation history; mdBook is the stable "what is
+this and how do I work with it" surface.
+
+| File | One-line goal |
+|------|---------------|
+| [96-production-js-surface-builders.md](./96-production-js-surface-builders.md) | Static JS surface specs + mutator-bound builders + centralized bootstrap registry; high-level contributor API without runtime hot-path overhead. |
+| [97-zero-cost-js-surface-macros.md](./97-zero-cost-js-surface-macros.md) | Proc/declarative macros generate static specs and normal Rust functions; no runtime registries, per-call allocation, or hidden control flow. |
+| [98-startup-bootstrap-performance.md](./98-startup-bootstrap-performance.md) | Cold startup / first-run benchmark ratchets, bootstrap telemetry, tiered/lazy initialization evaluation, and startup snapshot/code-cache decision. |
 
 ### Runtime / async binding track
 

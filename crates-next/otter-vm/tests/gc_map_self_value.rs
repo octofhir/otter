@@ -8,8 +8,7 @@ use otter_vm::Interpreter;
 use otter_vm::Value;
 use otter_vm::collections::{MAP_BODY_TYPE_TAG, SET_BODY_TYPE_TAG};
 
-#[test]
-fn map_self_value_reaped() {
+fn assert_map_self_value_reaped() {
     let mut interp = Interpreter::new();
 
     interp.force_gc();
@@ -39,8 +38,7 @@ fn map_self_value_reaped() {
     );
 }
 
-#[test]
-fn set_self_value_reaped() {
+fn assert_set_self_value_reaped() {
     let mut interp = Interpreter::new();
 
     interp.force_gc();
@@ -63,4 +61,10 @@ fn set_self_value_reaped() {
         after, baseline,
         "self-referential set must be reaped by force_gc (baseline={baseline}, after={after})"
     );
+}
+
+#[test]
+fn map_set_self_value_reaped() {
+    assert_map_self_value_reaped();
+    assert_set_self_value_reaped();
 }

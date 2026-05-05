@@ -1,4 +1,5 @@
 # CLAUDE.md
+For any file search or grep in the current git-indexed directory, use fff tools.
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -37,13 +38,13 @@ Current fast-path CLI surface:
 ## Key Architecture
 
 Current runtime stack:
-- `crates/otter-gc`
-- `crates/otter-vm`
-- `crates/otter-runtime`
-- `crates/otter-jit`
+- `crates-next/otter-gc`
+- `crates-next/otter-vm`
+- `crates-next/otter-runtime`
+- product crates under `crates-next/*`
 
 Compatibility rules:
-- New runtime/VM/API work belongs on the current runtime stack.
+- New runtime/VM/API work belongs on the active `crates-next/*` stack.
 - Do not add new dependencies from active crates into parked compatibility shims.
 - Keep `otter-nodejs` and `otter-node-compat` compileable, but treat them as parked surfaces rather than active implementation homes.
 
@@ -63,11 +64,11 @@ otter-gc
 
 ### Critical Implementation Details
 
-1. **Value Representation**: The target value model lives in `crates/otter-vm/src/value.rs`.
+1. **Value Representation**: The active value model lives in `crates-next/otter-vm/src/lib.rs`.
 
-2. **Object Model**: The target object model lives in `crates/otter-vm/src/object.rs`.
+2. **Object Model**: The active object model lives in `crates-next/otter-vm/src/object.rs`.
 
-3. **GC Safety**: Use `GcRef<T>` for references. Values must be properly rooted across GC boundaries.
+3. **GC Safety**: Use active `otter-gc` handles and explicit heap/runtime context. Values must be properly rooted across GC boundaries.
 
 4. **Native Functions**: Add native bindings against the current runtime/VM ABI.
    `otter:kv`, `otter:sql`, and `otter:ffi` live in `crates/otter-modules`, and `otter:ffi` includes the active `CFunction`, `linkSymbols`, and `JSCallback` path there.
@@ -90,6 +91,8 @@ otter-gc
 8. **Async Operations**: Require Tokio runtime handle.
 
 9. **Parsing**: Always use ASTs via `oxc` parser. **Never use regex to parse JS/TS code.**
+
+10. **Rust Module Docs**: New or materially changed Rust modules need accurate top-level `//!` docs in the active-engine style: purpose, `# Contents`, `# Invariants`, and `# See also` when the module owns non-trivial behavior. Remove stale "foundation gap", task-number, or TODO wording when the code lands.
 
 ### File Naming for Builtin Modules
 

@@ -6,6 +6,8 @@
 //! - [`GcHeap`] — the orchestrator the rest of the runtime sees.
 //! - [`Roots`] — caller-supplied root sources for full GC.
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
+//! - Ephemeron registry and split mark/sweep hooks used by weak
+//!   collections in the VM.
 //!
 //! # Invariants
 //!
@@ -20,6 +22,9 @@
 //! - Pages live forever inside the heap or are returned to the
 //!   cage on full-GC sweep. Pages are never leaked across heap
 //!   drops.
+//! - Weak collection tables are registered as type-erased raw
+//!   handles; VM code runs the ephemeron fixpoint between
+//!   [`GcHeap::mark_phase`] and [`GcHeap::sweep_phase`].
 //!
 //! # See also
 //!
@@ -30,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
+use crate::ephemeron::EphemeronRegistry;
 use crate::handle::{GlobalHandle, GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
@@ -127,6 +133,7 @@ pub struct GcHeap {
     marking: MarkingState,
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
+    ephemerons: EphemeronRegistry,
     stats: HeapStats,
     gc_stats: GcStats,
     /// Cooperative-cancellation flag; flipped to `true` when the
@@ -174,6 +181,7 @@ impl GcHeap {
             marking: MarkingState::new(),
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
+            ephemerons: EphemeronRegistry::default(),
             stats: HeapStats::default(),
             gc_stats: GcStats::default(),
             max_heap_bytes: cap,
@@ -286,6 +294,24 @@ impl GcHeap {
     /// traced during marking and scavenging.
     pub fn register_traceable<T: Traceable>(&mut self) {
         self.trace_table.register::<T>();
+    }
+
+    /// Register a GC-managed weak collection table for ephemeron
+    /// fixpoint work between full-GC marking and sweeping.
+    pub fn register_ephemeron_table<T: ?Sized>(&mut self, table: Gc<T>) {
+        self.ephemerons.register(table.raw());
+    }
+
+    /// Snapshot registered weak collection tables.
+    #[must_use]
+    pub fn ephemeron_tables_snapshot(&self) -> Vec<RawGc> {
+        self.ephemerons.snapshot()
+    }
+
+    /// Number of registered weak collection tables.
+    #[must_use]
+    pub fn ephemeron_table_count(&self) -> usize {
+        self.ephemerons.len()
     }
 
     /// Reference to the trace table (used by tests).
@@ -600,14 +626,23 @@ impl GcHeap {
 
     /// Run a full GC (young-gen scavenge + old-gen mark-sweep).
     ///
-    /// `external_visit` is invoked once for marking; it must
-    /// yield every external root slot.
+    /// `external_visit` yields every external root slot.
     pub fn collect_full(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
         let pause_start = Instant::now();
-        // 1) Scavenge first so survivors are in old / to-space.
+        self.mark_phase(external_visit);
+        self.sweep_phase_with_pause_start(pause_start);
+    }
+
+    /// Begin a full-GC mark phase and drain the ordinary root graph.
+    ///
+    /// Ephemeron users may call [`Self::mark_additional`] after this
+    /// method and before [`Self::sweep_phase`] to run a weak-table
+    /// fixpoint.
+    pub fn mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+        // Scavenge first so survivors are in old / to-space.
         self.collect_minor_internal(external_visit);
 
-        // 2) Reset old-space + LOS live counters; mark cycle.
+        // Reset old-space + LOS live counters; mark cycle.
         self.old_space.reset_live_bytes();
         self.large_space.reset_live_bytes();
         // Reset every header's mark to white before we begin.
@@ -635,7 +670,7 @@ impl GcHeap {
 
         self.marking.start_cycle();
 
-        // 3) Shade roots.
+        // Shade roots.
         let handle_stack: *const HandleStack = &*self.handle_stack;
         let global_handles: *const GlobalHandleTable = &*self.global_handles;
         let marking_ptr = &mut self.marking as *mut MarkingState;
@@ -650,13 +685,91 @@ impl GcHeap {
         }
         external_visit(&mut shade);
 
-        // 4) Drain.
         // SAFETY: STW pause; all pushed headers alive.
         unsafe {
             self.marking.drain_full(&self.trace_table);
         }
+    }
 
-        // 5) Sweep — anything still white in old / large / young
+    /// Mark additional raw objects during an active mark phase and
+    /// drain their transitive closure.
+    ///
+    /// Returns `true` when at least one previously-white object was
+    /// discovered.
+    pub fn mark_additional(&mut self, additions: impl IntoIterator<Item = RawGc>) -> bool {
+        let mut discovered = false;
+        for raw in additions {
+            if raw.is_null() || self.is_marked(raw) {
+                continue;
+            }
+            let mut slot = raw;
+            // SAFETY: `raw` came from a live heap payload inspected
+            // during the STW ephemeron phase.
+            unsafe {
+                self.marking.shade_from_slot(&mut slot as *mut RawGc);
+            }
+            discovered = true;
+        }
+        if discovered {
+            // SAFETY: STW pause; all pushed headers are heap objects.
+            unsafe {
+                self.marking.drain_full(&self.trace_table);
+            }
+        }
+        discovered
+    }
+
+    /// Returns true iff `raw` is marked in the current full-GC cycle.
+    #[must_use]
+    pub fn is_marked(&self, raw: RawGc) -> bool {
+        if raw.is_null() {
+            return false;
+        }
+        // SAFETY: caller supplies a heap-issued raw handle.
+        unsafe { (*raw.as_header_ptr()).is_marked() }
+    }
+
+    /// Type tag for a raw heap object.
+    #[must_use]
+    pub fn raw_type_tag(&self, raw: RawGc) -> Option<u8> {
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: caller supplies a heap-issued raw handle.
+        Some(unsafe { (*raw.as_header_ptr()).type_tag() })
+    }
+
+    /// Type-check and cast a raw heap object to `Gc<T>`.
+    #[must_use]
+    pub fn cast_raw_if_type<T: Traceable>(&self, raw: RawGc) -> Option<Gc<T>> {
+        if self.raw_type_tag(raw)? != T::TYPE_TAG {
+            return None;
+        }
+        // SAFETY: the runtime type tag matches `T`.
+        Some(unsafe { raw.cast::<T>() })
+    }
+
+    /// Prune the ephemeron registry to tables that survived the
+    /// current mark phase. Must run before sweep frees dead tables.
+    pub fn prune_ephemeron_registry_to_marked(&mut self) {
+        let marked: std::collections::HashSet<RawGc> = self
+            .ephemerons
+            .snapshot()
+            .into_iter()
+            .filter(|raw| self.is_marked(*raw))
+            .collect();
+        self.ephemerons.retain_marked(|raw| marked.contains(&raw));
+    }
+
+    /// Finish a full-GC cycle by sweeping everything left white.
+    pub fn sweep_phase(&mut self) {
+        self.sweep_phase_with_pause_start(Instant::now());
+    }
+
+    fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
+        self.prune_ephemeron_registry_to_marked();
+
+        // Sweep — anything still white in old / large / young
         // is dead. For old-space, walk pages; reap pages whose
         // live_bytes is zero. For young, our scavenger already
         // ran; any white survivor in from-space (post-flip) is

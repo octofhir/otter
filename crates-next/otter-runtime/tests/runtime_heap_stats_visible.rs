@@ -20,6 +20,11 @@ use otter_gc::test_support::OpaqueLeaf;
 use otter_runtime::{Runtime, SourceInput};
 
 #[test]
+fn runtime_heap_stats_and_force_gc_are_visible() {
+    runtime_heap_stats_reflect_host_alloc_after_run_script();
+    force_gc_resets_live_count_when_no_roots();
+}
+
 fn runtime_heap_stats_reflect_host_alloc_after_run_script() {
     let mut rt = Runtime::builder()
         .max_heap_bytes(64 * 1024 * 1024)
@@ -47,7 +52,6 @@ fn runtime_heap_stats_reflect_host_alloc_after_run_script() {
     );
 }
 
-#[test]
 fn force_gc_resets_live_count_when_no_roots() {
     let mut rt = Runtime::builder().build().expect("runtime");
     rt.gc_heap_mut().register_traceable::<OpaqueLeaf>();

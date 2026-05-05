@@ -1,4 +1,5 @@
 # AGENTS.md
+For any file search or grep in the current git-indexed directory, use fff tools.
 
 Guidance for coding agents (Claude Code / Codex CLI / etc.) when working in this repository.
 
@@ -61,6 +62,17 @@ Repository rules:
 - `crates/otter-node-compat`
 
 ## File Naming Conventions
+
+### Rust Module Documentation
+
+Every new or materially changed Rust module must keep its top-level
+`//!` docstring accurate in the same style as the rest of the active
+engine: short purpose, `# Contents`, `# Invariants`, and `# See also`
+sections when the module owns non-trivial runtime behavior. When a task
+removes a known limitation, update or delete stale "foundation gap",
+"task N", and "TODO until GC" wording in the same patch as the code.
+Docstrings should describe the current production behavior, not the
+history of how the port got there.
 
 ### Builtin Modules
 

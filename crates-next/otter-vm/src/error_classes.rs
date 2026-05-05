@@ -40,6 +40,7 @@
 //! - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 
 use crate::Value;
+use crate::gc_trace::{GcRootVisitor, GcTrace};
 use crate::object::JsObject;
 use crate::string::{JsString, StringError, StringHeap};
 
@@ -213,6 +214,28 @@ pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> Stri
 }
 
 impl ErrorClassRegistry {
+    /// Walk every GC-managed object held by the registry.
+    ///
+    /// The interpreter roots this registry across every full-GC
+    /// cycle. Each entry owns two `JsObject` handles — the
+    /// prototype and constructor — and those objects in turn trace
+    /// their prototype/property graph through `ObjectBody`.
+    pub(crate) fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        for entry in [
+            &self.error,
+            &self.type_error,
+            &self.range_error,
+            &self.syntax_error,
+            &self.reference_error,
+            &self.uri_error,
+            &self.eval_error,
+            &self.aggregate_error,
+        ] {
+            entry.prototype.trace_gc_roots(visitor);
+            entry.constructor.trace_gc_roots(visitor);
+        }
+    }
+
     /// Build the seven prototypes + constructors and link the
     /// inheritance chains.
     ///

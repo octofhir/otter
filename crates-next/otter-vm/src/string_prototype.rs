@@ -1217,7 +1217,7 @@ mod tests {
         heap: &StringHeap,
         gc_heap: &mut otter_gc::GcHeap,
     ) -> Value {
-        let recv_v = Value::String(JsString::from_str(recv, &heap).unwrap());
+        let recv_v = Value::String(JsString::from_str(recv, heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|a| match a {

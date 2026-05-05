@@ -1,20 +1,16 @@
 //! `Map`, `Set`, `WeakMap`, `WeakSet` collection value types.
 //!
 //! `Map` and `Set` preserve insertion order (ECMA-262 §24.1 /
-//! §24.2). `WeakMap` and `WeakSet` are object-keyed and would
-//! release entries once their key becomes unreachable; the
-//! foundation has no tracing GC yet (task 57), so weak collections
-//! behave as strong-keyed today and entries live until cleared
-//! explicitly. The module docstring is the canonical place to
-//! note this gap so the GC slice can wire eviction in without
-//! reshaping the public API.
+//! §24.2). `WeakMap` and `WeakSet` are object-keyed and keep
+//! entries through ephemeron tables: keys are weak, and values
+//! are marked only when their key is already reachable through
+//! another path.
 //!
 //! # Contents
 //! - [`JsMap`] — heap-shared, `IndexMap`-backed associative store.
 //! - [`JsSet`] — heap-shared, `IndexSet`-backed unique-element store.
-//! - [`JsWeakMap`] — object-keyed map (strong-ref today, weak when
-//!   GC ships).
-//! - [`JsWeakSet`] — object-keyed set with the same caveat.
+//! - [`JsWeakMap`] — GC-managed object-keyed weak map.
+//! - [`JsWeakSet`] — GC-managed object-keyed weak set.
 //! - [`MapKey`] — equality key used by `JsMap`/`JsSet`. Implements
 //!   ECMA-262 SameValueZero so `+0` / `-0` collapse and `NaN`
 //!   matches itself.
@@ -34,9 +30,6 @@
 //! - <https://tc39.es/ecma262/#sec-weakset-objects>
 //! - <https://tc39.es/ecma262/#sec-samevaluezero>
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use indexmap::IndexMap;
 
 use crate::Value;
@@ -49,12 +42,19 @@ pub const MAP_BODY_TYPE_TAG: u8 = 0x13;
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SetBody`].
 pub const SET_BODY_TYPE_TAG: u8 = 0x14;
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`WeakMapBody`].
+pub const WEAK_MAP_BODY_TYPE_TAG: u8 = 0x15;
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`WeakSetBody`].
+pub const WEAK_SET_BODY_TYPE_TAG: u8 = 0x16;
+
 /// Equality key for [`JsMap`] / [`JsSet`].
 ///
 /// Implements ECMA-262 SameValueZero (§7.2.12): `+0` and `-0` map
 /// to the same key, `NaN` matches itself, strings compare by
-/// content, symbols compare by identity, objects/arrays/functions
-/// compare by handle (`Rc::ptr_eq` via raw-pointer hashing).
+/// content, symbols compare by identity, migrated GC objects compare
+/// by heap identity, and remaining callable shapes fall back to the
+/// originating [`Value`] identity comparison.
 ///
 /// The structural projection in [`MapKey::from_value`] normalises
 /// `-0.0 → 0.0` so the equality + hashing paths can stay branch-free
@@ -82,7 +82,7 @@ pub enum MapKey {
     String(JsString),
     /// Symbols compare by `Rc::ptr_eq` identity.
     Symbol(JsSymbol),
-    /// Heap object identity (`Rc::as_ptr`).
+    /// Heap object identity.
     ObjectPtr(*const ()),
     /// The original [`Value`] for the object key — kept so iteration
     /// can hand back the live key reference.
@@ -95,10 +95,9 @@ impl MapKey {
     /// # Algorithm
     /// 1. Primitives map to a structural variant (number normalises
     ///    `-0.0 → 0.0`).
-    /// 2. Object-shaped values map to [`MapKey::ObjectPtr`] keyed
-    ///    on the underlying `Rc`'s data pointer; the originating
-    ///    `Value` is stashed in [`MapKey::ObjectValue`] alongside it
-    ///    via [`Self::from_value_with_origin`].
+    /// 2. Migrated object-shaped values map to [`MapKey::ObjectPtr`]
+    ///    keyed on their heap identity; non-migrated object-shaped
+    ///    values fall back to [`MapKey::ObjectValue`].
     pub fn from_value(value: &Value) -> Self {
         match value {
             Value::Undefined => MapKey::Undefined,
@@ -435,145 +434,203 @@ pub fn set_ptr_eq(a: JsSet, b: JsSet) -> bool {
     a == b
 }
 
-/// Object-keyed `WeakMap`.
-///
-/// **Foundation gap:** the runtime has no tracing GC yet, so
-/// entries are kept by **strong** reference. Once task 57 lands,
-/// the inner storage migrates to `Weak` handles and entries
-/// disappear when the key becomes unreachable. The public surface
-/// will stay the same.
-#[derive(Debug, Clone)]
-pub struct JsWeakMap {
-    inner: Rc<RefCell<WeakMapBody>>,
-}
+/// JS `WeakMap` — object-keyed ephemeron table.
+pub type JsWeakMap = otter_gc::Gc<WeakMapBody>;
 
 #[derive(Debug, Default)]
-struct WeakMapBody {
-    entries: IndexMap<*const (), (Value, Value)>,
+/// GC-allocated storage backing every [`JsWeakMap`] handle.
+pub struct WeakMapBody {
+    entries: IndexMap<otter_gc::RawGc, Value>,
 }
 
-impl JsWeakMap {
-    /// Construct an empty `JsWeakMap`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+impl otter_gc::SafeTraceable for WeakMapBody {
+    const TYPE_TAG: u8 = WEAK_MAP_BODY_TYPE_TAG;
 
-    /// `WeakMap.prototype.get` — Spec §24.3.3.3.
-    pub fn get(&self, key: &Value) -> Result<Option<Value>, CollectionError> {
-        let ptr = object_identity(key)?;
-        Ok(self
-            .inner
-            .borrow()
-            .entries
-            .get(&ptr)
-            .map(|(_, v)| v.clone()))
-    }
-
-    /// `WeakMap.prototype.has` — Spec §24.3.3.4.
-    pub fn has(&self, key: &Value) -> Result<bool, CollectionError> {
-        let ptr = object_identity(key)?;
-        Ok(self.inner.borrow().entries.contains_key(&ptr))
-    }
-
-    /// `WeakMap.prototype.set` — Spec §24.3.3.5.
-    pub fn set(&self, key: Value, value: Value) -> Result<(), CollectionError> {
-        let ptr = object_identity(&key)?;
-        let mut body = self.inner.borrow_mut();
-        if let Some(slot) = body.entries.get_mut(&ptr) {
-            slot.1 = value;
-        } else {
-            body.entries.insert(ptr, (key, value));
-        }
-        Ok(())
-    }
-
-    /// `WeakMap.prototype.delete` — Spec §24.3.3.2.
-    pub fn delete(&self, key: &Value) -> Result<bool, CollectionError> {
-        let ptr = object_identity(key)?;
-        Ok(self.inner.borrow_mut().entries.shift_remove(&ptr).is_some())
-    }
-
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::SlotVisitor<'_>) {
+        // Ephemeron entries are not ordinary strong edges. The VM
+        // fixpoint marks values only after the key is already live.
     }
 }
 
-impl Default for JsWeakMap {
-    fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(WeakMapBody::default())),
-        }
-    }
+/// Allocate a fresh empty `WeakMap`.
+pub fn alloc_weak_map(heap: &mut otter_gc::GcHeap) -> Result<JsWeakMap, otter_gc::OutOfMemory> {
+    let map = heap.alloc_old(WeakMapBody::default())?;
+    heap.register_ephemeron_table(map);
+    Ok(map)
 }
 
-/// Object-keyed `WeakSet`. Same foundation gap as
-/// [`JsWeakMap`] — strong-keyed today.
-#[derive(Debug, Clone)]
-pub struct JsWeakSet {
-    inner: Rc<RefCell<WeakSetBody>>,
+/// `WeakMap.prototype.get` — Spec §24.3.3.3.
+pub fn weak_map_get(
+    map: JsWeakMap,
+    heap: &otter_gc::GcHeap,
+    key: &Value,
+) -> Result<Option<Value>, CollectionError> {
+    let key = object_gc_key(key)?;
+    Ok(heap.read_payload(map, |body| body.entries.get(&key).cloned()))
 }
+
+/// `WeakMap.prototype.has` — Spec §24.3.3.4.
+pub fn weak_map_has(
+    map: JsWeakMap,
+    heap: &otter_gc::GcHeap,
+    key: &Value,
+) -> Result<bool, CollectionError> {
+    let key = object_gc_key(key)?;
+    Ok(heap.read_payload(map, |body| body.entries.contains_key(&key)))
+}
+
+/// `WeakMap.prototype.set` — Spec §24.3.3.5.
+pub fn weak_map_set(
+    map: JsWeakMap,
+    heap: &mut otter_gc::GcHeap,
+    key: Value,
+    value: Value,
+) -> Result<(), CollectionError> {
+    let key = object_gc_key(&key)?;
+    heap.with_payload(map, |body| {
+        body.entries.insert(key, value);
+    });
+    Ok(())
+}
+
+/// `WeakMap.prototype.delete` — Spec §24.3.3.2.
+pub fn weak_map_delete(
+    map: JsWeakMap,
+    heap: &mut otter_gc::GcHeap,
+    key: &Value,
+) -> Result<bool, CollectionError> {
+    let key = object_gc_key(key)?;
+    Ok(heap.with_payload(map, |body| body.entries.shift_remove(&key).is_some()))
+}
+
+/// JS `WeakSet` — object-keyed weak set.
+pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 
 #[derive(Debug, Default)]
-struct WeakSetBody {
-    entries: IndexMap<*const (), Value>,
+/// GC-allocated storage backing every [`JsWeakSet`] handle.
+pub struct WeakSetBody {
+    entries: IndexMap<otter_gc::RawGc, ()>,
 }
 
-impl JsWeakSet {
-    /// Construct an empty `JsWeakSet`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+impl otter_gc::SafeTraceable for WeakSetBody {
+    const TYPE_TAG: u8 = WEAK_SET_BODY_TYPE_TAG;
 
-    /// `WeakSet.prototype.has` — Spec §24.4.3.4.
-    pub fn has(&self, value: &Value) -> Result<bool, CollectionError> {
-        let ptr = object_identity(value)?;
-        Ok(self.inner.borrow().entries.contains_key(&ptr))
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::SlotVisitor<'_>) {
+        // WeakSet keys are weak and never traced as strong edges.
     }
+}
 
-    /// `WeakSet.prototype.add` — Spec §24.4.3.1.
-    pub fn add(&self, value: Value) -> Result<(), CollectionError> {
-        let ptr = object_identity(&value)?;
-        let mut body = self.inner.borrow_mut();
-        if !body.entries.contains_key(&ptr) {
-            body.entries.insert(ptr, value);
+/// Allocate a fresh empty `WeakSet`.
+pub fn alloc_weak_set(heap: &mut otter_gc::GcHeap) -> Result<JsWeakSet, otter_gc::OutOfMemory> {
+    let set = heap.alloc_old(WeakSetBody::default())?;
+    heap.register_ephemeron_table(set);
+    Ok(set)
+}
+
+/// `WeakSet.prototype.has` — Spec §24.4.3.4.
+pub fn weak_set_has(
+    set: JsWeakSet,
+    heap: &otter_gc::GcHeap,
+    value: &Value,
+) -> Result<bool, CollectionError> {
+    let key = object_gc_key(value)?;
+    Ok(heap.read_payload(set, |body| body.entries.contains_key(&key)))
+}
+
+/// `WeakSet.prototype.add` — Spec §24.4.3.1.
+pub fn weak_set_add(
+    set: JsWeakSet,
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+) -> Result<(), CollectionError> {
+    let key = object_gc_key(&value)?;
+    heap.with_payload(set, |body| {
+        body.entries.insert(key, ());
+    });
+    Ok(())
+}
+
+/// `WeakSet.prototype.delete` — Spec §24.4.3.3.
+pub fn weak_set_delete(
+    set: JsWeakSet,
+    heap: &mut otter_gc::GcHeap,
+    value: &Value,
+) -> Result<bool, CollectionError> {
+    let key = object_gc_key(value)?;
+    Ok(heap.with_payload(set, |body| body.entries.shift_remove(&key).is_some()))
+}
+
+/// Run the WeakMap / WeakSet ephemeron fixpoint after ordinary mark.
+pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
+    loop {
+        let mut additions = Vec::new();
+        for raw in heap.ephemeron_tables_snapshot() {
+            if !heap.is_marked(raw) {
+                continue;
+            }
+            match heap.raw_type_tag(raw) {
+                Some(WEAK_MAP_BODY_TYPE_TAG) => {
+                    let Some(map) = heap.cast_raw_if_type::<WeakMapBody>(raw) else {
+                        continue;
+                    };
+                    heap.read_payload(map, |body| {
+                        for (key, value) in &body.entries {
+                            if heap.is_marked(*key) {
+                                if let Some(value_raw) = value.as_gc_raw() {
+                                    additions.push(value_raw);
+                                }
+                            }
+                        }
+                    });
+                }
+                Some(WEAK_SET_BODY_TYPE_TAG) => {}
+                _ => {}
+            }
         }
-        Ok(())
+        if !heap.mark_additional(additions) {
+            break;
+        }
     }
 
-    /// `WeakSet.prototype.delete` — Spec §24.4.3.3.
-    pub fn delete(&self, value: &Value) -> Result<bool, CollectionError> {
-        let ptr = object_identity(value)?;
-        Ok(self.inner.borrow_mut().entries.shift_remove(&ptr).is_some())
-    }
-
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
-    }
-}
-
-impl Default for JsWeakSet {
-    fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(WeakSetBody::default())),
+    for raw in heap.ephemeron_tables_snapshot() {
+        if !heap.is_marked(raw) {
+            continue;
+        }
+        match heap.raw_type_tag(raw) {
+            Some(WEAK_MAP_BODY_TYPE_TAG) => {
+                let Some(map) = heap.cast_raw_if_type::<WeakMapBody>(raw) else {
+                    continue;
+                };
+                let live_keys: std::collections::HashSet<_> = heap
+                    .read_payload(map, |body| body.entries.keys().copied().collect::<Vec<_>>())
+                    .into_iter()
+                    .filter(|key| heap.is_marked(*key))
+                    .collect();
+                heap.with_payload(map, |body| {
+                    body.entries.retain(|key, _| live_keys.contains(key));
+                });
+            }
+            Some(WEAK_SET_BODY_TYPE_TAG) => {
+                let Some(set) = heap.cast_raw_if_type::<WeakSetBody>(raw) else {
+                    continue;
+                };
+                let live_keys: std::collections::HashSet<_> = heap
+                    .read_payload(set, |body| body.entries.keys().copied().collect::<Vec<_>>())
+                    .into_iter()
+                    .filter(|key| heap.is_marked(*key))
+                    .collect();
+                heap.with_payload(set, |body| {
+                    body.entries.retain(|key, _| live_keys.contains(key));
+                });
+            }
+            _ => {}
         }
     }
 }
 
-/// Project an object-shaped [`Value`] to its identity pointer for
-/// use as a `WeakMap`/`WeakSet` key.
-fn object_identity(value: &Value) -> Result<*const (), CollectionError> {
-    match value {
-        Value::Object(o) => Ok(o.as_header_ptr() as *const ()),
-        Value::Array(a) => Ok(crate::array::identity_addr(*a)),
-        Value::RegExp(r) => Ok(r.identity_addr()),
-        _ => Err(CollectionError::NonObjectKey),
-    }
+/// Project an object-shaped [`Value`] to a migrated GC key.
+fn object_gc_key(value: &Value) -> Result<otter_gc::RawGc, CollectionError> {
+    value.as_gc_raw().ok_or(CollectionError::NonObjectKey)
 }
 
 fn trace_map_key(key: &MapKey, visitor: &mut otter_gc::SlotVisitor<'_>) {
@@ -708,21 +765,22 @@ mod tests {
 
     #[test]
     fn weakmap_rejects_primitive_keys() {
-        let wm = JsWeakMap::new();
-        let err = wm.set(n(1), Value::Boolean(true)).unwrap_err();
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let wm = alloc_weak_map(&mut heap).unwrap();
+        let err = weak_map_set(wm, &mut heap, n(1), Value::Boolean(true)).unwrap_err();
         assert!(matches!(err, CollectionError::NonObjectKey));
     }
 
     #[test]
     fn weakmap_object_key_roundtrips() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        let wm = JsWeakMap::new();
+        let wm = alloc_weak_map(&mut heap).unwrap();
         let obj = Value::Object(crate::object::alloc_object(&mut heap).unwrap());
-        wm.set(obj.clone(), n(42)).unwrap();
-        assert!(wm.has(&obj).unwrap());
-        assert_eq!(wm.get(&obj).unwrap(), Some(n(42)));
+        weak_map_set(wm, &mut heap, obj.clone(), n(42)).unwrap();
+        assert!(weak_map_has(wm, &heap, &obj).unwrap());
+        assert_eq!(weak_map_get(wm, &heap, &obj).unwrap(), Some(n(42)));
         let other = Value::Object(crate::object::alloc_object(&mut heap).unwrap());
-        assert!(!wm.has(&other).unwrap());
+        assert!(!weak_map_has(wm, &heap, &other).unwrap());
     }
 
     #[test]

@@ -429,6 +429,9 @@ pub fn page_base_from_offset(cage_offset: u32) -> *mut u8 {
 mod tests {
     use super::*;
     use crate::compressed::Cage;
+    use std::sync::Mutex;
+
+    static PAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn ensure_cage() {
         let _ = Cage::ensure_default();
@@ -443,6 +446,7 @@ mod tests {
 
     #[test]
     fn page_alloc_and_bump() {
+        let _guard = PAGE_TEST_LOCK.lock().expect("page test lock");
         ensure_cage();
         let p = Page::new(SpaceKind::NewFrom).expect("page");
         let off1 = p.bump_alloc(64).expect("bump 1");
@@ -453,6 +457,7 @@ mod tests {
 
     #[test]
     fn page_base_of_is_o1() {
+        let _guard = PAGE_TEST_LOCK.lock().expect("page test lock");
         ensure_cage();
         let p = Page::new(SpaceKind::Old).expect("page");
         let mid = unsafe { p.base_ptr().add(PAGE_SIZE / 2) };
@@ -461,6 +466,7 @@ mod tests {
 
     #[test]
     fn card_table_set_and_test() {
+        let _guard = PAGE_TEST_LOCK.lock().expect("page test lock");
         ensure_cage();
         let p = Page::new(SpaceKind::Old).expect("page");
         let off = PAGE_HEADER_SIZE + 4 * CARD_SIZE;
@@ -476,6 +482,7 @@ mod tests {
 
     #[test]
     fn page_drop_returns_to_cage() {
+        let _guard = PAGE_TEST_LOCK.lock().expect("page test lock");
         ensure_cage();
         let before = Cage::free_page_count();
         {

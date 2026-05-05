@@ -8,8 +8,7 @@ use otter_vm::Interpreter;
 use otter_vm::Value;
 use otter_vm::array::ARRAY_BODY_TYPE_TAG;
 
-#[test]
-fn array_self_reference_reaped() {
+fn assert_array_self_reference_reaped() {
     let mut interp = Interpreter::new();
 
     interp.force_gc();
@@ -34,8 +33,7 @@ fn array_self_reference_reaped() {
     );
 }
 
-#[test]
-fn array_dense_storage_cap_kicks_in() {
+fn assert_array_dense_storage_cap_kicks_in() {
     let mut heap = otter_gc::GcHeap::with_max_heap_bytes(4 * 1024 * 1024).expect("gc heap");
     let values = std::iter::repeat_n(Value::Undefined, 1 << 20);
     let err = otter_vm::array::from_elements(&mut heap, values).expect_err("array must exceed cap");
@@ -43,4 +41,10 @@ fn array_dense_storage_cap_kicks_in() {
         matches!(err, otter_gc::OutOfMemory::HeapCapExceeded { .. }),
         "expected HeapCapExceeded, got {err:?}"
     );
+}
+
+#[test]
+fn array_gc_regressions() {
+    assert_array_self_reference_reaped();
+    assert_array_dense_storage_cap_kicks_in();
 }

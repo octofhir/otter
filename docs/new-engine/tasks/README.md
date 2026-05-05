@@ -384,7 +384,7 @@ deferred indefinitely.
 | [77-migrate-jsobject.md](./77-migrate-jsobject.md) | `JsObject` to `Gc<ObjectBody>`; barriers on every property store. |
 | [78-migrate-jsarray.md](./78-migrate-jsarray.md) | `JsArray` to `Gc<ArrayBody>`; barriers on element / named-prop stores. |
 | [79-migrate-jsmap-jsset.md](./79-migrate-jsmap-jsset.md) | `JsMap` / `JsSet` to `Gc<…>`; barriers on entry stores. |
-| [80-migrate-weakmap-weakset-ephemerons.md](./80-migrate-weakmap-weakset-ephemerons.md) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes long-standing "task 57" markers). |
+| ✅ 80 (closed 2026-05-05) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes long-standing "task 57" markers). |
 | [81-weakref-finalization-registry.md](./81-weakref-finalization-registry.md) | Introduce `WeakRef` and `FinalizationRegistry`. |
 | [82-migrate-promise-iterator-generator.md](./82-migrate-promise-iterator-generator.md) | `JsPromiseHandle::Pure`, `IteratorState`, generator-frame state. |
 | [83-migrate-bound-native-regexp.md](./83-migrate-bound-native-regexp.md) | `BoundFunction`, `NativeFunction`, `JsRegExp` — last `Rc`-shared variants. |

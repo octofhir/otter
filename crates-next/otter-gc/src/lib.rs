@@ -58,6 +58,7 @@ pub const OBJECT_ALIGNMENT: usize = 8;
 pub mod barrier;
 pub mod compressed;
 pub mod devtools_snapshot;
+pub mod ephemeron;
 pub mod handle;
 pub mod header;
 pub mod heap;

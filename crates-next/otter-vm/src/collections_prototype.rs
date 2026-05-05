@@ -230,9 +230,9 @@ fn impl_set_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 // WeakMap.prototype
 // ---------------------------------------------------------------
 
-fn receiver_weak_map<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsWeakMap, IntrinsicError> {
+fn receiver_weak_map(args: &IntrinsicArgs<'_>) -> Result<JsWeakMap, IntrinsicError> {
     match args.receiver {
-        Value::WeakMap(m) => Ok(m),
+        Value::WeakMap(m) => Ok(*m),
         _ => Err(IntrinsicError::BadReceiver {
             expected: "WeakMap",
         }),
@@ -242,7 +242,8 @@ fn receiver_weak_map<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsWeakMap, I
 fn impl_weak_map_get(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_weak_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    match m.get(&key) {
+    let heap = args.gc_heap.borrow();
+    match collections::weak_map_get(m, &heap, &key) {
         Ok(Some(v)) => Ok(v),
         Ok(None) | Err(CollectionError::NonObjectKey) => Ok(Value::Undefined),
         Err(_) => Ok(Value::Undefined),
@@ -252,7 +253,8 @@ fn impl_weak_map_get(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 fn impl_weak_map_has(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_weak_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    match m.has(&key) {
+    let heap = args.gc_heap.borrow();
+    match collections::weak_map_has(m, &heap, &key) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
         Err(_) => Ok(Value::Boolean(false)),
@@ -263,14 +265,16 @@ fn impl_weak_map_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let m = receiver_weak_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
     let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
-    m.set(key, value).map_err(weak_collection_to_intrinsic)?;
-    Ok(Value::WeakMap(m.clone()))
+    let mut heap = args.gc_heap.borrow_mut();
+    collections::weak_map_set(m, &mut heap, key, value).map_err(weak_collection_to_intrinsic)?;
+    Ok(Value::WeakMap(m))
 }
 
 fn impl_weak_map_delete(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_weak_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    match m.delete(&key) {
+    let mut heap = args.gc_heap.borrow_mut();
+    match collections::weak_map_delete(m, &mut heap, &key) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
         Err(_) => Ok(Value::Boolean(false)),
@@ -281,9 +285,9 @@ fn impl_weak_map_delete(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
 // WeakSet.prototype
 // ---------------------------------------------------------------
 
-fn receiver_weak_set<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsWeakSet, IntrinsicError> {
+fn receiver_weak_set(args: &IntrinsicArgs<'_>) -> Result<JsWeakSet, IntrinsicError> {
     match args.receiver {
-        Value::WeakSet(s) => Ok(s),
+        Value::WeakSet(s) => Ok(*s),
         _ => Err(IntrinsicError::BadReceiver {
             expected: "WeakSet",
         }),
@@ -293,14 +297,16 @@ fn receiver_weak_set<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsWeakSet, I
 fn impl_weak_set_add(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_weak_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    s.add(v).map_err(weak_collection_to_intrinsic)?;
-    Ok(Value::WeakSet(s.clone()))
+    let mut heap = args.gc_heap.borrow_mut();
+    collections::weak_set_add(s, &mut heap, v).map_err(weak_collection_to_intrinsic)?;
+    Ok(Value::WeakSet(s))
 }
 
 fn impl_weak_set_has(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_weak_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    match s.has(&v) {
+    let heap = args.gc_heap.borrow();
+    match collections::weak_set_has(s, &heap, &v) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
         Err(_) => Ok(Value::Boolean(false)),
@@ -310,7 +316,8 @@ fn impl_weak_set_has(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 fn impl_weak_set_delete(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_weak_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    match s.delete(&v) {
+    let mut heap = args.gc_heap.borrow_mut();
+    match collections::weak_set_delete(s, &mut heap, &v) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
         Err(_) => Ok(Value::Boolean(false)),

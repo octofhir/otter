@@ -4,10 +4,10 @@
 //! to `Gc<…>` over tasks 76–83 implements [`GcTrace`] here.
 //! The trait fires from [`crate::runtime_state::RuntimeState::trace_roots`]
 //! during a full GC. Bodies are intentionally empty today —
-//! Phase 1's value model is still `Rc`-shared, so there is
-//! nothing to enumerate. The signatures land **before** any
-//! migration so that each per-type task in tasks 76+ adds a
-//! body, not a fresh trait impl plus a fresh wiring point.
+//! Early phase entries started as stubs while the value model was
+//! still `Rc`-shared. As each migration task lands, the matching
+//! body is filled in so roots expose real `Gc<…>` slots without
+//! adding new wiring points.
 //!
 //! # Contents
 //!
@@ -18,9 +18,10 @@
 //!
 //! # Invariants
 //!
-//! - All implementations in this file are empty stubs. Any
-//!   non-empty body landing here without a corresponding
-//!   migration task is a bug.
+//! - A migrated implementation must visit its own `Gc<…>` slot and
+//!   delegate to nested VM containers that own additional slots.
+//! - A still-unmigrated implementation may remain an empty stub
+//!   only when the type genuinely holds no active GC handles yet.
 //! - The visitor receives `*mut RawGc` (slot pointer, not
 //!   value) so the scavenger can rewrite the slot when an
 //!   object moves — matches the
@@ -66,13 +67,11 @@ pub trait GcTrace {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-1 stubs.
+// Root adapters.
 //
-// Each impl below stays empty until the matching migration task
-// (76+) replaces the type's `Rc<RefCell<…>>` storage with a
-// real `Gc<T>` slot. At that point the body learns to yield
-// the slot pointer; the wiring in `RuntimeState::trace_roots`
-// already calls into it.
+// Each migrated impl yields the slot pointer for its own `Gc<T>`
+// handle. Still-parked value shapes keep explicit stubs until the
+// matching migration task replaces their storage.
 // ---------------------------------------------------------------------------
 
 // Task-76 note: `UpvalueCell` is now `otter_gc::Gc<UpvalueCellBody>`,
@@ -132,14 +131,19 @@ impl GcTrace for JsSet {
 }
 
 impl GcTrace for JsWeakMap {
-    /// Stub — body lands with task 80 (WeakMap / WeakSet
-    /// ephemerons).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsWeakMap as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for JsWeakSet {
-    /// Stub — body lands with task 80.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsWeakSet as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for JsPromiseHandle {
@@ -223,7 +227,8 @@ impl GcTrace for SymbolRegistry {
 }
 
 impl GcTrace for ErrorClassRegistry {
-    /// Stub — error-class prototypes are `JsObject`s; body
-    /// lands with task 77.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Trace constructor/prototype objects owned by the registry.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        ErrorClassRegistry::trace_gc_roots(self, visitor);
+    }
 }

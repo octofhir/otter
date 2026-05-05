@@ -215,14 +215,12 @@ pub enum Value {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-set-objects>
     Set(JsSet),
-    /// JS `WeakMap` — object-keyed map. Foundation keeps strong
-    /// refs until task 57 lands the tracing GC.
+    /// JS `WeakMap` — object-keyed ephemeron map.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-weakmap-objects>
     WeakMap(JsWeakMap),
-    /// JS `WeakSet` — object-keyed set. Same foundation gap as
-    /// [`Self::WeakMap`].
+    /// JS `WeakSet` — object-keyed weak set.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-weakset-objects>
@@ -567,6 +565,8 @@ impl Value {
             Value::Array(a) => Some(a.raw()),
             Value::Map(m) => Some(m.raw()),
             Value::Set(s) => Some(s.raw()),
+            Value::WeakMap(m) => Some(m.raw()),
+            Value::WeakSet(s) => Some(s.raw()),
             // Phase-1 stub for the rest. Subsequent migrations
             // (78+) add variant arms here as their handle types
             // move to `Gc<…>`.
@@ -617,6 +617,14 @@ impl Value {
             }
             Value::Set(s) => {
                 let p = s as *const JsSet as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::WeakMap(m) => {
+                let p = m as *const JsWeakMap as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::WeakSet(s) => {
+                let p = s as *const JsWeakSet as *mut otter_gc::RawGc;
                 visitor(p);
             }
             _ => {}
@@ -875,8 +883,8 @@ impl PartialEq for Value {
             (Value::ClassConstructor(a), Value::ClassConstructor(b)) => std::rc::Rc::ptr_eq(a, b),
             (Value::Map(a), Value::Map(b)) => crate::collections::map_ptr_eq(*a, *b),
             (Value::Set(a), Value::Set(b)) => crate::collections::set_ptr_eq(*a, *b),
-            (Value::WeakMap(a), Value::WeakMap(b)) => a.ptr_eq(b),
-            (Value::WeakSet(a), Value::WeakSet(b)) => a.ptr_eq(b),
+            (Value::WeakMap(a), Value::WeakMap(b)) => a == b,
+            (Value::WeakSet(a), Value::WeakSet(b)) => a == b,
             (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(b),
             (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(b),
             (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(b),
@@ -1929,7 +1937,9 @@ impl Interpreter {
                 sv(p);
             }
         };
-        self.gc_heap.collect_full(&mut visit);
+        self.gc_heap.mark_phase(&mut visit);
+        crate::collections::run_ephemeron_fixpoint(&mut self.gc_heap);
+        self.gc_heap.sweep_phase();
     }
 
     /// Execute `<main>` of `module` and return its completion value.
@@ -8657,7 +8667,7 @@ fn build_collection(
             Ok(Value::Set(s))
         }
         "WeakMap" => {
-            let m = JsWeakMap::new();
+            let m = crate::collections::alloc_weak_map(gc_heap)?;
             if seed_is_present(seed) {
                 for entry in seed_array(seed, gc_heap)? {
                     let pair = match entry {
@@ -8667,7 +8677,9 @@ fn build_collection(
                     if crate::array::len(pair, gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
-                    m.set(
+                    crate::collections::weak_map_set(
+                        m,
+                        gc_heap,
                         crate::array::get(pair, gc_heap, 0),
                         crate::array::get(pair, gc_heap, 1),
                     )
@@ -8677,10 +8689,11 @@ fn build_collection(
             Ok(Value::WeakMap(m))
         }
         "WeakSet" => {
-            let s = JsWeakSet::new();
+            let s = crate::collections::alloc_weak_set(gc_heap)?;
             if seed_is_present(seed) {
                 for v in seed_array(seed, gc_heap)? {
-                    s.add(v).map_err(|_| VmError::TypeMismatch)?;
+                    crate::collections::weak_set_add(s, gc_heap, v)
+                        .map_err(|_| VmError::TypeMismatch)?;
                 }
             }
             Ok(Value::WeakSet(s))

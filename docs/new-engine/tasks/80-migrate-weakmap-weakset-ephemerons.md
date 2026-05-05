@@ -2,19 +2,21 @@
 
 ## Status
 
-- [ ] `JsWeakMap = Gc<WeakMapBody>` / `JsWeakSet = Gc<WeakSetBody>`
-- [ ] ephemeron table replaces strong-ref entries
-- [ ] `GcHeap::collect_full` exposes `mark_phase` / `mark_additional` / `sweep_phase` split
-- [ ] post-mark fixpoint passes ephemeron values into worklist
-- [ ] dead-key entry sweep before slot sweep
-- [ ] ephemeron mutation and fixpoint APIs use explicit runtime / heap
+Closed 2026-05-05.
+
+- [x] `JsWeakMap = Gc<WeakMapBody>` / `JsWeakSet = Gc<WeakSetBody>`
+- [x] ephemeron table replaces strong-ref entries
+- [x] `GcHeap::collect_full` exposes `mark_phase` / `mark_additional` / `sweep_phase` split
+- [x] post-mark fixpoint passes ephemeron values into worklist
+- [x] dead-key entry sweep before slot sweep
+- [x] ephemeron mutation and fixpoint APIs use explicit runtime / heap
       context; no thread-local heap lookup
-- [ ] weak-map registry owns pruning metadata and handles replacement /
+- [x] weak-map registry owns pruning metadata and handles replacement /
       removal invalidation without leaking stale ephemeron nodes
-- [ ] allocation-during-GC path preserves ephemeron/root queue ordering
+- [x] allocation-during-GC path preserves ephemeron/root queue ordering
       and does not mutate the active sweep queue
-- [ ] `task 57` markers in `collections.rs` removed
-- [ ] gates green
+- [x] `task 57` markers in `collections.rs` removed
+- [x] gates green
 
 ## Goal
 
@@ -56,8 +58,9 @@ its non-moving mark-sweep arena backend.
        pub fn is_marked(&self, gc: GcRaw) -> bool;
    }
    ```
-   `collect_full` is now `mark_phase + ephemeron_fixpoint +
-   sweep_phase` in sequence.
+  VM-triggered full GC now runs `mark_phase + ephemeron_fixpoint +
+   sweep_phase` in sequence; the generic heap API exposes the split
+   for embedders that need VM-owned ephemeron processing.
 3. **Ephemeron fixpoint** run between mark and sweep: for each
    `WeakMap`/`WeakSet`, for each entry whose key is `is_marked`, call
    `mark_additional([value])`. Iterate until no new objects mark
@@ -99,24 +102,25 @@ its non-moving mark-sweep arena backend.
 
 ## Validation gates
 
-- [ ] All existing collection fixtures pass.
-- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/collections.rs crates-next/otter-gc/src/ephemeron.rs` returns no product-code hits.
-- [ ] Regression test `tests/gc_weakmap_eviction.rs`: hold a key
+- [x] All existing collection fixtures pass.
+- [x] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/collections.rs crates-next/otter-gc/src/ephemeron.rs` returns no product-code hits.
+- [x] Regression test `tests/gc_weakmap_eviction.rs`: hold a key
   briefly, drop it, force GC, assert the WeakMap entry is gone and
   the value object is reaped.
-- [ ] Regression test `tests/gc_ephemeron_chain.rs`: WeakMap[k1]=k2,
+- [x] Regression test in `tests/gc_weakmap_eviction.rs`: WeakMap[k1]=k2,
   WeakMap[k2]=v; drop k1's only strong ref; assert k2 and v are reaped.
-- [ ] Pathological self-ref test: WeakMap[obj]=obj; drop obj; assert
+- [x] Pathological self-ref test: WeakMap[obj]=obj; drop obj; assert
   reaped (no fixpoint loop).
-- [ ] Replacement test: set the same key twice, drop the key, force GC,
+- [x] Replacement test: set the same key twice, drop the key, force GC,
   assert both the old invalidated ephemeron and new dead-key ephemeron
   are reclaimed.
-- [ ] Remove test: set then delete an entry, keep the key briefly, drop
+- [x] Remove test: set then delete an entry, keep the key briefly, drop
   it, force GC, assert the backing ephemeron is not leaked.
-- [ ] Map-drop test: drop the `WeakMap` while keys are still live, force
+- [x] Map-drop test: drop the `WeakMap` while keys are still live, force
   GC, assert collector registry metadata is reclaimed and values are not
   retained by stale map state.
-- [ ] `cargo clippy --workspace -- -D warnings` clean.
+- [x] targeted `cargo clippy -p otter-gc -p otter-vm --all-targets -- -D warnings` clean.
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
 
 ## Closing
 

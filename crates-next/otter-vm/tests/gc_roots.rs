@@ -212,10 +212,19 @@ fn module_env_keeps_object_alive() {
 }
 
 #[test]
-#[ignore = "un-ignore in task 77 (error-class registry)"]
 fn error_class_registry_prototypes_survive_force_gc() {
-    // task 77: capture each canonical Error.prototype via
-    // identity, force_gc, assert identity preserved.
+    let mut interp = Interpreter::new();
+    interp.force_gc();
+
+    let registry = interp.error_classes_clone();
+    let proto = registry.prototype(otter_vm::ErrorKind::TypeError);
+    let name = otter_vm::object::get(proto, interp.gc_heap(), "name")
+        .expect("TypeError.prototype.name survives force_gc");
+
+    match name {
+        otter_vm::Value::String(s) => assert_eq!(s.to_lossy_string(), "TypeError"),
+        other => panic!("expected TypeError.prototype.name string, got {other:?}"),
+    }
 }
 
 #[test]
@@ -287,10 +296,69 @@ fn map_entry_root_survives_force_gc() {
 }
 
 #[test]
-#[ignore = "un-ignore in task 80 (WeakMap / WeakSet ephemerons)"]
 fn weak_collections_root_survives_force_gc() {
-    // task 80: WeakMap key-value pair survives while key is
-    // strongly rooted; collected when key dies.
+    let mut interp = Interpreter::new();
+    let map = otter_vm::collections::alloc_weak_map(interp.gc_heap_mut()).expect("alloc WeakMap");
+    let set = otter_vm::collections::alloc_weak_set(interp.gc_heap_mut()).expect("alloc WeakSet");
+    let key = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc key");
+    let value = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc value");
+
+    otter_vm::collections::weak_map_set(
+        map,
+        interp.gc_heap_mut(),
+        otter_vm::Value::Object(key),
+        otter_vm::Value::Object(value),
+    )
+    .expect("weak map set");
+    otter_vm::collections::weak_set_add(set, interp.gc_heap_mut(), otter_vm::Value::Object(key))
+        .expect("weak set add");
+
+    let global_this = *interp.global_this();
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__weak_map_root",
+        otter_vm::Value::WeakMap(map),
+    );
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__weak_set_root",
+        otter_vm::Value::WeakSet(set),
+    );
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__weak_key_root",
+        otter_vm::Value::Object(key),
+    );
+
+    let _ = map;
+    let _ = set;
+    let _ = key;
+    let _ = value;
+    interp.force_gc();
+
+    let rooted_key = otter_vm::object::get(global_this, interp.gc_heap(), "__weak_key_root")
+        .expect("weak key root survives force_gc");
+    let rooted_map = otter_vm::object::get(global_this, interp.gc_heap(), "__weak_map_root")
+        .expect("weak map root survives force_gc");
+    let rooted_set = otter_vm::object::get(global_this, interp.gc_heap(), "__weak_set_root")
+        .expect("weak set root survives force_gc");
+
+    match (rooted_map, rooted_set) {
+        (otter_vm::Value::WeakMap(map), otter_vm::Value::WeakSet(set)) => {
+            assert!(
+                otter_vm::collections::weak_map_has(map, interp.gc_heap(), &rooted_key)
+                    .expect("weak map has")
+            );
+            assert!(
+                otter_vm::collections::weak_set_has(set, interp.gc_heap(), &rooted_key)
+                    .expect("weak set has")
+            );
+        }
+        other => panic!("expected WeakMap/WeakSet after force_gc, got {other:?}"),
+    }
 }
 
 #[test]

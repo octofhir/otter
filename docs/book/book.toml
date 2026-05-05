@@ -1,0 +1,10 @@
+[book]
+authors = ["Otter contributors"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Otter Engine Contributor Guide"
+
+[output.html]
+git-repository-url = "https://github.com/octoshikari/otter"
+edit-url-template = "https://github.com/octoshikari/otter/edit/main/docs/book/{path}"

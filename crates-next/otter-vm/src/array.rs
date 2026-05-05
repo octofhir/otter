@@ -1,208 +1,309 @@
 //! JavaScript array value with dense element storage.
 //!
-//! Slice 20 ships the dense path: elements live in a
-//! `SmallVec<[Value; 4]>` so short literals stay inline. Out-of-
-//! bounds writes extend the storage with `Value::Undefined`,
-//! matching JS dense-array semantics. Sparse-fallback lands later
-//! once a real workload demands it.
-//!
-//! # Contents
-//! - [`JsArray`] — cheap-to-clone array handle (`Rc`-shared).
-//! - [`ArrayBody`] — internal element storage.
+//! Task 78 migrates arrays from the old refcounted body envelope to the
+//! page-based tracing GC. The public handle is a compressed
+//! [`otter_gc::Gc<ArrayBody>`]; every read or mutation takes an
+//! explicit [`otter_gc::GcHeap`] reference so no thread-local heap
+//! lookup can hide a safepoint.
 //!
 //! # Invariants
-//! - `len` always equals the number of slots in `elements`.
-//! - Out-of-range reads return `Value::Undefined` (foundation
-//!   approximation; spec returns `undefined` for missing indices,
-//!   so behaviour matches when the array is dense).
-//! - Cloning shares storage — both handles see mutations.
+//!
+//! - `len` always equals the number of dense slots in `elements`.
+//! - Out-of-range reads return `Value::Undefined`.
+//! - Element growth goes through helpers that reserve off-slot
+//!   `SmallVec` capacity against the heap cap before resizing.
 //!
 //! # See also
-//! - foundation plan §M9.
-//! - [`docs/new-engine/tasks/21-array-prototype-essentials.md`](
-//!     ../../../docs/new-engine/tasks/21-array-prototype-essentials.md
-//!   )
+//!
+//! - <https://tc39.es/ecma262/#sec-array-exotic-objects>
+//! - [GC architecture plan §4.1](../../../docs/new-engine/gc-architecture.md)
+//! - [Task 78](../../../docs/new-engine/tasks/78-migrate-jsarray.md)
 
-use std::cell::{Ref, RefCell, RefMut};
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::mem;
 
 use smallvec::SmallVec;
 
 use crate::Value;
 
-/// Cheap-to-clone array handle.
-#[derive(Debug, Clone)]
-pub struct JsArray {
-    inner: Rc<RefCell<ArrayBody>>,
-}
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ArrayBody`].
+///
+/// Distinct from task-76 upvalues (`0x10`) and task-77 objects
+/// (`0x11`).
+pub const ARRAY_BODY_TYPE_TAG: u8 = 0x12;
 
-/// Internal storage; `RefCell` only because the public surface
-/// keeps `&self` while mutating, mirroring how `JsObject` is
-/// borrowed.
+/// Heap-shared array handle.
+pub type JsArray = otter_gc::Gc<ArrayBody>;
+
+/// GC-allocated storage backing every [`JsArray`] handle.
 #[derive(Debug, Default)]
 pub struct ArrayBody {
-    /// Element storage. Crate-internal — outside callers should
-    /// go through `JsArray::{get, set, push, pop, ...}`.
+    /// Dense element storage. Crate-internal callers must go through
+    /// this module's helpers so growth is heap-accounted.
     pub(crate) elements: SmallVec<[Value; 4]>,
-    /// Optional non-index string-keyed own properties. ECMA-262
-    /// §10.4.2 arrays inherit from `Object` and accept arbitrary
-    /// own properties; the foundation needs this to support
-    /// tagged-template `strings.raw` and the rare assignment
-    /// `arr.someName = ...`. Allocated lazily on first use.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-array-exotic-objects>
-    pub(crate) named_properties: Option<std::collections::HashMap<String, Value>>,
+    /// Optional non-index string-keyed own properties.
+    pub(crate) named_properties: Option<HashMap<String, Value>>,
 }
 
-impl JsArray {
-    /// Allocate a fresh empty array.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+impl otter_gc::SafeTraceable for ArrayBody {
+    const TYPE_TAG: u8 = ARRAY_BODY_TYPE_TAG;
 
-    /// Construct from a vector of initial elements (used by
-    /// `[a, b, c]` literal lowering).
-    #[must_use]
-    pub fn from_elements(values: impl IntoIterator<Item = Value>) -> Self {
-        let mut body = ArrayBody::default();
-        for v in values {
-            body.elements.push(v);
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        for element in &self.elements {
+            element.trace_value_slots(visitor);
         }
-        Self {
-            inner: Rc::new(RefCell::new(body)),
+        if let Some(named) = &self.named_properties {
+            for value in named.values() {
+                value.trace_value_slots(visitor);
+            }
         }
     }
+}
 
-    /// Length in elements (O(1)).
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.borrow().elements.len()
-    }
+/// Allocate a fresh empty array.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if the array shell allocation
+/// would exceed the configured heap cap.
+pub fn alloc_array(heap: &mut otter_gc::GcHeap) -> Result<JsArray, otter_gc::OutOfMemory> {
+    heap.alloc_old(ArrayBody::default())
+}
 
-    /// `true` for an empty array.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.inner.borrow().elements.is_empty()
-    }
+/// Construct an array from initial elements.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if either the array shell or
+/// off-slot dense storage reservation would exceed the heap cap.
+pub fn from_elements(
+    heap: &mut otter_gc::GcHeap,
+    values: impl IntoIterator<Item = Value>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
+    let collected: Vec<Value> = values.into_iter().collect();
+    let mut body = ArrayBody::default();
+    reserve_elements_for_len(&mut body, heap, collected.len())?;
+    body.elements.extend(collected);
+    heap.alloc_old(body)
+}
 
-    /// Read element at `idx`. Out-of-range returns `Value::Undefined`.
-    #[must_use]
-    pub fn get(&self, idx: usize) -> Value {
-        self.inner
-            .borrow()
-            .elements
-            .get(idx)
-            .cloned()
-            .unwrap_or(Value::Undefined)
-    }
+/// Length in elements (O(1)).
+#[must_use]
+pub fn len(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(arr, |body| body.elements.len())
+}
 
-    /// Write element at `idx`. Extends with `Value::Undefined`
-    /// when `idx >= len`.
-    pub fn set(&self, idx: usize, value: Value) {
-        let mut body = self.inner.borrow_mut();
+/// `true` for an empty array.
+#[must_use]
+pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
+    len(arr, heap) == 0
+}
+
+/// Read element at `idx`. Out-of-range returns `Value::Undefined`.
+#[must_use]
+pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
+    heap.read_payload(arr, |body| {
+        body.elements.get(idx).cloned().unwrap_or(Value::Undefined)
+    })
+}
+
+/// Write element at `idx`, extending with `Value::Undefined` when
+/// `idx >= len`.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if extending dense storage would
+/// exceed the configured heap cap.
+pub fn set(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    idx: usize,
+    value: Value,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let child_raw = value.as_gc_raw();
+    let target_len = idx.saturating_add(1);
+    reserve_for_target_len(arr, heap, target_len)?;
+    heap.with_payload(arr, |body| {
         if idx < body.elements.len() {
             body.elements[idx] = value;
             return;
         }
+        body.elements
+            .reserve_exact(target_len.saturating_sub(body.elements.len()));
         while body.elements.len() < idx {
             body.elements.push(Value::Undefined);
         }
         body.elements.push(value);
+    });
+    if let Some(child) = child_raw {
+        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
     }
+    Ok(())
+}
 
-    /// Push to the tail (used by `Array.prototype.push` in slice
-    /// 21). Returns the new length.
-    pub fn push(&self, value: Value) -> usize {
-        let mut body = self.inner.borrow_mut();
+/// Push to the tail. Returns the new length.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if growing dense storage would
+/// exceed the configured heap cap.
+pub fn push(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+) -> Result<usize, otter_gc::OutOfMemory> {
+    let child_raw = value.as_gc_raw();
+    let target_len = len(arr, heap).saturating_add(1);
+    reserve_for_target_len(arr, heap, target_len)?;
+    let new_len = heap.with_payload(arr, |body| {
+        body.elements
+            .reserve_exact(target_len.saturating_sub(body.elements.len()));
         body.elements.push(value);
         body.elements.len()
+    });
+    if let Some(child) = child_raw {
+        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
     }
+    Ok(new_len)
+}
 
-    /// Pop from the tail (used by `Array.prototype.pop` in slice
-    /// 21). Returns `Value::Undefined` for an empty array.
-    pub fn pop(&self) -> Value {
-        self.inner
-            .borrow_mut()
-            .elements
-            .pop()
-            .unwrap_or(Value::Undefined)
+/// Pop from the tail. Returns `Value::Undefined` for an empty array.
+#[must_use]
+pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
+    heap.with_payload(arr, |body| body.elements.pop().unwrap_or(Value::Undefined))
+}
+
+/// Set a string-keyed own property. Numeric strings route into dense
+/// indexed storage.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if numeric-index growth would
+/// exceed the configured heap cap.
+pub fn set_named_property(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    value: Value,
+) -> Result<(), otter_gc::OutOfMemory> {
+    if let Ok(idx) = key.parse::<usize>() {
+        return set(arr, heap, idx, value);
     }
-
-    /// Set a string-keyed own property. Used for tagged-template
-    /// `strings.raw` and rare `arr.namedProp = …` assignments.
-    /// Numeric strings (`"0"`, `"1"`, …) are routed back into the
-    /// indexed-element storage so `arr["0"] = x` matches `arr[0] = x`.
-    pub fn set_named_property(&self, key: &str, value: Value) {
-        if let Ok(idx) = key.parse::<usize>() {
-            self.set(idx, value);
-            return;
-        }
-        let mut body = self.inner.borrow_mut();
-        let map = body
-            .named_properties
-            .get_or_insert_with(std::collections::HashMap::new);
+    let child_raw = value.as_gc_raw();
+    heap.with_payload(arr, |body| {
+        let map = body.named_properties.get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), value);
+    });
+    if let Some(child) = child_raw {
+        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
     }
+    Ok(())
+}
 
-    /// Read a string-keyed own property. Numeric strings route to
-    /// indexed elements; `length` returns the array length.
-    /// Returns `None` for missing names.
-    #[must_use]
-    pub fn get_named_property(&self, key: &str) -> Option<Value> {
-        if key == "length" {
-            return Some(Value::Number(crate::number::NumberValue::from_i32(
-                self.len() as i32,
-            )));
-        }
-        if let Ok(idx) = key.parse::<usize>() {
-            return if idx < self.len() {
-                Some(self.get(idx))
-            } else {
-                None
-            };
-        }
-        self.inner
-            .borrow()
-            .named_properties
+/// Read a string-keyed own property. Numeric strings route to indexed
+/// elements; `length` returns the array length.
+#[must_use]
+pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
+    if key == "length" {
+        return Some(Value::Number(crate::number::NumberValue::from_i32(
+            len(arr, heap) as i32,
+        )));
+    }
+    if let Ok(idx) = key.parse::<usize>() {
+        return if idx < len(arr, heap) {
+            Some(get(arr, heap, idx))
+        } else {
+            None
+        };
+    }
+    heap.read_payload(arr, |body| {
+        body.named_properties
             .as_ref()
             .and_then(|m| m.get(key).cloned())
+    })
+}
+
+/// Read-only access to dense elements for call sites that need to
+/// derive an aggregate result without exposing the body borrow.
+pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[Value]) -> R) -> R {
+    heap.read_payload(arr, |body| f(&body.elements))
+}
+
+/// Mutable access to dense elements for in-place rewrites that do not
+/// grow capacity.
+pub fn with_elements_mut<R>(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    f: impl FnOnce(&mut SmallVec<[Value; 4]>) -> R,
+) -> R {
+    heap.with_payload(arr, |body| f(&mut body.elements))
+}
+
+/// Identity comparison.
+#[must_use]
+pub fn ptr_eq(a: JsArray, b: JsArray) -> bool {
+    a == b
+}
+
+/// Stable identity token for hash tables that still key object-like
+/// values by address. Once Map/Set migrate in task 79 this can become
+/// a `Gc`-native key instead of a pointer-shaped token.
+#[must_use]
+pub fn identity_addr(arr: JsArray) -> *const () {
+    (arr.offset() as usize) as *const ()
+}
+
+fn reserve_elements_for_len(
+    body: &mut ArrayBody,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+) -> Result<(), otter_gc::OutOfMemory> {
+    if target_len <= body.elements.capacity() {
+        return Ok(());
     }
 
-    /// Borrow the underlying storage read-only.
-    #[must_use]
-    pub fn borrow_body(&self) -> Ref<'_, ArrayBody> {
-        self.inner.borrow()
+    let before = spilled_capacity_bytes(body.elements.capacity());
+    let after = spilled_capacity_bytes(target_len);
+    if after > before {
+        heap.reserve_bytes((after - before) as u64)?;
+    }
+    body.elements
+        .reserve_exact(target_len.saturating_sub(body.elements.len()));
+    Ok(())
+}
+
+fn reserve_for_target_len(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let current_capacity = heap.read_payload(arr, |body| body.elements.capacity());
+    if target_len <= current_capacity {
+        return Ok(());
     }
 
-    /// Mutable borrow of the underlying storage. Discouraged
-    /// outside the VM core.
-    #[must_use]
-    pub fn borrow_body_mut(&self) -> RefMut<'_, ArrayBody> {
-        self.inner.borrow_mut()
+    let before = spilled_capacity_bytes(current_capacity);
+    let after = spilled_capacity_bytes(target_len);
+    if after > before {
+        heap.reserve_bytes((after - before) as u64)?;
     }
+    // The actual reserve is performed under `with_payload` after the
+    // cap check succeeds; keep this helper allocation-free.
+    Ok(())
+}
 
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
-    }
-
-    /// Raw `Rc` data-pointer for cycle-detection identity sets.
-    /// See [`crate::object::JsObject::identity_addr`] for caveats.
-    #[must_use]
-    pub fn identity_addr(&self) -> *const () {
-        Rc::as_ptr(&self.inner).cast()
+fn spilled_capacity_bytes(capacity: usize) -> usize {
+    let inline = 4;
+    if capacity <= inline {
+        0
+    } else {
+        capacity.saturating_mul(mem::size_of::<Value>())
     }
 }
 
-impl Default for JsArray {
-    fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(ArrayBody::default())),
-        }
-    }
+fn array_payload_slot(arr: JsArray) -> *mut otter_gc::RawGc {
+    (arr.as_header_ptr() as *mut u8).wrapping_add(mem::size_of::<otter_gc::GcHeader>())
+        as *mut otter_gc::RawGc
 }
 
 impl ArrayBody {
@@ -216,48 +317,61 @@ impl ArrayBody {
 mod tests {
     use super::*;
 
+    fn fresh_heap() -> otter_gc::GcHeap {
+        otter_gc::GcHeap::new().expect("gc heap")
+    }
+
     #[test]
     fn literal_constructor() {
-        let a = JsArray::from_elements([Value::Boolean(true), Value::Null, Value::Boolean(false)]);
-        assert_eq!(a.len(), 3);
-        assert_eq!(a.get(0), Value::Boolean(true));
-        assert_eq!(a.get(1), Value::Null);
-        assert_eq!(a.get(2), Value::Boolean(false));
+        let mut heap = fresh_heap();
+        let a = from_elements(
+            &mut heap,
+            [Value::Boolean(true), Value::Null, Value::Boolean(false)],
+        )
+        .unwrap();
+        assert_eq!(len(a, &heap), 3);
+        assert_eq!(get(a, &heap, 0), Value::Boolean(true));
+        assert_eq!(get(a, &heap, 1), Value::Null);
+        assert_eq!(get(a, &heap, 2), Value::Boolean(false));
     }
 
     #[test]
     fn out_of_range_read_is_undefined() {
-        let a = JsArray::new();
-        assert_eq!(a.get(0), Value::Undefined);
+        let mut heap = fresh_heap();
+        let a = alloc_array(&mut heap).unwrap();
+        assert_eq!(get(a, &heap, 0), Value::Undefined);
     }
 
     #[test]
     fn out_of_range_write_extends_with_undefined() {
-        let a = JsArray::new();
-        a.set(2, Value::Boolean(true));
-        assert_eq!(a.len(), 3);
-        assert_eq!(a.get(0), Value::Undefined);
-        assert_eq!(a.get(1), Value::Undefined);
-        assert_eq!(a.get(2), Value::Boolean(true));
+        let mut heap = fresh_heap();
+        let a = alloc_array(&mut heap).unwrap();
+        set(a, &mut heap, 2, Value::Boolean(true)).unwrap();
+        assert_eq!(len(a, &heap), 3);
+        assert_eq!(get(a, &heap, 0), Value::Undefined);
+        assert_eq!(get(a, &heap, 1), Value::Undefined);
+        assert_eq!(get(a, &heap, 2), Value::Boolean(true));
     }
 
     #[test]
     fn push_and_pop() {
-        let a = JsArray::new();
-        assert_eq!(a.push(Value::Boolean(true)), 1);
-        assert_eq!(a.push(Value::Null), 2);
-        assert_eq!(a.pop(), Value::Null);
-        assert_eq!(a.pop(), Value::Boolean(true));
-        assert_eq!(a.pop(), Value::Undefined);
-        assert!(a.is_empty());
+        let mut heap = fresh_heap();
+        let a = alloc_array(&mut heap).unwrap();
+        assert_eq!(push(a, &mut heap, Value::Boolean(true)).unwrap(), 1);
+        assert_eq!(push(a, &mut heap, Value::Null).unwrap(), 2);
+        assert_eq!(pop(a, &mut heap), Value::Null);
+        assert_eq!(pop(a, &mut heap), Value::Boolean(true));
+        assert_eq!(pop(a, &mut heap), Value::Undefined);
+        assert!(is_empty(a, &heap));
     }
 
     #[test]
-    fn cloning_shares_storage() {
-        let a = JsArray::new();
-        let b = a.clone();
-        a.push(Value::Boolean(true));
-        assert!(a.ptr_eq(&b));
-        assert_eq!(b.len(), 1);
+    fn copying_handle_shares_storage() {
+        let mut heap = fresh_heap();
+        let a = alloc_array(&mut heap).unwrap();
+        let b = a;
+        push(a, &mut heap, Value::Boolean(true)).unwrap();
+        assert!(ptr_eq(a, b));
+        assert_eq!(get(b, &heap, 0), Value::Boolean(true));
     }
 }

@@ -137,7 +137,7 @@ fn impl_segment(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         elements.push(Value::Object(obj));
     }
-    Ok(Value::Array(crate::array::JsArray::from_elements(elements)))
+    Ok(Value::Array(crate::array::from_elements(*heap, elements)?))
 }
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

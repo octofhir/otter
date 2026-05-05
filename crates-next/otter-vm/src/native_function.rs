@@ -120,6 +120,15 @@ pub enum NativeError {
     },
 }
 
+impl From<otter_gc::OutOfMemory> for NativeError {
+    fn from(_: otter_gc::OutOfMemory) -> Self {
+        Self::TypeError {
+            name: "native",
+            reason: "out of memory".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,8 +5,8 @@
 //!
 //! Other engines pick one of two designs:
 //!
-//! - **Single deque under interior mutability** (V8, JSC, original
-//!   Bun draft) — single-thread by language spec; interior cell is
+//! - **Single deque under interior mutability** (common JS engine design) —
+//!   single-thread by language spec; interior cell is
 //!   not a problem because no other thread can touch it. Cheap, but
 //!   leaves no door open for cross-thread async-runtime callbacks.
 //! - **MPSC channel into the runtime thread** (Tokio, Deno bridge
@@ -36,9 +36,8 @@
 //!
 //! - **Swap-and-drain** with `mem::take`: tasks enqueued *during* a
 //!   drain go on the next generation. Each generation runs to
-//!   completion before the next. This matches JSC's
-//!   `drainMicrotasks()` and Bun's reused-buffer pattern but
-//!   skips the interior-mutability cost.
+//!   completion before the next. This matches reused-buffer engine
+//!   patterns while skipping the interior-mutability cost.
 //! - **Reentrant `drain_depth`**: nested `drain_microtasks()` calls
 //!   from inside a microtask are no-ops — the outermost drain
 //!   absorbs all pending work.
@@ -194,8 +193,8 @@ pub enum MicrotaskError {
 ///
 /// # Why a trait, not a concrete struct
 ///
-/// 1. Most embedders that aren't Bun-style standalone runtimes
-///    already have their own Tokio runtime; they want the VM to
+/// 1. Most embedders already have their own Tokio runtime; they want
+///    the VM to
 ///    plug into theirs, not start a second one.
 /// 2. Tests can mock the trait without standing up Tokio.
 /// 3. Different platforms (wasm32-wasi, no-std hosts) substitute

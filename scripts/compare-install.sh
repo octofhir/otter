@@ -156,7 +156,7 @@ run_time "otter_time_warm" otter install
 layout_stats "otter_layout" "$PROJECT_DIR/node_modules"
 run_warm_loop "otter_warm_runs" otter install
 
-# Bun: cold then warm
+# Alternate package manager: cold then warm
 rm -rf node_modules bun.lock bun.lockb
 run_time "bun_time_cold" bun install
 rm -rf node_modules
@@ -177,7 +177,7 @@ trace_fs_usage() {
   echo "match: $match" | tee -a "$cmd_log"
   echo "cmd: $*" | tee -a "$cmd_log"
 
-  # For very fast commands (bun can be ~20ms), starting fs_usage and then running a single install
+  # For very fast commands, starting fs_usage and then running a single install
   # often misses the window. We run multiple installs while fs_usage is collecting.
   local runs="$TRACE_INSTALL_RUNS"
   if [[ "$runs" -le 0 ]]; then
@@ -187,7 +187,7 @@ trace_fs_usage() {
 
   # Capture only filesys+pathname activity. Process filtering by name is unreliable for very short-lived
   # processes on some setups, so we capture system-wide and then post-filter by the final "proc.tid"
-  # column (works for processes without spaces like "otter" and "bun").
+  # column (works for process names without spaces).
   sudo fs_usage -w -f filesys -f pathname -t "$TRACE_SECONDS" >"$raw" 2>&1 &
   local fs_pid=$!
 

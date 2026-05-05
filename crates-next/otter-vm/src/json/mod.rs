@@ -111,6 +111,15 @@ impl From<crate::string::StringError> for JsonError {
     }
 }
 
+impl From<otter_gc::OutOfMemory> for JsonError {
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
+        }
+    }
+}
+
 impl From<ParseError> for JsonError {
     fn from(err: ParseError) -> Self {
         Self::ParseFailed {
@@ -228,8 +237,8 @@ mod tests {
         let v = parse("{\"x\":[1,2,3]}", &sheap, &mut heap).unwrap();
         if let Value::Object(o) = v {
             if let Some(Value::Array(arr)) = crate::object::get(o, &heap, "x") {
-                assert_eq!(arr.len(), 3);
-                assert_eq!(arr.get(1).display_string(), "2");
+                assert_eq!(crate::array::len(arr, &heap), 3);
+                assert_eq!(crate::array::get(arr, &heap, 1).display_string(), "2");
             } else {
                 panic!("expected x: array");
             }

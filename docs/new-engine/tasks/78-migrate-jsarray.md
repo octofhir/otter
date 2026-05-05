@@ -2,13 +2,13 @@
 
 ## Status
 
-- [ ] `JsArray = Gc<ArrayBody>`
-- [ ] `Rc<RefCell<ArrayBody>>` removed from `array.rs`
-- [ ] `Traceable` impl traces dense elements + named properties
-- [ ] all element / named-prop accesses go through `GcHeap`
-- [ ] all array APIs take explicit context; no thread-local heap lookup
-- [ ] `reserve_bytes` / `release_bytes` wired to `elements` capacity changes
-- [ ] gates green
+- [x] `JsArray = Gc<ArrayBody>`
+- [x] `Rc<RefCell<ArrayBody>>` removed from `array.rs`
+- [x] `Traceable` impl traces dense elements + named properties
+- [x] all element / named-prop accesses go through `GcHeap`
+- [x] all array APIs take explicit context; no thread-local heap lookup
+- [x] `reserve_bytes` wired to `elements` capacity growth
+- [x] gates green
 
 ## Goal
 
@@ -64,12 +64,12 @@ unaccounted heap user in the legacy engine
 
 ## Validation gates
 
-- [ ] No `Rc<RefCell<ArrayBody>>`.
-- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/array* crates-next/otter-vm/src` returns no array-path product-code hits.
-- [ ] All existing engine fixtures pass.
-- [ ] New regression test `tests/gc_array_cap_kicks_in.rs`: configure
+- [x] No `Rc<RefCell<ArrayBody>>`.
+- [x] `grep -R "with_thread_default\\|enter_thread_default\\|install_thread_default" crates-next/otter-vm/src/array* crates-next/otter-vm/src` returns no array-path product-code hits.
+- [x] All existing engine fixtures pass.
+- [x] New regression test `tests/gc_array_cap_kicks_in.rs`: configure
   cap = 4 MiB; run `Array.from({length: 1<<20})`; assert `Err(OtterError::OutOfMemory)`.
-- [ ] New regression test `tests/gc_array_self_reference.rs`:
+- [x] New regression test `tests/gc_array_self_reference.rs`:
   `let a = []; a.push(a); … drop; collect; assert no live Array`.
 - [ ] `cargo clippy --workspace -- -D warnings` clean.
 

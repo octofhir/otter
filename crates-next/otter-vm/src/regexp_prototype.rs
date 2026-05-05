@@ -132,13 +132,15 @@ pub(crate) fn build_match_result(
             None => out.push(Value::Undefined),
         }
     }
-    let arr = JsArray::from_elements(out);
+    let arr = crate::array::from_elements(gc_heap, out)?;
 
-    arr.set_named_property(
+    crate::array::set_named_property(
+        arr,
+        gc_heap,
         "index",
         Value::Number(NumberValue::from_i32(m.range.start as i32)),
-    );
-    arr.set_named_property("input", Value::String(input.clone()));
+    )?;
+    crate::array::set_named_property(arr, gc_heap, "input", Value::String(input.clone()))?;
 
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
@@ -157,54 +159,61 @@ pub(crate) fn build_match_result(
             };
             crate::object::set(groups_obj, gc_heap, name, value);
         }
-        arr.set_named_property("groups", Value::Object(groups_obj));
+        crate::array::set_named_property(arr, gc_heap, "groups", Value::Object(groups_obj))?;
     } else {
-        arr.set_named_property("groups", Value::Undefined);
+        crate::array::set_named_property(arr, gc_heap, "groups", Value::Undefined)?;
     }
 
     if has_indices {
         let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-        indices_elems.push(pair_array(m.range.start, m.range.end));
+        indices_elems.push(pair_array(m.range.start, m.range.end, gc_heap)?);
         for cap in &m.captures {
             match cap {
-                Some(r) => indices_elems.push(pair_array(r.start, r.end)),
+                Some(r) => indices_elems.push(pair_array(r.start, r.end, gc_heap)?),
                 None => indices_elems.push(Value::Undefined),
             }
         }
-        let indices_arr = JsArray::from_elements(indices_elems);
+        let indices_arr = crate::array::from_elements(gc_heap, indices_elems)?;
         let mut named_iter = m.named_groups();
         let first_named = named_iter.next();
         if let Some((name, range)) = first_named {
             let g_obj = crate::object::alloc_object(gc_heap)?;
             crate::object::set_prototype(g_obj, gc_heap, None);
             let v = match range {
-                Some(r) => pair_array(r.start, r.end),
+                Some(r) => pair_array(r.start, r.end, gc_heap)?,
                 None => Value::Undefined,
             };
             crate::object::set(g_obj, gc_heap, name, v);
             for (name, range) in named_iter {
                 let v = match range {
-                    Some(r) => pair_array(r.start, r.end),
+                    Some(r) => pair_array(r.start, r.end, gc_heap)?,
                     None => Value::Undefined,
                 };
                 crate::object::set(g_obj, gc_heap, name, v);
             }
-            indices_arr.set_named_property("groups", Value::Object(g_obj));
+            crate::array::set_named_property(indices_arr, gc_heap, "groups", Value::Object(g_obj))?;
         } else {
-            indices_arr.set_named_property("groups", Value::Undefined);
+            crate::array::set_named_property(indices_arr, gc_heap, "groups", Value::Undefined)?;
         }
-        arr.set_named_property("indices", Value::Array(indices_arr));
+        crate::array::set_named_property(arr, gc_heap, "indices", Value::Array(indices_arr))?;
     }
     Ok(arr)
 }
 
 /// Build a `[start, end]` two-element array used by the `d`-flag
 /// indices companion (§22.2.7.7).
-fn pair_array(start: usize, end: usize) -> Value {
-    Value::Array(JsArray::from_elements([
-        Value::Number(NumberValue::from_i32(start as i32)),
-        Value::Number(NumberValue::from_i32(end as i32)),
-    ]))
+fn pair_array(
+    start: usize,
+    end: usize,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    Ok(Value::Array(crate::array::from_elements(
+        gc_heap,
+        [
+            Value::Number(NumberValue::from_i32(start as i32)),
+            Value::Number(NumberValue::from_i32(end as i32)),
+        ],
+    )?))
 }
 
 fn impl_exec(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -308,15 +317,14 @@ mod tests {
         Value::RegExp(JsRegExp::compile(&units, flags).unwrap())
     }
 
-    fn call(method: &str, recv: &Value, args: &[Value]) -> Value {
+    fn call(method: &str, recv: &Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
         let heap = StringHeap::default();
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = lookup(method).unwrap();
         (entry.impl_fn)(&IntrinsicArgs {
             receiver: recv,
             args,
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: std::cell::RefCell::new(gc_heap),
         })
         .unwrap()
     }
@@ -324,25 +332,33 @@ mod tests {
     #[test]
     fn test_returns_boolean() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("ab+c", "");
         let text = Value::String(JsString::from_str("abbbc", &heap).unwrap());
-        assert_eq!(call("test", &re, &[text]), Value::Boolean(true));
+        assert_eq!(
+            call("test", &re, &[text], &mut gc_heap),
+            Value::Boolean(true)
+        );
         let no = Value::String(JsString::from_str("xy", &heap).unwrap());
-        assert_eq!(call("test", &re, &[no]), Value::Boolean(false));
+        assert_eq!(
+            call("test", &re, &[no], &mut gc_heap),
+            Value::Boolean(false)
+        );
     }
 
     #[test]
     fn exec_returns_array_or_null() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("(a)(b)", "");
         let text = Value::String(JsString::from_str("ab", &heap).unwrap());
-        let r = call("exec", &re, &[text]);
+        let r = call("exec", &re, &[text], &mut gc_heap);
         match r {
             Value::Array(arr) => {
-                assert_eq!(arr.len(), 3);
-                assert_eq!(arr.get(0).display_string(), "ab");
-                assert_eq!(arr.get(1).display_string(), "a");
-                assert_eq!(arr.get(2).display_string(), "b");
+                assert_eq!(crate::array::len(arr, &gc_heap), 3);
+                assert_eq!(crate::array::get(arr, &gc_heap, 0).display_string(), "ab");
+                assert_eq!(crate::array::get(arr, &gc_heap, 1).display_string(), "a");
+                assert_eq!(crate::array::get(arr, &gc_heap, 2).display_string(), "b");
             }
             _ => panic!("expected array"),
         }
@@ -350,6 +366,7 @@ mod tests {
             "exec",
             &re,
             &[Value::String(JsString::from_str("zz", &heap).unwrap())],
+            &mut gc_heap,
         );
         assert_eq!(miss, Value::Null);
     }
@@ -357,24 +374,25 @@ mod tests {
     #[test]
     fn exec_global_walks_through_text() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("a", "g");
         let text = Value::String(JsString::from_str("abab", &heap).unwrap());
         // First call → match at 0, lastIndex moves to 1.
-        let r1 = call("exec", &re, std::slice::from_ref(&text));
+        let r1 = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         match (&r1, &re) {
             (Value::Array(arr), Value::RegExp(rx)) => {
-                assert_eq!(arr.get(0).display_string(), "a");
+                assert_eq!(crate::array::get(*arr, &gc_heap, 0).display_string(), "a");
                 assert_eq!(rx.last_index(), 1);
             }
             _ => panic!(),
         }
         // Second call → match at 2, lastIndex → 3.
-        call("exec", &re, std::slice::from_ref(&text));
+        call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         if let Value::RegExp(rx) = &re {
             assert_eq!(rx.last_index(), 3);
         }
         // Third call → no match, lastIndex → 0.
-        let r3 = call("exec", &re, &[text]);
+        let r3 = call("exec", &re, &[text], &mut gc_heap);
         assert_eq!(r3, Value::Null);
         if let Value::RegExp(rx) = &re {
             assert_eq!(rx.last_index(), 0);

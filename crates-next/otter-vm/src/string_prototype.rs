@@ -34,7 +34,6 @@
 //!   )
 
 use crate::Value;
-use crate::array::JsArray;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
 use crate::regexp::JsRegExp;
@@ -670,15 +669,18 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     // Regex separator → defer to the dedicated walker.
     if let Some(Value::RegExp(re)) = args.args.first() {
         let limit = parse_split_limit(args)?;
-        return regex_split(recv, re, limit, args.string_heap);
+        let mut heap = args.gc_heap.borrow_mut();
+        return regex_split(recv, re, limit, args.string_heap, *heap);
     }
 
     // Resolve separator: missing or `undefined` → caller-as-only-element.
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => {
-            return Ok(Value::Array(JsArray::from_elements([Value::String(
-                recv.clone(),
-            )])));
+            let mut heap = args.gc_heap.borrow_mut();
+            return Ok(Value::Array(crate::array::from_elements(
+                *heap,
+                [Value::String(recv.clone())],
+            )?));
         }
         Some(Value::String(s)) => s,
         Some(_) => {
@@ -691,7 +693,8 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
     let limit = parse_split_limit(args)?;
     if limit == 0 {
-        return Ok(Value::Array(JsArray::new()));
+        let mut heap = args.gc_heap.borrow_mut();
+        return Ok(Value::Array(crate::array::alloc_array(*heap)?));
     }
 
     let recv_units = recv.to_utf16_vec();
@@ -706,7 +709,8 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 args.string_heap,
             )?));
         }
-        return Ok(Value::Array(JsArray::from_elements(out)));
+        let mut heap = args.gc_heap.borrow_mut();
+        return Ok(Value::Array(crate::array::from_elements(*heap, out)?));
     }
 
     let mut out: Vec<Value> = Vec::new();
@@ -725,7 +729,8 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let part = JsString::from_utf16_units(&recv_units[start..], args.string_heap)?;
         out.push(Value::String(part));
     }
-    Ok(Value::Array(JsArray::from_elements(out)))
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(Value::Array(crate::array::from_elements(*heap, out)?))
 }
 
 /// Common limit-arg parser shared by string-separator and
@@ -783,9 +788,10 @@ fn regex_split(
     re: &JsRegExp,
     limit: u32,
     string_heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, IntrinsicError> {
     if limit == 0 {
-        return Ok(Value::Array(JsArray::new()));
+        return Ok(Value::Array(crate::array::alloc_array(gc_heap)?));
     }
     let recv_units = recv.to_utf16_vec();
     let mut out: Vec<Value> = Vec::new();
@@ -817,7 +823,7 @@ fn regex_split(
         let part = JsString::from_utf16_units(&recv_units[cursor..], string_heap)?;
         out.push(Value::String(part));
     }
-    Ok(Value::Array(JsArray::from_elements(out)))
+    Ok(Value::Array(crate::array::from_elements(gc_heap, out)?))
 }
 
 /// §7.2.8 [`IsRegExp`](https://tc39.es/ecma262/#sec-isregexp): the
@@ -876,7 +882,8 @@ fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let s = JsString::from_utf16_units(&recv_units[m.range.clone()], args.string_heap)?;
             out.push(Value::String(s));
         }
-        return Ok(Value::Array(JsArray::from_elements(out)));
+        let mut heap = args.gc_heap.borrow_mut();
+        return Ok(Value::Array(crate::array::from_elements(*heap, out)?));
     }
     // Non-global → mirror `RegExp.prototype.exec` (carries
     // `index` / `input` / `groups` per §22.2.7.2).
@@ -940,7 +947,7 @@ fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         )?;
         out.push(Value::Array(arr));
     }
-    Ok(Value::Array(JsArray::from_elements(out)))
+    Ok(Value::Array(crate::array::from_elements(*heap, out)?))
 }
 
 fn impl_search(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -1200,20 +1207,30 @@ mod tests {
     fn call_v(method: &str, recv: &str, args: &[A]) -> Value {
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        call_v_with_heap(method, recv, args, &heap, &mut gc_heap)
+    }
+
+    fn call_v_with_heap(
+        method: &str,
+        recv: &str,
+        args: &[A],
+        heap: &StringHeap,
+        gc_heap: &mut otter_gc::GcHeap,
+    ) -> Value {
         let recv_v = Value::String(JsString::from_str(recv, &heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|a| match a {
                 A::N(n) => Value::Number(NumberValue::from_i32(*n)),
-                A::S(s) => Value::String(JsString::from_str(s, &heap).unwrap()),
+                A::S(s) => Value::String(JsString::from_str(s, heap).unwrap()),
             })
             .collect();
         let entry = lookup(method).unwrap();
         (entry.impl_fn)(&IntrinsicArgs {
             receiver: &recv_v,
             args: &arg_vs,
-            string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            string_heap: heap,
+            gc_heap: std::cell::RefCell::new(gc_heap),
         })
         .unwrap()
     }
@@ -1419,13 +1436,15 @@ mod tests {
 
     #[test]
     fn split_basic() {
-        let v = call_v("split", "a,b,c", &[A::S(",")]);
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = call_v_with_heap("split", "a,b,c", &[A::S(",")], &heap, &mut gc_heap);
         match v {
             Value::Array(a) => {
-                assert_eq!(a.len(), 3);
-                assert_eq!(a.get(0).display_string(), "a");
-                assert_eq!(a.get(1).display_string(), "b");
-                assert_eq!(a.get(2).display_string(), "c");
+                assert_eq!(crate::array::len(a, &gc_heap), 3);
+                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
+                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "b");
+                assert_eq!(crate::array::get(a, &gc_heap, 2).display_string(), "c");
             }
             _ => panic!("expected array"),
         }
@@ -1433,13 +1452,15 @@ mod tests {
 
     #[test]
     fn split_consecutive_separators_yield_empty_chunks() {
-        let v = call_v("split", "a,,b", &[A::S(",")]);
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = call_v_with_heap("split", "a,,b", &[A::S(",")], &heap, &mut gc_heap);
         match v {
             Value::Array(a) => {
-                assert_eq!(a.len(), 3);
-                assert_eq!(a.get(0).display_string(), "a");
-                assert_eq!(a.get(1).display_string(), "");
-                assert_eq!(a.get(2).display_string(), "b");
+                assert_eq!(crate::array::len(a, &gc_heap), 3);
+                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
+                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "");
+                assert_eq!(crate::array::get(a, &gc_heap, 2).display_string(), "b");
             }
             _ => panic!("expected array"),
         }
@@ -1447,13 +1468,15 @@ mod tests {
 
     #[test]
     fn split_empty_separator_yields_code_units() {
-        let v = call_v("split", "abc", &[A::S("")]);
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = call_v_with_heap("split", "abc", &[A::S("")], &heap, &mut gc_heap);
         match v {
             Value::Array(a) => {
-                assert_eq!(a.len(), 3);
-                assert_eq!(a.get(0).display_string(), "a");
-                assert_eq!(a.get(1).display_string(), "b");
-                assert_eq!(a.get(2).display_string(), "c");
+                assert_eq!(crate::array::len(a, &gc_heap), 3);
+                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
+                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "b");
+                assert_eq!(crate::array::get(a, &gc_heap, 2).display_string(), "c");
             }
             _ => panic!("expected array"),
         }
@@ -1461,12 +1484,20 @@ mod tests {
 
     #[test]
     fn split_with_limit() {
-        let v = call_v("split", "a,b,c,d", &[A::S(","), A::N(2)]);
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = call_v_with_heap(
+            "split",
+            "a,b,c,d",
+            &[A::S(","), A::N(2)],
+            &heap,
+            &mut gc_heap,
+        );
         match v {
             Value::Array(a) => {
-                assert_eq!(a.len(), 2);
-                assert_eq!(a.get(0).display_string(), "a");
-                assert_eq!(a.get(1).display_string(), "b");
+                assert_eq!(crate::array::len(a, &gc_heap), 2);
+                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
+                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "b");
             }
             _ => panic!("expected array"),
         }
@@ -1474,11 +1505,13 @@ mod tests {
 
     #[test]
     fn split_no_match_returns_singleton() {
-        let v = call_v("split", "abc", &[A::S(",")]);
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = call_v_with_heap("split", "abc", &[A::S(",")], &heap, &mut gc_heap);
         match v {
             Value::Array(a) => {
-                assert_eq!(a.len(), 1);
-                assert_eq!(a.get(0).display_string(), "abc");
+                assert_eq!(crate::array::len(a, &gc_heap), 1);
+                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "abc");
             }
             _ => panic!("expected array"),
         }
@@ -1487,18 +1520,20 @@ mod tests {
     #[test]
     fn split_empty_receiver() {
         // "".split(",") === [""]
-        let v = call_v("split", "", &[A::S(",")]);
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = call_v_with_heap("split", "", &[A::S(",")], &heap, &mut gc_heap);
         match v {
             Value::Array(a) => {
-                assert_eq!(a.len(), 1);
-                assert_eq!(a.get(0).display_string(), "");
+                assert_eq!(crate::array::len(a, &gc_heap), 1);
+                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "");
             }
             _ => panic!("expected array"),
         }
         // "".split("") === []
-        let v2 = call_v("split", "", &[A::S("")]);
+        let v2 = call_v_with_heap("split", "", &[A::S("")], &heap, &mut gc_heap);
         match v2 {
-            Value::Array(a) => assert_eq!(a.len(), 0),
+            Value::Array(a) => assert_eq!(crate::array::len(a, &gc_heap), 0),
             _ => panic!("expected array"),
         }
     }
@@ -1519,8 +1554,8 @@ mod tests {
         .unwrap();
         match r {
             Value::Array(a) => {
-                assert_eq!(a.len(), 1);
-                assert_eq!(a.get(0).display_string(), "abc");
+                assert_eq!(crate::array::len(a, &gc_heap), 1);
+                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "abc");
             }
             _ => panic!("expected array"),
         }

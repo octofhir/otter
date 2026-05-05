@@ -140,9 +140,10 @@ fn impl_format_to_parts(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let part = crate::object::alloc_object(*heap)?;
     crate::object::set(part, *heap, "type", literal);
     crate::object::set(part, *heap, "value", s);
-    Ok(Value::Array(crate::array::JsArray::from_elements([
-        Value::Object(part),
-    ])))
+    Ok(Value::Array(crate::array::from_elements(
+        *heap,
+        [Value::Object(part)],
+    )?))
 }
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

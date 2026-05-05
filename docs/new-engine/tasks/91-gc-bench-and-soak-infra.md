@@ -7,6 +7,8 @@
 - [ ] 24 h soak-test runner script
 - [ ] miri / asan / lsan / tsan CI jobs
 - [ ] V8-parity benchmark suite
+- [ ] allocator/backing-store benchmark matrix inspired by Oscars'
+      workload comparisons
 - [ ] runtime-handle leak / stress diagnostics integrated with GC soak
 - [ ] gates green
 
@@ -33,6 +35,11 @@ migration can capture its perf delta; some pieces (soak runner,
 
 [`docs/new-engine/gc-architecture.md`](../gc-architecture.md) §1.2
 (NF1, NF2, NF7, NF8, NF10), §7 (diagnostic surface).
+Research input: Boa Oscars' allocator experiments are useful as a
+benchmark taxonomy, not as a backend swap. Copy the workload categories
+(allocation pressure, mixed graph, vector/backing-store churn, memory
+pressure, weak-map churn) and measure them against Otter's page heap,
+Node/V8, and previous Otter baselines.
 
 ## Scope
 
@@ -48,6 +55,8 @@ crates-next/otter-gc/benches/bench_collect_full_1gb.rs
 crates-next/otter-gc/benches/bench_card_table_dirty_scan.rs
 crates-next/otter-gc/benches/bench_handle_scope_overhead.rs
 crates-next/otter-gc/benches/bench_pointer_compress_decompress.rs
+crates-next/otter-gc/benches/bench_backing_store_accounting.rs
+crates-next/otter-gc/benches/bench_weakmap_churn.rs
 ```
 
 Each bench produces a stable number; results are checked into
@@ -105,7 +114,32 @@ JS programs run **both** under Otter and under Node.js LTS:
 Runner reports Otter time / Node time ratio. Gates per
 architecture doc §1.2 NF10.
 
-### 91.6 — Runtime-handle leak and stress diagnostics
+### 91.6 — Oscars-style allocator / backing-store matrix
+
+Add workload benches that answer allocator questions before changing
+the allocator:
+
+- **vector/backing-store churn:** grow/shrink arrays, strings, typed
+  arrays when available, and map/set buckets; verify exact
+  `reserve_bytes` / `release_bytes` accounting tracks RSS-relevant
+  capacity, not only GC headers.
+- **mixed object graph:** allocate objects with nested arrays/maps and
+  measure total time, GC time, promoted bytes, and peak RSS.
+- **memory pressure:** run under low `max_heap_bytes`; assert catchable
+  OOM, emergency full-GC recovery, and no process abort.
+- **deep graph:** long prototype/closure/list chains to catch recursive
+  trace stack overflow and retained-size walker blowups.
+- **weak-map churn:** repeated set/replace/delete/drop-key/drop-map
+  cycles to catch stale ephemeron metadata and weak registry leaks.
+- **old-to-young mutation storm:** steady-state old object stores young
+  values; validates card-table dirty-card scanning and barrier cost.
+
+Do **not** adopt Oscars' `Collector: Allocator` direction for Otter's
+object heap. If the numbers show allocator pressure, prefer
+heap-accounted backing-store arenas / size classes for off-object
+buffers while preserving the moving young generation.
+
+### 91.7 — Runtime-handle leak and stress diagnostics
 
 Add reusable test utilities for task 85 and later server surfaces:
 
@@ -127,7 +161,9 @@ Add reusable test utilities for task 85 and later server surfaces:
   RSS drift, zero panics.
 - [ ] 91.4 CI workflow merged and green.
 - [ ] 91.5 V8-parity numbers checked into baseline.
-- [ ] 91.6 stress utilities are used by task 85 validation tests.
+- [ ] 91.6 allocator/backing-store matrix has checked-in baseline
+  results and documents whether any allocator change is justified.
+- [ ] 91.7 stress utilities are used by task 85 validation tests.
 
 ## Closing
 

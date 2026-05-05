@@ -40,6 +40,7 @@ Repository rules:
 7. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
 8. **Protect the runtime boundary**: do not add dependencies from active crates into parked compatibility shims.
 9. **Prefer build-graph cleanup**: when a slice lands, check whether temporary shims, adapters, or parked code can be simplified immediately.
+10. **Use porting markers for uncertain migrations**: for substantial ports from parked shims or reference implementations, follow `docs/engine-porting-process.md` (`TODO(port)`, `PERF(port)`, `PORT NOTE`, optional `PORT STATUS`).
 
 ## Repository Map (where to change what)
 
@@ -375,7 +376,7 @@ Practical rules when adding/altering APIs:
 - VM tests: `cargo test -p otter-vm`
 - Runtime tests: `cargo test -p otter-runtime`
 - Test262 conformance: `cargo test -p otter-test262`
-- Phase-by-phase cross-runtime baseline (Otter/Node/Bun/Deno): `benchmarks/cpu/phase_baseline.sh`
+- Phase-by-phase cross-runtime baseline (Otter/Node/Deno/other runtimes): `benchmarks/cpu/phase_baseline.sh`
   - Runs Otter in release mode (`target/release/otter`) and enforces `OTTER_TIMEOUT_SECONDS <= 45` for comparability.
   - Otter perf classification in artifacts:
     - `critical-timeout` = phase hit timeout cap (`45s`)

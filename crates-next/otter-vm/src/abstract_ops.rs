@@ -589,7 +589,9 @@ mod tests {
     #[test]
     fn is_array_recognises_array_only() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        assert!(is_array(&Value::Array(crate::JsArray::new())));
+        assert!(is_array(&Value::Array(
+            crate::array::alloc_array(&mut heap).unwrap()
+        )));
         assert!(!is_array(&Value::Object(
             crate::object::alloc_object(&mut heap).unwrap()
         )));

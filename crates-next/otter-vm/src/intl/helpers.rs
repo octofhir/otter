@@ -35,10 +35,7 @@ pub fn coerce_locale(arg: Option<&Value>) -> String {
     match arg {
         None | Some(Value::Undefined) => DEFAULT_LOCALE.to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
-        Some(Value::Array(arr)) => match arr.borrow_body().elements.first() {
-            Some(Value::String(s)) => s.to_lossy_string(),
-            _ => DEFAULT_LOCALE.to_string(),
-        },
+        Some(Value::Array(_)) => DEFAULT_LOCALE.to_string(),
         _ => DEFAULT_LOCALE.to_string(),
     }
 }

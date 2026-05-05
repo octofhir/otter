@@ -420,7 +420,11 @@ impl ErrorClassRegistry {
         gc_heap: &mut otter_gc::GcHeap,
     ) -> Result<JsObject, StringError> {
         let obj = self.make_instance(ErrorKind::AggregateError, message, heap, gc_heap)?;
-        let arr = crate::array::JsArray::from_elements(errors);
+        let arr =
+            crate::array::from_elements(gc_heap, errors).map_err(|_| StringError::OutOfMemory {
+                requested_bytes: 0,
+                heap_limit_bytes: gc_heap.max_heap_bytes(),
+            })?;
         crate::object::set(obj, gc_heap, "errors", Value::Array(arr));
         Ok(obj)
     }

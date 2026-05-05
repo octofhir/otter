@@ -184,7 +184,7 @@ impl LoaderConfig {
 ///    resolver (`resolve_with_extensions`).
 /// 3. If it is an absolute filesystem path, canonicalise.
 /// 4. If it starts with `npm:`, strip the prefix and treat as
-///    a bare specifier (sugar form Deno / Bun accept).
+///    a bare specifier (common runtime sugar).
 /// 5. Otherwise (bare name, `@scope/name`, …): hand off to
 ///    [`oxc_resolver`]. The resolver walks `node_modules`
 ///    upward from the importer's directory, respects

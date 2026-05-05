@@ -25,14 +25,14 @@
 //!   are documented inline.
 
 use crate::Value;
-use crate::array::JsArray;
+use crate::array::{self, JsArray};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
 use crate::string::JsString;
 
-fn receiver_array<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsArray, IntrinsicError> {
+fn receiver_array(args: &IntrinsicArgs<'_>) -> Result<JsArray, IntrinsicError> {
     match args.receiver {
-        Value::Array(a) => Ok(a),
+        Value::Array(a) => Ok(*a),
         _ => Err(IntrinsicError::BadReceiver { expected: "array" }),
     }
 }
@@ -71,88 +71,106 @@ fn arg_signed_index(
 
 fn impl_push(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut new_len = arr.len();
+    let mut heap = args.gc_heap.borrow_mut();
+    let mut new_len = array::len(arr, &heap);
     for v in args.args {
-        new_len = arr.push(v.clone());
+        new_len = array::push(arr, &mut heap, v.clone())?;
     }
     Ok(Value::Number(NumberValue::from_i32(new_len as i32)))
 }
 
 fn impl_pop(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    Ok(arr.pop())
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(array::pop(arr, &mut heap))
 }
 
 fn impl_shift(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut body = arr.borrow_body_mut();
-    if body.elements.is_empty() {
-        return Ok(Value::Undefined);
-    }
-    Ok(body.elements.remove(0))
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(array::with_elements_mut(arr, &mut heap, |elements| {
+        if elements.is_empty() {
+            Value::Undefined
+        } else {
+            elements.remove(0)
+        }
+    }))
 }
 
 fn impl_unshift(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut body = arr.borrow_body_mut();
-    for (i, v) in args.args.iter().enumerate() {
-        body.elements.insert(i, v.clone());
-    }
+    let mut heap = args.gc_heap.borrow_mut();
+    let existing_len = array::len(arr, &heap);
+    let mut values: Vec<Value> = args.args.to_vec();
+    array::with_elements(arr, &heap, |elements| {
+        values.extend(elements.iter().cloned())
+    });
+    let replacement = array::from_elements(&mut heap, values)?;
+    let copied = array::with_elements(replacement, &heap, |elements| elements.to_vec());
+    array::with_elements_mut(arr, &mut heap, |elements| {
+        elements.clear();
+        elements.extend(copied);
+    });
     Ok(Value::Number(NumberValue::from_i32(
-        body.elements.len() as i32
+        (existing_len + args.args.len()) as i32,
     )))
 }
 
 fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let len = arr.len();
+    let mut heap = args.gc_heap.borrow_mut();
+    let len = array::len(arr, &heap);
     let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
     let end_default = len as i64;
     let end_raw = arg_signed_index(args, 1, end_default)?;
     let end = clamp_index(end_raw, len);
-    let body = arr.borrow_body();
-    let slice: Vec<Value> = if start >= end {
-        Vec::new()
-    } else {
-        body.elements[start..end].to_vec()
-    };
-    Ok(Value::Array(JsArray::from_elements(slice)))
+    let slice: Vec<Value> = array::with_elements(arr, &heap, |elements| {
+        if start >= end {
+            Vec::new()
+        } else {
+            elements[start..end].to_vec()
+        }
+    });
+    Ok(Value::Array(array::from_elements(&mut heap, slice)?))
 }
 
 fn impl_concat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
+    let mut heap = args.gc_heap.borrow_mut();
     // Spec: result starts as a copy of the receiver; for each
     // argument, if it's an array, append its elements; otherwise
     // append the value itself.
-    let mut combined: Vec<Value> = arr.borrow_body().iter().cloned().collect();
+    let mut combined: Vec<Value> = array::with_elements(arr, &heap, |elements| elements.to_vec());
     for v in args.args {
         match v {
             Value::Array(other) => {
-                for el in other.borrow_body().iter() {
-                    combined.push(el.clone());
-                }
+                array::with_elements(*other, &heap, |elements| {
+                    combined.extend(elements.iter().cloned());
+                });
             }
             other => combined.push(other.clone()),
         }
     }
-    Ok(Value::Array(JsArray::from_elements(combined)))
+    Ok(Value::Array(array::from_elements(&mut heap, combined)?))
 }
 
 fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
+    let heap = args.gc_heap.borrow();
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => ",".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(),
     };
-    let body = arr.borrow_body();
-    let parts: Vec<String> = body
-        .iter()
-        .map(|v| match v {
-            Value::Undefined | Value::Null => String::new(),
-            other => other.display_string(),
-        })
-        .collect();
+    let parts: Vec<String> = array::with_elements(arr, &heap, |elements| {
+        elements
+            .iter()
+            .map(|v| match v {
+                Value::Undefined | Value::Null => String::new(),
+                other => other.display_string(),
+            })
+            .collect()
+    });
     let joined = parts.join(&separator);
     Ok(Value::String(JsString::from_str(
         &joined,
@@ -162,9 +180,9 @@ fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
+    let heap = args.gc_heap.borrow();
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let body = arr.borrow_body();
-    let found = body.iter().any(|v| v == &needle);
+    let found = array::with_elements(arr, &heap, |elements| elements.iter().any(|v| v == &needle));
     Ok(Value::Boolean(found))
 }
 
@@ -172,13 +190,18 @@ fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
     let from_raw = arg_signed_index(args, 1, 0)?;
-    let len = arr.len();
+    let heap = args.gc_heap.borrow();
+    let len = array::len(arr, &heap);
     let from = clamp_index(from_raw, len);
-    let body = arr.borrow_body();
-    for (i, v) in body.iter().enumerate().skip(from) {
-        if v == &needle {
-            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
-        }
+    let found = array::with_elements(arr, &heap, |elements| {
+        elements
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find_map(|(i, v)| if v == &needle { Some(i) } else { None })
+    });
+    if let Some(i) = found {
+        return Ok(Value::Number(NumberValue::from_i32(i as i32)));
     }
     Ok(Value::Number(NumberValue::from_i32(-1)))
 }
@@ -187,20 +210,22 @@ fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// <https://tc39.es/ecma262/#sec-array.prototype.at>
 fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let len = arr.len() as i64;
+    let heap = args.gc_heap.borrow();
+    let len = array::len(arr, &heap) as i64;
     let raw = arg_signed_index(args, 0, 0)?;
     let idx = if raw < 0 { len + raw } else { raw };
     if idx < 0 || idx >= len {
         return Ok(Value::Undefined);
     }
-    Ok(arr.get(idx as usize))
+    Ok(array::get(arr, &heap, idx as usize))
 }
 
 /// §23.1.3.18 `Array.prototype.lastIndexOf(value, fromIndex?)`.
 /// <https://tc39.es/ecma262/#sec-array.prototype.lastindexof>
 fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let len = arr.len();
+    let heap = args.gc_heap.borrow();
+    let len = array::len(arr, &heap);
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
     let from_default = (len as i64).saturating_sub(1);
     let from_raw = arg_signed_index(args, 1, from_default)?;
@@ -215,16 +240,24 @@ fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     } else {
         from_raw as usize
     };
-    let body = arr.borrow_body();
-    if body.elements.is_empty() {
-        return Ok(Value::Number(NumberValue::from_i32(-1)));
-    }
-    let mut i = from as i64;
-    while i >= 0 {
-        if body.elements[i as usize] == needle {
-            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+    let found = array::with_elements(arr, &heap, |elements| {
+        if elements.is_empty() {
+            return None;
         }
-        i -= 1;
+        let mut i = from as i64;
+        while i >= 0 {
+            if elements[i as usize] == needle {
+                return Some(i as i32);
+            }
+            i -= 1;
+        }
+        None
+    });
+    if let Some(i) = found {
+        return Ok(Value::Number(NumberValue::from_i32(i)));
+    }
+    if len == 0 {
+        return Ok(Value::Number(NumberValue::from_i32(-1)));
     }
     Ok(Value::Number(NumberValue::from_i32(-1)))
 }
@@ -233,25 +266,28 @@ fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// <https://tc39.es/ecma262/#sec-array.prototype.reverse>
 fn impl_reverse(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    arr.borrow_body_mut().elements.reverse();
-    Ok(Value::Array(arr.clone()))
+    let mut heap = args.gc_heap.borrow_mut();
+    array::with_elements_mut(arr, &mut heap, |elements| elements.reverse());
+    Ok(Value::Array(arr))
 }
 
 /// §23.1.3.7 `Array.prototype.fill(value, start?, end?)` — in-place.
 /// <https://tc39.es/ecma262/#sec-array.prototype.fill>
 fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let len = arr.len();
+    let mut heap = args.gc_heap.borrow_mut();
+    let len = array::len(arr, &heap);
     let value = args.args.first().cloned().unwrap_or(Value::Undefined);
     let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
     let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
     if start < end {
-        let mut body = arr.borrow_body_mut();
-        for i in start..end {
-            body.elements[i] = value.clone();
-        }
+        array::with_elements_mut(arr, &mut heap, |elements| {
+            for slot in elements.iter_mut().take(end).skip(start) {
+                *slot = value.clone();
+            }
+        });
     }
-    Ok(Value::Array(arr.clone()))
+    Ok(Value::Array(arr))
 }
 
 /// §23.1.3.11 `Array.prototype.flat(depth?)` — flattens at most
@@ -261,6 +297,7 @@ fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// <https://tc39.es/ecma262/#sec-array.prototype.flat>
 fn impl_flat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
+    let mut heap = args.gc_heap.borrow_mut();
     let depth = match args.args.first() {
         None | Some(Value::Undefined) => 1i64,
         Some(Value::Number(n)) => match n.as_smi() {
@@ -270,21 +307,21 @@ fn impl_flat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         },
         _ => 1,
     };
-    fn walk(out: &mut Vec<Value>, body: &[Value], depth: i64) {
+    fn walk(out: &mut Vec<Value>, heap: &otter_gc::GcHeap, body: &[Value], depth: i64) {
         for v in body {
             match v {
                 Value::Array(a) if depth > 0 => {
-                    let inner = a.borrow_body();
-                    walk(out, &inner.elements, depth - 1);
+                    array::with_elements(*a, heap, |inner| walk(out, heap, inner, depth - 1));
                 }
                 other => out.push(other.clone()),
             }
         }
     }
-    let body = arr.borrow_body();
-    let mut out: Vec<Value> = Vec::with_capacity(body.elements.len());
-    walk(&mut out, &body.elements, depth);
-    Ok(Value::Array(JsArray::from_elements(out)))
+    let mut out: Vec<Value> = Vec::with_capacity(array::len(arr, &heap));
+    array::with_elements(arr, &heap, |elements| {
+        walk(&mut out, &heap, elements, depth)
+    });
+    Ok(Value::Array(array::from_elements(&mut heap, out)?))
 }
 
 /// §23.1.3.31 `Array.prototype.splice(start, deleteCount?, ...items)`.
@@ -292,7 +329,8 @@ fn impl_flat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// <https://tc39.es/ecma262/#sec-array.prototype.splice>
 fn impl_splice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let len = arr.len();
+    let mut heap = args.gc_heap.borrow_mut();
+    let len = array::len(arr, &heap);
     let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
     // §23.1.3.31 step 6 — when `deleteCount` is omitted (foundation
     // accepts `undefined`), splice removes through the tail.
@@ -314,19 +352,20 @@ fn impl_splice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         _ => 0,
     };
     let inserts: Vec<Value> = args.args.iter().skip(2).cloned().collect();
-    let mut body = arr.borrow_body_mut();
     // `SmallVec` lacks a `splice` API — perform the equivalent by
     // hand: drain the removed slice, then insert the new items at
     // `start`.
-    let mut removed: Vec<Value> = Vec::with_capacity(delete_count);
-    for _ in 0..delete_count {
-        removed.push(body.elements.remove(start));
-    }
-    for (i, v) in inserts.into_iter().enumerate() {
-        body.elements.insert(start + i, v);
-    }
-    drop(body);
-    Ok(Value::Array(JsArray::from_elements(removed)))
+    let removed = array::with_elements_mut(arr, &mut heap, |elements| {
+        let mut removed: Vec<Value> = Vec::with_capacity(delete_count);
+        for _ in 0..delete_count {
+            removed.push(elements.remove(start));
+        }
+        for (i, v) in inserts.into_iter().enumerate() {
+            elements.insert(start + i, v);
+        }
+        removed
+    });
+    Ok(Value::Array(array::from_elements(&mut heap, removed)?))
 }
 
 /// §23.1.3.30 `Array.prototype.sort()` — default lexicographic
@@ -336,21 +375,23 @@ fn impl_splice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_sort_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
     if let Some(Value::Undefined) | None = args.args.first() {
-        let mut body = arr.borrow_body_mut();
+        let mut heap = args.gc_heap.borrow_mut();
         // §23.1.3.30.2 SortCompare (no comparator) — undefined values
         // sort to the end; remaining values compare by their
         // ToString result.
-        body.elements.sort_by(|a, b| {
-            let a_undef = matches!(a, Value::Undefined);
-            let b_undef = matches!(b, Value::Undefined);
-            match (a_undef, b_undef) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                (false, false) => a.display_string().cmp(&b.display_string()),
-            }
+        array::with_elements_mut(arr, &mut heap, |elements| {
+            elements.sort_by(|a, b| {
+                let a_undef = matches!(a, Value::Undefined);
+                let b_undef = matches!(b, Value::Undefined);
+                match (a_undef, b_undef) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => a.display_string().cmp(&b.display_string()),
+                }
+            })
         });
-        Ok(Value::Array(arr.clone()))
+        Ok(Value::Array(arr))
     } else {
         // Comparator path — interpreter dispatches it. Returning the
         // BadArgument here surfaces as a clear diagnostic during
@@ -398,59 +439,78 @@ mod tests {
     use super::*;
     use crate::string::StringHeap;
 
-    fn make_arr(values: &[i32]) -> Value {
-        let arr = JsArray::from_elements(
+    fn make_arr(gc_heap: &mut otter_gc::GcHeap, values: &[i32]) -> Value {
+        let arr = crate::array::from_elements(
+            gc_heap,
             values
                 .iter()
                 .map(|&n| Value::Number(NumberValue::from_i32(n))),
-        );
+        )
+        .unwrap();
         Value::Array(arr)
     }
 
-    fn call(method: &str, recv: Value, args: &[Value]) -> Value {
+    fn call(method: &str, recv: Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
         let heap = StringHeap::default();
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = lookup(method).unwrap();
         (entry.impl_fn)(&IntrinsicArgs {
             receiver: &recv,
             args,
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: std::cell::RefCell::new(gc_heap),
         })
         .unwrap()
     }
 
+    fn render(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
+        match value {
+            Value::Array(arr) => crate::array::with_elements(*arr, gc_heap, |elements| {
+                elements
+                    .iter()
+                    .map(Value::display_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            other => other.display_string(),
+        }
+    }
+
     #[test]
     fn push_returns_new_length() {
-        let arr = make_arr(&[1, 2]);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let arr = make_arr(&mut gc_heap, &[1, 2]);
         let r = call(
             "push",
             arr.clone(),
             &[Value::Number(NumberValue::from_i32(3))],
+            &mut gc_heap,
         );
         assert_eq!(r.display_string(), "3");
-        assert_eq!(arr.display_string(), "1,2,3");
+        assert_eq!(render(&arr, &gc_heap), "1,2,3");
     }
 
     #[test]
     fn pop_yields_tail() {
-        let arr = make_arr(&[1, 2, 3]);
-        let r = call("pop", arr.clone(), &[]);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let arr = make_arr(&mut gc_heap, &[1, 2, 3]);
+        let r = call("pop", arr.clone(), &[], &mut gc_heap);
         assert_eq!(r.display_string(), "3");
-        assert_eq!(arr.display_string(), "1,2");
+        assert_eq!(render(&arr, &gc_heap), "1,2");
     }
 
     #[test]
     fn shift_yields_head() {
-        let arr = make_arr(&[10, 20, 30]);
-        let r = call("shift", arr.clone(), &[]);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let arr = make_arr(&mut gc_heap, &[10, 20, 30]);
+        let r = call("shift", arr.clone(), &[], &mut gc_heap);
         assert_eq!(r.display_string(), "10");
-        assert_eq!(arr.display_string(), "20,30");
+        assert_eq!(render(&arr, &gc_heap), "20,30");
     }
 
     #[test]
     fn slice_handles_negative_end() {
-        let arr = make_arr(&[1, 2, 3, 4, 5]);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let arr = make_arr(&mut gc_heap, &[1, 2, 3, 4, 5]);
         let r = call(
             "slice",
             arr,
@@ -458,45 +518,57 @@ mod tests {
                 Value::Number(NumberValue::from_i32(1)),
                 Value::Number(NumberValue::from_i32(-1)),
             ],
+            &mut gc_heap,
         );
-        assert_eq!(r.display_string(), "2,3,4");
+        assert_eq!(render(&r, &gc_heap), "2,3,4");
     }
 
     #[test]
     fn concat_flattens_one_level() {
-        let arr = make_arr(&[1, 2]);
-        let other = make_arr(&[3, 4]);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let arr = make_arr(&mut gc_heap, &[1, 2]);
+        let other = make_arr(&mut gc_heap, &[3, 4]);
         let r = call(
             "concat",
             arr,
             &[other, Value::Number(NumberValue::from_i32(5))],
+            &mut gc_heap,
         );
-        assert_eq!(r.display_string(), "1,2,3,4,5");
+        assert_eq!(render(&r, &gc_heap), "1,2,3,4,5");
     }
 
     #[test]
     fn join_with_default_separator() {
-        let arr = make_arr(&[1, 2, 3]);
-        let r = call("join", arr, &[]);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let arr = make_arr(&mut gc_heap, &[1, 2, 3]);
+        let r = call("join", arr, &[], &mut gc_heap);
         assert_eq!(r.display_string(), "1,2,3");
     }
 
     #[test]
     fn includes_and_index_of() {
-        let arr = make_arr(&[10, 20, 30]);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let arr = make_arr(&mut gc_heap, &[10, 20, 30]);
         let yes = call(
             "includes",
             arr.clone(),
             &[Value::Number(NumberValue::from_i32(20))],
+            &mut gc_heap,
         );
         let no = call(
             "includes",
             arr.clone(),
             &[Value::Number(NumberValue::from_i32(99))],
+            &mut gc_heap,
         );
         assert_eq!(yes, Value::Boolean(true));
         assert_eq!(no, Value::Boolean(false));
-        let idx = call("indexOf", arr, &[Value::Number(NumberValue::from_i32(30))]);
+        let idx = call(
+            "indexOf",
+            arr,
+            &[Value::Number(NumberValue::from_i32(30))],
+            &mut gc_heap,
+        );
         assert_eq!(idx.display_string(), "2");
     }
 }

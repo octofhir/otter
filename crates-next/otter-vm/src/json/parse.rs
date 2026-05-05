@@ -21,7 +21,6 @@
 //!   inputs).
 
 use crate::Value;
-use crate::array::JsArray;
 use crate::number::NumberValue;
 use crate::string::{JsString, StringHeap};
 
@@ -303,7 +302,10 @@ fn finish_builder(
     pos: usize,
 ) -> Result<Value, ParseError> {
     match builder {
-        Builder::Array { elements, .. } => Ok(Value::Array(JsArray::from_elements(elements))),
+        Builder::Array { elements, .. } => Ok(Value::Array(
+            crate::array::from_elements(gc_heap, elements)
+                .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?,
+        )),
         Builder::Object { entries, .. } => {
             let obj = crate::object::alloc_object(gc_heap)
                 .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
@@ -604,8 +606,8 @@ mod tests {
         let Some(Value::Array(arr)) = crate::object::get(obj, &gc_heap, "x") else {
             panic!()
         };
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr.get(2).display_string(), "3");
+        assert_eq!(crate::array::len(arr, &gc_heap), 3);
+        assert_eq!(crate::array::get(arr, &gc_heap, 2).display_string(), "3");
     }
 
     #[test]

@@ -48,7 +48,11 @@ pub fn call(
             }
             let this_value = args.get(1).cloned().unwrap_or(Value::Undefined);
             let argv: SmallVec<[Value; 8]> = match args.get(2) {
-                Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect(),
+                Some(Value::Array(arr)) => {
+                    crate::array::with_elements(*arr, interp.gc_heap(), |elements| {
+                        elements.iter().cloned().collect()
+                    })
+                }
                 None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
                 _ => return Err(VmError::TypeMismatch),
             };
@@ -62,7 +66,11 @@ pub fn call(
                 return Err(VmError::NotCallable);
             }
             let argv: SmallVec<[Value; 8]> = match args.get(1) {
-                Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect(),
+                Some(Value::Array(arr)) => {
+                    crate::array::with_elements(*arr, interp.gc_heap(), |elements| {
+                        elements.iter().cloned().collect()
+                    })
+                }
                 None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
                 _ => return Err(VmError::TypeMismatch),
             };
@@ -209,7 +217,10 @@ pub fn call(
                     })
                     .collect()
             });
-            Ok(Value::Array(crate::array::JsArray::from_elements(keys)))
+            Ok(Value::Array(crate::array::from_elements(
+                interp.gc_heap_mut(),
+                keys,
+            )?))
         }
         // §28.1.12 Reflect.preventExtensions(target)
         // <https://tc39.es/ecma262/#sec-reflect.preventextensions>

@@ -71,16 +71,19 @@ fn join(items: &[String], payload: &ListFormatPayload) -> String {
     }
 }
 
-fn collect_items(value: Option<&Value>) -> Result<Vec<String>, IntrinsicError> {
+fn collect_items(
+    value: Option<&Value>,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Vec<String>, IntrinsicError> {
     match value {
         Some(Value::Array(arr)) => {
-            let body = arr.borrow_body();
-            let mut out: Vec<String> = Vec::with_capacity(body.elements.len());
-            for v in body.iter() {
+            let values = crate::array::with_elements(*arr, gc_heap, |elements| elements.to_vec());
+            let mut out: Vec<String> = Vec::with_capacity(values.len());
+            for v in values {
                 match v {
                     Value::String(s) => out.push(s.to_lossy_string()),
                     Value::Number(n) => out.push(n.to_display_string()),
-                    Value::Boolean(b) => out.push((if *b { "true" } else { "false" }).to_string()),
+                    Value::Boolean(b) => out.push((if b { "true" } else { "false" }).to_string()),
                     _ => {
                         return Err(IntrinsicError::BadArgument {
                             index: 0,
@@ -101,7 +104,8 @@ fn collect_items(value: Option<&Value>) -> Result<Vec<String>, IntrinsicError> {
 /// §13.5.3 `format(list)`.
 fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let items = collect_items(args.args.first())?;
+    let heap = args.gc_heap.borrow();
+    let items = collect_items(args.args.first(), &heap)?;
     let rendered = join(&items, payload);
     Ok(Value::String(crate::string::JsString::from_str(
         &rendered,
@@ -120,9 +124,10 @@ fn impl_format_to_parts(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let part = crate::object::alloc_object(*heap)?;
     crate::object::set(part, *heap, "type", literal);
     crate::object::set(part, *heap, "value", s);
-    Ok(Value::Array(crate::array::JsArray::from_elements([
-        Value::Object(part),
-    ])))
+    Ok(Value::Array(crate::array::from_elements(
+        *heap,
+        [Value::Object(part)],
+    )?))
 }
 
 fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

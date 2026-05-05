@@ -278,11 +278,11 @@ fn construct_typed_array(
         }
         // §23.2.5.1.5 `new T(object)` — array-like / iterable copy.
         Some(Value::Array(arr)) => {
-            let len = arr.len();
+            let len = crate::array::len(*arr, gc_heap);
             let new_buf = JsArrayBuffer::new(len * bpe);
             let view = JsTypedArray::new(new_buf, kind, 0, len);
             for i in 0..len {
-                let v = arr.get(i);
+                let v = crate::array::get(*arr, gc_heap, i);
                 let coerced = coerce_for_kind(kind, &v)?;
                 view.set(i, &coerced);
             }
@@ -347,10 +347,10 @@ fn from_static(
             Ok(typed_array_prototype::from_values(kind, &values))
         }
         Value::Array(arr) => {
-            let len = arr.len();
+            let len = crate::array::len(arr, gc_heap);
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
-                let v = arr.get(i);
+                let v = crate::array::get(arr, gc_heap, i);
                 values.push(coerce_for_kind(kind, &v)?);
             }
             Ok(typed_array_prototype::from_values(kind, &values))
@@ -442,11 +442,11 @@ pub fn snapshot_elements(t: &JsTypedArray) -> Vec<Value> {
 /// Convenience: build a TypedArray from a slice of arrays. Used by
 /// the iterator-based path in `Array.from`.
 #[must_use]
-pub fn from_arr(kind: TypedArrayKind, arr: &JsArray) -> Value {
-    let len = arr.len();
+pub fn from_arr(kind: TypedArrayKind, arr: &JsArray, gc_heap: &otter_gc::GcHeap) -> Value {
+    let len = crate::array::len(*arr, gc_heap);
     let mut values: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
-        values.push(arr.get(i));
+        values.push(crate::array::get(*arr, gc_heap, i));
     }
     typed_array_prototype::from_values(kind, &values)
 }

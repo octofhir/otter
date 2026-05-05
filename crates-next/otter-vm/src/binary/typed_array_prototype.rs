@@ -16,7 +16,6 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
 
 use crate::Value;
-use crate::array::JsArray;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::string::JsString;
 
@@ -378,7 +377,8 @@ fn impl_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
         }
         Value::Array(arr) => {
-            let src_len = arr.len();
+            let heap = args.gc_heap.borrow();
+            let src_len = crate::array::len(arr, &heap);
             if off + src_len > t.length() {
                 return Err(IntrinsicError::BadArgument {
                     index: 0,
@@ -386,7 +386,7 @@ fn impl_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
             for i in 0..src_len {
-                t.set(off + i, &arr.get(i));
+                t.set(off + i, &crate::array::get(arr, &heap, i));
             }
         }
         _ => {
@@ -448,24 +448,34 @@ fn impl_keys(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
-    let arr = JsArray::from_elements((0..len).map(|i| smi(i as i32)));
+    let mut heap = args.gc_heap.borrow_mut();
+    let arr = crate::array::from_elements(&mut heap, (0..len).map(|i| smi(i as i32)))?;
     Ok(Value::Array(arr))
 }
 
 fn impl_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    Ok(Value::Array(JsArray::from_elements(copy_view(&t))))
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(Value::Array(crate::array::from_elements(
+        &mut heap,
+        copy_view(&t),
+    )?))
 }
 
 fn impl_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
-    let entries: Vec<Value> = (0..len)
-        .map(|i| Value::Array(JsArray::from_elements([smi(i as i32), t.get(i)])))
-        .collect();
-    Ok(Value::Array(JsArray::from_elements(entries)))
+    let mut heap = args.gc_heap.borrow_mut();
+    let mut entries: Vec<Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        let pair = crate::array::from_elements(&mut heap, [smi(i as i32), t.get(i)])?;
+        entries.push(Value::Array(pair));
+    }
+    Ok(Value::Array(crate::array::from_elements(
+        &mut heap, entries,
+    )?))
 }
 
 // ---- comparison helpers -------------------------------------------------

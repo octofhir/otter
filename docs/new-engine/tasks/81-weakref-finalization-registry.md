@@ -2,15 +2,15 @@
 
 ## Status
 
-- [ ] `WeakRef` value variant + intrinsic
-- [ ] `FinalizationRegistry` value variant + intrinsic
-- [ ] post-sweep finaliser dispatch through microtask queue
-- [ ] finaliser enqueueing is isolate-local and uses explicit runtime
+- [x] `WeakRef` value variant + intrinsic
+- [x] `FinalizationRegistry` value variant + intrinsic
+- [x] post-sweep finaliser dispatch through microtask queue
+- [x] finaliser enqueueing is isolate-local and uses explicit runtime
       context
-- [ ] finalizer/resurrection safety policy documented and tested
-- [ ] allocation-during-finalizer path uses pending queues / black
+- [x] finalizer/resurrection safety policy documented and tested
+- [x] allocation-during-finalizer path uses pending queues / black
       allocation discipline and never mutates active sweep queues
-- [ ] gates green
+- [x] gates green except Test262 parity, intentionally deferred
 
 ## Goal
 
@@ -90,28 +90,28 @@ callbacks after sweep, never running JS during raw GC.
 
 ## Validation gates
 
-- [ ] `WeakRef.prototype.deref` returns the target while live;
+- [x] `WeakRef.prototype.deref` returns the target while live;
   returns `undefined` after the target is reaped.
-- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm crates-next/otter-gc/src/finalize.rs` returns no WeakRef / finalisation product-code hits.
-- [ ] `FinalizationRegistry` callback fires *exactly once* per cell
+- [x] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm crates-next/otter-gc/src/finalize.rs` returns no WeakRef / finalisation product-code hits.
+- [x] `FinalizationRegistry` callback fires *exactly once* per cell
   whose target is reaped.
-- [ ] Cycle test: registry holds a callback that captures itself
+- [x] Cycle test: registry holds a callback that captures itself
   through the held value; drop the registry; assert no leak.
-- [ ] Resurrection policy test: cleanup callback cannot observe or
+- [x] Resurrection policy test: cleanup callback cannot observe or
   resurrect the collected target through `WeakRef.deref`.
-- [ ] Allocation-during-finalization test: a Rust-side finalizer path
+- [x] Allocation-during-finalization test: a Rust-side finalizer path
   allocates while collection is closing; force GC and assert queue
   ordering, no UAF, and no stale mark bits.
-- [ ] Registry-laziness test: with no registries allocated, post-sweep
+- [x] Registry-laziness test: with no registries allocated, post-sweep
   weak-finalization work is skipped except for a single flag check.
-- [ ] Test262 `built-ins/WeakRef/**` and
+- [~] Test262 `built-ins/WeakRef/**` and
   `built-ins/FinalizationRegistry/**` pass at parity-or-better with
-  whatever baseline existed (likely ~0 today since the types didn't
-  exist).
-- [ ] `cargo clippy --workspace -- -D warnings` clean.
+  whatever baseline existed. Deferred by maintainer direction until
+  the surrounding JS surface is ready.
+- [x] `cargo clippy --workspace -- -D warnings` clean.
 
 ## Closing
 
-Gates from [`README.md`](./README.md#closing-a-task), tick 81 in
-[70-gc-master-tracker.md](./70-gc-master-tracker.md), delete this
-file.
+Closed 2026-05-05 for the non-Test262 task-81 vertical slice. Test262
+parity remains deferred because constructor/prototype conformance
+depends on broader JS surface work beyond this GC slice.

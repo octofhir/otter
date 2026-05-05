@@ -104,6 +104,17 @@ pub enum IntrinsicReceiver {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-weakset-prototype-object>
     WeakSet,
+    /// `WeakRef.prototype.<name>`. Receiver is a [`crate::Value::WeakRef`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-weak-ref-objects>
+    WeakRef,
+    /// `FinalizationRegistry.prototype.<name>`. Receiver is a
+    /// [`crate::Value::FinalizationRegistry`].
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-finalization-registry-objects>
+    FinalizationRegistry,
     /// `Temporal.<Class>.prototype.<name>`. Receiver is a
     /// [`crate::Value::Temporal`]. Per-kind routing happens in
     /// [`crate::temporal::lookup_prototype`].

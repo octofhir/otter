@@ -642,6 +642,17 @@ pub enum Op {
     /// seed element must itself be a 2-element array `[key, value]`;
     /// for `Set` / `WeakSet` each element is added directly.
     NewCollection,
+    /// Build a fresh `WeakRef`. Operands:
+    /// `Register(dst), Register(target)`.
+    ///
+    /// The runtime validates that `target` can be held weakly by the
+    /// current migrated GC value model.
+    NewWeakRef,
+    /// Build a fresh `FinalizationRegistry`. Operands:
+    /// `Register(dst), Register(cleanup_callback)`.
+    ///
+    /// The runtime validates that `cleanup_callback` is callable.
+    NewFinalizationRegistry,
     /// `r<dst> = Symbol.<name>` (well-known symbol read). Operands:
     /// `Register(dst), ConstIndex(name)`. Lowered by the compiler
     /// for static-member access on the `Symbol` namespace; the
@@ -1048,6 +1059,8 @@ impl Op {
             Op::TypeOf => "TYPEOF",
             Op::DeleteElement => "DELETE_ELEMENT",
             Op::NewCollection => "NEW_COLLECTION",
+            Op::NewWeakRef => "NEW_WEAK_REF",
+            Op::NewFinalizationRegistry => "NEW_FINALIZATION_REGISTRY",
             Op::TemporalCall => "TEMPORAL_CALL",
             Op::TemporalLoad => "TEMPORAL_LOAD",
             Op::NewIntl => "NEW_INTL",
@@ -1176,7 +1189,9 @@ impl Op {
             | Op::ArrayLength
             | Op::NewError
             | Op::GetIterator
-            | Op::ArrayPush => 2,
+            | Op::ArrayPush
+            | Op::NewWeakRef
+            | Op::NewFinalizationRegistry => 2,
             Op::IteratorNext => 3,
             Op::NewCollection => 3,
             Op::CallSpread => 4,

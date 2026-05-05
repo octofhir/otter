@@ -20,6 +20,7 @@
 //! - [`barrier`] — write barriers.
 //! - [`handle`] — `Local`, `HandleScope`, `GlobalHandle`.
 //! - [`heap`] — `GcHeap` orchestrator.
+//! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`oom`] — `OutOfMemory` error.
 //! - [`stats`] — per-heap counters and per-type rows.
 //! - [`snapshot`] — Rust-side heap snapshot + retained-size walker.
@@ -59,6 +60,7 @@ pub mod barrier;
 pub mod compressed;
 pub mod devtools_snapshot;
 pub mod ephemeron;
+pub mod finalize;
 pub mod handle;
 pub mod header;
 pub mod heap;

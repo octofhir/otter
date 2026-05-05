@@ -5393,6 +5393,29 @@ fn compile_expr(
                 );
                 return Ok(dst);
             }
+            // `new WeakRef(target)` / `new FinalizationRegistry(cb)`.
+            if let Expression::Identifier(id) = callee
+                && matches!(id.name.as_str(), "WeakRef" | "FinalizationRegistry")
+            {
+                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
+                let first_arg = arg_regs.first().copied().unwrap_or_else(|| {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
+                    r
+                });
+                let dst = cx.alloc_scratch();
+                let op = if id.name.as_str() == "WeakRef" {
+                    Op::NewWeakRef
+                } else {
+                    Op::NewFinalizationRegistry
+                };
+                cx.emit(
+                    op,
+                    vec![Operand::Register(dst), Operand::Register(first_arg)],
+                    new_span,
+                );
+                return Ok(dst);
+            }
             // §28.2.1 `new Proxy(target, handler)` — lower through
             // `Op::ProxyCall` with the empty-name sentinel.
             // <https://tc39.es/ecma262/#sec-proxy-constructor>

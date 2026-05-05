@@ -69,6 +69,7 @@ pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
+pub mod weak_refs;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,6 +96,7 @@ pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
 pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
+pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
 pub use runtime_cx::NativeCtx;
 
@@ -225,6 +227,16 @@ pub enum Value {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-weakset-objects>
     WeakSet(JsWeakSet),
+    /// JS `WeakRef` — weak target reference.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-weak-ref-objects>
+    WeakRef(JsWeakRef),
+    /// JS `FinalizationRegistry` — post-GC cleanup registry.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-finalization-registry-objects>
+    FinalizationRegistry(JsFinalizationRegistry),
     /// `Temporal.*` value — `Instant` / `Duration` / `PlainDate` /
     /// `PlainTime` / `PlainDateTime`. Backed by `temporal_rs`.
     ///
@@ -567,6 +579,8 @@ impl Value {
             Value::Set(s) => Some(s.raw()),
             Value::WeakMap(m) => Some(m.raw()),
             Value::WeakSet(s) => Some(s.raw()),
+            Value::WeakRef(w) => Some(w.raw()),
+            Value::FinalizationRegistry(r) => Some(r.raw()),
             // Phase-1 stub for the rest. Subsequent migrations
             // (78+) add variant arms here as their handle types
             // move to `Gc<…>`.
@@ -627,6 +641,14 @@ impl Value {
                 let p = s as *const JsWeakSet as *mut otter_gc::RawGc;
                 visitor(p);
             }
+            Value::WeakRef(w) => {
+                let p = w as *const JsWeakRef as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::FinalizationRegistry(r) => {
+                let p = r as *const JsFinalizationRegistry as *mut otter_gc::RawGc;
+                visitor(p);
+            }
             _ => {}
         }
     }
@@ -664,6 +686,8 @@ impl Value {
             Value::Set(_) => "[object Set]".to_string(),
             Value::WeakMap(_) => "[object WeakMap]".to_string(),
             Value::WeakSet(_) => "[object WeakSet]".to_string(),
+            Value::WeakRef(_) => "[object WeakRef]".to_string(),
+            Value::FinalizationRegistry(_) => "[object FinalizationRegistry]".to_string(),
             Value::Temporal(t) => format!("[object Temporal.{}]", t.kind().class_name()),
             Value::Date(d) => date::to_iso_string(d.time())
                 .map(|s| format!("Date({s})"))
@@ -719,6 +743,8 @@ impl Value {
             | Value::Set(_)
             | Value::WeakMap(_)
             | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
             | Value::Date(_)
             | Value::Intl(_)
@@ -823,6 +849,8 @@ impl Value {
             | Value::Set(_)
             | Value::WeakMap(_)
             | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
             | Value::Date(_)
             | Value::Intl(_)
@@ -885,6 +913,8 @@ impl PartialEq for Value {
             (Value::Set(a), Value::Set(b)) => crate::collections::set_ptr_eq(*a, *b),
             (Value::WeakMap(a), Value::WeakMap(b)) => a == b,
             (Value::WeakSet(a), Value::WeakSet(b)) => a == b,
+            (Value::WeakRef(a), Value::WeakRef(b)) => a == b,
+            (Value::FinalizationRegistry(a), Value::FinalizationRegistry(b)) => a == b,
             (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(b),
             (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(b),
             (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(b),
@@ -1939,6 +1969,19 @@ impl Interpreter {
         };
         self.gc_heap.mark_phase(&mut visit);
         crate::collections::run_ephemeron_fixpoint(&mut self.gc_heap);
+        let finalization_jobs =
+            crate::weak_refs::process_weak_refs_and_finalizers(&mut self.gc_heap);
+        for job in finalization_jobs {
+            let mut args = SmallVec::new();
+            args.push(job.held_value);
+            self.microtasks.enqueue(Microtask {
+                callee: job.cleanup_callback,
+                this_value: Value::Undefined,
+                args,
+                result_capability: None,
+                kind: MicrotaskKind::FinalizationCallback,
+            });
+        }
         self.gc_heap.sweep_phase();
     }
 
@@ -3507,6 +3550,8 @@ impl Interpreter {
                         | Value::Set(_)
                         | Value::WeakMap(_)
                         | Value::WeakSet(_)
+                        | Value::WeakRef(_)
+                        | Value::FinalizationRegistry(_)
                         | Value::Temporal(_)
                         | Value::Intl(_)
                         | Value::ArrayBuffer(_)
@@ -4434,6 +4479,23 @@ impl Interpreter {
                     let seed = read_register(frame, iter_reg)?.clone();
                     let value = build_collection(&kind, &seed, &mut self.gc_heap)?;
                     write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                }
+                Op::NewWeakRef => {
+                    let dst = register_operand(operands.first())?;
+                    let target_reg = register_operand(operands.get(1))?;
+                    let target = read_register(frame, target_reg)?.clone();
+                    let weak_ref = crate::weak_refs::alloc_weak_ref(&mut self.gc_heap, &target)?;
+                    write_register(frame, dst, Value::WeakRef(weak_ref))?;
+                    frame.pc += 1;
+                }
+                Op::NewFinalizationRegistry => {
+                    let dst = register_operand(operands.first())?;
+                    let callback_reg = register_operand(operands.get(1))?;
+                    let callback = read_register(frame, callback_reg)?.clone();
+                    let registry =
+                        crate::weak_refs::alloc_finalization_registry(&mut self.gc_heap, callback)?;
+                    write_register(frame, dst, Value::FinalizationRegistry(registry))?;
                     frame.pc += 1;
                 }
                 Op::TemporalCall => {
@@ -5502,6 +5564,8 @@ impl Interpreter {
             Value::Set(_) => collections_prototype::lookup_set(&name),
             Value::WeakMap(_) => collections_prototype::lookup_weak_map(&name),
             Value::WeakSet(_) => collections_prototype::lookup_weak_set(&name),
+            Value::WeakRef(_) => weak_refs::lookup_weak_ref(&name),
+            Value::FinalizationRegistry(_) => weak_refs::lookup_finalization_registry(&name),
             Value::Temporal(_) => temporal::lookup_prototype(&recv_value, &name),
             Value::Intl(_) => intl::lookup_prototype(&recv_value, &name),
             Value::ArrayBuffer(_) => binary::array_buffer_prototype::lookup(&name),

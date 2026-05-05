@@ -325,6 +325,8 @@ fn emit_value(
         | Value::Set(_)
         | Value::WeakMap(_)
         | Value::WeakSet(_)
+        | Value::WeakRef(_)
+        | Value::FinalizationRegistry(_)
         | Value::Temporal(_)
         | Value::Intl(_)
         | Value::ArrayBuffer(_)

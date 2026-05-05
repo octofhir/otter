@@ -42,6 +42,7 @@ use crate::object::JsObject;
 use crate::promise::{JsPromiseHandle, PurePromise};
 use crate::regexp::JsRegExp;
 use crate::symbol::{JsSymbol, SymbolRegistry, WellKnownSymbols};
+use crate::weak_refs::{JsFinalizationRegistry, JsWeakRef};
 use crate::{AsyncFrameState, BoundFunction, Frame, IteratorState};
 use otter_gc::RawGc;
 
@@ -146,6 +147,22 @@ impl GcTrace for JsWeakSet {
     }
 }
 
+impl GcTrace for JsWeakRef {
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsWeakRef as *mut RawGc;
+        visitor(p);
+    }
+}
+
+impl GcTrace for JsFinalizationRegistry {
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsFinalizationRegistry as *mut RawGc;
+        visitor(p);
+    }
+}
+
 impl GcTrace for JsPromiseHandle {
     /// Stub — body lands with task 82 (promise / iterator /
     /// generator migration).
@@ -196,15 +213,19 @@ impl GcTrace for AsyncFrameState {
 }
 
 impl GcTrace for Microtask {
-    /// Stub — body lands when microtask payloads carry `Gc`
-    /// handles (task 82).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Trace queued callback, receiver, arguments, and promise
+    /// capability slots. Finalization callbacks use this path so
+    /// held values remain live until the cleanup job runs.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_gc_slots(visitor);
+    }
 }
 
 impl GcTrace for MicrotaskQueue {
-    /// Stub — body lands with task 82, where each queued
-    /// [`Microtask`] payload's `Gc` slots get walked.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Trace every queued microtask payload.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_gc_slots(visitor);
+    }
 }
 
 impl GcTrace for JsSymbol {

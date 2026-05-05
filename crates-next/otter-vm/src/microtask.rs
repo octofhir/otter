@@ -127,6 +127,11 @@ pub enum MicrotaskKind {
     /// `queueMicrotask(callee, args...)`. Default for both plain
     /// `queueMicrotask` calls and promise-reaction handlers.
     Call,
+    /// Host cleanup callback queued after a `FinalizationRegistry`
+    /// cell's target was found dead by GC. Dispatch is identical to
+    /// [`Self::Call`], but the distinct kind keeps finalization jobs
+    /// visible to tests and future host scheduling policy.
+    FinalizationCallback,
     /// Resume a parked async frame. `frame` was popped off the
     /// active stack at the matching `Op::Await`; the drain rebuilds
     /// a fresh stack containing only this frame and continues
@@ -358,6 +363,32 @@ impl MicrotaskQueue {
     pub fn clear_for_tests(&mut self) {
         self.pending.clear();
         self.drain_depth = 0;
+    }
+}
+
+impl Microtask {
+    /// Trace every GC-bearing value slot held by this queued task.
+    pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut otter_gc::RawGc)) {
+        self.callee.trace_value_slots(visitor);
+        self.this_value.trace_value_slots(visitor);
+        for arg in &self.args {
+            arg.trace_value_slots(visitor);
+        }
+        if let Some(capability) = &self.result_capability {
+            capability.resolve.trace_value_slots(visitor);
+            capability.reject.trace_value_slots(visitor);
+        }
+    }
+}
+
+impl MicrotaskQueue {
+    /// Trace every queued task on the sync side. The cross-thread
+    /// inbox is drained into this deque before execution; it is not
+    /// an isolate-local root until folded into `pending`.
+    pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut otter_gc::RawGc)) {
+        for task in &self.pending {
+            task.trace_gc_slots(visitor);
+        }
     }
 }
 

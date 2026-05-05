@@ -8,6 +8,8 @@
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
 //! - Ephemeron registry and split mark/sweep hooks used by weak
 //!   collections in the VM.
+//! - Weak-reference/finalization registry bookkeeping used by VM
+//!   post-mark processing.
 //!
 //! # Invariants
 //!
@@ -36,6 +38,7 @@ use std::time::Instant;
 
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::ephemeron::EphemeronRegistry;
+use crate::finalize::WeakFinalizationRegistry;
 use crate::handle::{GlobalHandle, GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
@@ -134,6 +137,7 @@ pub struct GcHeap {
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
     ephemerons: EphemeronRegistry,
+    weak_finalization: WeakFinalizationRegistry,
     stats: HeapStats,
     gc_stats: GcStats,
     /// Cooperative-cancellation flag; flipped to `true` when the
@@ -182,6 +186,7 @@ impl GcHeap {
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
             ephemerons: EphemeronRegistry::default(),
+            weak_finalization: WeakFinalizationRegistry::default(),
             stats: HeapStats::default(),
             gc_stats: GcStats::default(),
             max_heap_bytes: cap,
@@ -302,6 +307,18 @@ impl GcHeap {
         self.ephemerons.register(table.raw());
     }
 
+    /// Register a GC-managed `WeakRef` body for post-mark clearing.
+    pub fn register_weak_ref<T: ?Sized>(&mut self, weak_ref: Gc<T>) {
+        self.weak_finalization.register_weak_ref(weak_ref.raw());
+    }
+
+    /// Register a GC-managed `FinalizationRegistry` body for
+    /// post-mark cleanup enqueueing.
+    pub fn register_finalization_registry<T: ?Sized>(&mut self, registry: Gc<T>) {
+        self.weak_finalization
+            .register_finalization_registry(registry.raw());
+    }
+
     /// Snapshot registered weak collection tables.
     #[must_use]
     pub fn ephemeron_tables_snapshot(&self) -> Vec<RawGc> {
@@ -312,6 +329,42 @@ impl GcHeap {
     #[must_use]
     pub fn ephemeron_table_count(&self) -> usize {
         self.ephemerons.len()
+    }
+
+    /// Snapshot registered `WeakRef` body handles.
+    #[must_use]
+    pub fn weak_refs_snapshot(&self) -> Vec<RawGc> {
+        self.weak_finalization.weak_refs_snapshot()
+    }
+
+    /// Snapshot registered `FinalizationRegistry` body handles.
+    #[must_use]
+    pub fn finalization_registries_snapshot(&self) -> Vec<RawGc> {
+        self.weak_finalization.finalization_registries_snapshot()
+    }
+
+    /// Whether this heap has ever allocated a finalization registry.
+    #[must_use]
+    pub fn has_finalization_registries(&self) -> bool {
+        self.weak_finalization.has_finalization_registries()
+    }
+
+    /// Whether there is no registered weak-reference/finalization work.
+    #[must_use]
+    pub fn weak_finalization_registry_is_empty(&self) -> bool {
+        self.weak_finalization.is_empty()
+    }
+
+    /// Count registered `WeakRef` bodies.
+    #[must_use]
+    pub fn weak_ref_count(&self) -> usize {
+        self.weak_finalization.weak_ref_count()
+    }
+
+    /// Count registered `FinalizationRegistry` bodies.
+    #[must_use]
+    pub fn finalization_registry_count(&self) -> usize {
+        self.weak_finalization.finalization_registry_count()
     }
 
     /// Reference to the trace table (used by tests).
@@ -761,6 +814,21 @@ impl GcHeap {
         self.ephemerons.retain_marked(|raw| marked.contains(&raw));
     }
 
+    /// Prune weak-reference/finalization registries to handles
+    /// that survived the current mark phase. Must run before sweep
+    /// frees dead bodies.
+    pub fn prune_weak_finalization_registry_to_marked(&mut self) {
+        let marked: std::collections::HashSet<RawGc> = self
+            .weak_finalization
+            .weak_refs_snapshot()
+            .into_iter()
+            .chain(self.weak_finalization.finalization_registries_snapshot())
+            .filter(|raw| self.is_marked(*raw))
+            .collect();
+        self.weak_finalization
+            .retain_marked(|raw| marked.contains(&raw));
+    }
+
     /// Finish a full-GC cycle by sweeping everything left white.
     pub fn sweep_phase(&mut self) {
         self.sweep_phase_with_pause_start(Instant::now());
@@ -768,6 +836,7 @@ impl GcHeap {
 
     fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
         self.prune_ephemeron_registry_to_marked();
+        self.prune_weak_finalization_registry_to_marked();
 
         // Sweep — anything still white in old / large / young
         // is dead. For old-space, walk pages; reap pages whose

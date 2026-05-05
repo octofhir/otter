@@ -280,22 +280,23 @@ keeping Phase 1 small.
 The types whose strong references must be reclaimable:
 
 ```
-Value::Object(JsObject)                         // Rc<RefCell<ObjectBody>> today
-Value::Array(JsArray)                            // Rc<RefCell<ArrayBody>>
-Value::Map(JsMap), ::Set(JsSet)                  // Rc<RefCell<…Body>>
+Value::Object(JsObject)                         // Gc<ObjectBody>
+Value::Array(JsArray)                            // Gc<ArrayBody>
+Value::Map(JsMap), ::Set(JsSet)                  // Gc<…Body>
 Value::WeakMap(JsWeakMap), ::WeakSet(JsWeakSet)  // ephemeron-table-backed
-Value::Promise(JsPromiseHandle::Pure(…))         // Rc<RefCell<PurePromiseBody>>
-Value::Iterator(Rc<RefCell<IteratorState>>)      // 7 places, lib.rs §iterator variants
+Value::Promise(JsPromiseHandle::Pure(…))         // Gc<PurePromiseBody>
+Value::Iterator(Gc<IteratorState>)               // iterator + helper states
+Value::Generator(JsGenerator)                    // Gc<GeneratorBody>
 Value::BoundFunction(Rc<BoundFunction>)
 Value::NativeFunction(Rc<NativeFunction>)
 Value::RegExp(JsRegExp)                          // wraps Rc<…>
-UpvalueCell                                      // Rc<RefCell<Value>>; closures
+UpvalueCell                                      // Gc<UpvalueCellBody>; closures
 JsString (when interned/cons-rope)               // already Arc-shared
 ```
 
-After Phase 1 these become `Gc<T>` opaque handles. `Value` stays an
-`enum` and stays small (`#[derive(Clone)]` cost goes from atomic
-ref-count to a `u32` copy).
+During Phase 1 these become `Gc<T>` opaque handles. `Value` stays an
+`enum` and stays small (`Copy` handles are compressed offsets instead
+of structural ref-count ownership).
 
 ### 4.2 Root sources (the trace begins here)
 
@@ -308,9 +309,9 @@ Enumerated by reading `crates-next/otter-vm/src/lib.rs`:
 | Module URL keys | `Rc<str>` keys — strings, not GC. | No-op for tracing. |
 | Intrinsics table | `RuntimeState::intrinsics` (well-known prototypes/constructors) | Always reachable; treat as global. |
 | Microtask queue | `MicrotaskQueue` entries (closures, promise reactions) | Each microtask carries handles to settled values + handler closures. |
-| Promise reaction graph | reachable transitively from Promises in the microtask queue / parked frames | Phase 1 leaves Promise traversal to `JsPromise::trace_handles`; no special-case. |
+| Promise reaction graph | reachable transitively from Promises in the microtask queue / parked frames | Promise bodies trace state values, reactions, capabilities, and async resume payloads. |
 | Call stack frames | `Interpreter::frames: Vec<Frame>` | Each frame's locals + register window + `this` slot + accumulator + bytecode-module reference. |
-| Parked async/generator frames | `Rc<Cell<Option<Box<Frame>>>>` slots in promise reactions (`lib.rs:4417, 4452`) | Treated as roots while parked. |
+| Parked async/generator frames | GC-managed parked-frame bodies in promise reactions / microtask resume jobs | Treated as roots while parked; host futures never own JS frames. |
 | Dynamic-import host | `module_loader.rs DYNAMIC_IMPORT_HOST` (thread-local) | Guarded; only set during `import()` — trace if `Some`. |
 | Symbol registry | `SymbolRegistry` keyed by description | Symbols are GC-managed; entries are roots while the registry exists. |
 | Active try/catch chain | error values pinned to landing pads | Implicit via frame walk. |

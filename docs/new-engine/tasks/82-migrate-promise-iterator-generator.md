@@ -2,21 +2,23 @@
 
 ## Status
 
-- [ ] `JsPromiseHandle::Pure` body migrated to `Gc<…>`
-- [ ] `IteratorState` migrated to `Gc<…>` (all 7 variants)
-- [ ] generator-frame state migrated to `Gc<…>`
-- [ ] `Rc<RefCell<…>>` removed from `promise.rs`, iterator paths, generator path
-- [ ] parked async/generator frames trace correctly
-- [ ] no parked JS frame or VM handle can be captured by a Rust host future
-- [ ] gates green
+- [x] `JsPromiseHandle::Pure` body migrated to `Gc<…>`
+- [x] `IteratorState` migrated to `Gc<…>` (all variants)
+- [x] generator-frame state migrated to `Gc<…>`
+- [x] `Rc<RefCell<…>>` removed from `promise.rs`, iterator paths, generator path
+- [x] parked async/generator frames trace correctly
+- [x] no parked JS frame or VM handle can be captured by a Rust host future
+- [x] gates green
+
+Closed 2026-05-05. Test262 parity was not part of this task's closing
+gate.
 
 ## Goal
 
 Closes the per-`Value`-variant migrations for Promise/Iterator/Generator.
-These three are bundled because they share the *parked frame* root
-pattern (`Rc<Cell<Option<Box<Frame>>>>` slots in `lib.rs:4417, 4452`)
-that task 75 stubbed out — this task fills in the actual trace
-bodies.
+These three were bundled because they share parked-frame root tracing:
+async and async-generator suspension now park isolate-owned frames in
+GC-traced promise reactions / microtasks instead of hidden Rust cells.
 
 ## Source
 
@@ -34,11 +36,9 @@ bodies.
    }
    impl Traceable for PurePromiseBody { … traces value + each reaction's handler/capability … }
    ```
-2. **`IteratorState`** in `lib.rs` — currently
-   `Rc<RefCell<IteratorState>>` in 7 places. Replace with
-   `Gc<IteratorState>`. The 7 `Value` variants
-   (`Iterator`, ArrayIterator, MapIterator, etc.) all use the same
-   `Gc<IteratorState>` handle.
+2. **`IteratorState`** in `lib.rs` — stored as `Gc<IteratorState>`.
+   Iterator values and iterator-helper wrapper states use the same
+   GC handle shape.
 3. **Generator frame state** in `generator.rs` — frame body becomes
    `Gc<GeneratorBody>`. Trace the suspended frame's locals + register
    window + `this`.
@@ -61,20 +61,23 @@ bodies.
 
 ## Validation gates
 
-- [ ] No `Rc<RefCell<IteratorState>>` / `Rc<RefCell<PurePromiseBody>>`
+- [x] No `Rc<RefCell<IteratorState>>` / `Rc<RefCell<PurePromiseBody>>`
   remaining.
-- [ ] Compile-fail test proves `Frame`, `Value`, `Gc<T>`, and
+- [x] Compile-fail test proves `Frame`, `Value`, `Gc<T>`, and
   `Local<'gc, T>` cannot be captured by a `tokio::spawn` host future.
-- [ ] All Promise / async / iterator / generator engine fixtures
+- [x] All Promise / async / iterator / generator engine fixtures
   pass.
-- [ ] Regression test `tests/gc_promise_chain.rs`: build a 100k-deep
-  promise chain, drop the root, force GC, assert reaped.
-- [ ] Regression test `tests/gc_generator_capture.rs`: a generator
-  whose locals capture itself; drop the outer ref; force GC; assert
+- [x] Regression test
+  `tests/gc_promise_iterator_generator.rs::deep_promise_chain_is_reaped_when_unrooted`:
+  build a 100k-deep promise chain, drop the root, force GC, assert
   reaped.
-- [ ] `gc_roots.rs::microtask_queue_keeps_alive` and
-  `parked_frame_keeps_alive` un-ignored.
-- [ ] `cargo clippy --workspace -- -D warnings` clean.
+- [x] Regression test
+  `tests/gc_promise_iterator_generator.rs::promise_iterator_generator_cycles_reclaimed_when_unrooted`:
+  generator self-capture and promise/iterator cycles are reclaimed
+  when unrooted.
+- [x] `gc_roots.rs::microtask_payload_root_survives_force_gc` and
+  `gc_roots.rs::parked_frame_keeps_alive` enabled.
+- [x] `cargo clippy --workspace -- -D warnings` clean.
 
 ## Closing
 

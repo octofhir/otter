@@ -15,6 +15,7 @@
   - [x] 79 — `JsMap` / `JsSet` → `Gc<MapBody>` / `Gc<SetBody>` + explicit heap API + strong entry tracing + self-cycle regressions (closed 2026-05-05)
   - [x] 80 — `JsWeakMap` / `JsWeakSet` → GC-managed ephemeron tables + split mark/additional/sweep fixpoint + dead-key pruning regressions (closed 2026-05-05)
   - [x] 81 — `WeakRef` / `FinalizationRegistry` GC bodies + weak-finalization registry + microtask cleanup enqueueing + unregister/resurrection/laziness regressions (closed 2026-05-05; Test262 parity deferred)
+  - [x] 82 — `JsPromiseHandle::Pure`, `IteratorState`, generator bodies, and parked async/generator frames migrated to GC-managed trace bodies + promise/iterator/generator cycle/root regressions (closed 2026-05-05)
 - [ ] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
 - [ ] Workers / isolate pools (task 92)
 - [ ] Compile-time GC safety hardening (task 93)
@@ -71,7 +72,7 @@ later tasks assume earlier ones have landed.
 | 79 | ✅ closed (2026-05-05) | `JsMap` / `JsSet` → `Gc<…>`; write barriers on entry stores. |
 | 80 | ✅ closed (2026-05-05) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes "task 57" markers). |
 | 81 | ✅ closed (2026-05-05; Test262 parity deferred) | `WeakRef` + `FinalizationRegistry`. |
-| 82 | [82-migrate-promise-iterator-generator.md](./82-migrate-promise-iterator-generator.md) | `JsPromiseHandle::Pure`, `IteratorState`, generator state; parked frame trace bodies. |
+| 82 | ✅ closed (2026-05-05) | `JsPromiseHandle::Pure`, `IteratorState`, generator state; parked frame trace bodies. |
 | 83 | [83-migrate-bound-native-regexp.md](./83-migrate-bound-native-regexp.md) | `BoundFunction`, `NativeFunction`, `JsRegExp` — last `Rc`-shared variants. |
 | 84 | [84-phase1-closeout-test262-array-sweep.md](./84-phase1-closeout-test262-array-sweep.md) | Phase 1 exit criteria: regression suite + cap-as-`RangeError` + `bash scripts/test262-safe.sh built-ins/Array` end-to-end on a 16 GB host. |
 

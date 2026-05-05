@@ -116,13 +116,9 @@ impl MapKey {
             Value::Object(o) => MapKey::ObjectPtr(o.as_header_ptr() as *const ()),
             Value::Array(a) => MapKey::ObjectPtr(crate::array::identity_addr(*a)),
             Value::RegExp(r) => MapKey::ObjectPtr(r.identity_addr()),
-            Value::Promise(_) => {
-                // Promises do not yet expose a stable `identity_addr`
-                // helper; fall through to display-based hashing —
-                // distinct handles still compare unequal because
-                // `Value::eq` uses `ptr_eq` on the pointer pair.
-                MapKey::ObjectValue(value.clone())
-            }
+            Value::Promise(p) => MapKey::ObjectPtr(p.identity_addr()),
+            Value::Iterator(i) => MapKey::ObjectPtr(i.as_header_ptr() as *const ()),
+            Value::Generator(g) => MapKey::ObjectPtr(g.identity_addr()),
             // Functions, closures, bound functions, native callables,
             // class constructors, iterators — all compare via the
             // originating `Value`'s `PartialEq`, which is identity

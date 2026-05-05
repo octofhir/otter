@@ -88,33 +88,24 @@ fn impl_map_clear(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_map_keys(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let mut heap = args.gc_heap.borrow_mut();
-    Ok(make_iter_value(map_iter_state(
-        MapIterKind::Keys,
-        m,
-        &mut heap,
-    )?))
+    let state = map_iter_state(MapIterKind::Keys, m, &mut heap)?;
+    Ok(make_iter_value(&mut heap, state)?)
 }
 
 /// `Map.prototype.values` — Spec §24.1.3.10.
 fn impl_map_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let mut heap = args.gc_heap.borrow_mut();
-    Ok(make_iter_value(map_iter_state(
-        MapIterKind::Values,
-        m,
-        &mut heap,
-    )?))
+    let state = map_iter_state(MapIterKind::Values, m, &mut heap)?;
+    Ok(make_iter_value(&mut heap, state)?)
 }
 
 /// `Map.prototype.entries` — Spec §24.1.3.4.
 fn impl_map_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let mut heap = args.gc_heap.borrow_mut();
-    Ok(make_iter_value(map_iter_state(
-        MapIterKind::Entries,
-        m,
-        &mut heap,
-    )?))
+    let state = map_iter_state(MapIterKind::Entries, m, &mut heap)?;
+    Ok(make_iter_value(&mut heap, state)?)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,8 +141,11 @@ fn map_iter_state(
     })
 }
 
-fn make_iter_value(state: crate::IteratorState) -> Value {
-    Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(state)))
+fn make_iter_value(
+    heap: &mut otter_gc::GcHeap,
+    state: crate::IteratorState,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    Ok(Value::Iterator(crate::alloc_iterator_state(heap, state)?))
 }
 
 // ---------------------------------------------------------------
@@ -198,10 +192,11 @@ fn impl_set_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
     let mut heap = args.gc_heap.borrow_mut();
     let snap: SmallVec<[Value; 4]> = collections::set_values(s, &heap).into_iter().collect();
-    Ok(make_iter_value(crate::IteratorState::Array {
-        array: crate::array::from_elements(&mut heap, snap)?,
-        index: 0,
-    }))
+    let array = crate::array::from_elements(&mut heap, snap)?;
+    Ok(make_iter_value(
+        &mut heap,
+        crate::IteratorState::Array { array, index: 0 },
+    )?)
 }
 
 /// `Set.prototype.keys` is the same as `values` per spec
@@ -220,10 +215,11 @@ fn impl_set_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let pair = crate::array::from_elements(&mut heap, [v.clone(), v])?;
         snap.push(Value::Array(pair));
     }
-    Ok(make_iter_value(crate::IteratorState::Array {
-        array: crate::array::from_elements(&mut heap, snap)?,
-        index: 0,
-    }))
+    let array = crate::array::from_elements(&mut heap, snap)?;
+    Ok(make_iter_value(
+        &mut heap,
+        crate::IteratorState::Array { array, index: 0 },
+    )?)
 }
 
 // ---------------------------------------------------------------
@@ -450,11 +446,8 @@ pub fn load_property_with_heap(value: &Value, name: &str, heap: &otter_gc::GcHea
 #[must_use]
 pub fn make_map_iterator_factory(map: JsMap) -> Value {
     native_value("Map[Symbol.iterator]", move |vm, _| {
-        Ok(make_iter_value(map_iter_state(
-            MapIterKind::Entries,
-            map,
-            vm.gc_heap_mut(),
-        )?))
+        let state = map_iter_state(MapIterKind::Entries, map, vm.gc_heap_mut())?;
+        Ok(make_iter_value(vm.gc_heap_mut(), state)?)
     })
 }
 
@@ -466,9 +459,10 @@ pub fn make_set_iterator_factory(set: JsSet) -> Value {
         let snap: SmallVec<[Value; 4]> = collections::set_values(set, vm.gc_heap())
             .into_iter()
             .collect();
-        Ok(make_iter_value(crate::IteratorState::Array {
-            array: crate::array::from_elements(vm.gc_heap_mut(), snap)?,
-            index: 0,
-        }))
+        let array = crate::array::from_elements(vm.gc_heap_mut(), snap)?;
+        Ok(make_iter_value(
+            vm.gc_heap_mut(),
+            crate::IteratorState::Array { array, index: 0 },
+        )?)
     })
 }

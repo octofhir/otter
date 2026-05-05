@@ -48,24 +48,26 @@ use crate::{Interpreter, Microtask, Value};
 ///
 /// The executor itself is invoked by the caller (the VM
 /// dispatcher) — this function only produces the value plumbing.
-#[must_use]
-pub fn construct() -> (JsPromiseHandle, Value, Value) {
-    let promise = JsPromiseHandle::pending();
-    let resolve = make_resolve_native(promise.clone());
-    let reject = make_reject_native(promise.clone());
-    (promise, resolve, reject)
+pub fn construct(
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
+    let promise = JsPromiseHandle::pending(heap)?;
+    let resolve = make_resolve_native(promise);
+    let reject = make_reject_native(promise);
+    Ok((promise, resolve, reject))
 }
 
 /// `NewPromiseCapability` — produce the `{promise, resolve,
 /// reject}` triple over a fresh pending promise.
-#[must_use]
-pub fn make_capability() -> PromiseCapability {
-    let (handle, resolve, reject) = construct();
-    PromiseCapability {
+pub fn make_capability(
+    heap: &mut otter_gc::GcHeap,
+) -> Result<PromiseCapability, otter_gc::OutOfMemory> {
+    let (handle, resolve, reject) = construct(heap)?;
+    Ok(PromiseCapability {
         promise: Value::Promise(handle),
         resolve,
         reject,
-    }
+    })
 }
 
 /// Dispatch a `Promise.<name>(args...)` static call. Mirrors
@@ -76,13 +78,13 @@ pub fn statics_call(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     match name {
-        "resolve" => Ok(Value::Promise(static_resolve(args))),
-        "reject" => Ok(Value::Promise(static_reject(args))),
-        "all" => Ok(static_all(interp, args)),
-        "race" => Ok(static_race(interp, args)),
-        "allSettled" => Ok(static_all_settled(interp, args)),
-        "any" => Ok(static_any(interp, args)),
-        "withResolvers" => Ok(static_with_resolvers(interp)),
+        "resolve" => Ok(Value::Promise(static_resolve(interp, args)?)),
+        "reject" => Ok(Value::Promise(static_reject(interp, args)?)),
+        "all" => static_all(interp, args),
+        "race" => static_race(interp, args),
+        "allSettled" => static_all_settled(interp, args),
+        "any" => static_any(interp, args),
+        "withResolvers" => static_with_resolvers(interp),
         other => Err(NativeError::TypeError {
             name: "Promise",
             reason: format!("static `{other}` is not defined"),
@@ -112,22 +114,25 @@ pub fn prototype_call(
 
 // -- statics --------------------------------------------------------
 
-fn static_resolve(args: &[Value]) -> JsPromiseHandle {
+fn static_resolve(
+    interp: &mut Interpreter,
+    args: &[Value],
+) -> Result<JsPromiseHandle, NativeError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     // Spec: if `value` is already a Promise we'd return it
     // unchanged. Foundation matches that for our concrete handle.
     if let Value::Promise(p) = &value {
-        return p.clone();
+        return Ok(*p);
     }
-    JsPromiseHandle::fulfilled(value)
+    Ok(JsPromiseHandle::fulfilled(interp.gc_heap_mut(), value)?)
 }
 
-fn static_reject(args: &[Value]) -> JsPromiseHandle {
+fn static_reject(interp: &mut Interpreter, args: &[Value]) -> Result<JsPromiseHandle, NativeError> {
     let reason = args.first().cloned().unwrap_or(Value::Undefined);
-    JsPromiseHandle::rejected(reason)
+    Ok(JsPromiseHandle::rejected(interp.gc_heap_mut(), reason)?)
 }
 
-fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
+fn static_all(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeError> {
     let entries = match args.first() {
         Some(Value::Array(arr)) => {
             crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
@@ -135,21 +140,29 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
         _ => {
             // Foundation: only array iterables. Generic iterables
             // arrive once `Symbol.iterator` is in.
-            return Value::Promise(JsPromiseHandle::rejected(Value::Undefined));
+            return Ok(Value::Promise(JsPromiseHandle::rejected(
+                interp.gc_heap_mut(),
+                Value::Undefined,
+            )?));
         }
     };
-    let result = JsPromiseHandle::pending();
+    let result = JsPromiseHandle::pending(interp.gc_heap_mut())?;
     if entries.is_empty() {
         // Spec: empty iterable resolves immediately with [].
         let arr = match crate::array::alloc_array(interp.gc_heap_for_cx_mut()) {
             Ok(arr) => arr,
-            Err(_) => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+            Err(_) => {
+                return Ok(Value::Promise(JsPromiseHandle::rejected(
+                    interp.gc_heap_mut(),
+                    Value::Undefined,
+                )?));
+            }
         };
-        let jobs = result.fulfill(Value::Array(arr));
+        let jobs = result.fulfill(interp.gc_heap_mut(), Value::Array(arr));
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
         }
-        return Value::Promise(result);
+        return Ok(Value::Promise(result));
     }
     // Track per-slot fulfillment via a shared `Rc<RefCell<...>>`
     // that the per-element resolver mutates. Foundation `Rc`
@@ -162,10 +175,10 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
     for (i, entry) in entries.into_iter().enumerate() {
         let slots = slots.clone();
         let remaining = remaining.clone();
-        let result_clone = result.clone();
+        let result_clone = result;
         let entry_promise = match entry {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(other),
+            other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
         let on_fulfill = native_value("Promise.all element", move |interp, args| {
             let v = args.first().cloned().unwrap_or(Value::Undefined);
@@ -180,17 +193,17 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
                     .collect();
                 drop(slots_mut);
                 let arr = crate::array::from_elements(interp.gc_heap_mut(), collected)?;
-                let jobs = result_clone.fulfill(Value::Array(arr));
+                let jobs = result_clone.fulfill(interp.gc_heap_mut(), Value::Array(arr));
                 for j in jobs.jobs {
                     interp.microtasks_mut().enqueue(j);
                 }
             }
             Ok(Value::Undefined)
         });
-        let result_for_reject = result.clone();
+        let result_for_reject = result;
         let on_reject = native_value("Promise.all reject", move |interp, args| {
             let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            let jobs = result_for_reject.reject(reason);
+            let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
             for j in jobs.jobs {
                 interp.microtasks_mut().enqueue(j);
             }
@@ -198,35 +211,40 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
         });
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
-    Value::Promise(result)
+    Ok(Value::Promise(result))
 }
 
-fn static_race(interp: &mut Interpreter, args: &[Value]) -> Value {
+fn static_race(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeError> {
     let entries = match args.first() {
         Some(Value::Array(arr)) => {
             crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
         }
-        _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+        _ => {
+            return Ok(Value::Promise(JsPromiseHandle::rejected(
+                interp.gc_heap_mut(),
+                Value::Undefined,
+            )?));
+        }
     };
-    let result = JsPromiseHandle::pending();
+    let result = JsPromiseHandle::pending(interp.gc_heap_mut())?;
     for entry in entries {
         let entry_promise = match entry {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(other),
+            other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
-        let result_for_fulfill = result.clone();
+        let result_for_fulfill = result;
         let on_fulfill = native_value("Promise.race fulfill", move |interp, args| {
             let v = args.first().cloned().unwrap_or(Value::Undefined);
-            let jobs = result_for_fulfill.fulfill(v);
+            let jobs = result_for_fulfill.fulfill(interp.gc_heap_mut(), v);
             for j in jobs.jobs {
                 interp.microtasks_mut().enqueue(j);
             }
             Ok(Value::Undefined)
         });
-        let result_for_reject = result.clone();
+        let result_for_reject = result;
         let on_reject = native_value("Promise.race reject", move |interp, args| {
             let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            let jobs = result_for_reject.reject(reason);
+            let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
             for j in jobs.jobs {
                 interp.microtasks_mut().enqueue(j);
             }
@@ -234,7 +252,7 @@ fn static_race(interp: &mut Interpreter, args: &[Value]) -> Value {
         });
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
-    Value::Promise(result)
+    Ok(Value::Promise(result))
 }
 
 /// §27.2.4.2 `Promise.allSettled(iterable)` — settle with an array
@@ -243,24 +261,34 @@ fn static_race(interp: &mut Interpreter, args: &[Value]) -> Value {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.allsettled>
-fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
+fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeError> {
     let entries = match args.first() {
         Some(Value::Array(arr)) => {
             crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
         }
-        _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+        _ => {
+            return Ok(Value::Promise(JsPromiseHandle::rejected(
+                interp.gc_heap_mut(),
+                Value::Undefined,
+            )?));
+        }
     };
-    let result = JsPromiseHandle::pending();
+    let result = JsPromiseHandle::pending(interp.gc_heap_mut())?;
     if entries.is_empty() {
         let arr = match crate::array::alloc_array(interp.gc_heap_for_cx_mut()) {
             Ok(arr) => arr,
-            Err(_) => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+            Err(_) => {
+                return Ok(Value::Promise(JsPromiseHandle::rejected(
+                    interp.gc_heap_mut(),
+                    Value::Undefined,
+                )?));
+            }
         };
-        let jobs = result.fulfill(Value::Array(arr));
+        let jobs = result.fulfill(interp.gc_heap_mut(), Value::Array(arr));
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
         }
-        return Value::Promise(result);
+        return Ok(Value::Promise(result));
     }
     let total = entries.len();
     let slots: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
@@ -271,12 +299,11 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
     for (i, entry) in entries.into_iter().enumerate() {
         let entry_promise = match entry {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(other),
+            other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
         let on_fulfill = {
             let slots = slots.clone();
             let remaining = remaining.clone();
-            let result = result.clone();
             let heap = heap.clone();
             native_value("Promise.allSettled fulfill", move |interp, args| {
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
@@ -292,7 +319,6 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
         let on_reject = {
             let slots = slots.clone();
             let remaining = remaining.clone();
-            let result = result.clone();
             let heap = heap.clone();
             native_value("Promise.allSettled reject", move |interp, args| {
                 let r = args.first().cloned().unwrap_or(Value::Undefined);
@@ -307,7 +333,7 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
         };
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
-    Value::Promise(result)
+    Ok(Value::Promise(result))
 }
 
 fn build_settled_record(
@@ -355,7 +381,7 @@ fn finalize_settled(
             Ok(arr) => arr,
             Err(_) => return,
         };
-        let jobs = result.fulfill(Value::Array(arr));
+        let jobs = result.fulfill(interp.gc_heap_mut(), Value::Array(arr));
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
         }
@@ -368,14 +394,19 @@ fn finalize_settled(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.any>
-fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
+fn static_any(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeError> {
     let entries = match args.first() {
         Some(Value::Array(arr)) => {
             crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
         }
-        _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+        _ => {
+            return Ok(Value::Promise(JsPromiseHandle::rejected(
+                interp.gc_heap_mut(),
+                Value::Undefined,
+            )?));
+        }
     };
-    let result = JsPromiseHandle::pending();
+    let result = JsPromiseHandle::pending(interp.gc_heap_mut())?;
     if entries.is_empty() {
         // Spec: empty iterable rejects with an AggregateError whose
         // `errors` array is empty.
@@ -392,11 +423,11 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
                 Err(_) => Value::Undefined,
             }
         };
-        let jobs = result.reject(agg);
+        let jobs = result.reject(interp.gc_heap_mut(), agg);
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
         }
-        return Value::Promise(result);
+        return Ok(Value::Promise(result));
     }
     let total = entries.len();
     let errors: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
@@ -408,13 +439,12 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
     for (i, entry) in entries.into_iter().enumerate() {
         let entry_promise = match entry {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(other),
+            other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
         let on_fulfill = {
-            let result = result.clone();
             native_value("Promise.any fulfill", move |interp, args| {
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let jobs = result.fulfill(v);
+                let jobs = result.fulfill(interp.gc_heap_mut(), v);
                 for j in jobs.jobs {
                     interp.microtasks_mut().enqueue(j);
                 }
@@ -424,7 +454,6 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
         let on_reject = {
             let errors = errors.clone();
             let remaining = remaining.clone();
-            let result = result.clone();
             let heap = heap.clone();
             let registry = registry.clone();
             native_value("Promise.any reject", move |interp, args| {
@@ -453,7 +482,7 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
                             name: "Promise",
                             reason: format!("string allocation failed: {e}"),
                         })?;
-                    let jobs = result.reject(Value::Object(agg));
+                    let jobs = result.reject(interp.gc_heap_mut(), Value::Object(agg));
                     for j in jobs.jobs {
                         interp.microtasks_mut().enqueue(j);
                     }
@@ -463,7 +492,7 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
         };
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
-    Value::Promise(result)
+    Ok(Value::Promise(result))
 }
 
 /// §27.2.4.6 `Promise.withResolvers()` — returns
@@ -471,17 +500,17 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.withResolvers>
-fn static_with_resolvers(interp: &mut Interpreter) -> Value {
-    let cap = make_capability();
+fn static_with_resolvers(interp: &mut Interpreter) -> Result<Value, NativeError> {
+    let cap = make_capability(interp.gc_heap_mut())?;
     let gc_heap = interp.gc_heap_for_cx_mut();
     let obj = match crate::object::alloc_object(gc_heap) {
         Ok(o) => o,
-        Err(_) => return Value::Undefined,
+        Err(_) => return Ok(Value::Undefined),
     };
     crate::object::set(obj, gc_heap, "promise", cap.promise);
     crate::object::set(obj, gc_heap, "resolve", cap.resolve);
     crate::object::set(obj, gc_heap, "reject", cap.reject);
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 // -- prototype methods ---------------------------------------------
@@ -549,7 +578,10 @@ fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[V
             // promise. The resolve-native adopts the returned
             // promise's state, so a rejected handle propagates as
             // expected.
-            Ok(Value::Promise(JsPromiseHandle::rejected(reason)))
+            Ok(Value::Promise(JsPromiseHandle::rejected(
+                interp.gc_heap_mut(),
+                reason,
+            )?))
         })
     };
     perform_then_with_handlers(interp, promise, Some(then_handler), Some(catch_handler))
@@ -563,9 +595,16 @@ fn perform_then_with_handlers(
     on_fulfilled: Option<Value>,
     on_rejected: Option<Value>,
 ) -> Value {
-    let capability = make_capability();
-    let outcome: PromiseThenOutcome =
-        promise.perform_then(on_fulfilled, on_rejected, capability.clone());
+    let capability = match make_capability(interp.gc_heap_mut()) {
+        Ok(cap) => cap,
+        Err(_) => return Value::Undefined,
+    };
+    let outcome: PromiseThenOutcome = promise.perform_then(
+        interp.gc_heap_mut(),
+        on_fulfilled,
+        on_rejected,
+        capability.clone(),
+    );
     if let Some(job) = outcome.immediate_job {
         interp.microtasks_mut().enqueue(job);
     }
@@ -581,8 +620,11 @@ fn attach_then(
     // Reusable "result-of-then" path that the combinators don't
     // expose to user code. We still need a capability so the
     // reaction has somewhere to settle, even if we never read it.
-    let capability = make_capability();
-    let outcome = promise.perform_then(on_fulfilled, on_rejected, capability);
+    let capability = match make_capability(interp.gc_heap_mut()) {
+        Ok(cap) => cap,
+        Err(_) => return,
+    };
+    let outcome = promise.perform_then(interp.gc_heap_mut(), on_fulfilled, on_rejected, capability);
     if let Some(job) = outcome.immediate_job {
         interp.microtasks_mut().enqueue(job);
     }
@@ -590,31 +632,34 @@ fn attach_then(
 
 fn make_resolve_native(promise: JsPromiseHandle) -> Value {
     native_value("Promise resolve", move |interp, args| {
-        if matches!(promise.state(), PromiseState::Pending) {
+        if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             // If the resolved value is itself a promise, adopt its
             // state. Spec §27.2.1.4 step 8: schedule a job that
             // forwards. Foundation: fulfill directly with the
             // inner value once that promise settles.
             if let Value::Promise(inner) = &value {
-                let resolver = promise.clone();
+                let resolver = promise;
                 let on_fulfill =
                     native_value("Promise resolve adopt fulfill", move |interp, args| {
                         let v = args.first().cloned().unwrap_or(Value::Undefined);
-                        drain_jobs(interp, resolver.fulfill(v));
+                        let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
+                        drain_jobs(interp, jobs);
                         Ok(Value::Undefined)
                     });
-                let resolver_for_reject = promise.clone();
+                let resolver_for_reject = promise;
                 let on_reject =
                     native_value("Promise resolve adopt reject", move |interp, args| {
                         let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                        drain_jobs(interp, resolver_for_reject.reject(reason));
+                        let jobs = resolver_for_reject.reject(interp.gc_heap_mut(), reason);
+                        drain_jobs(interp, jobs);
                         Ok(Value::Undefined)
                     });
                 attach_then(interp, inner, Some(on_fulfill), Some(on_reject));
                 return Ok(Value::Undefined);
             }
-            drain_jobs(interp, promise.fulfill(value));
+            let jobs = promise.fulfill(interp.gc_heap_mut(), value);
+            drain_jobs(interp, jobs);
         }
         Ok(Value::Undefined)
     })
@@ -622,9 +667,10 @@ fn make_resolve_native(promise: JsPromiseHandle) -> Value {
 
 fn make_reject_native(promise: JsPromiseHandle) -> Value {
     native_value("Promise reject", move |interp, args| {
-        if matches!(promise.state(), PromiseState::Pending) {
+        if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
             let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            drain_jobs(interp, promise.reject(reason));
+            let jobs = promise.reject(interp.gc_heap_mut(), reason);
+            drain_jobs(interp, jobs);
         }
         Ok(Value::Undefined)
     })

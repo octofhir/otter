@@ -164,24 +164,33 @@ impl GcTrace for JsFinalizationRegistry {
 }
 
 impl GcTrace for JsPromiseHandle {
-    /// Stub — body lands with task 82 (promise / iterator /
-    /// generator migration).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsPromiseHandle as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for PurePromise {
-    /// Stub — body lands with task 82.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const PurePromise as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for IteratorState {
-    /// Stub — body lands with task 82.
+    /// Iterator bodies are traced by `SafeTraceable`; roots carry
+    /// `IteratorHandle` slots through `Value::Iterator`.
     fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
 }
 
 impl GcTrace for JsGenerator {
-    /// Stub — body lands with task 82.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsGenerator as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for BoundFunction {
@@ -201,15 +210,17 @@ impl GcTrace for JsRegExp {
 }
 
 impl GcTrace for Frame {
-    /// Stub — body lands incrementally as locals / register
-    /// window / accumulator / `this` migrate (task 76+).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Trace frame locals, registers, receiver, and parked state.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_frame_slots(visitor);
+    }
 }
 
 impl GcTrace for AsyncFrameState {
-    /// Stub — body lands with task 82 (async / generator
-    /// parked-frame migration).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Trace async result promise.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.result_promise.trace_gc_roots(visitor);
+    }
 }
 
 impl GcTrace for Microtask {

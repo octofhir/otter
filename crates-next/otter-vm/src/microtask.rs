@@ -378,6 +378,14 @@ impl Microtask {
             capability.resolve.trace_value_slots(visitor);
             capability.reject.trace_value_slots(visitor);
         }
+        match &self.kind {
+            MicrotaskKind::Call | MicrotaskKind::FinalizationCallback => {}
+            MicrotaskKind::AsyncResume { frame, .. } => frame.trace_frame_slots(visitor),
+            MicrotaskKind::AsyncGenResume { frame, owner, .. } => {
+                frame.trace_frame_slots(visitor);
+                owner.trace_value_slots(visitor);
+            }
+        }
     }
 }
 

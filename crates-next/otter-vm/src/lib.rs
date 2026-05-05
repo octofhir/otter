@@ -193,7 +193,7 @@ pub enum Value {
     /// models iterators out-of-band as a dedicated value variant
     /// — they are not addressable via `o[@@iterator]` from user
     /// code.
-    Iterator(std::rc::Rc<std::cell::RefCell<IteratorState>>),
+    Iterator(IteratorHandle),
     /// Compiled regular-expression value, produced by
     /// [`otter_bytecode::Op::LoadRegExp`] reading a pooled
     /// [`otter_bytecode::Constant::RegExp`]. Identity is by handle:
@@ -323,6 +323,12 @@ pub struct ClassConstructor {
     pub statics: JsObject,
 }
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`IteratorState`].
+pub const ITERATOR_STATE_TYPE_TAG: u8 = 0x1c;
+
+/// Heap-shared iterator state handle.
+pub type IteratorHandle = otter_gc::Gc<IteratorState>;
+
 /// Foundation iterator-state machine. Each variant carries the
 /// minimum information needed to advance one step at a time. Once
 /// the iterator reports `done`, subsequent calls keep returning
@@ -331,7 +337,7 @@ pub struct ClassConstructor {
 pub enum IteratorState {
     /// Walks `array`'s dense storage in insertion order.
     Array {
-        /// Backing array — held by `JsArray`'s internal `Rc` so
+        /// Backing array — held by `JsArray`'s GC handle so
         /// mutation through the original handle is observable.
         array: JsArray,
         /// Next element index to read. Compared against the
@@ -374,7 +380,7 @@ pub enum IteratorState {
     /// Pulls from `source` and applies `mapper` on every step.
     Map {
         /// Underlying iterator handle.
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         /// Per-element mapper. Must be callable.
         mapper: Value,
     },
@@ -382,7 +388,7 @@ pub enum IteratorState {
     /// Skips elements for which `predicate` returns falsey.
     Filter {
         /// Underlying iterator handle.
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         /// Per-element predicate. Must be callable.
         predicate: Value,
     },
@@ -390,7 +396,7 @@ pub enum IteratorState {
     /// `remaining` more elements from `source`.
     Take {
         /// Underlying iterator handle.
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         /// Steps still allowed before the wrapper reports `done`.
         remaining: u64,
     },
@@ -398,7 +404,7 @@ pub enum IteratorState {
     /// first `to_drop` elements of `source` then forwards the rest.
     Drop {
         /// Underlying iterator handle.
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         /// Elements still to discard before forwarding kicks in.
         to_drop: u64,
     },
@@ -419,13 +425,64 @@ pub enum IteratorState {
     /// other values flow through directly.
     FlatMap {
         /// Underlying iterator handle.
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         /// Per-element mapper. Must be callable.
         mapper: Value,
         /// Inner iterator currently being drained, when the last
         /// `mapper` call produced an iterable.
-        inner: Option<std::rc::Rc<std::cell::RefCell<IteratorState>>>,
+        inner: Option<IteratorHandle>,
     },
+}
+
+impl otter_gc::SafeTraceable for IteratorState {
+    const TYPE_TAG: u8 = ITERATOR_STATE_TYPE_TAG;
+
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        match self {
+            IteratorState::Array { array, .. } => {
+                let p = array as *const JsArray as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            IteratorState::String { .. } | IteratorState::Exhausted => {}
+            IteratorState::User { iterator } => iterator.trace_value_slots(visitor),
+            IteratorState::Map { source, mapper } => {
+                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                visitor(p);
+                mapper.trace_value_slots(visitor);
+            }
+            IteratorState::Filter { source, predicate } => {
+                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                visitor(p);
+                predicate.trace_value_slots(visitor);
+            }
+            IteratorState::Take { source, .. } | IteratorState::Drop { source, .. } => {
+                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            IteratorState::Generator { handle } => handle.trace_value_slots(visitor),
+            IteratorState::FlatMap {
+                source,
+                mapper,
+                inner,
+            } => {
+                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                visitor(p);
+                mapper.trace_value_slots(visitor);
+                if let Some(inner) = inner {
+                    let p = inner as *const IteratorHandle as *mut otter_gc::RawGc;
+                    visitor(p);
+                }
+            }
+        }
+    }
+}
+
+/// Allocate a GC-managed iterator state.
+pub fn alloc_iterator_state(
+    heap: &mut otter_gc::GcHeap,
+    state: IteratorState,
+) -> Result<IteratorHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(state)
 }
 
 /// Storage for `Value::BoundFunction`. Constructed by the
@@ -581,6 +638,9 @@ impl Value {
             Value::WeakSet(s) => Some(s.raw()),
             Value::WeakRef(w) => Some(w.raw()),
             Value::FinalizationRegistry(r) => Some(r.raw()),
+            Value::Promise(p) => Some(p.raw()),
+            Value::Iterator(i) => Some(i.raw()),
+            Value::Generator(g) => Some(g.raw()),
             // Phase-1 stub for the rest. Subsequent migrations
             // (78+) add variant arms here as their handle types
             // move to `Gc<…>`.
@@ -648,6 +708,17 @@ impl Value {
             Value::FinalizationRegistry(r) => {
                 let p = r as *const JsFinalizationRegistry as *mut otter_gc::RawGc;
                 visitor(p);
+            }
+            Value::Promise(promise) => {
+                let p = promise as *const JsPromiseHandle as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::Iterator(iterator) => {
+                let p = iterator as *const IteratorHandle as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::Generator(generator) => {
+                generator.trace_value_slots(visitor);
             }
             _ => {}
         }
@@ -906,7 +977,7 @@ impl PartialEq for Value {
             (Value::BoundFunction(a), Value::BoundFunction(b)) => std::rc::Rc::ptr_eq(a, b),
             (Value::NativeFunction(a), Value::NativeFunction(b)) => std::rc::Rc::ptr_eq(a, b),
             (Value::Promise(a), Value::Promise(b)) => a.ptr_eq(b as &dyn JsPromise),
-            (Value::Iterator(a), Value::Iterator(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::Iterator(a), Value::Iterator(b)) => a == b,
             (Value::RegExp(a), Value::RegExp(b)) => a.ptr_eq(b),
             (Value::ClassConstructor(a), Value::ClassConstructor(b)) => std::rc::Rc::ptr_eq(a, b),
             (Value::Map(a), Value::Map(b)) => crate::collections::map_ptr_eq(*a, *b),
@@ -1320,6 +1391,44 @@ impl Frame {
             pending_get_iterator: None,
             pending_iterator_next: None,
             generator_owner: None,
+        }
+    }
+
+    /// Trace locals, register window, receiver, parked side-channel
+    /// values, and nested generator / async state held by this frame.
+    pub(crate) fn trace_frame_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        for value in &self.registers {
+            value.trace_value_slots(visitor);
+        }
+        for slot in self.upvalues.iter() {
+            let p = slot as *const UpvalueCell as *mut otter_gc::RawGc;
+            visitor(p);
+        }
+        self.this_value.trace_value_slots(visitor);
+        for value in &self.rest_args {
+            value.trace_value_slots(visitor);
+        }
+        for value in &self.incoming_args {
+            value.trace_value_slots(visitor);
+        }
+        if let Some(value) = &self.pending_throw {
+            value.trace_value_slots(visitor);
+        }
+        if let Some(obj) = &self.construct_target {
+            let p = obj as *const JsObject as *mut otter_gc::RawGc;
+            visitor(p);
+        }
+        if let Some(async_state) = &self.async_state {
+            async_state.result_promise.trace_value_slots(visitor);
+        }
+        if let Some(pending) = &self.pending_to_primitive {
+            pending.obj.trace_value_slots(visitor);
+        }
+        if let Some(pending) = &self.pending_iterator_next {
+            pending.iterator.trace_value_slots(visitor);
+        }
+        if let Some(owner) = &self.generator_owner {
+            owner.trace_value_slots(visitor);
         }
     }
 }
@@ -2272,9 +2381,10 @@ impl Interpreter {
         // The dispatch loop's exit returns the result promise's
         // resolved value once microtasks drain.
         let entry_promise = if main.is_async {
-            let result = JsPromiseHandle::pending();
+            let result = JsPromiseHandle::pending(&mut self.gc_heap)
+                .map_err(|oom| (VmError::from(oom), Vec::new()))?;
             entry.async_state = Some(AsyncFrameState {
-                result_promise: result.clone(),
+                result_promise: result,
             });
             Some(result)
         } else {
@@ -2292,7 +2402,7 @@ impl Interpreter {
                     if let Err(err) = self.drain_microtasks(module) {
                         return Err((err.error, err.frames));
                     }
-                    match promise.state() {
+                    match promise.state(&self.gc_heap) {
                         crate::promise::PromiseState::Fulfilled(v) => return Ok(v),
                         crate::promise::PromiseState::Rejected(reason) => {
                             return Err((
@@ -2518,19 +2628,16 @@ impl Interpreter {
                     let src = register_operand(operands.get(1))?;
                     let yielded = read_register(&stack[top_idx], src)?.clone();
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    let owner = frame.generator_owner.clone().ok_or(VmError::TypeMismatch)?;
+                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let popped = stack.pop().expect("frame present");
-                    let pending_request_resolve = {
-                        let mut body = owner.borrow_mut();
-                        body.frame = Some(popped);
-                        body.resume_dst = dst;
-                        body.yielded = Some(yielded.clone());
-                        if body.is_async {
-                            body.pending_request.take().map(|cap| cap.resolve)
-                        } else {
-                            None
-                        }
+                    owner.park_after_yield(&mut self.gc_heap, popped, dst, yielded.clone());
+                    let pending_request_resolve = if owner.is_async(&self.gc_heap) {
+                        owner
+                            .take_pending_request(&mut self.gc_heap)
+                            .map(|cap| cap.resolve)
+                    } else {
+                        None
                     };
                     // §27.6 — async-generator yield settles the
                     // outer `.next()` promise immediately with
@@ -4066,7 +4173,7 @@ impl Interpreter {
                     if !is_callable(&executor) {
                         return Err(VmError::NotCallable);
                     }
-                    let (handle, resolve, reject) = promise_dispatch::construct();
+                    let (handle, resolve, reject) = promise_dispatch::construct(&mut self.gc_heap)?;
                     let promise_value = Value::Promise(handle);
                     write_register(frame, dst, promise_value)?;
                     // Advance pc, then invoke executor with [resolve, reject].
@@ -4240,7 +4347,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
                     let value = read_register(frame, src)?.clone();
-                    let promise = JsPromiseHandle::fulfilled(value);
+                    let promise = JsPromiseHandle::fulfilled(&mut self.gc_heap, value)?;
                     write_register(frame, dst, Value::Promise(promise))?;
                     frame.pc += 1;
                 }
@@ -4382,7 +4489,7 @@ impl Interpreter {
                         }
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let iter = std::rc::Rc::new(std::cell::RefCell::new(state));
+                    let iter = alloc_iterator_state(&mut self.gc_heap, state)?;
                     write_register(frame, dst, Value::Iterator(iter))?;
                     frame.pc += 1;
                 }
@@ -4391,10 +4498,10 @@ impl Interpreter {
                     let done_dst = register_operand(operands.get(1))?;
                     let iter_reg = register_operand(operands.get(2))?;
                     let iter = match read_register(frame, iter_reg)? {
-                        Value::Iterator(rc) => rc.clone(),
+                        Value::Iterator(rc) => *rc,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let (value, done) = step_iterator(&iter, &self.string_heap, &self.gc_heap)?;
+                    let (value, done) = step_iterator(iter, &self.string_heap, &mut self.gc_heap)?;
                     write_register(frame, value_dst, value)?;
                     write_register(frame, done_dst, Value::Boolean(done))?;
                     frame.pc += 1;
@@ -4594,7 +4701,7 @@ impl Interpreter {
             None => value,
         };
         if let Some(state) = popped.async_state {
-            let jobs = state.result_promise.fulfill(resolved);
+            let jobs = state.result_promise.fulfill(&mut self.gc_heap, resolved);
             for j in jobs.jobs {
                 self.microtasks.enqueue(j);
             }
@@ -4771,8 +4878,8 @@ impl Interpreter {
         // `return_register = None` so its eventual completion
         // settles the promise instead of writing back.
         let (return_register, async_state) = if function.is_async {
-            let result_promise = JsPromiseHandle::pending();
-            let promise_value = Value::Promise(result_promise.clone());
+            let result_promise = JsPromiseHandle::pending(&mut self.gc_heap)?;
+            let promise_value = Value::Promise(result_promise);
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, promise_value)?;
             (None, Some(AsyncFrameState { result_promise }))
@@ -4820,16 +4927,11 @@ impl Interpreter {
         if function.is_generator {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
-            let gen_handle = crate::generator::JsGenerator::new(new_frame);
-            gen_handle.borrow_mut().is_async = async_gen;
+            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, new_frame)?;
+            gen_handle.set_async(&mut self.gc_heap, async_gen);
             // Backlink the generator into the frame so `Op::Yield`
             // can find its owner once execution starts.
-            {
-                let mut body = gen_handle.borrow_mut();
-                if let Some(frame) = body.frame.as_mut() {
-                    frame.generator_owner = Some(gen_handle.clone());
-                }
-            }
+            gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
             return Ok(());
@@ -4888,8 +4990,8 @@ impl Interpreter {
         // outer `pending_request` from a subsequent `Op::Yield` /
         // completion, or chains another `Op::Await`.
         if stack[top_idx].async_state.is_none() {
-            if let Some(owner) = stack[top_idx].generator_owner.clone() {
-                if owner.borrow().is_async {
+            if let Some(owner) = stack[top_idx].generator_owner {
+                if owner.is_async(&self.gc_heap) {
                     return self.do_await_async_gen(stack, dst, awaited, owner);
                 }
             }
@@ -4904,19 +5006,12 @@ impl Interpreter {
         let parked = stack.pop().expect("top frame existed");
         let promise = match awaited {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(other),
+            other => JsPromiseHandle::fulfilled(&mut self.gc_heap, other)?,
         };
-
-        // Share the parked frame between the two reaction
-        // closures. Whichever reaction the runtime invokes first
-        // takes the box; the other observes `None` and short-circuits.
-        let parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>> =
-            std::rc::Rc::new(std::cell::Cell::new(Some(Box::new(parked))));
-
-        let resume_native = make_async_resume_native(parked_slot.clone(), dst, true);
-        let reject_native = make_async_resume_native(parked_slot, dst, false);
-        let capability = promise_dispatch::make_capability();
-        let outcome = promise.perform_then(Some(resume_native), Some(reject_native), capability);
+        let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
+        let capability = promise_dispatch::make_capability(&mut self.gc_heap)?;
+        let outcome =
+            promise.perform_async_resume_then(&mut self.gc_heap, parked, dst, capability, None);
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
         }
@@ -4943,15 +5038,17 @@ impl Interpreter {
         let parked = stack.pop().expect("top frame existed");
         let promise = match awaited {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(other),
+            other => JsPromiseHandle::fulfilled(&mut self.gc_heap, other)?,
         };
-        let parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>> =
-            std::rc::Rc::new(std::cell::Cell::new(Some(Box::new(parked))));
-        let resume_native =
-            make_async_gen_resume_native(parked_slot.clone(), dst, owner.clone(), true);
-        let reject_native = make_async_gen_resume_native(parked_slot, dst, owner, false);
-        let capability = promise_dispatch::make_capability();
-        let outcome = promise.perform_then(Some(resume_native), Some(reject_native), capability);
+        let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
+        let capability = promise_dispatch::make_capability(&mut self.gc_heap)?;
+        let outcome = promise.perform_async_resume_then(
+            &mut self.gc_heap,
+            parked,
+            dst,
+            capability,
+            Some(owner),
+        );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
         }
@@ -4991,7 +5088,7 @@ impl Interpreter {
             if stack.is_empty() {
                 // Throw drained out of the gen body; settle the
                 // pending request as rejected.
-                let req = owner.borrow_mut().pending_request.take();
+                let req = owner.take_pending_request(&mut self.gc_heap);
                 if let Some(req) = req {
                     if let Err(error) = self.run_callable_sync(
                         module,
@@ -5005,22 +5102,22 @@ impl Interpreter {
                         });
                     }
                 }
-                owner.borrow_mut().done = true;
+                owner.mark_done(&mut self.gc_heap);
                 return Ok(());
             }
         }
         match self.dispatch_loop(module, &mut stack) {
             Ok(value) => {
-                let yielded_already = owner.borrow().yielded.is_some();
+                let yielded_already = owner.has_yielded(&self.gc_heap);
                 if yielded_already {
                     // Op::Yield already settled the request and
                     // saved the frame back to the gen.
-                    owner.borrow_mut().yielded.take();
+                    owner.take_yielded(&mut self.gc_heap);
                     return Ok(());
                 }
                 // Body completed: settle the pending request with
                 // the final return value as `done: true`.
-                let req = owner.borrow_mut().pending_request.take();
+                let req = owner.take_pending_request(&mut self.gc_heap);
                 if let Some(req) = req {
                     let record =
                         make_iter_result(value, true, &mut self.gc_heap).map_err(RunError::bare)?;
@@ -5036,8 +5133,7 @@ impl Interpreter {
                         });
                     }
                 }
-                owner.borrow_mut().done = true;
-                owner.borrow_mut().frame = None;
+                owner.mark_done(&mut self.gc_heap);
                 Ok(())
             }
             Err(error) => {
@@ -5156,7 +5252,7 @@ impl Interpreter {
                         .async_state
                         .expect("async_state checked just above")
                         .result_promise;
-                    let jobs = result_promise.reject(payload);
+                    let jobs = result_promise.reject(&mut self.gc_heap, payload);
                     for j in jobs.jobs {
                         self.microtasks.enqueue(j);
                     }
@@ -5410,7 +5506,7 @@ impl Interpreter {
         // Promise.prototype dispatches separately because it
         // needs `&mut self` to enqueue microtasks.
         if let Value::Promise(p) = &recv_value {
-            let promise = p.clone();
+            let promise = *p;
             let argv: Vec<Value> = arg_values.iter().cloned().collect();
             let result = promise_dispatch::prototype_call(self, &promise, &name, &argv)
                 .map_err(native_to_vm_error)?;
@@ -5433,7 +5529,7 @@ impl Interpreter {
         // lazy wrappers / drains for terminals.
         // <https://tc39.es/proposal-iterator-helpers/>
         if let Value::Iterator(rc) = &recv_value {
-            let iter_rc = rc.clone();
+            let iter_rc = *rc;
             if self.iterator_helper_dispatch(stack, module, &iter_rc, &name, &arg_values, dst)? {
                 return Ok(());
             }
@@ -5458,8 +5554,8 @@ impl Interpreter {
                 _ => None,
             };
             if let Some(kind) = kind {
-                let g = g.clone();
-                let is_async_gen = g.borrow().is_async;
+                let g = *g;
+                let is_async_gen = g.is_async(&self.gc_heap);
                 if is_async_gen {
                     // §27.6.3 — async-generator method calls always
                     // return a Promise. Allocate the outer
@@ -5467,9 +5563,9 @@ impl Interpreter {
                     // `pending_request` so `Op::Yield` /
                     // `resume_generator` / the await-resume native
                     // can settle it from inside the dispatch loop.
-                    let cap = promise_dispatch::make_capability();
+                    let cap = promise_dispatch::make_capability(&mut self.gc_heap)?;
                     let promise = cap.promise.clone();
-                    g.borrow_mut().pending_request = Some(cap.clone());
+                    g.set_pending_request(&mut self.gc_heap, cap.clone());
                     let outcome = self.resume_generator(module, &g, kind);
                     match outcome {
                         Ok(_) => {
@@ -5482,7 +5578,7 @@ impl Interpreter {
                         }
                         Err(err) => {
                             if let Some(thrown) = self.pending_generator_throw.take() {
-                                if let Some(req) = g.borrow_mut().pending_request.take() {
+                                if let Some(req) = g.take_pending_request(&mut self.gc_heap) {
                                     self.run_callable_sync(
                                         module,
                                         &req.reject,
@@ -5491,7 +5587,7 @@ impl Interpreter {
                                     )?;
                                 }
                             } else {
-                                g.borrow_mut().pending_request = None;
+                                g.clear_pending_request(&mut self.gc_heap);
                                 return Err(err);
                             }
                         }
@@ -6163,11 +6259,11 @@ impl Interpreter {
     fn iterator_next_full(
         &mut self,
         module: &BytecodeModule,
-        iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
         // First try the fast path; falls through to the
         // interpreter-aware branch on `User` / wrapper variants.
-        match step_iterator(iter, &self.string_heap, &self.gc_heap) {
+        match step_iterator(*iter, &self.string_heap, &mut self.gc_heap) {
             Ok((value, done)) => Ok((value, done)),
             Err(_) => self.iterator_next_full_slow(module, iter),
         }
@@ -6176,45 +6272,48 @@ impl Interpreter {
     fn iterator_next_full_slow(
         &mut self,
         module: &BytecodeModule,
-        iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
         // Snapshot the current state to avoid holding the borrow
         // across user-callback dispatch.
-        let snapshot: IteratorStateSnapshot = {
-            let state = iter.borrow();
-            match &*state {
-                IteratorState::User { iterator } => IteratorStateSnapshot::User(iterator.clone()),
-                IteratorState::Generator { handle } => {
-                    IteratorStateSnapshot::Generator(handle.clone())
+        let snapshot: Option<IteratorStateSnapshot> =
+            self.gc_heap.read_payload(*iter, |state| match state {
+                IteratorState::User { iterator } => {
+                    Some(IteratorStateSnapshot::User(iterator.clone()))
                 }
-                IteratorState::Map { source, mapper } => IteratorStateSnapshot::Map {
-                    source: source.clone(),
+                IteratorState::Generator { handle } => {
+                    Some(IteratorStateSnapshot::Generator(*handle))
+                }
+                IteratorState::Map { source, mapper } => Some(IteratorStateSnapshot::Map {
+                    source: *source,
                     mapper: mapper.clone(),
-                },
-                IteratorState::Filter { source, predicate } => IteratorStateSnapshot::Filter {
-                    source: source.clone(),
-                    predicate: predicate.clone(),
-                },
-                IteratorState::Take { source, remaining } => IteratorStateSnapshot::Take {
-                    source: source.clone(),
+                }),
+                IteratorState::Filter { source, predicate } => {
+                    Some(IteratorStateSnapshot::Filter {
+                        source: *source,
+                        predicate: predicate.clone(),
+                    })
+                }
+                IteratorState::Take { source, remaining } => Some(IteratorStateSnapshot::Take {
+                    source: *source,
                     remaining: *remaining,
-                },
-                IteratorState::Drop { source, to_drop } => IteratorStateSnapshot::Drop {
-                    source: source.clone(),
+                }),
+                IteratorState::Drop { source, to_drop } => Some(IteratorStateSnapshot::Drop {
+                    source: *source,
                     to_drop: *to_drop,
-                },
+                }),
                 IteratorState::FlatMap {
                     source,
                     mapper,
                     inner,
-                } => IteratorStateSnapshot::FlatMap {
-                    source: source.clone(),
+                } => Some(IteratorStateSnapshot::FlatMap {
+                    source: *source,
                     mapper: mapper.clone(),
-                    inner: inner.clone(),
-                },
-                _ => return Err(VmError::TypeMismatch),
-            }
-        };
+                    inner: *inner,
+                }),
+                _ => None,
+            });
+        let snapshot = snapshot.ok_or(VmError::TypeMismatch)?;
         match snapshot {
             IteratorStateSnapshot::Generator(handle) => {
                 let result = self.resume_generator(
@@ -6231,7 +6330,8 @@ impl Interpreter {
                     .unwrap_or(Value::Undefined)
                     .to_boolean();
                 if done {
-                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                 }
                 Ok((value, done))
             }
@@ -6255,14 +6355,16 @@ impl Interpreter {
                     .unwrap_or(Value::Undefined)
                     .to_boolean();
                 if done {
-                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                 }
                 Ok((value, done))
             }
             IteratorStateSnapshot::Map { source, mapper } => {
                 let (v, done) = self.iterator_next_full(module, &source)?;
                 if done {
-                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
                 let mapped = self.run_callable_sync(
@@ -6276,7 +6378,8 @@ impl Interpreter {
             IteratorStateSnapshot::Filter { source, predicate } => loop {
                 let (v, done) = self.iterator_next_full(module, &source)?;
                 if done {
-                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
                 let kept = self.run_callable_sync(
@@ -6291,33 +6394,41 @@ impl Interpreter {
             },
             IteratorStateSnapshot::Take { source, remaining } => {
                 if remaining == 0 {
-                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
                 let (v, done) = self.iterator_next_full(module, &source)?;
                 if done {
-                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
-                if let IteratorState::Take { remaining, .. } = &mut *iter.borrow_mut() {
-                    *remaining = remaining.saturating_sub(1);
-                }
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Take { remaining, .. } = state {
+                        *remaining = remaining.saturating_sub(1);
+                    }
+                });
                 Ok((v, false))
             }
             IteratorStateSnapshot::Drop { source, to_drop } => {
                 for _ in 0..to_drop {
                     let (_, done) = self.iterator_next_full(module, &source)?;
                     if done {
-                        *iter.borrow_mut() = IteratorState::Exhausted;
+                        self.gc_heap
+                            .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                         return Ok((Value::Undefined, true));
                     }
                 }
-                if let IteratorState::Drop { to_drop, .. } = &mut *iter.borrow_mut() {
-                    *to_drop = 0;
-                }
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Drop { to_drop, .. } = state {
+                        *to_drop = 0;
+                    }
+                });
                 let (v, done) = self.iterator_next_full(module, &source)?;
                 if done {
-                    *iter.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
                 Ok((v, false))
@@ -6336,14 +6447,16 @@ impl Interpreter {
                             // slot still holds it.
                             return Ok((v, false));
                         }
-                        if let IteratorState::FlatMap { inner: slot, .. } = &mut *iter.borrow_mut()
-                        {
-                            *slot = None;
-                        }
+                        self.gc_heap.with_payload(*iter, |state| {
+                            if let IteratorState::FlatMap { inner: slot, .. } = state {
+                                *slot = None;
+                            }
+                        });
                     }
                     let (v, done) = self.iterator_next_full(module, &source)?;
                     if done {
-                        *iter.borrow_mut() = IteratorState::Exhausted;
+                        self.gc_heap
+                            .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                         return Ok((Value::Undefined, true));
                     }
                     let mapped = self.run_callable_sync(
@@ -6358,21 +6471,23 @@ impl Interpreter {
                             index: 0,
                         },
                         Value::Iterator(rc) => {
-                            let new_inner = rc.clone();
-                            if let IteratorState::FlatMap { inner: slot, .. } =
-                                &mut *iter.borrow_mut()
-                            {
-                                *slot = Some(new_inner.clone());
-                            }
+                            let new_inner = rc;
+                            self.gc_heap.with_payload(*iter, |state| {
+                                if let IteratorState::FlatMap { inner: slot, .. } = state {
+                                    *slot = Some(new_inner);
+                                }
+                            });
                             inner = Some(new_inner);
                             continue;
                         }
                         other => return Ok((other, false)),
                     };
-                    let new_inner = std::rc::Rc::new(std::cell::RefCell::new(inner_state));
-                    if let IteratorState::FlatMap { inner: slot, .. } = &mut *iter.borrow_mut() {
-                        *slot = Some(new_inner.clone());
-                    }
+                    let new_inner = alloc_iterator_state(&mut self.gc_heap, inner_state)?;
+                    self.gc_heap.with_payload(*iter, |state| {
+                        if let IteratorState::FlatMap { inner: slot, .. } = state {
+                            *slot = Some(new_inner);
+                        }
+                    });
                     inner = Some(new_inner);
                 }
             }
@@ -6390,7 +6505,7 @@ impl Interpreter {
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
         module: &BytecodeModule,
-        iter_rc: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        iter_rc: &IteratorHandle,
         name: &str,
         args: &SmallVec<[Value; 8]>,
         dst: u16,
@@ -6400,49 +6515,54 @@ impl Interpreter {
         let result = match name {
             "map" => {
                 let mapper = require_callable(args.first())?;
-                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                Value::Iterator(alloc_iterator_state(
+                    &mut self.gc_heap,
                     IteratorState::Map {
-                        source: iter_rc.clone(),
+                        source: *iter_rc,
                         mapper,
                     },
-                )))
+                )?)
             }
             "filter" => {
                 let predicate = require_callable(args.first())?;
-                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                Value::Iterator(alloc_iterator_state(
+                    &mut self.gc_heap,
                     IteratorState::Filter {
-                        source: iter_rc.clone(),
+                        source: *iter_rc,
                         predicate,
                     },
-                )))
+                )?)
             }
             "take" => {
                 let n = take_drop_count(args.first())?;
-                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                Value::Iterator(alloc_iterator_state(
+                    &mut self.gc_heap,
                     IteratorState::Take {
-                        source: iter_rc.clone(),
+                        source: *iter_rc,
                         remaining: n,
                     },
-                )))
+                )?)
             }
             "drop" => {
                 let n = take_drop_count(args.first())?;
-                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                Value::Iterator(alloc_iterator_state(
+                    &mut self.gc_heap,
                     IteratorState::Drop {
-                        source: iter_rc.clone(),
+                        source: *iter_rc,
                         to_drop: n,
                     },
-                )))
+                )?)
             }
             "flatMap" => {
                 let mapper = require_callable(args.first())?;
-                Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+                Value::Iterator(alloc_iterator_state(
+                    &mut self.gc_heap,
                     IteratorState::FlatMap {
-                        source: iter_rc.clone(),
+                        source: *iter_rc,
                         mapper,
                         inner: None,
                     },
-                )))
+                )?)
             }
             "toArray" => {
                 let collected = self.drain_iterator(module, iter_rc)?;
@@ -6502,7 +6622,7 @@ impl Interpreter {
     fn drain_iterator(
         &mut self,
         module: &BytecodeModule,
-        iter_rc: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        iter_rc: &IteratorHandle,
     ) -> Result<Vec<Value>, VmError> {
         let mut out = Vec::new();
         loop {
@@ -6542,15 +6662,15 @@ impl Interpreter {
         kind: GeneratorResumeKind,
     ) -> Result<Value, VmError> {
         // Already-done generators short-circuit per §27.5.1.2.
-        let (frame_opt, resume_dst) = {
-            let body = handle.borrow();
-            (body.frame.is_some(), body.resume_dst)
-        };
+        let (frame_opt, resume_dst) = (
+            handle.has_frame(&self.gc_heap),
+            handle.resume_dst(&self.gc_heap),
+        );
         if !frame_opt {
             return make_iter_result(Value::Undefined, true, &mut self.gc_heap);
         }
         // Pull the frame out of the gen body so we can mutate it.
-        let mut frame = match handle.borrow_mut().frame.take() {
+        let mut frame = match handle.take_frame(&mut self.gc_heap) {
             Some(f) => f,
             None => return make_iter_result(Value::Undefined, true, &mut self.gc_heap),
         };
@@ -6568,8 +6688,7 @@ impl Interpreter {
             GeneratorResumeKind::Return(arg) => {
                 // Foundation: mark done and surface arg without
                 // running the body further.
-                handle.borrow_mut().done = true;
-                handle.borrow_mut().frame = None;
+                handle.mark_done(&mut self.gc_heap);
                 return make_iter_result(arg.clone(), true, &mut self.gc_heap);
             }
             GeneratorResumeKind::Throw(reason) => {
@@ -6577,7 +6696,7 @@ impl Interpreter {
             }
         }
         let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        sub_stack.push(frame);
+        sub_stack.push(*frame);
         if let Some(reason) = throw_value {
             // Preserve the original throw value so the caller can
             // re-raise it on the outer stack when the gen body
@@ -6588,14 +6707,12 @@ impl Interpreter {
             match self.unwind_throw(&mut sub_stack, reason) {
                 Ok(_) => {}
                 Err(err) => {
-                    handle.borrow_mut().done = true;
-                    handle.borrow_mut().frame = None;
+                    handle.mark_done(&mut self.gc_heap);
                     return Err(err);
                 }
             }
             if sub_stack.is_empty() {
-                handle.borrow_mut().done = true;
-                handle.borrow_mut().frame = None;
+                handle.mark_done(&mut self.gc_heap);
                 return Err(VmError::Uncaught {
                     value: "generator-throw".to_string(),
                 });
@@ -6603,13 +6720,13 @@ impl Interpreter {
             // A handler caught the throw — clear the side channel.
             self.pending_generator_throw = None;
         }
-        let is_async = handle.borrow().is_async;
+        let is_async = handle.is_async(&self.gc_heap);
         let outcome = self.dispatch_loop(module, &mut sub_stack);
         match outcome {
             Ok(value) => {
                 // If a Yield fired, the gen body has the paused
                 // frame back; surface yielded_value as the result.
-                let yielded = handle.borrow_mut().yielded.take();
+                let yielded = handle.take_yielded(&mut self.gc_heap);
                 if let Some(v) = yielded {
                     // Sync generators surface the iter result
                     // through the return value; async generators
@@ -6626,13 +6743,13 @@ impl Interpreter {
                 // (the await microtask owns it) AND `sub_stack` is
                 // empty.
                 let frame_taken_by_await =
-                    handle.borrow().frame.is_some() || sub_stack.is_empty() && is_async;
-                let parked = is_async && handle.borrow().frame.is_none() && {
+                    handle.has_frame(&self.gc_heap) || sub_stack.is_empty() && is_async;
+                let parked = is_async && !handle.has_frame(&self.gc_heap) && {
                     // The await machinery stored the parked frame
                     // in its closure, not on the gen handle. Detect
                     // that case by checking if pending_request is
                     // still set — if so, it's awaiting.
-                    handle.borrow().pending_request.is_some()
+                    handle.has_pending_request(&self.gc_heap)
                 };
                 let _ = frame_taken_by_await;
                 if parked {
@@ -6642,10 +6759,9 @@ impl Interpreter {
                     return Ok(Value::Undefined);
                 }
                 // Body completed.
-                handle.borrow_mut().done = true;
-                handle.borrow_mut().frame = None;
+                handle.mark_done(&mut self.gc_heap);
                 if is_async {
-                    if let Some(req) = handle.borrow_mut().pending_request.take() {
+                    if let Some(req) = handle.take_pending_request(&mut self.gc_heap) {
                         let record = make_iter_result(value, true, &mut self.gc_heap)?;
                         self.run_callable_sync(
                             module,
@@ -6659,8 +6775,7 @@ impl Interpreter {
                 make_iter_result(value, true, &mut self.gc_heap)
             }
             Err(err) => {
-                handle.borrow_mut().done = true;
-                handle.borrow_mut().frame = None;
+                handle.mark_done(&mut self.gc_heap);
                 if is_async {
                     // Pending request stays alive — the caller
                     // (do_call_method_value) settles it on the
@@ -7136,9 +7251,9 @@ impl Interpreter {
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut entry = Frame::for_function_with_heap(main, &mut self.gc_heap)?;
         let entry_promise = if main.is_async {
-            let result = JsPromiseHandle::pending();
+            let result = JsPromiseHandle::pending(&mut self.gc_heap)?;
             entry.async_state = Some(AsyncFrameState {
-                result_promise: result.clone(),
+                result_promise: result,
             });
             Some(result)
         } else {
@@ -7150,7 +7265,7 @@ impl Interpreter {
             // Drain microtasks attached to top-level await so the
             // entry promise settles before we read its value.
             self.drain_microtasks(&module).map_err(|e| e.error)?;
-            return Ok(match promise.state() {
+            return Ok(match promise.state(&self.gc_heap) {
                 crate::promise::PromiseState::Fulfilled(v) => v,
                 crate::promise::PromiseState::Rejected(reason) => {
                     return Err(VmError::Uncaught {
@@ -7645,7 +7760,7 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
             let iter_state = IteratorState::User { iterator: produced };
-            let iter = std::rc::Rc::new(std::cell::RefCell::new(iter_state));
+            let iter = alloc_iterator_state(&mut self.gc_heap, iter_state)?;
             write_register(&mut stack[top_idx], dst, Value::Iterator(iter))?;
             stack[top_idx].pending_get_iterator = None;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -7726,7 +7841,8 @@ impl Interpreter {
             let done = done_value.to_boolean();
             if done {
                 if let Value::Iterator(rc) = &state.iterator {
-                    *rc.borrow_mut() = IteratorState::Exhausted;
+                    self.gc_heap
+                        .with_payload(*rc, |state| *state = IteratorState::Exhausted);
                 }
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
@@ -7744,10 +7860,10 @@ impl Interpreter {
         // §27.5 generator-state path — drive the suspended body
         // synchronously and write the unpacked `value` / `done`
         // pair into the caller's destination registers.
-        let gen_handle = match &*iter_rc.borrow() {
-            IteratorState::Generator { handle } => Some(handle.clone()),
+        let gen_handle = self.gc_heap.read_payload(*iter_rc, |state| match state {
+            IteratorState::Generator { handle } => Some(*handle),
             _ => None,
-        };
+        });
         if let Some(handle) = gen_handle {
             let result = self.resume_generator(
                 module,
@@ -7763,7 +7879,8 @@ impl Interpreter {
                 .unwrap_or(Value::Undefined)
                 .to_boolean();
             if done {
-                *iter_rc.borrow_mut() = IteratorState::Exhausted;
+                self.gc_heap
+                    .with_payload(*iter_rc, |state| *state = IteratorState::Exhausted);
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
@@ -7772,14 +7889,16 @@ impl Interpreter {
         }
         // Helper-wrapper iterator states drive through the
         // interpreter-aware step path so callbacks can run.
-        let needs_full_step = matches!(
-            &*iter_rc.borrow(),
-            IteratorState::Map { .. }
-                | IteratorState::Filter { .. }
-                | IteratorState::Take { .. }
-                | IteratorState::Drop { .. }
-                | IteratorState::FlatMap { .. }
-        );
+        let needs_full_step = self.gc_heap.read_payload(*iter_rc, |state| {
+            matches!(
+                state,
+                IteratorState::Map { .. }
+                    | IteratorState::Filter { .. }
+                    | IteratorState::Take { .. }
+                    | IteratorState::Drop { .. }
+                    | IteratorState::FlatMap { .. }
+            )
+        });
         if needs_full_step {
             let (value, done) = self.iterator_next_full(module, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
@@ -7790,10 +7909,10 @@ impl Interpreter {
         // Snapshot the user iterator object out of the inner
         // state so the borrow does not span the `invoke` call
         // below.
-        let user_iter = match &*iter_rc.borrow() {
+        let user_iter = self.gc_heap.read_payload(*iter_rc, |state| match state {
             IteratorState::User { iterator } => Some(iterator.clone()),
             _ => None,
-        };
+        });
         let Some(user_iter_value) = user_iter else {
             // Built-in iterator — let the synchronous in-frame
             // path drive it.
@@ -8793,11 +8912,12 @@ fn seed_array(seed: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Vec<Value>, Vm
 ///   matching real-engine `Array.prototype[Symbol.iterator]`
 ///   semantics.
 fn make_array_iterator_factory(array: JsArray) -> Value {
-    native_value("Array[Symbol.iterator]", move |_, _| {
+    native_value("Array[Symbol.iterator]", move |vm, _| {
         let state = IteratorState::Array { array, index: 0 };
-        Ok(Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
+        Ok(Value::Iterator(alloc_iterator_state(
+            vm.gc_heap_mut(),
             state,
-        ))))
+        )?))
     })
 }
 
@@ -8947,9 +9067,7 @@ fn iterator_static_call(
                 }
                 _ => return Err(VmError::TypeMismatch),
             };
-            Ok(Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
-                state,
-            ))))
+            Ok(Value::Iterator(alloc_iterator_state(gc_heap, state)?))
         }
         other => Err(VmError::UnknownIntrinsic {
             name: format!("Iterator.{other}"),
@@ -8958,31 +9076,30 @@ fn iterator_static_call(
 }
 
 /// Cloned snapshot of an [`IteratorState`] taken before driving a
-/// helper callback so the borrow on `Rc<RefCell<IteratorState>>`
-/// does not span the dispatch.
+/// helper callback so the GC body borrow does not span dispatch.
 enum IteratorStateSnapshot {
     User(Value),
     Generator(crate::generator::JsGenerator),
     Map {
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         mapper: Value,
     },
     Filter {
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         predicate: Value,
     },
     Take {
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         remaining: u64,
     },
     Drop {
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         to_drop: u64,
     },
     FlatMap {
-        source: std::rc::Rc<std::cell::RefCell<IteratorState>>,
+        source: IteratorHandle,
         mapper: Value,
-        inner: Option<std::rc::Rc<std::cell::RefCell<IteratorState>>>,
+        inner: Option<IteratorHandle>,
     },
 }
 
@@ -9011,64 +9128,75 @@ fn take_drop_count(arg: Option<&Value>) -> Result<u64, VmError> {
 }
 
 fn step_iterator(
-    iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
+    iter: IteratorHandle,
     string_heap: &StringHeap,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<(Value, bool), VmError> {
-    let mut state = iter.borrow_mut();
-    let outcome = match &mut *state {
-        IteratorState::Array { array, index } => {
-            if *index >= crate::array::len(*array, gc_heap) {
-                None
-            } else {
-                let v = crate::array::get(*array, gc_heap, *index);
-                *index += 1;
-                Some(v)
-            }
-        }
+    enum FastIteratorSnapshot {
+        Array(JsArray, usize),
+        String(JsString, u32),
+        Exhausted,
+        Slow,
+    }
+
+    let snapshot = gc_heap.read_payload(iter, |state| match state {
+        IteratorState::Array { array, index } => FastIteratorSnapshot::Array(*array, *index),
         IteratorState::String { string, index } => {
-            // §22.1.5.1 [`%StringIteratorPrototype%.next`](
-            // https://tc39.es/ecma262/#sec-%25stringiteratorprototype%25.next
-            // ) — yield code points. A valid surrogate pair (high +
-            // low) combines into a single two-unit string; lone
-            // surrogates are yielded as-is.
-            if let Some(unit) = string.char_code_at(*index) {
-                let next_unit = string.char_code_at(*index + 1);
-                let is_pair = (0xD800..=0xDBFF).contains(&unit)
-                    && matches!(next_unit, Some(low) if (0xDC00..=0xDFFF).contains(&low));
-                let s = if is_pair {
-                    let pair = [unit, next_unit.unwrap()];
-                    *index += 2;
-                    JsString::from_utf16_units(&pair, string_heap)?
-                } else {
-                    *index += 1;
-                    JsString::from_utf16_units(&[unit], string_heap)?
-                };
-                Some(Value::String(s))
-            } else {
-                None
-            }
+            FastIteratorSnapshot::String(string.clone(), *index)
         }
+        IteratorState::Exhausted => FastIteratorSnapshot::Exhausted,
         IteratorState::User { .. }
         | IteratorState::Generator { .. }
         | IteratorState::Map { .. }
         | IteratorState::Filter { .. }
         | IteratorState::Take { .. }
         | IteratorState::Drop { .. }
-        | IteratorState::FlatMap { .. } => {
-            // The user-iterator + helper-wrapper protocols require
-            // invoking JS callbacks on each step, which mutates the
-            // dispatch stack. The synchronous helper cannot push
-            // frames; the dispatcher must take the interpreter-aware
-            // path (`Interpreter::iterator_next_full`) instead.
-            return Err(VmError::TypeMismatch);
+        | IteratorState::FlatMap { .. } => FastIteratorSnapshot::Slow,
+    });
+
+    let outcome = match snapshot {
+        FastIteratorSnapshot::Array(array, index) => {
+            if index >= crate::array::len(array, gc_heap) {
+                None
+            } else {
+                let v = crate::array::get(array, gc_heap, index);
+                gc_heap.with_payload(iter, |state| {
+                    if let IteratorState::Array { index, .. } = state {
+                        *index += 1;
+                    }
+                });
+                Some(v)
+            }
         }
-        IteratorState::Exhausted => None,
+        FastIteratorSnapshot::String(string, index) => {
+            // §22.1.5.1 `%StringIteratorPrototype%.next`.
+            if let Some(unit) = string.char_code_at(index) {
+                let next_unit = string.char_code_at(index + 1);
+                let is_pair = (0xD800..=0xDBFF).contains(&unit)
+                    && matches!(next_unit, Some(low) if (0xDC00..=0xDFFF).contains(&low));
+                let (s, advance) = if is_pair {
+                    let pair = [unit, next_unit.unwrap()];
+                    (JsString::from_utf16_units(&pair, string_heap)?, 2)
+                } else {
+                    (JsString::from_utf16_units(&[unit], string_heap)?, 1)
+                };
+                gc_heap.with_payload(iter, |state| {
+                    if let IteratorState::String { index, .. } = state {
+                        *index += advance;
+                    }
+                });
+                Some(Value::String(s))
+            } else {
+                None
+            }
+        }
+        FastIteratorSnapshot::Exhausted => None,
+        FastIteratorSnapshot::Slow => return Err(VmError::TypeMismatch),
     };
     match outcome {
         Some(value) => Ok((value, false)),
         None => {
-            *state = IteratorState::Exhausted;
+            gc_heap.with_payload(iter, |state| *state = IteratorState::Exhausted);
             Ok((Value::Undefined, true))
         }
     }
@@ -9149,93 +9277,6 @@ fn is_callable(value: &Value) -> bool {
 #[must_use]
 pub fn is_callable_value(value: &Value) -> bool {
     abstract_ops::is_callable(value)
-}
-
-/// Build a native callable that resumes a parked async frame when
-/// invoked as a `then` reaction.
-///
-/// # Algorithm
-/// 1. Take the parked frame out of the shared cell. If a sibling
-///    reaction already consumed it (the spec lets only one of
-///    `then`'s twin handlers fire), return `undefined` and exit.
-/// 2. Enqueue a [`MicrotaskKind::AsyncResume`] microtask carrying
-///    the boxed frame, the await's destination register, and the
-///    fulfilled / rejected branch tag. The drain re-pushes the
-///    frame onto a fresh stack and runs `dispatch_loop` from the
-///    next pc on the next generation.
-///
-/// # Invariants
-/// - The native handler MUST be idempotent. The shared cell
-///   guarantees this: once the parked frame is taken, subsequent
-///   invocations are no-ops.
-fn make_async_resume_native(
-    parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>>,
-    await_dst: u16,
-    fulfilled: bool,
-) -> Value {
-    let label = if fulfilled {
-        "async resume fulfill"
-    } else {
-        "async resume reject"
-    };
-    native_function::native_value(label, move |interp, args| {
-        let Some(frame) = parked_slot.take() else {
-            return Ok(Value::Undefined);
-        };
-        let value = args.first().cloned().unwrap_or(Value::Undefined);
-        let mut task_args: SmallVec<[Value; 4]> = SmallVec::new();
-        task_args.push(value);
-        interp.microtasks.enqueue(Microtask {
-            callee: Value::Undefined,
-            this_value: Value::Undefined,
-            args: task_args,
-            result_capability: None,
-            kind: MicrotaskKind::AsyncResume {
-                frame,
-                await_dst,
-                fulfilled,
-            },
-        });
-        Ok(Value::Undefined)
-    })
-}
-
-/// Build a resume / reject native for `Op::Await` inside an
-/// async-generator body. The closure runs as a promise reaction;
-/// it enqueues a [`MicrotaskKind::AsyncGenResume`] task that the
-/// drain rebinds back into the gen body with module access.
-fn make_async_gen_resume_native(
-    parked_slot: std::rc::Rc<std::cell::Cell<Option<Box<Frame>>>>,
-    await_dst: u16,
-    owner: crate::generator::JsGenerator,
-    fulfilled: bool,
-) -> Value {
-    let label = if fulfilled {
-        "async-gen await fulfill"
-    } else {
-        "async-gen await reject"
-    };
-    native_function::native_value(label, move |interp, args| {
-        let Some(frame) = parked_slot.take() else {
-            return Ok(Value::Undefined);
-        };
-        let value = args.first().cloned().unwrap_or(Value::Undefined);
-        let mut task_args: SmallVec<[Value; 4]> = SmallVec::new();
-        task_args.push(value);
-        interp.microtasks.enqueue(Microtask {
-            callee: Value::Undefined,
-            this_value: Value::Undefined,
-            args: task_args,
-            result_capability: None,
-            kind: MicrotaskKind::AsyncGenResume {
-                frame,
-                await_dst,
-                fulfilled,
-                owner: owner.clone(),
-            },
-        });
-        Ok(Value::Undefined)
-    })
 }
 
 #[cfg(test)]

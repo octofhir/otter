@@ -361,19 +361,149 @@ fn weak_collections_root_survives_force_gc() {
     }
 }
 
+/// Promise bodies are strong GC objects: a promise rooted through
+/// `globalThis` keeps its settlement value alive across a forced
+/// collection after the transient host handles are gone.
 #[test]
-#[ignore = "un-ignore in task 82 (promise / iterator / generator)"]
 fn promise_resolution_root_survives_force_gc() {
-    // task 82: settle a pending promise, drop intermediate
-    // handles, force_gc, assert resolution flows.
+    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+    use otter_vm::promise::{JsPromise, PromiseState};
+
+    let mut interp = Interpreter::new();
+    interp.force_gc();
+    let baseline =
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+
+    let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
+    promise.fulfill(interp.gc_heap_mut(), otter_vm::Value::Object(object));
+
+    let global_this = *interp.global_this();
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__promise_root",
+        otter_vm::Value::Promise(promise),
+    );
+
+    let _ = object;
+    let _ = promise;
+    interp.force_gc();
+
+    let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    assert!(
+        after > baseline,
+        "rooted fulfilled promise must retain its object value"
+    );
+
+    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__promise_root")
+        .expect("promise root survives force_gc");
+    match rooted {
+        otter_vm::Value::Promise(promise) => match promise.state(interp.gc_heap()) {
+            PromiseState::Fulfilled(otter_vm::Value::Object(_)) => {}
+            other => panic!("expected fulfilled object promise after force_gc, got {other:?}"),
+        },
+        other => panic!("expected Value::Promise after force_gc, got {other:?}"),
+    }
+}
+
+/// Queued microtasks are runtime roots. Their callee, receiver,
+/// arguments, result capability, and async-resume frame payloads
+/// must be traced while the job is pending.
+#[test]
+fn microtask_payload_root_survives_force_gc() {
+    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+
+    let mut interp = Interpreter::new();
+    interp.force_gc();
+    let baseline =
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+
+    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
+    interp.microtasks_mut().enqueue(otter_vm::Microtask {
+        callee: otter_vm::Value::Undefined,
+        this_value: otter_vm::Value::Undefined,
+        args: smallvec::smallvec![otter_vm::Value::Object(object)],
+        result_capability: None,
+        kind: otter_vm::MicrotaskKind::Call,
+    });
+
+    let _ = object;
+    interp.force_gc();
+    let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    assert!(
+        after > baseline,
+        "pending microtask payload must retain its object argument"
+    );
+
+    let mut batch = interp
+        .microtasks_mut()
+        .begin_drain()
+        .expect("outer drain batch");
+    let task = batch.tasks.pop_front().expect("queued task");
+    assert!(
+        matches!(task.args.first(), Some(otter_vm::Value::Object(_))),
+        "microtask payload remains observable after force_gc"
+    );
+    interp.microtasks_mut().end_drain();
 }
 
 #[test]
-#[ignore = "un-ignore in task 82 (microtask queue trace)"]
-fn microtask_payload_root_survives_force_gc() {
-    // task 82: enqueue microtask whose payload holds a Gc
-    // handle; force_gc before drain; assert payload value
-    // observable on drain.
+fn parked_frame_keeps_alive() {
+    use otter_bytecode::Function;
+    use otter_vm::generator::PARKED_FRAME_BODY_TYPE_TAG;
+    use otter_vm::{Frame, PromiseCapability, Value};
+
+    let mut interp = Interpreter::new();
+    interp.force_gc();
+    let baseline =
+        interp.gc_heap_mut().gc_stats().by_type[PARKED_FRAME_BODY_TYPE_TAG as usize].live_bytes;
+
+    let function = Function {
+        id: 0,
+        name: "gc-roots-parked-frame".to_string(),
+        locals: 1,
+        scratch: 1,
+        ..Function::default()
+    };
+    let mut frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
+    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
+    frame.registers[0] = Value::Object(object);
+
+    let parked =
+        otter_vm::generator::alloc_parked_frame(interp.gc_heap_mut(), frame).expect("parked frame");
+    let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+    promise.perform_async_resume_then(
+        interp.gc_heap_mut(),
+        parked,
+        0,
+        PromiseCapability {
+            promise: Value::Undefined,
+            resolve: Value::Undefined,
+            reject: Value::Undefined,
+        },
+        None,
+    );
+
+    let global_this = *interp.global_this();
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__parked_frame_promise_root",
+        Value::Promise(promise),
+    );
+
+    let _ = object;
+    let _ = parked;
+    let _ = promise;
+    interp.force_gc();
+
+    let after =
+        interp.gc_heap_mut().gc_stats().by_type[PARKED_FRAME_BODY_TYPE_TAG as usize].live_bytes;
+    assert!(
+        after > baseline,
+        "pending async reaction must retain its parked frame"
+    );
 }
 
 #[test]

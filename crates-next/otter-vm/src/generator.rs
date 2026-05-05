@@ -1,102 +1,274 @@
-//! ECMA-262 §27 Generator objects.
+//! ECMA-262 §27 Generator and parked-frame state.
 //!
-//! A generator value carries a paused [`crate::Frame`] plus the
-//! bookkeeping needed to resume it: the destination register the
-//! current `Op::Yield` paused on (so a follow-up `.next(arg)` can
-//! deposit `arg` there), and a `done` flag. Cloning a `JsGenerator`
-//! shares the same body — every clone observes the same suspension
-//! state.
+//! Generator objects and async `await` suspension both park full VM
+//! frames off the active interpreter stack. Task 82 makes those
+//! parked states GC-managed so locals, register windows, `this`, and
+//! pending promise capabilities are ordinary traceable roots.
 //!
 //! # Contents
-//! - [`JsGenerator`] — cheap-to-clone handle.
-//! - [`GeneratorBody`] — internal storage.
+//!
+//! - [`JsGenerator`] / [`GeneratorBody`] — generator object state.
+//! - [`ParkedFrame`] / [`ParkedFrameBody`] — async-await suspension
+//!   payload shared by promise reactions until settlement.
+//!
+//! # Invariants
+//!
+//! - Every operation that reads or mutates a body receives an explicit
+//!   [`otter_gc::GcHeap`].
+//! - Stored frames are isolate-owned. They are traced through the GC
+//!   body and are moved back onto an interpreter stack only by the
+//!   microtask drain.
+//! - A [`ParkedFrame`] is single-shot: the first settling reaction
+//!   takes the frame; the twin reaction observes `None`.
 //!
 //! # See also
+//!
 //! - <https://tc39.es/ecma262/#sec-generator-objects>
-//! - <https://tc39.es/ecma262/#sec-generator.prototype.next>
-
-use std::cell::RefCell;
-use std::rc::Rc;
+//! - <https://tc39.es/ecma262/#await>
+//! - [GC architecture plan §4.2](../../../docs/new-engine/gc-architecture.md)
+//! - [Task 82](../../../docs/new-engine/tasks/82-migrate-promise-iterator-generator.md)
 
 use crate::Frame;
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`GeneratorBody`].
+pub const GENERATOR_BODY_TYPE_TAG: u8 = 0x1a;
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ParkedFrameBody`].
+pub const PARKED_FRAME_BODY_TYPE_TAG: u8 = 0x1b;
+
 /// Cheap-to-clone generator handle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct JsGenerator {
-    inner: Rc<RefCell<GeneratorBody>>,
+    inner: otter_gc::Gc<GeneratorBody>,
 }
 
-/// Internal storage. Holds the suspended frame and a few resume
-/// hints.
+/// GC-managed parked async frame handle.
+pub type ParkedFrame = otter_gc::Gc<ParkedFrameBody>;
+
+/// Internal generator storage.
 #[derive(Debug)]
 pub struct GeneratorBody {
     /// `Some(frame)` when the generator can still resume; `None`
-    /// once the body returned (or threw past the top of the call).
-    pub frame: Option<Frame>,
+    /// once done or while an async-generator await owns the frame.
+    pub frame: Option<Box<Frame>>,
     /// Register slot that the most recent `Op::Yield` paused on.
-    /// `gen.next(arg)` writes `arg` into this slot before
-    /// re-entering the dispatch loop. `0` is a sentinel before
-    /// the first yield (the entry resume drops its argument per
-    /// §27.5.1.3 step 5).
     pub resume_dst: u16,
     /// `true` once the body has returned, thrown, or had `.return()`
-    /// invoked. Subsequent `.next()` calls short-circuit to
-    /// `{value: undefined, done: true}`.
+    /// invoked.
     pub done: bool,
-    /// Most recent value yielded by the body. Drained by
-    /// [`crate::Interpreter::resume_generator`] after each
-    /// dispatch turn.
+    /// Most recent value yielded by the body.
     pub yielded: Option<crate::Value>,
-    /// `true` for `async function*` generators. The runtime wraps
-    /// each `.next` / `.return` / `.throw` call in a Promise per
-    /// §27.6 and routes `Op::Await` inside the body through the
-    /// generator's pending-request slot.
+    /// `true` for `async function*` generators.
     pub is_async: bool,
-    /// Pending Promise capability for an in-flight `.next` /
-    /// `.return` / `.throw` on an async generator. The body's
-    /// `Op::Yield` / completion / unhandled throw settles this
-    /// promise before yielding control back to the caller.
+    /// Pending Promise capability for an in-flight async-generator
+    /// request.
     pub pending_request: Option<crate::promise::PromiseCapability>,
+}
+
+impl otter_gc::SafeTraceable for GeneratorBody {
+    const TYPE_TAG: u8 = GENERATOR_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        if let Some(frame) = &self.frame {
+            frame.trace_frame_slots(visitor);
+        }
+        if let Some(value) = &self.yielded {
+            value.trace_value_slots(visitor);
+        }
+        if let Some(capability) = &self.pending_request {
+            capability.promise.trace_value_slots(visitor);
+            capability.resolve.trace_value_slots(visitor);
+            capability.reject.trace_value_slots(visitor);
+        }
+    }
+}
+
+/// GC-managed async suspension payload.
+#[derive(Debug)]
+pub struct ParkedFrameBody {
+    frame: Option<Box<Frame>>,
+}
+
+impl otter_gc::SafeTraceable for ParkedFrameBody {
+    const TYPE_TAG: u8 = PARKED_FRAME_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        if let Some(frame) = &self.frame {
+            frame.trace_frame_slots(visitor);
+        }
+    }
 }
 
 impl JsGenerator {
     /// Allocate a fresh generator over `frame`.
-    #[must_use]
-    pub fn new(frame: Frame) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(GeneratorBody {
-                frame: Some(frame),
+    pub fn new(heap: &mut otter_gc::GcHeap, frame: Frame) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_old(GeneratorBody {
+                frame: Some(Box::new(frame)),
                 resume_dst: 0,
                 done: false,
                 yielded: None,
                 is_async: false,
                 pending_request: None,
-            })),
-        }
+            })?,
+        })
     }
 
-    /// Borrow the body for reads.
+    /// Raw handle used by root tracing and write barriers.
     #[must_use]
-    pub fn borrow(&self) -> std::cell::Ref<'_, GeneratorBody> {
-        self.inner.borrow()
+    pub fn raw(&self) -> otter_gc::RawGc {
+        self.inner.raw()
     }
 
-    /// Borrow the body mutably.
+    /// Stable identity token.
     #[must_use]
-    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GeneratorBody> {
-        self.inner.borrow_mut()
+    pub fn identity_addr(&self) -> *const () {
+        self.inner.as_header_ptr() as *const ()
     }
 
     /// Identity comparison.
     #[must_use]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+        self.inner == other.inner
     }
 
-    /// `Rc` data-pointer for cycle / identity sets.
+    /// Trace this handle as a root slot.
+    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        let p = self as *const JsGenerator as *mut otter_gc::RawGc;
+        visitor(p);
+    }
+
+    /// Read-only body access.
+    pub fn with_body<R>(&self, heap: &otter_gc::GcHeap, f: impl FnOnce(&GeneratorBody) -> R) -> R {
+        heap.read_payload(self.inner, f)
+    }
+
+    /// Mutable body access. Callers that store new GC-bearing values
+    /// must use the narrower helpers below so barriers fire.
+    pub fn with_body_mut<R>(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        f: impl FnOnce(&mut GeneratorBody) -> R,
+    ) -> R {
+        heap.with_payload(self.inner, f)
+    }
+
+    /// Set the async-generator flag.
+    pub fn set_async(&self, heap: &mut otter_gc::GcHeap, is_async: bool) {
+        heap.with_payload(self.inner, |body| body.is_async = is_async);
+    }
+
+    /// `true` for async generators.
     #[must_use]
-    pub fn identity_addr(&self) -> *const () {
-        Rc::as_ptr(&self.inner).cast()
+    pub fn is_async(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.is_async)
+    }
+
+    /// `true` when a frame is currently saved on the generator.
+    #[must_use]
+    pub fn has_frame(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.frame.is_some())
+    }
+
+    /// Resume destination register.
+    #[must_use]
+    pub fn resume_dst(&self, heap: &otter_gc::GcHeap) -> u16 {
+        heap.read_payload(self.inner, |body| body.resume_dst)
+    }
+
+    /// Take the saved frame.
+    pub fn take_frame(&self, heap: &mut otter_gc::GcHeap) -> Option<Box<Frame>> {
+        heap.with_payload(self.inner, |body| body.frame.take())
+    }
+
+    /// Store a saved frame and resume metadata.
+    pub fn park_after_yield(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        frame: Frame,
+        resume_dst: u16,
+        yielded: crate::Value,
+    ) {
+        let child_raw = yielded.as_gc_raw();
+        heap.with_payload(self.inner, |body| {
+            body.frame = Some(Box::new(frame));
+            body.resume_dst = resume_dst;
+            body.yielded = Some(yielded);
+        });
+        if let Some(child) = child_raw {
+            heap.write_barrier_raw(self.inner, generator_payload_slot(self.inner), child);
+        }
+    }
+
+    /// Take the last yielded value.
+    pub fn take_yielded(&self, heap: &mut otter_gc::GcHeap) -> Option<crate::Value> {
+        heap.with_payload(self.inner, |body| body.yielded.take())
+    }
+
+    /// `true` when `yielded` is still populated.
+    #[must_use]
+    pub fn has_yielded(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.yielded.is_some())
+    }
+
+    /// Mark done and clear the saved frame.
+    pub fn mark_done(&self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.inner, |body| {
+            body.done = true;
+            body.frame = None;
+        });
+    }
+
+    /// Clear the saved frame without marking done.
+    pub fn clear_frame(&self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.inner, |body| body.frame = None);
+    }
+
+    /// Store a pending async-generator request.
+    pub fn set_pending_request(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        capability: crate::promise::PromiseCapability,
+    ) {
+        let raws = [
+            capability.promise.as_gc_raw(),
+            capability.resolve.as_gc_raw(),
+            capability.reject.as_gc_raw(),
+        ];
+        heap.with_payload(self.inner, |body| {
+            body.pending_request = Some(capability);
+        });
+        for child in raws.into_iter().flatten() {
+            heap.write_barrier_raw(self.inner, generator_payload_slot(self.inner), child);
+        }
+    }
+
+    /// Clear the pending async-generator request.
+    pub fn clear_pending_request(&self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.inner, |body| body.pending_request = None);
+    }
+
+    /// Take the pending async-generator request.
+    pub fn take_pending_request(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+    ) -> Option<crate::promise::PromiseCapability> {
+        heap.with_payload(self.inner, |body| body.pending_request.take())
+    }
+
+    /// `true` when a pending request exists.
+    #[must_use]
+    pub fn has_pending_request(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.pending_request.is_some())
+    }
+
+    /// Install the generator self-reference into the saved frame.
+    pub fn install_owner_on_frame(&self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.inner, |body| {
+            if let Some(frame) = body.frame.as_mut() {
+                frame.generator_owner = Some(*self);
+            }
+        });
     }
 }
 
@@ -104,4 +276,25 @@ impl PartialEq for JsGenerator {
     fn eq(&self, other: &Self) -> bool {
         self.ptr_eq(other)
     }
+}
+
+/// Allocate a parked async frame.
+pub fn alloc_parked_frame(
+    heap: &mut otter_gc::GcHeap,
+    frame: Frame,
+) -> Result<ParkedFrame, otter_gc::OutOfMemory> {
+    heap.alloc_old(ParkedFrameBody {
+        frame: Some(Box::new(frame)),
+    })
+}
+
+/// Take a parked frame. Returns `None` if the twin reaction already
+/// consumed it.
+pub fn take_parked_frame(parked: ParkedFrame, heap: &mut otter_gc::GcHeap) -> Option<Box<Frame>> {
+    heap.with_payload(parked, |body| body.frame.take())
+}
+
+fn generator_payload_slot(generator: otter_gc::Gc<GeneratorBody>) -> *mut otter_gc::RawGc {
+    let body_base = generator.as_header_ptr() as *mut u8;
+    body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>()) as *mut otter_gc::RawGc
 }

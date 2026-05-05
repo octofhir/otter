@@ -24,6 +24,8 @@ fn compile_fail_send_sync_invariants() {
     //   1. Raw `Gc<T>` handles are `!Send` (compressed.rs invariants).
     //   2. `Local<'gc, T>` is `!Send` (handle.rs lifetime contract).
     //   3. `GcHeap` itself is `!Send` (single-mutator-per-isolate).
+    //   4. `Value` and parked `Frame` state are `!Send`, so async
+    //      host futures cannot capture JS payloads directly.
     //
     // Together these guarantee that no VM/GC handle can leak into a
     // `Send + 'static` future — the shape `tokio::spawn` requires —
@@ -34,4 +36,6 @@ fn compile_fail_send_sync_invariants() {
     t.compile_fail("tests/compile_fail/gc_handle_is_not_send.rs");
     t.compile_fail("tests/compile_fail/local_is_not_send.rs");
     t.compile_fail("tests/compile_fail/heap_is_not_send.rs");
+    t.compile_fail("tests/compile_fail/value_is_not_send.rs");
+    t.compile_fail("tests/compile_fail/frame_is_not_send.rs");
 }

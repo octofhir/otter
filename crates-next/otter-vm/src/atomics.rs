@@ -143,8 +143,10 @@ pub fn call(
             } else {
                 "not-equal"
             };
-            let promise =
-                JsPromiseHandle::fulfilled(Value::String(JsString::from_str(label, string_heap)?));
+            let promise = JsPromiseHandle::fulfilled(
+                gc_heap,
+                Value::String(JsString::from_str(label, string_heap)?),
+            )?;
             let result = crate::object::alloc_object(gc_heap)?;
             crate::object::set(result, gc_heap, "async", Value::Boolean(false));
             crate::object::set(result, gc_heap, "value", Value::Promise(promise));

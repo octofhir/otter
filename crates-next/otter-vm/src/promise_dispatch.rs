@@ -129,7 +129,9 @@ fn static_reject(args: &[Value]) -> JsPromiseHandle {
 
 fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
     let entries = match args.first() {
-        Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect::<Vec<_>>(),
+        Some(Value::Array(arr)) => {
+            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
+        }
         _ => {
             // Foundation: only array iterables. Generic iterables
             // arrive once `Symbol.iterator` is in.
@@ -139,7 +141,11 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
     let result = JsPromiseHandle::pending();
     if entries.is_empty() {
         // Spec: empty iterable resolves immediately with [].
-        let jobs = result.fulfill(Value::Array(crate::JsArray::new()));
+        let arr = match crate::array::alloc_array(interp.gc_heap_for_cx_mut()) {
+            Ok(arr) => arr,
+            Err(_) => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+        };
+        let jobs = result.fulfill(Value::Array(arr));
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
         }
@@ -173,7 +179,7 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
                     .map(|opt| opt.unwrap_or(Value::Undefined))
                     .collect();
                 drop(slots_mut);
-                let arr = crate::JsArray::from_elements(collected);
+                let arr = crate::array::from_elements(interp.gc_heap_mut(), collected)?;
                 let jobs = result_clone.fulfill(Value::Array(arr));
                 for j in jobs.jobs {
                     interp.microtasks_mut().enqueue(j);
@@ -197,7 +203,9 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Value {
 
 fn static_race(interp: &mut Interpreter, args: &[Value]) -> Value {
     let entries = match args.first() {
-        Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect::<Vec<_>>(),
+        Some(Value::Array(arr)) => {
+            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
+        }
         _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
     };
     let result = JsPromiseHandle::pending();
@@ -237,12 +245,18 @@ fn static_race(interp: &mut Interpreter, args: &[Value]) -> Value {
 /// - <https://tc39.es/ecma262/#sec-promise.allsettled>
 fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Value {
     let entries = match args.first() {
-        Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect::<Vec<_>>(),
+        Some(Value::Array(arr)) => {
+            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
+        }
         _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
     };
     let result = JsPromiseHandle::pending();
     if entries.is_empty() {
-        let jobs = result.fulfill(Value::Array(crate::JsArray::new()));
+        let arr = match crate::array::alloc_array(interp.gc_heap_for_cx_mut()) {
+            Ok(arr) => arr,
+            Err(_) => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
+        };
+        let jobs = result.fulfill(Value::Array(arr));
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
         }
@@ -337,7 +351,10 @@ fn finalize_settled(
             .map(|opt| opt.unwrap_or(Value::Undefined))
             .collect();
         drop(s);
-        let arr = crate::JsArray::from_elements(collected);
+        let arr = match crate::array::from_elements(interp.gc_heap_mut(), collected) {
+            Ok(arr) => arr,
+            Err(_) => return,
+        };
         let jobs = result.fulfill(Value::Array(arr));
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
@@ -353,7 +370,9 @@ fn finalize_settled(
 /// - <https://tc39.es/ecma262/#sec-promise.any>
 fn static_any(interp: &mut Interpreter, args: &[Value]) -> Value {
     let entries = match args.first() {
-        Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect::<Vec<_>>(),
+        Some(Value::Array(arr)) => {
+            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
+        }
         _ => return Value::Promise(JsPromiseHandle::rejected(Value::Undefined)),
     };
     let result = JsPromiseHandle::pending();

@@ -25,3 +25,13 @@ Thumbs.db
 
 # Test262 output
 tests/test262-results/
+
+# Local/generated benchmark artifacts
+benchmarks/
+test262_results/
+scratch/
+*.cpuprofile
+*.heapsnapshot
+*.trace.json
+*.folded
+timeout-dump*.txt

@@ -108,18 +108,27 @@ impl GcTrace for JsObject {
 }
 
 impl GcTrace for JsArray {
-    /// Stub — body lands with task 78 (JsArray migration).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsArray as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for JsMap {
-    /// Stub — body lands with task 79 (JsMap / JsSet migration).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsMap as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for JsSet {
-    /// Stub — body lands with task 79.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        let p = self as *const JsSet as *mut RawGc;
+        visitor(p);
+    }
 }
 
 impl GcTrace for JsWeakMap {

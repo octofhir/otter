@@ -2,13 +2,13 @@
 
 ## Status
 
-- [ ] `JsMap = Gc<MapBody>`
-- [ ] `JsSet = Gc<SetBody>`
-- [ ] `Rc<RefCell<…Body>>` removed from `collections.rs`
-- [ ] `Traceable` impls trace keys + values
-- [ ] Map / Set mutation APIs take explicit context for barriers and
+- [x] `JsMap = Gc<MapBody>`
+- [x] `JsSet = Gc<SetBody>`
+- [x] `Rc<RefCell<…Body>>` removed from `collections.rs`
+- [x] `Traceable` impls trace keys + values
+- [x] Map / Set mutation APIs take explicit context for barriers and
       off-slot accounting
-- [ ] gates green
+- [x] gates green
 
 ## Goal
 
@@ -56,12 +56,12 @@ a value, a Set containing an object that points back).
 
 ## Validation gates
 
-- [ ] No `Rc<RefCell<MapBody>>` / `Rc<RefCell<SetBody>>`.
-- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/collections.rs` returns no Map / Set product-code hits.
-- [ ] All existing engine fixtures pass.
-- [ ] Regression test `tests/gc_map_self_value.rs`: `let m = new Map();
+- [x] No `Rc<RefCell<MapBody>>` / `Rc<RefCell<SetBody>>`.
+- [x] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm/src/collections.rs` returns no Map / Set product-code hits.
+- [x] All existing engine fixtures pass.
+- [x] Regression test `tests/gc_map_self_value.rs`: `let m = new Map();
   m.set("k", m); … drop; collect; assert no live Map`.
-- [ ] `cargo clippy --workspace -- -D warnings` clean.
+- [x] `cargo clippy --workspace -- -D warnings` clean.
 
 ## Closing
 

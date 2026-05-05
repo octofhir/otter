@@ -1,0 +1,113 @@
+name: Nightly Release
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY_TAG: nightly
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: otter-linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: otter
+            archive: tar.gz
+          - name: otter-macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            binary: otter
+            archive: tar.gz
+          - name: otter-macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary: otter
+            archive: tar.gz
+          - name: otter-windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: otter.exe
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI
+        run: cargo build --locked --release -p otter-cli --target ${{ matrix.target }}
+
+      - name: Package Unix
+        if: matrix.archive == 'tar.gz'
+        run: |
+          mkdir -p dist/${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.name }}/otter
+          tar -C dist -czf dist/${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          shasum -a 256 dist/${{ matrix.name }}.tar.gz > dist/${{ matrix.name }}.tar.gz.sha256
+
+      - name: Package Windows
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/${{ matrix.name }}
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.name }}/otter.exe
+          Compress-Archive -Path dist/${{ matrix.name }} -DestinationPath dist/${{ matrix.name }}.zip -Force
+          Get-FileHash dist/${{ matrix.name }}.zip -Algorithm SHA256 |
+            ForEach-Object { $_.Hash.ToLower() + '  ' + '${{ matrix.name }}.zip' } |
+            Set-Content dist/${{ matrix.name }}.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}.${{ matrix.archive }}
+            dist/${{ matrix.name }}.${{ matrix.archive }}.sha256
+
+  release:
+    name: Publish nightly
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Move nightly tag
+        run: |
+          git tag -f "$NIGHTLY_TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$NIGHTLY_TAG"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$NIGHTLY_TAG" --cleanup-tag --yes || true
+          git push -f origin "refs/tags/$NIGHTLY_TAG"
+          gh release create "$NIGHTLY_TAG" artifacts/* \
+            --title "Otter Nightly" \
+            --notes "Automated nightly build from ${GITHUB_SHA}." \
+            --prerelease \
+            --latest=false

@@ -214,11 +214,11 @@ reader can decide quickly whether to open it for reference.
 - bucket: **active**
 - reason: developer shortcuts (`just fmt`, `just test262-filter`, …).
 
-### `cliff.toml`, `release-plz.toml`, `Dockerfile`, `.dockerignore`,
-  `.gitmodules`, `.gitignore`
+### `Dockerfile`, `.dockerignore`, `.gitmodules`, `.gitignore`
 
 - bucket: **active**
-- reason: release / containerization / VCS plumbing.
+- reason: containerization and VCS plumbing. Legacy `release-plz.toml`
+  and `cliff.toml` were removed with the old release-plz workflow.
 
 ### `node_compat_config.toml`
 
@@ -270,23 +270,14 @@ reader can decide quickly whether to open it for reference.
 
 ### `benchmarks/`
 
-- bucket: **reference-only** (with delete-candidate sub-entries for
-  generated artifacts; see below).
-- reason: every script under `benchmarks/` targets the legacy `otter`
-  binary. The new engine has its own Criterion benchmarks living
-  inside the staging crates (e.g.,
-  `crates-next/otter-vm/benches/strings.rs`) and its own `tests/engine/`
-  fixtures. The legacy `benchmarks/` directory is not exercised by
-  foundation work. If a workload there is interesting (e.g.,
-  `benchmarks/cpu/json.ts`), the relevant slice task may copy the
-  **input file** (not Rust harness code) into the staging crate's
-  bench input set; the bench harness itself is rewritten from scratch.
-- delete-candidate sub-entries (committed generated output, deleted in
-  task `01c`):
-  - `benchmarks/results/` — committed benchmark output dumps.
-  - `benchmarks/node_modules/` — vendored npm modules, should be
-    `.gitignore`d.
-  - `benchmarks/c2-strings-latest.log` — committed log.
+- bucket: **deleted**
+- reason: the legacy JS/TS benchmark suite targeted the old `otter`
+  binary and mixed benchmark sources, shell runners, lockfiles, and
+  committed result artifacts in one tree. The active engine keeps
+  new benchmark work in crate-local Rust benches, for example
+  `crates-next/otter-vm/benches/strings.rs`.
+- guard: `benchmarks/` is ignored so local benchmark scratch files do
+  not get recommitted.
 
 ### `scripts/`
 
@@ -395,17 +386,15 @@ not touched by foundation work.
 
 - `test262_results/` (already noted as delete candidate; once empty,
   add to `.gitignore`).
-- `benchmarks/results/` (delete candidate; add to `.gitignore`).
-- `benchmarks/node_modules/` (delete candidate; should never be
-  committed).
-- `benchmarks/c2-strings-latest.log` and similar `*.log` files.
+- `benchmarks/` local scratch directories (ignored; the legacy tree was deleted).
+- `benchmarks/node_modules/` and generated benchmark logs remain covered by
+  the ignored `benchmarks/` tree.
 - `*.cpuprofile`, `*.heapsnapshot`, `*.trace.json`, `*.folded`,
   `timeout-dump*.txt` anywhere outside approved fixture directories
   (foundation plan §M12 mentions a CI check for this).
 - `scratch/` if kept as a developer scratch space.
 
-The actual `.gitignore` edit is a follow-up cleanup task, not part of
-this map.
+The `.gitignore` entries for deleted legacy benchmark artifacts are now in place.
 
 ## Open questions (need a human decision)
 
@@ -427,19 +416,12 @@ to legacy code that nobody builds. The remaining open questions are:
    new engine has an early conformance signal (probably during the
    first slice that runs Test262 fixtures, ≥ task `09`).
 
-4. **`benchmarks/{async,io,http,sql,jit,memory,startup,src}/`** —
-   classify each leaf as kept-for-foundation-bench-suite or
-   delete-candidate only if a foundation slice needs the historical
-   data. Otherwise leave the directory alone until the
-   end-of-foundation cleanup commit.
-
 ## Follow-up tasks this map implies
 
 - **task-01a**: recreate `ES_CONFORMANCE.md` once the new engine has
   enough surface to register a baseline (foundation plan §M0 / §M10).
 - **task-01c**: dedicated deletion commit for `test262_results/`,
-  `benchmarks/results/`, `benchmarks/node_modules/`,
-  `benchmarks/c2-strings-latest.log`, `scratch/`, `run-benchmark.sh`,
+  `scratch/`, `run-benchmark.sh`,
   `run-bun-benchmark.sh`, `test-server.sh`. Update `.gitignore` to
   keep them out.
 - **task-01d**: archive move for `PRODUCTION_READINESS_PLAN.md`,

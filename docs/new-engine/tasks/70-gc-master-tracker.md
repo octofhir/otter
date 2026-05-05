@@ -11,8 +11,12 @@
   - [x] 76 — `UpvalueCell` migrated to `Gc<UpvalueCellBody>` + `SafeTraceable` trait + `alloc_old` / `with_payload` / `read_payload` / `write_barrier_raw` GC APIs + `GcHeap` moved into `Interpreter` + `Frame::for_function_with_heap` / `Frame::build_upvalues` + `Value::trace_value_slots` for closure-spine walk + upvalue smoke test un-ignored + `counter_closure_no_leak` regression (closed 2026-05-04)
   - [x] 76A — `RuntimeCx`/`NativeCtx`, `!Send + !Sync` static assertions, trybuild compile-fail fixtures (closed 2026-05-05)
   - [x] 77 — `JsObject` → `Gc<ObjectBody>` (split 77A → 77B → 77C; closed 2026-05-05)
+  - [x] 78 — `JsArray` → `Gc<ArrayBody>` + explicit heap API + dense-element cap accounting + array cycle/root regressions (closed 2026-05-05)
 - [ ] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
 - [ ] Workers / isolate pools (task 92)
+- [ ] Compile-time GC safety hardening (task 93)
+- [ ] Contributor-facing GC/VM API surface (task 94)
+- [ ] Contributor book / plugin and macro guide (task 95)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
 - [ ] Phase 4 (deferred indefinitely) — concurrent marking + parallel scavenge (task 87)
@@ -60,8 +64,8 @@ later tasks assume earlier ones have landed.
 | 77A | ✅ closed (2026-05-04) | Body type swap + `SafeTraceable` impl + explicit-`&[mut] GcHeap` API inside `object.rs`. Workspace build expected red until 77B. |
 | 77B | ✅ closed (2026-05-05) | Mechanical caller sweep across `crates-next/otter-vm/src/` — thread `&[mut] gc_heap` through every site. Workspace build green at the end. |
 | 77C | ✅ closed (2026-05-05) | Un-ignore root smoke tests, add `proto_cycle_reaped` regression, delete `#[doc(hidden)]` thread-default shims from `heap.rs`, tighten 76A's third box to `[x]`. |
-| 78 | [78-migrate-jsarray.md](./78-migrate-jsarray.md) | `JsArray` → `Gc<ArrayBody>`; write barriers on element / named-prop stores. |
-| 79 | [79-migrate-jsmap-jsset.md](./79-migrate-jsmap-jsset.md) | `JsMap` / `JsSet` → `Gc<…>`; write barriers on entry stores. |
+| 78 | ✅ closed (2026-05-05) | `JsArray` → `Gc<ArrayBody>`; write barriers on element / named-prop stores. |
+| 79 | ✅ closed (2026-05-05) | `JsMap` / `JsSet` → `Gc<…>`; write barriers on entry stores. |
 | 80 | [80-migrate-weakmap-weakset-ephemerons.md](./80-migrate-weakmap-weakset-ephemerons.md) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes "task 57" markers). |
 | 81 | [81-weakref-finalization-registry.md](./81-weakref-finalization-registry.md) | `WeakRef` + `FinalizationRegistry`. |
 | 82 | [82-migrate-promise-iterator-generator.md](./82-migrate-promise-iterator-generator.md) | `JsPromiseHandle::Pure`, `IteratorState`, generator state; parked frame trace bodies. |
@@ -74,6 +78,9 @@ later tasks assume earlier ones have landed.
 |---|------|---------------|
 | 85 | [85-tokio-event-loop-runtime-handle.md](./85-tokio-event-loop-runtime-handle.md) | Tokio-first `EventLoop` trait + default `TokioEventLoop`; public `Otter` / `RuntimeHandle` are `Send + Sync`; isolate runner owns the `!Send` VM and GC. |
 | 92 | [92-worker-isolates-and-structured-clone.md](./92-worker-isolates-and-structured-clone.md) | Worker isolates and isolate pools; no GC handle crosses worker boundaries; communication via structured clone / transferables. |
+| 93 | [93-gc-branded-session-api.md](./93-gc-branded-session-api.md) | Compile-time-branded GC session/root/weak API inspired by Oscars/gc-arena: cross-isolate and stale-GC-context misuse should fail to compile, not rely on runtime discipline. |
+| 94 | [94-gc-contributor-api-surface.md](./94-gc-contributor-api-surface.md) | Clean safe GC/VM API for engine contributors and extension authors: V8-style handle tiers, Boa-style derive ergonomics, Otter-branded safety, and narrow unsafe internals. |
+| 95 | [95-contributor-book-and-extension-guides.md](./95-contributor-book-and-extension-guides.md) | mdBook-or-equivalent contributor guide covering engine architecture, GC API, hosted modules, future plugin system, and macro authoring. |
 
 ## Phase 2 — incremental marking + concurrent sweep + pretenuring
 
@@ -107,11 +114,34 @@ later tasks assume earlier ones have landed.
 - Task 76A's explicit-context rule is binding for tasks 77–83: no
   product-code `GcHeap::with_thread_default*` or raw thread-local heap
   lookup.
+- Task 93's branded-session rule is the next hardening layer over
+  task 76A: GC/worker/native APIs should move to branded `Root` /
+  `Weak` / session-context shapes even when that requires breaking
+  Rust API changes. The new engine is still in migration; compile-time
+  safety and simpler invariants win over preserving interim APIs.
+- Task 94's contributor-facing API rule is binding after it lands:
+  extension/native/builtin authors should allocate, root, mutate, trace,
+  and account memory through safe wrappers. Direct `RawGc`,
+  `TraceTable`, manual barrier, or raw handle-table access should remain
+  internal to `otter-gc` / tightly-audited VM internals.
+- Balance rule: Rust safety and public extensibility are both product
+  requirements. Prefer APIs that make common extension work simple and
+  safe; expose low-level escape hatches only when a production use case
+  cannot be served by a safe wrapper, and isolate that escape hatch
+  behind explicit `unsafe` contracts and tests.
+- Documentation rule: contributor-facing APIs are not complete until
+  the book has buildable examples and docs for them. Task 95 is the
+  home for the mdBook-or-equivalent guide; tasks 93/94 must update it
+  when branded sessions, plugin APIs, or macros change.
 - Write barriers wired at every pointer store **as part of the
   migration that adds the store** — not as a follow-up sweep.
 - After each migration: full `cargo test --workspace` green and
   `cargo run -p otter-cli -- test --suite engine` green.
 - Every PR cites the architecture-doc section it implements.
+- Breaking API changes are allowed inside `crates-next/*` when they
+  remove unsoundness risk, runtime-only checks, thread-local coupling,
+  or compatibility shims. Do not preserve an interim API just because
+  downstream code already adapted to it.
 - Every task ends with the gates in [Closing a task](./README.md#closing-a-task).
 - `unsafe` is permitted **only** in `crates-next/otter-gc/`; every
   other `crates-next/*` crate keeps `#![forbid(unsafe_code)]`.

@@ -564,6 +564,9 @@ impl Value {
         match self {
             // Task 77 — `JsObject` is a `Gc<ObjectBody>` handle.
             Value::Object(o) => Some(o.raw()),
+            Value::Array(a) => Some(a.raw()),
+            Value::Map(m) => Some(m.raw()),
+            Value::Set(s) => Some(s.raw()),
             // Phase-1 stub for the rest. Subsequent migrations
             // (78+) add variant arms here as their handle types
             // move to `Gc<…>`.
@@ -602,6 +605,18 @@ impl Value {
             // moves (Phase 2; today old-space objects pinned).
             Value::Object(o) => {
                 let p = o as *const JsObject as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::Array(a) => {
+                let p = a as *const JsArray as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::Map(m) => {
+                let p = m as *const JsMap as *mut otter_gc::RawGc;
+                visitor(p);
+            }
+            Value::Set(s) => {
+                let p = s as *const JsSet as *mut otter_gc::RawGc;
                 visitor(p);
             }
             _ => {}
@@ -658,11 +673,7 @@ impl Value {
             Value::Generator(_) => "[object Generator]".to_string(),
             Value::Proxy(_) => "[object Proxy]".to_string(),
             Value::Object(_) => "[object Object]".to_string(),
-            Value::Array(a) => {
-                let body = a.borrow_body();
-                let parts: Vec<String> = body.iter().map(Value::display_string).collect();
-                parts.join(",")
-            }
+            Value::Array(_) => "[object Array]".to_string(),
         }
     }
 
@@ -842,7 +853,7 @@ impl PartialEq for Value {
             // descriptions.
             (Value::Symbol(a), Value::Symbol(b)) => a.ptr_eq(b),
             (Value::Object(a), Value::Object(b)) => a == b,
-            (Value::Array(a), Value::Array(b)) => a.ptr_eq(b),
+            (Value::Array(a), Value::Array(b)) => crate::array::ptr_eq(*a, *b),
             (Value::Function { function_id: a }, Value::Function { function_id: b }) => a == b,
             (
                 Value::Closure {
@@ -862,8 +873,8 @@ impl PartialEq for Value {
             (Value::Iterator(a), Value::Iterator(b)) => std::rc::Rc::ptr_eq(a, b),
             (Value::RegExp(a), Value::RegExp(b)) => a.ptr_eq(b),
             (Value::ClassConstructor(a), Value::ClassConstructor(b)) => std::rc::Rc::ptr_eq(a, b),
-            (Value::Map(a), Value::Map(b)) => a.ptr_eq(b),
-            (Value::Set(a), Value::Set(b)) => a.ptr_eq(b),
+            (Value::Map(a), Value::Map(b)) => crate::collections::map_ptr_eq(*a, *b),
+            (Value::Set(a), Value::Set(b)) => crate::collections::set_ptr_eq(*a, *b),
             (Value::WeakMap(a), Value::WeakMap(b)) => a.ptr_eq(b),
             (Value::WeakSet(a), Value::WeakSet(b)) => a.ptr_eq(b),
             (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(b),
@@ -2926,7 +2937,10 @@ impl Interpreter {
                         Value::String(s) if name == "length" => {
                             Value::Number(NumberValue::from_i32(s.len() as i32))
                         }
-                        Value::Array(a) => a.get_named_property(&name).unwrap_or(Value::Undefined),
+                        Value::Array(a) => {
+                            crate::array::get_named_property(*a, &self.gc_heap, &name)
+                                .unwrap_or(Value::Undefined)
+                        }
                         // §20.2.4 Function-instance properties — every
                         // callable carries `.name` / `.length` /
                         // `.prototype`; user writes through the side
@@ -2966,7 +2980,9 @@ impl Interpreter {
                         v @ (Value::Map(_)
                         | Value::Set(_)
                         | Value::WeakMap(_)
-                        | Value::WeakSet(_)) => collections_prototype::load_property(v, &name),
+                        | Value::WeakSet(_)) => {
+                            collections_prototype::load_property_with_heap(v, &name, &self.gc_heap)
+                        }
                         Value::Temporal(t) => temporal::load_property(t, &name),
                         Value::ArrayBuffer(b) => {
                             binary::array_buffer_prototype::load_property(b, &name)
@@ -2999,7 +3015,12 @@ impl Interpreter {
                             // dense element table; non-index names
                             // land in the optional named-property
                             // bag. `length` writes are filed.
-                            a.set_named_property(&name, value.clone());
+                            crate::array::set_named_property(
+                                *a,
+                                &mut self.gc_heap,
+                                &name,
+                                value.clone(),
+                            )?;
                             None
                         }
                         // §9.2 Function-instance ordinary [[Set]]:
@@ -3086,7 +3107,8 @@ impl Interpreter {
                         let r = register_operand(operands.get(2 + i))?;
                         elements.push(read_register(frame, r)?.clone());
                     }
-                    write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
+                    let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
+                    write_register(frame, dst, Value::Array(array))?;
                     frame.pc += 1;
                 }
                 Op::LoadElement => {
@@ -3121,7 +3143,7 @@ impl Interpreter {
                                 .well_known_tag()
                                 .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
                         {
-                            make_array_iterator_factory(arr.clone())
+                            make_array_iterator_factory(*arr)
                         }
                         // `map[Symbol.iterator]` aliases `entries` per
                         // Spec §24.1.3.12; `set[Symbol.iterator]`
@@ -3131,14 +3153,14 @@ impl Interpreter {
                                 .well_known_tag()
                                 .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
                         {
-                            collections_prototype::make_map_iterator_factory(m.clone())
+                            collections_prototype::make_map_iterator_factory(*m)
                         }
                         (Value::Set(s), Value::Symbol(sym))
                             if sym
                                 .well_known_tag()
                                 .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
                         {
-                            collections_prototype::make_set_iterator_factory(s.clone())
+                            collections_prototype::make_set_iterator_factory(*s)
                         }
                         // Numeric-indexed array / string element
                         // reads.
@@ -3151,7 +3173,7 @@ impl Interpreter {
                                 _ => return Err(VmError::TypeMismatch),
                             };
                             match recv {
-                                Value::Array(a) => a.get(idx),
+                                Value::Array(a) => crate::array::get(a, &self.gc_heap, idx),
                                 Value::String(s) => match s.char_code_at(idx as u32) {
                                     Some(unit) => Value::String(crate::JsString::from_utf16_units(
                                         &[unit],
@@ -3194,7 +3216,9 @@ impl Interpreter {
                         }
                         // Numeric-indexed array write.
                         (Value::Array(arr), Value::Number(n)) => match n.as_smi() {
-                            Some(v) if v >= 0 => arr.set(v as usize, value),
+                            Some(v) if v >= 0 => {
+                                crate::array::set(*arr, &mut self.gc_heap, v as usize, value)?
+                            }
                             _ => return Err(VmError::TypeMismatch),
                         },
                         // §10.4.5.14 IntegerIndexedElementSet — out-of-
@@ -3217,10 +3241,10 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
                     let arr = match read_register(frame, src)? {
-                        Value::Array(a) => a.clone(),
+                        Value::Array(a) => *a,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let n = NumberValue::from_i32(arr.len() as i32);
+                    let n = NumberValue::from_i32(crate::array::len(arr, &self.gc_heap) as i32);
                     write_register(frame, dst, Value::Number(n))?;
                     frame.pc += 1;
                 }
@@ -3303,7 +3327,9 @@ impl Interpreter {
                             // in `[0, len)`. The string `"length"`
                             // is also always present.
                             Value::Number(n) => match n.as_smi() {
-                                Some(i) if i >= 0 => (i as usize) < arr.len(),
+                                Some(i) if i >= 0 => {
+                                    (i as usize) < crate::array::len(*arr, &self.gc_heap)
+                                }
                                 _ => false,
                             },
                             Value::String(s) => {
@@ -3311,7 +3337,7 @@ impl Interpreter {
                                 if key == "length" {
                                     true
                                 } else if let Ok(i) = key.parse::<usize>() {
-                                    i < arr.len()
+                                    i < crate::array::len(*arr, &self.gc_heap)
                                 } else {
                                     false
                                 }
@@ -3807,7 +3833,7 @@ impl Interpreter {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = iterator_static_call(&name, &args)?;
+                    let result = iterator_static_call(&name, &args, &mut self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -3920,7 +3946,7 @@ impl Interpreter {
                     // `array_statics::call`. With a callback we
                     // dispatch on the surrounding stack instead —
                     // filed as a follow-up.
-                    let result = array_statics::call(&name, &args)?;
+                    let result = array_statics::call(&name, &args, &mut self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4030,7 +4056,8 @@ impl Interpreter {
                     // single consumer, so freeing the backing
                     // storage promptly keeps frame sizes small.
                     let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
-                    write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
+                    let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
+                    write_register(frame, dst, Value::Array(array))?;
                     frame.pc += 1;
                 }
                 Op::CollectArguments => {
@@ -4042,7 +4069,8 @@ impl Interpreter {
                     // single) materialisation.
                     let dst = register_operand(operands.first())?;
                     let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.incoming_args);
-                    write_register(frame, dst, Value::Array(JsArray::from_elements(elements)))?;
+                    let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
+                    write_register(frame, dst, Value::Array(array))?;
                     frame.pc += 1;
                 }
                 Op::ImportNamespace => {
@@ -4258,24 +4286,29 @@ impl Interpreter {
                         // (Spec §24.2.3.11). We snapshot at iteration
                         // start, building a synthetic backing array.
                         Value::Map(m) => {
-                            let entries = m.entries();
+                            let entries = crate::collections::map_entries(m, &self.gc_heap);
                             let mut snap: SmallVec<[Value; 4]> =
                                 SmallVec::with_capacity(entries.len());
                             for (k, v) in entries {
                                 let mut pair: SmallVec<[Value; 4]> = SmallVec::new();
                                 pair.push(k);
                                 pair.push(v);
-                                snap.push(Value::Array(JsArray::from_elements(pair)));
+                                let pair_array =
+                                    crate::array::from_elements(&mut self.gc_heap, pair)?;
+                                snap.push(Value::Array(pair_array));
                             }
                             IteratorState::Array {
-                                array: JsArray::from_elements(snap),
+                                array: crate::array::from_elements(&mut self.gc_heap, snap)?,
                                 index: 0,
                             }
                         }
                         Value::Set(s) => {
-                            let snap: SmallVec<[Value; 4]> = s.values().into_iter().collect();
+                            let snap: SmallVec<[Value; 4]> =
+                                crate::collections::set_values(s, &self.gc_heap)
+                                    .into_iter()
+                                    .collect();
                             IteratorState::Array {
-                                array: JsArray::from_elements(snap),
+                                array: crate::array::from_elements(&mut self.gc_heap, snap)?,
                                 index: 0,
                             }
                         }
@@ -4306,7 +4339,7 @@ impl Interpreter {
                         Value::Iterator(rc) => rc.clone(),
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let (value, done) = step_iterator(&iter, &self.string_heap)?;
+                    let (value, done) = step_iterator(&iter, &self.string_heap, &self.gc_heap)?;
                     write_register(frame, value_dst, value)?;
                     write_register(frame, done_dst, Value::Boolean(done))?;
                     frame.pc += 1;
@@ -4316,11 +4349,10 @@ impl Interpreter {
                     let value_reg = register_operand(operands.get(1))?;
                     let value = read_register(frame, value_reg)?.clone();
                     let array = match read_register(frame, arr_reg)? {
-                        Value::Array(a) => a.clone(),
+                        Value::Array(a) => *a,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let next_idx = array.len();
-                    array.set(next_idx, value);
+                    crate::array::push(array, &mut self.gc_heap, value)?;
                     frame.pc += 1;
                 }
                 Op::SymbolLoad => {
@@ -4390,7 +4422,7 @@ impl Interpreter {
                     let iter_reg = register_operand(operands.get(2))?;
                     let kind = lookup_string_constant(module, kind_idx)?;
                     let seed = read_register(frame, iter_reg)?.clone();
-                    let value = build_collection(&kind, &seed)?;
+                    let value = build_collection(&kind, &seed, &mut self.gc_heap)?;
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
@@ -4612,7 +4644,8 @@ impl Interpreter {
         // target as a function.
         if let Value::Proxy(p) = &current {
             let proxy = p.clone();
-            let argv_array = JsArray::from_elements(effective_args.iter().cloned());
+            let argv_array =
+                crate::array::from_elements(&mut self.gc_heap, effective_args.iter().cloned())?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(),
                 effective_this.clone(),
@@ -5130,7 +5163,10 @@ impl Interpreter {
             Value::Array(a) => a,
             _ => return Err(VmError::TypeMismatch),
         };
-        let args: SmallVec<[Value; 8]> = arr.borrow_body().iter().cloned().collect();
+        let args: SmallVec<[Value; 8]> =
+            crate::array::with_elements(arr, &self.gc_heap, |elements| {
+                elements.iter().cloned().collect()
+            });
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
@@ -5151,7 +5187,7 @@ impl Interpreter {
         // otherwise delegates to the target.
         if let Value::Proxy(p) = &callee {
             let proxy = p.clone();
-            let argv_array = JsArray::from_elements(args.iter().cloned());
+            let argv_array = crate::array::from_elements(&mut self.gc_heap, args.iter().cloned())?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(),
                 Value::Array(argv_array),
@@ -5217,10 +5253,13 @@ impl Interpreter {
         let callee = read_register(&stack[top_idx], callee_reg)?.clone();
         let this_value = read_register(&stack[top_idx], this_reg)?.clone();
         let args_array = match read_register(&stack[top_idx], args_reg)? {
-            Value::Array(a) => a.clone(),
+            Value::Array(a) => *a,
             _ => return Err(VmError::TypeMismatch),
         };
-        let args: SmallVec<[Value; 8]> = args_array.borrow_body().iter().cloned().collect();
+        let args: SmallVec<[Value; 8]> =
+            crate::array::with_elements(args_array, &self.gc_heap, |elements| {
+                elements.iter().cloned().collect()
+            });
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
@@ -5659,8 +5698,11 @@ impl Interpreter {
             _ => return Err(VmError::NotCallable),
         };
         let entries: Vec<(Value, Value)> = match recv {
-            Value::Map(m) => m.entries(),
-            Value::Set(s) => s.values().into_iter().map(|v| (v.clone(), v)).collect(),
+            Value::Map(m) => crate::collections::map_entries(*m, &self.gc_heap),
+            Value::Set(s) => crate::collections::set_values(*s, &self.gc_heap)
+                .into_iter()
+                .map(|v| (v.clone(), v))
+                .collect(),
             _ => return Err(VmError::TypeMismatch),
         };
         // Advance pc *before* invoking the callbacks so each
@@ -5725,14 +5767,15 @@ impl Interpreter {
             return Ok(false);
         }
 
-        let arr_value = Value::Array(arr.clone());
+        let arr_value = Value::Array(*arr);
         // Snapshot the elements so callback-driven mutation of the
         // receiver does not corrupt iteration. Foundation matches
         // ECMA-262's "single-pass over indices 0..len" by capturing
         // length at entry; growing the array inside the callback
         // does not extend the walk (spec-compliant for `forEach` /
         // `map` / `filter`).
-        let elements: Vec<Value> = arr.borrow_body().elements.iter().cloned().collect();
+        let elements: Vec<Value> =
+            crate::array::with_elements(*arr, &self.gc_heap, |elements| elements.to_vec());
         let len = elements.len();
 
         let top_idx = stack.len() - 1;
@@ -5759,7 +5802,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     out.push(self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?);
                 }
-                Value::Array(JsArray::from_elements(out))
+                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
             }
             "filter" => {
                 let callee = require_callable(args.first())?;
@@ -5769,10 +5812,10 @@ impl Interpreter {
                     let kept =
                         self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                     if kept.to_boolean() {
-                        out.push(arr.get(i));
+                        out.push(crate::array::get(*arr, &self.gc_heap, i));
                     }
                 }
-                Value::Array(JsArray::from_elements(out))
+                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
             }
             "reduce" | "reduceRight" => {
                 let callee = require_callable(args.first())?;
@@ -5824,7 +5867,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                     if hit.to_boolean() {
-                        found = arr.get(i);
+                        found = crate::array::get(*arr, &self.gc_heap, i);
                         break;
                     }
                 }
@@ -5878,14 +5921,14 @@ impl Interpreter {
                         self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                     match mapped {
                         Value::Array(inner) => {
-                            for el in inner.borrow_body().iter() {
-                                out.push(el.clone());
-                            }
+                            crate::array::with_elements(inner, &self.gc_heap, |elements| {
+                                out.extend(elements.iter().cloned());
+                            });
                         }
                         other => out.push(other),
                     }
                 }
-                Value::Array(JsArray::from_elements(out))
+                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
             }
             "sort" => {
                 let callee = require_callable(args.first())?;
@@ -5919,11 +5962,10 @@ impl Interpreter {
                     }
                 }
                 {
-                    let mut body = arr.borrow_body_mut();
-                    body.elements.clear();
-                    for v in buffer {
-                        body.elements.push(v);
-                    }
+                    crate::array::with_elements_mut(*arr, &mut self.gc_heap, |elements| {
+                        elements.clear();
+                        elements.extend(buffer);
+                    });
                 }
                 arr_value.clone()
             }
@@ -6051,7 +6093,7 @@ impl Interpreter {
     ) -> Result<(Value, bool), VmError> {
         // First try the fast path; falls through to the
         // interpreter-aware branch on `User` / wrapper variants.
-        match step_iterator(iter, &self.string_heap) {
+        match step_iterator(iter, &self.string_heap, &self.gc_heap) {
             Ok((value, done)) => Ok((value, done)),
             Err(_) => self.iterator_next_full_slow(module, iter),
         }
@@ -6330,7 +6372,7 @@ impl Interpreter {
             }
             "toArray" => {
                 let collected = self.drain_iterator(module, iter_rc)?;
-                Value::Array(JsArray::from_elements(collected))
+                Value::Array(crate::array::from_elements(&mut self.gc_heap, collected)?)
             }
             "forEach" => {
                 let callback = require_callable(args.first())?;
@@ -6607,7 +6649,11 @@ impl Interpreter {
                 let this_value = iter.next().unwrap_or(Value::Undefined);
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
                     None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
-                    Some(Value::Array(arr)) => arr.borrow_body().iter().cloned().collect(),
+                    Some(Value::Array(arr)) => {
+                        crate::array::with_elements(arr, &self.gc_heap, |elements| {
+                            elements.iter().cloned().collect()
+                        })
+                    }
                     _ => return Err(VmError::TypeMismatch),
                 };
                 stack[top_idx].pc = stack[top_idx]
@@ -8573,30 +8619,39 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// - <https://tc39.es/ecma262/#sec-set-constructor>
 /// - <https://tc39.es/ecma262/#sec-weakmap-constructor>
 /// - <https://tc39.es/ecma262/#sec-weakset-constructor>
-fn build_collection(kind: &str, seed: &Value) -> Result<Value, VmError> {
+fn build_collection(
+    kind: &str,
+    seed: &Value,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     match kind {
         "Map" => {
-            let m = JsMap::new();
+            let m = crate::collections::alloc_map(gc_heap)?;
             if seed_is_present(seed) {
-                let entries = seed_array(seed)?;
+                let entries = seed_array(seed, gc_heap)?;
                 for entry in entries {
                     let pair = match entry {
                         Value::Array(a) => a,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    if pair.len() < 2 {
+                    if crate::array::len(pair, gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
-                    m.set(pair.get(0), pair.get(1));
+                    crate::collections::map_set(
+                        m,
+                        gc_heap,
+                        crate::array::get(pair, gc_heap, 0),
+                        crate::array::get(pair, gc_heap, 1),
+                    )?;
                 }
             }
             Ok(Value::Map(m))
         }
         "Set" => {
-            let s = JsSet::new();
+            let s = crate::collections::alloc_set(gc_heap)?;
             if seed_is_present(seed) {
-                for v in seed_array(seed)? {
-                    s.add(v);
+                for v in seed_array(seed, gc_heap)? {
+                    crate::collections::set_add(s, gc_heap, v)?;
                 }
             }
             Ok(Value::Set(s))
@@ -8604,16 +8659,19 @@ fn build_collection(kind: &str, seed: &Value) -> Result<Value, VmError> {
         "WeakMap" => {
             let m = JsWeakMap::new();
             if seed_is_present(seed) {
-                for entry in seed_array(seed)? {
+                for entry in seed_array(seed, gc_heap)? {
                     let pair = match entry {
                         Value::Array(a) => a,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    if pair.len() < 2 {
+                    if crate::array::len(pair, gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
-                    m.set(pair.get(0), pair.get(1))
-                        .map_err(|_| VmError::TypeMismatch)?;
+                    m.set(
+                        crate::array::get(pair, gc_heap, 0),
+                        crate::array::get(pair, gc_heap, 1),
+                    )
+                    .map_err(|_| VmError::TypeMismatch)?;
                 }
             }
             Ok(Value::WeakMap(m))
@@ -8621,7 +8679,7 @@ fn build_collection(kind: &str, seed: &Value) -> Result<Value, VmError> {
         "WeakSet" => {
             let s = JsWeakSet::new();
             if seed_is_present(seed) {
-                for v in seed_array(seed)? {
+                for v in seed_array(seed, gc_heap)? {
                     s.add(v).map_err(|_| VmError::TypeMismatch)?;
                 }
             }
@@ -8637,9 +8695,11 @@ fn seed_is_present(v: &Value) -> bool {
     !matches!(v, Value::Undefined | Value::Null)
 }
 
-fn seed_array(seed: &Value) -> Result<Vec<Value>, VmError> {
+fn seed_array(seed: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
     match seed {
-        Value::Array(a) => Ok(a.borrow_body().iter().cloned().collect()),
+        Value::Array(a) => Ok(crate::array::with_elements(*a, gc_heap, |elements| {
+            elements.to_vec()
+        })),
         _ => Err(VmError::TypeMismatch),
     }
 }
@@ -8657,10 +8717,7 @@ fn seed_array(seed: &Value) -> Result<Vec<Value>, VmError> {
 ///   semantics.
 fn make_array_iterator_factory(array: JsArray) -> Value {
     native_value("Array[Symbol.iterator]", move |_, _| {
-        let state = IteratorState::Array {
-            array: array.clone(),
-            index: 0,
-        };
+        let state = IteratorState::Array { array, index: 0 };
         Ok(Value::Iterator(std::rc::Rc::new(std::cell::RefCell::new(
             state,
         ))))
@@ -8763,7 +8820,11 @@ fn proxy_static_call(
 ///
 /// # See also
 /// - <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
-fn iterator_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
+fn iterator_static_call(
+    name: &str,
+    args: &[Value],
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, VmError> {
     match name {
         // Reserved spec form — the constructor itself isn't
         // user-callable.
@@ -8782,20 +8843,22 @@ fn iterator_static_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
                     index: 0,
                 },
                 Value::Set(s) => {
-                    let snap: SmallVec<[Value; 4]> = s.values().into_iter().collect();
+                    let snap: SmallVec<[Value; 4]> = crate::collections::set_values(s, gc_heap)
+                        .into_iter()
+                        .collect();
                     IteratorState::Array {
-                        array: JsArray::from_elements(snap),
+                        array: crate::array::from_elements(gc_heap, snap)?,
                         index: 0,
                     }
                 }
                 Value::Map(m) => {
-                    let entries: Vec<Value> = m
-                        .entries()
-                        .into_iter()
-                        .map(|(k, v)| Value::Array(JsArray::from_elements([k, v])))
-                        .collect();
+                    let mut entries: Vec<Value> = Vec::new();
+                    for (k, v) in crate::collections::map_entries(m, gc_heap) {
+                        let pair = crate::array::from_elements(gc_heap, [k, v])?;
+                        entries.push(Value::Array(pair));
+                    }
                     IteratorState::Array {
-                        array: JsArray::from_elements(entries),
+                        array: crate::array::from_elements(gc_heap, entries)?,
                         index: 0,
                     }
                 }
@@ -8873,14 +8936,15 @@ fn take_drop_count(arg: Option<&Value>) -> Result<u64, VmError> {
 fn step_iterator(
     iter: &std::rc::Rc<std::cell::RefCell<IteratorState>>,
     string_heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<(Value, bool), VmError> {
     let mut state = iter.borrow_mut();
     let outcome = match &mut *state {
         IteratorState::Array { array, index } => {
-            if *index >= array.len() {
+            if *index >= crate::array::len(*array, gc_heap) {
                 None
             } else {
-                let v = array.get(*index);
+                let v = crate::array::get(*array, gc_heap, *index);
                 *index += 1;
                 Some(v)
             }

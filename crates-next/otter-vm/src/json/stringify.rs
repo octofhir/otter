@@ -120,7 +120,7 @@ impl VisitSet {
         self.objects.pop();
     }
     fn enter_array(&mut self, arr: &JsArray) -> Result<(), JsonError> {
-        let key = arr.identity_addr();
+        let key = crate::array::identity_addr(*arr);
         if self.arrays.contains(&key) {
             return Err(JsonError::Cyclic);
         }
@@ -170,7 +170,7 @@ fn drive(
                 idx,
                 had_member,
             } => {
-                if *idx >= arr.len() {
+                if *idx >= crate::array::len(*arr, gc_heap) {
                     if options.pretty() && *had_member {
                         write_indent(out, &options.indent, depth - 1);
                     }
@@ -179,7 +179,7 @@ fn drive(
                     visit.leave_array();
                     continue;
                 }
-                let elem = arr.get(*idx);
+                let elem = crate::array::get(*arr, gc_heap, *idx);
                 *idx += 1;
                 if *had_member {
                     out.push(',');
@@ -272,7 +272,7 @@ fn emit_value(
             visit.enter_array(arr)?;
             out.push('[');
             stack.push(Frame::Array {
-                arr: arr.clone(),
+                arr: *arr,
                 idx: 0,
                 had_member: false,
             });
@@ -342,16 +342,15 @@ fn emit_value(
                     limit: MAX_NESTING_DEPTH,
                 });
             }
-            // Snapshot to a transient JsArray so the existing array
-            // walker handles separators uniformly.
-            let snapshot: Vec<Value> = (0..ta.length()).map(|i| ta.get(i)).collect();
-            let arr = crate::array::JsArray::from_elements(snapshot);
             out.push('[');
-            stack.push(Frame::Array {
-                arr,
-                idx: 0,
-                had_member: false,
-            });
+            for i in 0..ta.length() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let value = ta.get(i);
+                emit_value(&value, out, stack, visit, options, gc_heap)?;
+            }
+            out.push(']');
         }
         // §25.5.2 Date — emit the ISO-8601 representation as a JSON
         // string, mirroring `Date.prototype.toJSON`.

@@ -29,8 +29,7 @@
 //! - <https://tc39.es/ecma262/#sec-weakmap-prototype-object>
 //! - <https://tc39.es/ecma262/#sec-weakset-prototype-object>
 
-use crate::array::JsArray;
-use crate::collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet};
+use crate::collections::{self, CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
 use crate::{Value, native_value};
@@ -40,9 +39,9 @@ use smallvec::SmallVec;
 // Map.prototype
 // ---------------------------------------------------------------
 
-fn receiver_map<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsMap, IntrinsicError> {
+fn receiver_map(args: &IntrinsicArgs<'_>) -> Result<JsMap, IntrinsicError> {
     match args.receiver {
-        Value::Map(m) => Ok(m),
+        Value::Map(m) => Ok(*m),
         _ => Err(IntrinsicError::BadReceiver { expected: "Map" }),
     }
 }
@@ -50,52 +49,72 @@ fn receiver_map<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsMap, IntrinsicE
 fn impl_map_get(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(m.get(&key).unwrap_or(Value::Undefined))
+    let heap = args.gc_heap.borrow();
+    Ok(collections::map_get(m, &heap, &key).unwrap_or(Value::Undefined))
 }
 
 fn impl_map_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
     let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
-    m.set(key, value);
-    Ok(Value::Map(m.clone()))
+    let mut heap = args.gc_heap.borrow_mut();
+    collections::map_set(m, &mut heap, key, value)?;
+    Ok(Value::Map(m))
 }
 
 fn impl_map_has(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(Value::Boolean(m.has(&key)))
+    let heap = args.gc_heap.borrow();
+    Ok(Value::Boolean(collections::map_has(m, &heap, &key)))
 }
 
 fn impl_map_delete(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(Value::Boolean(m.delete(&key)))
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(Value::Boolean(collections::map_delete(m, &mut heap, &key)))
 }
 
 fn impl_map_clear(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
-    m.clear();
+    let mut heap = args.gc_heap.borrow_mut();
+    collections::map_clear(m, &mut heap);
     Ok(Value::Undefined)
 }
 
 /// `Map.prototype.keys` — returns a foundation iterator factory
 /// closure-bearing native function. Spec §24.1.3.8.
 fn impl_map_keys(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let m = receiver_map(args)?.clone();
-    Ok(make_iter_value(map_iter_state(MapIterKind::Keys, m)))
+    let m = receiver_map(args)?;
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(make_iter_value(map_iter_state(
+        MapIterKind::Keys,
+        m,
+        &mut heap,
+    )?))
 }
 
 /// `Map.prototype.values` — Spec §24.1.3.10.
 fn impl_map_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let m = receiver_map(args)?.clone();
-    Ok(make_iter_value(map_iter_state(MapIterKind::Values, m)))
+    let m = receiver_map(args)?;
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(make_iter_value(map_iter_state(
+        MapIterKind::Values,
+        m,
+        &mut heap,
+    )?))
 }
 
 /// `Map.prototype.entries` — Spec §24.1.3.4.
 fn impl_map_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let m = receiver_map(args)?.clone();
-    Ok(make_iter_value(map_iter_state(MapIterKind::Entries, m)))
+    let m = receiver_map(args)?;
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(make_iter_value(map_iter_state(
+        MapIterKind::Entries,
+        m,
+        &mut heap,
+    )?))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,26 +124,30 @@ enum MapIterKind {
     Entries,
 }
 
-fn map_iter_state(kind: MapIterKind, m: JsMap) -> crate::IteratorState {
-    let entries = m.entries();
-    let snapshot: SmallVec<[Value; 4]> = entries
-        .into_iter()
-        .map(|(k, v)| match kind {
+fn map_iter_state(
+    kind: MapIterKind,
+    m: JsMap,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<crate::IteratorState, otter_gc::OutOfMemory> {
+    let entries = collections::map_entries(m, gc_heap);
+    let mut snapshot: SmallVec<[Value; 4]> = SmallVec::with_capacity(entries.len());
+    for (k, v) in entries {
+        snapshot.push(match kind {
             MapIterKind::Keys => k,
             MapIterKind::Values => v,
-            MapIterKind::Entries => Value::Array(JsArray::from_elements({
+            MapIterKind::Entries => {
                 let mut sv: SmallVec<[Value; 4]> = SmallVec::new();
                 sv.push(k);
                 sv.push(v);
-                sv
-            })),
-        })
-        .collect();
-    let arr = JsArray::from_elements(snapshot);
-    crate::IteratorState::Array {
+                Value::Array(crate::array::from_elements(gc_heap, sv)?)
+            }
+        });
+    }
+    let arr = crate::array::from_elements(gc_heap, snapshot)?;
+    Ok(crate::IteratorState::Array {
         array: arr,
         index: 0,
-    }
+    })
 }
 
 fn make_iter_value(state: crate::IteratorState) -> Value {
@@ -135,9 +158,9 @@ fn make_iter_value(state: crate::IteratorState) -> Value {
 // Set.prototype
 // ---------------------------------------------------------------
 
-fn receiver_set<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsSet, IntrinsicError> {
+fn receiver_set(args: &IntrinsicArgs<'_>) -> Result<JsSet, IntrinsicError> {
     match args.receiver {
-        Value::Set(s) => Ok(s),
+        Value::Set(s) => Ok(*s),
         _ => Err(IntrinsicError::BadReceiver { expected: "Set" }),
     }
 }
@@ -145,33 +168,38 @@ fn receiver_set<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsSet, IntrinsicE
 fn impl_set_add(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    s.add(v);
-    Ok(Value::Set(s.clone()))
+    let mut heap = args.gc_heap.borrow_mut();
+    collections::set_add(s, &mut heap, v)?;
+    Ok(Value::Set(s))
 }
 
 fn impl_set_has(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(Value::Boolean(s.has(&v)))
+    let heap = args.gc_heap.borrow();
+    Ok(Value::Boolean(collections::set_has(s, &heap, &v)))
 }
 
 fn impl_set_delete(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(Value::Boolean(s.delete(&v)))
+    let mut heap = args.gc_heap.borrow_mut();
+    Ok(Value::Boolean(collections::set_delete(s, &mut heap, &v)))
 }
 
 fn impl_set_clear(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    s.clear();
+    let mut heap = args.gc_heap.borrow_mut();
+    collections::set_clear(s, &mut heap);
     Ok(Value::Undefined)
 }
 
 fn impl_set_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let s = receiver_set(args)?.clone();
-    let snap: SmallVec<[Value; 4]> = s.values().into_iter().collect();
+    let s = receiver_set(args)?;
+    let mut heap = args.gc_heap.borrow_mut();
+    let snap: SmallVec<[Value; 4]> = collections::set_values(s, &heap).into_iter().collect();
     Ok(make_iter_value(crate::IteratorState::Array {
-        array: JsArray::from_elements(snap),
+        array: crate::array::from_elements(&mut heap, snap)?,
         index: 0,
     }))
 }
@@ -185,19 +213,15 @@ fn impl_set_keys(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// `Set.prototype.entries` — yields `[v, v]` pairs per
 /// §24.2.3.5.
 fn impl_set_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let s = receiver_set(args)?.clone();
-    let snap: SmallVec<[Value; 4]> = s
-        .values()
-        .into_iter()
-        .map(|v| {
-            let mut sv: SmallVec<[Value; 4]> = SmallVec::new();
-            sv.push(v.clone());
-            sv.push(v);
-            Value::Array(JsArray::from_elements(sv))
-        })
-        .collect();
+    let s = receiver_set(args)?;
+    let mut heap = args.gc_heap.borrow_mut();
+    let mut snap: SmallVec<[Value; 4]> = SmallVec::new();
+    for v in collections::set_values(s, &heap) {
+        let pair = crate::array::from_elements(&mut heap, [v.clone(), v])?;
+        snap.push(Value::Array(pair));
+    }
     Ok(make_iter_value(crate::IteratorState::Array {
-        array: JsArray::from_elements(snap),
+        array: crate::array::from_elements(&mut heap, snap)?,
         index: 0,
     }))
 }
@@ -391,10 +415,21 @@ pub fn lookup_weak_set(name: &str) -> Option<&'static crate::intrinsics::Intrins
 /// omits it deliberately because the entries can vanish under GC).
 #[must_use]
 pub fn load_property(value: &Value, name: &str) -> Value {
+    let _ = (value, name);
+    Value::Undefined
+}
+
+/// Heap-aware version of [`load_property`].
+#[must_use]
+pub fn load_property_with_heap(value: &Value, name: &str, heap: &otter_gc::GcHeap) -> Value {
     if name == "size" {
         match value {
-            Value::Map(m) => Value::Number(NumberValue::from_i32(m.len() as i32)),
-            Value::Set(s) => Value::Number(NumberValue::from_i32(s.len() as i32)),
+            Value::Map(m) => {
+                Value::Number(NumberValue::from_i32(collections::map_len(*m, heap) as i32))
+            }
+            Value::Set(s) => {
+                Value::Number(NumberValue::from_i32(collections::set_len(*s, heap) as i32))
+            }
             _ => Value::Undefined,
         }
     } else {
@@ -407,11 +442,12 @@ pub fn load_property(value: &Value, name: &str) -> Value {
 /// matches Spec §24.1.3.12 (`@@iterator` aliases `entries`).
 #[must_use]
 pub fn make_map_iterator_factory(map: JsMap) -> Value {
-    native_value("Map[Symbol.iterator]", move |_, _| {
+    native_value("Map[Symbol.iterator]", move |vm, _| {
         Ok(make_iter_value(map_iter_state(
             MapIterKind::Entries,
-            map.clone(),
-        )))
+            map,
+            vm.gc_heap_mut(),
+        )?))
     })
 }
 
@@ -419,10 +455,12 @@ pub fn make_map_iterator_factory(map: JsMap) -> Value {
 /// resolves to (alias of `values`, Spec §24.2.3.11).
 #[must_use]
 pub fn make_set_iterator_factory(set: JsSet) -> Value {
-    native_value("Set[Symbol.iterator]", move |_, _| {
-        let snap: SmallVec<[Value; 4]> = set.values().into_iter().collect();
+    native_value("Set[Symbol.iterator]", move |vm, _| {
+        let snap: SmallVec<[Value; 4]> = collections::set_values(set, vm.gc_heap())
+            .into_iter()
+            .collect();
         Ok(make_iter_value(crate::IteratorState::Array {
-            array: JsArray::from_elements(snap),
+            array: crate::array::from_elements(vm.gc_heap_mut(), snap)?,
             index: 0,
         }))
     })

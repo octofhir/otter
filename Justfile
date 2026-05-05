@@ -12,21 +12,30 @@ lint:
 test:
     cargo test --all --all-features
 
+# Report process-risk markers without failing the build.
+process-audit:
+    @echo "=== Porting debt markers ==="
+    @grep -R "TODO(port)\|PERF(port)\|PORT NOTE\|PORT STATUS" crates docs --line-number 2>/dev/null || true
+    @echo "\n=== Reachable placeholders ==="
+    @grep -R "todo!()\|unimplemented!()" crates --include '*.rs' --line-number 2>/dev/null || true
+    @echo "\n=== Unsafe usage for manual review ==="
+    @grep -R "unsafe" crates/otter-gc crates/otter-jit crates/otter-modules --include '*.rs' --line-number 2>/dev/null || true
+    @echo "\n=== Runtime-visible UTF-8/string conversions ==="
+    @grep -R "from_utf8.*unwrap\|from_utf8_lossy\|to_string()" crates/otter-vm crates/otter-runtime crates/otter-web crates/otter-modules --include '*.rs' --line-number 2>/dev/null || true
+    @echo "\n=== Potentially nondeterministic maps in spec-visible crates ==="
+    @grep -R "HashMap\|FxHashMap" crates/otter-vm crates/otter-runtime crates/otter-web crates/otter-modules --include '*.rs' --line-number 2>/dev/null || true
+
 # Build all targets
 build:
     cargo build --all-targets
 
 # Build release
 release:
-    cargo build --release -p otterjs
-
-# Run the release-mode Tier 1 JIT benchmark gate
-jit-tier1-gate *benchmarks:
-    bash benchmarks/jit/tier1_release_gate.sh {{benchmarks}}
+    cargo build --release -p otter-cli
 
 # Run CLI with arguments
 run *args:
-    cargo run -p otterjs -- {{args}}
+    cargo run -p otter-cli -- {{args}}
 
 # Clean build artifacts
 clean:
@@ -36,32 +45,32 @@ clean:
 
 # Run a JavaScript example
 example-js file:
-    cargo run -p otterjs -- run examples/{{file}}.js
+    cargo run -p otter-cli -- run examples/{{file}}.js
 
 # Run a TypeScript example
 example-ts file:
-    cargo run -p otterjs -- run examples/{{file}}.ts
+    cargo run -p otter-cli -- run examples/{{file}}.ts
 
 # Run all JavaScript examples
 examples-js:
     @echo "=== Running JavaScript examples ==="
-    cargo run -p otterjs -- run examples/basic.js
+    cargo run -p otter-cli -- run examples/basic.js
     @echo ""
-    cargo run -p otterjs -- run examples/event_loop.js
+    cargo run -p otter-cli -- run examples/event_loop.js
     @echo ""
-    cargo run -p otterjs -- run examples/http_fetch.js
+    cargo run -p otter-cli -- run examples/http_fetch.js
 
 # Run all TypeScript examples
 examples-ts:
     @echo "=== Running TypeScript examples ==="
     @echo "\n--- basic.ts ---"
-    cargo run -p otterjs -- run examples/basic.ts
+    cargo run -p otter-cli -- run examples/basic.ts
     @echo "\n--- generics.ts ---"
-    cargo run -p otterjs -- run examples/generics.ts
+    cargo run -p otter-cli -- run examples/generics.ts
     @echo "\n--- async.ts ---"
-    cargo run -p otterjs -- run examples/async.ts
+    cargo run -p otter-cli -- run examples/async.ts
     @echo "\n--- classes.ts ---"
-    cargo run -p otterjs -- run examples/classes.ts
+    cargo run -p otter-cli -- run examples/classes.ts
 
 # Run all examples
 examples: examples-js examples-ts
@@ -77,15 +86,15 @@ list-examples:
 
 # Type check TypeScript files
 check *files:
-    cargo run -p otterjs -- check {{files}}
+    cargo run -p otter-cli -- check {{files}}
 
 # Type check all TypeScript examples
 check-examples:
-    cargo run -p otterjs -- check examples/*.ts
+    cargo run -p otter-cli -- check examples/*.ts
 
 # Type check with a tsconfig.json project
 check-project project:
-    cargo run -p otterjs -- check -p {{project}} .
+    cargo run -p otter-cli -- check -p {{project}} .
 
 # === Test262 Conformance Tests ===
 

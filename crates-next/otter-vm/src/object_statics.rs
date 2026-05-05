@@ -28,7 +28,6 @@
 //! - <https://tc39.es/ecma262/#sec-topropertydescriptor>
 //! - <https://tc39.es/ecma262/#sec-setintegritylevel>
 
-use crate::array::JsArray;
 use crate::object::{DescriptorKind, JsObject, PropertyDescriptor, PropertyLookup};
 use crate::string::{JsString, StringHeap};
 use crate::{Value, VmError};
@@ -220,7 +219,7 @@ pub fn call(
             for k in owned {
                 names.push(string_value(&k, string_heap)?);
             }
-            Ok(Value::Array(JsArray::from_elements(names)))
+            Ok(Value::Array(crate::array::from_elements(gc_heap, names)?))
         }
         // §20.1.2.22 Object.values(O) — enumerable own data values.
         // <https://tc39.es/ecma262/#sec-object.values>
@@ -229,7 +228,7 @@ pub fn call(
             let values: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.enumerable_data_iter().map(|(_, v)| v).collect()
             });
-            Ok(Value::Array(JsArray::from_elements(values)))
+            Ok(Value::Array(crate::array::from_elements(gc_heap, values)?))
         }
         // §20.1.2.5 Object.entries(O) — `[key, value]` pairs in
         // insertion order.
@@ -245,9 +244,9 @@ pub fn call(
             for (k, v) in raw {
                 let key = string_value(&k, string_heap)?;
                 let pair: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![key, v];
-                pairs.push(Value::Array(JsArray::from_elements(pair)));
+                pairs.push(Value::Array(crate::array::from_elements(gc_heap, pair)?));
             }
-            Ok(Value::Array(JsArray::from_elements(pairs)))
+            Ok(Value::Array(crate::array::from_elements(gc_heap, pairs)?))
         }
         // §20.1.2.1 Object.assign(target, ...sources). Copies own
         // enumerable string-keyed data properties from each source
@@ -293,12 +292,13 @@ pub fn call(
                 Value::Array(arr) => {
                     // Snapshot to avoid holding the array's RefCell
                     // borrow while we recurse into per-pair work.
-                    let snapshot: Vec<Value> = arr.borrow_body().iter().cloned().collect();
+                    let snapshot: Vec<Value> =
+                        crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
                     for entry in snapshot {
                         match entry {
                             Value::Array(pair) => {
-                                let key = pair.get(0);
-                                let value = pair.get(1);
+                                let key = crate::array::get(pair, gc_heap, 0);
+                                let value = crate::array::get(pair, gc_heap, 1);
                                 let key_str = property_key_from_value(&key)?;
                                 crate::object::set(result, gc_heap, &key_str, value);
                             }
@@ -307,7 +307,7 @@ pub fn call(
                     }
                 }
                 Value::Map(m) => {
-                    for (key, value) in m.entries() {
+                    for (key, value) in crate::collections::map_entries(m, gc_heap) {
                         let key_str = property_key_from_value(&key)?;
                         crate::object::set(result, gc_heap, &key_str, value);
                     }
@@ -340,7 +340,7 @@ pub fn call(
             for k in owned {
                 names.push(string_value(&k, string_heap)?);
             }
-            Ok(Value::Array(JsArray::from_elements(names)))
+            Ok(Value::Array(crate::array::from_elements(gc_heap, names)?))
         }
         // §20.1.2.13 Object.getOwnPropertySymbols(O) — every own
         // symbol-keyed property. Foundation property bag is
@@ -352,7 +352,7 @@ pub fn call(
             let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.symbol_keys().map(Value::Symbol).collect()
             });
-            Ok(Value::Array(JsArray::from_elements(syms)))
+            Ok(Value::Array(crate::array::from_elements(gc_heap, syms)?))
         }
         _ => Err(VmError::UnknownIntrinsic {
             name: format!("Object.{name}"),

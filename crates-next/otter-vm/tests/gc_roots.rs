@@ -219,16 +219,71 @@ fn error_class_registry_prototypes_survive_force_gc() {
 }
 
 #[test]
-#[ignore = "un-ignore in task 78 (JsArray migration)"]
 fn array_element_root_survives_force_gc() {
-    // task 78: alloc array, populate, drop handle, force_gc,
-    // assert element readable.
+    let mut interp = Interpreter::new();
+    let arr = otter_vm::array::alloc_array(interp.gc_heap_mut()).expect("alloc array");
+    otter_vm::array::push(arr, interp.gc_heap_mut(), otter_vm::Value::Boolean(true))
+        .expect("push element");
+    let global_this = *interp.global_this();
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__array_root",
+        otter_vm::Value::Array(arr),
+    );
+
+    let _ = arr;
+    interp.force_gc();
+
+    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__array_root")
+        .expect("array root survives force_gc");
+    match rooted {
+        otter_vm::Value::Array(array) => {
+            assert_eq!(
+                otter_vm::array::get(array, interp.gc_heap(), 0),
+                otter_vm::Value::Boolean(true)
+            );
+        }
+        other => panic!("expected Value::Array after force_gc, got {other:?}"),
+    }
 }
 
 #[test]
-#[ignore = "un-ignore in task 79 (JsMap / JsSet migration)"]
 fn map_entry_root_survives_force_gc() {
-    // task 79: alloc Map, set entry, drop, force_gc, assert.
+    let mut interp = Interpreter::new();
+    let map = otter_vm::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");
+    let stashed = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc object");
+    let key = otter_vm::Value::Number(otter_vm::NumberValue::Smi(7));
+    otter_vm::collections::map_set(
+        map,
+        interp.gc_heap_mut(),
+        key.clone(),
+        otter_vm::Value::Object(stashed),
+    )
+    .expect("map set");
+
+    let global_this = *interp.global_this();
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__map_root",
+        otter_vm::Value::Map(map),
+    );
+
+    let _ = map;
+    let _ = stashed;
+    interp.force_gc();
+
+    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__map_root")
+        .expect("map root survives force_gc");
+    match rooted {
+        otter_vm::Value::Map(rooted_map) => {
+            let value = otter_vm::collections::map_get(rooted_map, interp.gc_heap(), &key)
+                .expect("map entry survives force_gc");
+            assert!(matches!(value, otter_vm::Value::Object(_)));
+        }
+        other => panic!("expected Value::Map after force_gc, got {other:?}"),
+    }
 }
 
 #[test]

@@ -34,7 +34,7 @@
 //! - <https://tc39.es/ecma262/#sec-weakset-objects>
 //! - <https://tc39.es/ecma262/#sec-samevaluezero>
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -42,6 +42,12 @@ use indexmap::IndexMap;
 use crate::Value;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`MapBody`].
+pub const MAP_BODY_TYPE_TAG: u8 = 0x13;
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SetBody`].
+pub const SET_BODY_TYPE_TAG: u8 = 0x14;
 
 /// Equality key for [`JsMap`] / [`JsSet`].
 ///
@@ -109,7 +115,7 @@ impl MapKey {
             Value::String(s) => MapKey::String(s.clone()),
             Value::Symbol(s) => MapKey::Symbol(s.clone()),
             Value::Object(o) => MapKey::ObjectPtr(o.as_header_ptr() as *const ()),
-            Value::Array(a) => MapKey::ObjectPtr(a.identity_addr()),
+            Value::Array(a) => MapKey::ObjectPtr(crate::array::identity_addr(*a)),
             Value::RegExp(r) => MapKey::ObjectPtr(r.identity_addr()),
             Value::Promise(_) => {
                 // Promises do not yet expose a stable `identity_addr`
@@ -203,202 +209,230 @@ pub enum CollectionError {
 /// where the tuple holds `(original_key_value, value)` so iteration
 /// can hand back the original key (e.g. the actual object handle,
 /// not the pointer-projected key form).
-#[derive(Debug, Clone)]
-pub struct JsMap {
-    inner: Rc<RefCell<MapBody>>,
-}
+pub type JsMap = otter_gc::Gc<MapBody>;
 
 #[derive(Debug, Default)]
-struct MapBody {
+/// GC-allocated storage backing every [`JsMap`] handle.
+pub struct MapBody {
     entries: IndexMap<MapKey, (Value, Value)>,
 }
 
-impl JsMap {
-    /// Construct an empty `JsMap`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+impl otter_gc::SafeTraceable for MapBody {
+    const TYPE_TAG: u8 = MAP_BODY_TYPE_TAG;
 
-    /// Number of entries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.borrow().entries.len()
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        for (key, (original_key, value)) in &self.entries {
+            trace_map_key(key, visitor);
+            original_key.trace_value_slots(visitor);
+            value.trace_value_slots(visitor);
+        }
     }
+}
 
-    /// `true` when empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+/// Allocate a fresh empty `Map`.
+pub fn alloc_map(heap: &mut otter_gc::GcHeap) -> Result<JsMap, otter_gc::OutOfMemory> {
+    heap.alloc_old(MapBody::default())
+}
+
+/// Number of entries.
+#[must_use]
+pub fn map_len(map: JsMap, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(map, |body| body.entries.len())
+}
+
+/// `true` when empty.
+#[must_use]
+pub fn map_is_empty(map: JsMap, heap: &otter_gc::GcHeap) -> bool {
+    map_len(map, heap) == 0
+}
+
+/// `Map.prototype.get` — Spec §24.1.3.6.
+#[must_use]
+pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value> {
+    let k = MapKey::from_value(key);
+    heap.read_payload(map, |body| body.entries.get(&k).map(|(_, v)| v.clone()))
+}
+
+/// `Map.prototype.has` — Spec §24.1.3.7.
+#[must_use]
+pub fn map_has(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> bool {
+    let k = MapKey::from_value(key);
+    heap.read_payload(map, |body| body.entries.contains_key(&k))
+}
+
+/// `Map.prototype.set` — Spec §24.1.3.9. Updates in place
+/// without changing insertion order; new keys append.
+pub fn map_set(
+    map: JsMap,
+    heap: &mut otter_gc::GcHeap,
+    key: Value,
+    value: Value,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let key_raw = key.as_gc_raw();
+    let value_raw = value.as_gc_raw();
+    let k = MapKey::from_value(&key);
+    let exists = heap.read_payload(map, |body| body.entries.contains_key(&k));
+    if !exists {
+        reserve_map_for_target_len(map, heap, map_len(map, heap).saturating_add(1))?;
     }
-
-    /// `Map.prototype.get` — Spec §24.1.3.6.
-    #[must_use]
-    pub fn get(&self, key: &Value) -> Option<Value> {
-        let k = MapKey::from_value(key);
-        self.inner.borrow().entries.get(&k).map(|(_, v)| v.clone())
-    }
-
-    /// `Map.prototype.has` — Spec §24.1.3.7.
-    #[must_use]
-    pub fn has(&self, key: &Value) -> bool {
-        let k = MapKey::from_value(key);
-        self.inner.borrow().entries.contains_key(&k)
-    }
-
-    /// `Map.prototype.set` — Spec §24.1.3.9. Updates in place
-    /// without changing insertion order; new keys append.
-    pub fn set(&self, key: Value, value: Value) {
-        let k = MapKey::from_value(&key);
-        let mut body = self.inner.borrow_mut();
+    heap.with_payload(map, |body| {
         if let Some(slot) = body.entries.get_mut(&k) {
             slot.1 = value;
         } else {
             body.entries.insert(k, (key, value));
         }
+    });
+    if !exists {
+        if let Some(child) = key_raw {
+            heap.write_barrier_raw(map, map_payload_slot(map), child);
+        }
     }
-
-    /// `Map.prototype.delete` — Spec §24.1.3.3. Returns `true` when
-    /// the entry existed.
-    pub fn delete(&self, key: &Value) -> bool {
-        let k = MapKey::from_value(key);
-        // `shift_remove` preserves the order of remaining entries
-        // (matches spec iteration semantics).
-        self.inner.borrow_mut().entries.shift_remove(&k).is_some()
+    if let Some(child) = value_raw {
+        heap.write_barrier_raw(map, map_payload_slot(map), child);
     }
+    Ok(())
+}
 
-    /// `Map.prototype.clear` — Spec §24.1.3.2.
-    pub fn clear(&self) {
-        self.inner.borrow_mut().entries.clear();
-    }
+/// `Map.prototype.delete` — Spec §24.1.3.3. Returns `true` when
+/// the entry existed.
+pub fn map_delete(map: JsMap, heap: &mut otter_gc::GcHeap, key: &Value) -> bool {
+    let k = MapKey::from_value(key);
+    // `shift_remove` preserves the order of remaining entries
+    // (matches spec iteration semantics).
+    heap.with_payload(map, |body| body.entries.shift_remove(&k).is_some())
+}
 
-    /// Snapshot key list (in insertion order).
-    #[must_use]
-    pub fn keys(&self) -> Vec<Value> {
-        self.inner
-            .borrow()
-            .entries
-            .values()
-            .map(|(k, _)| k.clone())
-            .collect()
-    }
+/// `Map.prototype.clear` — Spec §24.1.3.2.
+pub fn map_clear(map: JsMap, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(map, |body| body.entries.clear());
+}
 
-    /// Snapshot value list (in insertion order).
-    #[must_use]
-    pub fn values(&self) -> Vec<Value> {
-        self.inner
-            .borrow()
-            .entries
-            .values()
-            .map(|(_, v)| v.clone())
-            .collect()
-    }
+/// Snapshot key list (in insertion order).
+#[must_use]
+pub fn map_keys(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
+    heap.read_payload(map, |body| {
+        body.entries.values().map(|(k, _)| k.clone()).collect()
+    })
+}
 
-    /// Snapshot entry list as `[key, value]` arrays.
-    #[must_use]
-    pub fn entries(&self) -> Vec<(Value, Value)> {
-        self.inner
-            .borrow()
-            .entries
+/// Snapshot value list (in insertion order).
+#[must_use]
+pub fn map_values(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
+    heap.read_payload(map, |body| {
+        body.entries.values().map(|(_, v)| v.clone()).collect()
+    })
+}
+
+/// Snapshot entry list.
+#[must_use]
+pub fn map_entries(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<(Value, Value)> {
+    heap.read_payload(map, |body| {
+        body.entries
             .values()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
-    }
-
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
-    }
+    })
 }
 
-impl Default for JsMap {
-    fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(MapBody::default())),
-        }
-    }
+/// Identity comparison.
+#[must_use]
+pub fn map_ptr_eq(a: JsMap, b: JsMap) -> bool {
+    a == b
 }
 
 /// JS `Set` — ordered unique-element store.
-#[derive(Debug, Clone)]
-pub struct JsSet {
-    inner: Rc<RefCell<SetBody>>,
-}
+pub type JsSet = otter_gc::Gc<SetBody>;
 
 #[derive(Debug, Default)]
-struct SetBody {
+/// GC-allocated storage backing every [`JsSet`] handle.
+pub struct SetBody {
     /// `IndexMap<MapKey, Value>` rather than `IndexSet`: the
     /// original `Value` lives in the map slot so iteration returns
     /// the live handle (matching what `Map`'s tuple gives us).
     entries: IndexMap<MapKey, Value>,
 }
 
-impl JsSet {
-    /// Construct an empty `JsSet`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+impl otter_gc::SafeTraceable for SetBody {
+    const TYPE_TAG: u8 = SET_BODY_TYPE_TAG;
 
-    /// Number of unique entries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.borrow().entries.len()
-    }
-
-    /// `true` when empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// `Set.prototype.has` — Spec §24.2.3.7.
-    #[must_use]
-    pub fn has(&self, value: &Value) -> bool {
-        let k = MapKey::from_value(value);
-        self.inner.borrow().entries.contains_key(&k)
-    }
-
-    /// `Set.prototype.add` — Spec §24.2.3.1.
-    pub fn add(&self, value: Value) {
-        let k = MapKey::from_value(&value);
-        let mut body = self.inner.borrow_mut();
-        if !body.entries.contains_key(&k) {
-            body.entries.insert(k, value);
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        for (key, value) in &self.entries {
+            trace_map_key(key, visitor);
+            value.trace_value_slots(visitor);
         }
-    }
-
-    /// `Set.prototype.delete` — Spec §24.2.3.4.
-    pub fn delete(&self, value: &Value) -> bool {
-        let k = MapKey::from_value(value);
-        self.inner.borrow_mut().entries.shift_remove(&k).is_some()
-    }
-
-    /// `Set.prototype.clear` — Spec §24.2.3.3.
-    pub fn clear(&self) {
-        self.inner.borrow_mut().entries.clear();
-    }
-
-    /// Snapshot value list in insertion order.
-    #[must_use]
-    pub fn values(&self) -> Vec<Value> {
-        self.inner.borrow().entries.values().cloned().collect()
-    }
-
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
-impl Default for JsSet {
-    fn default() -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(SetBody::default())),
+/// Allocate a fresh empty `Set`.
+pub fn alloc_set(heap: &mut otter_gc::GcHeap) -> Result<JsSet, otter_gc::OutOfMemory> {
+    heap.alloc_old(SetBody::default())
+}
+
+/// Number of unique entries.
+#[must_use]
+pub fn set_len(set: JsSet, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(set, |body| body.entries.len())
+}
+
+/// `true` when empty.
+#[must_use]
+pub fn set_is_empty(set: JsSet, heap: &otter_gc::GcHeap) -> bool {
+    set_len(set, heap) == 0
+}
+
+/// `Set.prototype.has` — Spec §24.2.3.7.
+#[must_use]
+pub fn set_has(set: JsSet, heap: &otter_gc::GcHeap, value: &Value) -> bool {
+    let k = MapKey::from_value(value);
+    heap.read_payload(set, |body| body.entries.contains_key(&k))
+}
+
+/// `Set.prototype.add` — Spec §24.2.3.1.
+pub fn set_add(
+    set: JsSet,
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let value_raw = value.as_gc_raw();
+    let k = MapKey::from_value(&value);
+    let exists = heap.read_payload(set, |body| body.entries.contains_key(&k));
+    if !exists {
+        reserve_set_for_target_len(set, heap, set_len(set, heap).saturating_add(1))?;
+    }
+    heap.with_payload(set, |body| {
+        if !body.entries.contains_key(&k) {
+            body.entries.insert(k, value);
+        }
+    });
+    if !exists {
+        if let Some(child) = value_raw {
+            heap.write_barrier_raw(set, set_payload_slot(set), child);
         }
     }
+    Ok(())
+}
+
+/// `Set.prototype.delete` — Spec §24.2.3.4.
+pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> bool {
+    let k = MapKey::from_value(value);
+    heap.with_payload(set, |body| body.entries.shift_remove(&k).is_some())
+}
+
+/// `Set.prototype.clear` — Spec §24.2.3.3.
+pub fn set_clear(set: JsSet, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(set, |body| body.entries.clear());
+}
+
+/// Snapshot value list in insertion order.
+#[must_use]
+pub fn set_values(set: JsSet, heap: &otter_gc::GcHeap) -> Vec<Value> {
+    heap.read_payload(set, |body| body.entries.values().cloned().collect())
+}
+
+/// Identity comparison.
+#[must_use]
+pub fn set_ptr_eq(a: JsSet, b: JsSet) -> bool {
+    a == b
 }
 
 /// Object-keyed `WeakMap`.
@@ -536,31 +570,76 @@ impl Default for JsWeakSet {
 fn object_identity(value: &Value) -> Result<*const (), CollectionError> {
     match value {
         Value::Object(o) => Ok(o.as_header_ptr() as *const ()),
-        Value::Array(a) => Ok(a.identity_addr()),
+        Value::Array(a) => Ok(crate::array::identity_addr(*a)),
         Value::RegExp(r) => Ok(r.identity_addr()),
         _ => Err(CollectionError::NonObjectKey),
     }
 }
 
-/// Borrow helpers used by the iterator state machine.
-impl JsMap {
-    /// Read-only view of the entry list. Used by the iterator
-    /// machinery to walk in insertion order without snapshotting.
-    pub fn borrow_entries(&self) -> Ref<'_, IndexMap<MapKey, (Value, Value)>> {
-        Ref::map(self.inner.borrow(), |b| &b.entries)
-    }
-
-    /// Mutable view (rare; only used by collection methods).
-    pub fn borrow_entries_mut(&self) -> RefMut<'_, IndexMap<MapKey, (Value, Value)>> {
-        RefMut::map(self.inner.borrow_mut(), |b| &mut b.entries)
+fn trace_map_key(key: &MapKey, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    if let MapKey::ObjectValue(value) = key {
+        value.trace_value_slots(visitor);
     }
 }
 
-impl JsSet {
-    /// Read-only view of the value list.
-    pub fn borrow_values(&self) -> Ref<'_, IndexMap<MapKey, Value>> {
-        Ref::map(self.inner.borrow(), |b| &b.entries)
+fn map_payload_slot(map: JsMap) -> *mut otter_gc::RawGc {
+    (map.as_header_ptr() as *mut u8).wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
+        as *mut otter_gc::RawGc
+}
+
+fn set_payload_slot(set: JsSet) -> *mut otter_gc::RawGc {
+    (set.as_header_ptr() as *mut u8).wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
+        as *mut otter_gc::RawGc
+}
+
+fn reserve_map_for_target_len(
+    map: JsMap,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let capacity = heap.read_payload(map, |body| body.entries.capacity());
+    if target_len <= capacity {
+        return Ok(());
     }
+    let before = map_capacity_bytes(capacity);
+    let after = map_capacity_bytes(target_len);
+    if after > before {
+        heap.reserve_bytes((after - before) as u64)?;
+    }
+    heap.with_payload(map, |body| {
+        body.entries
+            .reserve(target_len.saturating_sub(body.entries.len()));
+    });
+    Ok(())
+}
+
+fn reserve_set_for_target_len(
+    set: JsSet,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let capacity = heap.read_payload(set, |body| body.entries.capacity());
+    if target_len <= capacity {
+        return Ok(());
+    }
+    let before = set_capacity_bytes(capacity);
+    let after = set_capacity_bytes(target_len);
+    if after > before {
+        heap.reserve_bytes((after - before) as u64)?;
+    }
+    heap.with_payload(set, |body| {
+        body.entries
+            .reserve(target_len.saturating_sub(body.entries.len()));
+    });
+    Ok(())
+}
+
+fn map_capacity_bytes(capacity: usize) -> usize {
+    capacity.saturating_mul(std::mem::size_of::<(MapKey, (Value, Value))>())
+}
+
+fn set_capacity_bytes(capacity: usize) -> usize {
+    capacity.saturating_mul(std::mem::size_of::<(MapKey, Value)>())
 }
 
 #[cfg(test)]
@@ -575,40 +654,56 @@ mod tests {
 
     #[test]
     fn map_insertion_order_preserved() {
-        let m = JsMap::new();
-        m.set(n(1), Value::Boolean(true));
-        m.set(n(2), Value::Boolean(false));
-        m.set(n(1), Value::Boolean(false)); // update
-        let keys = m.keys();
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let m = alloc_map(&mut heap).unwrap();
+        map_set(m, &mut heap, n(1), Value::Boolean(true)).unwrap();
+        map_set(m, &mut heap, n(2), Value::Boolean(false)).unwrap();
+        map_set(m, &mut heap, n(1), Value::Boolean(false)).unwrap(); // update
+        let keys = map_keys(m, &heap);
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].as_number().unwrap().as_smi(), Some(1));
         assert_eq!(keys[1].as_number().unwrap().as_smi(), Some(2));
-        assert_eq!(m.get(&n(1)), Some(Value::Boolean(false)));
+        assert_eq!(map_get(m, &heap, &n(1)), Some(Value::Boolean(false)));
     }
 
     #[test]
     fn map_samevaluezero_zero_collapse() {
-        let m = JsMap::new();
-        m.set(Value::Number(NumberValue::from_f64(-0.0)), n(7));
-        let v = m.get(&Value::Number(NumberValue::from_f64(0.0)));
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let m = alloc_map(&mut heap).unwrap();
+        map_set(
+            m,
+            &mut heap,
+            Value::Number(NumberValue::from_f64(-0.0)),
+            n(7),
+        )
+        .unwrap();
+        let v = map_get(m, &heap, &Value::Number(NumberValue::from_f64(0.0)));
         assert_eq!(v, Some(n(7)));
     }
 
     #[test]
     fn map_samevaluezero_nan_matches() {
-        let m = JsMap::new();
-        m.set(Value::Number(NumberValue::from_f64(f64::NAN)), n(9));
-        let v = m.get(&Value::Number(NumberValue::from_f64(f64::NAN)));
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let m = alloc_map(&mut heap).unwrap();
+        map_set(
+            m,
+            &mut heap,
+            Value::Number(NumberValue::from_f64(f64::NAN)),
+            n(9),
+        )
+        .unwrap();
+        let v = map_get(m, &heap, &Value::Number(NumberValue::from_f64(f64::NAN)));
         assert_eq!(v, Some(n(9)));
     }
 
     #[test]
     fn set_dedupes() {
-        let s = JsSet::new();
-        s.add(n(1));
-        s.add(n(1));
-        s.add(n(2));
-        assert_eq!(s.len(), 2);
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let s = alloc_set(&mut heap).unwrap();
+        set_add(s, &mut heap, n(1)).unwrap();
+        set_add(s, &mut heap, n(1)).unwrap();
+        set_add(s, &mut heap, n(2)).unwrap();
+        assert_eq!(set_len(s, &heap), 2);
     }
 
     #[test]
@@ -632,11 +727,22 @@ mod tests {
 
     #[test]
     fn map_string_keys() {
-        let heap = StringHeap::default();
-        let m = JsMap::new();
-        m.set(Value::String(JsString::from_str("k", &heap).unwrap()), n(1));
+        let string_heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let m = alloc_map(&mut gc_heap).unwrap();
+        map_set(
+            m,
+            &mut gc_heap,
+            Value::String(JsString::from_str("k", &string_heap).unwrap()),
+            n(1),
+        )
+        .unwrap();
         assert_eq!(
-            m.get(&Value::String(JsString::from_str("k", &heap).unwrap())),
+            map_get(
+                m,
+                &gc_heap,
+                &Value::String(JsString::from_str("k", &string_heap).unwrap())
+            ),
             Some(n(1)),
         );
     }

@@ -16,8 +16,8 @@ error[E0521]: borrowed data escapes outside of closure
 error[E0521]: borrowed data escapes outside of closure
   --> tests/compile_fail/branded_root_cross_isolate_rejected.rs:12:21
    |
- 8 |     otter_gc::with_gc_session(&mut left, |left_session| {
-   |                                           ------------
+ 8 |     otter_gc::with_gc_session(&mut left, |mut left_session| {
+   |                                           ----------------
    |                                           |
    |                                           `left_session` is a reference that is only valid in the closure body
    |                                           has type `GcSession<'1, '_>`

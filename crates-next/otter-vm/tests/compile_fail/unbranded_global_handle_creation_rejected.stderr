@@ -1,0 +1,5 @@
+error[E0599]: no method named `create_global` found for struct `GcHeap` in the current scope
+  --> tests/compile_fail/unbranded_global_handle_creation_rejected.rs:11:22
+   |
+11 |     let _root = heap.create_global(gc);
+   |                      ^^^^^^^^^^^^^ method not found in `GcHeap`

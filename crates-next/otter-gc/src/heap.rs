@@ -39,7 +39,7 @@ use std::time::Instant;
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::ephemeron::EphemeronRegistry;
 use crate::finalize::WeakFinalizationRegistry;
-use crate::handle::{GlobalHandle, GlobalHandleTable, HandleStack};
+use crate::handle::{GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
 use crate::oom::OutOfMemory;
@@ -418,15 +418,10 @@ impl GcHeap {
         &*self.handle_stack as *const _
     }
 
-    /// Borrow the heap's global handle table.
-    pub fn global_handles(&self) -> &GlobalHandleTable {
+    /// Borrow the heap's global handle table for crate-internal
+    /// rooting APIs.
+    pub(crate) fn global_handles(&self) -> &GlobalHandleTable {
         &self.global_handles
-    }
-
-    /// Raw pointer to the heap's global handle table. See
-    /// [`Self::handle_stack_ptr`] for the rationale.
-    pub fn global_handles_ptr(&self) -> *const GlobalHandleTable {
-        &*self.global_handles as *const _
     }
 
     /// Reference to the marking state (Phase 2 / task 86 will
@@ -1006,13 +1001,6 @@ impl GcHeap {
         self.gc_stats.live_objects = live_objects;
         self.gc_stats.live_bytes = live_bytes;
         &self.gc_stats
-    }
-
-    /// Construct a [`GlobalHandle`] from a `Gc<T>`. Note: the
-    /// returned handle holds a raw pointer to the heap's global
-    /// handle table; it must be dropped before the [`GcHeap`].
-    pub fn create_global<T: ?Sized>(&self, gc: Gc<T>) -> GlobalHandle<T> {
-        self.global_handles.create(gc)
     }
 
     /// Single hot-path write barrier for a pointer-field store.

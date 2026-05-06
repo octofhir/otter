@@ -53,11 +53,6 @@ tokio               = { version = "1", features = ["rt-multi-thread", "sync", "t
 # Collections / utilities.
 smallvec    = "1"
 indexmap    = "2"
-# Lock-free MPMC channel: cross-thread microtask enqueue from the
-# async runtime (fetch / timers / Promise.then completion handlers)
-# back into the interpreter. The single-thread sync side stays on
-# the plain VecDeque inside `MicrotaskQueue`.
-crossbeam-channel = "0.5"
 
 # Arbitrary-precision integers for `Value::BigInt`.
 num-bigint  = "0.4"

@@ -9,8 +9,8 @@
 //!
 //! - [`with_gc_session`] — enters a heap with a fresh isolate brand.
 //! - [`GcSession`] / [`MutationSession`] — short-lived mutator access.
-//! - [`Root`] — isolate-branded persistent root over
-//!   [`crate::GlobalHandle`].
+//! - [`Root`] — isolate-branded persistent root over the collector's
+//!   internal global-handle table.
 //! - [`Weak`] — isolate-branded weak handle shape.
 //!
 //! # Invariants
@@ -99,7 +99,7 @@ impl<'iso> GcSession<'iso, '_> {
 
     /// Persistently root `gc` under this isolate brand.
     #[must_use]
-    pub fn root<T: ?Sized>(&self, gc: Gc<T>) -> Root<'iso, T> {
+    pub fn root<T: ?Sized>(&mut self, gc: Gc<T>) -> Root<'iso, T> {
         Root {
             inner: self.heap.global_handles().create(gc),
             _iso: PhantomData,
@@ -124,9 +124,8 @@ impl<'iso> GcSession<'iso, '_> {
 
 /// Isolate-branded persistent root.
 ///
-/// `Root` wraps the existing moving-GC-compatible
-/// [`crate::GlobalHandle`] and adds the `'iso` brand required to read
-/// it back.
+/// `Root` wraps the existing moving-GC-compatible global handle and
+/// adds the `'iso` brand required to read it back.
 pub struct Root<'iso, T: ?Sized> {
     inner: GlobalHandle<T>,
     _iso: InvariantBrand<'iso>,
@@ -193,12 +192,14 @@ impl<T: ?Sized> std::fmt::Debug for Weak<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::compressed::CAGE_TEST_LOCK;
     use crate::test_support::OpaqueLeaf;
 
     use super::*;
 
     #[test]
     fn branded_session_roots_and_reads_persistent_handle() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
         let mut heap = GcHeap::new().unwrap();
 
         with_gc_session(&mut heap, |mut session| {
@@ -211,6 +212,7 @@ mod tests {
 
     #[test]
     fn branded_weak_upgrade_requires_session_shape() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
         let mut heap = GcHeap::new().unwrap();
 
         with_gc_session(&mut heap, |mut session| {

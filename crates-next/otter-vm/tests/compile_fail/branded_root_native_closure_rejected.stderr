@@ -1,4 +1,4 @@
-error[E0277]: `*const GlobalHandleTable` cannot be sent between threads safely
+error[E0277]: `*const handle::GlobalHandleTable` cannot be sent between threads safely
   --> tests/compile_fail/branded_root_native_closure_rejected.rs:15:31
    |
 15 |           store_native_callback(move || {
@@ -9,14 +9,14 @@ error[E0277]: `*const GlobalHandleTable` cannot be sent between threads safely
    | |         required by a bound introduced by this call
 16 | |             std::hint::black_box(root);
 17 | |         });
-   | |_________^ `*const GlobalHandleTable` cannot be sent between threads safely
+   | |_________^ `*const handle::GlobalHandleTable` cannot be sent between threads safely
    |
-   = help: within `{closure@$DIR/tests/compile_fail/branded_root_native_closure_rejected.rs:15:31: 15:38}`, the trait `Send` is not implemented for `*const GlobalHandleTable`
-note: required because it appears within the type `GlobalHandle<OpaqueLeaf>`
+   = help: within `{closure@$DIR/tests/compile_fail/branded_root_native_closure_rejected.rs:15:31: 15:38}`, the trait `Send` is not implemented for `*const handle::GlobalHandleTable`
+note: required because it appears within the type `handle::GlobalHandle<OpaqueLeaf>`
   --> $WORKSPACE/crates-next/otter-gc/src/handle.rs
    |
-   | pub struct GlobalHandle<T: ?Sized> {
-   |            ^^^^^^^^^^^^
+   | pub(crate) struct GlobalHandle<T: ?Sized> {
+   |                   ^^^^^^^^^^^^
 note: required because it appears within the type `Root<'_, OpaqueLeaf>`
   --> $WORKSPACE/crates-next/otter-gc/src/branded.rs
    |
@@ -52,11 +52,11 @@ note: required because it appears within the type `PhantomData<*const OpaqueLeaf
    |
    | pub struct PhantomData<T: PointeeSized>;
    |            ^^^^^^^^^^^
-note: required because it appears within the type `GlobalHandle<OpaqueLeaf>`
+note: required because it appears within the type `handle::GlobalHandle<OpaqueLeaf>`
   --> $WORKSPACE/crates-next/otter-gc/src/handle.rs
    |
-   | pub struct GlobalHandle<T: ?Sized> {
-   |            ^^^^^^^^^^^^
+   | pub(crate) struct GlobalHandle<T: ?Sized> {
+   |                   ^^^^^^^^^^^^
 note: required because it appears within the type `Root<'_, OpaqueLeaf>`
   --> $WORKSPACE/crates-next/otter-gc/src/branded.rs
    |

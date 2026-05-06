@@ -85,10 +85,9 @@ pub use array::JsArray;
 pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
-pub use microtask::{AsyncRuntime, Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
+pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_function::{
     NativeError, NativeFn, NativeFunction, native_value, native_value_with_captures,
-    native_value_with_trace,
 };
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
@@ -2003,9 +2002,9 @@ impl Interpreter {
         self.module_environments.get(target_url.as_ref()).cloned()
     }
 
-    /// Mutable handle to the microtask queue. Embedders use this
-    /// to wire an [`AsyncRuntime`] inbox or to enqueue host-side
-    /// callbacks before a script runs.
+    /// Mutable handle to the isolate-local microtask queue.
+    /// Host-side async callbacks must re-enter the isolate before
+    /// enqueueing GC-bearing [`Microtask`] values.
     pub fn microtasks_mut(&mut self) -> &mut MicrotaskQueue {
         &mut self.microtasks
     }
@@ -2328,8 +2327,9 @@ impl Interpreter {
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call = native.call(&self.gc_heap);
+            let captures = native.captures(&self.gc_heap);
             let mut ctx = NativeCtx::new(self);
-            return match call(&mut ctx, &argv) {
+            return match call(&mut ctx, &argv, &captures) {
                 Ok(value) => {
                     self.settle_microtask_capability(result_capability, Ok(value));
                     Ok(())
@@ -4928,8 +4928,9 @@ impl Interpreter {
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call = native.call(&self.gc_heap);
+            let captures = native.captures(&self.gc_heap);
             let mut ctx = NativeCtx::new(self);
-            let result = call(&mut ctx, &argv).map_err(native_to_vm_error)?;
+            let result = call(&mut ctx, &argv, &captures).map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -6335,8 +6336,9 @@ impl Interpreter {
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call = native.call(&self.gc_heap);
+            let captures = native.captures(&self.gc_heap);
             let mut ctx = NativeCtx::new(self);
-            return call(&mut ctx, &argv).map_err(native_to_vm_error);
+            return call(&mut ctx, &argv, &captures).map_err(native_to_vm_error);
         }
         let (function_id, parent_upvalues, this_for_callee) = match current {
             Value::Function { function_id } => {
@@ -7465,10 +7467,10 @@ impl Interpreter {
         };
         let module_rc = std::rc::Rc::new(module);
         let module_clone = std::rc::Rc::clone(&module_rc);
-        let native = NativeFunction::new(
+        let native = native_function::native_value_unchecked(
             &mut self.gc_heap,
             "anonymous",
-            move |ctx: &mut NativeCtx<'_>, call_args: &[Value]| {
+            move |ctx: &mut NativeCtx<'_>, call_args: &[Value], _captures: &[Value]| {
                 let interp = ctx.interp_mut();
                 interp
                     .invoke_eval_function(&module_clone, function_id, call_args)
@@ -7478,7 +7480,7 @@ impl Interpreter {
                     })
             },
         )?;
-        Ok(Value::NativeFunction(native))
+        Ok(native)
     }
 
     /// Invoke a function from a previously-eval'd module on a
@@ -9061,8 +9063,17 @@ fn make_array_iterator_factory(
         heap,
         "Array[Symbol.iterator]",
         smallvec::smallvec![Value::Array(array)],
-        move |ctx, _| {
+        |ctx, _, captures| {
             let vm = ctx.interp_mut();
+            let array = match captures.first() {
+                Some(Value::Array(array)) => *array,
+                _ => {
+                    return Err(crate::native_function::NativeError::TypeError {
+                        name: "Array[Symbol.iterator]",
+                        reason: "missing traced array capture".to_string(),
+                    });
+                }
+            };
             let state = IteratorState::Array { array, index: 0 };
             Ok(Value::Iterator(alloc_iterator_state(
                 vm.gc_heap_mut(),
@@ -9143,10 +9154,11 @@ fn proxy_static_call(
             };
             let proxy = crate::proxy::JsProxy::new(target, handler);
             let proxy_handle = proxy.clone();
-            let revoke = native_function::native_value(gc_heap, "revoke", move |_, _| {
-                proxy_handle.revoke();
-                Ok(Value::Undefined)
-            })?;
+            let revoke =
+                native_function::native_value_unchecked(gc_heap, "revoke", move |_, _, _| {
+                    proxy_handle.revoke();
+                    Ok(Value::Undefined)
+                })?;
             let obj = crate::object::alloc_object(gc_heap)?;
             crate::object::set(obj, gc_heap, "proxy", Value::Proxy(proxy));
             crate::object::set(obj, gc_heap, "revoke", revoke);

@@ -357,6 +357,9 @@ unsafe impl Sync for Cage {}
 
 static CAGE_GUARD: Mutex<Option<Cage>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(crate) static CAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 impl Cage {
     /// Ensure the cage has been initialised at the default size.
     /// No-op if it is already up.
@@ -517,6 +520,7 @@ mod tests {
 
     #[test]
     fn cage_initialises_and_hands_out_pages() {
+        let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
         ensure_cage();
         let p1 = Cage::alloc_page().expect("page 1");
         let p2 = Cage::alloc_page().expect("page 2");

@@ -25,4 +25,5 @@ fn worker_message_boundary_rejects_vm_and_gc_handles() {
     t.compile_fail("tests/compile_fail/worker_message_branded_root_rejected.rs");
     t.compile_fail("tests/compile_fail/worker_message_branded_weak_rejected.rs");
     t.compile_fail("tests/compile_fail/worker_message_gc_session_rejected.rs");
+    t.compile_fail("tests/compile_fail/runtime_raw_heap_access_rejected.rs");
 }

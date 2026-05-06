@@ -13,7 +13,7 @@
       `Weak<'iso, T>`, and `GcSession<'_, '_>` cannot cross worker
       boundaries or be dereferenced through another worker's brand
 - [x] migration guidance written for tasks 85, 92, and future FFI work
-- [ ] gates green; broad persistent-handle migration remains open
+- [x] gates green; broad persistent-handle audit closed
 
 ## Goal
 
@@ -163,7 +163,7 @@ Add trybuild fixtures that prove:
 - [x] `cargo test -p otter-vm --test compile_fail` covers every misuse
   category in 93.5.
 - [x] `cargo test -p otter-gc -p otter-vm -p otter-runtime` green.
-- [ ] No public API stores `Gc<T>` where `Root<'iso, T>` is required
+- [x] No public API stores `Gc<T>` where `Root<'iso, T>` is required
   for persistence across a safepoint, async boundary, or worker queue.
 - [x] No product-code thread-local heap lookup is reintroduced.
 - [x] Worker task 92 gates still hold after branded roots land.
@@ -206,8 +206,64 @@ Add trybuild fixtures that prove:
   yet been migrated/audited to require `Root<'iso, T>` for every
   persistent handle across safepoints, async boundaries, worker queues,
   native callbacks, timers, and future FFI.
+- 2026-05-06: migrated one persistent-root entry point: external code
+  can no longer create unbranded persistent handles through
+  `GcHeap::create_global` / `GlobalHandleTable::create`. The card-table
+  regression now holds its cross-safepoint test root through
+  `GcSession::root`, and trybuild rejects direct unbranded
+  `create_global` usage from outside `otter-gc`. This is a narrow
+  slice toward the broad persistent-handle gate, not the final audit.
+- 2026-05-06: hid the remaining unbranded persistent-handle surface:
+  `GlobalHandle`, `GlobalHandleTable`, and the raw global-handle-table
+  pointer accessor are no longer public API. External code cannot name
+  or construct unbranded persistent handles; `Root<'iso, T>` is the
+  exposed persistent-root shape. Added trybuild coverage for the public
+  type name rejection. Task 93 remains open for the wider VM/runtime
+  persistence audit.
+- 2026-05-06: removed the VM's public cross-thread microtask inbox
+  skeleton. `Microtask` records carry `Value` and parked `Frame` state,
+  so async hosts must send owned runtime messages and re-enter the
+  owning isolate before enqueueing isolate-local microtasks. The queue
+  now exposes only mutator-thread enqueue/drain operations, and a
+  static assertion keeps `Microtask` `!Send + !Sync`. Task 93 remains
+  open for the rest of the public/runtime/native/timer persistence
+  audit.
+- 2026-05-06: completed the broad persistence audit for active
+  `crates-next/*` runtime/native/async/timer/worker-adjacent surfaces.
+  Classification:
+  - Runtime async/timer/worker APIs (`RuntimeHandle`, `EventLoop`,
+    `TimerRequest`, `Worker`, `OtterPool`) carry only owned source
+    bundles, strings, tokens, counters, structured-clone payloads, and
+    public `ExecutionResult` strings across sendable queues.
+  - Structured clone accepts internal `Value` only in crate-visible
+    isolate-side clone helpers and emits owned `StructuredCloneValue`;
+    worker compile-fail fixtures reject `Value`, `Gc<T>`,
+    `Local<'gc, T>`, `NativeCtx<'_>`, `Root<'iso, T>`,
+    `Weak<'iso, T>`, and `GcSession<'_, '_>`.
+  - `Microtask`, parked `Frame`, generator state, promise reactions,
+    iterators, objects, arrays, maps/sets, weak refs, and
+    finalization registries are persistent but isolate-local and
+    traced through their owning GC bodies or `MicrotaskQueue`; they
+    remain `!Send + !Sync`.
+  - Public runtime raw-heap access was removed so embedders cannot
+    allocate raw `Gc<T>` through `Runtime` and hold it across later
+    runtime safepoints. Trybuild now rejects `Runtime::gc_heap_mut`.
+  - Public native constructors now require `Send + Sync` Rust call
+    closures and pass traced captures as an explicit slice at call
+    time, so external native closures cannot hide `Gc<T>` / `Value`
+    captures in long-lived payloads. VM-internal promise/proxy/eval
+    helpers use crate-visible unchecked constructors with explicit
+    captures/trace hooks.
+  - `array::with_elements_mut` is no longer public and now
+    conservatively fires write barriers for all GC-bearing elements
+    left after the mutation.
+  No remaining task-93 blocker was found in the active
+  runtime/native/async/timer/worker public boundary. Lower-level
+  contributor ergonomics and any future public replacement for raw VM
+  heap access belong to task 94.
 
 ## Closing
 
-Tick task 93 in [70-gc-master-tracker.md](./70-gc-master-tracker.md).
-Update task 85 / task 92 if their API names change to carry the brand.
+Task 93 is closed in
+[70-gc-master-tracker.md](./70-gc-master-tracker.md). Task 85 / task
+92 API names did not need branded renames in this slice.

@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use otter_bytecode::BytecodeModule;
 use otter_compiler::compile;
-use otter_gc::{GcHeap, GcStats, HeapSnapshot};
+use otter_gc::GcStats;
 use otter_syntax::{SourceKind, detect_source_kind, parse};
 use otter_vm::{Interpreter, InterruptFlag};
 use serde::{Deserialize, Serialize};
@@ -758,20 +758,6 @@ impl Runtime {
         self.config.max_heap_bytes
     }
 
-    /// Borrow the runtime's GC heap. Owned by the interpreter
-    /// since task 76; this accessor delegates.
-    #[must_use]
-    pub fn gc_heap(&self) -> &GcHeap {
-        self.interp.gc_heap()
-    }
-
-    /// Mutable borrow of the runtime's GC heap. Owned by the
-    /// interpreter since task 76; this accessor delegates.
-    #[must_use]
-    pub fn gc_heap_mut(&mut self) -> &mut GcHeap {
-        self.interp.gc_heap_mut()
-    }
-
     /// Per-heap GC counters: live objects / live bytes / per-
     /// `type_tag` rows / last-GC pause / cycle counter.
     ///
@@ -784,25 +770,6 @@ impl Runtime {
     /// allocations through [`Self::gc_heap_mut`].
     pub fn heap_stats(&mut self) -> &GcStats {
         self.interp.gc_heap_mut().gc_stats()
-    }
-
-    /// Snapshot the live object graph plus a caller-supplied
-    /// root set, returning a Rust-side [`HeapSnapshot`].
-    ///
-    /// Distinct from
-    /// [`otter_gc::devtools_snapshot::write_heap_snapshot`],
-    /// which produces a Chrome DevTools JSON payload — that
-    /// writer is the production-debug path; this snapshot is
-    /// for Rust assertions and per-root retained-size queries
-    /// (e.g. migration tasks proving cycles return to baseline).
-    ///
-    /// `roots` are the root slot values to attribute retained
-    /// size to. Phase 1 callers typically pass an empty slice
-    /// when the heap holds nothing reachable from the
-    /// interpreter; per-type migrations widen the typical root
-    /// set as they land.
-    pub fn heap_snapshot(&mut self, roots: &[otter_gc::RawGc]) -> HeapSnapshot {
-        self.interp.gc_heap().snapshot(roots)
     }
 
     /// Force a full GC cycle (scavenge + old-gen mark-sweep).

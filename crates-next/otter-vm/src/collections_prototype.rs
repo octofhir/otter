@@ -451,8 +451,17 @@ pub fn make_map_iterator_factory(
         heap,
         "Map[Symbol.iterator]",
         smallvec::smallvec![Value::Map(map)],
-        move |ctx, _| {
+        |ctx, _, captures| {
             let vm = ctx.interp_mut();
+            let map = match captures.first() {
+                Some(Value::Map(map)) => *map,
+                _ => {
+                    return Err(crate::NativeError::TypeError {
+                        name: "Map[Symbol.iterator]",
+                        reason: "missing traced map capture".to_string(),
+                    });
+                }
+            };
             let state = map_iter_state(MapIterKind::Entries, map, vm.gc_heap_mut())?;
             Ok(make_iter_value(vm.gc_heap_mut(), state)?)
         },
@@ -469,8 +478,17 @@ pub fn make_set_iterator_factory(
         heap,
         "Set[Symbol.iterator]",
         smallvec::smallvec![Value::Set(set)],
-        move |ctx, _| {
+        |ctx, _, captures| {
             let vm = ctx.interp_mut();
+            let set = match captures.first() {
+                Some(Value::Set(set)) => *set,
+                _ => {
+                    return Err(crate::NativeError::TypeError {
+                        name: "Set[Symbol.iterator]",
+                        reason: "missing traced set capture".to_string(),
+                    });
+                }
+            };
             let snap: SmallVec<[Value; 4]> = collections::set_values(set, vm.gc_heap())
                 .into_iter()
                 .collect();

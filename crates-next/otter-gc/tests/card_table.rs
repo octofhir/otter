@@ -70,11 +70,14 @@ fn old_to_young_pointer_survives_via_dirty_card() {
         // Scope still holds parent rooted; child is reachable
         // ONLY through parent.child via the dirty card.
         let _ = local;
-        // Hold parent via global handle so it survives scope
-        // close.
-        let _g = heap.create_global(promoted);
-        std::mem::forget(_g); // leak intentionally so we can
-        // verify post-scavenge state.
+        // Hold parent via branded root so it survives scope close.
+        // The intentional leak keeps the root live for the
+        // post-scavenge assertions without exposing unbranded
+        // `GlobalHandle` construction to external callers.
+        otter_gc::with_gc_session(&mut heap, |mut session| {
+            let root = session.root(promoted);
+            std::mem::forget(root);
+        });
     }
     // Run a scavenge.
     heap.collect_minor(otter_gc::EmptyRoots);

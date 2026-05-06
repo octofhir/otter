@@ -264,14 +264,29 @@ pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[
     heap.read_payload(arr, |body| f(&body.elements))
 }
 
-/// Mutable access to dense elements for in-place rewrites that do not
-/// grow capacity.
-pub fn with_elements_mut<R>(
+/// Crate-internal mutable access to dense elements for in-place
+/// rewrites that do not grow capacity.
+///
+/// The helper conservatively fires write barriers for every
+/// GC-bearing element left in the array after the mutation. This keeps
+/// internal algorithms such as `reverse`, `sort`, and `splice` from
+/// having to duplicate barrier bookkeeping while preventing external
+/// code from storing untraced values through an arbitrary closure.
+pub(crate) fn with_elements_mut<R>(
     arr: JsArray,
     heap: &mut otter_gc::GcHeap,
     f: impl FnOnce(&mut SmallVec<[Value; 4]>) -> R,
 ) -> R {
-    heap.with_payload(arr, |body| f(&mut body.elements))
+    let (out, children) = heap.with_payload(arr, |body| {
+        let out = f(&mut body.elements);
+        let children: SmallVec<[otter_gc::RawGc; 8]> =
+            body.elements.iter().filter_map(Value::as_gc_raw).collect();
+        (out, children)
+    });
+    for child in children {
+        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
+    }
+    out
 }
 
 /// Identity comparison.

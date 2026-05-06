@@ -40,6 +40,14 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    /// Evaluate JavaScript directly from the command line.
+    #[arg(short = 'e', long = "eval", value_name = "code")]
+    eval_source: Option<String>,
+
+    /// Evaluate JavaScript and print the completion value.
+    #[arg(short = 'p', long = "print", value_name = "code")]
+    print_source: Option<String>,
+
     /// Shorthand: positional file path.
     #[arg(global = false, num_args = 0..)]
     args: Vec<String>,
@@ -299,12 +307,6 @@ enum Command {
     Run(RunArgs),
     /// Evaluate an expression.
     Eval(EvalArgs),
-    /// `-e <expr>` alias of `eval`.
-    #[command(name = "-e", hide = true)]
-    DashE(EvalArgs),
-    /// `-p <expr>`: eval + print final value.
-    #[command(name = "-p", hide = true)]
-    DashP(EvalArgs),
     /// Compile / type-check without executing.
     Check(CheckArgs),
     /// Run the engine test harness.
@@ -324,6 +326,10 @@ struct RunArgs {
 
 #[derive(Debug, Args)]
 struct EvalArgs {
+    /// Print the completion value, like `node -p` / `deno eval -p`.
+    #[arg(short = 'p', long = "print")]
+    print: bool,
+
     /// Expression / statement to evaluate.
     expression: String,
 }
@@ -352,14 +358,37 @@ fn main() -> ExitCode {
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
     let caps = cli.perms.clone().into_capabilities();
+    let inline_eval = cli.eval_source.clone();
+    let inline_print = cli.print_source.clone();
+
+    if inline_eval.is_some() && inline_print.is_some() {
+        eprintln!("error: --eval and --print cannot be used together");
+        return ExitCode::from(2);
+    }
+
+    if inline_eval.is_some() || inline_print.is_some() {
+        if cli.command.is_some() || !cli.args.is_empty() || dump_mode.is_some() {
+            eprintln!("error: inline eval/print cannot be combined with a subcommand or file path");
+            return ExitCode::from(2);
+        }
+        let (source, print) = match (inline_eval.as_deref(), inline_print.as_deref()) {
+            (Some(source), None) => (source, false),
+            (None, Some(source)) => (source, true),
+            _ => unreachable!("checked conflicting inline eval modes above"),
+        };
+        return match run_eval(source, print, json, &caps) {
+            Ok(code) => code,
+            Err(err) => {
+                emit_error(&err, json);
+                ExitCode::from(u8::try_from(err.exit_code().clamp(0, 255)).unwrap_or(64))
+            }
+        };
+    }
 
     let result = match (cli.command, cli.args.first().cloned()) {
         // Explicit subcommand.
         (Some(Command::Run(args)), _) => run_file(&args.file, json, dump_mode.as_deref(), &caps),
-        (Some(Command::Eval(args)), _) | (Some(Command::DashE(args)), _) => {
-            run_eval(&args.expression, false, json, &caps)
-        }
-        (Some(Command::DashP(args)), _) => run_eval(&args.expression, true, json, &caps),
+        (Some(Command::Eval(args)), _) => run_eval(&args.expression, args.print, json, &caps),
         (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps),
         (Some(Command::Test(args)), _) => run_test(args, json),
         (Some(Command::Info), _) => run_info(json),
@@ -572,5 +601,38 @@ fn emit_error(err: &OtterError, json: bool) {
         }
     } else {
         eprintln!("error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_eval_flag_parses_node_style() {
+        let cli = Cli::try_parse_from(["otter", "-e", "42"]).expect("parse -e");
+        assert_eq!(cli.eval_source.as_deref(), Some("42"));
+        assert!(cli.print_source.is_none());
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn top_level_print_flag_parses_node_style() {
+        let cli = Cli::try_parse_from(["otter", "--print", "40 + 2"]).expect("parse --print");
+        assert_eq!(cli.print_source.as_deref(), Some("40 + 2"));
+        assert!(cli.eval_source.is_none());
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn eval_subcommand_print_flag_parses_deno_style() {
+        let cli = Cli::try_parse_from(["otter", "eval", "-p", "40 + 2"]).expect("parse eval -p");
+        match cli.command {
+            Some(Command::Eval(args)) => {
+                assert!(args.print);
+                assert_eq!(args.expression, "40 + 2");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

@@ -1,36 +1,18 @@
-//! Microtask queue with a sync hot path and a cross-thread async
-//! inbox.
+//! Microtask queue for isolate-local promise and finalization jobs.
 //!
 //! # Why this shape
 //!
-//! Other engines pick one of two designs:
+//! This queue deliberately stays isolate-local. `Microtask` records
+//! carry [`crate::Value`] and parked [`crate::Frame`] state, both of
+//! which can contain GC handles. Host async work must therefore post
+//! owned runtime messages through `otter-runtime` and re-enter the
+//! isolate before enqueueing a `Microtask`; there is no public
+//! cross-thread `Sender<Microtask>` surface.
 //!
-//! - **Single deque under interior mutability** (common JS engine design) —
-//!   single-thread by language spec; interior cell is
-//!   not a problem because no other thread can touch it. Cheap, but
-//!   leaves no door open for cross-thread async-runtime callbacks.
-//! - **MPSC channel into the runtime thread** (Tokio, Deno bridge
-//!   layer) — every enqueue goes through a lock-free channel so
-//!   any thread can post. Strictly more flexible, slightly more
-//!   per-task overhead than a plain deque.
-//!
-//! We do **both**, split by axis:
-//!
-//! - **Sync hot path:** plain `VecDeque<Microtask>` mutated through
-//!   `&mut self` from inside the dispatch loop. No `RefCell`, no
-//!   `UnsafeCell`, no atomics — just a field write. This is the
-//!   path `Op::QueueMicrotask` takes 100% of the time today.
-//! - **Cross-thread async path:** an optional
-//!   [`crossbeam_channel::Receiver`] populated by an
-//!   [`AsyncRuntime`] impl from any thread. The drain calls
-//!   `try_recv()` between generations to fold async-side work into
-//!   the same FIFO order as sync-side enqueues.
-//!
-//! The async slot is wired in shape but **left unpopulated by the
-//! foundation slice** — task 35 (`async`/`await`) plugs in the
-//! Tokio-backed [`AsyncRuntime`] impl. The trait skeleton is here
-//! today so the queue's API is stable across Phase F: no rework
-//! when async lands, just plug in the impl.
+//! The hot path is a plain `VecDeque<Microtask>` mutated through
+//! `&mut self` from inside the dispatch loop. No `RefCell`, no
+//! `UnsafeCell`, no atomics — just a field write. This is the path
+//! `Op::QueueMicrotask` takes 100% of the time today.
 //!
 //! # Drain semantics
 //!
@@ -51,9 +33,7 @@
 //!
 //! # Contents
 //! - [`Microtask`] — task record (callee + this + inline args).
-//! - [`MicrotaskQueue`] — sync deque + optional async inbox + state.
-//! - [`AsyncRuntime`] — trait the embedder implements (Tokio in
-//!   task 35).
+//! - [`MicrotaskQueue`] — sync deque + drain state.
 //! - [`MicrotaskError`] — drain-time failure modes.
 //!
 //! # See also
@@ -63,7 +43,6 @@
 
 use std::collections::VecDeque;
 
-use crossbeam_channel::Receiver;
 use smallvec::SmallVec;
 
 use crate::{Frame, Value};
@@ -192,64 +171,16 @@ pub enum MicrotaskError {
     },
 }
 
-/// Async-runtime contract. The interpreter never owns a runtime
-/// itself; the embedder wires one in. Foundation slice ships only
-/// the trait — the Tokio impl arrives with task 35.
-///
-/// # Why a trait, not a concrete struct
-///
-/// 1. Most embedders already have their own Tokio runtime; they want
-///    the VM to
-///    plug into theirs, not start a second one.
-/// 2. Tests can mock the trait without standing up Tokio.
-/// 3. Different platforms (wasm32-wasi, no-std hosts) substitute
-///    different impls without touching the interpreter.
-pub trait AsyncRuntime: Send + Sync {
-    /// Cloneable handle for posting microtasks back from any
-    /// thread. The interpreter wires the matching `Receiver` into
-    /// [`MicrotaskQueue::async_inbox`].
-    fn microtask_sender(&self) -> crossbeam_channel::Sender<Microtask>;
-
-    /// Spawn a future onto the underlying runtime. Foundation
-    /// guarantee: the future must complete (or post a microtask)
-    /// before the next drain returns; long-running futures belong
-    /// to the embedder's `Runtime`, not the microtask path.
-    fn spawn(&self, fut: futures_core_local::BoxFuture<'static, ()>);
-
-    /// Park the runtime thread until at least one microtask is
-    /// available on `recv`. Used by long-running event loops; the
-    /// foundation `drain_microtasks` does not park.
-    fn park_until_microtask(&self, recv: &Receiver<Microtask>);
-}
-
-// Foundation-local `BoxFuture` placeholder. Once task 35 introduces
-// a real `futures` dep we'll replace this re-export module with the
-// real `futures::future::BoxFuture`. The shim keeps the trait
-// signature stable today so embedders can implement against it.
-pub mod futures_core_local {
-    //! Placeholder for `futures::future::BoxFuture<'a, T>`. Task 35
-    //! swaps this for the real type.
-    use std::future::Future;
-    use std::pin::Pin;
-
-    /// Boxed dynamic future. Mirrors `futures::future::BoxFuture`.
-    pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-}
-
 /// Sync deque + optional async inbox + drain bookkeeping.
 ///
 /// Owned by [`crate::Interpreter`] as a plain field — every method
 /// that touches the queue takes `&mut self`. No `RefCell`, no
-/// `UnsafeCell`. Cross-thread enqueues go through `async_inbox`.
+/// `UnsafeCell`.
 #[derive(Debug, Default)]
 pub struct MicrotaskQueue {
     /// Sync side: pushed by `Op::QueueMicrotask` and host-side
     /// `enqueue` calls running on the interpreter thread.
     pending: VecDeque<Microtask>,
-    /// Cross-thread async inbox. `None` until task 35 wires up the
-    /// `AsyncRuntime` impl. When `Some`, drain pulls from this on
-    /// every generation boundary.
-    async_inbox: Option<Receiver<Microtask>>,
     /// Reentrant-drain depth. Only the outermost drain finalises;
     /// nested calls return immediately (no-op) so a microtask body
     /// can call `drain_microtasks` itself without recursing.
@@ -268,12 +199,6 @@ impl MicrotaskQueue {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Wire a cross-thread receiver into the queue. Idempotent —
-    /// replaces any prior receiver.
-    pub fn set_async_inbox(&mut self, recv: Receiver<Microtask>) {
-        self.async_inbox = Some(recv);
     }
 
     /// `true` when the sync side has tasks pending.
@@ -299,9 +224,7 @@ impl MicrotaskQueue {
     }
 
     /// Drain bookkeeping — see module docstring. Returns the
-    /// generation snapshot the caller is now responsible for
-    /// running; pulls from `async_inbox` so the snapshot includes
-    /// any cross-thread tasks posted up to this moment.
+    /// generation snapshot the caller is now responsible for running.
     ///
     /// Returns `None` when this is a reentrant call (drain already
     /// in progress on an outer frame); the caller should yield
@@ -311,17 +234,6 @@ impl MicrotaskQueue {
             return None;
         }
         self.drain_depth += 1;
-        // Pull cross-thread tasks into the sync deque before
-        // swapping. `try_recv` returns immediately when empty —
-        // never blocks the interpreter thread.
-        if let Some(recv) = &self.async_inbox {
-            while let Ok(task) = recv.try_recv() {
-                self.pending.push_back(task);
-                if self.pending.len() > self.high_water {
-                    self.high_water = self.pending.len();
-                }
-            }
-        }
         self.generation += 1;
         // Take ownership of the current generation. Tasks enqueued
         // during the drain go on the fresh deque (returned to
@@ -342,18 +254,10 @@ impl MicrotaskQueue {
         self.drain_depth = self.drain_depth.saturating_sub(1);
     }
 
-    /// `true` if either the sync side has work or the async inbox
-    /// has unread tasks. The async-inbox check is non-blocking
-    /// (`is_empty` peek).
+    /// `true` if the sync side has work.
     #[must_use]
     pub fn has_any_pending(&self) -> bool {
-        if !self.pending.is_empty() {
-            return true;
-        }
-        match &self.async_inbox {
-            Some(recv) => !recv.is_empty(),
-            None => false,
-        }
+        !self.pending.is_empty()
     }
 
     /// Hot-path testing helper — clear the queue without going
@@ -390,9 +294,7 @@ impl Microtask {
 }
 
 impl MicrotaskQueue {
-    /// Trace every queued task on the sync side. The cross-thread
-    /// inbox is drained into this deque before execution; it is not
-    /// an isolate-local root until folded into `pending`.
+    /// Trace every queued isolate-local task.
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut otter_gc::RawGc)) {
         for task in &self.pending {
             task.trace_gc_slots(visitor);
@@ -487,20 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn async_inbox_folds_into_drain() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let mut q = MicrotaskQueue::new();
-        q.set_async_inbox(rx);
-        // Cross-thread post (from this thread, but the API is
-        // identical to a Tokio-task post).
-        tx.send(task_for(42)).unwrap();
-        assert!(q.has_any_pending());
-        let batch = q.begin_drain().unwrap();
-        assert_eq!(batch.tasks.len(), 1);
-        assert_eq!(
-            batch.tasks[0].callee.as_number().unwrap().as_smi().unwrap(),
-            42
-        );
-        q.end_drain();
+    fn microtask_records_stay_isolate_local() {
+        static_assertions::assert_not_impl_any!(Microtask: Send, Sync);
     }
 }

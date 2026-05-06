@@ -48,4 +48,7 @@ fn compile_fail_branded_gc_session_invariants() {
     t.compile_fail("tests/compile_fail/branded_weak_cross_isolate_rejected.rs");
     t.compile_fail("tests/compile_fail/branded_session_across_await_rejected.rs");
     t.compile_fail("tests/compile_fail/branded_root_native_closure_rejected.rs");
+    t.compile_fail("tests/compile_fail/native_closure_gc_capture_rejected.rs");
+    t.compile_fail("tests/compile_fail/unbranded_global_handle_creation_rejected.rs");
+    t.compile_fail("tests/compile_fail/unbranded_global_handle_type_rejected.rs");
 }

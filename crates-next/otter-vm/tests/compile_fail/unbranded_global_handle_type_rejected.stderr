@@ -1,0 +1,5 @@
+error[E0425]: cannot find type `GlobalHandle` in crate `otter_gc`
+ --> tests/compile_fail/unbranded_global_handle_type_rejected.rs:5:35
+  |
+5 |     let _handle: Option<otter_gc::GlobalHandle<otter_gc::test_support::OpaqueLeaf>> = None;
+  |                                   ^^^^^^^^^^^^ not found in `otter_gc`

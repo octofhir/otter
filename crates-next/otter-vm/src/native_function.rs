@@ -19,8 +19,13 @@
 //!   Host async work must copy owned, non-GC data out before any
 //!   `.await`; `NativeCtx`, `Value`, and GC handles are
 //!   isolate-local.
-//! - The body traces only `captures`; the Rust closure must not hide
-//!   additional GC-bearing values without mirroring them there.
+//! - Public native constructors require `Send + Sync` closures and
+//!   pass traced JS captures as an explicit slice at call time. That
+//!   keeps embedders from hiding isolate-local `Gc<T>` / `Value`
+//!   handles inside a long-lived closure.
+//! - Crate-internal unchecked constructors are reserved for audited
+//!   isolate-local VM helpers whose payload-specific trace hook covers
+//!   every hidden JS value.
 //!
 //! # See also
 //! - [GC architecture plan §4.1](../../../docs/new-engine/gc-architecture.md)
@@ -47,7 +52,8 @@ pub const NATIVE_FUNCTION_BODY_TYPE_TAG: u8 = 0x1d;
 /// expansion). Implementations return `Ok(value)` to write into
 /// the call-site destination register, or `Err` to surface as a
 /// runtime error.
-pub type NativeFn = dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>;
+pub type NativeFn =
+    dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
 
 /// Optional tracing hook for native payloads whose Rust-side state
 /// owns JS values outside the fixed capture list.
@@ -57,15 +63,15 @@ pub type NativeTraceFn = dyn Fn(&mut otter_gc::SlotVisitor<'_>);
 pub struct NativeFunctionBody {
     /// Display name (used in stack traces and `Function.prototype.
     /// toString` once that lands).
-    pub name: &'static str,
+    name: &'static str,
     /// Captured `Fn` payload.
-    pub call: Rc<NativeFn>,
+    call: Rc<NativeFn>,
     /// JS values owned by the native payload and therefore traced
     /// strongly while this function is reachable.
-    pub captures: SmallVec<[Value; 4]>,
+    captures: SmallVec<[Value; 4]>,
     /// Optional trace hook for native-owned state such as shared
     /// Promise combinator slots.
-    pub trace: Option<Rc<NativeTraceFn>>,
+    trace: Option<Rc<NativeTraceFn>>,
 }
 
 impl otter_gc::SafeTraceable for NativeFunctionBody {
@@ -105,7 +111,10 @@ impl NativeFunction {
         call: F,
     ) -> Result<Self, otter_gc::OutOfMemory>
     where
-        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError> + 'static,
+        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+            + Send
+            + Sync
+            + 'static,
     {
         Self::with_captures(heap, name, call, SmallVec::new())
     }
@@ -118,7 +127,10 @@ impl NativeFunction {
         captures: SmallVec<[Value; 4]>,
     ) -> Result<Self, otter_gc::OutOfMemory>
     where
-        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError> + 'static,
+        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+            + Send
+            + Sync
+            + 'static,
     {
         Ok(Self {
             inner: heap.alloc_old(NativeFunctionBody {
@@ -126,28 +138,6 @@ impl NativeFunction {
                 call: Rc::new(call),
                 captures,
                 trace: None,
-            })?,
-        })
-    }
-
-    /// Build a native function with explicit captures plus an
-    /// additional payload-specific trace hook.
-    pub fn with_trace<F>(
-        heap: &mut otter_gc::GcHeap,
-        name: &'static str,
-        call: F,
-        captures: SmallVec<[Value; 4]>,
-        trace: Rc<NativeTraceFn>,
-    ) -> Result<Self, otter_gc::OutOfMemory>
-    where
-        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError> + 'static,
-    {
-        Ok(Self {
-            inner: heap.alloc_old(NativeFunctionBody {
-                name,
-                call: Rc::new(call),
-                captures,
-                trace: Some(trace),
             })?,
         })
     }
@@ -183,6 +173,12 @@ impl NativeFunction {
         heap.read_payload(self.inner, |body| body.call.clone())
     }
 
+    /// Clone the traced JS captures supplied at construction.
+    #[must_use]
+    pub fn captures(&self, heap: &otter_gc::GcHeap) -> SmallVec<[Value; 4]> {
+        heap.read_payload(self.inner, |body| body.captures.clone())
+    }
+
     /// Trace this handle as a root slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
         let p = self as *const NativeFunction as *mut otter_gc::RawGc;
@@ -197,7 +193,10 @@ pub fn native_value<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+        + Send
+        + Sync
+        + 'static,
 {
     Ok(Value::NativeFunction(NativeFunction::new(
         heap, name, call,
@@ -213,16 +212,47 @@ pub fn native_value_with_captures<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+        + Send
+        + Sync
+        + 'static,
 {
     Ok(Value::NativeFunction(NativeFunction::with_captures(
         heap, name, call, captures,
     )?))
 }
 
-/// Convenience: produce a native function with explicit captures
-/// and a payload-specific trace hook.
-pub fn native_value_with_trace<F>(
+pub(crate) fn native_value_unchecked<F>(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    native_value_with_captures_unchecked(heap, name, SmallVec::new(), call)
+}
+
+pub(crate) fn native_value_with_captures_unchecked<F>(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    captures: SmallVec<[Value; 4]>,
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    Ok(Value::NativeFunction(NativeFunction {
+        inner: heap.alloc_old(NativeFunctionBody {
+            name,
+            call: Rc::new(call),
+            captures,
+            trace: None,
+        })?,
+    }))
+}
+
+pub(crate) fn native_value_with_trace_unchecked<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     captures: SmallVec<[Value; 4]>,
@@ -230,11 +260,16 @@ pub fn native_value_with_trace<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    Ok(Value::NativeFunction(NativeFunction::with_trace(
-        heap, name, call, captures, trace,
-    )?))
+    Ok(Value::NativeFunction(NativeFunction {
+        inner: heap.alloc_old(NativeFunctionBody {
+            name,
+            call: Rc::new(call),
+            captures,
+            trace: Some(trace),
+        })?,
+    }))
 }
 
 /// Failure outcome from a native call. Mirrors the
@@ -282,7 +317,7 @@ mod tests {
     #[test]
     fn native_value_dispatches() {
         let mut interp = crate::Interpreter::new();
-        let f = native_value(interp.gc_heap_mut(), "identity", |_, args| {
+        let f = native_value(interp.gc_heap_mut(), "identity", |_, args, _captures| {
             Ok(args.first().cloned().unwrap_or(Value::Undefined))
         })
         .expect("native");
@@ -290,30 +325,41 @@ mod tests {
             panic!("expected NativeFunction")
         };
         let call = native.call(interp.gc_heap());
+        let captures = native.captures(interp.gc_heap());
         let mut ctx = NativeCtx::new(&mut interp);
-        let r = call(&mut ctx, &[Value::Number(NumberValue::from_i32(7))]).unwrap();
+        let r = call(
+            &mut ctx,
+            &[Value::Number(NumberValue::from_i32(7))],
+            &captures,
+        )
+        .unwrap();
         assert_eq!(r.display_string(), "7");
     }
 
     #[test]
     fn rejects_arity_via_typeerror() {
         let mut interp = crate::Interpreter::new();
-        let f = native_value(interp.gc_heap_mut(), "require_one_arg", |_, args| {
-            if args.len() != 1 {
-                return Err(NativeError::TypeError {
-                    name: "require_one_arg",
-                    reason: format!("expected 1 arg, got {}", args.len()),
-                });
-            }
-            Ok(args[0].clone())
-        })
+        let f = native_value(
+            interp.gc_heap_mut(),
+            "require_one_arg",
+            |_, args, _captures| {
+                if args.len() != 1 {
+                    return Err(NativeError::TypeError {
+                        name: "require_one_arg",
+                        reason: format!("expected 1 arg, got {}", args.len()),
+                    });
+                }
+                Ok(args[0].clone())
+            },
+        )
         .expect("native");
         let Value::NativeFunction(native) = &f else {
             panic!()
         };
         let call = native.call(interp.gc_heap());
+        let captures = native.captures(interp.gc_heap());
         let mut ctx = NativeCtx::new(&mut interp);
-        let err = call(&mut ctx, &[]).unwrap_err();
+        let err = call(&mut ctx, &[], &captures).unwrap_err();
         assert!(matches!(err, NativeError::TypeError { .. }));
     }
 }

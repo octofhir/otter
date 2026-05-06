@@ -18,7 +18,8 @@
 //! - [`marking`] — tri-color worklist.
 //! - [`scavenger`] — Cheney BFS scavenger.
 //! - [`barrier`] — write barriers.
-//! - [`handle`] — `Local`, `HandleScope`, `GlobalHandle`.
+//! - [`handle`] — `Local`, `HandleScope`, and internal persistent
+//!   roots.
 //! - [`branded`] — experimental isolate-branded session/root API.
 //! - [`heap`] — `GcHeap` orchestrator.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
@@ -78,7 +79,7 @@ pub mod trace;
 
 pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
 pub use compressed::{Gc, RawGc, cage_base, cage_size, init_cage_with_size};
-pub use handle::{GlobalHandle, GlobalHandleTable, HandleScope, HandleStack, Local};
+pub use handle::{HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
 pub use heap::{EmptyRoots, GcHeap, HeapStats, Roots};
 pub use oom::OutOfMemory;

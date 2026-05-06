@@ -80,7 +80,6 @@ fn runtime_max_heap_bytes_zero_disables_cap() {
         .build()
         .expect("runtime");
     assert_eq!(runtime.max_heap_bytes(), 0);
-    assert_eq!(runtime.gc_heap().max_heap_bytes(), 0);
 }
 
 #[test]
@@ -91,5 +90,4 @@ fn runtime_gc_heap_observes_configured_cap() {
         .build()
         .expect("runtime");
     assert_eq!(runtime.max_heap_bytes(), cap);
-    assert_eq!(runtime.gc_heap().max_heap_bytes(), cap);
 }

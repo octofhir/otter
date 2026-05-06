@@ -1,5 +1,5 @@
-//! Rooting handles: `Local<'gc, T>`, `HandleScope<'gc>`,
-//! `GlobalHandle<T>`.
+//! Rooting handles: `Local<'gc, T>`, `HandleScope<'gc>`, and the
+//! internal persistent-handle table behind branded `Root<'iso, T>`.
 //!
 //! Phase-1 GC is moving (the scavenger relocates young objects).
 //! Native code that holds a `Gc<T>` across a safepoint must root
@@ -12,8 +12,8 @@
 //!   every [`Local`] created inside it.
 //! - [`Local`] — typed root; backed by an entry on the
 //!   [`HandleStack`].
-//! - [`GlobalHandle`] — explicit-drop root for long-lived
-//!   pointers held outside any scope.
+//! - `GlobalHandle` — crate-internal explicit-drop root used by
+//!   [`crate::Root`] for long-lived pointers held outside any scope.
 //! - [`HandleStack`] — owned by [`crate::heap::GcHeap`]; walked
 //!   by the scavenger to fix up moved pointers.
 //!
@@ -274,7 +274,7 @@ impl<T: ?Sized> std::fmt::Debug for Local<'_, T> {
 
 /// Long-lived root unbound from any [`HandleScope`]. Drop must
 /// fire to release the entry; otherwise the heap leaks.
-pub struct GlobalHandle<T: ?Sized> {
+pub(crate) struct GlobalHandle<T: ?Sized> {
     /// Index in the global handle table.
     idx: u32,
     /// Owning heap's global handle table is reached through a
@@ -309,7 +309,7 @@ impl<T: ?Sized> Drop for GlobalHandle<T> {
 
 /// Backing table for [`GlobalHandle`]. A free-list reclaims
 /// indices to keep the table dense.
-pub struct GlobalHandleTable {
+pub(crate) struct GlobalHandleTable {
     entries: UnsafeCell<Vec<RawGc>>,
     free: UnsafeCell<Vec<u32>>,
 }
@@ -396,7 +396,7 @@ impl GlobalHandleTable {
     }
 
     /// Allocate a [`GlobalHandle`] from a `Gc<T>`.
-    pub fn create<T: ?Sized>(&self, gc: Gc<T>) -> GlobalHandle<T> {
+    pub(crate) fn create<T: ?Sized>(&self, gc: Gc<T>) -> GlobalHandle<T> {
         let idx = self.allocate(gc.raw());
         GlobalHandle {
             idx,

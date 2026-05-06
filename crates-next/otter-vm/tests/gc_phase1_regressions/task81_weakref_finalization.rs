@@ -1,7 +1,7 @@
 //! Regression coverage for task 81 WeakRef / FinalizationRegistry GC semantics.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use otter_bytecode::{BytecodeModule, SourceKind};
 use otter_vm::native_value;
@@ -89,11 +89,11 @@ fn weak_ref_target_becomes_unavailable_after_force_gc() {
 #[test]
 fn finalization_registry_registers_without_strong_target_retention() {
     let mut interp = Interpreter::new();
-    let calls = Rc::new(Cell::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
     let callback = native_value(interp.gc_heap_mut(), "cleanup", {
-        let calls = Rc::clone(&calls);
-        move |_, _| {
-            calls.set(calls.get() + 1);
+        let calls = Arc::clone(&calls);
+        move |_, _, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
             Ok(Value::Undefined)
         }
     })
@@ -133,7 +133,11 @@ fn finalization_registry_registers_without_strong_target_retention() {
     interp
         .drain_microtasks(&empty_module())
         .expect("second drain");
-    assert_eq!(calls.get(), 1, "finalizer should enqueue at most once");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "finalizer should enqueue at most once"
+    );
 }
 
 #[test]
@@ -141,7 +145,7 @@ fn dropped_finalization_registry_self_cycle_is_reaped() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
     let target = alloc_object(&mut heap).expect("target");
     let callback =
-        native_value(&mut heap, "cleanup", |_, _| Ok(Value::Undefined)).expect("native cleanup");
+        native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::Undefined)).expect("native cleanup");
     let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
     finalization_registry_register(
         registry,
@@ -168,14 +172,17 @@ fn dropped_finalization_registry_self_cycle_is_reaped() {
 #[test]
 fn finalization_registry_schedules_cleanup_microtask() {
     let mut interp = Interpreter::new();
-    let calls = Rc::new(Cell::new(0));
-    let seen_held = Rc::new(Cell::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen_held = Arc::new(AtomicBool::new(false));
     let callback = {
-        let calls = Rc::clone(&calls);
-        let seen_held = Rc::clone(&seen_held);
-        native_value(interp.gc_heap_mut(), "cleanup", move |_, args| {
-            calls.set(calls.get() + 1);
-            seen_held.set(matches!(args.first(), Some(Value::Boolean(true))));
+        let calls = Arc::clone(&calls);
+        let seen_held = Arc::clone(&seen_held);
+        native_value(interp.gc_heap_mut(), "cleanup", move |_, args, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            seen_held.store(
+                matches!(args.first(), Some(Value::Boolean(true))),
+                Ordering::Relaxed,
+            );
             Ok(Value::Undefined)
         })
         .expect("native cleanup")
@@ -199,33 +206,44 @@ fn finalization_registry_schedules_cleanup_microtask() {
     );
 
     interp.force_gc();
-    assert_eq!(calls.get(), 0, "cleanup must not run during raw GC");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "cleanup must not run during raw GC"
+    );
     assert!(interp.microtasks().has_pending_sync());
     interp
         .drain_microtasks(&empty_module())
         .expect("drain finalization callback");
-    assert_eq!(calls.get(), 1);
-    assert!(seen_held.get());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(seen_held.load(Ordering::Relaxed));
 
     interp.force_gc();
     interp
         .drain_microtasks(&empty_module())
         .expect("second drain");
-    assert_eq!(calls.get(), 1, "cleanup should run exactly once");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "cleanup should run exactly once"
+    );
 }
 
 #[test]
 fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
     let mut interp = Interpreter::new();
-    let observed_undefined = Rc::new(Cell::new(false));
+    let observed_undefined = Arc::new(AtomicBool::new(false));
     let callback = {
-        let observed_undefined = Rc::clone(&observed_undefined);
-        native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args| {
+        let observed_undefined = Arc::clone(&observed_undefined);
+        native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args, _| {
             let interp = ctx.interp_mut();
             let Some(Value::WeakRef(weak_ref)) = args.first() else {
                 return Ok(Value::Undefined);
             };
-            observed_undefined.set(weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined);
+            observed_undefined.store(
+                weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined,
+                Ordering::Relaxed,
+            );
             Ok(Value::Undefined)
         })
         .expect("native cleanup")
@@ -253,21 +271,24 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
     interp
         .drain_microtasks(&empty_module())
         .expect("drain finalization callback");
-    assert!(observed_undefined.get());
+    assert!(observed_undefined.load(Ordering::Relaxed));
 }
 
 #[test]
 fn pending_finalization_microtask_roots_held_value_across_next_gc() {
     let mut interp = Interpreter::new();
-    let observed_undefined = Rc::new(Cell::new(false));
+    let observed_undefined = Arc::new(AtomicBool::new(false));
     let callback = {
-        let observed_undefined = Rc::clone(&observed_undefined);
-        native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args| {
+        let observed_undefined = Arc::clone(&observed_undefined);
+        native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args, _| {
             let interp = ctx.interp_mut();
             let Some(Value::WeakRef(weak_ref)) = args.first() else {
                 return Ok(Value::Undefined);
             };
-            observed_undefined.set(weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined);
+            observed_undefined.store(
+                weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined,
+                Ordering::Relaxed,
+            );
             Ok(Value::Undefined)
         })
         .expect("native cleanup")
@@ -297,13 +318,13 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
     interp
         .drain_microtasks(&empty_module())
         .expect("drain finalization callback");
-    assert!(observed_undefined.get());
+    assert!(observed_undefined.load(Ordering::Relaxed));
 }
 
 #[test]
 fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
     let mut interp = Interpreter::new();
-    let callback = native_value(interp.gc_heap_mut(), "cleanup", |ctx, _| {
+    let callback = native_value(interp.gc_heap_mut(), "cleanup", |ctx, _, _| {
         let interp = ctx.interp_mut();
         let allocated = alloc_object(interp.gc_heap_mut())?;
         let global = *interp.global_this();
@@ -357,7 +378,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
 fn finalization_registry_unregister_token_removes_cells() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
     let callback =
-        native_value(&mut heap, "cleanup", |_, _| Ok(Value::Undefined)).expect("native cleanup");
+        native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::Undefined)).expect("native cleanup");
     let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
     let target = alloc_object(&mut heap).expect("target");
     let token = alloc_object(&mut heap).expect("token");
@@ -394,7 +415,7 @@ fn weak_finalization_registry_prunes_dead_handles_and_keeps_lazy_flag() {
     assert!(!heap.has_finalization_registries());
 
     let callback =
-        native_value(&mut heap, "cleanup", |_, _| Ok(Value::Undefined)).expect("native cleanup");
+        native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::Undefined)).expect("native cleanup");
     let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
     assert_eq!(heap.finalization_registry_count(), 1);
     assert!(heap.has_finalization_registries());

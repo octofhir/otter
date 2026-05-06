@@ -35,7 +35,9 @@
 
 use smallvec::smallvec;
 
-use crate::native_function::{NativeError, native_value_with_captures, native_value_with_trace};
+use crate::native_function::{
+    NativeError, native_value_with_captures_unchecked, native_value_with_trace_unchecked,
+};
 use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
     PromiseThenOutcome,
@@ -189,12 +191,12 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
                 }
             })
         };
-        let on_fulfill = native_value_with_trace(
+        let on_fulfill = native_value_with_trace_unchecked(
             interp.gc_heap_mut(),
             "Promise.all element",
             smallvec![Value::Promise(result_clone)],
             trace_slots,
-            move |ctx, args| {
+            move |ctx, args, _captures| {
                 let interp = ctx.interp_mut();
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
                 let mut slots_mut = slots.borrow_mut();
@@ -217,11 +219,11 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
             },
         )?;
         let result_for_reject = result;
-        let on_reject = native_value_with_captures(
+        let on_reject = native_value_with_captures_unchecked(
             interp.gc_heap_mut(),
             "Promise.all reject",
             smallvec![Value::Promise(result_for_reject)],
-            move |ctx, args| {
+            move |ctx, args, _captures| {
                 let interp = ctx.interp_mut();
                 let reason = args.first().cloned().unwrap_or(Value::Undefined);
                 let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
@@ -255,11 +257,11 @@ fn static_race(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Native
             other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
         let result_for_fulfill = result;
-        let on_fulfill = native_value_with_captures(
+        let on_fulfill = native_value_with_captures_unchecked(
             interp.gc_heap_mut(),
             "Promise.race fulfill",
             smallvec![Value::Promise(result_for_fulfill)],
-            move |ctx, args| {
+            move |ctx, args, _captures| {
                 let interp = ctx.interp_mut();
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
                 let jobs = result_for_fulfill.fulfill(interp.gc_heap_mut(), v);
@@ -270,11 +272,11 @@ fn static_race(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Native
             },
         )?;
         let result_for_reject = result;
-        let on_reject = native_value_with_captures(
+        let on_reject = native_value_with_captures_unchecked(
             interp.gc_heap_mut(),
             "Promise.race reject",
             smallvec![Value::Promise(result_for_reject)],
-            move |ctx, args| {
+            move |ctx, args, _captures| {
                 let interp = ctx.interp_mut();
                 let reason = args.first().cloned().unwrap_or(Value::Undefined);
                 let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
@@ -347,12 +349,12 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Result<Value,
                     }
                 })
             };
-            native_value_with_trace(
+            native_value_with_trace_unchecked(
                 interp.gc_heap_mut(),
                 "Promise.allSettled fulfill",
                 smallvec![Value::Promise(result)],
                 trace_slots,
-                move |ctx, args| {
+                move |ctx, args, _captures| {
                     let interp = ctx.interp_mut();
                     let v = args.first().cloned().unwrap_or(Value::Undefined);
                     let record = build_settled_record(true, v, &heap, interp.gc_heap_for_cx_mut())
@@ -377,12 +379,12 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Result<Value,
                     }
                 })
             };
-            native_value_with_trace(
+            native_value_with_trace_unchecked(
                 interp.gc_heap_mut(),
                 "Promise.allSettled reject",
                 smallvec![Value::Promise(result)],
                 trace_slots,
-                move |ctx, args| {
+                move |ctx, args, _captures| {
                     let interp = ctx.interp_mut();
                     let r = args.first().cloned().unwrap_or(Value::Undefined);
                     let record = build_settled_record(false, r, &heap, interp.gc_heap_for_cx_mut())
@@ -506,11 +508,11 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
             other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
         let on_fulfill = {
-            native_value_with_captures(
+            native_value_with_captures_unchecked(
                 interp.gc_heap_mut(),
                 "Promise.any fulfill",
                 smallvec![Value::Promise(result)],
-                move |ctx, args| {
+                move |ctx, args, _captures| {
                     let interp = ctx.interp_mut();
                     let v = args.first().cloned().unwrap_or(Value::Undefined);
                     let jobs = result.fulfill(interp.gc_heap_mut(), v);
@@ -534,12 +536,12 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
                     }
                 })
             };
-            native_value_with_trace(
+            native_value_with_trace_unchecked(
                 interp.gc_heap_mut(),
                 "Promise.any reject",
                 smallvec![Value::Promise(result)],
                 trace_errors,
-                move |ctx, args| {
+                move |ctx, args, _captures| {
                     let interp = ctx.interp_mut();
                     let reason = args.first().cloned().unwrap_or(Value::Undefined);
                     let mut errs = errors.borrow_mut();
@@ -637,11 +639,11 @@ fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[V
     // common case of a synchronous cleanup is preserved.
     let then_handler = {
         let on_finally = on_finally.clone();
-        match native_value_with_captures(
+        match native_value_with_captures_unchecked(
             interp.gc_heap_mut(),
             "Promise.prototype.finally then",
             smallvec![on_finally.clone()],
-            move |ctx, args| {
+            move |ctx, args, _captures| {
                 let interp = ctx.interp_mut();
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
                 interp.microtasks_mut().enqueue(Microtask {
@@ -659,11 +661,11 @@ fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[V
         }
     };
     let catch_handler = {
-        match native_value_with_captures(
+        match native_value_with_captures_unchecked(
             interp.gc_heap_mut(),
             "Promise.prototype.finally catch",
             smallvec![on_finally.clone()],
-            move |ctx, args| {
+            move |ctx, args, _captures| {
                 let interp = ctx.interp_mut();
                 let reason = args.first().cloned().unwrap_or(Value::Undefined);
                 interp.microtasks_mut().enqueue(Microtask {
@@ -737,11 +739,11 @@ fn make_resolve_native(
     heap: &mut otter_gc::GcHeap,
     promise: JsPromiseHandle,
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    native_value_with_captures(
+    native_value_with_captures_unchecked(
         heap,
         "Promise resolve",
         smallvec![Value::Promise(promise)],
-        move |ctx, args| {
+        move |ctx, args, _captures| {
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
@@ -751,11 +753,11 @@ fn make_resolve_native(
                 // inner value once that promise settles.
                 if let Value::Promise(inner) = &value {
                     let resolver = promise;
-                    let on_fulfill = native_value_with_captures(
+                    let on_fulfill = native_value_with_captures_unchecked(
                         interp.gc_heap_mut(),
                         "Promise resolve adopt fulfill",
                         smallvec![Value::Promise(resolver)],
-                        move |ctx, args| {
+                        move |ctx, args, _captures| {
                             let interp = ctx.interp_mut();
                             let v = args.first().cloned().unwrap_or(Value::Undefined);
                             let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
@@ -764,11 +766,11 @@ fn make_resolve_native(
                         },
                     )?;
                     let resolver_for_reject = promise;
-                    let on_reject = native_value_with_captures(
+                    let on_reject = native_value_with_captures_unchecked(
                         interp.gc_heap_mut(),
                         "Promise resolve adopt reject",
                         smallvec![Value::Promise(resolver_for_reject)],
-                        move |ctx, args| {
+                        move |ctx, args, _captures| {
                             let interp = ctx.interp_mut();
                             let reason = args.first().cloned().unwrap_or(Value::Undefined);
                             let jobs = resolver_for_reject.reject(interp.gc_heap_mut(), reason);
@@ -791,11 +793,11 @@ fn make_reject_native(
     heap: &mut otter_gc::GcHeap,
     promise: JsPromiseHandle,
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    native_value_with_captures(
+    native_value_with_captures_unchecked(
         heap,
         "Promise reject",
         smallvec![Value::Promise(promise)],
-        move |ctx, args| {
+        move |ctx, args, _captures| {
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
                 let reason = args.first().cloned().unwrap_or(Value::Undefined);

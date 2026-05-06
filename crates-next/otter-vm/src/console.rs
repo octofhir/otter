@@ -41,7 +41,7 @@ pub(crate) fn install(
     Ok(())
 }
 
-type ConsoleFn = for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>;
+type ConsoleFn = for<'rt> fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
 
 fn install_method(
     gc_heap: &mut otter_gc::GcHeap,
@@ -54,32 +54,56 @@ fn install_method(
     Ok(())
 }
 
-fn console_log(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_log(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _captures: &[Value],
+) -> Result<Value, NativeError> {
     write_stdout(ctx, args);
     Ok(Value::Undefined)
 }
 
-fn console_info(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_info(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _captures: &[Value],
+) -> Result<Value, NativeError> {
     write_stdout(ctx, args);
     Ok(Value::Undefined)
 }
 
-fn console_debug(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_debug(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _captures: &[Value],
+) -> Result<Value, NativeError> {
     write_stdout(ctx, args);
     Ok(Value::Undefined)
 }
 
-fn console_warn(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_warn(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _captures: &[Value],
+) -> Result<Value, NativeError> {
     write_stderr(ctx, args);
     Ok(Value::Undefined)
 }
 
-fn console_error(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_error(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _captures: &[Value],
+) -> Result<Value, NativeError> {
     write_stderr(ctx, args);
     Ok(Value::Undefined)
 }
 
-fn console_trace(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_trace(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _captures: &[Value],
+) -> Result<Value, NativeError> {
     let mut values = Vec::with_capacity(args.len() + 1);
     values.push("Trace".to_string());
     values.extend(format_args(ctx, args));
@@ -87,7 +111,11 @@ fn console_trace(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::Undefined)
 }
 
-fn console_assert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_assert(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    _captures: &[Value],
+) -> Result<Value, NativeError> {
     if args.first().is_some_and(Value::to_boolean) {
         return Ok(Value::Undefined);
     }

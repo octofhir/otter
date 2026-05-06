@@ -143,16 +143,6 @@ impl JsGenerator {
         heap.read_payload(self.inner, f)
     }
 
-    /// Mutable body access. Callers that store new GC-bearing values
-    /// must use the narrower helpers below so barriers fire.
-    pub fn with_body_mut<R>(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-        f: impl FnOnce(&mut GeneratorBody) -> R,
-    ) -> R {
-        heap.with_payload(self.inner, f)
-    }
-
     /// Set the async-generator flag.
     pub fn set_async(&self, heap: &mut otter_gc::GcHeap, is_async: bool) {
         heap.with_payload(self.inner, |body| body.is_async = is_async);

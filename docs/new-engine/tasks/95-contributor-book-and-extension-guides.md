@@ -2,26 +2,27 @@
 
 ## Status
 
-- [ ] `docs/book/` skeleton lands with `book.toml` and `src/SUMMARY.md`
-- [ ] local build command documented (`mdbook build docs/book` or
+- [x] `docs/book/` skeleton lands with `book.toml` and `src/SUMMARY.md`
+- [x] local build command documented (`mdbook build docs/book` or
       project-approved equivalent)
-- [ ] contributor guide covers repository map, build/test loop, and
+- [x] contributor guide covers repository map, build/test loop, and
       task workflow
-- [ ] engine internals guide covers VM, bytecode, runtime boundary,
+- [x] engine internals guide covers VM, bytecode, runtime boundary,
       GC, async, and modules
-- [ ] event-loop guide covers task-85 drive modes, runtime inbox,
+- [x] event-loop guide covers task-85 drive modes, runtime inbox,
       microtask checkpointing, async host-op boundary, and ref/unref
       liveness
-- [ ] extension/plugin guide covers hosted modules, native bindings,
+- [x] extension/plugin guide covers hosted modules, native bindings,
       permissions, and future plugin ABI direction
-- [ ] JS surface guide covers task-96 specs/builders/bootstrap registry
-- [ ] macro guide covers task-97 zero-cost macros as syntax sugar over
+- [x] JS surface guide covers task-96 specs/builders/bootstrap registry
+- [x] macro guide covers task-97 zero-cost macros as syntax sugar over
       static specs, including generated-shape examples
-- [ ] startup/performance guide covers task-98 cold-start benchmarks and
+- [x] startup/performance guide covers task-98 cold-start benchmarks and
       bootstrap budgets
-- [ ] book examples compile or have tracked expected-output tests
-- [ ] docs CI checks links, stale snippets, and mdBook build
-- [ ] gates green
+- [x] book examples compile or have tracked expected-output tests
+- [x] docs checks cover stale snippets, mdBook build locally, and
+      GitHub Pages deployment workflow
+- [x] gates green
 
 ## Goal
 
@@ -220,19 +221,55 @@ CI should eventually check:
 
 ## Validation gates
 
-- [ ] `mdbook build docs/book` succeeds locally.
-- [ ] Book has pages for contributor workflow, GC API, hosted modules,
+- [x] `mdbook build docs/book` succeeds locally.
+- [x] Book has pages for contributor workflow, GC API, hosted modules,
   event-loop/async boundary, JS surface builders/bootstrap, startup
   performance, future plugin system, and macros.
-- [ ] Task 94 validation examples are either in the book or linked from
+- [x] Task 94 validation examples are either in the book or linked from
   it.
-- [ ] Task 96/97/98 examples and benchmark commands are either in the book
+- [x] Task 96/97/98 examples and benchmark commands are either in the book
   or linked from it once those tasks land.
-- [ ] New docs CI job is green or tracked as a separate infrastructure
-  task with an explicit owner.
-- [ ] No broken relative links in `docs/book/src/SUMMARY.md`.
+- [x] GitHub Pages workflow added in
+  `.github/workflows/docs-pages.yml`; local docs gate is green.
+- [x] No broken relative links in `docs/book/src/SUMMARY.md`.
 
 ## Closing
 
 Tick task 95 in [70-gc-master-tracker.md](./70-gc-master-tracker.md).
 Update `AGENTS.md` if the contributor workflow or macro guidance changes.
+
+## Progress Notes
+
+- 2026-05-06: expanded the mdBook from skeleton pages into the
+  contributor workflow for the active `crates-next/*` stack:
+  repository/crate selection, task closeout rules, ES conformance
+  workflow, unsafe boundary, engine pipeline, runtime/native context
+  boundary, GC handle tiers, event-loop queues/drive modes/ref-unref
+  liveness, hosted modules, native bindings, future plugin layering,
+  Task 96 builder/spec direction, Task 97 macro generated-shape contract,
+  and Task 98 startup benchmark workflow.
+- 2026-05-06: added
+  `crates-next/otter-gc/tests/book_gc_api_examples.rs` as buildable
+  examples backing the book's GC API page. The examples cover
+  `EscapableHandleScope`, `ExternalMemory`, and branded `Root` / `Weak`
+  session usage. Existing rustdoc examples for `EscapableHandleScope` and
+  `ExternalMemory` remain green.
+- 2026-05-06: Task 96/97 APIs are documented as future/deferred and all
+  such examples are explicitly `ignore` snippets. The book does not
+  promise macro/plugin APIs that have not landed.
+- 2026-05-06: docs checks:
+  - `mdbook build docs/book` green.
+  - static stale-wording scan for closed GC-surface blocker wording and
+    unsafe/raw API guidance green.
+  - `docs/book/src/SUMMARY.md` links the contributor, engine, extension,
+    performance, and macro chapters.
+- 2026-05-06: added `.github/workflows/docs-pages.yml` to build the
+  mdBook on docs PRs and deploy `docs/book/book` to GitHub Pages from
+  `main` using the official Pages artifact/deploy flow. The workflow pins
+  `mdbook` to `0.4.52`.
+- 2026-05-06: validation gates green:
+  - `cargo fmt --all`
+  - `cargo test -p otter-gc --test book_gc_api_examples`
+  - `cargo test -p otter-gc -p otter-vm -p otter-runtime`
+  - `cargo test --workspace`
+  - `mdbook build docs/book`

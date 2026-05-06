@@ -26,15 +26,14 @@ license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
-# docs/new-engine/adr/0002-oxc-frontend.md.
-oxc_allocator   = "0.127"
-oxc_span        = "0.127"
-oxc_syntax      = "0.127"
-oxc_ast         = "0.127"
-oxc_parser      = "0.127"
-oxc_ast_visit   = "0.127"
-oxc_diagnostics = "0.127"
-oxc_codegen     = "0.127"
+oxc_allocator   = "0.129"
+oxc_span        = "0.129"
+oxc_syntax      = "0.129"
+oxc_ast         = "0.129"
+oxc_parser      = "0.129"
+oxc_ast_visit   = "0.129"
+oxc_diagnostics = "0.129"
+oxc_codegen     = "0.129"
 oxc_resolver    = "11.19"
 
 # Errors and serialization.

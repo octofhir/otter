@@ -1,8 +1,11 @@
 # GC API
 
 Otter's active GC is moving, generational, and isolate-local. Normal
-engine and extension work should use the safe context API rather than
-raw collector internals.
+engine and extension work should use the safe context API rather than raw
+collector internals.
+
+The landed contributor API is the Task 94 surface. Task 97 owns future
+trace derive/macros; do not invent a macro-first GC API before then.
 
 ## Handle Tiers
 
@@ -19,8 +22,8 @@ raw collector internals.
 ## Native Context
 
 Native functions receive `NativeCtx<'_>`. The public mutable raw heap
-borrow is intentionally not available to native authors. Use these
-helpers instead:
+borrow is intentionally not available to native authors. Use these helpers
+instead:
 
 ```rust,ignore
 fn native(
@@ -38,8 +41,19 @@ fn native(
 }
 ```
 
-Use `NativeCtx::with_gc_session` when a native path needs branded root
-or weak operations:
+Current stable helpers:
+
+- `alloc` / `alloc_old`: allocate through the owning isolate;
+- `record_write`: record outgoing GC edges after a store;
+- `reserve_external`: account native/off-object backing stores with RAII;
+- `with_gc_session`: enter branded root/weak operations;
+- `interp_mut`: use isolate services such as microtasks or string tables.
+
+`NativeCtx::heap()` is an immutable diagnostic/read path. The mutable heap
+borrow is crate-private; contributor code should not need it.
+
+Use `NativeCtx::with_gc_session` when a native path needs branded root or
+weak operations:
 
 ```rust,ignore
 ctx.with_gc_session(|mut session| {
@@ -54,9 +68,9 @@ ctx.with_gc_session(|mut session| {
 ## Mutation
 
 Do not call write barriers directly. Store the value first, then record
-the store through `GcHeap::record_write` or `NativeCtx::record_write`.
-The stored value implements `GcStore`, and the heap records every
-outgoing GC edge without exposing raw slot pointers:
+the store through `GcHeap::record_write` or `NativeCtx::record_write`. The
+stored value implements `GcStore`, and the heap records every outgoing GC
+edge without exposing raw slot pointers:
 
 ```rust,ignore
 let stored = value.clone();
@@ -69,6 +83,10 @@ heap.record_write(parent, &stored);
 This is the reference pattern used by object properties, array elements,
 Map/Set entries, promises, generators, upvalues, and finalization
 registries.
+
+For containers that can hide GC edges, implement or reuse `GcStore` so the
+heap sees every outgoing edge without exposing raw slot pointers to the
+caller.
 
 ## Escaping Locals
 
@@ -83,6 +101,10 @@ let escaped = {
 };
 ```
 
+The runnable copy of this pattern is covered by
+`crates-next/otter-gc/tests/book_gc_api_examples.rs` and the
+`EscapableHandleScope` rustdoc example.
+
 ## External Memory
 
 Memory outside GC cells must be accounted with an RAII reservation:
@@ -93,8 +115,28 @@ backing.resize(32 * 1024)?;
 drop(backing); // releases the reservation
 ```
 
-This covers typed-array backing stores, host buffers, large module
-source caches, and native resources.
+This covers typed-array backing stores, host buffers, large module source
+caches, and native resources.
+
+The runnable copy of this pattern is covered by
+`crates-next/otter-gc/tests/book_gc_api_examples.rs` and the
+`ExternalMemory` rustdoc example.
+
+## Worker And Async Boundaries
+
+Never send `Gc<T>`, `Local<'gc, T>`, `Root<'iso, T>`, `Weak<'iso, T>`,
+`RuntimeCx<'_>`, `NativeCtx<'_>`, or VM `Value` into worker messages or
+Rust futures. Use owned structured-clone payloads, transferable metadata,
+or host-owned byte buffers. Re-enter the isolate with an owned completion
+and only then touch JS values.
+
+## Trace Ergonomics
+
+Today, VM payloads implement the current tracing traits manually or reuse
+existing wrappers. The future `GcTrace` derive is explicitly deferred to
+Task 97 and must generate normal trace code over the safe visitor path.
+Until then, do not add contributor macros that expose raw trace tables, raw
+slot visitors, or manual barrier calls.
 
 ## Internal Only
 
@@ -108,6 +150,6 @@ The following are collector or audited VM-adapter internals:
 - context-free weak upgrades
 
 Raw collector types are not re-exported from the root `otter_gc` API.
-Audited VM adapters may import `otter_gc::raw::*`; contributor code
-should treat that module as unavailable. Compile-fail gates reject
-root-level raw imports and direct raw barrier calls.
+Audited VM adapters may import `otter_gc::raw::*`; contributor code should
+treat that module as unavailable. Compile-fail gates reject root-level raw
+imports and direct raw barrier calls.

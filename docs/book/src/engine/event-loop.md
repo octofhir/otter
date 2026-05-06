@@ -1,15 +1,15 @@
 # Event Loop And Async Boundary
 
 Otter's public runtime is handle-first and async-friendly, but one isolate
-still owns one VM, one runtime state, and one GC heap. The public handle may
-be `Send + Sync`; the isolate internals are not.
+still owns one VM, one runtime state, and one GC heap. The public handle
+may be `Send + Sync`; the isolate internals are not.
 
-The production event-loop boundary landed in task 85. Deno's
-`JsRuntime` shape is the closest reference: the runtime itself stays
-local to one isolate, while embedders drive it with one-tick and
-run-to-idle style APIs. Boa's job model is the smaller ECMA-262
-reference: promise, timeout, native async, and generic jobs run only
-when no execution context is active and each job runs to completion.
+The production event-loop boundary landed in task 85. Deno's `JsRuntime`
+shape is the closest reference: the runtime itself stays local to one
+isolate, while embedders drive it with one-tick and run-to-idle style APIs.
+Boa's job model is the smaller ECMA-262 reference: promise, timeout,
+native async, and generic jobs run only when no execution context is active
+and each job runs to completion.
 
 ## Runtime Layers
 
@@ -34,9 +34,13 @@ Do not overload one queue for all async work:
 - Runtime inbox: commands, host-op completions, timers, dynamic module
   completion, interrupts, inspector/debug events, and shutdown.
 
-A runtime turn runs JS work on the mutator, performs a microtask checkpoint,
-then folds host completions into the runtime inbox according to the selected
-drive mode.
+A runtime turn runs JS work on the mutator, performs a microtask
+checkpoint, then folds host completions into the runtime inbox according
+to the selected drive mode.
+
+Microtask checkpointing is VM work. Promise reactions, `queueMicrotask`,
+and async-function resumes run only after the current JS execution context
+unwinds and before the runtime turn is considered complete.
 
 Tokio-specific state belongs in `TokioEventLoop`. Runtime handles carry
 owned command payloads, timer tokens, and completion records; they do not
@@ -70,7 +74,7 @@ Never move `RuntimeCx`, `NativeCtx`, `Value`, `Frame`, `Gc<T>`,
 
 Host operations follow this concrete pattern:
 
-```rust
+```rust,ignore
 let handle = otter.handle().clone();
 handle.spawn_host_op(RuntimeLiveness::Ref, Box::pin(async move {
     // Owned host data only. No VM/GC handles here.
@@ -86,11 +90,23 @@ The isolate runner receives the completion as a runtime inbox message on a
 later turn, then performs the JS-side resolution/checkpoint work on the
 mutator thread.
 
+Cancellation and backpressure are runtime-handle concerns. Dropping or
+aborting a host future must not leave a JS promise in an untracked state:
+record the operation id, decrement liveness counters, and settle or report
+the pending JS work on the isolate turn that observes cancellation.
+
 ## Liveness And Diagnostics
 
 Timers and host ops have ref/unref liveness. Referenced work keeps
 `run_until_idle` alive; unreferenced work may finish if the loop is already
 being driven but must not keep the runtime alive by itself.
+
+Use ref/unref deliberately:
+
+- `Ref` for work that the user can observe and that should keep
+  `run_until_idle` alive;
+- `Unref` for background diagnostics or cache cleanup that may complete
+  opportunistically but must not prevent idle shutdown.
 
 Contributor tests should be able to inspect activity stats: pending
 commands, timers, host ops, dynamic module jobs, microtasks, cancellations,

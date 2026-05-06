@@ -8,7 +8,7 @@
 - [x] Workers / isolate pools (task 92)
 - [x] Compile-time GC safety hardening (task 93)
 - [x] Contributor-facing GC/VM API surface (task 94)
-- [ ] Contributor book / plugin and macro guide (task 95)
+- [x] Contributor book / plugin and macro guide (task 95)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
 - [ ] Phase 4 (deferred indefinitely) — concurrent marking + parallel scavenge (task 87)
@@ -55,7 +55,7 @@ later tasks assume earlier ones have landed.
 | 92 | ✅ closed (2026-05-06) | Worker isolates and isolate pools; current GC handles cannot cross worker boundaries; communication payload shape is owned structured clone / transfer-list metadata. Branded `Root` / `Weak` / `GcSession` follow-up moved to task 93. |
 | 93 | ✅ closed (2026-05-06) | Compile-time-branded GC session/root/weak API inspired by Oscars/gc-arena: cross-isolate, worker, async, public runtime, and native persistent-handle misuse fail at compile time or are removed from the public boundary. |
 | 94 | ✅ closed (2026-05-06) | Safe contributor GC/VM API surface: `NativeCtx` allocation/accounting/session helpers, `record_write`/`GcStore`, `ExternalMemory`, `EscapableHandleScope`, root-level raw import rejection, and doc-hidden raw backend adapters. |
-| 95 | [95-contributor-book-and-extension-guides.md](./95-contributor-book-and-extension-guides.md) | mdBook contributor guide covering engine architecture, GC API, hosted modules, JS surface builders, startup performance, future plugin system, and macros. |
+| 95 | ✅ closed (2026-05-06) | mdBook contributor guide covering engine architecture, GC API, hosted modules, JS surface builders, startup performance, future plugin system, and macros. |
 
 ## Post-GC production API / startup
 

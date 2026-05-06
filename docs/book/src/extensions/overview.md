@@ -24,9 +24,26 @@ JavaScript-visible surfaces should use the production spec/builder flow:
 - macros, when available, generate the same static specs rather than a
   separate runtime registry.
 
+Task 96 owns the first stable builder/spec backend. Before Task 96 lands,
+write explicit native/bootstrap code and keep capability checks and install
+order visible.
+
 Breaking changes to extension APIs are allowed while the new engine is in
 `crates-next/*` if they improve safety, startup, or steady-state
 performance.
 
 The future plugin system is tracked in the new-engine task files until the
 API is stable enough to document here fully.
+
+## Extension Checklist
+
+For any new JS-visible API:
+
+- choose the active `crates-next/*` crate that owns the behavior;
+- decide whether the surface is a global, builtin class, namespace,
+  hosted module, or runtime-only helper;
+- enforce permissions at the Rust boundary;
+- allocate, root, mutate, and account memory through context APIs;
+- add runtime tests and TypeScript declarations when the surface is
+  public;
+- add docs here when the workflow is stable.

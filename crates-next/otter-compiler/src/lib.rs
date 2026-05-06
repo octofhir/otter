@@ -5003,12 +5003,12 @@ fn compile_expr(
                 );
                 return Ok(dst);
             }
-            // `Math.PI` / `Math.E` — lower to MathLoad so the runtime
-            // doesn't need a real global object yet. Method-call
-            // forms (`Math.abs(...)`) are handled in
-            // `compile_method_call`.
+            // `Math.PI` / `Math.E` / other value properties lower to
+            // MathLoad. Method reads fall through to ordinary property
+            // load now that task 96 installs a real `Math` namespace.
             if let Expression::Identifier(id) = &m.object
                 && id.name.as_str() == "Math"
+                && math_static_constant(m.property.name.as_str()).is_some()
             {
                 let dst = cx.alloc_scratch();
                 let name_idx = cx.intern_string_constant(m.property.name.as_str());
@@ -8985,6 +8985,20 @@ fn number_static_constant(name: &str) -> Option<f64> {
         "NaN" => f64::NAN,
         _ => return None,
     })
+}
+
+/// §21.3.1 Math value properties. Returns the names the compiler
+/// may route through `Op::MathLoad`; method properties must remain
+/// ordinary loads so `Math.abs.length` and extracted calls observe
+/// the real namespace installed by bootstrap.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-value-properties-of-the-math-object>
+fn math_static_constant(name: &str) -> Option<()> {
+    match name {
+        "E" | "LN10" | "LN2" | "LOG10E" | "LOG2E" | "PI" | "SQRT1_2" | "SQRT2" => Some(()),
+        _ => None,
+    }
 }
 
 /// Lower a template literal `\`hello ${x} world\`` per §13.2.8 — a

@@ -72,9 +72,17 @@ keeps contributor ergonomics high while preserving write barriers,
 deterministic install order, fast native-call dispatch, and startup
 benchmark visibility.
 
-Task 96 owns the production builder/backend. Until it lands, do not
-promise builder or macro APIs as stable; write manual native/bootstrap code
-using the explicit context APIs and keep install order obvious.
+The registry lives in `otter-vm::bootstrap` as a static ordered slice of
+install entries. Each entry declares a global name, required bootstrap
+feature bits, and a plain installer function. Installers receive an
+explicit `&mut GcHeap` plus `globalThis`; migrated surfaces use
+`otter-vm::js_surface` specs/builders, and unmigrated globals remain
+small placeholders until their own slices land.
+
+The first migrated namespace is `Math`. Direct `Math.<fn>(...)` syntax
+still uses the existing bytecode fast path, while observable property
+reads and extracted method calls use the real namespace object installed
+from `math::MATH_SPEC`.
 
 ## Debug Workflows
 

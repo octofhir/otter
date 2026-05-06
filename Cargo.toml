@@ -9,6 +9,7 @@ members = [
     "crates-next/otter-syntax",
     "crates-next/otter-compiler",
     "crates-next/otter-gc",
+    "crates-next/otter-macros",
     "crates-next/otter-vm",
     "crates-next/otter-runtime",
     "crates-next/otter-test",
@@ -52,6 +53,9 @@ tokio               = { version = "1", features = ["rt-multi-thread", "sync", "t
 # Collections / utilities.
 smallvec    = "1"
 indexmap    = "2"
+proc-macro2 = "1"
+quote       = "1"
+syn         = { version = "2", features = ["full", "parsing", "printing"] }
 
 # Arbitrary-precision integers for `Value::BigInt`.
 num-bigint  = "0.4"
@@ -78,6 +82,7 @@ otter-bytecode  = { path = "crates-next/otter-bytecode" }
 otter-syntax    = { path = "crates-next/otter-syntax" }
 otter-compiler  = { path = "crates-next/otter-compiler" }
 otter-gc        = { path = "crates-next/otter-gc" }
+otter-macros    = { path = "crates-next/otter-macros" }
 otter-vm        = { path = "crates-next/otter-vm" }
 otter-runtime   = { path = "crates-next/otter-runtime" }
 otter-test      = { path = "crates-next/otter-test" }

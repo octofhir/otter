@@ -20,10 +20,50 @@
 //! - <https://tc39.es/ecma262/#sec-atomics-object>
 
 use crate::binary::{JsTypedArray, TypedArrayKind};
+use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
 use crate::number::NumberValue;
 use crate::promise::JsPromiseHandle;
 use crate::string::{JsString, StringHeap};
-use crate::{Value, VmError};
+use crate::{NativeCall, NativeCtx, NativeError, Value, VmError};
+
+/// Static namespace spec installed by the centralized bootstrap
+/// registry.
+pub static ATOMICS_SPEC: NamespaceSpec = NamespaceSpec {
+    name: "Atomics",
+    methods: ATOMICS_METHODS,
+    accessors: &[],
+    constants: &[],
+    attrs: Attr::global_binding(),
+};
+
+const ATOMICS_METHODS: &[MethodSpec] = &[
+    method("add", 3, native_add),
+    method("and", 3, native_and),
+    method("compareExchange", 4, native_compare_exchange),
+    method("exchange", 3, native_exchange),
+    method("isLockFree", 1, native_is_lock_free),
+    method("load", 2, native_load),
+    method("notify", 3, native_notify),
+    method("or", 3, native_or),
+    method("store", 3, native_store),
+    method("sub", 3, native_sub),
+    method("wait", 4, native_wait),
+    method("waitAsync", 4, native_wait_async),
+    method("xor", 3, native_xor),
+];
+
+const fn method(
+    name: &'static str,
+    length: u8,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        length,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(call),
+    }
+}
 
 /// Dispatch `Atomics.<name>(args...)`.
 ///
@@ -157,6 +197,41 @@ pub fn call(
         }),
     }
 }
+
+fn native_atomics_call(
+    ctx: &mut NativeCtx<'_>,
+    name: &'static str,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let interp = ctx.interp_mut();
+    let string_heap = interp.string_heap.clone();
+    call(name, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
+        name,
+        reason: err.to_string(),
+    })
+}
+
+macro_rules! native_atomics {
+    ($fn_name:ident, $js_name:literal) => {
+        fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            native_atomics_call(ctx, $js_name, args)
+        }
+    };
+}
+
+native_atomics!(native_add, "add");
+native_atomics!(native_and, "and");
+native_atomics!(native_compare_exchange, "compareExchange");
+native_atomics!(native_exchange, "exchange");
+native_atomics!(native_is_lock_free, "isLockFree");
+native_atomics!(native_load, "load");
+native_atomics!(native_notify, "notify");
+native_atomics!(native_or, "or");
+native_atomics!(native_store, "store");
+native_atomics!(native_sub, "sub");
+native_atomics!(native_wait, "wait");
+native_atomics!(native_wait_async, "waitAsync");
+native_atomics!(native_xor, "xor");
 
 /// Single-thread arithmetic / bitwise modify-and-return-old.
 fn atomic_modify(args: &[Value], op: fn(i64, i64) -> i64) -> Result<Value, VmError> {

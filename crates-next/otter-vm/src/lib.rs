@@ -42,12 +42,14 @@ pub mod collections_prototype;
 pub mod console;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
+pub mod bootstrap;
 pub mod error_classes;
 pub mod gc_trace;
 pub mod generator;
 pub mod global_functions;
 pub mod intl;
 pub mod intrinsics;
+pub mod js_surface;
 pub mod json;
 pub mod math;
 pub mod microtask;
@@ -83,11 +85,18 @@ use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 
 pub use array::JsArray;
 pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
+pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
+pub use js_surface::{
+    AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
+    ConstructorSpec, FunctionBuilder, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec,
+    ObjectBuilder, PropertySpec,
+};
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_function::{
-    NativeError, NativeFn, NativeFunction, native_value, native_value_with_captures,
+    NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, native_value,
+    native_value_static, native_value_with_captures,
 };
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
@@ -1816,6 +1825,10 @@ pub struct Interpreter {
     /// underlying function so writes through any closure handle
     /// land on the same place.
     function_user_props: std::collections::HashMap<u32, JsObject>,
+    /// Embedder-overridable sink behind the `console` namespace.
+    /// Defaults to `println!` / `eprintln!` via
+    /// [`console::StdConsoleSink`].
+    console_sink: console::ConsoleSinkHandle,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -1854,8 +1867,8 @@ impl Interpreter {
             .expect("GcHeap construction never fails on the default cage");
         let error_classes = ErrorClassRegistry::new(&string_heap, &mut gc_heap)
             .expect("error class prototypes fit within any positive cap");
-        let global_this =
-            build_global_this(&mut gc_heap).expect("global_this fits within any positive cap");
+        let global_this = bootstrap::build_global_this(&mut gc_heap)
+            .expect("global_this fits within any positive cap");
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
@@ -1871,7 +1884,19 @@ impl Interpreter {
             eval_hook: None,
             pending_generator_throw: None,
             function_user_props: std::collections::HashMap::new(),
+            console_sink: console::default_console_sink(),
         }
+    }
+
+    /// Replace the sink used by `console.*` methods.
+    pub fn set_console_sink(&mut self, sink: console::ConsoleSinkHandle) {
+        self.console_sink = sink;
+    }
+
+    /// Clone the sink used by `console.*` methods.
+    #[must_use]
+    pub fn console_sink(&self) -> console::ConsoleSinkHandle {
+        self.console_sink.clone()
     }
 
     /// Resolve a property read on a `Value::Function` /
@@ -2337,10 +2362,9 @@ impl Interpreter {
         // push, no return register. Errors propagate as RunError.
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call(&self.gc_heap);
-            let captures = native.captures(&self.gc_heap);
+            let call = native.call_target(&self.gc_heap);
             let mut ctx = NativeCtx::new(self);
-            return match call(&mut ctx, &argv, &captures) {
+            return match call.invoke(&mut ctx, &argv) {
                 Ok(value) => {
                     self.settle_microtask_capability(result_capability, Ok(value));
                     Ok(())
@@ -3214,6 +3238,20 @@ impl Interpreter {
                                                     &self.string_heap,
                                                 )?
                                             }
+                                            Value::NativeFunction(native) => {
+                                                if name == "name" {
+                                                    let s = JsString::from_str(
+                                                        native.name(&self.gc_heap),
+                                                        &self.string_heap,
+                                                    )
+                                                    .map_err(|_| VmError::TypeMismatch)?;
+                                                    Value::String(s)
+                                                } else {
+                                                    Value::Number(NumberValue::from_i32(
+                                                        native.length(&self.gc_heap) as i32,
+                                                    ))
+                                                }
+                                            }
                                             _ => Value::Undefined,
                                         }
                                     }
@@ -3252,7 +3290,9 @@ impl Interpreter {
                                 .map_err(|_| VmError::TypeMismatch)?;
                                 Value::String(s)
                             } else {
-                                Value::Number(NumberValue::from_i32(0))
+                                Value::Number(NumberValue::from_i32(
+                                    native.length(&self.gc_heap) as i32
+                                ))
                             }
                         }
                         Value::BoundFunction(bound) if name == "name" || name == "length" => {
@@ -4938,10 +4978,9 @@ impl Interpreter {
         // is created — the closure cannot itself push frames.
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call(&self.gc_heap);
-            let captures = native.captures(&self.gc_heap);
+            let call = native.call_target(&self.gc_heap);
             let mut ctx = NativeCtx::new(self);
-            let result = call(&mut ctx, &argv, &captures).map_err(native_to_vm_error)?;
+            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -5539,6 +5578,21 @@ impl Interpreter {
             crate::object::set_prototype(receiver, &mut self.gc_heap, Some(proto));
         }
         let this_value = Value::Object(receiver);
+        if let Value::ClassConstructor(class) = &callee
+            && let Value::NativeFunction(native) = &class.ctor
+        {
+            let argv: Vec<Value> = args.into_iter().collect();
+            let call = native.call_target(&self.gc_heap);
+            let mut ctx = NativeCtx::new(self);
+            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
+            let constructed = match result {
+                Value::Object(_) => result,
+                _ => this_value,
+            };
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, constructed)?;
+            return Ok(());
+        }
         self.invoke(stack, module, &callee, this_value, args, dst)?;
         // The pushed frame is now on top; mark it so `pop_frame`
         // can substitute the receiver for any non-object return.
@@ -6346,10 +6400,9 @@ impl Interpreter {
         }
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call(&self.gc_heap);
-            let captures = native.captures(&self.gc_heap);
+            let call = native.call_target(&self.gc_heap);
             let mut ctx = NativeCtx::new(self);
-            return call(&mut ctx, &argv, &captures).map_err(native_to_vm_error);
+            return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
         }
         let (function_id, parent_upvalues, this_for_callee) = match current {
             Value::Function { function_id } => {
@@ -8667,82 +8720,6 @@ fn bound_function_intrinsic_property(
         }
         _ => Value::Undefined,
     })
-}
-
-/// Build the per-Interpreter shared `globalThis` JsObject. Foundation
-/// seeds the self-reference so `globalThis.globalThis === globalThis`
-/// and leaves the rest of the global namespace empty — the §19.2
-/// global functions are reached through `Op::GlobalCall`, not
-/// `globalThis.parseInt`.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-globalthis>
-fn build_global_this(gc_heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let obj = crate::object::alloc_object(gc_heap)?;
-    crate::object::set(obj, gc_heap, "globalThis", Value::Object(obj));
-    // §19.1 standard globals — install placeholder constructor
-    // sentinels so identifier-as-value reads (e.g. `Array.prototype`,
-    // `Object.keys`) resolve to *something* rather than throwing
-    // ReferenceError. Each placeholder has a `prototype` own
-    // property pointing at a fresh object; the engine's existing
-    // intrinsic interceptors (`Op::ArrayCall` / `Op::ObjectCall` /
-    // …) handle the call sites that matter, and reads of `.length`
-    // / `.name` arrive at the per-function intrinsic helper.
-    //
-    // This is intentionally minimal — full constructor semantics
-    // (e.g. `new Array(n)` returning an array of length `n`) await
-    // the dedicated §22 / §23 engine track. The placeholder lets
-    // tests that *don't* rely on the constructor identity compile
-    // and run.
-    for name in [
-        "Array",
-        "Object",
-        "JSON",
-        "String",
-        "Number",
-        "Boolean",
-        "BigInt",
-        "Symbol",
-        "Math",
-        "Date",
-        "RegExp",
-        "Map",
-        "Set",
-        "WeakMap",
-        "WeakSet",
-        "WeakRef",
-        "Promise",
-        "Proxy",
-        "Reflect",
-        "Function",
-        "ArrayBuffer",
-        "SharedArrayBuffer",
-        "DataView",
-        "Int8Array",
-        "Uint8Array",
-        "Uint8ClampedArray",
-        "Int16Array",
-        "Uint16Array",
-        "Int32Array",
-        "Uint32Array",
-        "Float32Array",
-        "Float64Array",
-        "BigInt64Array",
-        "BigUint64Array",
-        "Atomics",
-        "Intl",
-        "Temporal",
-        "AggregateError",
-        "FinalizationRegistry",
-        "Iterator",
-    ] {
-        let placeholder = crate::object::alloc_object(gc_heap)?;
-        let proto = crate::object::alloc_object(gc_heap)?;
-        crate::object::set(placeholder, gc_heap, "prototype", Value::Object(proto));
-        crate::object::set(obj, gc_heap, name, Value::Object(placeholder));
-    }
-    crate::console::install(obj, gc_heap)?;
-    Ok(obj)
 }
 
 /// Resolve `specifier` against `referrer`, mirroring the WHATWG URL

@@ -2,13 +2,42 @@
 
 ## Status
 
-- [ ] open only after task 96 lands and at least two surfaces use the builder/spec backend
-- [ ] active `crates-next/otter-macros` or equivalent proc-macro crate added
-- [ ] macros generate static specs, not runtime registries
-- [ ] macro expansion audit documented with `cargo expand` output or equivalent
-- [ ] macro-generated surfaces benchmark equal to handwritten specs
-- [ ] mdBook macro guide updated with generated-shape examples
-- [ ] gates green
+- [x] open only after task 96 lands and at least two surfaces use the builder/spec backend
+- [x] active `crates-next/otter-macros` or equivalent proc-macro crate added
+- [x] macros generate static specs, not runtime registries
+- [x] macro expansion audit documented with `cargo expand` output or equivalent
+- [x] macro-generated surfaces benchmark equal to handwritten specs
+- [x] mdBook macro guide updated with generated-shape examples
+- [x] gates green
+
+## Progress Notes
+
+- 2026-05-06: first macro slice added `crates-next/otter-macros` with
+  `#[js_namespace(name = "...", spec = SPEC_IDENT)]`.
+- The macro consumes `#[js_fn(name = "...", length = N)]` on inline module
+  functions, rejects duplicate exported function names in one namespace, and
+  emits `NamespaceSpec` / `MethodSpec` records with `NativeCall::Static`.
+- The first slice was intentionally namespace-only; the follow-up slice added
+  class and grouped namespace declarations. Benchmark comparison and final
+  contributor recipes remain open before task 97 can close.
+- 2026-05-06: expanded the macro set to `#[js_class]` and `raft!`.
+  `#[js_class]` emits `ClassSpec` with constructor, constructor/static-side
+  methods, prototype instance methods, and prototype accessors. Instance
+  methods use `#[js_method]`; JavaScript static methods use
+  `#[js_static_method]`. Both compile to `NativeCall::Static` by default.
+- 2026-05-06: `cargo expand` audit captured in
+  [`97-expansion-audit.md`](./97-expansion-audit.md).
+- 2026-05-06: validation commands passed for the current macro slice:
+  `cargo fmt --all`, `cargo test -p otter-macros -p otter-vm`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  `cargo test --workspace`, `mdbook build docs/book`, and fff static scans
+  for thread-default GC lookup, hot-path boxed registries, and async
+  VM/GC/context capture patterns.
+- 2026-05-06: added `crates-next/otter-macros/benches/js_surface_macros.rs`
+  and captured handwritten-vs-macro parity in
+  [`97-benchmark-report.md`](./97-benchmark-report.md). `#[js_namespace]`,
+  `raft!`, and `#[js_class]` macro-generated surfaces were not slower than
+  equivalent handwritten specs on the same Task 96 builder path.
 
 ## Goal
 

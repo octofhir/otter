@@ -2,15 +2,17 @@
 //! functions reachable through the dedicated `Op::MathLoad` and
 //! `Op::MathCall` opcodes.
 //!
-//! Foundation goal: the compiler intercepts `Math.<name>` directly
-//! so the runtime does not need a true global object yet. Each
-//! entry below is registered in one of two static tables — one
-//! for read-only constants (`PI`, `E`, …) and one for callable
-//! routines (`abs`, `min`, …) — and looked up by name.
+//! `Math` is also exposed as a real global namespace through the
+//! task-96 static spec / builder bootstrap flow. The dedicated
+//! opcodes remain as a compiler fast path for direct
+//! `Math.<name>(...)` calls, while extracted methods such as
+//! `let abs = Math.abs; abs(-1)` dispatch through static native
+//! function pointers.
 //!
 //! # Contents
+//! - [`MATH_SPEC`] — static namespace spec used by bootstrap.
 //! - [`load_constant`] — used by `Op::MathLoad`.
-//! - [`call`] — used by `Op::MathCall`.
+//! - [`call`] — used by `Op::MathCall` and native wrappers.
 //! - [`MathError`] — failure modes the dispatcher converts to
 //!   `VmError`.
 //!
@@ -19,8 +21,9 @@
 //!     ../../../docs/new-engine/tasks/28-bitwise-and-number-prototype.md
 //!   )
 
-use crate::Value;
+use crate::js_surface::{Attr, ConstSpec, ConstValue, MethodSpec, NamespaceSpec};
 use crate::number::{NumberValue, bitwise};
+use crate::{NativeCall, NativeCtx, NativeError, Value};
 
 /// Foundation `Math` constants per ECMA-262 §21.3.1. Each constant
 /// is a static `f64` so the compiler can fold them at intern time
@@ -43,6 +46,110 @@ pub const LOG10E: f64 = std::f64::consts::LOG10_E;
 pub const SQRT1_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// Square root of 2.
 pub const SQRT2: f64 = std::f64::consts::SQRT_2;
+
+/// Static namespace spec installed by the centralized bootstrap
+/// registry.
+pub static MATH_SPEC: NamespaceSpec = NamespaceSpec {
+    name: "Math",
+    methods: MATH_METHODS,
+    accessors: &[],
+    constants: MATH_CONSTANTS,
+    attrs: Attr::global_binding(),
+};
+
+const MATH_CONSTANTS: &[ConstSpec] = &[
+    ConstSpec {
+        name: "E",
+        value: ConstValue::Number(E),
+        attrs: Attr::read_only(),
+    },
+    ConstSpec {
+        name: "LN10",
+        value: ConstValue::Number(LN10),
+        attrs: Attr::read_only(),
+    },
+    ConstSpec {
+        name: "LN2",
+        value: ConstValue::Number(LN2),
+        attrs: Attr::read_only(),
+    },
+    ConstSpec {
+        name: "LOG10E",
+        value: ConstValue::Number(LOG10E),
+        attrs: Attr::read_only(),
+    },
+    ConstSpec {
+        name: "LOG2E",
+        value: ConstValue::Number(LOG2E),
+        attrs: Attr::read_only(),
+    },
+    ConstSpec {
+        name: "PI",
+        value: ConstValue::Number(PI),
+        attrs: Attr::read_only(),
+    },
+    ConstSpec {
+        name: "SQRT1_2",
+        value: ConstValue::Number(SQRT1_2),
+        attrs: Attr::read_only(),
+    },
+    ConstSpec {
+        name: "SQRT2",
+        value: ConstValue::Number(SQRT2),
+        attrs: Attr::read_only(),
+    },
+];
+
+const MATH_METHODS: &[MethodSpec] = &[
+    method("abs", 1, native_abs),
+    method("floor", 1, native_floor),
+    method("ceil", 1, native_ceil),
+    method("round", 1, native_round),
+    method("trunc", 1, native_trunc),
+    method("sqrt", 1, native_sqrt),
+    method("pow", 2, native_pow),
+    method("min", 2, native_min),
+    method("max", 2, native_max),
+    method("log", 1, native_log),
+    method("log2", 1, native_log2),
+    method("log10", 1, native_log10),
+    method("log1p", 1, native_log1p),
+    method("exp", 1, native_exp),
+    method("expm1", 1, native_expm1),
+    method("sin", 1, native_sin),
+    method("cos", 1, native_cos),
+    method("tan", 1, native_tan),
+    method("asin", 1, native_asin),
+    method("acos", 1, native_acos),
+    method("atan", 1, native_atan),
+    method("atan2", 2, native_atan2),
+    method("sinh", 1, native_sinh),
+    method("cosh", 1, native_cosh),
+    method("tanh", 1, native_tanh),
+    method("asinh", 1, native_asinh),
+    method("acosh", 1, native_acosh),
+    method("atanh", 1, native_atanh),
+    method("cbrt", 1, native_cbrt),
+    method("fround", 1, native_fround),
+    method("hypot", 2, native_hypot),
+    method("sign", 1, native_sign),
+    method("clz32", 1, native_clz32),
+    method("imul", 2, native_imul),
+    method("random", 0, native_random),
+];
+
+const fn method(
+    name: &'static str,
+    length: u8,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        length,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(call),
+    }
+}
 
 /// Failure modes for [`call`].
 #[derive(Debug, Clone, thiserror::Error)]
@@ -92,6 +199,63 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, MathError> {
     let nums = coerce_all(entry.name, args)?;
     Ok(Value::Number((entry.impl_fn)(&nums)))
 }
+
+fn native_call(name: &'static str, args: &[Value]) -> Result<Value, NativeError> {
+    call(name, args).map_err(|err| match err {
+        MathError::UnknownMember(member) => NativeError::TypeError {
+            name,
+            reason: format!("unknown Math member {member}"),
+        },
+        MathError::BadArgument { reason, .. } => NativeError::TypeError {
+            name,
+            reason: reason.to_string(),
+        },
+    })
+}
+
+macro_rules! native_math {
+    ($fn_name:ident, $js_name:literal) => {
+        fn $fn_name(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            native_call($js_name, args)
+        }
+    };
+}
+
+native_math!(native_abs, "abs");
+native_math!(native_floor, "floor");
+native_math!(native_ceil, "ceil");
+native_math!(native_round, "round");
+native_math!(native_trunc, "trunc");
+native_math!(native_sqrt, "sqrt");
+native_math!(native_pow, "pow");
+native_math!(native_min, "min");
+native_math!(native_max, "max");
+native_math!(native_log, "log");
+native_math!(native_log2, "log2");
+native_math!(native_log10, "log10");
+native_math!(native_log1p, "log1p");
+native_math!(native_exp, "exp");
+native_math!(native_expm1, "expm1");
+native_math!(native_sin, "sin");
+native_math!(native_cos, "cos");
+native_math!(native_tan, "tan");
+native_math!(native_asin, "asin");
+native_math!(native_acos, "acos");
+native_math!(native_atan, "atan");
+native_math!(native_atan2, "atan2");
+native_math!(native_sinh, "sinh");
+native_math!(native_cosh, "cosh");
+native_math!(native_tanh, "tanh");
+native_math!(native_asinh, "asinh");
+native_math!(native_acosh, "acosh");
+native_math!(native_atanh, "atanh");
+native_math!(native_cbrt, "cbrt");
+native_math!(native_fround, "fround");
+native_math!(native_hypot, "hypot");
+native_math!(native_sign, "sign");
+native_math!(native_clz32, "clz32");
+native_math!(native_imul, "imul");
+native_math!(native_random, "random");
 
 /// One entry in the Math function table.
 struct MathFn {

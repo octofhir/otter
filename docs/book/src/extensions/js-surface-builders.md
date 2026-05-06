@@ -3,9 +3,10 @@
 Otter's preferred contributor API for JavaScript-visible surfaces is a
 static spec plus mutator-bound builder flow.
 
-This API is planned for Task 96. The examples below document the required
-generated/runtime shape; they are intentionally marked `ignore` until the
-Task 96 names land.
+This is the Task 96 API shape. The examples below document the required
+generated/runtime shape. The first production slice is implemented in
+`otter-vm::js_surface` and `otter-vm::bootstrap`; `Math`, `JSON`,
+`Atomics`, and `console` are installed through this path.
 
 The goal is high-level ergonomics without runtime overhead:
 
@@ -23,7 +24,17 @@ The goal is high-level ergonomics without runtime overhead:
 
 The intended model is:
 
-```rust,ignore
+```rust
+use otter_vm::{
+    Attr, ConstSpec, ConstValue, MethodSpec, NamespaceSpec, NativeCall,
+    NativeCtx, NativeError, Value,
+};
+
+fn math_abs(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let _ = (ctx, args);
+    Ok(Value::Undefined)
+}
+
 static MATH_SPEC: NamespaceSpec = NamespaceSpec {
     name: "Math",
     methods: &[
@@ -37,17 +48,19 @@ static MATH_SPEC: NamespaceSpec = NamespaceSpec {
     constants: &[
         ConstSpec {
             name: "PI",
-            attrs: Attr::read_only(),
             value: ConstValue::Number(std::f64::consts::PI),
+            attrs: Attr::read_only(),
         },
     ],
+    accessors: &[],
+    attrs: Attr::global_binding(),
 };
 ```
 
 Builders are lifetime-bound to the current mutator turn:
 
 ```rust,ignore
-NamespaceBuilder::from_spec(cx, &MATH_SPEC)?.build()?;
+let namespace = NamespaceBuilder::from_spec(heap, &MATH_SPEC)?.build()?;
 ```
 
 Do not store builders, contexts, `Value`, `Gc<T>`, `Local<'gc, T>`, or VM
@@ -55,10 +68,11 @@ frames in async host futures.
 
 ## Spec Records
 
-Task 96 owns the final names, but the records must cover:
-
 - `Attr`: writable/enumerable/configurable attributes with explicit
-  defaults;
+  defaults and helpers such as `builtin_function`, `read_only`, and
+  `global_binding`;
+- `ConstValue` / `ConstSpec`: static primitive values and constant/data
+  properties;
 - `PropertySpec`: data properties and constants;
 - `MethodSpec`: exported name, `.length`, attributes, and native call
   target;
@@ -85,19 +99,42 @@ modules.
 
 ## Native Calls
 
-Task 96 should split native call storage into a static fast path and a
-dynamic path:
+Native call storage is split into a static fast path and a dynamic path:
 
 ```rust,ignore
+use otter_vm::{NativeCall, NativeFastFn, NativeFn};
+use std::sync::Arc;
+
 pub enum NativeCall {
     Static(NativeFastFn),
-    Dynamic(Box<NativeFn>),
+    Dynamic(Arc<NativeFn>),
 }
 ```
 
 Spec-declared builtins and macro-generated builtins should use
-`NativeCall::Static` by default. Use dynamic boxed closures only when the
+`NativeCall::Static` by default. Use dynamic closures only when the
 embedder needs captured Rust state, and keep traced JS captures explicit.
+Crate-internal VM helpers may still use local unchecked constructors for
+audited isolate-local payloads.
+
+## Current Migration
+
+The first migrated namespaces are `Math`, `JSON`, `Atomics`, and
+`console`:
+
+- `globalThis.Math` is installed from `math::MATH_SPEC`;
+- Math constants use non-writable, non-enumerable, non-configurable
+  descriptors;
+- Math methods are `Value::NativeFunction` values using
+  `NativeCall::Static` and explicit `.length`;
+- direct `Math.abs(...)` calls still use the existing `Op::MathCall`
+  compiler fast path, while method reads such as `Math.abs.length` and
+  extracted calls use the installed namespace object.
+- `globalThis.JSON`, `globalThis.Atomics`, and `globalThis.console` are
+  installed by the centralized bootstrap registry from static namespace
+  specs;
+- `console` output is routed through an embedder-overridable
+  `ConsoleSink`; the default sink writes with `println!` / `eprintln!`.
 
 ## Performance Rules
 

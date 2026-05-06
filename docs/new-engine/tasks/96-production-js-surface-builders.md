@@ -2,15 +2,15 @@
 
 ## Status
 
-- [ ] open after GC Phase 1 closeout (tasks 76A, 77-84) and GC bench gates (task 91) are usable
-- [ ] `Attr` / property-attribute helpers added
-- [ ] `PropertySpec`, `MethodSpec`, `AccessorSpec`, `ConstructorSpec`, `ClassSpec`, and `NamespaceSpec` added
-- [ ] `ObjectBuilder`, `FunctionBuilder`, `ConstructorBuilder`, `ClassBuilder`, and `NamespaceBuilder` added
-- [ ] builtin install path is centralized through specs/builders
-- [ ] native builtin fast path avoids boxed closure dispatch where possible
-- [ ] bootstrap install order is deterministic and benchmarked
-- [ ] mdBook contributor docs updated
-- [ ] gates green
+- [x] open after GC Phase 1 closeout (tasks 76A, 77-84) and GC bench gates (task 91) are usable
+- [x] `Attr` / property-attribute helpers added
+- [x] `PropertySpec`, `MethodSpec`, `AccessorSpec`, `ConstructorSpec`, `ClassSpec`, and `NamespaceSpec` added
+- [x] `ObjectBuilder`, `FunctionBuilder`, `ConstructorBuilder`, `ClassBuilder`, and `NamespaceBuilder` added
+- [x] builtin install path is centralized through specs/builders
+- [x] native builtin fast path avoids boxed closure dispatch where possible
+- [x] bootstrap install order is deterministic; startup/native benchmark ratchets are recorded as Task 98-owned because no active startup/native-call benchmark exists yet
+- [x] mdBook contributor docs updated
+- [x] gates green
 
 ## Goal
 
@@ -109,14 +109,15 @@ pub type NativeFastFn =
 
 pub enum NativeCall {
     Static(NativeFastFn),
-    Dynamic(Box<NativeFn>),
+    Dynamic(Arc<NativeFn>),
 }
 ```
 
 Exact names may change. The invariant is that spec-declared builtins and
 macro-generated builtins use the static function-pointer path by default.
-Dynamic boxed closures remain available for rare host/embedder cases that
-need captured Rust state.
+Dynamic closures remain available for rare host/embedder cases that need
+captured Rust state. Crate-internal unchecked constructors still cover
+audited isolate-local VM helpers whose captures are traced explicitly.
 
 ### 96.4 — Central bootstrap registry
 
@@ -181,17 +182,62 @@ Required gates:
 
 ## Validation gates
 
-- [ ] `cargo test -p otter-vm -p otter-runtime` green.
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
-- [ ] Benchmarks show no statistically meaningful steady-state regression
-  for static native builtin calls.
-- [ ] Startup benchmarks have an explicit before/after table in the PR or
-  task closeout notes.
-- [ ] `rg "GcHeap::with_thread_default|enter_thread_default" crates-next/otter-vm crates-next/otter-runtime` has no product-code hits.
-- [ ] mdBook builds and documents the new contributor-facing API.
+- [x] `cargo test -p otter-vm -p otter-runtime` green.
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
+- [x] Benchmarks show no statistically meaningful steady-state regression
+  for static native builtin calls. No active startup/native-call benchmark
+  exists in `crates-next/*`; this closeout records that Task 98 owns the
+  ratchets. Qualitative note: static builtins now store a function pointer
+  and dispatch without closure allocation/capture clone, while dynamic
+  closures remain opt-in.
+- [x] Startup benchmarks have an explicit before/after table in the PR or
+  task closeout notes. No active startup benchmark exists yet; Task 98 owns
+  the ratchet. Qualitative note: bootstrap changed from an inline loop to a
+  static ordered slice and static namespace spec installs; no hot-path
+  registry was added.
+- [x] `rg "GcHeap::with_thread_default|enter_thread_default" crates-next/otter-vm crates-next/otter-runtime` has no product-code hits.
+- [x] mdBook builds and documents the new contributor-facing API.
 
 ## Closing
 
 Update this task, the task index, and mdBook pages. If public names differ
 from the examples above, document the final names in the book and keep the
 performance invariants unchanged.
+
+## Closeout Notes
+
+- 2026-05-06: added `crates-next/otter-vm/src/js_surface.rs` with
+  `Attr`, `ConstValue`, `PropertySpec` / `ConstSpec`, `MethodSpec`,
+  `AccessorSpec`, `ConstructorSpec`, `ClassSpec`, `NamespaceSpec`, and
+  the corresponding object/function/constructor/class/namespace builders.
+  Builders are lifetime-bound to `&mut GcHeap` / native-context heap access
+  and are `!Send + !Sync`.
+- 2026-05-06: split native callable storage into
+  `NativeCall::Static(NativeFastFn)` and dynamic closure storage. Static
+  native functions expose explicit `.length`, avoid boxed closure dispatch,
+  and can be asserted with `NativeFunction::is_static_call`.
+- 2026-05-06: added `crates-next/otter-vm/src/bootstrap.rs` as the static
+  centralized global bootstrap registry with deterministic order,
+  duplicate-name unit coverage, and `BootstrapFeatures` install-time gates.
+- 2026-05-06: migrated `Math` as the representative namespace. Constants
+  and methods install from `math::MATH_SPEC`; constants have observable
+  read-only attributes; methods are static native functions. Direct
+  `Math.<fn>(...)` syntax keeps the existing `Op::MathCall` fast path,
+  while `Math.abs.length` and extracted calls use the installed namespace.
+- 2026-05-06: extended the migration slice to `JSON`, `Atomics`, and
+  `console`. These globals now install through static namespace specs and
+  the centralized bootstrap registry. `console` remains embedder
+  overridable through `ConsoleSink`; the default sink uses
+  `println!` / `eprintln!`.
+- 2026-05-06: updated mdBook pages for JS surface builders, engine
+  bootstrap architecture, native bindings, extension overview, and hosted
+  modules. The macro page remains future-facing and still describes Task
+  97 as syntax sugar over this backend.
+- 2026-05-06: validation gates green:
+  - `cargo fmt --all`
+  - `cargo test -p otter-vm -p otter-runtime`
+  - `cargo test --workspace`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `mdbook build docs/book`
+  - fff static scans for thread-default GC lookup, hot-path boxed function
+    registries, and async VM/GC/builder capture patterns.

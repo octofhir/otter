@@ -45,11 +45,12 @@ Rust futures.
 
 ## Bootstrap
 
-Task 96 will provide the production builder/spec flow for hosted module
-namespace installation. Until then, keep module registration manual,
-centralized, and easy to audit. If capability enforcement or bootstrap
-order is delicate, prefer explicit manual code over hiding control flow
-behind a macro.
+Task 96 provides the production builder/spec flow for namespace
+installation. Hosted modules should use `NamespaceSpec` /
+`NamespaceBuilder` when their surface is a plain namespace. Keep module
+registration centralized and easy to audit. If capability enforcement or
+bootstrap order is delicate, prefer explicit manual code over hiding
+control flow behind a macro.
 
 Task 97 may add hosted-module macros later, but those macros must generate
 Task 96 specs and ordinary Rust functions. They must not invent a separate

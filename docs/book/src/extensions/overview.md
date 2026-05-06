@@ -24,9 +24,11 @@ JavaScript-visible surfaces should use the production spec/builder flow:
 - macros, when available, generate the same static specs rather than a
   separate runtime registry.
 
-Task 96 owns the first stable builder/spec backend. Before Task 96 lands,
-write explicit native/bootstrap code and keep capability checks and install
-order visible.
+Task 96 landed the first stable builder/spec backend in
+`otter-vm::js_surface` plus the centralized `otter-vm::bootstrap`
+registry. New JS-visible surfaces should use that path unless capability
+checks or delicate install order require a small manual installer that
+still calls the same builders.
 
 Breaking changes to extension APIs are allowed while the new engine is in
 `crates-next/*` if they improve safety, startup, or steady-state

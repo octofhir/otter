@@ -583,6 +583,7 @@ pub(crate) struct RuntimeConfig {
     max_stack_depth: u32,
     capabilities: CapabilitySet,
     loader: Option<module_loader::LoaderConfig>,
+    console_sink: otter_vm::ConsoleSinkHandle,
 }
 
 impl Default for RuntimeConfig {
@@ -593,6 +594,7 @@ impl Default for RuntimeConfig {
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             capabilities: CapabilitySet::default(),
             loader: None,
+            console_sink: otter_vm::console::default_console_sink(),
         }
     }
 }
@@ -651,6 +653,18 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Override the implementation behind `console.*`.
+    ///
+    /// The default sink writes `log` / `info` / `debug` through
+    /// `println!` and `warn` / `error` / `trace` / failed `assert`
+    /// through `eprintln!`. Embedders can replace it with a sink
+    /// backed by `tracing`, structured logs, or test capture.
+    #[must_use]
+    pub fn console_sink(mut self, sink: otter_vm::ConsoleSinkHandle) -> Self {
+        self.config.console_sink = sink;
+        self
+    }
+
     /// Construct the runtime.
     ///
     /// # Errors
@@ -689,6 +703,7 @@ impl Runtime {
         // the configured cap.
         let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes);
         interp.set_max_stack_depth(config.max_stack_depth);
+        interp.set_console_sink(config.console_sink.clone());
         // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
         // `new Function(...)` reach a real parse + compile path.
         // The closure is reusable across calls; each invocation
@@ -1190,6 +1205,13 @@ impl OtterBuilder {
         self
     }
 
+    /// Override the implementation behind `console.*`.
+    #[must_use]
+    pub fn console_sink(mut self, sink: otter_vm::ConsoleSinkHandle) -> Self {
+        self.runtime = self.runtime.console_sink(sink);
+        self
+    }
+
     /// Construct the public async facade.
     ///
     /// # Errors
@@ -1554,6 +1576,101 @@ mod tests {
                 console.warn(new Error("warn-path"));
                 console.assert(true, "should not print");
                 console.assert(false, "assert-path");
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(result.completion_string(), "undefined");
+    }
+
+    type ConsoleEvents =
+        std::sync::Arc<std::sync::Mutex<Vec<(otter_vm::ConsoleLevel, Vec<String>)>>>;
+
+    #[derive(Debug)]
+    struct CapturingConsole {
+        events: ConsoleEvents,
+    }
+
+    impl otter_vm::ConsoleSink for CapturingConsole {
+        fn write(&self, level: otter_vm::ConsoleLevel, fields: &[String]) {
+            self.events.lock().unwrap().push((level, fields.to_vec()));
+        }
+    }
+
+    #[test]
+    fn runtime_console_sink_is_embedder_overridable() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::new(CapturingConsole {
+            events: events.clone(),
+        });
+        let otter = Otter::builder().console_sink(sink).build().unwrap();
+        let result = otter
+            .blocking_run_typescript(
+                r#"
+                console.log("hello", 7);
+                console.warn("careful");
+                console.assert(false, "nope");
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(result.completion_string(), "undefined");
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0].0, otter_vm::ConsoleLevel::Log);
+        assert_eq!(captured[0].1, vec!["hello".to_string(), "7".to_string()]);
+        assert_eq!(captured[1].0, otter_vm::ConsoleLevel::Warn);
+        assert_eq!(captured[1].1, vec!["careful".to_string()]);
+        assert_eq!(captured[2].0, otter_vm::ConsoleLevel::Assert);
+        assert_eq!(
+            captured[2].1,
+            vec!["Assertion failed".to_string(), "nope".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_installs_math_namespace_from_static_surface_spec() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_typescript(
+                r#"
+                function fail(msg) { throw new Error(msg); }
+                const pi = Object.getOwnPropertyDescriptor(Math, "PI");
+                if (pi.writable !== false) fail("PI writable");
+                if (pi.enumerable !== false) fail("PI enumerable");
+                if (pi.configurable !== false) fail("PI configurable");
+                const abs = Math.abs;
+                if (typeof abs !== "function") fail("missing Math.abs");
+                if (abs.length !== 1) fail("bad Math.abs length");
+                if (abs(-7) !== 7) fail("bad extracted Math.abs");
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(result.completion_string(), "undefined");
+    }
+
+    #[test]
+    fn runtime_installs_json_and_atomics_namespaces_from_static_surface_specs() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_typescript(
+                r#"
+                function fail(msg) { throw new Error(msg); }
+
+                const parse = JSON.parse;
+                if (typeof parse !== "function") fail("missing JSON.parse");
+                if (parse.length !== 2) fail("bad JSON.parse length");
+                if (parse("{\"x\":3}").x !== 3) fail("bad extracted JSON.parse");
+
+                const stringify = JSON.stringify;
+                if (stringify.length !== 3) fail("bad JSON.stringify length");
+                if (stringify({ x: 4 }) !== "{\"x\":4}") fail("bad extracted JSON.stringify");
+
+                const isLockFree = Atomics.isLockFree;
+                if (typeof isLockFree !== "function") fail("missing Atomics.isLockFree");
+                if (isLockFree.length !== 1) fail("bad Atomics.isLockFree length");
+                if (isLockFree(4) !== true) fail("bad extracted Atomics.isLockFree");
                 "#,
             )
             .unwrap();

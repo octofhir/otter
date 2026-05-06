@@ -9,6 +9,7 @@
 - [x] Compile-time GC safety hardening (task 93)
 - [x] Contributor-facing GC/VM API surface (task 94)
 - [x] Contributor book / plugin and macro guide (task 95)
+- [x] Production JS surface specs/builders/bootstrap (task 96)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
 - [ ] Phase 4 (deferred indefinitely) — concurrent marking + parallel scavenge (task 87)
@@ -61,8 +62,8 @@ later tasks assume earlier ones have landed.
 
 | # | File | One-line goal |
 |---|------|---------------|
-| 96 | [96-production-js-surface-builders.md](./96-production-js-surface-builders.md) | Static JS surface specs + mutator-bound builders + centralized bootstrap registry; high-level contributor API without runtime hot-path overhead. |
-| 97 | [97-zero-cost-js-surface-macros.md](./97-zero-cost-js-surface-macros.md) | Macros generate static specs and normal Rust functions over task 96; no runtime registry, per-call allocation, or hidden control flow. |
+| 96 | ✅ closed (2026-05-06) | Static JS surface specs + mutator-bound builders + centralized bootstrap registry; `Math`, `JSON`, `Atomics`, and `console` install through static namespace specs with static native function-pointer methods. |
+| 97 | ✅ closed (2026-05-06) | Zero-cost macros over Task 96 specs: `#[js_namespace]`, `#[js_class]`, and `raft!` generate static specs and normal Rust functions with `NativeCall::Static`; expansion audit and handwritten-vs-macro benchmark report are recorded. |
 | 98 | [98-startup-bootstrap-performance.md](./98-startup-bootstrap-performance.md) | Startup/first-run benchmark ratchets, bootstrap telemetry, tiered/lazy init evaluation, and startup snapshot/code-cache decision. |
 
 ## Phase 2 — incremental marking + concurrent sweep + pretenuring

@@ -8,6 +8,7 @@
 //! the common case (ASCII strings, small integers, dense arrays).
 //!
 //! # Contents
+//! - [`JSON_SPEC`] — static namespace spec used by bootstrap.
 //! - [`call`] — namespace-call dispatcher (used by `Op::JsonCall`).
 //! - [`stringify`] / [`parse`] — public entry points.
 //! - [`stringify_with_options`] — programmable `space` + `replacer`.
@@ -41,8 +42,34 @@ mod stringify;
 pub use parse::{ParseError, parse};
 pub use stringify::{StringifyOptions, stringify, stringify_with_options};
 
-use crate::Value;
+use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
 use crate::string::JsString;
+use crate::{NativeCall, NativeCtx, NativeError, Value};
+
+/// Static namespace spec installed by the centralized bootstrap
+/// registry.
+pub static JSON_SPEC: NamespaceSpec = NamespaceSpec {
+    name: "JSON",
+    methods: JSON_METHODS,
+    accessors: &[],
+    constants: &[],
+    attrs: Attr::global_binding(),
+};
+
+const JSON_METHODS: &[MethodSpec] = &[
+    MethodSpec {
+        name: "parse",
+        length: 2,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(native_parse),
+    },
+    MethodSpec {
+        name: "stringify",
+        length: 3,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(native_stringify),
+    },
+];
 
 /// Hard cap on nesting depth. Both stringify and parse abort with
 /// `JsonError::TooDeep` once exceeded — keeps adversarial input
@@ -142,6 +169,27 @@ pub fn call(
         "parse" => json_parse(args, string_heap, gc_heap),
         _ => Err(JsonError::UnknownMember(name.to_string())),
     }
+}
+
+fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    native_json_call(ctx, "parse", args)
+}
+
+fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    native_json_call(ctx, "stringify", args)
+}
+
+fn native_json_call(
+    ctx: &mut NativeCtx<'_>,
+    name: &'static str,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let interp = ctx.interp_mut();
+    let string_heap = interp.string_heap.clone();
+    call(name, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
+        name,
+        reason: err.to_string(),
+    })
 }
 
 fn json_stringify(

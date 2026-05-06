@@ -1,15 +1,18 @@
 //! `Value::NativeFunction` — host-implemented callable values.
 //!
-//! Native callables are GC-managed handles. Their Rust closure
-//! payload is a leaf from the GC's point of view; any JS values the
-//! closure owns must also be listed in the body's capture list so
-//! tracing can keep those values alive.
+//! Native callables are GC-managed handles. Production builtins use
+//! a static function-pointer dispatch path; dynamic closures remain
+//! available for host/embedder cases that need captured Rust state.
+//! Any JS values a dynamic closure owns must also be listed in the
+//! body's capture list so tracing can keep those values alive.
 //!
 //! # Contents
 //! - [`NativeFunction`] — cheap-to-clone GC handle.
 //! - [`NativeFunctionBody`] — name, closure payload, and traced
 //!   captured values.
-//! - [`NativeFn`] — the function-pointer signature.
+//! - [`NativeFastFn`] / [`NativeCall`] — static and dynamic native
+//!   dispatch targets.
+//! - [`NativeFn`] — the dynamic closure signature.
 //! - [`NativeError`] — failure outcome the dispatcher converts to
 //!   `VmError`.
 //!
@@ -19,10 +22,12 @@
 //!   Host async work must copy owned, non-GC data out before any
 //!   `.await`; `NativeCtx`, `Value`, and GC handles are
 //!   isolate-local.
-//! - Public native constructors require `Send + Sync` closures and
-//!   pass traced JS captures as an explicit slice at call time. That
-//!   keeps embedders from hiding isolate-local `Gc<T>` / `Value`
-//!   handles inside a long-lived closure.
+//! - Static builtins carry a plain function pointer and no captured
+//!   payload.
+//! - Public dynamic native constructors require `Send + Sync`
+//!   closures and pass traced JS captures as an explicit slice at
+//!   call time. That keeps embedders from hiding isolate-local
+//!   `Gc<T>` / `Value` handles inside a long-lived closure.
 //! - Crate-internal unchecked constructors are reserved for audited
 //!   isolate-local VM helpers whose payload-specific trace hook covers
 //!   every hidden JS value.
@@ -32,6 +37,7 @@
 //! - [Task 83](../../../docs/new-engine/tasks/83-migrate-bound-native-regexp.md)
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -53,8 +59,57 @@ pub const NATIVE_FUNCTION_BODY_TYPE_TAG: u8 = 0x1d;
 /// expansion). Implementations return `Ok(value)` to write into
 /// the call-site destination register, or `Err` to surface as a
 /// runtime error.
-pub type NativeFn =
+pub type NativeFn = dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+    + Send
+    + Sync;
+
+type LocalNativeFn =
     dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
+
+/// Function-pointer signature for static builtin callables.
+///
+/// This is the production fast path for spec-declared builtins and
+/// future macro-generated surfaces: invoking it requires no closure
+/// allocation, capture clone, or dynamic dispatch.
+pub type NativeFastFn = for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>;
+
+/// Native callable storage.
+///
+/// Static specs should use [`NativeCall::Static`]. Dynamic closures
+/// are reserved for embedder cases that need captured Rust state.
+#[derive(Clone)]
+pub enum NativeCall {
+    /// Plain function-pointer dispatch with no captured payload.
+    Static(NativeFastFn),
+    /// Dynamic closure dispatch. Captured JS values still live in
+    /// [`NativeFunctionBody::captures`] so the GC can trace them.
+    Dynamic(Arc<NativeFn>),
+}
+
+#[derive(Clone)]
+enum NativeCallStorage {
+    Static(NativeFastFn),
+    Dynamic(Arc<NativeFn>),
+    LocalDynamic(Rc<LocalNativeFn>),
+}
+
+impl From<NativeCall> for NativeCallStorage {
+    fn from(value: NativeCall) -> Self {
+        match value {
+            NativeCall::Static(call) => Self::Static(call),
+            NativeCall::Dynamic(call) => Self::Dynamic(call),
+        }
+    }
+}
+
+impl std::fmt::Debug for NativeCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(_) => f.write_str("NativeCall::Static(..)"),
+            Self::Dynamic(_) => f.write_str("NativeCall::Dynamic(..)"),
+        }
+    }
+}
 
 /// Optional tracing hook for native payloads whose Rust-side state
 /// owns JS values outside the fixed capture list.
@@ -65,8 +120,10 @@ pub struct NativeFunctionBody {
     /// Display name (used in stack traces and `Function.prototype.
     /// toString` once that lands).
     name: &'static str,
-    /// Captured `Fn` payload.
-    call: Rc<NativeFn>,
+    /// ECMAScript `.length` metadata.
+    length: u8,
+    /// Static function pointer or dynamic closure payload.
+    call: NativeCallStorage,
     /// JS values owned by the native payload and therefore traced
     /// strongly while this function is reachable.
     captures: SmallVec<[Value; 4]>,
@@ -117,7 +174,44 @@ impl NativeFunction {
             + Sync
             + 'static,
     {
-        Self::with_captures(heap, name, call, SmallVec::new())
+        Self::with_length_and_captures(heap, name, 0, call, SmallVec::new())
+    }
+
+    /// Build a static native function with explicit `.length`.
+    pub fn new_static(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeFastFn,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_old(NativeFunctionBody {
+                name,
+                length,
+                call: NativeCallStorage::Static(call),
+                captures: SmallVec::new(),
+                trace: None,
+            })?,
+        })
+    }
+
+    /// Build a native function from an already-classified call
+    /// target.
+    pub fn from_call(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_old(NativeFunctionBody {
+                name,
+                length,
+                call: call.into(),
+                captures: SmallVec::new(),
+                trace: None,
+            })?,
+        })
     }
 
     /// Build a native function with explicit traced JS captures.
@@ -133,10 +227,29 @@ impl NativeFunction {
             + Sync
             + 'static,
     {
+        Self::with_length_and_captures(heap, name, 0, call, captures)
+    }
+
+    /// Build a dynamic native function with explicit `.length` and
+    /// explicit traced JS captures.
+    pub fn with_length_and_captures<F>(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: F,
+        captures: SmallVec<[Value; 4]>,
+    ) -> Result<Self, otter_gc::OutOfMemory>
+    where
+        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+            + Send
+            + Sync
+            + 'static,
+    {
         Ok(Self {
             inner: heap.alloc_old(NativeFunctionBody {
                 name,
-                call: Rc::new(call),
+                length,
+                call: NativeCallStorage::Dynamic(Arc::new(call)),
                 captures,
                 trace: None,
             })?,
@@ -167,23 +280,78 @@ impl NativeFunction {
         heap.read_payload(self.inner, |body| body.name)
     }
 
-    /// Clone the Rust closure payload so the caller can invoke it
-    /// after releasing the heap borrow.
+    /// Read ECMAScript `.length` metadata.
     #[must_use]
-    pub fn call(&self, heap: &otter_gc::GcHeap) -> Rc<NativeFn> {
-        heap.read_payload(self.inner, |body| body.call.clone())
+    pub fn length(&self, heap: &otter_gc::GcHeap) -> u8 {
+        heap.read_payload(self.inner, |body| body.length)
     }
 
-    /// Clone the traced JS captures supplied at construction.
+    /// Clone the call target and captures so the caller can invoke
+    /// it after releasing the heap borrow.
     #[must_use]
-    pub fn captures(&self, heap: &otter_gc::GcHeap) -> SmallVec<[Value; 4]> {
-        heap.read_payload(self.inner, |body| body.captures.clone())
+    pub(crate) fn call_target(&self, heap: &otter_gc::GcHeap) -> NativeCallTarget {
+        heap.read_payload(self.inner, |body| match &body.call {
+            NativeCallStorage::Static(call) => NativeCallTarget::Static(*call),
+            NativeCallStorage::Dynamic(call) => NativeCallTarget::Dynamic {
+                call: call.clone(),
+                captures: body.captures.clone(),
+            },
+            NativeCallStorage::LocalDynamic(call) => NativeCallTarget::LocalDynamic {
+                call: call.clone(),
+                captures: body.captures.clone(),
+            },
+        })
+    }
+
+    /// `true` when this callable uses the static function-pointer
+    /// fast path.
+    #[must_use]
+    pub fn is_static_call(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| {
+            matches!(body.call, NativeCallStorage::Static(_))
+        })
     }
 
     /// Trace this handle as a root slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = self as *const NativeFunction as *mut RawGc;
         visitor(p);
+    }
+}
+
+/// Cloned native target ready for invocation after the heap borrow
+/// has ended.
+pub(crate) enum NativeCallTarget {
+    /// Static fast path.
+    Static(NativeFastFn),
+    /// Dynamic closure path with traced captures.
+    Dynamic {
+        /// Closure payload.
+        call: Arc<NativeFn>,
+        /// Traced JS captures.
+        captures: SmallVec<[Value; 4]>,
+    },
+    /// Local VM-only closure path.
+    LocalDynamic {
+        /// Closure payload.
+        call: Rc<LocalNativeFn>,
+        /// Traced JS captures.
+        captures: SmallVec<[Value; 4]>,
+    },
+}
+
+impl NativeCallTarget {
+    /// Invoke the target.
+    pub(crate) fn invoke(
+        self,
+        ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        match self {
+            Self::Static(call) => call(ctx, args),
+            Self::Dynamic { call, captures } => call(ctx, args, &captures),
+            Self::LocalDynamic { call, captures } => call(ctx, args, &captures),
+        }
     }
 }
 
@@ -201,6 +369,18 @@ where
 {
     Ok(Value::NativeFunction(NativeFunction::new(
         heap, name, call,
+    )?))
+}
+
+/// Convenience: produce a static native function value.
+pub fn native_value_static(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: NativeFastFn,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    Ok(Value::NativeFunction(NativeFunction::new_static(
+        heap, name, length, call,
     )?))
 }
 
@@ -246,7 +426,8 @@ where
     Ok(Value::NativeFunction(NativeFunction {
         inner: heap.alloc_old(NativeFunctionBody {
             name,
-            call: Rc::new(call),
+            length: 0,
+            call: NativeCallStorage::LocalDynamic(Rc::new(call)),
             captures,
             trace: None,
         })?,
@@ -266,7 +447,8 @@ where
     Ok(Value::NativeFunction(NativeFunction {
         inner: heap.alloc_old(NativeFunctionBody {
             name,
-            call: Rc::new(call),
+            length: 0,
+            call: NativeCallStorage::LocalDynamic(Rc::new(call)),
             captures,
             trace: Some(trace),
         })?,
@@ -325,15 +507,11 @@ mod tests {
         let Value::NativeFunction(native) = &f else {
             panic!("expected NativeFunction")
         };
-        let call = native.call(interp.gc_heap());
-        let captures = native.captures(interp.gc_heap());
+        let call = native.call_target(interp.gc_heap());
         let mut ctx = NativeCtx::new(&mut interp);
-        let r = call(
-            &mut ctx,
-            &[Value::Number(NumberValue::from_i32(7))],
-            &captures,
-        )
-        .unwrap();
+        let r = call
+            .invoke(&mut ctx, &[Value::Number(NumberValue::from_i32(7))])
+            .unwrap();
         assert_eq!(r.display_string(), "7");
     }
 
@@ -357,10 +535,24 @@ mod tests {
         let Value::NativeFunction(native) = &f else {
             panic!()
         };
-        let call = native.call(interp.gc_heap());
-        let captures = native.captures(interp.gc_heap());
+        let call = native.call_target(interp.gc_heap());
         let mut ctx = NativeCtx::new(&mut interp);
-        let err = call(&mut ctx, &[], &captures).unwrap_err();
+        let err = call.invoke(&mut ctx, &[]).unwrap_err();
         assert!(matches!(err, NativeError::TypeError { .. }));
+    }
+
+    #[test]
+    fn static_native_value_uses_fast_path_and_length() {
+        fn id(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+        }
+
+        let mut interp = crate::Interpreter::new();
+        let f = native_value_static(interp.gc_heap_mut(), "id", 1, id).expect("native");
+        let Value::NativeFunction(native) = &f else {
+            panic!("expected NativeFunction")
+        };
+        assert!(native.is_static_call(interp.gc_heap()));
+        assert_eq!(native.length(interp.gc_heap()), 1);
     }
 }

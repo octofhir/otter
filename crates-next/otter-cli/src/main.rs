@@ -353,7 +353,8 @@ struct TestArgs {
     root: Option<PathBuf>,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
@@ -376,35 +377,38 @@ fn main() -> ExitCode {
             (None, Some(source)) => (source, true),
             _ => unreachable!("checked conflicting inline eval modes above"),
         };
-        return match run_eval(source, print, json, &caps) {
-            Ok(code) => code,
-            Err(err) => {
-                emit_error(&err, json);
-                ExitCode::from(u8::try_from(err.exit_code().clamp(0, 255)).unwrap_or(64))
-            }
-        };
+        return exit_from_result(run_eval(source, print, json, &caps).await, json);
     }
 
     let result = match (cli.command, cli.args.first().cloned()) {
         // Explicit subcommand.
-        (Some(Command::Run(args)), _) => run_file(&args.file, json, dump_mode.as_deref(), &caps),
-        (Some(Command::Eval(args)), _) => run_eval(&args.expression, args.print, json, &caps),
+        (Some(Command::Run(args)), _) => {
+            run_file(&args.file, json, dump_mode.as_deref(), &caps).await
+        }
+        (Some(Command::Eval(args)), _) => run_eval(&args.expression, args.print, json, &caps).await,
         (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps),
         (Some(Command::Test(args)), _) => run_test(args, json),
         (Some(Command::Info), _) => run_info(json),
         // Shorthand: `otter <file>`.
-        (None, Some(positional)) => run_file(
-            &PathBuf::from(positional),
-            json,
-            dump_mode.as_deref(),
-            &caps,
-        ),
+        (None, Some(positional)) => {
+            run_file(
+                &PathBuf::from(positional),
+                json,
+                dump_mode.as_deref(),
+                &caps,
+            )
+            .await
+        }
         (None, None) => {
             eprintln!("usage: otter <file> | otter <subcommand> [args...]");
             return ExitCode::from(2);
         }
     };
 
+    exit_from_result(result, json)
+}
+
+fn exit_from_result(result: Result<ExitCode, OtterError>, json: bool) -> ExitCode {
     match result {
         Ok(code) => code,
         Err(err) => {
@@ -418,7 +422,7 @@ fn build_runtime(caps: &CapabilitySet) -> Result<Runtime, OtterError> {
     Runtime::builder().capabilities(caps.clone()).build()
 }
 
-fn run_file(
+async fn run_file(
     path: &std::path::Path,
     json: bool,
     dump_mode: Option<&str>,
@@ -440,7 +444,7 @@ fn run_file(
     let otter = otter_runtime::Otter::builder()
         .capabilities(caps.clone())
         .build()?;
-    let result = otter.blocking_run_file(path)?;
+    let result = otter.run_file(path).await?;
     if json {
         println!(
             "{{\"completion\":{}}}",
@@ -450,14 +454,16 @@ fn run_file(
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_eval(
+async fn run_eval(
     source: &str,
     print: bool,
     json: bool,
     caps: &CapabilitySet,
 ) -> Result<ExitCode, OtterError> {
-    let mut runtime = build_runtime(caps)?;
-    let result = runtime.eval(SourceInput::from_javascript(source))?;
+    let otter = otter_runtime::Otter::builder()
+        .capabilities(caps.clone())
+        .build()?;
+    let result = otter.eval(source).await?;
     if print {
         println!("{}", result.completion_string());
     } else if json {

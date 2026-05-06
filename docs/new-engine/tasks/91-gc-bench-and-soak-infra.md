@@ -10,6 +10,7 @@
 - [ ] allocator/backing-store benchmark matrix inspired by Oscars'
       workload comparisons
 - [ ] runtime-handle leak / stress diagnostics integrated with GC soak
+- [x] cold-start benchmark memory isolation / GC cage teardown plan
 - [ ] gates green
 
 ## Why this exists
@@ -45,6 +46,23 @@ Node/V8, and previous Otter baselines.
 
 ### 91.1 — Criterion bench harness
 
+2026-05-06 progress: active `otter-gc` now has eight safe Criterion targets
+checked into `crates-next/otter-gc/benches/`:
+
+- `bench_alloc_young_bump.rs`;
+- `bench_alloc_with_barrier.rs`;
+- `bench_scavenge_4mb.rs`;
+- `bench_collect_full_256mb.rs`;
+- `bench_card_table_dirty_scan.rs`;
+- `bench_handle_scope_overhead.rs`;
+- `bench_pointer_compress_decompress.rs`;
+- `bench_backing_store_accounting.rs`.
+
+The remaining `collect_full_1gb` and `weakmap_churn` targets stay open.
+Do not add a default 1 GiB bench run until the workflow has an explicit
+memory policy; user-facing local validation should not unexpectedly consume
+gigabytes.
+
 Files:
 ```
 crates-next/otter-gc/benches/bench_alloc_young_bump.rs
@@ -62,6 +80,23 @@ crates-next/otter-gc/benches/bench_weakmap_churn.rs
 Each bench produces a stable number; results are checked into
 `docs/new-engine/test262-baseline/gc-bench-baseline.md` and
 regression-gated in CI.
+
+Smoke results for the lightweight targets:
+
+```text
+commands:
+cargo bench -p otter-gc --bench bench_pointer_compress_decompress -- --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench -p otter-gc --bench bench_handle_scope_overhead -- --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench -p otter-gc --bench bench_card_table_dirty_scan -- --sample-size 10 --measurement-time 1 --warm-up-time 1
+cargo bench -p otter-gc --bench bench_backing_store_accounting -- --sample-size 10 --measurement-time 1 --warm-up-time 1
+
+pointer_compress_decompress/offset                 349.33-351.47 ps
+pointer_compress_decompress/header_ptr             809.80-816.24 ps
+handle_scope_overhead/scope_with_16_locals         26.848-27.055 ns
+card_table_dirty_scan/one_page_sparse_dirty        438.32-441.36 ns
+backing_store_accounting/reserve_release_4k        8.5399-8.7049 ns
+backing_store_accounting/resize_4k_to_8k_to_1k     19.337-19.389 ns
+```
 
 ### 91.2 — `cargo fuzz` corpus
 
@@ -151,6 +186,50 @@ Add reusable test utilities for task 85 and later server surfaces:
 - cancellation/timeout soak tests where waiters are dropped while the
   isolate continues to a safepoint.
 
+### 91.8 — Cold-start benchmark memory isolation
+
+Task 98 exposed a benchmark-infrastructure gap: in-process Criterion
+cold-start loops can construct thousands of fresh runtimes in one long-lived
+bench process. Each fresh runtime allocates from the process-wide GC cage,
+and today dropping the runtime does not return those pages to the cage. That
+can exhaust the cage before the benchmark finishes even when the per-runtime
+startup footprint is small.
+
+This is a benchmark/GC lifecycle task, not a reason to remove startup
+ratchets.
+
+Implemented 2026-05-06:
+
+- `RuntimeHandleInner::drop` now joins the isolate runner when the final
+  public handle is dropped, so the isolate-owned `Runtime` and its `GcHeap`
+  are torn down before the next cold-start iteration;
+- `otter_gc::cage_stats()` exposes process-global cage occupancy diagnostics
+  for tests and benchmark lifecycle checks;
+- `crates-next/otter-runtime/tests/runtime_cage_reuse.rs` checks that
+  repeated `Otter::builder().build()` / drop cycles return allocated cage
+  pages to the pre-build count;
+- `crates-next/otter-runtime/benches/startup.rs` no longer caps actual
+  runtime constructions per sample. It measures the build/first-run body,
+  then drops the runtime immediately in the same iteration so Criterion does
+  not retain a batch of live heaps.
+
+Choose and implement one production-grade path:
+
+- make `GcHeap` teardown return owned pages/cage reservations so repeated
+  in-process runtime construction is memory-neutral; or
+- provide a benchmark runner that isolates cold-start iterations in
+  subprocesses and records wall time/RSS per process; or
+- both, if embedders also need repeated create/drop isolate churn in one
+  process.
+
+Required output:
+
+- a checked-in cold-start memory regression test or bench that records peak
+  RSS/cage usage;
+- documentation for the safe sample/iteration policy;
+- removal or justification of any artificial iteration cap in Task 98
+  startup benches.
+
 ## Validation gates
 
 - [ ] All eight Criterion benches in 91.1 produce stable numbers
@@ -164,6 +243,9 @@ Add reusable test utilities for task 85 and later server surfaces:
 - [ ] 91.6 allocator/backing-store matrix has checked-in baseline
   results and documents whether any allocator change is justified.
 - [ ] 91.7 stress utilities are used by task 85 validation tests.
+- [x] 91.8 proves repeated cold-start benchmarking cannot exhaust the
+  process-wide GC cage, or documents subprocess isolation as the supported
+  workflow.
 
 ## Closing
 

@@ -4,6 +4,13 @@ Otter's public runtime is handle-first and async-friendly, but one isolate
 still owns one VM, one runtime state, and one GC heap. The public handle
 may be `Send + Sync`; the isolate internals are not.
 
+The default product path is async-first. CLI execution starts in an async
+`main` and awaits the public `Otter`/`RuntimeHandle` stack directly.
+Blocking wrappers exist only as sync-caller conveniences. Blocking does
+not mean a separate synchronous runtime: the same event-loop-capable
+isolate runner must remain available for timers, host ops, dynamic
+modules, workers, and future async Web APIs.
+
 The production event-loop boundary landed in task 85. Deno's `JsRuntime`
 shape is the closest reference: the runtime itself stays local to one
 isolate, while embedders drive it with one-tick and run-to-idle style APIs.

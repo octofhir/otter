@@ -64,7 +64,8 @@ later tasks assume earlier ones have landed.
 |---|------|---------------|
 | 96 | ✅ closed (2026-05-06) | Static JS surface specs + mutator-bound builders + centralized bootstrap registry; `Math`, `JSON`, `Atomics`, and `console` install through static namespace specs with static native function-pointer methods. |
 | 97 | ✅ closed (2026-05-06) | Zero-cost macros over Task 96 specs: `#[js_namespace]`, `#[js_class]`, and `raft!` generate static specs and normal Rust functions with `NativeCall::Static`; expansion audit and handwritten-vs-macro benchmark report are recorded. |
-| 98 | [98-startup-bootstrap-performance.md](./98-startup-bootstrap-performance.md) | Startup/first-run benchmark ratchets, bootstrap telemetry, tiered/lazy init evaluation, and startup snapshot/code-cache decision. |
+| 98 | ✅ closed (2026-05-06) | Startup/first-run benchmark ratchets, bootstrap telemetry, tiered/lazy init evaluation, and startup snapshot/code-cache decision; cold-start bench memory-isolation follow-up moved to task 91.8. |
+| 99 | [99-async-first-runtime-and-docs-consolidation.md](./99-async-first-runtime-and-docs-consolidation.md) | One async-first runtime stack, faster CLI cold start below the Task 98 ~25 ms baseline, startup bench memory isolation, obsolete runtime/docs cleanup, and mdBook-only contributor docs. |
 
 ## Phase 2 — incremental marking + concurrent sweep + pretenuring
 

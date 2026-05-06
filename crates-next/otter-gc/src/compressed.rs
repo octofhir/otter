@@ -136,6 +136,26 @@ pub fn cage_size() -> usize {
     CAGE_SIZE.load(Ordering::Acquire)
 }
 
+/// Process-global cage occupancy snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CageStats {
+    /// Cage size in bytes.
+    pub size_bytes: usize,
+    /// Total page slots in the cage, including reserved page 0.
+    pub total_pages: u32,
+    /// Page slots currently on the cage free-list.
+    pub free_pages: usize,
+    /// Page slots currently owned by GC heaps.
+    pub allocated_pages: usize,
+}
+
+/// Return cage occupancy diagnostics after initialisation.
+#[inline]
+#[must_use]
+pub fn cage_stats() -> Option<CageStats> {
+    Cage::stats()
+}
+
 // ---------------------------------------------------------------------------
 // Gc<T>
 // ---------------------------------------------------------------------------
@@ -467,6 +487,23 @@ impl Cage {
     pub(crate) fn total_page_count() -> u32 {
         let guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
         guard.as_ref().map(|c| c.page_count).unwrap_or(0)
+    }
+
+    pub(crate) fn stats() -> Option<CageStats> {
+        let guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
+        guard.as_ref().map(|c| {
+            let free_pages = c.free_pages.len();
+            let reserved_pages = usize::from(c.page_count > 0);
+            let allocated_pages = (c.page_count as usize)
+                .saturating_sub(free_pages)
+                .saturating_sub(reserved_pages);
+            CageStats {
+                size_bytes: c.size,
+                total_pages: c.page_count,
+                free_pages,
+                allocated_pages,
+            }
+        })
     }
 }
 

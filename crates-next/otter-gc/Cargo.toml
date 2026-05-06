@@ -45,3 +45,19 @@ harness = false
 [[bench]]
 name = "bench_collect_full_256mb"
 harness = false
+
+[[bench]]
+name = "bench_card_table_dirty_scan"
+harness = false
+
+[[bench]]
+name = "bench_handle_scope_overhead"
+harness = false
+
+[[bench]]
+name = "bench_pointer_compress_decompress"
+harness = false
+
+[[bench]]
+name = "bench_backing_store_accounting"
+harness = false

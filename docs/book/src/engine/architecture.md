@@ -41,6 +41,26 @@ boundaries, runtime inbox messages, or host-operation futures. Async work
 copies owned host data out, then re-enters the isolate later with an owned
 completion.
 
+## Async-First Runtime
+
+The active runtime model is async-first. `Otter` is the public
+async-capable facade over `RuntimeHandle` and the isolate runner. CLI
+execution runs from an async `main` and awaits `Otter` execution directly;
+embedding entry points may expose async or sync caller ergonomics, but
+observable JavaScript semantics still converge on the same async-capable
+runtime machinery.
+
+Blocking APIs are convenience adapters. They may block the caller while the
+same async-capable runtime handle drives the isolate, but they must not grow
+a second sync-only engine path that bypasses timers, host ops, workers,
+module loading, or future async Web APIs.
+
+`Runtime` remains the local isolate layer for tests, compile/check/dump
+workflows, and low-level embedders that deliberately drive the VM in-process.
+It is not a separate product runtime with different semantics. If behavior
+is observable from JavaScript, the `Otter`/`RuntimeHandle` path and the
+local `Runtime` path must converge on the same VM/runtime state machinery.
+
 ## GC And Handles
 
 The GC is page-based, moving, generational, and isolate-local. Normal
@@ -83,6 +103,11 @@ The first migrated namespace is `Math`. Direct `Math.<fn>(...)` syntax
 still uses the existing bytecode fast path, while observable property
 reads and extracted method calls use the real namespace object installed
 from `math::MATH_SPEC`.
+
+Task 98 adds default-off bootstrap telemetry for benchmark runs. The plain
+runtime construction path does not maintain telemetry counters; benches can
+call the instrumented bootstrap entry point to capture install counts, GC
+allocation deltas, duplicate-name validation, and per-entry timing.
 
 ## Debug Workflows
 

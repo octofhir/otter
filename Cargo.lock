@@ -259,9 +259,9 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "colorchoice"
-version = "1.0.4"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
+checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "combine"
@@ -1199,10 +1199,12 @@ name = "otter-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "criterion",
  "otter-bytecode",
  "otter-runtime",
  "otter-test",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1250,6 +1252,7 @@ dependencies = [
 name = "otter-runtime"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "otter-bytecode",
  "otter-compiler",
  "otter-gc",

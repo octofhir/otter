@@ -1085,7 +1085,7 @@ impl Otter {
         self.handle.eval(SourceInput::from_javascript(source)).await
     }
 
-    /// Blocking file execution wrapper for CLI / sync embedders.
+    /// Blocking file execution wrapper for sync embedders.
     ///
     /// # Errors
     /// See [`OtterError`] variants.

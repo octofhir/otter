@@ -25,6 +25,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
@@ -118,6 +119,7 @@ impl std::fmt::Debug for RuntimeHandle {
 
 struct RuntimeHandleInner {
     tx: SyncSender<RuntimeMessage>,
+    runner: Mutex<Option<std::thread::JoinHandle<()>>>,
     event_loop: TokioEventLoop,
     interrupt: otter_vm::InterruptFlag,
     command_timeout: Duration,
@@ -256,7 +258,7 @@ impl RuntimeHandle {
             shutdown: AtomicBool::new(false),
         });
         let runner_counters = counters.clone();
-        std::thread::Builder::new()
+        let runner = std::thread::Builder::new()
             .name("otter-isolate".to_string())
             .spawn(move || run_isolate(config, rx, runner_counters, interrupt_tx))
             .map_err(|e| OtterError::Internal {
@@ -269,6 +271,7 @@ impl RuntimeHandle {
         })?;
         let inner = Arc::new(RuntimeHandleInner {
             tx,
+            runner: Mutex::new(Some(runner)),
             event_loop,
             interrupt,
             command_timeout,
@@ -565,7 +568,6 @@ impl RuntimeHandle {
         Arc::strong_count(&self.inner)
     }
 
-    /// Run a future on the backing Tokio runtime for sync callers.
     pub(crate) fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         self.inner.event_loop.block_on(future)
     }
@@ -656,7 +658,10 @@ impl RuntimeHandle {
 impl Drop for RuntimeHandleInner {
     fn drop(&mut self) {
         self.counters.shutdown.store(true, Ordering::Relaxed);
-        let _ = self.tx.try_send(RuntimeMessage::Shutdown);
+        let _ = self.tx.send(RuntimeMessage::Shutdown);
+        if let Some(runner) = self.runner.lock().expect("runner mutex poisoned").take() {
+            let _ = runner.join();
+        }
     }
 }
 

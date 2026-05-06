@@ -8,8 +8,8 @@
 //!    `ignored_tests`).
 //! 2. Parse frontmatter; on parse failure → [`Outcome::Fail`].
 //! 3. Skip via `skip_features` (config-driven).
-//! 4. Skip `flags: [noStrict]`-only tests
-//!    (foundation is always strict per ADR-0001).
+//! 4. Skip `flags: [noStrict]`-only tests because the active runner
+//!    executes strict-mode tests.
 //! 5. Build a fresh `Runtime` with the configured heap cap.
 //! 6. Compile + run the harness preamble (cached per-worker).
 //! 7. Compile + run the test body. `flags: [module]` routes through
@@ -127,8 +127,7 @@ pub fn count_tests(paths: &CorpusPaths, filter: Option<&str>) -> usize {
     list_tests(paths, filter).len()
 }
 
-/// The per-test outcome taxonomy. Mirrors task 100 §"Outcome
-/// taxonomy".
+/// The per-test outcome taxonomy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
@@ -318,8 +317,8 @@ pub fn run_one(
         );
     }
 
-    // 6. Strict-mode policy. Foundation is always strict per
-    //    ADR-0001 — `noStrict`-only tests skip.
+    // 6. Strict-mode policy. The active runner executes strict-mode
+    //    tests, so `noStrict`-only tests skip.
     if frontmatter.is_no_strict() && !frontmatter.is_only_strict() && !frontmatter.is_module() {
         return result_with(
             rel_path,

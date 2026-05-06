@@ -1,8 +1,8 @@
 //! Capture analysis: which of a function's own bindings are read /
 //! written from inside a nested function?
 //!
-//! Closure semantics (task 22) needs every binding that escapes its
-//! lexical owner to live in a heap-shared
+//! Closure semantics need every binding that escapes its lexical
+//! owner to live in a heap-shared
 //! [`UpvalueCell`](otter_vm::UpvalueCell), not a register slot. This
 //! module performs a **single pre-pass** over each function body
 //! that returns the set of names which need that promotion.
@@ -19,11 +19,6 @@
 //!   tracking inside this analyzer.
 //! - We never recurse across module / file boundaries — each
 //!   function body is its own analysis unit.
-//!
-//! # See also
-//! - [`docs/new-engine/tasks/22-closures-with-upvalues.md`](
-//!     ../../../docs/new-engine/tasks/22-closures-with-upvalues.md
-//!   )
 
 use std::collections::HashSet;
 

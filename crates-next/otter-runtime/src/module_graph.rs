@@ -36,7 +36,6 @@
 //!   source-graph topology.
 //!
 //! # See also
-//! - [task 36a](../../docs/new-engine/tasks/36a-modules-graph-and-live-bindings.md)
 //! - <https://tc39.es/ecma262/#sec-cyclic-module-records>
 //!   — spec model for the cyclic-graph evaluation algorithm we
 //!   approximate with post-order DFS + literal `import()`.

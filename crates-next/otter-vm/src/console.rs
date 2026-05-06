@@ -8,7 +8,7 @@
 //! # Contents
 //! - [`CONSOLE_SPEC`] — static namespace spec used by bootstrap.
 //! - [`install`] — allocate and attach the `console` object through
-//!   the task-96 builder backend.
+//!   the JS surface builder backend.
 //! - Native method bodies for the common console methods.
 //! - Formatting helpers shared by stdout and stderr paths.
 //!

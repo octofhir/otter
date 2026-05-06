@@ -2,10 +2,8 @@
 //!
 //! The compiler walks the OXC AST produced by `otter-syntax` and
 //! emits an [`otter_bytecode::BytecodeModule`]. After task 08 the
-//! frontend handles the **complete** foundation TypeScript subset
-//! per [ADR-0002 §4](
-//!     ../../../docs/new-engine/adr/0002-oxc-frontend.md
-//!   ):
+//! frontend handles the foundation TypeScript subset documented in the
+//! mdBook frontend chapter:
 //!
 //! - **Erased silently** (compile to nothing): `interface`, `type`
 //!   aliases, `declare` statements/functions, `import type`,
@@ -36,9 +34,7 @@
 //!   re-emit JS source and re-parse.
 //!
 //! # See also
-//! - [`docs/new-engine/adr/0002-oxc-frontend.md`](
-//!     ../../../docs/new-engine/adr/0002-oxc-frontend.md
-//!   )
+//! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
 mod capture;
 
@@ -50,9 +46,9 @@ use otter_bytecode::{
     BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind as BytecodeSourceKind,
     SpanEntry,
 };
-use otter_syntax::{Parsed, SourceKind as SyntaxSourceKind};
+use otter_syntax::{Parsed, SourceKind as SyntaxSourceKind, with_program};
 use oxc_ast::ast::{
-    AssignmentOperator, AssignmentTarget, BinaryOperator, Expression, LogicalOperator,
+    AssignmentOperator, AssignmentTarget, BinaryOperator, Expression, LogicalOperator, Program,
     SimpleAssignmentTarget, Statement, UnaryOperator, UpdateOperator,
 };
 use serde::{Deserialize, Serialize};
@@ -156,7 +152,52 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
     let program = parsed.program().map_err(|e| CompileError::Syntax {
         messages: e.messages,
     })?;
+    compile_program(&program, parsed.kind, module_specifier)
+}
 
+/// Compile source text through a single OXC parse.
+///
+/// This is the runtime hot path. Use [`compile`] when a caller already owns a
+/// [`Parsed`] value for tests or staged analysis.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing fails or the AST contains constructs
+/// outside the foundation subset.
+pub fn compile_source(
+    source: &str,
+    kind: SyntaxSourceKind,
+    module_specifier: &str,
+) -> Result<BytecodeModule, CompileError> {
+    with_program(source, kind, |program| {
+        compile_parsed_program(program, kind, module_specifier)
+    })
+    .map_err(|e| CompileError::Syntax {
+        messages: e.messages,
+    })?
+}
+
+/// Compile an already parsed OXC program.
+///
+/// This keeps callers that need a syntax pass for routing or analysis from
+/// parsing the same source twice. The caller must pass the same source kind
+/// that was used to create `program`.
+///
+/// # Errors
+/// Returns [`CompileError`] when the AST contains constructs outside the
+/// foundation subset.
+pub fn compile_parsed_program(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+) -> Result<BytecodeModule, CompileError> {
+    compile_program(program, source_kind, module_specifier)
+}
+
+fn compile_program(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     // §16.2.1.7 — top-level `await` upgrades `<main>` to async so
     // the dispatch loop's async machinery parks / resumes the
@@ -238,7 +279,7 @@ pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule
     }
     drop(cx);
 
-    let kind = match parsed.kind {
+    let kind = match source_kind {
         SyntaxSourceKind::JavaScript => BytecodeSourceKind::JavaScript,
         SyntaxSourceKind::TypeScript => BytecodeSourceKind::TypeScript,
     };
@@ -9691,7 +9732,7 @@ fn expr_span(expr: &Expression<'_>) -> (u32, u32) {
 ///
 /// Recognises `TSAsExpression`, `TSSatisfiesExpression`,
 /// `TSNonNullExpression`, `TSTypeAssertion`, and
-/// `TSInstantiationExpression` per ADR-0002 §4. Also unwraps
+/// `TSInstantiationExpression`. Also unwraps
 /// `ParenthesizedExpression` so `(undefined as any)` and
 /// `(((x as A) satisfies B)!)` collapse to their leaf expressions.
 /// Recursive.
@@ -9708,7 +9749,7 @@ pub fn unwrap_ts_expr<'a, 'b>(expr: &'a Expression<'b>) -> &'a Expression<'b> {
     }
 }
 
-/// `true` for top-level TS statements that ADR-0002 §4 marks as
+/// `true` for top-level TS statements that the frontend policy marks as
 /// "erased" — they produce no bytecode and are not errors.
 fn is_erased_ts_statement(stmt: &Statement<'_>) -> bool {
     match stmt {
@@ -9737,7 +9778,7 @@ fn is_erased_ts_statement(stmt: &Statement<'_>) -> bool {
     }
 }
 
-/// `Some((node, span))` for top-level TS statements that ADR-0002 §4
+/// `Some((node, span))` for top-level TS statements that the frontend policy
 /// marks as "diagnosed" — produce a structured `TS_UNSUPPORTED`.
 fn rejected_ts_statement(stmt: &Statement<'_>) -> Option<(&'static str, (u32, u32))> {
     use oxc_span::GetSpan;
@@ -9808,8 +9849,8 @@ pub enum CompileError {
         span: (u32, u32),
     },
     /// A TypeScript construct is intentionally rejected by the
-    /// foundation per ADR-0002 §4 (e.g., `enum`, runtime
-    /// `namespace`, decorators).
+    /// frontend policy (e.g., `enum`, runtime `namespace`,
+    /// decorators).
     #[error("typescript construct {node} is not supported in foundation")]
     TypeScriptUnsupported {
         /// AST node kind name.

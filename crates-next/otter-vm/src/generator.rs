@@ -1,9 +1,9 @@
 //! ECMA-262 §27 Generator and parked-frame state.
 //!
-//! Generator objects and async `await` suspension both park full VM
-//! frames off the active interpreter stack. Task 82 makes those
-//! parked states GC-managed so locals, register windows, `this`, and
-//! pending promise capabilities are ordinary traceable roots.
+//! Generator objects and async `await` suspension both park full VM frames off
+//! the active interpreter stack. Those parked states are GC-managed so locals,
+//! register windows, `this`, and pending promise capabilities are ordinary
+//! traceable roots.
 //!
 //! # Contents
 //!
@@ -25,8 +25,7 @@
 //!
 //! - <https://tc39.es/ecma262/#sec-generator-objects>
 //! - <https://tc39.es/ecma262/#await>
-//! - [GC architecture plan §4.2](../../../docs/new-engine/gc-architecture.md)
-//! - [Task 82](../../../docs/new-engine/tasks/82-migrate-promise-iterator-generator.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use crate::Frame;
 use otter_gc::raw::{RawGc, SlotVisitor};

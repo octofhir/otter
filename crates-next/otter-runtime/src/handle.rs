@@ -1,6 +1,7 @@
 //! Sendable runtime command handle and isolate runner.
 //!
-//! [`RuntimeHandle`] is the Layer-B async boundary from ADR-0005. It is
+//! [`RuntimeHandle`] is the Layer-B async boundary described in the mdBook
+//! event-loop docs. It is
 //! cloneable and `Send + Sync`; every command crosses an owned message
 //! channel into a dedicated isolate runner thread that constructs and
 //! owns the local [`crate::Runtime`].
@@ -20,8 +21,8 @@
 //!
 //! # See also
 //!
-//! - [ADR-0005](../../../docs/new-engine/adr/0005-async-runtime-binding.md)
-//! - [Task 85](../../../docs/new-engine/tasks/85-tokio-event-loop-runtime-handle.md)
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md)
+//! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
 use std::path::PathBuf;
 use std::sync::Arc;

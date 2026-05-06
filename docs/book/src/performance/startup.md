@@ -4,7 +4,7 @@ Otter treats startup as a production requirement. Contributor-friendly APIs
 must not silently make `RuntimeBuilder::build()` or first script execution
 slower.
 
-Task 98 owns the startup ratchet. The active benchmark suite covers
+The active benchmark suite covers
 bootstrap install, runtime construction, first execution, static native
 dispatch through an extracted builtin, and CLI process cold start.
 
@@ -33,7 +33,7 @@ Bootstrap telemetry should be opt-in and default-off. Useful counters are:
 - duplicate-name and install-order validation cost.
 
 When changing bootstrap, builders, macro generation, or builtin install
-order, include a before/after startup table in the task closeout or PR.
+order, include a before/after startup table in the PR or closeout notes.
 
 The report should include:
 
@@ -59,7 +59,7 @@ guards the same lifecycle at the public `Otter` handle boundary.
 
 ## Current Budgets
 
-Task 98's local 2026-05-06 ratchet values are:
+The local 2026-05-06 ratchet values are:
 
 - default global bootstrap: ~113 us;
 - global bootstrap with telemetry: ~121 us;
@@ -69,7 +69,19 @@ Task 98's local 2026-05-06 ratchet values are:
 - first extracted static native `Math.abs` call: ~122 us;
 - CLI cold `-e ""` / tiny JS / tiny TS: ~25-26 ms.
 
-After Task 99's cage-reuse fix, `cargo bench -p otter-runtime --bench
+The CLI cold-start bench also includes bucket cases:
+
+- `info`: process + clap + dispatch baseline with no runtime/compiler touch;
+- `dump_tiny_js_file`: compile-only first-touch frontend/compiler baseline.
+
+The compile-only path is split from the runtime path. `otter check` and
+`otter --dump-bytecode` call the compiler directly and do not construct a
+`Runtime`, interpreter, or GC heap. Ambiguous `.js` / `.ts` file execution uses
+one OXC parse for module-syntax detection and script compilation; `.mjs` /
+`.mts` route directly to the module graph and `.cjs` / `.cts` route directly to
+script execution.
+
+After the cage-reuse fix, `cargo bench -p otter-runtime --bench
 startup -- --sample-size 10 --measurement-time 2 --warm-up-time 1` completed
 without an iteration cap. Its build-body-only smoke values were:
 
@@ -77,6 +89,30 @@ without an iteration cap. Its build-body-only smoke values were:
 - `Otter::builder().build()`: ~266 us, including isolate runner startup;
 - first `run_script("undefined;")`: ~22 us;
 - first extracted static native `Math.abs` call: ~26 us.
+
+After the compile-only split and ambiguous-file parse-once routing,
+`cargo bench -p otter-cli --bench cold_start -- --sample-size 10
+--measurement-time 2 --warm-up-time 1` produced:
+
+- `info`: ~3.14-3.18 ms;
+- `eval_empty`: ~25.62-25.79 ms;
+- `tiny_js_file`: ~25.24-25.59 ms;
+- `dump_tiny_js_file`: ~3.19-3.26 ms;
+- `tiny_ts_file`: ~25.85-26.61 ms.
+
+Set `OTTER_CLI_STARTUP_TIMINGS=1` on a single CLI invocation to print
+default-off phase timings to stderr. This is intended for cold-start triage,
+not for benchmark scoring.
+
+After removing eager zeroing of the full 256 MiB GC cage at process startup,
+`cargo bench -p otter-cli --bench cold_start -- --sample-size 10
+--measurement-time 2 --warm-up-time 1` produced:
+
+- `info`: ~3.17-3.21 ms;
+- `eval_empty`: ~4.31-4.35 ms;
+- `tiny_js_file`: ~4.36-4.51 ms;
+- `dump_tiny_js_file`: ~3.25-3.39 ms;
+- `tiny_ts_file`: ~4.45-4.53 ms.
 
 Bootstrap telemetry budget:
 

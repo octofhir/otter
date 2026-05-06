@@ -1,6 +1,6 @@
 //! Zero-cost JavaScript surface macros for Otter.
 //!
-//! These macros generate task-96 static specs and ordinary Rust
+//! These macros generate static specs and ordinary Rust
 //! functions. They do not register globals, allocate at runtime, or
 //! create dynamic dispatch paths for static builtins.
 //!
@@ -23,12 +23,11 @@
 //!   and `MethodSpec` static data with `NativeCall::Static` function
 //!   pointers.
 //! - Bootstrap remains explicit; generated specs are installed by
-//!   task-96 builders or the centralized bootstrap registry.
+//!   JS surface builders or the centralized bootstrap registry.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/97-zero-cost-js-surface-macros.md`](
-//!     ../../../docs/new-engine/tasks/97-zero-cost-js-surface-macros.md
-//!   )
+//! - [Macro overview](../../../docs/book/src/macros/overview.md)
+//! - [JS surface builders](../../../docs/book/src/extensions/js-surface-builders.md)
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,7 +56,7 @@ use syn::{
 ///
 /// Expansion keeps the module intact, removes the consumed `js_fn`
 /// attributes, and emits a static spec equivalent to handwritten
-/// task-96 data.
+/// surface data.
 #[proc_macro_attribute]
 pub fn js_namespace(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as NamespaceArgs);
@@ -162,8 +161,8 @@ pub fn js_namespace(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 ///
 /// Expansion keeps the module intact, removes consumed helper
-/// attributes, and emits a static class spec over the task-96 builder
-/// backend.
+/// attributes, and emits a static class spec over the JS surface
+/// builder backend.
 #[proc_macro_attribute]
 pub fn js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as ClassArgs);

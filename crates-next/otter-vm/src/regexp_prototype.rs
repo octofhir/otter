@@ -21,9 +21,7 @@
 //!   so a manual `re.lastIndex = -1` doesn't underflow.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/31-regexp-and-pattern-methods.md`](
-//!     ../../../docs/new-engine/tasks/31-regexp-and-pattern-methods.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 
 use crate::Value;
 use crate::array::JsArray;

@@ -1,7 +1,7 @@
 //! Public embedding API for the Otter foundation engine.
 //!
 //! Two-layer surface per
-//! [ADR-0003](../../../docs/new-engine/adr/0003-public-api-and-cli.md):
+//! [the public runtime architecture](../../../docs/book/src/engine/architecture.md):
 //!
 //! - **Layer A — [`Otter`]**: zero-config entry point. The simple
 //!   case for embedders ("just run a script").
@@ -22,8 +22,8 @@
 //! - [`InterruptHandle`] — cooperative cancellation.
 //!
 //! # See also
-//! - [ADR-0001](../../../docs/new-engine/adr/0001-staging-directory.md)
-//! - [ADR-0003](../../../docs/new-engine/adr/0003-public-api-and-cli.md)
+//! - [Engine architecture](../../../docs/book/src/engine/architecture.md)
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 pub mod error;
 pub mod event_loop;
@@ -37,9 +37,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use otter_bytecode::BytecodeModule;
-use otter_compiler::compile;
+use otter_compiler::{
+    compile_parsed_program as compile_script_program, compile_source as compile_script_source,
+};
 use otter_gc::GcStats;
-use otter_syntax::{SourceKind, detect_source_kind, parse};
+use otter_syntax::{SourceKind, detect_source_kind, with_program};
 use otter_vm::{Interpreter, InterruptFlag};
 use serde::{Deserialize, Serialize};
 
@@ -709,9 +711,8 @@ impl Runtime {
         // The closure is reusable across calls; each invocation
         // builds a fresh `BytecodeModule`.
         let hook: otter_vm::EvalHook = std::rc::Rc::new(|source: &str| {
-            let parsed = parse(source, SourceKind::JavaScript)
-                .map_err(|e| format!("syntax error: {e:?}"))?;
-            compile(&parsed, "<eval>").map_err(|e| format!("compile error: {e:?}"))
+            compile_script_source(source, SourceKind::JavaScript, "<eval>")
+                .map_err(|e| format!("compile error: {e:?}"))
         });
         interp.set_eval_hook(Some(hook));
         Ok(Runtime { interp, config })
@@ -826,6 +827,14 @@ impl Runtime {
     ) -> Result<ExecutionResult, OtterError> {
         let start = std::time::Instant::now();
         let module = self.compile_source(&source, specifier)?;
+        self.run_compiled_script_since(module, start)
+    }
+
+    fn run_compiled_script_since(
+        &mut self,
+        module: BytecodeModule,
+        start: std::time::Instant,
+    ) -> Result<ExecutionResult, OtterError> {
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
         // drain so any `queueMicrotask` registered during script
@@ -897,11 +906,7 @@ impl Runtime {
         source: &SourceInput,
         specifier: &str,
     ) -> Result<BytecodeModule, OtterError> {
-        let parsed =
-            parse(source.text.clone(), source.kind).map_err(|err| OtterError::Compile {
-                diagnostics: vec![Diagnostic::syntax(err.messages.join("; "))],
-            })?;
-        compile(&parsed, specifier).map_err(map_compile_error)
+        compile_script_source(&source.text, source.kind, specifier).map_err(map_compile_error)
     }
 
     /// Load + link + execute the module-graph rooted at `entry_path`.
@@ -996,7 +1001,28 @@ impl Runtime {
     pub fn run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
         let path = path.as_ref();
         let source = SourceInput::from_path(path)?;
-        if source_text_looks_like_module(&source.text, source.kind) {
+        if source_path_has_module_extension(path) {
+            return self.run_module(path);
+        }
+        let specifier = path.to_string_lossy().to_string();
+        if !source_path_has_script_extension(path) {
+            let start = std::time::Instant::now();
+            let module = with_program(&source.text, source.kind, |program| {
+                if program_looks_like_module(program) {
+                    return Ok(None);
+                }
+                compile_script_program(program, source.kind, &specifier)
+                    .map(Some)
+                    .map_err(map_compile_error)
+            })
+            .map_err(|e| {
+                map_compile_error(otter_compiler::CompileError::Syntax {
+                    messages: e.messages,
+                })
+            })??;
+            if let Some(module) = module {
+                return self.run_compiled_script_since(module, start);
+            }
             return self.run_module(path);
         }
         let specifier = path.to_string_lossy().to_string();
@@ -1036,12 +1062,14 @@ impl Otter {
     ///
     /// # Algorithm
     /// 1. Read the file's source text.
-    /// 2. Heuristically detect "is this a module?" by scanning
-    ///    the source for top-level `import` / `export` keywords
-    ///    (the parser would tell us authoritatively, but cheap
-    ///    string matching avoids two parses on the script path).
-    /// 3. Module sources go through [`Runtime::run_module`];
-    ///    plain scripts go through [`Runtime::run_script`].
+    /// 2. Use module-only extensions (`.mjs` / `.mts`) to route directly to
+    ///    the module graph and script-only extensions (`.cjs` / `.cts`) to
+    ///    route directly to script execution.
+    /// 3. For ambiguous `.js` / `.ts`, parse once with OXC, inspect the AST
+    ///    for module syntax, and reuse that parsed program for script
+    ///    compilation when no module syntax is present.
+    /// 4. Module sources go through [`Runtime::run_module`]; plain scripts go
+    ///    through the script bytecode path.
     ///
     /// # Errors
     /// See [`OtterError`] variants.
@@ -1339,21 +1367,18 @@ pub struct StackFrame {
 ///   only legal in modules).
 ///
 /// The walk uses [`oxc_ast_visit::Visit`] so we don't hand-roll a
-/// match arm per AST node kind. ADR-0002 forbids regex / string
-/// parsing of JS/TS source.
+/// match arm per AST node kind. The frontend policy forbids regex /
+/// string parsing of JS/TS source.
 ///
 /// Parse failures default to `false`: the caller routes to the
 /// script path, which will re-parse and surface the same syntax
 /// error through its diagnostic pipeline.
+#[cfg(test)]
 fn source_text_looks_like_module(text: &str, kind: SourceKind) -> bool {
-    let parsed = match parse(text.to_string(), kind) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let program = match parsed.program() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
+    with_program(text, kind, program_looks_like_module).unwrap_or(false)
+}
+
+fn program_looks_like_module(program: &oxc_ast::ast::Program<'_>) -> bool {
     use oxc_ast::ast::{Expression, Statement};
     use oxc_ast_visit::Visit;
 
@@ -1402,6 +1427,20 @@ fn source_text_looks_like_module(text: &str, kind: SourceKind) -> bool {
     // statements — covered by visit_statement above.
     let _ = (Statement::EmptyStatement, Expression::NullLiteral);
     finder.found
+}
+
+fn source_path_has_module_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("mjs" | "mts")
+    )
+}
+
+fn source_path_has_script_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("cjs" | "cts")
+    )
 }
 
 fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
@@ -2009,7 +2048,7 @@ mod tests {
 
     #[test]
     fn otter_rejects_typescript_enum() {
-        // `enum` is intentionally rejected by ADR-0002 §4.
+        // `enum` is intentionally rejected by the frontend policy.
         let otter = Otter::new();
         let err = otter.blocking_run_typescript("enum E { A }").unwrap_err();
         match err {

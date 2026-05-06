@@ -22,12 +22,8 @@
 //!   `12`).
 //!
 //! # See also
-//! - [`docs/new-engine/adr/0003-public-api-and-cli.md`](
-//!     ../../../docs/new-engine/adr/0003-public-api-and-cli.md
-//!   )
-//! - [`docs/new-engine/specs/bytecode-dump-disasm-trace.md`](
-//!     ../../../docs/new-engine/specs/bytecode-dump-disasm-trace.md
-//!   )
+//! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
+//! - [Frontend and bytecode dumps](../../../docs/book/src/engine/frontend.md)
 
 pub mod abstract_ops;
 pub mod array;
@@ -117,12 +113,11 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 // ---------------------------------------------------------------------------
 // `!Send + !Sync` static assertions for the new-engine VM.
 //
-// Per ADR-0005 §3 ("VM and GC stay explicit-context and
-// single-mutator") and task 76A, the interpreter, every GC handle,
-// and every borrowed-context type must be `!Send + !Sync` so the
-// compile-fail tests under `tests/compile_fail/` reject any future
-// edit that accidentally moves a VM handle into `tokio::spawn` or
-// holds a `&mut RuntimeCx` across `.await`.
+// The VM and GC stay explicit-context and single-mutator: the
+// interpreter, every GC handle, and every borrowed-context type must
+// be `!Send + !Sync` so compile-fail tests reject any future edit
+// that accidentally moves a VM handle into `tokio::spawn` or holds a
+// `&mut RuntimeCx` across `.await`.
 //
 // Spec:
 // - <https://tc39.es/ecma262/#sec-agents>
@@ -624,8 +619,7 @@ pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
 /// (InitializeBinding); the closure spine that holds these
 /// cells is built by `Op::MakeClosure` per §15.2.5
 /// (FunctionDeclarationInstantiation). Upvalue migration
-/// rationale lives in
-/// `docs/new-engine/gc-architecture.md` §4.1, §6.3.
+/// rationale lives in the mdBook GC API chapter.
 pub struct UpvalueCellBody {
     /// Captured `Value`. Phase 1: arbitrary `Value`; once
     /// `Value` carries `Gc<…>` variants (tasks 77+),
@@ -1846,6 +1840,29 @@ impl std::fmt::Debug for Interpreter {
 /// dispatch result.
 pub type EvalHook = std::rc::Rc<dyn Fn(&str) -> Result<BytecodeModule, String>>;
 
+struct StartupPhaseTimer {
+    enabled: bool,
+    start: std::time::Instant,
+}
+
+impl StartupPhaseTimer {
+    fn from_env() -> Self {
+        Self {
+            enabled: std::env::var_os("OTTER_CLI_STARTUP_TIMINGS").is_some(),
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn mark(&self, label: &str) {
+        if self.enabled {
+            eprintln!(
+                "otter_cli_startup phase={label} elapsed_us={}",
+                self.start.elapsed().as_micros()
+            );
+        }
+    }
+}
+
 impl Interpreter {
     /// Construct a fresh interpreter with its own interrupt flag,
     /// a no-cap string heap, the default stack-depth limit, and a
@@ -1860,15 +1877,21 @@ impl Interpreter {
     /// GC heap.
     #[must_use]
     pub fn with_string_heap_cap(cap_bytes: u64) -> Self {
+        let startup_timer = StartupPhaseTimer::from_env();
         let string_heap = Arc::new(StringHeap::with_cap(cap_bytes));
+        startup_timer.mark("vm_string_heap");
         let well_known_symbols = WellKnownSymbols::new(&string_heap)
             .expect("well-known symbol descriptions fit within any positive cap");
+        startup_timer.mark("vm_well_known_symbols");
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
             .expect("GcHeap construction never fails on the default cage");
+        startup_timer.mark("vm_gc_heap");
         let error_classes = ErrorClassRegistry::new(&string_heap, &mut gc_heap)
             .expect("error class prototypes fit within any positive cap");
+        startup_timer.mark("vm_error_classes");
         let global_this = bootstrap::build_global_this(&mut gc_heap)
             .expect("global_this fits within any positive cap");
+        startup_timer.mark("vm_global_this");
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
@@ -4395,11 +4418,9 @@ impl Interpreter {
                 }
                 Op::CollectArguments => {
                     // §10.4.4 Arguments Exotic Objects (foundation
-                    // lowers the unmapped variant — strict mode is
-                    // ADR-0001's default). Wrap the captured argv
-                    // as a fresh JsArray. Drain so the frame's
-                    // copy is released after the (typically
-                    // single) materialisation.
+                    // lowers the unmapped variant). Wrap the captured argv as
+                    // a fresh JsArray. Drain so the frame's copy is released
+                    // after the (typically single) materialisation.
                     let dst = register_operand(operands.first())?;
                     let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.incoming_args);
                     let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
@@ -7681,10 +7702,9 @@ impl Interpreter {
     /// `Ok(false)` when the in-frame data-write fast path should run.
     ///
     /// Non-writable / accessor-without-setter / non-extensible
-    /// rejections surface as [`VmError::TypeMismatch`] today —
-    /// follow-up [task 25](../docs/new-engine/tasks/25-internal-error-throwability.md)
-    /// upgrades these to real `TypeError` instances. Sloppy-mode
-    /// silent rejection is filed against the same task.
+    /// rejections surface as [`VmError::TypeMismatch`] today. A later
+    /// TypeError slice should upgrade these to real `TypeError` instances.
+    /// Sloppy-mode silent rejection belongs with that same behavior slice.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-ordinaryset>

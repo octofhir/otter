@@ -10,7 +10,6 @@
 //! Spec links:
 //! - <https://tc39.es/ecma262/>
 //! - <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
-//! - `docs/new-engine/tasks/100-test262-conformance.md`
 
 #![forbid(unsafe_code)]
 
@@ -44,16 +43,15 @@ const MAX_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_HEAP_BYTES: u64 = 512 * 1024 * 1024;
 /// How often to flush the cursor file mid-shard.
 const CURSOR_FLUSH_EVERY: u64 = 100;
-/// Default location for baselines.
-const BASELINE_DIR: &str = "docs/new-engine/test262-baseline";
+/// Default location for generated baselines.
+const BASELINE_DIR: &str = "tests/test262-baseline";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "otter-test262",
     about = "Test262 conformance runner for the new-engine Otter stack.",
     long_about = "Drives the tc39/test262 corpus through the active otter-runtime / \
-                  otter-vm stack and publishes a versioned baseline. See \
-                  docs/new-engine/tasks/100-test262-conformance.md."
+                  otter-vm stack and publishes a versioned baseline."
 )]
 struct Cli {
     /// Path to the repository root. Defaults to the current
@@ -138,7 +136,7 @@ struct DiffArgs {
     /// Path to the previous baseline (`*.json`).
     previous: PathBuf,
     /// Path to the freshly produced baseline. Defaults to the
-    /// canonical `docs/new-engine/test262-baseline/main.json`.
+    /// canonical `tests/test262-baseline/main.json`.
     #[arg(long)]
     current: Option<PathBuf>,
 }

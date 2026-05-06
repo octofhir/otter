@@ -8,9 +8,8 @@ rust-version.workspace = true
 description = "Production-grade page-based generational tracing GC for the Otter new-engine VM."
 
 [lints.rust]
-# `unsafe_code` ban lifted for this crate per ADR-0004 (which amends
-# ADR-0001 §5). Every other `crates-next/*` crate keeps the workspace
-# `forbid(unsafe_code)`. See docs/new-engine/adr/0004-gc-crate-and-unsafe-boundary.md.
+# `unsafe_code` ban lifted for this crate per the mdBook GC API docs. Every
+# other `crates-next/*` crate keeps the workspace `forbid(unsafe_code)`.
 missing_docs = "deny"
 
 [lints.clippy]

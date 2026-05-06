@@ -104,7 +104,7 @@ still uses the existing bytecode fast path, while observable property
 reads and extracted method calls use the real namespace object installed
 from `math::MATH_SPEC`.
 
-Task 98 adds default-off bootstrap telemetry for benchmark runs. The plain
+Default-off bootstrap telemetry is available for benchmark runs. The plain
 runtime construction path does not maintain telemetry counters; benches can
 call the instrumented bootstrap entry point to capture install counts, GC
 allocation deltas, duplicate-name validation, and per-entry timing.
@@ -123,4 +123,4 @@ New debug/profiling features should stay default-off and should use
 standard output formats where possible.
 
 Documentation for stable contributor workflows belongs in this book.
-`docs/new-engine/tasks/` records implementation plans and closeout history.
+Historical task and ADR files are not part of the living contributor docs.

@@ -11,12 +11,11 @@ not mean a separate synchronous runtime: the same event-loop-capable
 isolate runner must remain available for timers, host ops, dynamic
 modules, workers, and future async Web APIs.
 
-The production event-loop boundary landed in task 85. Deno's `JsRuntime`
-shape is the closest reference: the runtime itself stays local to one
-isolate, while embedders drive it with one-tick and run-to-idle style APIs.
-Boa's job model is the smaller ECMA-262 reference: promise, timeout,
-native async, and generic jobs run only when no execution context is active
-and each job runs to completion.
+The production event-loop boundary follows Deno's `JsRuntime` shape: the
+runtime itself stays local to one isolate, while embedders drive it with
+one-tick and run-to-idle style APIs. Boa's job model is the smaller
+ECMA-262 reference: promise, timeout, native async, and generic jobs run
+only when no execution context is active and each job runs to completion.
 
 ## Runtime Layers
 

@@ -4,8 +4,9 @@ Otter's active GC is moving, generational, and isolate-local. Normal
 engine and extension work should use the safe context API rather than raw
 collector internals.
 
-The landed contributor API is the Task 94 surface. Task 97 owns future
-trace derive/macros; do not invent a macro-first GC API before then.
+The landed contributor API is the safe context surface. Trace
+derive/macros are future work; do not invent a macro-first GC API before
+the backend is stable.
 
 ## Handle Tiers
 
@@ -133,10 +134,9 @@ and only then touch JS values.
 ## Trace Ergonomics
 
 Today, VM payloads implement the current tracing traits manually or reuse
-existing wrappers. The future `GcTrace` derive is explicitly deferred to
-Task 97 and must generate normal trace code over the safe visitor path.
-Until then, do not add contributor macros that expose raw trace tables, raw
-slot visitors, or manual barrier calls.
+existing wrappers. A future `GcTrace` derive must generate normal trace
+code over the safe visitor path. Until then, do not add contributor macros
+that expose raw trace tables, raw slot visitors, or manual barrier calls.
 
 ## Internal Only
 

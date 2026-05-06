@@ -23,8 +23,8 @@ Design constraints:
 The supported layers should arrive in this order:
 
 1. in-workspace hosted modules using current native/context APIs;
-2. native bindings compiled with the engine and installed through Task 96
-   builders;
+2. native bindings compiled with the engine and installed through JS
+   surface builders;
 3. out-of-tree Rust plugin packages that depend on a stable extension
    crate;
 4. optional dynamic ABI/FFI plugins, only after versioning, safety, and
@@ -45,6 +45,4 @@ Plugins may request capabilities, but the runtime decides whether those
 capabilities are granted. Permission checks must remain explicit and
 testable at the Rust boundary.
 
-Task tracking lives in
-[`Task 95`](../../../new-engine/tasks/95-contributor-book-and-extension-guides.md)
-until the plugin API becomes concrete.
+Plugin details stay design-only until the plugin API becomes concrete.

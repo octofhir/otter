@@ -27,9 +27,8 @@
 //!   `queueMicrotask(fn) inside fn` from livelocking the host.
 //!   Hitting it surfaces as [`MicrotaskError::Runaway`].
 //! - **Exception policy**: foundation propagates the **first**
-//!   error out of the drain. Once the `Promise` constructor lands
-//!   in task 34, this flips to spec semantics ("rejected promise,
-//!   continue draining").
+//!   error out of the drain. Promise reactions use spec-style rejection
+//!   scheduling when they are queued through the promise machinery.
 //!
 //! # Contents
 //! - [`Microtask`] — task record (callee + this + inline args).
@@ -37,9 +36,7 @@
 //! - [`MicrotaskError`] — drain-time failure modes.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/33-microtask-queue.md`](
-//!     ../../../docs/new-engine/tasks/33-microtask-queue.md
-//!   )
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 use std::collections::VecDeque;
 

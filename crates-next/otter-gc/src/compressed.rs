@@ -36,7 +36,7 @@
 //!   §2.3 ("Pointer compression — add in Phase 1").
 //! - V8 pointer compression: <https://v8.dev/blog/pointer-compression>.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::{Layout, alloc, dealloc};
 use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -409,12 +409,14 @@ impl Cage {
             return Ok(());
         }
         // SAFETY: Layout is built from a non-zero multiple of
-        // PAGE_SIZE that we just validated; alloc_zeroed is the
-        // documented portable way to obtain a page-aligned region
-        // and zero-initialise it. The pointer is checked for null.
+        // PAGE_SIZE that we just validated; `alloc` obtains a
+        // page-aligned region without eagerly zeroing the whole
+        // default cage. Individual pages initialise their headers
+        // in `Page::new`, and returned pages are zeroed before
+        // reuse in `free_page`.
         let layout = Layout::from_size_align(size_bytes, PAGE_SIZE)
             .map_err(|_| CageError::InvalidSize(size_bytes))?;
-        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             return Err(CageError::AllocFailed);
         }
@@ -514,8 +516,8 @@ impl Drop for Cage {
         // the backing region so leak sanitiser is happy.
         if !self.base.is_null() {
             // SAFETY: layout matches the one used in
-            // `ensure_inner`; the pointer was returned by
-            // `alloc_zeroed` and has not been freed yet.
+            // `ensure_inner`; the pointer was returned by `alloc`
+            // and has not been freed yet.
             let layout = Layout::from_size_align(self.size, PAGE_SIZE)
                 .expect("cage layout was valid at init");
             unsafe {

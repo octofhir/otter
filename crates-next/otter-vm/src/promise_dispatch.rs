@@ -8,8 +8,8 @@
 //!   a [`crate::Value::Promise`].
 //! - The value-level state machine implemented by
 //!   [`crate::JsPromiseHandle`] / [`crate::PurePromise`].
-//! - The microtask queue introduced in task 33: settlement
-//!   reactions land on the queue as plain [`crate::Microtask`]s.
+//! - The microtask queue: settlement reactions land on the queue as plain
+//!   [`crate::Microtask`]s.
 //!
 //! # Contents
 //! - [`construct`] — `new Promise(executor)` body.
@@ -29,9 +29,8 @@
 //!   them up on the next generation.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/34-promise-value.md`](
-//!     ../../../docs/new-engine/tasks/34-promise-value.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-promise-objects>
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 use smallvec::smallvec;
 

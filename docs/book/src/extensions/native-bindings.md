@@ -16,8 +16,8 @@ The current safe path is:
   pending promise, run the async phase without VM references, then post a
   completion back to the isolate.
 
-Task 96 adds specs/builders for exposing functions, classes, namespaces,
-and accessors. Production builtins should use
+Specs/builders expose functions, classes, namespaces, and accessors.
+Production builtins should use
 `NativeCall::Static(NativeFastFn)` through `MethodSpec` by default.
 Dynamic closures are reserved for embedder cases that need captured Rust
 state and can still trace explicit JS captures.
@@ -69,8 +69,8 @@ fn read_flag(
 ```
 
 This snippet is shape-only because string/value helper names continue to
-move while Task 96 is open. The stable rule is that permission checks and
-allocation happen through the explicit native context.
+move. The stable rule is that permission checks and allocation happen
+through the explicit native context.
 
 To expose that function as a static builtin, put it behind a spec and let
 bootstrap or a mutator-bound builder install it:

@@ -1,7 +1,6 @@
 //! JavaScript array value with dense and sparse indexed storage.
 //!
-//! Task 78 migrates arrays from the old refcounted body envelope to the
-//! page-based tracing GC. The public handle is a compressed
+//! Arrays live on the page-based tracing GC. The public handle is a compressed
 //! [`otter_gc::Gc<ArrayBody>`]; every read or mutation takes an
 //! explicit [`otter_gc::GcHeap`] reference so no thread-local heap
 //! lookup can hide a safepoint.
@@ -18,8 +17,7 @@
 //! # See also
 //!
 //! - <https://tc39.es/ecma262/#sec-array-exotic-objects>
-//! - [GC architecture plan §4.1](../../../docs/new-engine/gc-architecture.md)
-//! - [Task 78](../../../docs/new-engine/tasks/78-migrate-jsarray.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use std::collections::HashMap;
 use std::mem;

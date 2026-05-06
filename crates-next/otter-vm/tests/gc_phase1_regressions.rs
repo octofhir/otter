@@ -25,11 +25,6 @@
 //! - Heap-cap failures are reported as recoverable errors, not
 //!   process aborts.
 //!
-//! # See also
-//!
-//! - `docs/new-engine/tasks/84-phase1-closeout-test262-array-sweep.md`
-//! - `docs/new-engine/gc-architecture.md` §8 Phase 1 exit criteria.
-
 // Origin task 76: root walker and first migrated GC body.
 #[path = "gc_phase1_regressions/task76_roots.rs"]
 mod task76_roots;

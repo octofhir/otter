@@ -24,8 +24,8 @@
 //!
 //! # See also
 //!
-//! - [Task 92](../../../docs/new-engine/tasks/92-worker-isolates-and-structured-clone.md)
-//! - [ADR-0005](../../../docs/new-engine/adr/0005-async-runtime-binding.md)
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md)
+//! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
 use std::path::Path;
 use std::sync::Arc;

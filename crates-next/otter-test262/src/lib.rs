@@ -1,10 +1,9 @@
 //! Test262 conformance runner for the new-engine
 //! (`crates-next/*`) Otter stack.
 //!
-//! This crate is the foundation-phase replacement for the parked
-//! [`crates/otter-test262`] runner. It speaks the active
-//! `otter-runtime` / `otter-vm` ABI and is the single source of
-//! truth for ECMA-262 conformance numbers reported by the project.
+//! This crate speaks the active `otter-runtime` / `otter-vm` ABI and
+//! is the single source of truth for ECMA-262 conformance numbers
+//! reported by the project.
 //!
 //! # Layout (target shape — slices 101 → 105)
 //!

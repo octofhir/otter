@@ -1,12 +1,11 @@
 //! Engine test harness (`otter test`).
 //!
-//! Implements the contract pinned by
-//! [`docs/new-engine/specs/otter-test-harness.md`](
-//!     ../../../docs/new-engine/specs/otter-test-harness.md
-//!   ). The harness slice (task 07) supports the minimum needed to
-//! drive `tests/engine/smoke/*.ts` end-to-end: TOML metadata,
-//! `engine` and `smoke` suites, exit-code assertions, fresh runtime
-//! per fixture, NDJSON `--json` output.
+//! Implements the fixture contract documented in
+//! [the mdBook test harness guide](
+//!     ../../../docs/book/src/contributing/test-harness.md
+//!   ). The harness supports TOML metadata, `engine`, `smoke`, and
+//! `test262` suites, exit-code assertions, a fresh runtime per
+//! fixture, and NDJSON `--json` output.
 //!
 //! # Contents
 //! - [`Suite`] — suite enum (`Engine`, `Smoke`, `Test262`).
@@ -16,9 +15,7 @@
 //!   types (`serde::Serialize` for `--json`).
 //!
 //! # See also
-//! - [`docs/new-engine/specs/otter-test-harness.md`](
-//!     ../../../docs/new-engine/specs/otter-test-harness.md
-//!   )
+//! - [Test harness](../../../docs/book/src/contributing/test-harness.md)
 
 use std::path::{Path, PathBuf};
 
@@ -302,8 +299,8 @@ fn discover(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), OtterError> {
             // contents are package source loaded through the
             // module-graph driver, never tests themselves.
             //
-            // See `docs/new-engine/specs/otter-test-harness.md` §2
-            // for the full fixture-format spec amendment.
+            // See the mdBook test harness guide for the full
+            // fixture-format contract.
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())

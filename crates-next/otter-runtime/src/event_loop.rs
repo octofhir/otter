@@ -1,8 +1,8 @@
 //! Runtime scheduling boundary and Tokio default implementation.
 //!
-//! Task 85 introduces a product-level event-loop abstraction so public
-//! handles can be `Send + Sync` while VM and GC internals stay owned by a
-//! single isolate runner.
+//! The runtime exposes a product-level event-loop abstraction so public handles
+//! can be `Send + Sync` while VM and GC internals stay owned by a single
+//! isolate runner.
 //!
 //! # Contents
 //!
@@ -19,8 +19,8 @@
 //!
 //! # See also
 //!
-//! - [ADR-0005](../../../docs/new-engine/adr/0005-async-runtime-binding.md)
-//! - [Task 85](../../../docs/new-engine/tasks/85-tokio-event-loop-runtime-handle.md)
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md)
+//! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
 use std::collections::HashMap;
 use std::future::Future;

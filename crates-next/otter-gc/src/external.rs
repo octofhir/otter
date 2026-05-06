@@ -19,8 +19,8 @@
 //!
 //! # See also
 //!
-//! - [Task 94](../../../docs/new-engine/tasks/94-gc-contributor-api-surface.md)
-//! - [Task 91](../../../docs/new-engine/tasks/91-gc-bench-and-soak-infra.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
+//! - [Startup performance](../../../docs/book/src/performance/startup.md)
 
 use std::marker::PhantomData;
 

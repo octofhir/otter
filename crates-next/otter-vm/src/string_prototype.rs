@@ -1,7 +1,6 @@
 //! `String.prototype.*` intrinsic implementations.
 //!
-//! Slice 10 introduced the table; task 30 finishes the foundation
-//! method set. Every method dispatches through the
+//! Every method dispatches through the
 //! [`crate::intrinsics`] table so primitive string receivers reach
 //! these implementations without allocating a wrapper object
 //! (foundation plan rule #2).
@@ -23,15 +22,9 @@
 //!   units pass through unchanged.
 //! - `replace` / `replaceAll` perform **literal** substitution — the
 //!   spec's `$&` / `$<n>` substitution patterns are not honoured.
-//!   Regex-needle variants live in task 31.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/10-string-methods-slice.md`](
-//!     ../../../docs/new-engine/tasks/10-string-methods-slice.md
-//!   )
-//! - [`docs/new-engine/tasks/30-string-prototype-completion.md`](
-//!     ../../../docs/new-engine/tasks/30-string-prototype-completion.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-properties-of-the-string-prototype-object>
 
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};

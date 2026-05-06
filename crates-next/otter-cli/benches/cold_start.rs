@@ -5,7 +5,7 @@
 //! the exact sample settings alongside the local results.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -26,6 +26,8 @@ fn otter_binary() -> PathBuf {
 fn run_otter(args: &[&str]) {
     let status = Command::new(otter_binary())
         .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .expect("spawn otter");
     assert!(status.success(), "otter exited with {status}");
@@ -46,6 +48,9 @@ fn bench_cli_cold_start(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(2));
 
+    group.bench_function("info", |b| {
+        b.iter_batched(|| (), |()| run_otter(&["info"]), BatchSize::SmallInput);
+    });
     group.bench_function("eval_empty", |b| {
         b.iter_batched(|| (), |()| run_otter(&["-e", ""]), BatchSize::SmallInput);
     });
@@ -53,6 +58,13 @@ fn bench_cli_cold_start(c: &mut Criterion) {
         b.iter_batched(
             || tiny_js.clone(),
             |path| run_otter(&[path.to_str().expect("utf-8 path")]),
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_function("dump_tiny_js_file", |b| {
+        b.iter_batched(
+            || tiny_js.clone(),
+            |path| run_otter(&["--dump-bytecode", path.to_str().expect("utf-8 path")]),
             BatchSize::SmallInput,
         );
     });

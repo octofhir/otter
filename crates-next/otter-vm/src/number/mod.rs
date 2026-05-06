@@ -1,6 +1,6 @@
 //! Foundation numeric model + the surfaces built on top of it.
 //!
-//! Two-state representation per task 11:
+//! Two-state representation:
 //!
 //! - [`NumberValue::Smi`] — small-integer immediate path
 //!   (`i32`-range exact integers). Arithmetic on two `Smi`s
@@ -29,10 +29,7 @@
 //!   - [`prototype`] — `Number.prototype.{toString, toFixed}`.
 //!
 //! # See also
-//! - foundation plan §M5
-//! - [`docs/new-engine/tasks/28-bitwise-and-number-prototype.md`](
-//!     ../../../docs/new-engine/tasks/28-bitwise-and-number-prototype.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-number-type>
 
 use std::cmp::Ordering;
 

@@ -1,8 +1,7 @@
 //! OXC-only frontend for the new Otter engine.
 //!
-//! Per [ADR-0002](../../../docs/new-engine/adr/0002-oxc-frontend.md),
-//! all JavaScript and TypeScript parsing in the new engine goes
-//! through OXC. This crate is the only place in `crates-next/*` that
+//! All JavaScript and TypeScript parsing in the active engine goes through
+//! OXC. This crate is the only place in `crates-next/*` that
 //! depends on `oxc_parser` directly: every other crate consumes the
 //! parsed AST through this surface.
 //!
@@ -13,6 +12,7 @@
 //!   resulting [`oxc_ast::ast::Program`] (lifetime-bound to the
 //!   allocator).
 //! - [`parse`] — parse a string with an explicit [`SourceKind`].
+//! - [`with_program`] — parse once and consume the AST inside a callback.
 //! - [`SyntaxError`] — concrete error returned when OXC reports
 //!   parser diagnostics.
 //!
@@ -23,9 +23,7 @@
 //!   original source string supplied by the caller.
 //!
 //! # See also
-//! - [`docs/new-engine/adr/0002-oxc-frontend.md`](
-//!     ../../../docs/new-engine/adr/0002-oxc-frontend.md
-//!   )
+//! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
 use std::path::Path;
 
@@ -144,6 +142,34 @@ pub fn parse(source: impl Into<String>, kind: SourceKind) -> Result<Parsed, Synt
     Ok(parsed)
 }
 
+/// Parse `source` once and pass the AST to `f`.
+///
+/// Use this on hot compile paths that only need to consume the AST once. It
+/// avoids the validation parse performed by [`parse`] plus the later
+/// [`Parsed::program`] parse.
+///
+/// # Errors
+/// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
+pub fn with_program<R>(
+    source: impl Into<String>,
+    kind: SourceKind,
+    f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
+) -> Result<R, SyntaxError> {
+    let allocator = Allocator::default();
+    let source = source.into();
+    let parser = Parser::new(&allocator, &source, kind.to_oxc()).with_options(ParseOptions {
+        parse_regular_expression: true,
+        ..Default::default()
+    });
+    let ret = parser.parse();
+    if !ret.errors.is_empty() {
+        return Err(SyntaxError {
+            messages: ret.errors.iter().map(|e| e.to_string()).collect(),
+        });
+    }
+    Ok(f(&ret.program))
+}
+
 /// Errors produced by the OXC frontend.
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
 #[error("syntax error: {}", .messages.join("; "))]
@@ -183,8 +209,23 @@ mod tests {
     }
 
     #[test]
+    fn with_program_parses_once_for_callback_consumers() {
+        let len = with_program("undefined;", SourceKind::TypeScript, |program| {
+            program.body.len()
+        })
+        .unwrap();
+        assert_eq!(len, 1);
+    }
+
+    #[test]
     fn rejects_garbage() {
         let err = parse("@@@@", SourceKind::TypeScript).unwrap_err();
+        assert!(!err.messages.is_empty());
+    }
+
+    #[test]
+    fn with_program_rejects_garbage() {
+        let err = with_program("@@@@", SourceKind::TypeScript, |_| ()).unwrap_err();
         assert!(!err.messages.is_empty());
     }
 }

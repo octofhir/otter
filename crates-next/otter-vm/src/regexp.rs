@@ -29,9 +29,7 @@
 //!   `last_index` cell through the same GC body.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/31-regexp-and-pattern-methods.md`](
-//!     ../../../docs/new-engine/tasks/31-regexp-and-pattern-methods.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-regexp-regular-expression-objects>
 
 use std::cell::Cell;
 

@@ -35,7 +35,7 @@
 //! # Invariants
 //!
 //! - `unsafe_code` is permitted only inside this crate (per
-//!   ADR-0004); every other `crates-next/*` crate keeps the
+//!   GC API/unsafe-boundary docs); every other `crates-next/*` crate keeps the
 //!   workspace `forbid(unsafe_code)`.
 //! - Every `unsafe` block carries a `// SAFETY:` comment; every
 //!   public `unsafe fn` documents preconditions in a `# Safety`
@@ -48,12 +48,8 @@
 //!
 //! # See also
 //!
-//! - [GC architecture plan](../../../docs/new-engine/gc-architecture.md)
-//! - [ADR-0001](../../../docs/new-engine/adr/0001-staging-directory.md)
-//!   — staging directory
-//! - [ADR-0004](../../../docs/new-engine/adr/0004-gc-crate-and-unsafe-boundary.md)
-//!   — GC crate & unsafe boundary
-//! - Task 72 — core heap and handles.
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
+//! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
 /// Object alignment used everywhere in the GC. Every payload
 /// starts at a multiple of this; cell size in bump alloc is the
@@ -116,12 +112,11 @@ pub mod raw {
 // ---------------------------------------------------------------------------
 // `!Send + !Sync` static assertions.
 //
-// Per ADR-0005 §3 and the GC architecture plan §6.2, every GC primitive
-// is bound to a single mutator thread. These compile-time checks make
-// the single-mutator invariant visible to the type system: any future
-// edit that accidentally adds `Send`/`Sync` to one of these handles
-// will fail to compile, and `tokio::spawn` callers cannot capture them
-// in `Send` futures (see compile-fail fixtures under
+// Every GC primitive is bound to a single mutator thread. These compile-time
+// checks make the single-mutator invariant visible to the type system: any
+// future edit that accidentally adds `Send`/`Sync` to one of these handles will
+// fail to compile, and `tokio::spawn` callers cannot capture them in `Send`
+// futures (see compile-fail fixtures under
 // `crates-next/otter-vm/tests/compile_fail/`).
 //
 // Spec:

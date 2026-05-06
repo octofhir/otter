@@ -12,11 +12,8 @@
 //!   constants index.
 //! - [`BytecodeModule`] — top-level container the compiler emits and
 //!   the VM consumes.
-//! - [`disasm`] — text disassembler per spec
-//!   [`docs/new-engine/specs/bytecode-dump-disasm-trace.md`](
-//!     ../../../docs/new-engine/specs/bytecode-dump-disasm-trace.md
-//!   ).
-//! - [`dump`] — JSON dump per the same spec
+//! - [`disasm`] — text disassembler for CLI/debug output.
+//! - [`dump`] — JSON dump for tooling and tests
 //!   (`otterBytecodeDumpVersion: 1`).
 //!
 //! # Invariants
@@ -26,12 +23,7 @@
 //!   disassembler emits.
 //!
 //! # See also
-//! - [`docs/new-engine/specs/bytecode-dump-disasm-trace.md`](
-//!     ../../../docs/new-engine/specs/bytecode-dump-disasm-trace.md
-//!   )
-//! - [`docs/new-engine/adr/0003-public-api-and-cli.md`](
-//!     ../../../docs/new-engine/adr/0003-public-api-and-cli.md
-//!   )
+//! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
 pub mod disasm;
 pub mod dump;
@@ -509,8 +501,7 @@ pub enum Op {
     /// The compiler emits this for free-identifier reads that did
     /// not resolve to a local / upvalue / module import / known
     /// intrinsic. Strict-mode behaviour (every test262 test runs
-    /// strict per ADR-0001) is the only mode the foundation
-    /// supports.
+    /// strict) is the only mode the foundation supports.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-resolvebinding>
@@ -1414,7 +1405,7 @@ pub struct Function {
     pub spans: Vec<SpanEntry>,
 }
 
-/// Source-language flavor (per ADR-0002).
+/// Source-language flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {

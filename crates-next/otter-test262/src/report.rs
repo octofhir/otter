@@ -1,9 +1,9 @@
 //! JSON + Markdown report writers.
 //!
-//! Output layout: `docs/new-engine/test262-baseline/<engine-commit>.{json,md}`
-//! per task 100 §"Output formats". The JSON is the canonical
-//! machine-readable wire format; the Markdown is a human-readable
-//! summary that GitHub renders inline on PR review.
+//! Output layout: `tests/test262-baseline/<engine-commit>.{json,md}`.
+//! The JSON is the canonical machine-readable wire format; the
+//! Markdown is a human-readable summary that GitHub renders inline
+//! on PR review.
 //!
 //! Spec link: <https://tc39.es/ecma262/>
 
@@ -81,7 +81,7 @@ pub struct FailingTest {
 }
 
 /// Canonical JSON shape written to
-/// `docs/new-engine/test262-baseline/<engine-commit>.json`.
+/// `tests/test262-baseline/<engine-commit>.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Baseline {
     /// SHA of the pinned `vendor/test262` commit.

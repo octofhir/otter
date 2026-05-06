@@ -2,7 +2,7 @@
 //!
 //! The registry owns the deterministic install order for globals,
 //! constructors, namespaces, and host-provided surfaces. Entries
-//! install through task-96 static specs and builders when available,
+//! install through static specs and builders when available,
 //! or through small placeholder installers for surfaces that have not
 //! been migrated yet.
 //!
@@ -23,9 +23,7 @@
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-global-object>
-//! - [`docs/new-engine/tasks/96-production-js-surface-builders.md`](
-//!     ../../../docs/new-engine/tasks/96-production-js-surface-builders.md
-//!   )
+//! - [JS surface builders](../../../docs/book/src/extensions/js-surface-builders.md)
 
 use std::time::{Duration, Instant};
 

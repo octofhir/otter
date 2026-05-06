@@ -1,19 +1,16 @@
 # Contributing Overview
 
-Otter's active new engine lives under `crates-next/`. The legacy crates
-under `crates/` are parked compatibility shims and reference material;
-do not wire them into the active build graph unless a task explicitly
-requires it.
+Otter's active engine lives under `crates-next/`. The remaining crates
+under `crates/` are product/reference crates that are not wired into the
+active build graph unless a product task explicitly revives them.
 
 Start with:
 
-- [`repository-map.md`](../../../new-engine/repository-map.md) for crate
-  ownership;
-- [`70-gc-master-tracker.md`](../../../new-engine/tasks/70-gc-master-tracker.md)
-  for GC/runtime work;
+- [Architecture](../engine/architecture.md) for active crate ownership;
+- [Frontend And Compilation](../engine/frontend.md) before changing
+  parser, module detection, or TypeScript behavior;
 - [`ES_CONFORMANCE.md`](../../../../ES_CONFORMANCE.md) before changing
   ECMAScript behavior;
-- [`adr/`](../../../new-engine/adr/) for accepted architecture decisions;
 - [`AGENTS.md`](../../../../AGENTS.md) for repository-specific workflow
   rules.
 
@@ -92,12 +89,10 @@ Match test depth to risk:
 
 Book examples for APIs that exist today should either compile through
 normal cargo gates or point at the exact test file that backs them. Future
-Task 96/97 APIs are shown as `ignore` snippets until those tasks land.
+APIs are shown as `ignore` snippets until their backend surface lands.
 
-## Closing A Task
+## Closing Work
 
-Close a task only after its validation gates are actually green. Update
-the task file with what shipped, note command output or blockers, then
-tick the master tracker. If a gate cannot run because tooling is missing,
-record the reason and leave the task open unless the task explicitly
-allows a tracked infrastructure follow-up.
+Close implementation work only after its validation gates are actually
+green. Record what shipped, note command output or blockers, and keep the
+book aligned with any workflow that changed.

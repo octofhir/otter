@@ -237,9 +237,9 @@ pub struct Page {
 }
 
 // SAFETY: The page is logically owned by a single GcHeap which is
-// itself !Sync (see ADR-0004 / NF5). Implementing Send is required
-// so a heap can be transferred between threads when an isolate is
-// reassigned. Sync is *not* implemented.
+// itself !Sync. Implementing Send is required so a heap can be
+// transferred between threads when an isolate is reassigned. Sync is
+// *not* implemented.
 unsafe impl Send for Page {}
 
 impl Page {

@@ -28,8 +28,7 @@
 //! # See also
 //!
 //! - <https://tc39.es/ecma262/#sec-promise-objects>
-//! - [GC architecture plan §4.2](../../../docs/new-engine/gc-architecture.md)
-//! - [Task 82](../../../docs/new-engine/tasks/82-migrate-promise-iterator-generator.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use crate::Value;
 use crate::microtask::{Microtask, MicrotaskKind};

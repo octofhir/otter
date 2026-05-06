@@ -1201,6 +1201,7 @@ dependencies = [
  "clap",
  "criterion",
  "otter-bytecode",
+ "otter-compiler",
  "otter-runtime",
  "otter-test",
  "serde_json",

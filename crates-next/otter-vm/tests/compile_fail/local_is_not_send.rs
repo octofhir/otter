@@ -1,4 +1,4 @@
-//! `Local<'gc, T>` must not be `Send` — see ADR-0005 §3 / task 76A.
+//! `Local<'gc, T>` must not be `Send`.
 
 fn assert_send<T: Send>(_t: T) {}
 

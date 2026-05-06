@@ -1,7 +1,6 @@
 //! WTF-16 backed JavaScript string with rope variants.
 //!
-//! Implements the foundation string model from
-//! [task 09](../../../docs/new-engine/tasks/09-string-core-slice.md):
+//! Implements the active string model:
 //!
 //! - canonical storage is WTF-16 (`Arc<[u16]>`); we never round-trip
 //!   through UTF-8 internally;
@@ -10,9 +9,8 @@
 //! - slices produce `Sliced` views (over flat parents) without
 //!   flattening; slicing a `Cons` flattens once;
 //! - `Thin` variant is reserved for the future Latin-1 / WTF-16
-//!   hybrid (not constructed in this slice; tag occupies the enum
-//!   discriminant so it cannot be repurposed without an ADR
-//!   amendment);
+//!   hybrid (not constructed yet; tag occupies the enum discriminant
+//!   so it cannot be repurposed casually);
 //! - heap accounting goes through a fallible `alloc_string` helper
 //!   that checks the runtime cap **before** mutation and returns
 //!   `OutOfMemory` if the allocation would exceed it.
@@ -36,10 +34,7 @@
 //!   `String` or `Vec<u8>` heap allocation.
 //!
 //! # See also
-//! - foundation plan §M3
-//! - [`docs/new-engine/tasks/09-string-core-slice.md`](
-//!     ../../../docs/new-engine/tasks/09-string-core-slice.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -29,7 +29,7 @@
 //!
 //! - <https://tc39.es/ecma262/#sec-weak-ref-objects>
 //! - <https://tc39.es/ecma262/#sec-finalization-registry-objects>
-//! - [GC architecture §6.2](../../../docs/new-engine/gc-architecture.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use crate::Value;
 use crate::abstract_ops::is_callable;

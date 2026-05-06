@@ -1,9 +1,6 @@
 //! JSON dump for [`crate::BytecodeModule`].
 //!
-//! Output format is locked by
-//! [`docs/new-engine/specs/bytecode-dump-disasm-trace.md`](
-//!     ../../../docs/new-engine/specs/bytecode-dump-disasm-trace.md
-//!   ) §2. Top-level wrapper carries `otterBytecodeDumpVersion: 1`.
+//! Top-level wrapper carries `otterBytecodeDumpVersion: 1`.
 //!
 //! # Contents
 //! - [`DUMP_SCHEMA_VERSION`] — pinned at `1`.
@@ -15,7 +12,7 @@ use serde::Serialize;
 
 use crate::BytecodeModule;
 
-/// Current dump schema version. Bump per spec §6 only.
+/// Current dump schema version.
 pub const DUMP_SCHEMA_VERSION: u32 = 1;
 
 /// Top-level wrapper that prepends the schema-version field.

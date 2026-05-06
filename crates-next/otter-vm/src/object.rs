@@ -6,21 +6,16 @@
 //! a `[[Value]]` (data property) or a `([[Get]], [[Set]])` accessor
 //! pair. The `Shape`-based hidden-class model stays — keys are still
 //! shared across literals — but as of task 77 the per-object body
-//! (slots, prototype, symbol props, extensibility) lives on the
-//! tracing GC heap as a [`Gc<ObjectBody>`] payload.
+//! (slots, prototype, symbol props, extensibility) lives on the tracing GC
+//! heap as a [`Gc<ObjectBody>`] payload.
 //!
 //! # Storage
 //!
-//! Pre-77 the body lived behind an `Rc<RefCell<…>>` envelope and
-//! callers reached for the value through interior mutability. As of
-//! task 77 (per [GC architecture plan §4.1, §6.3] and ADR-0005 §3
-//! "Async Runtime Binding"), every read / write / write-barrier
-//! path takes an explicit `&otter_gc::GcHeap` (or `&mut`) so the
-//! single-mutator invariant is visible in the type system. Method
-//! signatures are now of the shape `obj.get(heap, key)` and
-//! `obj.set(heap, key, value)` — the heap is **not** thread-local.
-//! No thread-local heap lookup is permitted in this module
-//! (per ADR-0005 §3 / task 76A).
+//! Every read / write / write-barrier path takes an explicit
+//! `&otter_gc::GcHeap` (or `&mut`) so the single-mutator invariant is visible in
+//! the type system. Method signatures are of the shape `obj.get(heap, key)` and
+//! `obj.set(heap, key, value)` — the heap is **not** thread-local. No
+//! thread-local heap lookup is permitted in this module.
 //!
 //! `JsObject` is therefore a 4-byte compressed offset
 //! ([`otter_gc::Gc<ObjectBody>`]); cloning a handle is `Copy`.
@@ -60,8 +55,8 @@
 //! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
 //! - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
 //! - <https://tc39.es/ecma262/#sec-ordinaryset>
-//! - [GC architecture plan §4.1, §6.3](../../../docs/new-engine/gc-architecture.md)
-//! - [ADR-0005 — async runtime binding](../../../docs/new-engine/adr/0005-async-runtime-binding.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
@@ -624,7 +619,7 @@ impl otter_gc::SafeTraceable for ObjectBody {
 /// Every method that reads or mutates the body takes an explicit
 /// `&otter_gc::GcHeap` (read) or `&mut otter_gc::GcHeap` (mutate).
 /// There is no thread-local heap lookup in this module; per
-/// ADR-0005 §3 and task 76A every borrow path threads the heap.
+/// every borrow path threads the heap.
 pub type JsObject = otter_gc::Gc<ObjectBody>;
 
 /// Maximum prototype-chain hops a property lookup will follow.

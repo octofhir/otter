@@ -2,7 +2,7 @@
 //!
 //! Thin wrapper over [`otter_runtime`]. Implements the foundation-
 //! phase command surface from
-//! [ADR-0003](../../../docs/new-engine/adr/0003-public-api-and-cli.md):
+//! [the public runtime architecture](../../../docs/book/src/engine/architecture.md):
 //! `run`, `<file>` shorthand, `eval`, `-e`, `-p`, `check`, `test`,
 //! `info`, `--dump-bytecode[=json]`. Slice tasks `09`+ extend
 //! behavior; this binary owns the argument parsing and exit-code
@@ -15,19 +15,18 @@
 //!
 //! # Invariants
 //! - Every fallible path returns [`otter_runtime::OtterError`] and
-//!   the binary translates it to the documented exit code via
-//!   `OtterError::exit_code` (ADR-0003 §4).
+//!   the binary translates it through `OtterError::exit_code`.
 //! - JSON outputs (`--json`, `--dump-bytecode=json`, error payloads)
-//!   match the wire formats locked by ADR-0003 and the bytecode-
-//!   dump spec.
+//!   match the documented CLI and bytecode-dump wire formats.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use otter_bytecode::{disasm::disassemble, dump::to_json_pretty};
 use otter_runtime::{
-    BooleanPermission, CapabilitySet, OtterError, Permission, Runtime, SourceInput,
+    BooleanPermission, CapabilitySet, Diagnostic, OtterError, Permission, SourceInput,
 };
 use otter_test::{Report, RunOptions, Suite};
 
@@ -353,12 +352,15 @@ struct TestArgs {
     root: Option<PathBuf>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse();
+    startup_timer.mark("parse_args");
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
     let caps = cli.perms.clone().into_capabilities();
+    startup_timer.mark("build_capabilities");
     let inline_eval = cli.eval_source.clone();
     let inline_print = cli.print_source.clone();
 
@@ -377,16 +379,27 @@ async fn main() -> ExitCode {
             (None, Some(source)) => (source, true),
             _ => unreachable!("checked conflicting inline eval modes above"),
         };
-        return exit_from_result(run_eval(source, print, json, &caps).await, json);
+        let result = run_eval(source, print, json, &caps, &startup_timer).await;
+        startup_timer.finish();
+        return exit_from_result(result, json);
     }
 
     let result = match (cli.command, cli.args.first().cloned()) {
         // Explicit subcommand.
         (Some(Command::Run(args)), _) => {
-            run_file(&args.file, json, dump_mode.as_deref(), &caps).await
+            run_file(
+                &args.file,
+                json,
+                dump_mode.as_deref(),
+                &caps,
+                &startup_timer,
+            )
+            .await
         }
-        (Some(Command::Eval(args)), _) => run_eval(&args.expression, args.print, json, &caps).await,
-        (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps),
+        (Some(Command::Eval(args)), _) => {
+            run_eval(&args.expression, args.print, json, &caps, &startup_timer).await
+        }
+        (Some(Command::Check(args)), _) => run_check(&args.file, json),
         (Some(Command::Test(args)), _) => run_test(args, json),
         (Some(Command::Info), _) => run_info(json),
         // Shorthand: `otter <file>`.
@@ -396,6 +409,7 @@ async fn main() -> ExitCode {
                 json,
                 dump_mode.as_deref(),
                 &caps,
+                &startup_timer,
             )
             .await
         }
@@ -405,7 +419,35 @@ async fn main() -> ExitCode {
         }
     };
 
+    startup_timer.finish();
     exit_from_result(result, json)
+}
+
+struct CliStartupTimer {
+    enabled: bool,
+    start: Instant,
+}
+
+impl CliStartupTimer {
+    fn from_env() -> Self {
+        Self {
+            enabled: std::env::var_os("OTTER_CLI_STARTUP_TIMINGS").is_some(),
+            start: Instant::now(),
+        }
+    }
+
+    fn mark(&self, label: &str) {
+        if self.enabled {
+            eprintln!(
+                "otter_cli_startup phase={label} elapsed_us={}",
+                self.start.elapsed().as_micros()
+            );
+        }
+    }
+
+    fn finish(&self) {
+        self.mark("done");
+    }
 }
 
 fn exit_from_result(result: Result<ExitCode, OtterError>, json: bool) -> ExitCode {
@@ -418,33 +460,27 @@ fn exit_from_result(result: Result<ExitCode, OtterError>, json: bool) -> ExitCod
     }
 }
 
-fn build_runtime(caps: &CapabilitySet) -> Result<Runtime, OtterError> {
-    Runtime::builder().capabilities(caps.clone()).build()
-}
-
 async fn run_file(
     path: &std::path::Path,
     json: bool,
     dump_mode: Option<&str>,
     caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
     if let Some(mode) = dump_mode {
-        return run_dump(path, mode, caps);
+        return run_dump(path, mode);
     }
     // Route module-shaped files through the module-graph
     // pipeline; fall back to script execution otherwise. The
     // detection is AST-based (see `Otter::run_file` for the
     // shared helper used in the embedder Layer-A path).
     //
-    // The `caps`-aware `Runtime` builder is constructed but not
-    // used directly — module-mode runs go through `Otter::new()`
-    // which uses the default capability set. Capability-respecting
-    // module runs are a follow-up once `Runtime::run_module` lands
-    // on the Layer-B builder.
     let otter = otter_runtime::Otter::builder()
         .capabilities(caps.clone())
         .build()?;
+    startup_timer.mark("runtime_build");
     let result = otter.run_file(path).await?;
+    startup_timer.mark("runtime_run_file");
     if json {
         println!(
             "{{\"completion\":{}}}",
@@ -459,11 +495,14 @@ async fn run_eval(
     print: bool,
     json: bool,
     caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
     let otter = otter_runtime::Otter::builder()
         .capabilities(caps.clone())
         .build()?;
+    startup_timer.mark("runtime_build");
     let result = otter.eval(source).await?;
+    startup_timer.mark("runtime_eval");
     if print {
         println!("{}", result.completion_string());
     } else if json {
@@ -475,30 +514,16 @@ async fn run_eval(
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_check(
-    path: &std::path::Path,
-    json: bool,
-    caps: &CapabilitySet,
-) -> Result<ExitCode, OtterError> {
-    let source = SourceInput::from_path(path)?;
-    let specifier = path.to_string_lossy().to_string();
-    let runtime = build_runtime(caps)?;
-    runtime.check(source, &specifier)?;
+fn run_check(path: &std::path::Path, json: bool) -> Result<ExitCode, OtterError> {
+    compile_source_for_cli(path)?;
     if json {
         println!("{{\"ok\":true}}");
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_dump(
-    path: &std::path::Path,
-    mode: &str,
-    caps: &CapabilitySet,
-) -> Result<ExitCode, OtterError> {
-    let source = SourceInput::from_path(path)?;
-    let specifier = path.to_string_lossy().to_string();
-    let runtime = build_runtime(caps)?;
-    let module = runtime.dump(source, &specifier)?;
+fn run_dump(path: &std::path::Path, mode: &str) -> Result<ExitCode, OtterError> {
+    let module = compile_source_for_cli(path)?;
     let text = match mode {
         "json" => to_json_pretty(&module).map_err(|e| OtterError::Internal {
             code: "DUMP_JSON".to_string(),
@@ -508,6 +533,39 @@ fn run_dump(
     };
     print!("{text}");
     Ok(ExitCode::SUCCESS)
+}
+
+fn compile_source_for_cli(
+    path: &std::path::Path,
+) -> Result<otter_bytecode::BytecodeModule, OtterError> {
+    let source = SourceInput::from_path(path)?;
+    let specifier = path.to_string_lossy().to_string();
+    otter_compiler::compile_source(&source.text, source.kind, &specifier).map_err(map_compile_error)
+}
+
+fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
+    use otter_compiler::CompileError;
+    match err {
+        CompileError::Syntax { messages } => OtterError::Compile {
+            diagnostics: vec![Diagnostic::syntax(messages.join("; "))],
+        },
+        CompileError::Unsupported { node, span } => OtterError::Compile {
+            diagnostics: vec![Diagnostic::unsupported(
+                format!("unsupported AST node: {node}"),
+                span,
+            )],
+        },
+        CompileError::TypeScriptUnsupported { node, span } => OtterError::Compile {
+            diagnostics: vec![Diagnostic::ts_unsupported(
+                format!("typescript {node} is not supported in foundation"),
+                span,
+            )],
+        },
+        _ => OtterError::Internal {
+            code: "COMPILE_UNKNOWN".to_string(),
+            message: "unknown compiler error variant".to_string(),
+        },
+    }
 }
 
 fn run_test(args: TestArgs, json: bool) -> Result<ExitCode, OtterError> {
@@ -538,14 +596,14 @@ fn run_test(args: TestArgs, json: bool) -> Result<ExitCode, OtterError> {
 }
 
 fn run_info(json: bool) -> Result<ExitCode, OtterError> {
-    let info = serde_json::json!({
-        "name": "otter",
-        "version": env!("CARGO_PKG_VERSION"),
-        "phase": "foundation",
-        "interpreter_only": true,
-        "edition": "2024",
-    });
     if json {
+        let info = serde_json::json!({
+            "name": "otter",
+            "version": env!("CARGO_PKG_VERSION"),
+            "phase": "foundation",
+            "interpreter_only": true,
+            "rust_edition": "2024",
+        });
         println!("{}", serde_json::to_string(&info).unwrap());
     } else {
         println!(

@@ -1,11 +1,8 @@
 //! Declarative scaffolding for primitive-receiver intrinsics.
 //!
-//! Slice tasks `10`+ wire JS `String.prototype` / `Number.prototype`
-//! methods through this module. The harness slice (task 09)
-//! introduces the **types and the macro** so future slices can
-//! register intrinsics without ad-hoc dispatch sprawl. No JS-visible
-//! intrinsic is registered yet — the type tag and method tables
-//! exist to lock the shape.
+//! JS `String.prototype` / `Number.prototype` methods can route
+//! through this module. The type tags, tables, and macro let the VM
+//! register intrinsics without ad-hoc dispatch sprawl.
 //!
 //! # Why a table, not free functions?
 //!
@@ -38,12 +35,7 @@
 //!   so lookup is a simple string compare without allocation.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/09-string-core-slice.md`](
-//!     ../../../docs/new-engine/tasks/09-string-core-slice.md
-//!   )
-//! - [`docs/new-engine/tasks/10-string-methods-slice.md`](
-//!     ../../../docs/new-engine/tasks/10-string-methods-slice.md
-//!   )
+//! - [Architecture](../../../docs/book/src/engine/architecture.md)
 
 use crate::Value;
 use crate::string::StringHeap;
@@ -172,8 +164,8 @@ pub struct IntrinsicArgs<'a> {
     /// one and only mutator. The dispatch site is single-threaded
     /// and the runtime borrow is scoped to a single
     /// `[[Call]]`-shaped intrinsic body so re-entrancy can't strike
-    /// here. Threaded explicitly per ADR-0005 §3 and task 76A — no
-    /// thread-local heap lookup.
+    /// here. Threaded explicitly through the active mutator context:
+    /// no thread-local heap lookup.
     pub gc_heap: std::cell::RefCell<&'a mut otter_gc::GcHeap>,
 }
 

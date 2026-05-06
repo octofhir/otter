@@ -41,7 +41,7 @@ Repository rules:
 7. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
 8. **Protect the runtime boundary**: do not add dependencies from active crates into parked compatibility shims.
 9. **Prefer build-graph cleanup**: when a slice lands, check whether temporary shims, adapters, or parked code can be simplified immediately.
-10. **Use porting markers for uncertain migrations**: for substantial ports from parked shims or reference implementations, follow `docs/engine-porting-process.md` (`TODO(port)`, `PERF(port)`, `PORT NOTE`, optional `PORT STATUS`).
+10. **Use porting markers for uncertain migrations**: for substantial ports from parked shims or reference implementations, follow `docs/book/src/contributing/porting.md` (`TODO(port)`, `PERF(port)`, `PORT NOTE`, optional `PORT STATUS`).
 
 ## Repository Map (where to change what)
 
@@ -94,7 +94,7 @@ This separation:
 
 ### Intrinsic and Bootstrap Pattern
 
-New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the post-GC descriptor/spec/builder/bootstrap flow tracked in `docs/new-engine/tasks/96-production-js-surface-builders.md`.
+New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the descriptor/spec/builder/bootstrap flow documented in `docs/book/src/extensions/js-surface-builders.md`.
 
 - Add new bootstrap work in `crates-next/otter-vm` / `crates-next/otter-runtime`.
 - Keep global installation centralized; do not scatter ad-hoc global mutation across unrelated modules.
@@ -116,9 +116,9 @@ New ECMAScript builtins, global namespaces, Web API globals, and extension-visib
 
 ### Macro usage
 
-Macros are planned as zero-cost contributor ergonomics after the task-96 static spec / builder backend lands. Do not add macro-first APIs that bypass the builder/bootstrap layer.
+Macros are planned as zero-cost contributor ergonomics over the static spec / builder backend. Do not add macro-first APIs that bypass the builder/bootstrap layer.
 
-Initial post-task-96 macro scope:
+Initial macro scope:
 
 - `#[js_class]` for constructor-backed JS classes
 - `#[js_namespace]` for namespace-style JS objects
@@ -133,7 +133,7 @@ Deferred until their backend APIs are stable:
 
 Rules:
 
-- Macros must generate static specs plus normal Rust functions; they are syntax sugar over task-96 builders, not a parallel runtime registry.
+- Macros must generate static specs plus normal Rust functions; they are syntax sugar over JS surface builders, not a parallel runtime registry.
 - Generated builtins should use the static native function-pointer path by default.
 - Keep exported JS names and arity explicit in the macro declaration. Do not hide API shape in unrelated helper code.
 - If a macro-based API surface changes, update tests, `.d.ts` declarations, and mdBook docs in the same patch when applicable.

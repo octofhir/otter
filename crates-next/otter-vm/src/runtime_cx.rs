@@ -1,4 +1,4 @@
-//! Explicit runtime context per ADR-0005 §3 / task 76A.
+//! Explicit runtime context for VM dispatch and native bindings.
 //!
 //! [`RuntimeCx<'rt>`] is the internal context handed to VM dispatch
 //! and built-in helpers; it bundles the borrow set every algorithm
@@ -14,29 +14,25 @@
 //!
 //! # Why explicit context?
 //!
-//! Pre-task-76A the GC heap was reachable through a thread-default
-//! escape hatch on `GcHeap`. That helper could not prove which
-//! isolate owns a handle once Tokio worker migration enters the
-//! picture, and it hid borrow boundaries from the type system. Per
-//! ADR-0005, every read / write / write-barrier path must know
-//! which isolate owns the object. The explicit-context types are
-//! the type-level expression of that rule.
+//! The GC heap used to be reachable through a thread-default escape hatch on
+//! `GcHeap`. That helper could not prove which isolate owns a handle once
+//! Tokio worker migration enters the picture, and it hid borrow boundaries from
+//! the type system. Every read / write / write-barrier path must know which
+//! isolate owns the object. The explicit-context types are the type-level
+//! expression of that rule.
 //!
-//! # Status (task 77C)
+//! # Status
 //!
-//! The thread-default escape hatch on `GcHeap` was removed in
-//! task 77C; every caller now threads `&GcHeap` / `&mut GcHeap` (or
+//! The thread-default escape hatch on `GcHeap` was removed; every caller now
+//! threads `&GcHeap` / `&mut GcHeap` (or
 //! `&NativeCtx<'_>` / `&mut NativeCtx<'_>` for native bindings)
-//! explicitly. Tasks 78-83 widen the migrated surface to
-//! `JsArray` / `JsMap` / promise / iterator / generator and the
-//! native-binding entry points.
+//! explicitly.
 //!
 //! # Spec
 //!
 //! - <https://tc39.es/ecma262/#sec-agents> (one mutator per agent).
-//! - [`docs/new-engine/adr/0005-async-runtime-binding.md`] §3.
-//! - [`docs/new-engine/tasks/76a-runtime-binding-explicit-context.md`].
-//! - [`docs/new-engine/gc-architecture.md`] §6.2 / §6.3.
+//! - [Event loop](../../../docs/book/src/engine/event-loop.md).
+//! - [GC API](../../../docs/book/src/engine/gc-api.md).
 
 use std::marker::PhantomData;
 
@@ -62,12 +58,6 @@ use crate::Interpreter;
 /// small set of internal helpers may build one. Native bindings
 /// receive [`NativeCtx<'rt>`] (a public view) instead.
 ///
-/// # Migration
-///
-/// Tasks 77-83 progressively replace `JsObject::get(&self, key)`
-/// etc. with `JsObject::get(&self, cx: &RuntimeCx<'_>, key)` so
-/// every property access threads the heap. The constructor here
-/// is the single source of truth for those callers.
 pub(crate) struct RuntimeCx<'rt> {
     /// The interpreter owns the GC heap and every other isolate
     /// resource (string heap, microtask queue, intrinsic

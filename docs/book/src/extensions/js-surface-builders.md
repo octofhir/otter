@@ -3,8 +3,8 @@
 Otter's preferred contributor API for JavaScript-visible surfaces is a
 static spec plus mutator-bound builder flow.
 
-This is the Task 96 API shape. The examples below document the required
-generated/runtime shape. The first production slice is implemented in
+The examples below document the required generated/runtime shape. The first
+production slice is implemented in
 `otter-vm::js_surface` and `otter-vm::bootstrap`; `Math`, `JSON`,
 `Atomics`, and `console` are installed through this path.
 

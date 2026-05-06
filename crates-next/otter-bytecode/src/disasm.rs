@@ -1,10 +1,7 @@
 //! Text disassembler for [`crate::BytecodeModule`].
 //!
-//! Output format is locked by
-//! [`docs/new-engine/specs/bytecode-dump-disasm-trace.md`](
-//!     ../../../docs/new-engine/specs/bytecode-dump-disasm-trace.md
-//!   ) §1. Identical bytecode produces identical text byte-for-byte;
-//! the format is consumed by golden tests.
+//! Identical bytecode produces identical text byte-for-byte; the
+//! format is consumed by golden tests.
 //!
 //! # Contents
 //! - [`disassemble`] — render a whole module to a `String`.

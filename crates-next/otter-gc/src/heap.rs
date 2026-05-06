@@ -534,8 +534,8 @@ impl GcHeap {
         let payload_ptr =
             unsafe { cage_base().add(offset as usize + std::mem::size_of::<GcHeader>()) as *mut T };
         // SAFETY: offset references a freshly-alloc-ed cage
-        // region inside a page we own; bytes are zeroed by
-        // alloc_zeroed at cage init.
+        // region inside a page we own. The header and payload are
+        // fully initialised below before any read.
         unsafe {
             let header = if aligned > LARGE_OBJECT_THRESHOLD {
                 let h = GcHeader::new(T::TYPE_TAG, aligned as u32);
@@ -640,8 +640,9 @@ impl GcHeap {
         let header_ptr = unsafe { cage_base().add(offset as usize) as *mut GcHeader };
         let payload_ptr =
             unsafe { cage_base().add(offset as usize + std::mem::size_of::<GcHeader>()) as *mut T };
-        // SAFETY: freshly-alloc-ed cage region inside a page
-        // we own; bytes are zeroed by alloc_zeroed at cage init.
+        // SAFETY: freshly-alloc-ed cage region inside a page we
+        // own. The header and payload are fully initialised below
+        // before any read.
         unsafe {
             let header = if is_marking {
                 let h = GcHeader::new(T::TYPE_TAG, aligned as u32);

@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 otter-bytecode = { workspace = true }
+otter-compiler = { workspace = true }
 otter-runtime = { workspace = true }
 otter-test = { workspace = true }
 clap = { workspace = true }

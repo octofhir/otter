@@ -1,9 +1,8 @@
 //! Per-test isolation primitives: fresh `Runtime` factory, watchdog
 //! thread + cooperative cancellation, and `catch_unwind` crash trap.
 //!
-//! Per [`docs/new-engine/tasks/100-test262-conformance.md`]
-//! §"Test execution model" the runner allocates a fresh `Runtime`
-//! for every test so a poisoned global cannot leak across tests.
+//! The runner allocates a fresh `Runtime` for every test so a
+//! poisoned global cannot leak across tests.
 //! This module isolates that machinery so the per-test driver in
 //! [`crate::runner`] stays mechanical.
 //!

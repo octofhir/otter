@@ -32,9 +32,7 @@
 //!   and falls back to WTF-16 unescape only inside string literals.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/32-json-stringify-parse.md`](
-//!     ../../../docs/new-engine/tasks/32-json-stringify-parse.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-json-object>
 
 mod parse;
 mod stringify;

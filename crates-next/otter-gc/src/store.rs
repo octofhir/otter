@@ -23,8 +23,7 @@
 //!
 //! # See also
 //!
-//! - [Task 94](../../../docs/new-engine/tasks/94-gc-contributor-api-surface.md)
-//! - [GC architecture plan §6.1](../../../docs/new-engine/gc-architecture.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use crate::compressed::{Gc, RawGc};
 

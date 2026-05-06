@@ -3,7 +3,7 @@
 //! `Op::MathCall` opcodes.
 //!
 //! `Math` is also exposed as a real global namespace through the
-//! task-96 static spec / builder bootstrap flow. The dedicated
+//! static spec / builder bootstrap flow. The dedicated
 //! opcodes remain as a compiler fast path for direct
 //! `Math.<name>(...)` calls, while extracted methods such as
 //! `let abs = Math.abs; abs(-1)` dispatch through static native
@@ -17,9 +17,7 @@
 //!   `VmError`.
 //!
 //! # See also
-//! - [`docs/new-engine/tasks/28-bitwise-and-number-prototype.md`](
-//!     ../../../docs/new-engine/tasks/28-bitwise-and-number-prototype.md
-//!   )
+//! - <https://tc39.es/ecma262/#sec-math-object>
 
 use crate::js_surface::{Attr, ConstSpec, ConstValue, MethodSpec, NamespaceSpec};
 use crate::number::{NumberValue, bitwise};

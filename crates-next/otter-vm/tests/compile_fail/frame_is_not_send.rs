@@ -1,8 +1,7 @@
 //! `Frame` owns register windows and async/generator suspension
 //! state containing `Value`, so parked JS frames must stay on the
 //! isolate thread.
-//!
-//! Spec: task 82 / parked-frame root migration.
+
 
 fn assert_send<T: Send>(_t: T) {}
 

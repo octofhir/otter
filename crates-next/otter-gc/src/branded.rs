@@ -1,6 +1,6 @@
 //! Experimental isolate-branded GC session API.
 //!
-//! Task 93 adds a compile-time brand over the existing page-based
+//! This module adds a compile-time brand over the existing page-based
 //! heap. The brand does not replace the collector backend; it makes
 //! the owning isolate part of the Rust type shape for persistent
 //! roots, weak handles, and mutator sessions.
@@ -25,8 +25,7 @@
 //!
 //! # See also
 //!
-//! - [Task 93](../../../docs/new-engine/tasks/93-gc-branded-session-api.md)
-//! - [GC architecture plan](../../../docs/new-engine/gc-architecture.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use std::marker::PhantomData;
 

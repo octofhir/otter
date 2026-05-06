@@ -3,9 +3,8 @@
 Test262 conformance runner for the new-engine
 [`crates-next/*`](../) Otter stack.
 
-This crate is the foundation-phase replacement for the parked
-[`crates/otter-test262`](../../crates/otter-test262) runner. The
-parked runner speaks the legacy VM ABI and is reference-only.
+This crate speaks the active `otter-runtime` / `otter-vm` ABI and is the
+project's Test262 runner.
 
 ## Status
 
@@ -20,9 +19,6 @@ parked runner speaks the legacy VM ABI and is reference-only.
   sharding (`--shard N/M`), supervisor + cursor persistence.
 - **Slice 105** — GitHub Actions integration, PR-comment template,
   baseline-bump workflow.
-
-See the master plan:
-[`docs/new-engine/tasks/100-test262-conformance.md`](../../docs/new-engine/tasks/100-test262-conformance.md).
 
 ## Quick start
 
@@ -64,8 +60,7 @@ over the config defaults.
 
 ## Safety controls
 
-Per task 100 §"Safety controls", the foundation-phase runner runs
-under three layers of protection (slice 103 onward):
+The runner runs under three layers of protection:
 
 1. **In-engine cooperative cancellation.** Per-test wall-clock
    budget; a watchdog thread trips
@@ -94,5 +89,3 @@ Operator rules (ported from `MEMORY.md`):
 - ECMA-262: <https://tc39.es/ecma262/>
 - Test262 INTERPRETING.md:
   <https://github.com/tc39/test262/blob/main/INTERPRETING.md>
-- ADR-0001:
-  [`docs/new-engine/adr/0001-staging-directory.md`](../../docs/new-engine/adr/0001-staging-directory.md)

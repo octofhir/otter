@@ -1,9 +1,8 @@
 [workspace]
 resolver = "3"
-# Foundation phase (2026-04-26 onward, ADR-0001):
-# the new engine lives in `crates-next/*`. The legacy stack under
-# `crates/*` is reference-only and is intentionally excluded from the
-# workspace build graph.
+# Active engine crates live in `crates-next/*`. The legacy stack under
+# `crates/*` is reference-only or product-specific and is intentionally
+# excluded from the workspace build graph.
 members = [
     "crates-next/otter-bytecode",
     "crates-next/otter-syntax",

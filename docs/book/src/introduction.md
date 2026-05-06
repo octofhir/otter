@@ -4,18 +4,11 @@ This book is the contributor-facing guide for Otter's active new engine.
 It explains how to extend the runtime without copying internals from task
 files, parked crates, or raw GC adapters.
 
-Use these sources together:
+Use this book for stable contributor workflows and examples. Repository rules
+for coding agents live in [`AGENTS.md`](../../../AGENTS.md).
 
-- this book: stable contributor workflows and examples;
-- [`docs/new-engine/tasks/`](../../new-engine/tasks/README.md):
-  implementation slices, current migration state, and closeout notes;
-- [`docs/new-engine/adr/`](../../new-engine/adr/): accepted architecture
-  decisions;
-- [`AGENTS.md`](../../../AGENTS.md): repository rules for coding agents.
-
-Task files are not the long-term API manual. When a contributor-facing API
-stabilizes, move the workflow here and leave the task file as historical
-context.
+Historical task and ADR files are intentionally excluded from the living docs.
+When a contributor-facing API stabilizes, its workflow belongs here.
 
 ## Local Build
 
@@ -33,5 +26,4 @@ cargo test -p otter-gc
 ```
 
 If `mdbook` is not installed, install it with normal Rust tooling outside
-this repository. CI wiring is tracked in
-[`Task 95`](../../new-engine/tasks/95-contributor-book-and-extension-guides.md).
+this repository.

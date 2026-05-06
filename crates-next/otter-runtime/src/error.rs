@@ -4,7 +4,7 @@
 //! surfaces. It is `#[non_exhaustive]`, derives
 //! [`thiserror::Error`] + [`serde::Serialize`] /
 //! [`serde::Deserialize`], and serializes to a stable JSON wire
-//! format (see ADR-0003 §3.7).
+//! format.
 //!
 //! # Contents
 //! - [`OtterError`] — top-level error enum.
@@ -14,8 +14,8 @@
 //! - [`OtterError::to_json`] — convenience for CLI `--json` output.
 //!
 //! # Invariants
-//! - The wire format is locked by ADR-0003 §3.7. Renaming or
-//!   removing fields requires a `error_schema_version` bump.
+//! - Renaming or removing serialized fields requires an
+//!   `error_schema_version` bump.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -130,8 +130,7 @@ impl OtterError {
         }
     }
 
-    /// Serialize to stable JSON wire format
-    /// (see ADR-0003 §3.7).
+    /// Serialize to stable JSON wire format.
     ///
     /// # Errors
     /// Returns [`serde_json::Error`] if serialization fails (none of
@@ -159,7 +158,7 @@ impl OtterError {
         Ok(s)
     }
 
-    /// Recommended CLI exit code per ADR-0003 §4.
+    /// Recommended CLI exit code.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {

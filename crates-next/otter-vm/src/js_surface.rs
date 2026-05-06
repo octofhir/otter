@@ -1,6 +1,6 @@
 //! Static JavaScript surface specs and mutator-bound builders.
 //!
-//! This module is the task-96 backend for JavaScript-visible
+//! This module is the backend for JavaScript-visible
 //! namespaces, functions, constructors, classes, accessors, and data
 //! properties. Contributors describe exported names, arity, native
 //! call targets, and attributes in static records; builders install
@@ -29,9 +29,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-property-attributes>
 //! - <https://tc39.es/ecma262/#sec-ecmascript-function-objects>
-//! - [`docs/new-engine/tasks/96-production-js-surface-builders.md`](
-//!     ../../../docs/new-engine/tasks/96-production-js-surface-builders.md
-//!   )
+//! - [JS surface builders](../../../docs/book/src/extensions/js-surface-builders.md)
 
 use std::marker::PhantomData;
 use std::rc::Rc;

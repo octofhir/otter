@@ -3,14 +3,8 @@
 Macros are contributor ergonomics over the static JS surface backend, not a
 separate runtime registration system.
 
-The required order is:
-
-1. task 96 lands static specs, mutator-bound builders, and centralized
-   bootstrap;
-2. task 97 adds macros that generate those static specs and normal Rust
-   functions;
-3. task 98 protects startup and first-run performance with benchmark
-   ratchets.
+Macros sit on top of static specs, mutator-bound builders, centralized
+bootstrap, and startup/first-run benchmark ratchets.
 
 Macros must be zero-cost at runtime. Generated code should look like
 handwritten static specs:
@@ -29,7 +23,7 @@ static MATH_SPEC: NamespaceSpec = NamespaceSpec {
 };
 ```
 
-The available Task 97 slice is in `otter-macros`:
+The available macro surface is in `otter-macros`:
 
 - `#[js_namespace]` generates namespace specs from inline Rust modules;
 - `#[js_class]` generates constructor/prototype class specs;
@@ -50,7 +44,7 @@ mod math {
 ```
 
 The macro emits a public `MATH_SPEC: NamespaceSpec` and private static
-method metadata that can be passed to the Task 96 builders or installed by
+method metadata that can be passed to the JS surface builders or installed by
 the centralized bootstrap registry.
 
 `#[js_class]` separates ordinary instance methods from JavaScript static
@@ -120,7 +114,7 @@ concerns are the main behavior.
 
 Macro expansion must produce:
 
-- static spec records from Task 96;
+- static spec records;
 - ordinary Rust functions with explicit exported JS names and arity;
 - static native call targets for builtins by default;
 - builder/bootstrap calls through the centralized registry.
@@ -166,7 +160,7 @@ static MATH_SPEC: NamespaceSpec = NamespaceSpec {
 };
 ```
 
-Keep manual Task 96 specs for capability gates, delicate bootstrap order,
+Keep manual specs for capability gates, delicate bootstrap order,
 async scheduling, host-owned object lifetimes, or API shapes not covered by
 the current macros.
 

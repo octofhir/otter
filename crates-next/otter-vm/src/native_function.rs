@@ -33,8 +33,8 @@
 //!   every hidden JS value.
 //!
 //! # See also
-//! - [GC architecture plan §4.1](../../../docs/new-engine/gc-architecture.md)
-//! - [Task 83](../../../docs/new-engine/tasks/83-migrate-bound-native-regexp.md)
+//! - [GC API](../../../docs/book/src/engine/gc-api.md)
+//! - [Native bindings](../../../docs/book/src/extensions/native-bindings.md)
 
 use std::rc::Rc;
 use std::sync::Arc;

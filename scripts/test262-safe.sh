@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Safety wrapper around `otter-test262 run`.
 #
-# Three layers per docs/new-engine/tasks/100-test262-conformance.md
-# §"Safety controls":
+# Three safety layers:
 #   1. In-engine cooperative cancellation (`--timeout`).
 #   2. Per-test heap cap (`--max-heap-bytes`).
 #   3. OS virtual-memory cap (`ulimit -v`, Linux).

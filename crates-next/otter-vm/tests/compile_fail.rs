@@ -1,9 +1,7 @@
 //! Compile-fail fixtures proving the VM / GC handle types are
 //! `!Send + !Sync` and so cannot be captured by Tokio futures.
 //!
-//! Per ADR-0005 §3 ("Stability and early detection are required
-//! features") and task 76A.5, the new-engine VM must reject these
-//! shapes at compile time:
+//! The active VM must reject these shapes at compile time:
 //!
 //! - capturing `Gc<T>` in `tokio::spawn`;
 //! - capturing `Local<'gc, T>` in `tokio::spawn`;
@@ -14,9 +12,7 @@
 //! whose `cargo build` must fail — the canonical [`trybuild`]
 //! harness checks for the expected error.
 //!
-//! Spec / source:
-//! - [`docs/new-engine/adr/0005-async-runtime-binding.md`] §6.
-//! - [`docs/new-engine/tasks/76a-runtime-binding-explicit-context.md`] §5.
+//! See the mdBook event-loop and GC API chapters for the runtime boundary.
 
 #[test]
 fn compile_fail_send_sync_invariants() {

@@ -23,7 +23,6 @@
 //!   (the loader itself is stateless).
 //!
 //! # See also
-//! - [task 36a](../../docs/new-engine/tasks/36a-modules-graph-and-live-bindings.md)
 //! - <https://tc39.es/ecma262/#sec-hostloadimportedmodule>
 //!   — the host-defined module-loading hook this struct backs.
 

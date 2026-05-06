@@ -5,7 +5,7 @@
 - [x] Phase 1 — page-based generational GC + pointer compression + card table + black alloc + DevTools snapshot + per-type migration (tasks 71–84)
   - [x] 71–84 — Phase 1 closed 2026-05-06; see [`task84-array-sweep.md`](../test262-baseline/task84-array-sweep.md) for the closeout Array sweep baseline.
 - [x] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
-- [ ] Workers / isolate pools (task 92)
+- [x] Workers / isolate pools (task 92)
 - [ ] Compile-time GC safety hardening (task 93)
 - [ ] Contributor-facing GC/VM API surface (task 94)
 - [ ] Contributor book / plugin and macro guide (task 95)
@@ -52,7 +52,7 @@ later tasks assume earlier ones have landed.
 | # | File | One-line goal |
 |---|------|---------------|
 | 85 | ✅ closed (2026-05-06) | Tokio-first `EventLoop` trait + default `TokioEventLoop`; public `Otter` / `RuntimeHandle` are `Send + Sync`; isolate runner owns the `!Send` VM and GC. |
-| 92 | [92-worker-isolates-and-structured-clone.md](./92-worker-isolates-and-structured-clone.md) | Worker isolates and isolate pools; no GC handle crosses worker boundaries; communication via structured clone / transferables. |
+| 92 | ✅ closed (2026-05-06) | Worker isolates and isolate pools; current GC handles cannot cross worker boundaries; communication payload shape is owned structured clone / transfer-list metadata. Branded `Root` / `Weak` / `GcSession` follow-up moved to task 93. |
 | 93 | [93-gc-branded-session-api.md](./93-gc-branded-session-api.md) | Compile-time-branded GC session/root/weak API inspired by Oscars/gc-arena: cross-isolate and stale-GC-context misuse should fail to compile, not rely on runtime discipline. |
 | 94 | [94-gc-contributor-api-surface.md](./94-gc-contributor-api-surface.md) | Clean safe GC/VM API for engine contributors and extension authors: V8-style handle tiers, Boa-style derive ergonomics, Otter-branded safety, and narrow unsafe internals. |
 | 95 | [95-contributor-book-and-extension-guides.md](./95-contributor-book-and-extension-guides.md) | mdBook contributor guide covering engine architecture, GC API, hosted modules, JS surface builders, startup performance, future plugin system, and macros. |

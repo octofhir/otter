@@ -30,6 +30,8 @@ pub mod event_loop;
 pub mod handle;
 pub mod module_graph;
 pub mod module_loader;
+pub mod structured_clone;
+pub mod worker;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,6 +49,15 @@ pub use event_loop::{
     TimerRequest, TimerToken, TokioEventLoop,
 };
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
+pub use structured_clone::{
+    StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
+    StructuredCloneProperty, StructuredCloneTransfer, StructuredCloneTransferId,
+    StructuredCloneTransferKind, StructuredCloneTransferList, StructuredCloneTransferListError,
+    StructuredCloneValue,
+};
+pub use worker::{
+    OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
+};
 
 /// Default heap cap (256 MiB) when none is configured.
 pub const DEFAULT_MAX_HEAP_BYTES: u64 = 256 * 1024 * 1024;

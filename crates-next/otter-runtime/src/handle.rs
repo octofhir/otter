@@ -559,6 +559,12 @@ impl RuntimeHandle {
         }
     }
 
+    /// Number of public handle clones still referencing this isolate.
+    #[must_use]
+    pub fn live_handle_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
     /// Run a future on the backing Tokio runtime for sync callers.
     pub(crate) fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         self.inner.event_loop.block_on(future)

@@ -9,6 +9,9 @@
 - [ ] weak upgrade requires a matching session/context
 - [ ] compile-fail tests reject cross-isolate roots, weak upgrades,
       worker messages, and native closures
+- [ ] task-92 worker follow-up covered: `Root<'iso, T>`,
+      `Weak<'iso, T>`, and `GcSession<'_, '_>` cannot cross worker
+      boundaries or be dereferenced through another worker's brand
 - [ ] migration guidance written for tasks 85, 92, and future FFI work
 - [ ] gates green
 
@@ -32,6 +35,14 @@ on top of the current V8/JSC-shaped collector:
 - `Weak` upgrade only through a matching context;
 - persistent roots tied to the owning isolate, not to thread-local state;
 - compile-fail tests for cross-isolate, worker, async, and FFI misuse.
+
+Task 92 already closed the currently available worker boundary:
+structured-clone payloads are owned/sendable, worker isolates do not
+share VM/GC state, and compile-fail fixtures reject `Gc<T>`,
+`Local<'gc, T>`, internal `Value`, and `NativeCtx<'_>` as worker
+messages. This task owns the remaining branded worker proof obligations
+because it introduces `Root<'iso, T>`, `Weak<'iso, T>`, and
+`GcSession<'iso, 'gc>`.
 
 The collector backend stays Otter's page-based generational heap. Do not
 replace it with Oscars' mark-sweep arena prototype.
@@ -156,6 +167,8 @@ Add trybuild fixtures that prove:
   for persistence across a safepoint, async boundary, or worker queue.
 - [ ] No product-code thread-local heap lookup is reintroduced.
 - [ ] Worker task 92 gates still hold after branded roots land.
+- [ ] Worker-boundary compile-fail tests cover `Root<'iso, T>`,
+  `Weak<'iso, T>`, and `GcSession<'_, '_>` after those types exist.
 
 ## Closing
 

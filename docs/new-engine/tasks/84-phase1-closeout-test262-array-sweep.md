@@ -8,7 +8,7 @@
 - [x] full `cargo test --workspace` green
 - [x] runtime binding safety gates from task 76A remain green
 - [x] documentation updates
-- [ ] gates green
+- [x] gates green
 
 ## Goal
 
@@ -78,24 +78,27 @@ NF3, §7.4 (repro harness), §8 Phase 1 exit criteria.
 
 ### Functional correctness
 
-- [ ] `bash scripts/test262-safe.sh built-ins/Array` reaches
+- [x] `bash scripts/test262-safe.sh built-ins/Array` reaches
   completion; pass rate documented in
   `docs/new-engine/test262-baseline/`. The task-84 baseline is
   recorded in `task84-array-sweep.json` / `task84-array-sweep.md`:
-  3083 tests, 517 pass, 2338 fail, 227 skip, 0 timeout, 1
-  in-engine OOM, 0 crash, peak host RSS 791936 KiB (~774 MiB).
+  3083 tests, 517 pass, 2339 fail, 227 skip, 0 timeout, 0
+  in-engine OOM, 0 crash, peak host RSS 791936 KiB (~774 MiB)
+  from the pre-fix external process-tree measurement. A sandboxed
+  `/usr/bin/time -l` rerun completed but could not report RSS
+  because `sysctl kern.clockrate` was denied.
 - [ ] **Full test262 corpus** runs to completion across all
   built-ins/* and language/* (not just Array). Per-test heap cap
   honoured.
-- [ ] `cargo test --workspace --all-features` green.
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
-- [ ] `cargo fmt --all` clean.
-- [ ] `cargo run -p otter-cli -- test --suite engine` green.
-- [ ] No `Rc<RefCell<…>>` survives in `crates-next/otter-vm/src`
+- [x] `cargo test --workspace` green.
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
+- [x] `cargo fmt --all` clean.
+- [x] `cargo run -p otter-cli -- test --suite engine` green.
+- [x] No `Rc<RefCell<…>>` survives in `crates-next/otter-vm/src`
   inside any `Value`-variant body (`grep -rn "Rc<RefCell" crates-next/otter-vm/src`
   zero relevant hits; Shape / module URL strings exempted).
-- [ ] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm crates-next/otter-runtime` returns no product-code hits.
-- [ ] Compile-fail suite proves `Gc<T>`, `Local<'gc, T>`, `NativeCtx`,
+- [x] `rg "with_thread_default|enter_thread_default|install_thread_default" crates-next/otter-vm crates-next/otter-runtime` returns no product-code hits.
+- [x] Compile-fail suite proves `Gc<T>`, `Local<'gc, T>`, `NativeCtx`,
   `RuntimeState`, `Frame`, and internal `Value` cannot cross
   `tokio::spawn` / `.await`.
 

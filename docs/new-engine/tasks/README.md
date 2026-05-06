@@ -371,24 +371,16 @@ and unblocks the test sweep. Phase 2 (86) lights up incremental
 marking on the same barrier insertion sites. Phase 3 (87) is
 deferred indefinitely.
 
+✅ Phase complete (2026-05-06) — see the
+[task 84 Array sweep baseline](../test262-baseline/task84-array-sweep.md).
+Runtime binding is now closed by
+[task 85](./85-tokio-event-loop-runtime-handle.md). Next GC work is
+[task 86](./86-gc-incremental-marking.md).
+
 | File | One-line goal |
 |------|---------------|
 | [70-gc-master-tracker.md](./70-gc-master-tracker.md) | Master tracker; all phases checklisted in one place. |
-| ✅ 71 (closed 2026-05-02) | New `crates-next/otter-gc` empty crate; ADR-0004 amends ADR-0001 §5 to lift `forbid(unsafe_code)` for this crate only. |
-| ✅ 72 (closed 2026-05-04) | Page heap: `GcHeader`, `Page`, semispace + old-space + LOS, Cheney scavenger, tri-color marking, generational + insertion barriers, type-tag fn-ptr trace table, `Gc<T>`/`Local<'gc, T>`/`HandleScope<'gc>`. |
-| ✅ 73 (closed 2026-05-04) | `OutOfMemory::HeapCapExceeded` payload + `GcHeap::with_max_heap_bytes` + retry-once-then-fail emergency-collect path; `Runtime::max_heap_bytes` plumbed end-to-end. |
-| ✅ 74 (closed 2026-05-04) | `GcStats` per-tag counters fused into the alloc fast path + sweep walk; `HeapSnapshot` + retained-size walker + `group_by_type`; `Runtime::heap_stats` / `heap_snapshot` / `force_gc` API. |
-| ✅ 75 (closed 2026-05-04) | `RuntimeState::trace_roots` central walker; `GcTrace` stubs on every future-`Gc` value-model type (UpvalueCell / JsObject / JsArray / JsMap+Set / JsWeakMap+Set / JsPromiseHandle / IteratorState / JsGenerator / BoundFunction / NativeFunction / JsRegExp / Frame / AsyncFrameState / Microtask / JsSymbol / SymbolRegistry / WellKnownSymbols / ErrorClassRegistry); `Runtime::force_gc` invokes the walker; per-root smoke coverage now runs through `crates-next/otter-vm/tests/gc_phase1_regressions.rs`. |
-| ✅ 76 (closed 2026-05-04) | First per-type migration: `UpvalueCell` is now `Gc<UpvalueCellBody>` (4-byte compressed offset, `Copy`) backed by `otter_gc::SafeTraceable`; new GC APIs `alloc_old` / `with_payload` / `read_payload` / `write_barrier_raw`; `GcHeap` moved into `Interpreter` (Runtime delegates); `Frame::for_function_with_heap` + `Frame::build_upvalues` for the entry / call paths; `Op::MakeClosure` / `Op::LoadUpvalue` / `Op::StoreUpvalue` route through `alloc_upvalue` / `read_upvalue` / `store_upvalue`; `Value::trace_value_slots` walks closure upvalue spines; upvalue smoke test un-ignored; `gc_upvalue_cycle::counter_closure_no_leak_after_force_gc` regression. |
-| [76a-runtime-binding-explicit-context.md](./76a-runtime-binding-explicit-context.md) | Blocking cleanup before 77: explicit context for heap/barrier/native access; thread-local heap lookup is not a product-code API. |
-| [77-migrate-jsobject.md](./77-migrate-jsobject.md) | `JsObject` to `Gc<ObjectBody>`; barriers on every property store. |
-| [78-migrate-jsarray.md](./78-migrate-jsarray.md) | `JsArray` to `Gc<ArrayBody>`; barriers on element / named-prop stores. |
-| [79-migrate-jsmap-jsset.md](./79-migrate-jsmap-jsset.md) | `JsMap` / `JsSet` to `Gc<…>`; barriers on entry stores. |
-| ✅ 80 (closed 2026-05-05) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes long-standing "task 57" markers). |
-| [81-weakref-finalization-registry.md](./81-weakref-finalization-registry.md) | Introduce `WeakRef` and `FinalizationRegistry`. |
-| [82-migrate-promise-iterator-generator.md](./82-migrate-promise-iterator-generator.md) | `JsPromiseHandle::Pure`, `IteratorState`, generator-frame state. |
-| [83-migrate-bound-native-regexp.md](./83-migrate-bound-native-regexp.md) | `BoundFunction`, `NativeFunction`, `JsRegExp` — last `Rc`-shared variants. |
-| [84-phase1-closeout-test262-array-sweep.md](./84-phase1-closeout-test262-array-sweep.md) | Phase 1 exit criteria: regression suite + cap-as-`RangeError` + `bash scripts/test262-safe.sh built-ins/Array` end-to-end on a 16 GB host. |
+| ✅ 71–84 (closed 2026-05-06) | Phase 1 complete: page heap + handles, cap enforcement, stats/snapshot, root enumeration, per-type `Gc<T>` migrations, weak/finalization semantics, consolidated GC regressions, cap-as-`RangeError`, runtime binding audit, and `built-ins/Array/` Test262 closeout baseline ([snapshot](../test262-baseline/task84-array-sweep.md)). |
 | [86-gc-incremental-marking.md](./86-gc-incremental-marking.md) | Phase 2 — incremental marking + concurrent sweep + incremental sweep + allocation-site pretenuring. Phase-1 barriers go load-bearing; no new audit sweep. |
 | [88-gc-mark-compact.md](./88-gc-mark-compact.md) | Phase 3 — sliding compactor for old-gen fragmentation. |
 | [89-gc-memory-reducer-idle-gc.md](./89-gc-memory-reducer-idle-gc.md) | Phase 3 — `Runtime::notify_idle` + memory-reducer state machine; matches V8 MemoryReducer. |
@@ -430,7 +422,7 @@ runtime is handle-first and Tokio-first: `Otter` / `RuntimeHandle` are
 
 | File | One-line goal |
 |------|---------------|
-| [85-tokio-event-loop-runtime-handle.md](./85-tokio-event-loop-runtime-handle.md) | `EventLoop` trait + required `TokioEventLoop` default; public async `Otter` facade; isolate runner; cancellation, timeout, backpressure, and leak diagnostics. |
+| ✅ [85-tokio-event-loop-runtime-handle.md](./85-tokio-event-loop-runtime-handle.md) | Closed 2026-05-06: `EventLoop` trait + required `TokioEventLoop` default; public async `Otter` facade; isolate runner; cancellation, timeout, backpressure, and activity diagnostics. |
 | [92-worker-isolates-and-structured-clone.md](./92-worker-isolates-and-structured-clone.md) | Workers and isolate pools. Each worker owns its own heap; communication crosses workers only through structured clone / transferables. |
 
 ### Test262 conformance

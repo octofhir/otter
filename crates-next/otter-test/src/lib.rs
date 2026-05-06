@@ -342,8 +342,8 @@ fn run_fixture(path: &Path, display: &str) -> TestRecord {
     let expected_exit = metadata.expect.exit_code.unwrap_or(0);
     let display_name = metadata.name.clone().unwrap_or_else(|| display.to_string());
 
-    let mut otter = Otter::new();
-    let outcome = match otter.run_file(path) {
+    let otter = Otter::new();
+    let outcome = match otter.blocking_run_file(path) {
         Ok(_) => {
             if expected_exit == 0 {
                 Outcome::Passed

@@ -39,6 +39,7 @@ pub mod binary;
 pub mod boolean_prototype;
 pub mod collections;
 pub mod collections_prototype;
+pub mod console;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod error_classes;
@@ -2502,7 +2503,7 @@ impl Interpreter {
                         crate::promise::PromiseState::Rejected(reason) => {
                             return Err((
                                 VmError::Uncaught {
-                                    value: reason.display_string(),
+                                    value: render_thrown_value(&reason, &self.gc_heap),
                                 },
                                 Vec::new(),
                             ));
@@ -3448,10 +3449,8 @@ impl Interpreter {
                         // reads.
                         _ => {
                             let idx = match &idx_value {
-                                Value::Number(n) => match n.as_smi() {
-                                    Some(v) if v >= 0 => v as usize,
-                                    _ => return Err(VmError::TypeMismatch),
-                                },
+                                Value::Number(n) => crate::array::index_from_number(*n)
+                                    .ok_or(VmError::TypeMismatch)?,
                                 _ => return Err(VmError::TypeMismatch),
                             };
                             match recv {
@@ -3497,12 +3496,11 @@ impl Interpreter {
                             );
                         }
                         // Numeric-indexed array write.
-                        (Value::Array(arr), Value::Number(n)) => match n.as_smi() {
-                            Some(v) if v >= 0 => {
-                                crate::array::set(*arr, &mut self.gc_heap, v as usize, value)?
-                            }
-                            _ => return Err(VmError::TypeMismatch),
-                        },
+                        (Value::Array(arr), Value::Number(n)) => {
+                            let idx =
+                                crate::array::index_from_number(*n).ok_or(VmError::TypeMismatch)?;
+                            crate::array::set(*arr, &mut self.gc_heap, idx, value)?;
+                        }
                         // §10.4.5.14 IntegerIndexedElementSet — out-of-
                         // range indices silently no-op; element-type /
                         // value-type mismatches raise TypeError.
@@ -7404,7 +7402,7 @@ impl Interpreter {
                 crate::promise::PromiseState::Fulfilled(v) => v,
                 crate::promise::PromiseState::Rejected(reason) => {
                     return Err(VmError::Uncaught {
-                        value: reason.display_string(),
+                        value: render_thrown_value(&reason, &self.gc_heap),
                     });
                 }
                 crate::promise::PromiseState::Pending => Value::Undefined,
@@ -8730,6 +8728,7 @@ fn build_global_this(gc_heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_g
         crate::object::set(placeholder, gc_heap, "prototype", Value::Object(proto));
         crate::object::set(obj, gc_heap, name, Value::Object(placeholder));
     }
+    crate::console::install(obj, gc_heap)?;
     Ok(obj)
 }
 

@@ -2,23 +2,48 @@
 
 ## Status
 
-- [ ] open after GC Phase 1 safety gates needed by async roots are green
+- [x] open after GC Phase 1 safety gates needed by async roots are green
       (tasks 76A, 77-84)
-- [ ] `EventLoop` trait added to `otter-runtime`
-- [ ] `TokioEventLoop` default implementation added and documented
-- [ ] public `Otter` facade is `Clone + Send + Sync`
-- [ ] `RuntimeHandle` command/completion API implemented
-- [ ] isolate runner owns `RuntimeCore` / VM / `GcHeap` on one mutator
-- [ ] runtime inbox separates commands, host completions, timers, interrupts,
+- [x] `EventLoop` trait added to `otter-runtime`
+- [x] `TokioEventLoop` default implementation added and documented
+- [x] public `Otter` facade is `Clone + Send + Sync`
+- [x] `RuntimeHandle` command/completion API implemented
+- [x] isolate runner owns `RuntimeCore` / VM / `GcHeap` on one mutator
+- [x] runtime inbox separates commands, host completions, timers, interrupts,
       and diagnostics
-- [ ] event-loop drive APIs cover one tick, run-to-idle, and run-until-promise
-- [ ] async `run_*` APIs work from Tokio multi-thread executor
-- [ ] timers, host ops, dynamic module work, and promise settlement obey
+- [x] event-loop drive APIs cover one tick, run-to-idle, and run-until-promise
+- [x] async `run_*` APIs work from Tokio multi-thread executor
+- [x] timers, host ops, dynamic module work, and promise settlement obey
       deterministic turn/checkpoint semantics
-- [ ] cancellation, timeout, backpressure, ref/unref, and leak diagnostics
+- [x] cancellation, timeout, backpressure, ref/unref, and leak diagnostics
       covered
-- [ ] activity stats / op metrics available for tests and debug tooling
-- [ ] gates green
+- [x] activity stats / op metrics available for tests and debug tooling
+- [x] gates green
+
+## Progress Notes
+
+- 2026-05-06: first runtime-binding slice landed on the active stack.
+  `otter-runtime` now owns an `EventLoop` trait, a Tokio default
+  implementation, and a cloneable `RuntimeHandle` that sends owned
+  commands to a dedicated isolate runner thread. The runner constructs and
+  owns the local `Runtime` / VM / `GcHeap`; public async results render
+  completion values to strings at the isolate boundary instead of exposing
+  internal VM handles.
+- 2026-05-06: `Otter` is now a cloneable handle facade with async
+  `run_file`, `run_module`, `run_script`, `run_typescript`, and `eval`,
+  plus thin blocking wrappers for CLI and existing sync callers. Tokio
+  multi-thread tests cover clone-and-run serialization through the handle.
+- 2026-05-06: closeout slice split the runtime inbox into command,
+  host-completion, timer, dynamic-module, diagnostic, interrupt, and
+  shutdown messages; added runner drive primitives, Tokio-backed timer
+  cancellation, command timeouts via direct interrupt flags, bounded-queue
+  backpressure, and activity counters by work kind. Tokio-specific timer
+  task storage lives only in `TokioEventLoop`; `RuntimeHandle` carries
+  owned tokens/completions and does not hold executor locks.
+- JS-visible timer globals and async host APIs are consumers of this
+  boundary, not reopened runtime-binding blockers. Their future promise
+  resolution paths must enter through the task-85 inbox message kinds and
+  then drain the VM microtask queue on the isolate turn.
 
 ## Goal
 
@@ -332,39 +357,39 @@ Add stress modes:
 
 ## Validation gates
 
-- [ ] `Otter` and `RuntimeHandle` satisfy `Send + Sync`; `RuntimeCore`,
+- [x] `Otter` and `RuntimeHandle` satisfy `Send + Sync`; `RuntimeCore`,
   `RuntimeState`, `Interpreter`, `GcHeap`, `Gc<T>`, `Local<'gc, T>`,
   `RuntimeCx<'_>`, and `NativeCtx<'_>` do not.
-- [ ] Compile-fail test proves `Value`, `Frame`, `Gc<T>`, `Local<'gc, T>`,
+- [x] Compile-fail test proves `Value`, `Frame`, `Gc<T>`, `Local<'gc, T>`,
   `RuntimeCx<'_>`, and `NativeCtx<'_>` cannot be captured by a
   `tokio::spawn` host future.
-- [ ] Tokio multi-thread test: clone `Otter`, call `tokio::spawn` from
+- [x] Tokio multi-thread test: clone `Otter`, call `tokio::spawn` from
   multiple tasks, verify runs serialize correctly and all results return.
-- [ ] `run_until_promise` test: target promise resolves only while event
+- [x] `run_until_promise` test: target promise resolves only while event
   loop is being driven; if loop idles with promise pending, returns a
   structured error.
-- [ ] `poll_one_tick` deterministic-order tests for command, timer,
+- [x] `poll_one_tick` deterministic-order tests for command, timer,
   host-op completion, microtask checkpoint, and nested microtask enqueue.
-- [ ] Timer tests cover timeout, interval, cancellation, and ref/unref
+- [x] Timer tests cover timeout, interval, cancellation, and ref/unref
   liveness.
-- [ ] Dynamic import / top-level await tests use the same event-loop drive
+- [x] Dynamic import / top-level await tests use the same event-loop drive
   model as host ops.
-- [ ] Cancellation test: drop the waiting future while the isolate is
+- [x] Cancellation test: drop the waiting future while the isolate is
   running; isolate reaches a consistent safepoint and later commands work.
-- [ ] Timeout test: timeout rejects/returns `OtterError::Timeout`, no
+- [x] Timeout test: timeout rejects/returns `OtterError::Timeout`, no
   leaked pending host op / timer.
-- [ ] Backpressure test: bounded queue refuses or awaits when full.
-- [ ] Leak report test: intentionally leak a timer/host op and assert the
+- [x] Backpressure test: bounded queue refuses or awaits when full.
+- [x] Leak report test: intentionally leak a timer/host op and assert the
   diagnostic identifies id, kind, liveness, and origin.
-- [ ] Activity stats test: counters for dispatched/completed/failed ops and
+- [x] Activity stats test: counters for dispatched/completed/failed ops and
   ref/unref pending work update correctly.
-- [ ] Stress-GC tests green in all async stress modes.
-- [ ] Startup and steady-state benchmarks show the handle/event-loop layer
+- [x] Stress-GC tests green in all async stress modes.
+- [x] Startup and steady-state benchmarks show the handle/event-loop layer
   does not regress sync script execution beyond an approved budget.
-- [ ] `cargo test -p otter-runtime -p otter-vm -p otter-gc` green.
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [x] `cargo test -p otter-runtime -p otter-vm -p otter-gc` green.
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   clean.
-- [ ] mdBook documents how the event loop is driven and how contributors
+- [x] mdBook documents how the event loop is driven and how contributors
   write async host ops safely.
 
 ## Closing

@@ -4,7 +4,12 @@ Otter's public runtime is handle-first and async-friendly, but one isolate
 still owns one VM, one runtime state, and one GC heap. The public handle may
 be `Send + Sync`; the isolate internals are not.
 
-The production event-loop model is tracked in task 85.
+The production event-loop boundary landed in task 85. Deno's
+`JsRuntime` shape is the closest reference: the runtime itself stays
+local to one isolate, while embedders drive it with one-tick and
+run-to-idle style APIs. Boa's job model is the smaller ECMA-262
+reference: promise, timeout, native async, and generic jobs run only
+when no execution context is active and each job runs to completion.
 
 ## Runtime Layers
 
@@ -33,6 +38,10 @@ A runtime turn runs JS work on the mutator, performs a microtask checkpoint,
 then folds host completions into the runtime inbox according to the selected
 drive mode.
 
+Tokio-specific state belongs in `TokioEventLoop`. Runtime handles carry
+owned command payloads, timer tokens, and completion records; they do not
+hold VM values, GC handles, or executor locks.
+
 ## Drive Modes
 
 The runner should support deterministic drive modes:
@@ -59,6 +68,24 @@ Native async APIs must split at the runtime boundary:
 Never move `RuntimeCx`, `NativeCtx`, `Value`, `Frame`, `Gc<T>`,
 `Local<'gc, T>`, or handle scopes into a Rust future.
 
+Host operations follow this concrete pattern:
+
+```rust
+let handle = otter.handle().clone();
+handle.spawn_host_op(RuntimeLiveness::Ref, Box::pin(async move {
+    // Owned host data only. No VM/GC handles here.
+    HostOpCompletion {
+        id: 0, // RuntimeHandle assigns the final id before posting.
+        kind: "example".to_string(),
+        result: Ok("done".to_string()),
+    }
+}));
+```
+
+The isolate runner receives the completion as a runtime inbox message on a
+later turn, then performs the JS-side resolution/checkpoint work on the
+mutator thread.
+
 ## Liveness And Diagnostics
 
 Timers and host ops have ref/unref liveness. Referenced work keeps
@@ -68,3 +95,7 @@ being driven but must not keep the runtime alive by itself.
 Contributor tests should be able to inspect activity stats: pending
 commands, timers, host ops, dynamic module jobs, microtasks, cancellations,
 timeouts, and leaked work at shutdown.
+
+`RuntimeHandle::activity_stats()` exposes cheap aggregate counters for this
+purpose. Detailed tracing should stay opt-in so native dispatch and script
+startup keep their steady-state cost.

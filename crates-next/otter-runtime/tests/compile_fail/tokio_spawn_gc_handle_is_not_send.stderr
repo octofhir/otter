@@ -1,0 +1,23 @@
+error: future cannot be sent between threads safely
+ --> tests/compile_fail/tokio_spawn_gc_handle_is_not_send.rs:6:5
+  |
+6 | /     tokio::spawn(async move {
+7 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+8 | |         std::hint::black_box(handle);
+9 | |     });
+  | |______^ future created by async block is not `Send`
+  |
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_gc_handle_is_not_send.rs:6:18: 6:28}`, the trait `Send` is not implemented for `*const ()`
+note: captured value is not `Send`
+ --> tests/compile_fail/tokio_spawn_gc_handle_is_not_send.rs:8:30
+  |
+8 |         std::hint::black_box(handle);
+  |                              ^^^^^^ has type `Gc<()>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+ --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+  |
+  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+  |            ----- required by a bound in this function
+  |     where
+  |         F: Future + Send + 'static,
+  |                     ^^^^ required by this bound in `spawn`

@@ -48,6 +48,7 @@ clap                = { version = "4", features = ["derive"] }
 miette              = { version = "7", features = ["fancy"] }
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+tokio               = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 # Collections / utilities.
 smallvec    = "1"

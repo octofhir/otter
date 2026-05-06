@@ -70,7 +70,7 @@ fn runtime_array_cap_is_catchable_as_range_error() {
     let result = runtime
         .run_script(source, "<script>")
         .expect("script should catch heap cap as RangeError");
-    assert_eq!(result.completion.as_boolean(), Some(true));
+    assert_eq!(result.completion_string(), "true");
 }
 
 #[test]

@@ -1,0 +1,39 @@
+error[E0521]: borrowed data escapes outside of function
+ --> tests/compile_fail/tokio_spawn_local_is_not_send.rs:5:5
+  |
+4 |   fn spawn_local<'gc>(local: otter_gc::Local<'gc, ()>) {
+  |                  ---  ----- `local` is a reference that is only valid in the function body
+  |                  |
+  |                  lifetime `'gc` defined here
+5 | /     tokio::spawn(async move {
+6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+7 | |         std::hint::black_box(local);
+8 | |     });
+  | |      ^
+  | |      |
+  | |______`local` escapes the function body here
+  |        argument requires that `'gc` must outlive `'static`
+
+error: future cannot be sent between threads safely
+ --> tests/compile_fail/tokio_spawn_local_is_not_send.rs:5:5
+  |
+5 | /     tokio::spawn(async move {
+6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+7 | |         std::hint::black_box(local);
+8 | |     });
+  | |______^ future created by async block is not `Send`
+  |
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_local_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const HandleStack`
+note: captured value is not `Send`
+ --> tests/compile_fail/tokio_spawn_local_is_not_send.rs:7:30
+  |
+7 |         std::hint::black_box(local);
+  |                              ^^^^^ has type `Local<'_, ()>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+ --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+  |
+  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+  |            ----- required by a bound in this function
+  |     where
+  |         F: Future + Send + 'static,
+  |                     ^^^^ required by this bound in `spawn`

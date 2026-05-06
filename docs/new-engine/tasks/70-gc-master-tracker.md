@@ -2,22 +2,9 @@
 
 ## Status
 
-- [ ] Phase 1 — page-based generational GC + pointer compression + card table + black alloc + DevTools snapshot + per-type migration (tasks 71–84)
-  - [x] 71 — crate skeleton + ADR-0004 (closed 2026-05-02)
-  - [x] 72 — core heap and handles (closed 2026-05-04)
-  - [x] 73 — OOM + cap enforcement; `Runtime::max_heap_bytes` load-bearing (closed 2026-05-04)
-  - [x] 74 — `GcStats` + `HeapSnapshot` + retained-size walker + `Runtime::heap_stats` / `heap_snapshot` / `force_gc` (closed 2026-05-04)
-  - [x] 75 — `RuntimeState::trace_roots` + `GcTrace` stubs on every future-`Gc` type + `Runtime::force_gc` wiring + per-root smoke-test scaffold (closed 2026-05-04)
-  - [x] 76 — `UpvalueCell` migrated to `Gc<UpvalueCellBody>` + `SafeTraceable` trait + `alloc_old` / `with_payload` / `read_payload` / `write_barrier_raw` GC APIs + `GcHeap` moved into `Interpreter` + `Frame::for_function_with_heap` / `Frame::build_upvalues` + `Value::trace_value_slots` for closure-spine walk + upvalue smoke test un-ignored + `counter_closure_no_leak` regression (closed 2026-05-04)
-  - [x] 76A — `RuntimeCx`/`NativeCtx`, `!Send + !Sync` static assertions, trybuild compile-fail fixtures (closed 2026-05-05)
-  - [x] 77 — `JsObject` → `Gc<ObjectBody>` (split 77A → 77B → 77C; closed 2026-05-05)
-  - [x] 78 — `JsArray` → `Gc<ArrayBody>` + explicit heap API + dense-element cap accounting + array cycle/root regressions (closed 2026-05-05)
-  - [x] 79 — `JsMap` / `JsSet` → `Gc<MapBody>` / `Gc<SetBody>` + explicit heap API + strong entry tracing + self-cycle regressions (closed 2026-05-05)
-  - [x] 80 — `JsWeakMap` / `JsWeakSet` → GC-managed ephemeron tables + split mark/additional/sweep fixpoint + dead-key pruning regressions (closed 2026-05-05)
-  - [x] 81 — `WeakRef` / `FinalizationRegistry` GC bodies + weak-finalization registry + microtask cleanup enqueueing + unregister/resurrection/laziness regressions (closed 2026-05-05; Test262 parity deferred)
-  - [x] 82 — `JsPromiseHandle::Pure`, `IteratorState`, generator bodies, and parked async/generator frames migrated to GC-managed trace bodies + promise/iterator/generator cycle/root regressions (closed 2026-05-05)
-  - [x] 83 — `BoundFunction`, `NativeFunction`, and `JsRegExp` migrated to GC-managed bodies + explicit `NativeCtx` call signature + native capture tracing + bound/native/regexp cycle/root regressions (closed 2026-05-05)
-- [ ] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
+- [x] Phase 1 — page-based generational GC + pointer compression + card table + black alloc + DevTools snapshot + per-type migration (tasks 71–84)
+  - [x] 71–84 — Phase 1 closed 2026-05-06; see [`task84-array-sweep.md`](../test262-baseline/task84-array-sweep.md) for the closeout Array sweep baseline.
+- [x] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
 - [ ] Workers / isolate pools (task 92)
 - [ ] Compile-time GC safety hardening (task 93)
 - [ ] Contributor-facing GC/VM API surface (task 94)
@@ -58,30 +45,13 @@ later tasks assume earlier ones have landed.
 
 | # | File | One-line goal |
 |---|------|---------------|
-| 71 | ✅ closed (2026-05-02) | New `crates-next/otter-gc` crate; ADR-0004 amends ADR-0001 §5 to lift `forbid(unsafe_code)` for this crate only. |
-| 72 | ✅ closed (2026-05-04) | Page heap: `GcHeader`, `Page`, `NewSpace`/`OldSpace`/`LargeObjectSpace`, scavenger, marking, barriers, trace table, `Gc<T>` + `Local<'gc, T>` + `HandleScope<'gc>`. |
-| 73 | ✅ closed (2026-05-04) | `OutOfMemory::HeapCapExceeded` payload + `GcHeap::with_max_heap_bytes` + tracked / reserved bytes + retry-once-then-fail emergency-collect path; `Runtime::max_heap_bytes` plumbed end-to-end with `From<otter_gc::OutOfMemory>` mapping. |
-| 74 | [74-gc-stats-and-snapshot.md](./74-gc-stats-and-snapshot.md) | `GcStats`, `HeapSnapshot`, retained-size walker, `Runtime::heap_stats()`. |
-| 75 | [75-gc-root-enumeration.md](./75-gc-root-enumeration.md) | `RuntimeState::trace_roots`: frames, microtask queue, module envs, dynamic-import host, symbol registry; smoke tests. |
-| 76 | [76-migrate-upvalue-cell.md](./76-migrate-upvalue-cell.md) | `UpvalueCell` from `Rc<RefCell<Value>>` → `Gc<UpvalueCellBody>` + write-barrier wiring on every upvalue store. |
-| 76A | ✅ closed (2026-05-05) | `RuntimeCx<'rt>` / `NativeCtx<'rt>` types in `crates-next/otter-vm/src/runtime_cx.rs`; `!Send + !Sync` static assertions on `GcHeap` / `Gc<T>` / `Local<'gc, T>` / `HandleScope` / `Interpreter` / `NativeCtx<'_>`; trybuild compile-fail fixtures rejecting `Gc<T>` / `Local<'gc, T>` / `GcHeap` captured into `Send` futures (`crates-next/otter-vm/tests/compile_fail/`). Thread-default escape hatch deleted in 77C. |
-| 77 | ✅ closed (2026-05-05) | `JsObject` → `Gc<ObjectBody>`; the heart of the leak surface; write barriers on every property store. Split into 77A/77B/77C. |
-| 77A | ✅ closed (2026-05-04) | Body type swap + `SafeTraceable` impl + explicit-`&[mut] GcHeap` API inside `object.rs`. Workspace build expected red until 77B. |
-| 77B | ✅ closed (2026-05-05) | Mechanical caller sweep across `crates-next/otter-vm/src/` — thread `&[mut] gc_heap` through every site. Workspace build green at the end. |
-| 77C | ✅ closed (2026-05-05) | Un-ignore root smoke tests, add `proto_cycle_reaped` regression, delete `#[doc(hidden)]` thread-default shims from `heap.rs`, tighten 76A's third box to `[x]`. |
-| 78 | ✅ closed (2026-05-05) | `JsArray` → `Gc<ArrayBody>`; write barriers on element / named-prop stores. |
-| 79 | ✅ closed (2026-05-05) | `JsMap` / `JsSet` → `Gc<…>`; write barriers on entry stores. |
-| 80 | ✅ closed (2026-05-05) | `WeakMap` / `WeakSet` with ephemeron fixpoint (closes "task 57" markers). |
-| 81 | ✅ closed (2026-05-05; Test262 parity deferred) | `WeakRef` + `FinalizationRegistry`. |
-| 82 | ✅ closed (2026-05-05) | `JsPromiseHandle::Pure`, `IteratorState`, generator state; parked frame trace bodies. |
-| 83 | ✅ closed (2026-05-05) | `BoundFunction`, `NativeFunction`, `JsRegExp` — last `Rc`-shared variants. |
-| 84 | [84-phase1-closeout-test262-array-sweep.md](./84-phase1-closeout-test262-array-sweep.md) | Phase 1 exit criteria: regression suite + cap-as-`RangeError` + `bash scripts/test262-safe.sh built-ins/Array` end-to-end on a 16 GB host. |
+| 71–84 | ✅ closed (2026-05-06) | Phase 1 complete: page heap + handles, cap enforcement, stats/snapshot, root enumeration, per-type `Gc<T>` migrations, weak/finalization semantics, consolidated GC regressions, cap-as-`RangeError`, runtime binding audit, and `built-ins/Array/` Test262 closeout baseline ([snapshot](../test262-baseline/task84-array-sweep.md)). |
 
 ## Runtime / async binding
 
 | # | File | One-line goal |
 |---|------|---------------|
-| 85 | [85-tokio-event-loop-runtime-handle.md](./85-tokio-event-loop-runtime-handle.md) | Tokio-first `EventLoop` trait + default `TokioEventLoop`; public `Otter` / `RuntimeHandle` are `Send + Sync`; isolate runner owns the `!Send` VM and GC. |
+| 85 | ✅ closed (2026-05-06) | Tokio-first `EventLoop` trait + default `TokioEventLoop`; public `Otter` / `RuntimeHandle` are `Send + Sync`; isolate runner owns the `!Send` VM and GC. |
 | 92 | [92-worker-isolates-and-structured-clone.md](./92-worker-isolates-and-structured-clone.md) | Worker isolates and isolate pools; no GC handle crosses worker boundaries; communication via structured clone / transferables. |
 | 93 | [93-gc-branded-session-api.md](./93-gc-branded-session-api.md) | Compile-time-branded GC session/root/weak API inspired by Oscars/gc-arena: cross-isolate and stale-GC-context misuse should fail to compile, not rely on runtime discipline. |
 | 94 | [94-gc-contributor-api-surface.md](./94-gc-contributor-api-surface.md) | Clean safe GC/VM API for engine contributors and extension authors: V8-style handle tiers, Boa-style derive ergonomics, Otter-branded safety, and narrow unsafe internals. |

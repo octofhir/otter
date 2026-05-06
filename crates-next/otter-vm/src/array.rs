@@ -1,4 +1,4 @@
-//! JavaScript array value with dense element storage.
+//! JavaScript array value with dense and sparse indexed storage.
 //!
 //! Task 78 migrates arrays from the old refcounted body envelope to the
 //! page-based tracing GC. The public handle is a compressed
@@ -8,8 +8,10 @@
 //!
 //! # Invariants
 //!
-//! - `len` always equals the number of dense slots in `elements`.
-//! - Out-of-range reads return `Value::Undefined`.
+//! - Low, contiguous indices live in `elements`.
+//! - Large sparse indices live in `sparse_elements` so Array-index
+//!   semantics do not force host-sized dense allocations.
+//! - Missing-index reads return `Value::Undefined`.
 //! - Element growth goes through helpers that reserve off-slot
 //!   `SmallVec` capacity against the heap cap before resizing.
 //!
@@ -25,6 +27,7 @@ use std::mem;
 use smallvec::SmallVec;
 
 use crate::Value;
+use crate::number::NumberValue;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ArrayBody`].
 ///
@@ -41,6 +44,13 @@ pub struct ArrayBody {
     /// Dense element storage. Crate-internal callers must go through
     /// this module's helpers so growth is heap-accounted.
     pub(crate) elements: SmallVec<[Value; 4]>,
+    /// Sparse array-indexed own elements.
+    ///
+    /// This is intentionally separate from string-keyed
+    /// `named_properties`: array indices have different `length`
+    /// semantics in ECMA-262, but storing huge holes densely would
+    /// violate the task-84 survivability gate.
+    pub(crate) sparse_elements: Option<HashMap<usize, Value>>,
     /// Optional non-index string-keyed own properties.
     pub(crate) named_properties: Option<HashMap<String, Value>>,
 }
@@ -51,6 +61,11 @@ impl otter_gc::SafeTraceable for ArrayBody {
     fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
         for element in &self.elements {
             element.trace_value_slots(visitor);
+        }
+        if let Some(sparse) = &self.sparse_elements {
+            for value in sparse.values() {
+                value.trace_value_slots(visitor);
+            }
         }
         if let Some(named) = &self.named_properties {
             for value in named.values() {
@@ -103,7 +118,15 @@ pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
     heap.read_payload(arr, |body| {
-        body.elements.get(idx).cloned().unwrap_or(Value::Undefined)
+        body.elements
+            .get(idx)
+            .cloned()
+            .or_else(|| {
+                body.sparse_elements
+                    .as_ref()
+                    .and_then(|sparse| sparse.get(&idx).cloned())
+            })
+            .unwrap_or(Value::Undefined)
     })
 }
 
@@ -122,6 +145,16 @@ pub fn set(
 ) -> Result<(), otter_gc::OutOfMemory> {
     let child_raw = value.as_gc_raw();
     let target_len = idx.saturating_add(1);
+    if should_store_sparse(arr, heap, idx) {
+        heap.with_payload(arr, |body| {
+            let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
+            sparse.insert(idx, value);
+        });
+        if let Some(child) = child_raw {
+            heap.write_barrier_raw(arr, array_payload_slot(arr), child);
+        }
+        return Ok(());
+    }
     reserve_for_target_len(arr, heap, target_len)?;
     heap.with_payload(arr, |body| {
         if idx < body.elements.len() {
@@ -210,11 +243,13 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
         )));
     }
     if let Ok(idx) = key.parse::<usize>() {
-        return if idx < len(arr, heap) {
-            Some(get(arr, heap, idx))
-        } else {
-            None
-        };
+        return heap.read_payload(arr, |body| {
+            body.elements.get(idx).cloned().or_else(|| {
+                body.sparse_elements
+                    .as_ref()
+                    .and_then(|sparse| sparse.get(&idx).cloned())
+            })
+        });
     }
     heap.read_payload(arr, |body| {
         body.named_properties
@@ -243,6 +278,20 @@ pub fn with_elements_mut<R>(
 #[must_use]
 pub fn ptr_eq(a: JsArray, b: JsArray) -> bool {
     a == b
+}
+
+/// Convert a numeric computed-property key to an Array index.
+///
+/// ECMA-262 array indices are uint32 values except `2^32 - 1`.
+/// The VM's small-integer fast path only covers `i32`, so this helper
+/// accepts integral `Double` values as well.
+#[must_use]
+pub fn index_from_number(n: NumberValue) -> Option<usize> {
+    let raw = n.as_f64();
+    if !raw.is_finite() || raw < 0.0 || raw.fract() != 0.0 || raw >= u32::MAX as f64 {
+        return None;
+    }
+    Some(raw as usize)
 }
 
 /// Stable identity token for hash tables that still key object-like
@@ -290,6 +339,15 @@ fn reserve_for_target_len(
     // The actual reserve is performed under `with_payload` after the
     // cap check succeeds; keep this helper allocation-free.
     Ok(())
+}
+
+fn should_store_sparse(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
+    const MAX_DENSE_GAP: usize = 1024;
+    const MAX_DENSE_INDEX: usize = 1 << 20;
+
+    heap.read_payload(arr, |body| {
+        idx >= MAX_DENSE_INDEX || idx.saturating_sub(body.elements.len()) > MAX_DENSE_GAP
+    })
 }
 
 fn spilled_capacity_bytes(capacity: usize) -> usize {

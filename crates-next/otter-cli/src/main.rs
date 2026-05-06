@@ -408,9 +408,10 @@ fn run_file(
     // which uses the default capability set. Capability-respecting
     // module runs are a follow-up once `Runtime::run_module` lands
     // on the Layer-B builder.
-    let _runtime = build_runtime(caps)?;
-    let mut otter = otter_runtime::Otter::new();
-    let result = otter.run_file(path)?;
+    let otter = otter_runtime::Otter::builder()
+        .capabilities(caps.clone())
+        .build()?;
+    let result = otter.blocking_run_file(path)?;
     if json {
         println!(
             "{{\"completion\":{}}}",

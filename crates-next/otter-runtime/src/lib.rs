@@ -26,6 +26,8 @@
 //! - [ADR-0003](../../../docs/new-engine/adr/0003-public-api-and-cli.md)
 
 pub mod error;
+pub mod event_loop;
+pub mod handle;
 pub mod module_graph;
 pub mod module_loader;
 
@@ -36,10 +38,15 @@ use otter_bytecode::BytecodeModule;
 use otter_compiler::compile;
 use otter_gc::{GcHeap, GcStats, HeapSnapshot};
 use otter_syntax::{SourceKind, detect_source_kind, parse};
-use otter_vm::{Interpreter, InterruptFlag, Value};
+use otter_vm::{Interpreter, InterruptFlag};
 use serde::{Deserialize, Serialize};
 
 pub use error::{ConfigError, IoErrorKind, OtterError, error_schema_version};
+pub use event_loop::{
+    EventLoop, HostFuture, HostJoinHandle, HostOpCompletion, RuntimeLiveness, RuntimeWake,
+    TimerRequest, TimerToken, TokioEventLoop,
+};
+pub use handle::{RuntimeActivityStats, RuntimeHandle};
 
 /// Default heap cap (256 MiB) when none is configured.
 pub const DEFAULT_MAX_HEAP_BYTES: u64 = 256 * 1024 * 1024;
@@ -114,17 +121,30 @@ impl SourceInput {
 /// Successful run output.
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
-    /// Completion value (foundation: `Value::Undefined`).
-    pub completion: Value,
+    /// Completion value rendered at the isolate boundary.
+    ///
+    /// Public async handles must not expose internal VM values or GC
+    /// handles. The local [`Runtime`] therefore renders the completion
+    /// before sending it through [`RuntimeHandle`].
+    completion: String,
     /// Wall-clock duration.
     pub duration: Duration,
 }
 
 impl ExecutionResult {
+    /// Build from an interpreter completion value.
+    #[must_use]
+    fn from_vm_value(completion: otter_vm::Value, duration: Duration) -> Self {
+        Self {
+            completion: completion.display_string(),
+            duration,
+        }
+    }
+
     /// Render the completion value for CLI preview output.
     #[must_use]
-    pub fn completion_string(&self) -> String {
-        self.completion.display_string()
+    pub fn completion_string(&self) -> &str {
+        &self.completion
     }
 }
 
@@ -538,11 +558,15 @@ impl InterruptHandle {
     pub fn reset(&self) {
         self.0.reset();
     }
+
+    pub(crate) fn raw_flag(&self) -> InterruptFlag {
+        self.0.clone()
+    }
 }
 
 /// Runtime configuration.
 #[derive(Debug, Clone)]
-struct RuntimeConfig {
+pub(crate) struct RuntimeConfig {
     max_heap_bytes: u64,
     timeout: Duration,
     max_stack_depth: u32,
@@ -559,6 +583,12 @@ impl Default for RuntimeConfig {
             capabilities: CapabilitySet::default(),
             loader: None,
         }
+    }
+}
+
+impl RuntimeConfig {
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -616,18 +646,38 @@ impl RuntimeBuilder {
     /// Returns [`OtterError::Config`] when the configuration is
     /// inconsistent.
     pub fn build(self) -> Result<Runtime, OtterError> {
-        if self.config.max_stack_depth == 0 {
+        Runtime::from_config(self.config)
+    }
+
+    /// Construct a sendable runtime handle.
+    ///
+    /// # Errors
+    /// Returns [`OtterError`] when the configuration is invalid or the
+    /// isolate runner cannot be started.
+    pub fn build_handle(self) -> Result<RuntimeHandle, OtterError> {
+        RuntimeHandle::spawn(self.config)
+    }
+}
+
+impl Runtime {
+    pub(crate) fn validate_config(config: &RuntimeConfig) -> Result<(), OtterError> {
+        if config.max_stack_depth == 0 {
             return Err(OtterError::Config {
                 reason: ConfigError::InvalidStackDepth {
                     message: "max_stack_depth must be > 0".to_string(),
                 },
             });
         }
+        Ok(())
+    }
+
+    pub(crate) fn from_config(config: RuntimeConfig) -> Result<Self, OtterError> {
+        Self::validate_config(&config)?;
         // The interpreter owns the per-isolate GC heap (since
         // task 76); both the string heap and the GC heap honour
         // the configured cap.
-        let mut interp = Interpreter::with_string_heap_cap(self.config.max_heap_bytes);
-        interp.set_max_stack_depth(self.config.max_stack_depth);
+        let mut interp = Interpreter::with_string_heap_cap(config.max_heap_bytes);
+        interp.set_max_stack_depth(config.max_stack_depth);
         // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
         // `new Function(...)` reach a real parse + compile path.
         // The closure is reusable across calls; each invocation
@@ -638,10 +688,7 @@ impl RuntimeBuilder {
             compile(&parsed, "<eval>").map_err(|e| format!("compile error: {e:?}"))
         });
         interp.set_eval_hook(Some(hook));
-        Ok(Runtime {
-            interp,
-            config: self.config,
-        })
+        Ok(Runtime { interp, config })
     }
 }
 
@@ -650,6 +697,12 @@ impl RuntimeBuilder {
 pub struct Runtime {
     interp: Interpreter,
     config: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MicrotaskStats {
+    pub(crate) pending: bool,
+    pub(crate) generation: u64,
 }
 
 impl Runtime {
@@ -670,6 +723,14 @@ impl Runtime {
     #[must_use]
     pub fn timeout(&self) -> Duration {
         self.config.timeout
+    }
+
+    pub(crate) fn microtask_stats(&self) -> MicrotaskStats {
+        let queue = self.interp.microtasks();
+        MicrotaskStats {
+            pending: queue.has_any_pending(),
+            generation: queue.generation(),
+        }
     }
 
     /// Configured heap cap in bytes (`0` = disabled).
@@ -783,10 +844,7 @@ impl Runtime {
             (Ok(_), Err(drain_err)) => return Err(map_vm_error(drain_err)),
             (Ok(v), Ok(())) => v,
         };
-        Ok(ExecutionResult {
-            completion: value,
-            duration: start.elapsed(),
-        })
+        Ok(ExecutionResult::from_vm_value(value, start.elapsed()))
     }
 
     /// Drain the microtask queue manually. Embedders that want to
@@ -935,20 +993,32 @@ impl Runtime {
             (Ok(_), Err(drain_err)) => return Err(map_vm_error(drain_err)),
             (Ok(v), Ok(())) => v,
         };
-        Ok(ExecutionResult {
-            completion: value,
-            duration: start.elapsed(),
-        })
+        Ok(ExecutionResult::from_vm_value(value, start.elapsed()))
+    }
+
+    /// Run a file from disk, detecting script vs module shape.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
+        let path = path.as_ref();
+        let source = SourceInput::from_path(path)?;
+        if source_text_looks_like_module(&source.text, source.kind) {
+            return self.run_module(path);
+        }
+        let specifier = path.to_string_lossy().to_string();
+        self.run_script(source, &specifier)
     }
 }
 
 /// Layer A entry point: zero-config Otter.
 ///
-/// Wraps a [`Runtime`] with sensible defaults. The simple case
-/// for embedders.
-#[derive(Debug)]
+/// Wraps a [`RuntimeHandle`] with sensible defaults. The simple case
+/// for embedders is async-first and safe to clone into Tokio worker
+/// tasks.
+#[derive(Clone, Debug)]
 pub struct Otter {
-    runtime: Runtime,
+    handle: RuntimeHandle,
 }
 
 impl Otter {
@@ -956,11 +1026,15 @@ impl Otter {
     /// 256 MiB heap cap, 30 s timeout.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            runtime: Runtime::builder()
-                .build()
-                .expect("default RuntimeBuilder must build"),
-        }
+        Self::builder()
+            .build()
+            .expect("default OtterBuilder must build")
+    }
+
+    /// Start configuring the public handle facade.
+    #[must_use]
+    pub fn builder() -> OtterBuilder {
+        OtterBuilder::default()
     }
 
     /// Run a file from disk, detecting kind by extension and
@@ -978,65 +1052,175 @@ impl Otter {
     ///
     /// # Errors
     /// See [`OtterError`] variants.
-    pub fn run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
-        let path = path.as_ref();
-        let source = SourceInput::from_path(path)?;
-        if source_text_looks_like_module(&source.text, source.kind) {
-            return self.runtime.run_module(path);
-        }
-        let specifier = path.to_string_lossy().to_string();
-        self.runtime.run_script(source, &specifier)
+    pub async fn run_file(&self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
+        self.handle.run_file(path.as_ref().to_path_buf()).await
+    }
+
+    /// Run an ES module entry file from disk.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub async fn run_module(&self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
+        self.handle.run_module(path.as_ref().to_path_buf()).await
     }
 
     /// Run a string of JavaScript.
     ///
     /// # Errors
     /// See [`OtterError`] variants.
-    pub fn run_script(&mut self, source: &str) -> Result<ExecutionResult, OtterError> {
-        self.runtime
+    pub async fn run_script(&self, source: &str) -> Result<ExecutionResult, OtterError> {
+        self.handle
             .run_script(SourceInput::from_javascript(source), "<script>")
+            .await
     }
 
     /// Run a string of TypeScript.
     ///
     /// # Errors
     /// See [`OtterError`] variants.
-    pub fn run_typescript(&mut self, source: &str) -> Result<ExecutionResult, OtterError> {
-        self.runtime
+    pub async fn run_typescript(&self, source: &str) -> Result<ExecutionResult, OtterError> {
+        self.handle
             .run_script(SourceInput::from_typescript(source), "<script>")
+            .await
     }
 
     /// Evaluate a snippet.
     ///
     /// # Errors
     /// See [`OtterError`] variants.
-    pub fn eval(&mut self, source: &str) -> Result<ExecutionResult, OtterError> {
-        self.runtime.eval(SourceInput::from_javascript(source))
+    pub async fn eval(&self, source: &str) -> Result<ExecutionResult, OtterError> {
+        self.handle.eval(SourceInput::from_javascript(source)).await
     }
 
-    /// Cooperative cancellation handle.
+    /// Blocking file execution wrapper for CLI / sync embedders.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn blocking_run_file(&self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
+        let path = path.as_ref().to_path_buf();
+        self.handle.block_on(self.run_file(path))
+    }
+
+    /// Blocking ES module execution wrapper.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn blocking_run_module(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ExecutionResult, OtterError> {
+        let path = path.as_ref().to_path_buf();
+        self.handle.block_on(self.run_module(path))
+    }
+
+    /// Blocking JavaScript execution wrapper.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn blocking_run_script(&self, source: &str) -> Result<ExecutionResult, OtterError> {
+        let source = source.to_string();
+        let handle = self.handle.clone();
+        self.handle.block_on(async move {
+            handle
+                .run_script(SourceInput::from_javascript(source), "<script>")
+                .await
+        })
+    }
+
+    /// Blocking TypeScript execution wrapper.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn blocking_run_typescript(&self, source: &str) -> Result<ExecutionResult, OtterError> {
+        let source = source.to_string();
+        let handle = self.handle.clone();
+        self.handle.block_on(async move {
+            handle
+                .run_script(SourceInput::from_typescript(source), "<script>")
+                .await
+        })
+    }
+
+    /// Blocking eval wrapper.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn blocking_eval(&self, source: &str) -> Result<ExecutionResult, OtterError> {
+        let source = source.to_string();
+        let handle = self.handle.clone();
+        self.handle
+            .block_on(async move { handle.eval(SourceInput::from_javascript(source)).await })
+    }
+
+    /// Cooperative cancellation.
+    pub fn interrupt(&self) {
+        self.handle.interrupt();
+    }
+
+    /// Snapshot activity counters.
     #[must_use]
-    pub fn interrupt_handle(&self) -> InterruptHandle {
-        self.runtime.interrupt_handle()
+    pub fn activity_stats(&self) -> RuntimeActivityStats {
+        self.handle.activity_stats()
     }
 
     /// Drop down to Layer B.
     #[must_use]
-    pub fn into_runtime(self) -> Runtime {
-        self.runtime
+    pub fn handle(&self) -> &RuntimeHandle {
+        &self.handle
+    }
+}
+
+/// Builder for the public [`Otter`] facade.
+#[derive(Debug, Clone, Default)]
+pub struct OtterBuilder {
+    runtime: RuntimeBuilder,
+}
+
+impl OtterBuilder {
+    /// Replace the capability set.
+    #[must_use]
+    pub fn capabilities(mut self, caps: CapabilitySet) -> Self {
+        self.runtime = self.runtime.capabilities(caps);
+        self
     }
 
-    /// Borrow the underlying [`Runtime`] (Layer B) for advanced
-    /// operations such as bytecode dump or compile-only check.
+    /// Hard heap cap. `0` disables the cap.
     #[must_use]
-    pub fn runtime(&self) -> &Runtime {
-        &self.runtime
+    pub fn max_heap_bytes(mut self, bytes: u64) -> Self {
+        self.runtime = self.runtime.max_heap_bytes(bytes);
+        self
     }
 
-    /// Mutable borrow of the underlying [`Runtime`].
+    /// Per-command timeout. `Duration::ZERO` disables the timeout.
     #[must_use]
-    pub fn runtime_mut(&mut self) -> &mut Runtime {
-        &mut self.runtime
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.runtime = self.runtime.timeout(timeout);
+        self
+    }
+
+    /// JS call-stack depth cap.
+    #[must_use]
+    pub fn max_stack_depth(mut self, depth: u32) -> Self {
+        self.runtime = self.runtime.max_stack_depth(depth);
+        self
+    }
+
+    /// Override the module-loader configuration.
+    #[must_use]
+    pub fn module_loader(mut self, loader: module_loader::LoaderConfig) -> Self {
+        self.runtime = self.runtime.module_loader(loader);
+        self
+    }
+
+    /// Construct the public async facade.
+    ///
+    /// # Errors
+    /// Returns [`OtterError`] if configuration validation or isolate
+    /// startup fails.
+    pub fn build(self) -> Result<Otter, OtterError> {
+        Ok(Otter {
+            handle: self.runtime.build_handle()?,
+        })
     }
 }
 
@@ -1327,6 +1511,208 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
 mod tests {
     use super::*;
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_handle_types_are_send_sync() {
+        assert_send_sync::<Otter>();
+        assert_send_sync::<RuntimeHandle>();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn otter_clone_runs_from_tokio_worker_tasks() {
+        let otter = Otter::new();
+        let mut joins = Vec::new();
+        for i in 0..8 {
+            let otter = otter.clone();
+            joins.push(tokio::spawn(async move {
+                let source = format!("{i};");
+                let result = otter.run_script(&source).await.unwrap();
+                result.completion_string().to_string()
+            }));
+        }
+
+        let mut completions = Vec::new();
+        for join in joins {
+            completions.push(join.await.unwrap());
+        }
+        completions.sort();
+        assert_eq!(completions, ["0", "1", "2", "3", "4", "5", "6", "7"]);
+
+        let stats = otter.activity_stats();
+        assert_eq!(stats.submitted_commands, 8);
+        assert_eq!(stats.completed_commands, 8);
+        assert_eq!(stats.failed_commands, 0);
+        assert_eq!(stats.queued_commands, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn otter_async_run_module_uses_handle_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dep.ts"), "export const value = 41;\n").unwrap();
+        std::fs::write(
+            dir.path().join("entry.ts"),
+            "import { value } from \"./dep.ts\";\nfunction fail() { return undefined.x; }\nif (value !== 41) fail();\n",
+        )
+        .unwrap();
+
+        let otter = Otter::new();
+        let result = otter.run_module(dir.path().join("entry.ts")).await.unwrap();
+
+        assert_eq!(result.completion_string(), "undefined");
+    }
+
+    #[test]
+    fn runtime_installs_console_global() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_typescript(
+                r#"
+                function fail(msg) { throw new Error(msg); }
+                if (typeof console !== "object") fail("missing console");
+                if (typeof console.log !== "function") fail("missing console.log");
+                if (typeof console.error !== "function") fail("missing console.error");
+                console.log("runtime-console", 7);
+                console.warn(new Error("warn-path"));
+                console.assert(true, "should not print");
+                console.assert(false, "assert-path");
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(result.completion_string(), "undefined");
+    }
+
+    #[test]
+    fn top_level_await_rejection_renders_error_to_string() {
+        let otter = Otter::new();
+        let err = otter
+            .blocking_run_typescript(
+                r#"
+                await Promise.resolve();
+                throw new Error("boom");
+                "#,
+            )
+            .unwrap_err();
+
+        match err {
+            OtterError::Runtime { diagnostic } => {
+                assert_eq!(diagnostic.code, "UNCAUGHT");
+                assert_eq!(diagnostic.message, "uncaught exception: Error: boom");
+            }
+            other => panic!("expected Runtime, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_handle_host_ops_timers_and_diagnostics_update_stats() {
+        let otter = Otter::new();
+        let handle = otter.handle().clone();
+
+        handle.spawn_host_op(
+            RuntimeLiveness::Ref,
+            Box::pin(async {
+                HostOpCompletion {
+                    id: 0,
+                    kind: "test-op".to_string(),
+                    result: Ok("done".to_string()),
+                }
+            }),
+        );
+        let token = handle.schedule_timer(TimerRequest {
+            delay: Duration::from_millis(10),
+            repeat: None,
+            liveness: RuntimeLiveness::Ref,
+            origin: "runtime-test".to_string(),
+        });
+        assert!(!handle.cancel_timer(TimerToken(token.0 + 1)));
+        handle.complete_dynamic_module_job_for_tests();
+        handle.wake_runtime("runtime-test");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stats = handle.activity_stats();
+
+        assert_eq!(stats.pending_ref_host_ops, 0);
+        assert_eq!(stats.completed_host_ops, 1);
+        assert_eq!(stats.pending_ref_timers, 0);
+        assert_eq!(stats.fired_timers, 1);
+        assert_eq!(stats.pending_dynamic_module_jobs, 0);
+        assert_eq!(stats.completed_dynamic_module_jobs, 1);
+        assert_eq!(stats.diagnostics, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_handle_timer_cancellation_and_timeout_are_observable() {
+        let otter = Otter::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let handle = otter.handle().clone();
+        let token = handle.schedule_timer(TimerRequest {
+            delay: Duration::from_secs(60),
+            repeat: None,
+            liveness: RuntimeLiveness::Ref,
+            origin: "runtime-test-cancel".to_string(),
+        });
+        assert!(handle.cancel_timer(token));
+
+        let err = otter.run_script("while (true) {}").await.unwrap_err();
+        assert!(matches!(err, OtterError::Timeout { .. }));
+
+        let result = otter.run_script("1 + 1;").await.unwrap();
+        assert_eq!(result.completion_string(), "2");
+
+        let stats = otter.activity_stats();
+        assert_eq!(stats.cancelled_timers, 1);
+        assert_eq!(stats.timed_out_commands, 1);
+        assert!(stats.failed_commands >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_handle_bounded_queue_reports_backpressure() {
+        let config = RuntimeConfig {
+            timeout: Duration::from_millis(100),
+            ..RuntimeConfig::default()
+        };
+        let handle = RuntimeHandle::spawn_with_capacity(config, 1).unwrap();
+
+        let first = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .run_script(SourceInput::from_javascript("while (true) {}"), "<busy>")
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let second = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .run_script(SourceInput::from_javascript("1;"), "<queued>")
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let err = handle
+            .run_script(SourceInput::from_javascript("2;"), "<overflow>")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            OtterError::Internal { code, .. } if code == "RUNTIME_BACKPRESSURE"
+        ));
+
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(OtterError::Timeout { .. })
+        ));
+        assert_eq!(second.await.unwrap().unwrap().completion_string(), "1");
+        assert_eq!(handle.activity_stats().backpressure_rejections, 1);
+    }
+
     #[test]
     fn looks_like_module_detects_import_at_top_level() {
         let text = "import { x } from \"./y.ts\";\n";
@@ -1354,8 +1740,10 @@ mod tests {
             "import { value } from \"./other.ts\";\nfunction fail() { return undefined.x; }\nif (value !== 7) fail();\n",
         )
         .unwrap();
-        let mut otter = Otter::new();
-        otter.run_file(dir.path().join("entry.ts")).unwrap();
+        let otter = Otter::new();
+        otter
+            .blocking_run_file(dir.path().join("entry.ts"))
+            .unwrap();
     }
 
     #[test]
@@ -1371,8 +1759,10 @@ mod tests {
             "import { inc, get } from \"./counter.ts\";\nfunction fail() { return undefined.x; }\ninc(); inc();\nif (get() !== 2) fail();\n",
         )
         .unwrap();
-        let mut otter = Otter::new();
-        otter.run_file(dir.path().join("entry.ts")).unwrap();
+        let otter = Otter::new();
+        otter
+            .blocking_run_file(dir.path().join("entry.ts"))
+            .unwrap();
     }
 
     #[test]
@@ -1388,8 +1778,10 @@ mod tests {
             "import { a } from \"./a.ts\";\nexport let b = 2;\n",
         )
         .unwrap();
-        let mut otter = Otter::new();
-        let err = otter.run_file(dir.path().join("a.ts")).unwrap_err();
+        let otter = Otter::new();
+        let err = otter
+            .blocking_run_file(dir.path().join("a.ts"))
+            .unwrap_err();
         match err {
             OtterError::Compile { diagnostics } => {
                 assert!(
@@ -1412,8 +1804,10 @@ mod tests {
             "function fail() { return undefined.x; }\nimport(\"./util.ts\").then((m) => { if (m.answer !== 42) fail(); });\n",
         )
         .unwrap();
-        let mut otter = Otter::new();
-        otter.run_file(dir.path().join("entry.ts")).unwrap();
+        let otter = Otter::new();
+        otter
+            .blocking_run_file(dir.path().join("entry.ts"))
+            .unwrap();
     }
 
     #[test]
@@ -1424,29 +1818,31 @@ mod tests {
             "function fail() { return undefined.x; }\nlet u = import.meta.url;\nif (u.indexOf(\"file://\") !== 0) fail();\nif (u.indexOf(\"entry.ts\") < 0) fail();\n",
         )
         .unwrap();
-        let mut otter = Otter::new();
-        otter.run_file(dir.path().join("entry.ts")).unwrap();
+        let otter = Otter::new();
+        otter
+            .blocking_run_file(dir.path().join("entry.ts"))
+            .unwrap();
     }
 
     #[test]
     fn otter_runs_empty_typescript() {
-        let mut otter = Otter::new();
-        let result = otter.run_typescript("").unwrap();
+        let otter = Otter::new();
+        let result = otter.blocking_run_typescript("").unwrap();
         assert_eq!(result.completion_string(), "undefined");
     }
 
     #[test]
     fn otter_runs_undefined_literal() {
-        let mut otter = Otter::new();
-        let result = otter.run_typescript("undefined;").unwrap();
+        let otter = Otter::new();
+        let result = otter.blocking_run_typescript("undefined;").unwrap();
         assert_eq!(result.completion_string(), "undefined");
     }
 
     #[test]
     fn json_cyclic_surfaces_jsc_style_diagnostic() {
-        let mut otter = Otter::new();
+        let otter = Otter::new();
         let err = otter
-            .run_typescript("const a = {}; a.self = a; JSON.stringify(a);")
+            .blocking_run_typescript("const a = {}; a.self = a; JSON.stringify(a);")
             .unwrap_err();
         match err {
             OtterError::Runtime { diagnostic } => {
@@ -1462,9 +1858,9 @@ mod tests {
 
     #[test]
     fn json_parse_error_carries_byte_position() {
-        let mut otter = Otter::new();
+        let otter = Otter::new();
         let err = otter
-            .run_typescript("JSON.parse(\"[1, 2,]\");")
+            .blocking_run_typescript("JSON.parse(\"[1, 2,]\");")
             .unwrap_err();
         match err {
             OtterError::Runtime { diagnostic } => {
@@ -1482,9 +1878,9 @@ mod tests {
 
     #[test]
     fn json_bigint_emits_jsc_style_message() {
-        let mut otter = Otter::new();
+        let otter = Otter::new();
         let err = otter
-            .run_typescript("JSON.stringify({ n: 1n });")
+            .blocking_run_typescript("JSON.stringify({ n: 1n });")
             .unwrap_err();
         match err {
             OtterError::Runtime { diagnostic } => {
@@ -1503,8 +1899,10 @@ mod tests {
         // `with` is permanently outside the foundation subset, so
         // it makes a stable canary for the FEATURE_NOT_IN_SLICE
         // diagnostic shape. (`try`/`catch` shipped in task 24.)
-        let mut otter = Otter::new();
-        let err = otter.run_typescript("with (o) { x; }").unwrap_err();
+        let otter = Otter::new();
+        let err = otter
+            .blocking_run_typescript("with (o) { x; }")
+            .unwrap_err();
         match err {
             OtterError::Compile { diagnostics } => {
                 assert_eq!(diagnostics.len(), 1);
@@ -1517,8 +1915,8 @@ mod tests {
     #[test]
     fn otter_rejects_typescript_enum() {
         // `enum` is intentionally rejected by ADR-0002 §4.
-        let mut otter = Otter::new();
-        let err = otter.run_typescript("enum E { A }").unwrap_err();
+        let otter = Otter::new();
+        let err = otter.blocking_run_typescript("enum E { A }").unwrap_err();
         match err {
             OtterError::Compile { diagnostics } => {
                 assert_eq!(diagnostics.len(), 1);
@@ -1530,17 +1928,17 @@ mod tests {
 
     #[test]
     fn otter_erases_interface() {
-        let mut otter = Otter::new();
+        let otter = Otter::new();
         let result = otter
-            .run_typescript("interface I { x: number; } undefined;")
+            .blocking_run_typescript("interface I { x: number; } undefined;")
             .unwrap();
         assert_eq!(result.completion_string(), "undefined");
     }
 
     #[test]
     fn run_file_rejects_unknown_extension() {
-        let mut otter = Otter::new();
-        let err = otter.run_file("/nonexistent.foo").unwrap_err();
+        let otter = Otter::new();
+        let err = otter.blocking_run_file("/nonexistent.foo").unwrap_err();
         assert!(matches!(err, OtterError::SourceKind { .. }));
     }
 

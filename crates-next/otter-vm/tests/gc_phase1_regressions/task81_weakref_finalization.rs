@@ -88,31 +88,52 @@ fn weak_ref_target_becomes_unavailable_after_force_gc() {
 
 #[test]
 fn finalization_registry_registers_without_strong_target_retention() {
-    let mut heap = otter_gc::GcHeap::new().expect("heap");
-    let target = alloc_object(&mut heap).expect("target");
-    let callback =
-        native_value(&mut heap, "cleanup", |_, _| Ok(Value::Undefined)).expect("native cleanup");
-    let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
+    let mut interp = Interpreter::new();
+    let calls = Rc::new(Cell::new(0));
+    let callback = native_value(interp.gc_heap_mut(), "cleanup", {
+        let calls = Rc::clone(&calls);
+        move |_, _| {
+            calls.set(calls.get() + 1);
+            Ok(Value::Undefined)
+        }
+    })
+    .expect("native cleanup");
+    let registry = alloc_finalization_registry(interp.gc_heap_mut(), callback).expect("registry");
+    let global = *interp.global_this();
+    otter_vm::object::set(
+        global,
+        interp.gc_heap_mut(),
+        "registry",
+        Value::FinalizationRegistry(registry),
+    );
+    let baseline_object_live_bytes =
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    let target = alloc_object(interp.gc_heap_mut()).expect("target");
     finalization_registry_register(
         registry,
-        &mut heap,
+        interp.gc_heap_mut(),
         &Value::Object(target),
         Value::Boolean(true),
         None,
     )
     .expect("register");
 
-    let mut registry_root = registry.raw();
-    let jobs = full_gc_with_roots(&mut heap, &mut [&mut registry_root]);
-    assert_eq!(jobs.len(), 1);
+    interp.force_gc();
+    assert!(interp.microtasks().has_pending_sync());
     assert_eq!(
-        heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes,
-        0,
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes,
+        baseline_object_live_bytes,
         "registry cell must not strongly retain target"
     );
 
-    let jobs = full_gc_with_roots(&mut heap, &mut [&mut registry_root]);
-    assert!(jobs.is_empty(), "finalizer should enqueue at most once");
+    interp
+        .drain_microtasks(&empty_module())
+        .expect("drain cleanup");
+    interp.force_gc();
+    interp
+        .drain_microtasks(&empty_module())
+        .expect("second drain");
+    assert_eq!(calls.get(), 1, "finalizer should enqueue at most once");
 }
 
 #[test]

@@ -43,8 +43,35 @@ fn assert_array_dense_storage_cap_kicks_in() {
     );
 }
 
+fn assert_array_sparse_power_indices_do_not_dense_allocate() {
+    let mut heap = otter_gc::GcHeap::with_max_heap_bytes(16 * 1024 * 1024).expect("gc heap");
+    let arr = otter_vm::array::alloc_array(&mut heap).expect("alloc array");
+
+    let mut k = 1_usize;
+    for _ in 0..32 {
+        k *= 2;
+        otter_vm::array::set(
+            arr,
+            &mut heap,
+            k - 2,
+            Value::Number(otter_vm::NumberValue::from_f64(k as f64)),
+        )
+        .expect("sparse power-of-two write must not exhaust dense storage");
+    }
+
+    k = 1;
+    for _ in 0..32 {
+        k *= 2;
+        assert_eq!(
+            otter_vm::array::get(arr, &heap, k - 2),
+            Value::Number(otter_vm::NumberValue::from_f64(k as f64))
+        );
+    }
+}
+
 #[test]
 fn array_gc_regressions() {
     assert_array_self_reference_reaped();
     assert_array_dense_storage_cap_kicks_in();
+    assert_array_sparse_power_indices_do_not_dense_allocate();
 }

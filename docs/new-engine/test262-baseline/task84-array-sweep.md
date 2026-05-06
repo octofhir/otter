@@ -1,8 +1,8 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `74f792bff313cfc8ecdaf684ed067ef67130def4`
+- **Engine commit:** `5705e8154841fc548a4b132535368979996814ce`
 - **Test262 commit:** `unknown`
-- **Captured:** 2026-05-06T06:23:13.571680+00:00
+- **Captured:** 2026-05-06T06:47:43.687611+00:00
 
 ## Totals
 
@@ -10,11 +10,11 @@
 |---|---|
 | total      | 3083 |
 | passed     | 517 |
-| failed     | 2338 |
+| failed     | 2339 |
 | skipped    | 227 |
 | crashed    | 0 |
 | timed_out  | 0 |
-| oom        | 1 |
+| oom        | 0 |
 
 **Pass rate (excl. skipped):** 18.10%
 
@@ -25,14 +25,14 @@
 - Host: local macOS developer machine.
 - Per-test heap cap: 512 MiB (`536870912` bytes).
 - Per-test timeout: 5000 ms.
-- Peak host RSS: 791936 KiB (~774 MiB), measured by external process-tree polling with `ps`.
-- Completion: reached end of the Array directory sweep; no process crash and no timeout. One test reported an in-engine OOM outcome (`built-ins/Array/S15.4_A1.1_T10.js`).
+- Peak host RSS: 791936 KiB (~774 MiB), measured by external process-tree polling during the pre-fix run. A sandboxed `/usr/bin/time -l` rerun on 2026-05-06 completed the sweep but could not report RSS because `sysctl kern.clockrate` was denied.
+- Completion: reached end of the Array directory sweep; no process crash, timeout, or in-engine OOM. The former OOM test (`built-ins/Array/S15.4_A1.1_T10.js`) now passes.
 
 ## Top failing sections (top 50)
 
 | Section | total | passed | failed | pass-rate |
 |---|---:|---:|---:|---:|
-| built-ins/Array/prototype | 2810 | 480 | 2206 | 17.9% |
+| built-ins/Array/prototype | 2810 | 479 | 2207 | 17.8% |
 | built-ins/Array/from | 47 | 5 | 39 | 11.4% |
 | built-ins/Array/length | 30 | 5 | 24 | 17.2% |
 | built-ins/Array/of | 16 | 2 | 13 | 13.3% |
@@ -108,12 +108,11 @@
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismat… | `built-ins/Array/S15.4.5.1_A1.2_T2.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismat… | `built-ins/Array/S15.4.5.1_A2.1_T1.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: The value of x.length is expec… | `built-ins/Array/S15.4.5.1_A2.2_T1.js` |
-| fail | runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismat… | `built-ins/Array/S15.4.5.2_A1_T1.js` |
+| fail | runtime: TypeError (UNCAUGHT) uncaught exception: The value of x.length is expec… | `built-ins/Array/S15.4.5.2_A1_T1.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismat… | `built-ins/Array/S15.4.5.2_A1_T2.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: The value of x.length is expec… | `built-ins/Array/S15.4.5.2_A3_T1.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: The value of x.length is expec… | `built-ins/Array/S15.4.5.2_A3_T2.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: The value of x.length is expec… | `built-ins/Array/S15.4.5.2_A3_T3.js` |
-| oom | oom: 268435456 bytes requested | `built-ins/Array/S15.4_A1.1_T10.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismat… | `built-ins/Array/S15.4_A1.1_T4.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismat… | `built-ins/Array/S15.4_A1.1_T5.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismat… | `built-ins/Array/S15.4_A1.1_T6.js` |
@@ -187,3 +186,4 @@
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: The result of evaluating (e in… | `built-ins/Array/length/S15.4.2.2_A2.2_T2.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: The result of evaluating (e in… | `built-ins/Array/length/S15.4.2.2_A2.2_T3.js` |
 | fail | runtime: TypeError (UNCAUGHT) uncaught exception: The value of Array.prototype.l… | `built-ins/Array/length/S15.4.4_A1.3_T1.js` |
+| fail | runtime: TypeError (UNCAUGHT) uncaught exception: The result of evaluating (e in… | `built-ins/Array/length/S15.4.5.1_A1.1_T1.js` |

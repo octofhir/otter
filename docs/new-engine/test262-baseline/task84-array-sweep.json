@@ -1,15 +1,15 @@
 {
   "test262_commit": "unknown",
-  "engine_commit": "74f792bff313cfc8ecdaf684ed067ef67130def4",
-  "ran_at": "2026-05-06T06:23:13.571680+00:00",
+  "engine_commit": "5705e8154841fc548a4b132535368979996814ce",
+  "ran_at": "2026-05-06T06:47:43.687611+00:00",
   "totals": {
     "total": 3083,
     "passed": 517,
-    "failed": 2338,
+    "failed": 2339,
     "skipped": 227,
     "crashed": 0,
     "timed_out": 0,
-    "oom": 1
+    "oom": 0
   },
   "by_section": {
     "annexB/built-ins/Array": {
@@ -302,12 +302,12 @@
     },
     "built-ins/Array/S15.4_A1.1_T10.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
-      "oom": 1
+      "oom": 0
     },
     "built-ins/Array/S15.4_A1.1_T4.js": {
       "total": 1,
@@ -527,8 +527,8 @@
     },
     "built-ins/Array/prototype": {
       "total": 2810,
-      "passed": 480,
-      "failed": 2206,
+      "passed": 479,
+      "failed": 2207,
       "skipped": 124,
       "crashed": 0,
       "timed_out": 0,
@@ -654,7 +654,7 @@
     {
       "path": "built-ins/Array/S15.4.5.2_A1_T1.js",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismatch"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: The value of x.length is expected to be 2147483649 Expected SameValue(«2», «2147483649») to be true"
     },
     {
       "path": "built-ins/Array/S15.4.5.2_A1_T2.js",
@@ -675,11 +675,6 @@
       "path": "built-ins/Array/S15.4.5.2_A3_T3.js",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: The value of x.length is expected to be 4294967295 Expected SameValue(«0», «4294967295») to be true"
-    },
-    {
-      "path": "built-ins/Array/S15.4_A1.1_T10.js",
-      "outcome": "oom",
-      "reason": "oom: 268435456 bytes requested"
     },
     {
       "path": "built-ins/Array/S15.4_A1.1_T4.js",
@@ -1151,7 +1146,7 @@
       "path": "built-ins/Array/length/S15.4.5.2_A3_T4.js",
       "esid": "sec-properties-of-array-instances-length",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismatch"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: The value of x[2] is expected to equal undefined Expected SameValue(«2», «undefined») to be true"
     },
     {
       "path": "built-ins/Array/length/define-own-prop-length-coercion-order-set.js",
@@ -5903,6 +5898,12 @@
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismatch"
     },
     {
+      "path": "built-ins/Array/prototype/indexOf/15.4.4.14-10-1.js",
+      "esid": "sec-array.prototype.indexof",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: a.indexOf(\"\") Expected SameValue(«-1», «99999») to be true"
+    },
+    {
       "path": "built-ins/Array/prototype/indexOf/15.4.4.14-10-2.js",
       "esid": "sec-array.prototype.indexof",
       "outcome": "fail",
@@ -6228,12 +6229,6 @@
     },
     {
       "path": "built-ins/Array/prototype/indexOf/15.4.4.14-5-1.js",
-      "esid": "sec-array.prototype.indexof",
-      "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismatch"
-    },
-    {
-      "path": "built-ins/Array/prototype/indexOf/15.4.4.14-5-12.js",
       "esid": "sec-array.prototype.indexof",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismatch"
@@ -7208,7 +7203,7 @@
       "path": "built-ins/Array/prototype/lastIndexOf/15.4.4.15-5-12.js",
       "esid": "sec-array.prototype.lastindexof",
       "outcome": "fail",
-      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismatch"
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: arr.lastIndexOf(null, Infinity) Expected SameValue(«-1», «4294967294») to be true"
     },
     {
       "path": "built-ins/Array/prototype/lastIndexOf/15.4.4.15-5-15.js",
@@ -7599,6 +7594,12 @@
       "esid": "sec-array.prototype.lastindexof",
       "outcome": "fail",
       "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: operand type mismatch"
+    },
+    {
+      "path": "built-ins/Array/prototype/lastIndexOf/15.4.4.15-9-1.js",
+      "esid": "sec-array.prototype.lastindexof",
+      "outcome": "fail",
+      "reason": "runtime: TypeError (UNCAUGHT) uncaught exception: a.lastIndexOf(\"\") Expected SameValue(«-1», «99999») to be true"
     },
     {
       "path": "built-ins/Array/prototype/lastIndexOf/15.4.4.15-9-2.js",

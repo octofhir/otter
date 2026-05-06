@@ -2,13 +2,18 @@
 
 ## Status
 
-- [ ] `BoundFunction` body migrated to `Gc<…>`
-- [ ] `NativeFunction` body migrated to `Gc<…>`
-- [ ] `JsRegExp` body migrated to `Gc<…>`
-- [ ] last `Rc<…>` removed from public `Value` variants
-- [ ] native function signature uses explicit `NativeCtx`; async host
+- [x] `BoundFunction` body migrated to `Gc<…>`
+- [x] `NativeFunction` body migrated to `Gc<…>`
+- [x] `JsRegExp` body migrated to `Gc<…>`
+- [x] last `Rc<…>` removed from public `Value` variants
+- [x] native function signature uses explicit `NativeCtx`; async host
       ops do not capture VM / GC references
-- [ ] gates green
+- [x] gates green
+
+Closed 2026-05-05. Non-Test262 gates run:
+`cargo fmt --all`, targeted task-83 VM tests, `cargo clippy
+--workspace --all-targets --all-features -- -D warnings`, and
+`cargo test --workspace`.
 
 ## Goal
 
@@ -58,13 +63,13 @@ variant carries a non-leaf `Rc` or `RefCell`.
 
 ## Validation gates
 
-- [ ] `grep -rn "Rc<RefCell\|Rc<.*Body" crates-next/otter-vm/src` returns
+- [x] `grep -rn "Rc<RefCell\|Rc<.*Body" crates-next/otter-vm/src` returns
   zero hits inside `Value`-variant bodies (Shape and other
   immutable-shared types still allowed).
-- [ ] Compile-fail test proves a native host future cannot capture
+- [x] Compile-fail test proves a native host future cannot capture
   `NativeCtx<'_>`, internal `Value`, `Gc<T>`, or `Local<'gc, T>`.
-- [ ] All existing engine fixtures pass.
-- [ ] `cargo clippy --workspace -- -D warnings` clean.
+- [x] All existing engine fixtures pass.
+- [x] `cargo clippy --workspace -- -D warnings` clean.
 
 ## Closing
 

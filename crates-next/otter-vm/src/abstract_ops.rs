@@ -276,14 +276,17 @@ pub fn is_callable(value: &Value) -> bool {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-isconstructor>
 #[must_use]
-pub fn is_constructor(value: &Value, module: &BytecodeModule) -> bool {
+pub fn is_constructor(value: &Value, module: &BytecodeModule, heap: &otter_gc::GcHeap) -> bool {
     match value {
         Value::ClassConstructor(_) => true,
         Value::Function { function_id } | Value::Closure { function_id, .. } => module
             .functions
             .get(*function_id as usize)
             .is_some_and(|f| !f.is_arrow),
-        Value::BoundFunction(b) => is_constructor(&b.target, module),
+        Value::BoundFunction(b) => {
+            let (target, _, _) = b.parts(heap);
+            is_constructor(&target, module, heap)
+        }
         _ => false,
     }
 }

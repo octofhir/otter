@@ -265,7 +265,7 @@ fn reserve_elements_for_len(
     let before = spilled_capacity_bytes(body.elements.capacity());
     let after = spilled_capacity_bytes(target_len);
     if after > before {
-        heap.reserve_bytes((after - before) as u64)?;
+        heap.reserve_bytes_no_collect((after - before) as u64)?;
     }
     body.elements
         .reserve_exact(target_len.saturating_sub(body.elements.len()));
@@ -285,7 +285,7 @@ fn reserve_for_target_len(
     let before = spilled_capacity_bytes(current_capacity);
     let after = spilled_capacity_bytes(target_len);
     if after > before {
-        heap.reserve_bytes((after - before) as u64)?;
+        heap.reserve_bytes_no_collect((after - before) as u64)?;
     }
     // The actual reserve is performed under `with_payload` after the
     // cap check succeeds; keep this helper allocation-free.

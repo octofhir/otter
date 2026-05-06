@@ -311,6 +311,10 @@ fn execute_in_process(
             eprintln!("\ninterrupted by user — writing partial baseline");
             break;
         }
+        if std::env::var_os("OTTER_TEST262_TRACE_CURRENT").is_some() {
+            let rel = path.strip_prefix(&paths.test_dir).unwrap_or(path).display();
+            eprintln!("test262-current {} {rel}", resume_offset + idx);
+        }
         let result = run_one(path, paths, &mut harness, &exec);
         record_progress(&pb, &result.outcome);
         results.push(result);

@@ -236,6 +236,36 @@ impl GcHeap {
         Ok(())
     }
 
+    /// Reserve off-slot bytes without running an emergency
+    /// collection.
+    ///
+    /// VM containers use this for capacity growth while their
+    /// roots live in interpreter frames. A heap-local emergency GC
+    /// cannot see those frame roots, so the only sound cap behavior
+    /// at this boundary is to refuse the reservation and let the VM
+    /// synthesize a catchable diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// [`OutOfMemory::HeapCapExceeded`] when `bytes` would exceed
+    /// the configured cap.
+    pub fn reserve_bytes_no_collect(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+        if self.max_heap_bytes == 0 {
+            return Ok(());
+        }
+        let projected = self.tracked_bytes.saturating_add(bytes);
+        if projected > self.max_heap_bytes {
+            self.oom_flag.store(true, Ordering::Relaxed);
+            return Err(OutOfMemory::HeapCapExceeded {
+                requested_bytes: bytes,
+                heap_limit_bytes: self.max_heap_bytes,
+            });
+        }
+        self.tracked_bytes = projected;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
     /// Release `bytes` previously booked via [`Self::reserve_bytes`].
     /// Saturates at zero if the caller overshoots — not an error;
     /// keeps the counter monotone-correct under arithmetic edge
@@ -541,6 +571,38 @@ impl GcHeap {
     ///   a fresh page request.
     #[inline]
     pub fn alloc_old<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_old_inner(value, true)
+    }
+
+    /// Allocate a diagnostic object directly in old-space without
+    /// refusing on [`OutOfMemory::HeapCapExceeded`].
+    ///
+    /// This is a narrow escape hatch for error objects that make a
+    /// just-triggered heap cap catchable by script code. Cage
+    /// exhaustion still fails normally, and the allocation is
+    /// reflected back into [`Self::tracked_bytes`] so subsequent
+    /// mutator allocations continue to observe the exceeded cap.
+    ///
+    /// # Errors
+    ///
+    /// [`OutOfMemory::CageExhausted`] if no in-cage page can satisfy
+    /// the allocation.
+    #[inline]
+    pub fn alloc_old_diagnostic<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
+        let out = self.alloc_old_inner(value, false)?;
+        if self.max_heap_bytes != 0 {
+            self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
+            self.oom_flag.store(true, Ordering::Relaxed);
+        }
+        Ok(out)
+    }
+
+    #[inline]
+    fn alloc_old_inner<T: Traceable>(
+        &mut self,
+        value: T,
+        enforce_cap: bool,
+    ) -> Result<Gc<T>, OutOfMemory> {
         if self.trace_table.get(T::TYPE_TAG).is_none() {
             self.trace_table.register::<T>();
         }
@@ -550,7 +612,7 @@ impl GcHeap {
             aligned <= u32::MAX as usize,
             "object size exceeds u32 limit"
         );
-        if self.max_heap_bytes != 0 {
+        if enforce_cap && self.max_heap_bytes != 0 {
             self.account_or_collect(aligned as u64)?;
         }
         let is_marking = self.marking.is_marking();

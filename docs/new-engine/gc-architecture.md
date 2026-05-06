@@ -601,6 +601,10 @@ backend.
 - All `crates-next` lib tests still pass.
 - `bash scripts/test262-safe.sh built-ins/Array` runs to completion
   on a 16 GB host without thrashing; peak host RSS ≤ 4 GB.
+  Task 84 local baseline (2026-05-06): wrapper-normalized
+  `built-ins/Array/` filter completed 3083 tests with 517 pass,
+  2338 fail, 227 skip, 0 timeout, 1 in-engine OOM, 0 crash;
+  peak host RSS was 791936 KiB (~774 MiB).
 - Regression tests: cycle reclamation, WeakMap/WeakSet eviction,
   WeakRef clearing, FinalizationRegistry firing, cap-as-`RangeError`.
 - STW old-gen pause ≤ 200 ms at 1 GB live (acceptable for tests;

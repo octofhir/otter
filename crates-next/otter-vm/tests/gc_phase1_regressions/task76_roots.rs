@@ -1,12 +1,10 @@
-//! Per-root smoke-test scaffold for the GC root walker
+//! Per-root regression coverage for the GC root walker
 //! ([`otter_vm::runtime_state::RuntimeState::trace_roots`]).
 //!
-//! Each test is `#[ignore]` today: Phase 1's value model is
-//! still `Rc`-shared, so allocating "via root R, drop the local
-//! handle, force GC, assert the value is still readable" needs
-//! the future `Gc<T>` API which has not landed yet. Each
-//! migration task in 76–83 un-ignores the matching test as it
-//! brings its type online.
+//! Tasks 76–83 enabled the root cases for their migrated value
+//! bodies. The remaining ignored entries are intentionally outside
+//! Phase 1 (`active call frame` still needs a suspension harness;
+//! symbols remain leaf interned values).
 //!
 //! # Mapping
 //!
@@ -22,7 +20,7 @@
 //! | bound / native / regexp | 83 |
 //! | active call frame | 76 (concurrently with upvalue) |
 //! | microtask queue | 82 |
-//! | symbol registry | 83 |
+//! | symbol registry | out of scope while symbols stay leaf interned values |
 //! | error-class registry | 77 |
 //!
 //! # See also
@@ -507,22 +505,78 @@ fn parked_frame_keeps_alive() {
 }
 
 #[test]
-#[ignore = "un-ignore in task 83 (symbol registry)"]
+#[ignore = "symbols remain leaf interned values; no GC body to root yet"]
 fn symbol_registry_root_survives_force_gc() {
-    // task 83: Symbol.for("k") retains the registered symbol
-    // across force_gc and Symbol.keyFor returns "k".
+    // Future symbol-body migration: Symbol.for("k") retains the
+    // registered symbol across force_gc and Symbol.keyFor returns "k".
 }
 
 #[test]
-#[ignore = "un-ignore in task 83 (bound / native / regexp)"]
 fn bound_function_root_survives_force_gc() {
-    // task 83: f.bind(this), drop intermediate, force_gc,
-    // assert callable.
+    let mut interp = Interpreter::new();
+    let target = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("target");
+    let bound_this = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("this");
+    let bound = otter_vm::BoundFunction::new(
+        interp.gc_heap_mut(),
+        otter_vm::Value::Object(target),
+        otter_vm::Value::Object(bound_this),
+        smallvec::smallvec![otter_vm::Value::Boolean(true)],
+    )
+    .expect("bound");
+    let global_this = *interp.global_this();
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__bound_root",
+        otter_vm::Value::BoundFunction(bound),
+    );
+
+    let _ = target;
+    let _ = bound_this;
+    let _ = bound;
+    interp.force_gc();
+
+    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__bound_root")
+        .expect("bound root survives force_gc");
+    match rooted {
+        otter_vm::Value::BoundFunction(bound) => {
+            let (target, bound_this, args) = bound.parts(interp.gc_heap());
+            assert!(matches!(target, otter_vm::Value::Object(_)));
+            assert!(matches!(bound_this, otter_vm::Value::Object(_)));
+            assert!(matches!(args.first(), Some(otter_vm::Value::Boolean(true))));
+        }
+        other => panic!("expected Value::BoundFunction after force_gc, got {other:?}"),
+    }
 }
 
 #[test]
-#[ignore = "un-ignore in task 83 (regexp body)"]
 fn regexp_root_survives_force_gc() {
-    // task 83: alloc /a/g, drop handle, force_gc, assert
-    // re-execable.
+    let mut interp = Interpreter::new();
+    let pattern: Vec<u16> = "a+".encode_utf16().collect();
+    let re = otter_vm::JsRegExp::compile(interp.gc_heap_mut(), &pattern, "g").expect("regexp");
+    let global_this = *interp.global_this();
+    otter_vm::object::set(
+        global_this,
+        interp.gc_heap_mut(),
+        "__regexp_root",
+        otter_vm::Value::RegExp(re),
+    );
+
+    let _ = re;
+    interp.force_gc();
+
+    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__regexp_root")
+        .expect("regexp root survives force_gc");
+    match rooted {
+        otter_vm::Value::RegExp(re) => {
+            let text: Vec<u16> = "aaab".encode_utf16().collect();
+            let first = re
+                .find_from_utf16(interp.gc_heap(), &text, 0)
+                .into_iter()
+                .next()
+                .expect("regexp remains executable after force_gc");
+            assert_eq!(first.range, 0..3);
+        }
+        other => panic!("expected Value::RegExp after force_gc, got {other:?}"),
+    }
 }

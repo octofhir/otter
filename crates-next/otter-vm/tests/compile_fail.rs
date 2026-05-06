@@ -36,6 +36,7 @@ fn compile_fail_send_sync_invariants() {
     t.compile_fail("tests/compile_fail/gc_handle_is_not_send.rs");
     t.compile_fail("tests/compile_fail/local_is_not_send.rs");
     t.compile_fail("tests/compile_fail/heap_is_not_send.rs");
+    t.compile_fail("tests/compile_fail/native_ctx_is_not_send.rs");
     t.compile_fail("tests/compile_fail/value_is_not_send.rs");
     t.compile_fail("tests/compile_fail/frame_is_not_send.rs");
 }

@@ -70,31 +70,34 @@ fn exec_once(
 ) -> Result<Value, IntrinsicError> {
     let units = text.to_utf16_vec();
     let len = units.len();
-    let flags = re.flags();
-    let mut start = re.last_index() as usize;
+    let flags = re.flags(gc_heap);
+    let mut start = re.last_index(gc_heap) as usize;
     if (flags.global || flags.sticky) && start > len {
-        re.set_last_index(0);
+        re.set_last_index(gc_heap, 0);
         return Ok(Value::Null);
     }
     if !flags.global && !flags.sticky {
         start = 0;
     }
-    let m = re.regex().find_from_utf16(&units, start).next();
+    let m = re
+        .find_from_utf16(gc_heap, &units, start)
+        .into_iter()
+        .next();
     let m = match m {
         Some(m) => m,
         None => {
             if flags.global || flags.sticky {
-                re.set_last_index(0);
+                re.set_last_index(gc_heap, 0);
             }
             return Ok(Value::Null);
         }
     };
     if flags.sticky && m.range.start != start {
-        re.set_last_index(0);
+        re.set_last_index(gc_heap, 0);
         return Ok(Value::Null);
     }
     if flags.global || flags.sticky {
-        re.set_last_index(m.range.end as u32);
+        re.set_last_index(gc_heap, m.range.end as u32);
     }
 
     Ok(Value::Array(build_match_result(
@@ -219,7 +222,7 @@ fn pair_array(
 fn impl_exec(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
     let text = arg_string(args, 0)?.clone();
-    let re_clone = re.clone();
+    let re_clone = *re;
     let mut heap = args.gc_heap.borrow_mut();
     exec_once(&re_clone, &text, args.string_heap, *heap)
 }
@@ -227,7 +230,7 @@ fn impl_exec(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_test(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
     let text = arg_string(args, 0)?.clone();
-    let re_clone = re.clone();
+    let re_clone = *re;
     let mut heap = args.gc_heap.borrow_mut();
     let result = exec_once(&re_clone, &text, args.string_heap, *heap)?;
     Ok(Value::Boolean(!matches!(result, Value::Null)))
@@ -235,7 +238,8 @@ fn impl_test(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
-    let rendered = format!("/{}/{}", re.source(), re.flags().to_js_string());
+    let heap = args.gc_heap.borrow();
+    let rendered = format!("/{}/{}", re.source(&heap), re.flags(&heap).to_js_string());
     Ok(Value::String(JsString::from_str(
         &rendered,
         args.string_heap,
@@ -264,25 +268,30 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
 /// back to `Value::Undefined`. `lastIndex` reads and writes flow
 /// through here too.
 #[must_use]
-pub fn load_property(re: &JsRegExp, name: &str, string_heap: &crate::string::StringHeap) -> Value {
+pub fn load_property(
+    re: &JsRegExp,
+    gc_heap: &otter_gc::GcHeap,
+    name: &str,
+    string_heap: &crate::string::StringHeap,
+) -> Value {
     match name {
-        "source" => match JsString::from_str(re.source(), string_heap) {
+        "source" => match JsString::from_str(&re.source(gc_heap), string_heap) {
             Ok(s) => Value::String(s),
             Err(_) => Value::Undefined,
         },
-        "flags" => match JsString::from_str(&re.flags().to_js_string(), string_heap) {
+        "flags" => match JsString::from_str(&re.flags(gc_heap).to_js_string(), string_heap) {
             Ok(s) => Value::String(s),
             Err(_) => Value::Undefined,
         },
-        "hasIndices" => Value::Boolean(re.flags().has_indices),
-        "global" => Value::Boolean(re.flags().global),
-        "ignoreCase" => Value::Boolean(re.flags().ignore_case),
-        "multiline" => Value::Boolean(re.flags().multiline),
-        "dotAll" => Value::Boolean(re.flags().dot_all),
-        "unicode" => Value::Boolean(re.flags().unicode),
-        "sticky" => Value::Boolean(re.flags().sticky),
-        "unicodeSets" => Value::Boolean(re.flags().unicode_sets),
-        "lastIndex" => Value::Number(NumberValue::from_i32(re.last_index() as i32)),
+        "hasIndices" => Value::Boolean(re.flags(gc_heap).has_indices),
+        "global" => Value::Boolean(re.flags(gc_heap).global),
+        "ignoreCase" => Value::Boolean(re.flags(gc_heap).ignore_case),
+        "multiline" => Value::Boolean(re.flags(gc_heap).multiline),
+        "dotAll" => Value::Boolean(re.flags(gc_heap).dot_all),
+        "unicode" => Value::Boolean(re.flags(gc_heap).unicode),
+        "sticky" => Value::Boolean(re.flags(gc_heap).sticky),
+        "unicodeSets" => Value::Boolean(re.flags(gc_heap).unicode_sets),
+        "lastIndex" => Value::Number(NumberValue::from_i32(re.last_index(gc_heap) as i32)),
         _ => Value::Undefined,
     }
 }
@@ -291,7 +300,7 @@ pub fn load_property(re: &JsRegExp, name: &str, string_heap: &crate::string::Str
 /// `lastIndex` is writable; everything else is silently ignored
 /// (foundation: the spec marks accessors non-writable, so a real
 /// `TypeError` belongs in a later strict-mode slice).
-pub fn store_property(re: &JsRegExp, name: &str, value: &Value) {
+pub fn store_property(re: &JsRegExp, gc_heap: &otter_gc::GcHeap, name: &str, value: &Value) {
     if name == "lastIndex" {
         if let Value::Number(n) = value {
             let raw = n.as_f64();
@@ -302,7 +311,7 @@ pub fn store_property(re: &JsRegExp, name: &str, value: &Value) {
             } else {
                 raw as u32
             };
-            re.set_last_index(clamped);
+            re.set_last_index(gc_heap, clamped);
         }
     }
 }
@@ -312,9 +321,9 @@ mod tests {
     use super::*;
     use crate::string::StringHeap;
 
-    fn make(pattern: &str, flags: &str) -> Value {
+    fn make(pattern: &str, flags: &str, gc_heap: &mut otter_gc::GcHeap) -> Value {
         let units: Vec<u16> = pattern.encode_utf16().collect();
-        Value::RegExp(JsRegExp::compile(&units, flags).unwrap())
+        Value::RegExp(JsRegExp::compile(gc_heap, &units, flags).unwrap())
     }
 
     fn call(method: &str, recv: &Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
@@ -333,7 +342,7 @@ mod tests {
     fn test_returns_boolean() {
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = make("ab+c", "");
+        let re = make("ab+c", "", &mut gc_heap);
         let text = Value::String(JsString::from_str("abbbc", &heap).unwrap());
         assert_eq!(
             call("test", &re, &[text], &mut gc_heap),
@@ -350,7 +359,7 @@ mod tests {
     fn exec_returns_array_or_null() {
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = make("(a)(b)", "");
+        let re = make("(a)(b)", "", &mut gc_heap);
         let text = Value::String(JsString::from_str("ab", &heap).unwrap());
         let r = call("exec", &re, &[text], &mut gc_heap);
         match r {
@@ -375,45 +384,54 @@ mod tests {
     fn exec_global_walks_through_text() {
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let re = make("a", "g");
+        let re = make("a", "g", &mut gc_heap);
         let text = Value::String(JsString::from_str("abab", &heap).unwrap());
         // First call → match at 0, lastIndex moves to 1.
         let r1 = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         match (&r1, &re) {
             (Value::Array(arr), Value::RegExp(rx)) => {
                 assert_eq!(crate::array::get(*arr, &gc_heap, 0).display_string(), "a");
-                assert_eq!(rx.last_index(), 1);
+                assert_eq!(rx.last_index(&gc_heap), 1);
             }
             _ => panic!(),
         }
         // Second call → match at 2, lastIndex → 3.
         call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         if let Value::RegExp(rx) = &re {
-            assert_eq!(rx.last_index(), 3);
+            assert_eq!(rx.last_index(&gc_heap), 3);
         }
         // Third call → no match, lastIndex → 0.
         let r3 = call("exec", &re, &[text], &mut gc_heap);
         assert_eq!(r3, Value::Null);
         if let Value::RegExp(rx) = &re {
-            assert_eq!(rx.last_index(), 0);
+            assert_eq!(rx.last_index(&gc_heap), 0);
         }
     }
 
     #[test]
     fn property_lookups() {
         let heap = StringHeap::default();
-        let re = JsRegExp::compile(&"ab+c".encode_utf16().collect::<Vec<_>>(), "gi").unwrap();
-        let src = load_property(&re, "source", &heap);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let re = JsRegExp::compile(
+            &mut gc_heap,
+            &"ab+c".encode_utf16().collect::<Vec<_>>(),
+            "gi",
+        )
+        .unwrap();
+        let src = load_property(&re, &gc_heap, "source", &heap);
         assert_eq!(src.display_string(), "ab+c");
-        let flags = load_property(&re, "flags", &heap);
+        let flags = load_property(&re, &gc_heap, "flags", &heap);
         assert_eq!(flags.display_string(), "gi");
-        assert_eq!(load_property(&re, "global", &heap), Value::Boolean(true));
         assert_eq!(
-            load_property(&re, "ignoreCase", &heap),
+            load_property(&re, &gc_heap, "global", &heap),
             Value::Boolean(true)
         );
         assert_eq!(
-            load_property(&re, "multiline", &heap),
+            load_property(&re, &gc_heap, "ignoreCase", &heap),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            load_property(&re, &gc_heap, "multiline", &heap),
             Value::Boolean(false)
         );
     }
@@ -421,22 +439,36 @@ mod tests {
     #[test]
     fn last_index_writable() {
         let heap = StringHeap::default();
-        let re = JsRegExp::compile(&"a".encode_utf16().collect::<Vec<_>>(), "g").unwrap();
-        store_property(&re, "lastIndex", &Value::Number(NumberValue::from_i32(7)));
-        assert_eq!(re.last_index(), 7);
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let re =
+            JsRegExp::compile(&mut gc_heap, &"a".encode_utf16().collect::<Vec<_>>(), "g").unwrap();
+        store_property(
+            &re,
+            &gc_heap,
+            "lastIndex",
+            &Value::Number(NumberValue::from_i32(7)),
+        );
+        assert_eq!(re.last_index(&gc_heap), 7);
         // Negative clamps to 0.
-        store_property(&re, "lastIndex", &Value::Number(NumberValue::from_i32(-3)));
-        assert_eq!(re.last_index(), 0);
+        store_property(
+            &re,
+            &gc_heap,
+            "lastIndex",
+            &Value::Number(NumberValue::from_i32(-3)),
+        );
+        assert_eq!(re.last_index(&gc_heap), 0);
         // String writes are ignored (non-spec, but defensive).
         store_property(
             &re,
+            &gc_heap,
             "lastIndex",
             &Value::String(JsString::from_str("x", &heap).unwrap()),
         );
-        assert_eq!(re.last_index(), 0);
+        assert_eq!(re.last_index(&gc_heap), 0);
         // Non-lastIndex names are silently ignored.
         store_property(
             &re,
+            &gc_heap,
             "source",
             &Value::String(JsString::from_str("nope", &heap).unwrap()),
         );

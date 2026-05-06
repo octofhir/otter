@@ -35,7 +35,7 @@
 
 use smallvec::smallvec;
 
-use crate::native_function::{NativeError, native_value};
+use crate::native_function::{NativeError, native_value_with_captures, native_value_with_trace};
 use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
     PromiseThenOutcome,
@@ -52,8 +52,8 @@ pub fn construct(
     heap: &mut otter_gc::GcHeap,
 ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
     let promise = JsPromiseHandle::pending(heap)?;
-    let resolve = make_resolve_native(promise);
-    let reject = make_reject_native(promise);
+    let resolve = make_resolve_native(heap, promise)?;
+    let reject = make_reject_native(heap, promise)?;
     Ok((promise, resolve, reject))
 }
 
@@ -164,9 +164,10 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
         }
         return Ok(Value::Promise(result));
     }
-    // Track per-slot fulfillment via a shared `Rc<RefCell<...>>`
-    // that the per-element resolver mutates. Foundation `Rc`
-    // model — task 57 (GC) revisits.
+    // Track per-slot fulfillment via shared Rust state that each
+    // per-element resolver mutates. The native function bodies
+    // install trace hooks over this state, so any fulfilled GC
+    // values remain live while the combinator is pending.
     let total = entries.len();
     let slots: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![None; total]));
@@ -180,35 +181,56 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
             Value::Promise(p) => p,
             other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
-        let on_fulfill = native_value("Promise.all element", move |interp, args| {
-            let v = args.first().cloned().unwrap_or(Value::Undefined);
-            let mut slots_mut = slots.borrow_mut();
-            slots_mut[i] = Some(v);
-            let count = remaining.get().saturating_sub(1);
-            remaining.set(count);
-            if count == 0 {
-                let collected: Vec<Value> = slots_mut
-                    .drain(..)
-                    .map(|opt| opt.unwrap_or(Value::Undefined))
-                    .collect();
-                drop(slots_mut);
-                let arr = crate::array::from_elements(interp.gc_heap_mut(), collected)?;
-                let jobs = result_clone.fulfill(interp.gc_heap_mut(), Value::Array(arr));
+        let trace_slots = {
+            let slots = slots.clone();
+            std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+                for value in slots.borrow().iter().flatten() {
+                    value.trace_value_slots(visitor);
+                }
+            })
+        };
+        let on_fulfill = native_value_with_trace(
+            interp.gc_heap_mut(),
+            "Promise.all element",
+            smallvec![Value::Promise(result_clone)],
+            trace_slots,
+            move |ctx, args| {
+                let interp = ctx.interp_mut();
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                let mut slots_mut = slots.borrow_mut();
+                slots_mut[i] = Some(v);
+                let count = remaining.get().saturating_sub(1);
+                remaining.set(count);
+                if count == 0 {
+                    let collected: Vec<Value> = slots_mut
+                        .drain(..)
+                        .map(|opt| opt.unwrap_or(Value::Undefined))
+                        .collect();
+                    drop(slots_mut);
+                    let arr = crate::array::from_elements(interp.gc_heap_mut(), collected)?;
+                    let jobs = result_clone.fulfill(interp.gc_heap_mut(), Value::Array(arr));
+                    for j in jobs.jobs {
+                        interp.microtasks_mut().enqueue(j);
+                    }
+                }
+                Ok(Value::Undefined)
+            },
+        )?;
+        let result_for_reject = result;
+        let on_reject = native_value_with_captures(
+            interp.gc_heap_mut(),
+            "Promise.all reject",
+            smallvec![Value::Promise(result_for_reject)],
+            move |ctx, args| {
+                let interp = ctx.interp_mut();
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
                 for j in jobs.jobs {
                     interp.microtasks_mut().enqueue(j);
                 }
-            }
-            Ok(Value::Undefined)
-        });
-        let result_for_reject = result;
-        let on_reject = native_value("Promise.all reject", move |interp, args| {
-            let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
-            for j in jobs.jobs {
-                interp.microtasks_mut().enqueue(j);
-            }
-            Ok(Value::Undefined)
-        });
+                Ok(Value::Undefined)
+            },
+        )?;
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
     Ok(Value::Promise(result))
@@ -233,23 +255,35 @@ fn static_race(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Native
             other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
         let result_for_fulfill = result;
-        let on_fulfill = native_value("Promise.race fulfill", move |interp, args| {
-            let v = args.first().cloned().unwrap_or(Value::Undefined);
-            let jobs = result_for_fulfill.fulfill(interp.gc_heap_mut(), v);
-            for j in jobs.jobs {
-                interp.microtasks_mut().enqueue(j);
-            }
-            Ok(Value::Undefined)
-        });
+        let on_fulfill = native_value_with_captures(
+            interp.gc_heap_mut(),
+            "Promise.race fulfill",
+            smallvec![Value::Promise(result_for_fulfill)],
+            move |ctx, args| {
+                let interp = ctx.interp_mut();
+                let v = args.first().cloned().unwrap_or(Value::Undefined);
+                let jobs = result_for_fulfill.fulfill(interp.gc_heap_mut(), v);
+                for j in jobs.jobs {
+                    interp.microtasks_mut().enqueue(j);
+                }
+                Ok(Value::Undefined)
+            },
+        )?;
         let result_for_reject = result;
-        let on_reject = native_value("Promise.race reject", move |interp, args| {
-            let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
-            for j in jobs.jobs {
-                interp.microtasks_mut().enqueue(j);
-            }
-            Ok(Value::Undefined)
-        });
+        let on_reject = native_value_with_captures(
+            interp.gc_heap_mut(),
+            "Promise.race reject",
+            smallvec![Value::Promise(result_for_reject)],
+            move |ctx, args| {
+                let interp = ctx.interp_mut();
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
+                for j in jobs.jobs {
+                    interp.microtasks_mut().enqueue(j);
+                }
+                Ok(Value::Undefined)
+            },
+        )?;
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
     Ok(Value::Promise(result))
@@ -305,31 +339,61 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Result<Value,
             let slots = slots.clone();
             let remaining = remaining.clone();
             let heap = heap.clone();
-            native_value("Promise.allSettled fulfill", move |interp, args| {
-                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let record = build_settled_record(true, v, &heap, interp.gc_heap_for_cx_mut())
-                    .map_err(|e| NativeError::TypeError {
-                        name: "Promise",
-                        reason: format!("string allocation failed: {e}"),
-                    })?;
-                finalize_settled(&slots, &remaining, &result, i, record, interp);
-                Ok(Value::Undefined)
-            })
+            let trace_slots = {
+                let slots = slots.clone();
+                std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+                    for value in slots.borrow().iter().flatten() {
+                        value.trace_value_slots(visitor);
+                    }
+                })
+            };
+            native_value_with_trace(
+                interp.gc_heap_mut(),
+                "Promise.allSettled fulfill",
+                smallvec![Value::Promise(result)],
+                trace_slots,
+                move |ctx, args| {
+                    let interp = ctx.interp_mut();
+                    let v = args.first().cloned().unwrap_or(Value::Undefined);
+                    let record = build_settled_record(true, v, &heap, interp.gc_heap_for_cx_mut())
+                        .map_err(|e| NativeError::TypeError {
+                            name: "Promise",
+                            reason: format!("string allocation failed: {e}"),
+                        })?;
+                    finalize_settled(&slots, &remaining, &result, i, record, interp);
+                    Ok(Value::Undefined)
+                },
+            )?
         };
         let on_reject = {
             let slots = slots.clone();
             let remaining = remaining.clone();
             let heap = heap.clone();
-            native_value("Promise.allSettled reject", move |interp, args| {
-                let r = args.first().cloned().unwrap_or(Value::Undefined);
-                let record = build_settled_record(false, r, &heap, interp.gc_heap_for_cx_mut())
-                    .map_err(|e| NativeError::TypeError {
-                        name: "Promise",
-                        reason: format!("string allocation failed: {e}"),
-                    })?;
-                finalize_settled(&slots, &remaining, &result, i, record, interp);
-                Ok(Value::Undefined)
-            })
+            let trace_slots = {
+                let slots = slots.clone();
+                std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+                    for value in slots.borrow().iter().flatten() {
+                        value.trace_value_slots(visitor);
+                    }
+                })
+            };
+            native_value_with_trace(
+                interp.gc_heap_mut(),
+                "Promise.allSettled reject",
+                smallvec![Value::Promise(result)],
+                trace_slots,
+                move |ctx, args| {
+                    let interp = ctx.interp_mut();
+                    let r = args.first().cloned().unwrap_or(Value::Undefined);
+                    let record = build_settled_record(false, r, &heap, interp.gc_heap_for_cx_mut())
+                        .map_err(|e| NativeError::TypeError {
+                            name: "Promise",
+                            reason: format!("string allocation failed: {e}"),
+                        })?;
+                    finalize_settled(&slots, &remaining, &result, i, record, interp);
+                    Ok(Value::Undefined)
+                },
+            )?
         };
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
@@ -442,53 +506,74 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
             other => JsPromiseHandle::fulfilled(interp.gc_heap_mut(), other)?,
         };
         let on_fulfill = {
-            native_value("Promise.any fulfill", move |interp, args| {
-                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let jobs = result.fulfill(interp.gc_heap_mut(), v);
-                for j in jobs.jobs {
-                    interp.microtasks_mut().enqueue(j);
-                }
-                Ok(Value::Undefined)
-            })
+            native_value_with_captures(
+                interp.gc_heap_mut(),
+                "Promise.any fulfill",
+                smallvec![Value::Promise(result)],
+                move |ctx, args| {
+                    let interp = ctx.interp_mut();
+                    let v = args.first().cloned().unwrap_or(Value::Undefined);
+                    let jobs = result.fulfill(interp.gc_heap_mut(), v);
+                    for j in jobs.jobs {
+                        interp.microtasks_mut().enqueue(j);
+                    }
+                    Ok(Value::Undefined)
+                },
+            )?
         };
         let on_reject = {
             let errors = errors.clone();
             let remaining = remaining.clone();
             let heap = heap.clone();
             let registry = registry.clone();
-            native_value("Promise.any reject", move |interp, args| {
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                let mut errs = errors.borrow_mut();
-                if errs[i].is_some() {
-                    return Ok(Value::Undefined);
-                }
-                errs[i] = Some(reason);
-                let count = remaining.get().saturating_sub(1);
-                remaining.set(count);
-                if count == 0 {
-                    let collected: Vec<Value> = errs
-                        .drain(..)
-                        .map(|opt| opt.unwrap_or(Value::Undefined))
-                        .collect();
-                    drop(errs);
-                    let agg = registry
-                        .make_aggregate_instance(
-                            collected,
-                            Some("All promises were rejected"),
-                            &heap,
-                            interp.gc_heap_for_cx_mut(),
-                        )
-                        .map_err(|e| NativeError::TypeError {
-                            name: "Promise",
-                            reason: format!("string allocation failed: {e}"),
-                        })?;
-                    let jobs = result.reject(interp.gc_heap_mut(), Value::Object(agg));
-                    for j in jobs.jobs {
-                        interp.microtasks_mut().enqueue(j);
+            let trace_errors = {
+                let errors = errors.clone();
+                std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+                    for value in errors.borrow().iter().flatten() {
+                        value.trace_value_slots(visitor);
                     }
-                }
-                Ok(Value::Undefined)
-            })
+                })
+            };
+            native_value_with_trace(
+                interp.gc_heap_mut(),
+                "Promise.any reject",
+                smallvec![Value::Promise(result)],
+                trace_errors,
+                move |ctx, args| {
+                    let interp = ctx.interp_mut();
+                    let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                    let mut errs = errors.borrow_mut();
+                    if errs[i].is_some() {
+                        return Ok(Value::Undefined);
+                    }
+                    errs[i] = Some(reason);
+                    let count = remaining.get().saturating_sub(1);
+                    remaining.set(count);
+                    if count == 0 {
+                        let collected: Vec<Value> = errs
+                            .drain(..)
+                            .map(|opt| opt.unwrap_or(Value::Undefined))
+                            .collect();
+                        drop(errs);
+                        let agg = registry
+                            .make_aggregate_instance(
+                                collected,
+                                Some("All promises were rejected"),
+                                &heap,
+                                interp.gc_heap_for_cx_mut(),
+                            )
+                            .map_err(|e| NativeError::TypeError {
+                                name: "Promise",
+                                reason: format!("string allocation failed: {e}"),
+                            })?;
+                        let jobs = result.reject(interp.gc_heap_mut(), Value::Object(agg));
+                        for j in jobs.jobs {
+                            interp.microtasks_mut().enqueue(j);
+                        }
+                    }
+                    Ok(Value::Undefined)
+                },
+            )?
         };
         attach_then(interp, &entry_promise, Some(on_fulfill), Some(on_reject));
     }
@@ -552,37 +637,55 @@ fn method_finally(interp: &mut Interpreter, promise: &JsPromiseHandle, args: &[V
     // common case of a synchronous cleanup is preserved.
     let then_handler = {
         let on_finally = on_finally.clone();
-        native_value("Promise.prototype.finally then", move |interp, args| {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
-            interp.microtasks_mut().enqueue(Microtask {
-                callee: on_finally.clone(),
-                this_value: Value::Undefined,
-                args: smallvec![],
-                result_capability: None,
-                kind: crate::microtask::MicrotaskKind::Call,
-            });
-            Ok(value)
-        })
+        match native_value_with_captures(
+            interp.gc_heap_mut(),
+            "Promise.prototype.finally then",
+            smallvec![on_finally.clone()],
+            move |ctx, args| {
+                let interp = ctx.interp_mut();
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                interp.microtasks_mut().enqueue(Microtask {
+                    callee: on_finally.clone(),
+                    this_value: Value::Undefined,
+                    args: smallvec![],
+                    result_capability: None,
+                    kind: crate::microtask::MicrotaskKind::Call,
+                });
+                Ok(value)
+            },
+        ) {
+            Ok(value) => value,
+            Err(_) => return perform_then_with_handlers(interp, promise, None, None),
+        }
     };
     let catch_handler = {
-        native_value("Promise.prototype.finally catch", move |interp, args| {
-            let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            interp.microtasks_mut().enqueue(Microtask {
-                callee: on_finally.clone(),
-                this_value: Value::Undefined,
-                args: smallvec![],
-                result_capability: None,
-                kind: crate::microtask::MicrotaskKind::Call,
-            });
-            // Re-raise the original rejection through the chained
-            // promise. The resolve-native adopts the returned
-            // promise's state, so a rejected handle propagates as
-            // expected.
-            Ok(Value::Promise(JsPromiseHandle::rejected(
-                interp.gc_heap_mut(),
-                reason,
-            )?))
-        })
+        match native_value_with_captures(
+            interp.gc_heap_mut(),
+            "Promise.prototype.finally catch",
+            smallvec![on_finally.clone()],
+            move |ctx, args| {
+                let interp = ctx.interp_mut();
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                interp.microtasks_mut().enqueue(Microtask {
+                    callee: on_finally.clone(),
+                    this_value: Value::Undefined,
+                    args: smallvec![],
+                    result_capability: None,
+                    kind: crate::microtask::MicrotaskKind::Call,
+                });
+                // Re-raise the original rejection through the chained
+                // promise. The resolve-native adopts the returned
+                // promise's state, so a rejected handle propagates as
+                // expected.
+                Ok(Value::Promise(JsPromiseHandle::rejected(
+                    interp.gc_heap_mut(),
+                    reason,
+                )?))
+            },
+        ) {
+            Ok(value) => value,
+            Err(_) => return perform_then_with_handlers(interp, promise, None, None),
+        }
     };
     perform_then_with_handlers(interp, promise, Some(then_handler), Some(catch_handler))
 }
@@ -630,50 +733,78 @@ fn attach_then(
     }
 }
 
-fn make_resolve_native(promise: JsPromiseHandle) -> Value {
-    native_value("Promise resolve", move |interp, args| {
-        if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
-            // If the resolved value is itself a promise, adopt its
-            // state. Spec §27.2.1.4 step 8: schedule a job that
-            // forwards. Foundation: fulfill directly with the
-            // inner value once that promise settles.
-            if let Value::Promise(inner) = &value {
-                let resolver = promise;
-                let on_fulfill =
-                    native_value("Promise resolve adopt fulfill", move |interp, args| {
-                        let v = args.first().cloned().unwrap_or(Value::Undefined);
-                        let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
-                        drain_jobs(interp, jobs);
-                        Ok(Value::Undefined)
-                    });
-                let resolver_for_reject = promise;
-                let on_reject =
-                    native_value("Promise resolve adopt reject", move |interp, args| {
-                        let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                        let jobs = resolver_for_reject.reject(interp.gc_heap_mut(), reason);
-                        drain_jobs(interp, jobs);
-                        Ok(Value::Undefined)
-                    });
-                attach_then(interp, inner, Some(on_fulfill), Some(on_reject));
-                return Ok(Value::Undefined);
+fn make_resolve_native(
+    heap: &mut otter_gc::GcHeap,
+    promise: JsPromiseHandle,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    native_value_with_captures(
+        heap,
+        "Promise resolve",
+        smallvec![Value::Promise(promise)],
+        move |ctx, args| {
+            let interp = ctx.interp_mut();
+            if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                // If the resolved value is itself a promise, adopt its
+                // state. Spec §27.2.1.4 step 8: schedule a job that
+                // forwards. Foundation: fulfill directly with the
+                // inner value once that promise settles.
+                if let Value::Promise(inner) = &value {
+                    let resolver = promise;
+                    let on_fulfill = native_value_with_captures(
+                        interp.gc_heap_mut(),
+                        "Promise resolve adopt fulfill",
+                        smallvec![Value::Promise(resolver)],
+                        move |ctx, args| {
+                            let interp = ctx.interp_mut();
+                            let v = args.first().cloned().unwrap_or(Value::Undefined);
+                            let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
+                            drain_jobs(interp, jobs);
+                            Ok(Value::Undefined)
+                        },
+                    )?;
+                    let resolver_for_reject = promise;
+                    let on_reject = native_value_with_captures(
+                        interp.gc_heap_mut(),
+                        "Promise resolve adopt reject",
+                        smallvec![Value::Promise(resolver_for_reject)],
+                        move |ctx, args| {
+                            let interp = ctx.interp_mut();
+                            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                            let jobs = resolver_for_reject.reject(interp.gc_heap_mut(), reason);
+                            drain_jobs(interp, jobs);
+                            Ok(Value::Undefined)
+                        },
+                    )?;
+                    attach_then(interp, inner, Some(on_fulfill), Some(on_reject));
+                    return Ok(Value::Undefined);
+                }
+                let jobs = promise.fulfill(interp.gc_heap_mut(), value);
+                drain_jobs(interp, jobs);
             }
-            let jobs = promise.fulfill(interp.gc_heap_mut(), value);
-            drain_jobs(interp, jobs);
-        }
-        Ok(Value::Undefined)
-    })
+            Ok(Value::Undefined)
+        },
+    )
 }
 
-fn make_reject_native(promise: JsPromiseHandle) -> Value {
-    native_value("Promise reject", move |interp, args| {
-        if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-            let reason = args.first().cloned().unwrap_or(Value::Undefined);
-            let jobs = promise.reject(interp.gc_heap_mut(), reason);
-            drain_jobs(interp, jobs);
-        }
-        Ok(Value::Undefined)
-    })
+fn make_reject_native(
+    heap: &mut otter_gc::GcHeap,
+    promise: JsPromiseHandle,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    native_value_with_captures(
+        heap,
+        "Promise reject",
+        smallvec![Value::Promise(promise)],
+        move |ctx, args| {
+            let interp = ctx.interp_mut();
+            if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                let jobs = promise.reject(interp.gc_heap_mut(), reason);
+                drain_jobs(interp, jobs);
+            }
+            Ok(Value::Undefined)
+        },
+    )
 }
 
 fn drain_jobs(interp: &mut Interpreter, jobs: PromiseSettleJobs) {

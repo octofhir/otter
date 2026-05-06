@@ -29,10 +29,10 @@
 //! - <https://tc39.es/ecma262/#sec-weakmap-prototype-object>
 //! - <https://tc39.es/ecma262/#sec-weakset-prototype-object>
 
+use crate::Value;
 use crate::collections::{self, CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
-use crate::{Value, native_value};
 use smallvec::SmallVec;
 
 // ---------------------------------------------------------------
@@ -443,26 +443,42 @@ pub fn load_property_with_heap(value: &Value, name: &str, heap: &otter_gc::GcHea
 /// Build the native callable that `Map.prototype[Symbol.iterator]`
 /// resolves to. Returning the same iterator factory as `entries()`
 /// matches Spec §24.1.3.12 (`@@iterator` aliases `entries`).
-#[must_use]
-pub fn make_map_iterator_factory(map: JsMap) -> Value {
-    native_value("Map[Symbol.iterator]", move |vm, _| {
-        let state = map_iter_state(MapIterKind::Entries, map, vm.gc_heap_mut())?;
-        Ok(make_iter_value(vm.gc_heap_mut(), state)?)
-    })
+pub fn make_map_iterator_factory(
+    map: JsMap,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    crate::native_value_with_captures(
+        heap,
+        "Map[Symbol.iterator]",
+        smallvec::smallvec![Value::Map(map)],
+        move |ctx, _| {
+            let vm = ctx.interp_mut();
+            let state = map_iter_state(MapIterKind::Entries, map, vm.gc_heap_mut())?;
+            Ok(make_iter_value(vm.gc_heap_mut(), state)?)
+        },
+    )
 }
 
 /// Build the native callable that `Set.prototype[Symbol.iterator]`
 /// resolves to (alias of `values`, Spec §24.2.3.11).
-#[must_use]
-pub fn make_set_iterator_factory(set: JsSet) -> Value {
-    native_value("Set[Symbol.iterator]", move |vm, _| {
-        let snap: SmallVec<[Value; 4]> = collections::set_values(set, vm.gc_heap())
-            .into_iter()
-            .collect();
-        let array = crate::array::from_elements(vm.gc_heap_mut(), snap)?;
-        Ok(make_iter_value(
-            vm.gc_heap_mut(),
-            crate::IteratorState::Array { array, index: 0 },
-        )?)
-    })
+pub fn make_set_iterator_factory(
+    set: JsSet,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    crate::native_value_with_captures(
+        heap,
+        "Set[Symbol.iterator]",
+        smallvec::smallvec![Value::Set(set)],
+        move |ctx, _| {
+            let vm = ctx.interp_mut();
+            let snap: SmallVec<[Value; 4]> = collections::set_values(set, vm.gc_heap())
+                .into_iter()
+                .collect();
+            let array = crate::array::from_elements(vm.gc_heap_mut(), snap)?;
+            Ok(make_iter_value(
+                vm.gc_heap_mut(),
+                crate::IteratorState::Array { array, index: 0 },
+            )?)
+        },
+    )
 }

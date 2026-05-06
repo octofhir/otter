@@ -50,6 +50,30 @@ fn runtime_string_alloc_past_cap_surfaces_out_of_memory() {
 }
 
 #[test]
+fn runtime_array_cap_is_catchable_as_range_error() {
+    let mut runtime = Runtime::builder()
+        .max_heap_bytes(2 * 1024 * 1024)
+        .build()
+        .expect("runtime");
+    let source = SourceInput::from_javascript(
+        r#"
+            let caught = false;
+            try {
+                let a = [];
+                while (true) a.push(0);
+            } catch (e) {
+                caught = e instanceof RangeError;
+            }
+            caught;
+        "#,
+    );
+    let result = runtime
+        .run_script(source, "<script>")
+        .expect("script should catch heap cap as RangeError");
+    assert_eq!(result.completion.as_boolean(), Some(true));
+}
+
+#[test]
 fn runtime_max_heap_bytes_zero_disables_cap() {
     let runtime = Runtime::builder()
         .max_heap_bytes(0)

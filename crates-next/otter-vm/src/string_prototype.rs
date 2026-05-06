@@ -165,11 +165,15 @@ fn is_ws_code_unit(u: u16) -> bool {
 /// `Range<usize>` ranges, owned capture vec, owned group-name table)
 /// so we can release the iterator's borrow on `text_units` before
 /// allocating replacement strings or building result arrays.
-fn collect_regex_matches(re: &JsRegExp, text_units: &[u16]) -> Vec<regress::Match> {
+fn collect_regex_matches(
+    re: &JsRegExp,
+    gc_heap: &otter_gc::GcHeap,
+    text_units: &[u16],
+) -> Vec<regress::Match> {
     let mut out = Vec::new();
-    for m in re.regex().find_from_utf16(text_units, 0) {
+    for m in re.find_from_utf16(gc_heap, text_units, 0) {
         out.push(m);
-        if !re.flags().global {
+        if !re.flags(gc_heap).global {
             break;
         }
     }
@@ -576,7 +580,14 @@ fn impl_replace(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     if let Some(Value::RegExp(re)) = args.args.first() {
         let replacement = arg_string(args, 1)?;
-        return regex_replace(recv, re, &replacement.to_utf16_vec(), args.string_heap);
+        let heap = args.gc_heap.borrow();
+        return regex_replace(
+            recv,
+            re,
+            &heap,
+            &replacement.to_utf16_vec(),
+            args.string_heap,
+        );
     }
     let needle = arg_string(args, 0)?;
     let replacement = arg_string(args, 1)?;
@@ -612,14 +623,21 @@ fn impl_replace_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     if let Some(Value::RegExp(re)) = args.args.first() {
         // Spec: `replaceAll` requires the `g` flag for regex args.
-        if !re.flags().global {
+        let heap = args.gc_heap.borrow();
+        if !re.flags(&heap).global {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
                 reason: "must be a global regular expression",
             });
         }
         let replacement = arg_string(args, 1)?;
-        return regex_replace(recv, re, &replacement.to_utf16_vec(), args.string_heap);
+        return regex_replace(
+            recv,
+            re,
+            &heap,
+            &replacement.to_utf16_vec(),
+            args.string_heap,
+        );
     }
     let needle = arg_string(args, 0)?;
     let replacement = arg_string(args, 1)?;
@@ -760,11 +778,12 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
 fn regex_replace(
     recv: &JsString,
     re: &JsRegExp,
+    gc_heap: &otter_gc::GcHeap,
     replacement_template: &[u16],
     string_heap: &crate::string::StringHeap,
 ) -> Result<Value, IntrinsicError> {
     let recv_units = recv.to_utf16_vec();
-    let matches = collect_regex_matches(re, &recv_units);
+    let matches = collect_regex_matches(re, gc_heap, &recv_units);
     if matches.is_empty() {
         return Ok(Value::String(recv.clone()));
     }
@@ -796,7 +815,7 @@ fn regex_split(
     let recv_units = recv.to_utf16_vec();
     let mut out: Vec<Value> = Vec::new();
     let mut cursor: usize = 0;
-    let mut iter = re.regex().find_from_utf16(&recv_units, 0);
+    let mut iter = re.find_from_utf16(gc_heap, &recv_units, 0).into_iter();
     while (out.len() as u32) < limit {
         let m = match iter.next() {
             Some(m) => m,
@@ -812,7 +831,7 @@ fn regex_split(
             // Drop the iterator and resume after the cursor advance.
             drop(iter);
             cursor += 1;
-            iter = re.regex().find_from_utf16(&recv_units, cursor);
+            iter = re.find_from_utf16(gc_heap, &recv_units, cursor).into_iter();
             continue;
         }
         let part = JsString::from_utf16_units(&recv_units[cursor..m.range.start], string_heap)?;
@@ -840,7 +859,11 @@ fn is_regexp_arg(arg: Option<&Value>) -> bool {
 /// the first argument is not a `RegExp`, ToString-coerce it and run
 /// `RegExpCreate(pattern, flags)`. The string fast-path matters for
 /// idiomatic JS like `"foo".match("o+")` and `"foo".matchAll("o")`.
-fn coerce_pattern_to_regexp(value: &Value, flags: &str) -> Result<JsRegExp, IntrinsicError> {
+fn coerce_pattern_to_regexp(
+    value: &Value,
+    flags: &str,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<JsRegExp, IntrinsicError> {
     let pattern_units: Vec<u16> = match value {
         Value::String(s) => s.to_utf16_vec(),
         Value::Undefined => Vec::new(),
@@ -851,7 +874,7 @@ fn coerce_pattern_to_regexp(value: &Value, flags: &str) -> Result<JsRegExp, Intr
             });
         }
     };
-    JsRegExp::compile(&pattern_units, flags).map_err(|_| IntrinsicError::BadArgument {
+    JsRegExp::compile(gc_heap, &pattern_units, flags).map_err(|_| IntrinsicError::BadArgument {
         index: 0,
         reason: "is not a valid regular expression pattern",
     })
@@ -867,13 +890,15 @@ fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     } else {
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        coerced = coerce_pattern_to_regexp(arg0, "")?;
+        let mut heap = args.gc_heap.borrow_mut();
+        coerced = coerce_pattern_to_regexp(arg0, "", *heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
-    if re.flags().global {
+    let mut heap = args.gc_heap.borrow_mut();
+    if re.flags(*heap).global {
         // `g` flag → return array of full matches only (no captures).
-        let matches = collect_regex_matches(re, &recv_units);
+        let matches = collect_regex_matches(re, *heap, &recv_units);
         if matches.is_empty() {
             return Ok(Value::Null);
         }
@@ -882,18 +907,16 @@ fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let s = JsString::from_utf16_units(&recv_units[m.range.clone()], args.string_heap)?;
             out.push(Value::String(s));
         }
-        let mut heap = args.gc_heap.borrow_mut();
         return Ok(Value::Array(crate::array::from_elements(*heap, out)?));
     }
     // Non-global → mirror `RegExp.prototype.exec` (carries
     // `index` / `input` / `groups` per §22.2.7.2).
-    let m = match re.regex().find_from_utf16(&recv_units, 0).next() {
+    let m = match re.find_from_utf16(*heap, &recv_units, 0).into_iter().next() {
         Some(m) => m,
         None => return Ok(Value::Null),
     };
     let recv_clone = recv.clone();
-    let has_indices = re.flags().has_indices;
-    let mut heap = args.gc_heap.borrow_mut();
+    let has_indices = re.flags(*heap).has_indices;
     let arr = crate::regexp_prototype::build_match_result(
         &m,
         &recv_units,
@@ -915,7 +938,8 @@ fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         };
         // §22.1.3.14 step 5.b: matchAll requires the global flag on
         // a RegExp arg; non-global is a TypeError.
-        if !r.flags().global {
+        let heap = args.gc_heap.borrow();
+        if !r.flags(&heap).global {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
                 reason: "must be a global regular expression",
@@ -927,14 +951,15 @@ fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         // synthesised regex always has `g` set so the iteration
         // sweep visits every match.
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        coerced = coerce_pattern_to_regexp(arg0, "g")?;
+        let mut heap = args.gc_heap.borrow_mut();
+        coerced = coerce_pattern_to_regexp(arg0, "g", *heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
-    let matches = collect_regex_matches(re, &recv_units);
-    let has_indices = re.flags().has_indices;
-    let recv_clone = recv.clone();
     let mut heap = args.gc_heap.borrow_mut();
+    let matches = collect_regex_matches(re, *heap, &recv_units);
+    let has_indices = re.flags(*heap).has_indices;
+    let recv_clone = recv.clone();
     let mut out: Vec<Value> = Vec::with_capacity(matches.len());
     for m in &matches {
         let arr = crate::regexp_prototype::build_match_result(
@@ -960,15 +985,17 @@ fn impl_search(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     } else {
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        coerced = coerce_pattern_to_regexp(arg0, "")?;
+        let mut heap = args.gc_heap.borrow_mut();
+        coerced = coerce_pattern_to_regexp(arg0, "", *heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
     // `search` always starts at index 0 — `lastIndex` is ignored
     // and not mutated per spec §22.1.3.13.
+    let heap = args.gc_heap.borrow();
     let pos = re
-        .regex()
-        .find_from_utf16(&recv_units, 0)
+        .find_from_utf16(&heap, &recv_units, 0)
+        .into_iter()
         .next()
         .map_or(-1, |m| m.range.start as i32);
     Ok(Value::Number(NumberValue::from_i32(pos)))

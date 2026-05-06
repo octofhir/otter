@@ -119,8 +119,10 @@ impl MapKey {
             Value::Promise(p) => MapKey::ObjectPtr(p.identity_addr()),
             Value::Iterator(i) => MapKey::ObjectPtr(i.as_header_ptr() as *const ()),
             Value::Generator(g) => MapKey::ObjectPtr(g.identity_addr()),
-            // Functions, closures, bound functions, native callables,
-            // class constructors, iterators — all compare via the
+            Value::BoundFunction(b) => MapKey::ObjectPtr(b.identity_addr()),
+            Value::NativeFunction(n) => MapKey::ObjectPtr(n.identity_addr()),
+            // Functions, closures, class constructors, and other
+            // non-GC reference wrappers — all compare via the
             // originating `Value`'s `PartialEq`, which is identity
             // on every callable shape.
             _ => MapKey::ObjectValue(value.clone()),

@@ -1,7 +1,6 @@
 //! GC root-tracing scaffolding.
 //!
-//! Every value-model type that will move from `Rc<RefCell<…>>`
-//! to `Gc<…>` over tasks 76–83 implements [`GcTrace`] here.
+//! Every GC-managed value-model type implements [`GcTrace`] here.
 //! The trait fires from [`crate::runtime_state::RuntimeState::trace_roots`]
 //! during a full GC. Bodies are intentionally empty today —
 //! Early phase entries started as stubs while the value model was
@@ -194,19 +193,24 @@ impl GcTrace for JsGenerator {
 }
 
 impl GcTrace for BoundFunction {
-    /// Stub — body lands with task 83 (bound / native / regexp
-    /// migration).
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_value_slots(visitor);
+    }
 }
 
 impl GcTrace for NativeFunction {
-    /// Stub — body lands with task 83.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_value_slots(visitor);
+    }
 }
 
 impl GcTrace for JsRegExp {
-    /// Stub — body lands with task 83.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of `*self` as a slot pointer.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_value_slots(visitor);
+    }
 }
 
 impl GcTrace for Frame {
@@ -240,21 +244,18 @@ impl GcTrace for MicrotaskQueue {
 }
 
 impl GcTrace for JsSymbol {
-    /// Stub — body lands with task 83 if symbols ever carry
-    /// inline GC references (`description` becomes `Gc<…>`).
+    /// Leaf primitive: symbol bodies hold descriptions but no GC
+    /// children.
     fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
 }
 
 impl GcTrace for WellKnownSymbols {
-    /// Stub — well-known symbols are leaf primitives; the
-    /// trace ladder only matters once `description` is
-    /// `Gc`-stored (task 83).
+    /// Leaf primitive collection.
     fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
 }
 
 impl GcTrace for SymbolRegistry {
-    /// Stub — registry stores `JsSymbol`s; body lands with
-    /// task 83.
+    /// Registry stores leaf symbols; descriptions are not GC values.
     fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
 }
 

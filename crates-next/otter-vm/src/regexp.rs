@@ -1,11 +1,9 @@
 //! JavaScript `RegExp` value, backed by the `regress` engine.
 //!
-//! Slice 31 introduces the value type plus the bytecode-level
-//! pre-compilation cache. The runtime never re-parses a regex
-//! literal: the compiler emits a [`otter_bytecode::Constant::RegExp`],
-//! the VM compiles it once on first `Op::LoadRegExp` (cached in the
-//! constant-pool slot), and every subsequent literal load shares the
-//! same compiled engine.
+//! `JsRegExp` is a GC-managed handle. The body owns the compiled
+//! `regress::Regex`, original pattern, parsed flags, and `lastIndex`.
+//! The regex engine is a GC leaf: `regress` owns external allocations
+//! that are not traced and are not counted against the Otter heap cap.
 //!
 //! `regress` does not implement the JavaScript `g` (global) or `y`
 //! (sticky) flags — those are stateful and live above the engine
@@ -15,6 +13,7 @@
 //!
 //! # Contents
 //! - [`JsRegExp`] — the cheap-to-clone handle used in [`crate::Value`].
+//! - [`JsRegExpBody`] — GC-managed compiled regex payload.
 //! - [`RegExpFlags`] — parsed flag bits.
 //! - [`compile`] — pattern + flag-string → engine, surfaced as
 //!   [`RegExpError`] on failure.
@@ -24,9 +23,10 @@
 //!   the compiler validates this at intern time.
 //! - `last_index` is interior-mutable but never stashed across
 //!   reentrant calls; native methods refresh it before returning.
+//! - Every operation that reads or mutates the body receives an
+//!   explicit [`otter_gc::GcHeap`].
 //! - Cloning a [`JsRegExp`] shares the compiled engine and the
-//!   `last_index` cell — same identity semantics as `JsString` /
-//!   `JsArray`.
+//!   `last_index` cell through the same GC body.
 //!
 //! # See also
 //! - [`docs/new-engine/tasks/31-regexp-and-pattern-methods.md`](
@@ -34,9 +34,11 @@
 //!   )
 
 use std::cell::Cell;
-use std::rc::Rc;
 
 use regress::{Flags, Regex};
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsRegExpBody`].
+pub const REGEXP_BODY_TYPE_TAG: u8 = 0x1e;
 
 /// Outcome of a fallible regex compile.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -60,6 +62,15 @@ pub enum RegExpError {
         /// The repeated flag.
         flag: char,
     },
+    /// The GC heap refused the regex body allocation.
+    #[error("regular expression allocation failed")]
+    OutOfMemory,
+}
+
+impl From<otter_gc::OutOfMemory> for RegExpError {
+    fn from(_: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory
+    }
 }
 
 /// Foundation flag bits.
@@ -178,15 +189,26 @@ pub struct JsRegExpBody {
     pub last_index: Cell<u32>,
 }
 
+impl otter_gc::SafeTraceable for JsRegExpBody {
+    const TYPE_TAG: u8 = REGEXP_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::SlotVisitor<'_>) {}
+}
+
 /// Cheap-to-clone JS regex handle.
-#[derive(Debug, Clone)]
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
 pub struct JsRegExp {
-    inner: Rc<JsRegExpBody>,
+    inner: otter_gc::Gc<JsRegExpBody>,
 }
 
 impl JsRegExp {
     /// Compile a pattern + flag string into a runtime regex value.
-    pub fn compile(pattern_utf16: &[u16], flag_str: &str) -> Result<Self, RegExpError> {
+    pub fn compile(
+        heap: &mut otter_gc::GcHeap,
+        pattern_utf16: &[u16],
+        flag_str: &str,
+    ) -> Result<Self, RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
         // `regress` parses from a Rust `&str`, so feed it the lossy
         // UTF-8 reading. JS-only escape sequences (`\u{...}`,
@@ -208,52 +230,66 @@ impl JsRegExp {
                 message: format!("{e}"),
             })?;
         Ok(Self {
-            inner: Rc::new(JsRegExpBody {
+            inner: heap.alloc_old(JsRegExpBody {
                 regex,
                 pattern_utf16: pattern_utf16.to_vec(),
                 source,
                 flags,
                 last_index: Cell::new(0),
-            }),
+            })?,
         })
     }
 
-    /// Compiled engine for direct execution.
+    /// Raw handle used by root tracing and write barriers.
     #[must_use]
-    pub fn regex(&self) -> &Regex {
-        &self.inner.regex
+    pub fn raw(&self) -> otter_gc::RawGc {
+        self.inner.raw()
+    }
+
+    /// Run the compiled engine from a UTF-16 offset and collect
+    /// owned matches.
+    #[must_use]
+    pub fn find_from_utf16(
+        &self,
+        heap: &otter_gc::GcHeap,
+        text_units: &[u16],
+        start: usize,
+    ) -> Vec<regress::Match> {
+        heap.read_payload(self.inner, |body| {
+            body.regex.find_from_utf16(text_units, start).collect()
+        })
     }
 
     /// Parsed flag bits.
     #[must_use]
-    pub fn flags(&self) -> RegExpFlags {
-        self.inner.flags
+    pub fn flags(&self, heap: &otter_gc::GcHeap) -> RegExpFlags {
+        heap.read_payload(self.inner, |body| body.flags)
     }
 
     /// `RegExp.prototype.source` view (UTF-8). Note this is lossy
     /// for surrogate-bearing patterns; the canonical body is
     /// [`Self::pattern_utf16`].
     #[must_use]
-    pub fn source(&self) -> &str {
-        &self.inner.source
+    pub fn source(&self, heap: &otter_gc::GcHeap) -> String {
+        heap.read_payload(self.inner, |body| body.source.clone())
     }
 
     /// Original WTF-16 pattern body.
     #[must_use]
-    pub fn pattern_utf16(&self) -> &[u16] {
-        &self.inner.pattern_utf16
+    pub fn pattern_utf16(&self, heap: &otter_gc::GcHeap) -> Vec<u16> {
+        heap.read_payload(self.inner, |body| body.pattern_utf16.clone())
     }
 
     /// Read `lastIndex`.
     #[must_use]
-    pub fn last_index(&self) -> u32 {
-        self.inner.last_index.get()
+    pub fn last_index(&self, heap: &otter_gc::GcHeap) -> u32 {
+        heap.read_payload(self.inner, |body| body.last_index.get())
     }
 
     /// Update `lastIndex`. Pattern-arg methods use this to step
     /// through successive `g` / `y` matches.
-    pub fn set_last_index(&self, value: u32) {
-        self.inner.last_index.set(value);
+    pub fn set_last_index(&self, heap: &otter_gc::GcHeap, value: u32) {
+        heap.read_payload(self.inner, |body| body.last_index.set(value));
     }
 
     /// Identity comparison — two handles are equal iff they share
@@ -261,7 +297,7 @@ impl JsRegExp {
     /// follows handle identity.
     #[must_use]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+        self.inner == other.inner
     }
 
     /// Raw `Rc`-data pointer for use as a hash / map key in
@@ -269,7 +305,13 @@ impl JsRegExp {
     /// the originating handle for the lifetime of the pointer.
     #[must_use]
     pub fn identity_addr(&self) -> *const () {
-        Rc::as_ptr(&self.inner).cast()
+        self.inner.as_header_ptr() as *const ()
+    }
+
+    /// Trace this handle as a root slot.
+    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        let p = self as *const JsRegExp as *mut otter_gc::RawGc;
+        visitor(p);
     }
 }
 
@@ -286,8 +328,9 @@ mod tests {
     use super::*;
 
     fn compile_simple(pattern: &str, flags: &str) -> Result<JsRegExp, RegExpError> {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let units: Vec<u16> = pattern.encode_utf16().collect();
-        JsRegExp::compile(&units, flags)
+        JsRegExp::compile(&mut heap, &units, flags)
     }
 
     #[test]
@@ -316,11 +359,17 @@ mod tests {
 
     #[test]
     fn compile_smoke() {
-        let r = compile_simple("ab+c", "i").unwrap();
-        assert_eq!(r.source(), "ab+c");
-        assert!(r.flags().ignore_case);
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let units: Vec<u16> = "ab+c".encode_utf16().collect();
+        let r = JsRegExp::compile(&mut heap, &units, "i").unwrap();
+        assert_eq!(r.source(&heap), "ab+c");
+        assert!(r.flags(&heap).ignore_case);
         let utf16: Vec<u16> = "abbbcXabbbbc".encode_utf16().collect();
-        let m = r.regex().find_from_utf16(&utf16, 0).next().unwrap();
+        let m = r
+            .find_from_utf16(&heap, &utf16, 0)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(m.range, 0..5);
     }
 
@@ -332,13 +381,15 @@ mod tests {
 
     #[test]
     fn last_index_round_trips() {
-        let r = compile_simple("a", "g").unwrap();
-        assert_eq!(r.last_index(), 0);
-        r.set_last_index(7);
-        assert_eq!(r.last_index(), 7);
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let units: Vec<u16> = "a".encode_utf16().collect();
+        let r = JsRegExp::compile(&mut heap, &units, "g").unwrap();
+        assert_eq!(r.last_index(&heap), 0);
+        r.set_last_index(&heap, 7);
+        assert_eq!(r.last_index(&heap), 7);
         // Cloning shares the cell.
-        let r2 = r.clone();
-        r2.set_last_index(11);
-        assert_eq!(r.last_index(), 11);
+        let r2 = r;
+        r2.set_last_index(&heap, 11);
+        assert_eq!(r.last_index(&heap), 11);
     }
 }

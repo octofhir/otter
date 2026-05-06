@@ -269,7 +269,10 @@ fn construct_prototype(callee: &Value, heap: &otter_gc::GcHeap) -> Option<JsObje
             Some(Value::Object(p)) => Some(p),
             _ => None,
         },
-        Value::BoundFunction(b) => construct_prototype(&b.target, heap),
+        Value::BoundFunction(b) => {
+            let (target, _, _) = b.parts(heap);
+            construct_prototype(&target, heap)
+        }
         _ => None,
     }
 }

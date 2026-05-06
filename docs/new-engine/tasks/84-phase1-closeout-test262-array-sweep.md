@@ -2,12 +2,12 @@
 
 ## Status
 
-- [ ] cycle-reclamation regression suite consolidated
-- [ ] cap-as-`RangeError` JS surface
-- [ ] `bash scripts/test262-safe.sh built-ins/Array` runs to completion on a 16 GB host
-- [ ] full `cargo test --workspace` green
-- [ ] runtime binding safety gates from task 76A remain green
-- [ ] documentation updates
+- [x] cycle-reclamation regression suite consolidated
+- [x] cap-as-`RangeError` JS surface
+- [x] `bash scripts/test262-safe.sh built-ins/Array` runs to completion on a 16 GB host
+- [x] full `cargo test --workspace` green
+- [x] runtime binding safety gates from task 76A remain green
+- [x] documentation updates
 - [ ] gates green
 
 ## Goal
@@ -26,7 +26,7 @@ NF3, §7.4 (repro harness), §8 Phase 1 exit criteria.
 
 1. **Consolidated regression suite.** Move the per-task regression
    tests from tasks 76–83 into one well-named file
-   `crates-next/otter-vm/tests/gc_phase1_regressions.rs` so future
+  `crates-next/otter-vm/tests/gc_phase1_regressions.rs` so future
    refactors can run them as a unit. Tag each with a comment
    referencing its origin task.
 2. **`RangeError` wrapping** — when the cap fires inside a script,
@@ -80,7 +80,10 @@ NF3, §7.4 (repro harness), §8 Phase 1 exit criteria.
 
 - [ ] `bash scripts/test262-safe.sh built-ins/Array` reaches
   completion; pass rate documented in
-  `docs/new-engine/test262-baseline/`.
+  `docs/new-engine/test262-baseline/`. The task-84 baseline is
+  recorded in `task84-array-sweep.json` / `task84-array-sweep.md`:
+  3083 tests, 517 pass, 2338 fail, 227 skip, 0 timeout, 1
+  in-engine OOM, 0 crash, peak host RSS 791936 KiB (~774 MiB).
 - [ ] **Full test262 corpus** runs to completion across all
   built-ins/* and language/* (not just Array). Per-test heap cap
   honoured.

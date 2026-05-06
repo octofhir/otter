@@ -85,7 +85,10 @@ pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKe
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use microtask::{AsyncRuntime, Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
-pub use native_function::{NativeError, NativeFn, NativeFunction, native_value};
+pub use native_function::{
+    NativeError, NativeFn, NativeFunction, native_value, native_value_with_captures,
+    native_value_with_trace,
+};
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
 pub use promise::{
@@ -180,13 +183,13 @@ pub enum Value {
     /// Result of `Function.prototype.bind(thisArg, ...prefix)`. When
     /// invoked, forwards to `target` with `this = bound_this` and
     /// `prefix ++ call_args` as the argument list. Cheap to clone:
-    /// the wrapper is `Rc`-shared.
-    BoundFunction(std::rc::Rc<BoundFunction>),
+    /// the wrapper is a GC handle.
+    BoundFunction(BoundFunction),
     /// Host-implemented callable. Used by `Promise` resolve/reject
     /// closures, the `Promise.all` aggregator-functions, and any
     /// other native shape that needs to be JS-callable without
     /// going through bytecode. See [`crate::NativeFunction`].
-    NativeFunction(std::rc::Rc<NativeFunction>),
+    NativeFunction(NativeFunction),
     /// Internal iterator state, produced by [`otter_bytecode::Op::GetIterator`]
     /// and driven by [`otter_bytecode::Op::IteratorNext`]. Until
     /// task 37 adds real `Symbol.iterator` lookup, the foundation
@@ -485,11 +488,15 @@ pub fn alloc_iterator_state(
     heap.alloc_old(state)
 }
 
-/// Storage for `Value::BoundFunction`. Constructed by the
-/// `Op::BindFunction` opcode and consumed by every call dispatch
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
+/// [`BoundFunctionBody`].
+pub const BOUND_FUNCTION_BODY_TYPE_TAG: u8 = 0x1c;
+
+/// GC-allocated storage for `Value::BoundFunction`. Constructed by
+/// the `Op::BindFunction` opcode and consumed by every call dispatch
 /// path (`Op::Call`, `Op::CallWithThis`, `Op::CallMethodValue`).
 #[derive(Debug, Clone)]
-pub struct BoundFunction {
+pub struct BoundFunctionBody {
     /// Underlying callable. Foundation slice keeps this as a
     /// `Value`; chained `bind` flattens by re-wrapping at call
     /// time without unbounded recursion (one hop per layer).
@@ -501,6 +508,80 @@ pub struct BoundFunction {
     /// invocation. Stored inline up to four entries to keep the
     /// usual `f.bind(t, a, b)` shape off the heap.
     pub bound_args: SmallVec<[Value; 4]>,
+}
+
+impl otter_gc::SafeTraceable for BoundFunctionBody {
+    const TYPE_TAG: u8 = BOUND_FUNCTION_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        self.target.trace_value_slots(visitor);
+        self.bound_this.trace_value_slots(visitor);
+        for arg in &self.bound_args {
+            arg.trace_value_slots(visitor);
+        }
+    }
+}
+
+/// Cheap-to-clone handle for [`BoundFunctionBody`].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct BoundFunction {
+    inner: otter_gc::Gc<BoundFunctionBody>,
+}
+
+impl BoundFunction {
+    /// Allocate a bound-function body on the GC heap.
+    pub fn new(
+        heap: &mut otter_gc::GcHeap,
+        target: Value,
+        bound_this: Value,
+        bound_args: SmallVec<[Value; 4]>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_old(BoundFunctionBody {
+                target,
+                bound_this,
+                bound_args,
+            })?,
+        })
+    }
+
+    /// Raw handle used by root tracing and write barriers.
+    #[must_use]
+    pub fn raw(&self) -> otter_gc::RawGc {
+        self.inner.raw()
+    }
+
+    /// Stable identity token.
+    #[must_use]
+    pub fn identity_addr(&self) -> *const () {
+        self.inner.as_header_ptr() as *const ()
+    }
+
+    /// Identity comparison.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+
+    /// Clone the callable parts so dispatch can release the heap
+    /// borrow before continuing with mutable interpreter work.
+    #[must_use]
+    pub fn parts(&self, heap: &otter_gc::GcHeap) -> (Value, Value, SmallVec<[Value; 4]>) {
+        heap.read_payload(self.inner, |body| {
+            (
+                body.target.clone(),
+                body.bound_this.clone(),
+                body.bound_args.clone(),
+            )
+        })
+    }
+
+    /// Trace this handle as a root slot.
+    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+        let p = self as *const BoundFunction as *mut otter_gc::RawGc;
+        visitor(p);
+    }
 }
 
 /// One captured-variable cell. Cloning shares the same heap slot
@@ -522,7 +603,7 @@ pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
 /// One `Value` field. After task 76 the body is the only place
 /// the captured value lives — every closure handle stores a
 /// `Gc<UpvalueCellBody>` (4-byte compressed offset) instead of
-/// the previous `Rc<RefCell<Value>>` (8-byte pointer +
+/// the previous ref-counted mutable cell (8-byte pointer +
 /// allocation overhead).
 ///
 /// # Spec
@@ -560,7 +641,7 @@ impl otter_gc::SafeTraceable for UpvalueCellBody {
 }
 
 /// Compressed handle to an [`UpvalueCellBody`] — replaces the
-/// pre-task-76 `Rc<RefCell<Value>>`. `Copy + Eq + Hash`
+/// pre-task-76 ref-counted mutable cell. `Copy + Eq + Hash`
 /// (inherited from [`otter_gc::Gc`]); identity comparison via
 /// `cell == other`.
 pub type UpvalueCell = otter_gc::Gc<UpvalueCellBody>;
@@ -641,6 +722,9 @@ impl Value {
             Value::Promise(p) => Some(p.raw()),
             Value::Iterator(i) => Some(i.raw()),
             Value::Generator(g) => Some(g.raw()),
+            Value::BoundFunction(b) => Some(b.raw()),
+            Value::NativeFunction(n) => Some(n.raw()),
+            Value::RegExp(r) => Some(r.raw()),
             // Phase-1 stub for the rest. Subsequent migrations
             // (78+) add variant arms here as their handle types
             // move to `Gc<…>`.
@@ -720,6 +804,15 @@ impl Value {
             Value::Generator(generator) => {
                 generator.trace_value_slots(visitor);
             }
+            Value::BoundFunction(bound) => {
+                bound.trace_value_slots(visitor);
+            }
+            Value::NativeFunction(native) => {
+                native.trace_value_slots(visitor);
+            }
+            Value::RegExp(regexp) => {
+                regexp.trace_value_slots(visitor);
+            }
             _ => {}
         }
     }
@@ -747,10 +840,10 @@ impl Value {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 format!("[Function #{function_id}]")
             }
-            Value::BoundFunction(b) => format!("[BoundFunction → {}]", b.target.display_string()),
-            Value::NativeFunction(f) => format!("[NativeFunction {}]", f.name),
+            Value::BoundFunction(_) => "[BoundFunction]".to_string(),
+            Value::NativeFunction(_) => "[NativeFunction]".to_string(),
             Value::Iterator(_) => "[object Iterator]".to_string(),
-            Value::RegExp(r) => format!("/{}/{}", r.source(), r.flags().to_js_string()),
+            Value::RegExp(_) => "[object RegExp]".to_string(),
             Value::Promise(_) => "[object Promise]".to_string(),
             Value::ClassConstructor(_) => "[class]".to_string(),
             Value::Map(_) => "[object Map]".to_string(),
@@ -974,8 +1067,8 @@ impl PartialEq for Value {
                     ..
                 },
             ) => a == b && std::rc::Rc::ptr_eq(ua, ub),
-            (Value::BoundFunction(a), Value::BoundFunction(b)) => std::rc::Rc::ptr_eq(a, b),
-            (Value::NativeFunction(a), Value::NativeFunction(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::BoundFunction(a), Value::BoundFunction(b)) => a.ptr_eq(b),
+            (Value::NativeFunction(a), Value::NativeFunction(b)) => a.ptr_eq(b),
             (Value::Promise(a), Value::Promise(b)) => a.ptr_eq(b as &dyn JsPromise),
             (Value::Iterator(a), Value::Iterator(b)) => a == b,
             (Value::RegExp(a), Value::RegExp(b)) => a.ptr_eq(b),
@@ -2213,13 +2306,14 @@ impl Interpreter {
             match current {
                 Value::BoundFunction(bound) => {
                     hops += 1;
+                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
                     let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
-                    combined.extend(bound.bound_args.iter().cloned());
+                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
+                    combined.extend(bound_args);
                     combined.extend(effective_args);
-                    effective_this = bound.bound_this.clone();
+                    effective_this = bound_this;
                     effective_args = combined;
-                    current = bound.target.clone();
+                    current = target;
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
@@ -2232,8 +2326,9 @@ impl Interpreter {
         // push, no return register. Errors propagate as RunError.
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
-            let native = native.clone();
-            return match (native.call)(self, &argv) {
+            let call = native.call(&self.gc_heap);
+            let mut ctx = NativeCtx::new(self);
+            return match call(&mut ctx, &argv) {
                 Ok(value) => {
                     self.settle_microtask_capability(result_capability, Ok(value));
                     Ok(())
@@ -2425,7 +2520,8 @@ impl Interpreter {
     }
 
     /// Drive the dispatch loop, converting convertible `VmError`
-    /// variants (TypeMismatch, NotCallable, TemporalDeadZone, etc.)
+    /// variants (TypeMismatch, NotCallable, TemporalDeadZone,
+    /// OutOfMemory, etc.)
     /// into typed `Error` instances that flow through `unwind_throw`
     /// — so user code can `try { … } catch (e) { e instanceof
     /// TypeError }` and observe the same shape it would in any
@@ -2446,7 +2542,12 @@ impl Interpreter {
                 Ok(value) => return Ok(value),
                 Err(err) => {
                     if let Some(thrown) = self.vm_error_to_throwable(&err) {
-                        self.unwind_throw(stack, thrown)?;
+                        let uncaught = if matches!(err, VmError::OutOfMemory { .. }) {
+                            Some(err.clone())
+                        } else {
+                            None
+                        };
+                        self.unwind_throw_with_uncaught(stack, thrown, uncaught)?;
                         if stack.is_empty() {
                             return Ok(Value::Undefined);
                         }
@@ -2463,6 +2564,7 @@ impl Interpreter {
     /// keep propagating as host errors (StackOverflow, etc.).
     fn vm_error_to_throwable(&mut self, err: &VmError) -> Option<Value> {
         let dynamic_message: String;
+        let is_oom = matches!(err, VmError::OutOfMemory { .. });
         let (kind, message) = match err {
             VmError::TypeMismatch => (error_classes::ErrorKind::TypeError, "operand type mismatch"),
             VmError::NotCallable => (
@@ -2484,21 +2586,35 @@ impl Interpreter {
                 error_classes::ErrorKind::TypeError,
                 "unknown intrinsic method",
             ),
+            VmError::OutOfMemory { .. } => {
+                dynamic_message = err.to_string();
+                (
+                    error_classes::ErrorKind::RangeError,
+                    dynamic_message.as_str(),
+                )
+            }
             // Hard / structural errors stay as host failures so the
             // caller surfaces them through `RunError` rather than
             // catching them as `try { ... } catch`.
             _ => return None,
         };
         let proto = self.error_classes.prototype(kind);
-        let obj = crate::object::alloc_object(&mut self.gc_heap).ok()?;
+        let obj = if is_oom {
+            crate::object::alloc_diagnostic_object(&mut self.gc_heap).ok()?
+        } else {
+            crate::object::alloc_object(&mut self.gc_heap).ok()?
+        };
         crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-        let message_str = JsString::from_str(message, &self.string_heap).ok()?;
-        crate::object::set(
-            obj,
-            &mut self.gc_heap,
-            "message",
-            Value::String(message_str),
-        );
+        if let Ok(message_str) = JsString::from_str(message, &self.string_heap) {
+            crate::object::set(
+                obj,
+                &mut self.gc_heap,
+                "message",
+                Value::String(message_str),
+            );
+        } else if !is_oom {
+            return None;
+        }
         Some(Value::Object(obj))
     }
 
@@ -2962,11 +3078,10 @@ impl Interpreter {
                         Some(Constant::RegExp {
                             pattern_utf16,
                             flags,
-                        }) => regexp::JsRegExp::compile(pattern_utf16, flags).map_err(|e| {
-                            VmError::InvalidRegExp {
+                        }) => regexp::JsRegExp::compile(&mut self.gc_heap, pattern_utf16, flags)
+                            .map_err(|e| VmError::InvalidRegExp {
                                 message: e.to_string(),
-                            }
-                        })?,
+                            })?,
                         _ => return Err(VmError::InvalidOperand),
                     };
                     write_register(frame, dst, Value::RegExp(regex))?;
@@ -3118,8 +3233,11 @@ impl Interpreter {
                         }
                         Value::NativeFunction(native) if name == "name" || name == "length" => {
                             if name == "name" {
-                                let s = JsString::from_str(native.name, &self.string_heap)
-                                    .map_err(|_| VmError::TypeMismatch)?;
+                                let s = JsString::from_str(
+                                    native.name(&self.gc_heap),
+                                    &self.string_heap,
+                                )
+                                .map_err(|_| VmError::TypeMismatch)?;
                                 Value::String(s)
                             } else {
                                 Value::Number(NumberValue::from_i32(0))
@@ -3131,11 +3249,15 @@ impl Interpreter {
                                 bound,
                                 &name,
                                 &self.string_heap,
+                                &self.gc_heap,
                             )?
                         }
-                        Value::RegExp(r) => {
-                            regexp_prototype::load_property(r, &name, &self.string_heap)
-                        }
+                        Value::RegExp(r) => regexp_prototype::load_property(
+                            r,
+                            &self.gc_heap,
+                            &name,
+                            &self.string_heap,
+                        ),
                         Value::Symbol(s) => symbol_prototype::load_property(s, &name),
                         v @ (Value::Map(_)
                         | Value::Set(_)
@@ -3166,7 +3288,7 @@ impl Interpreter {
                         Value::Object(o) => Some(*o),
                         Value::ClassConstructor(c) => Some(c.statics),
                         Value::RegExp(r) => {
-                            regexp_prototype::store_property(r, &name, &value);
+                            regexp_prototype::store_property(r, &self.gc_heap, &name, &value);
                             None
                         }
                         Value::Array(a) => {
@@ -3303,7 +3425,7 @@ impl Interpreter {
                                 .well_known_tag()
                                 .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
                         {
-                            make_array_iterator_factory(*arr)
+                            make_array_iterator_factory(*arr, &mut self.gc_heap)?
                         }
                         // `map[Symbol.iterator]` aliases `entries` per
                         // Spec §24.1.3.12; `set[Symbol.iterator]`
@@ -3313,14 +3435,14 @@ impl Interpreter {
                                 .well_known_tag()
                                 .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
                         {
-                            collections_prototype::make_map_iterator_factory(*m)
+                            collections_prototype::make_map_iterator_factory(*m, &mut self.gc_heap)?
                         }
                         (Value::Set(s), Value::Symbol(sym))
                             if sym
                                 .well_known_tag()
                                 .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
                         {
-                            collections_prototype::make_set_iterator_factory(*s)
+                            collections_prototype::make_set_iterator_factory(*s, &mut self.gc_heap)?
                         }
                         // Numeric-indexed array / string element
                         // reads.
@@ -4427,11 +4549,8 @@ impl Interpreter {
                         let r = register_operand(operands.get(4 + i))?;
                         bound_args.push(read_register(frame, r)?.clone());
                     }
-                    let bound = std::rc::Rc::new(BoundFunction {
-                        target,
-                        bound_this,
-                        bound_args,
-                    });
+                    let bound =
+                        BoundFunction::new(&mut self.gc_heap, target, bound_this, bound_args)?;
                     write_register(frame, dst, Value::BoundFunction(bound))?;
                     frame.pc += 1;
                 }
@@ -4788,13 +4907,14 @@ impl Interpreter {
             match current {
                 Value::BoundFunction(bound) => {
                     hops += 1;
+                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
                     let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
-                    combined.extend(bound.bound_args.iter().cloned());
+                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
+                    combined.extend(bound_args);
                     combined.extend(effective_args);
-                    effective_this = bound.bound_this.clone();
+                    effective_this = bound_this;
                     effective_args = combined;
-                    current = bound.target.clone();
+                    current = target;
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
@@ -4809,11 +4929,9 @@ impl Interpreter {
         // is created — the closure cannot itself push frames.
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
-            // Clone the Rc out of `current` so the native body can
-            // freely take `&mut self` without holding a borrow on
-            // `current`.
-            let native = native.clone();
-            let result = (native.call)(self, &argv).map_err(native_to_vm_error)?;
+            let call = native.call(&self.gc_heap);
+            let mut ctx = NativeCtx::new(self);
+            let result = call(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -5235,11 +5353,28 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
     ) -> Result<(), VmError> {
+        self.unwind_throw_with_uncaught(stack, value, None)
+    }
+
+    /// Same as [`Self::unwind_throw`], but returns
+    /// `uncaught_error` if the frame stack empties without a
+    /// handler. Heap-cap failures use this path so script code can
+    /// catch a real `RangeError`, while embedders still receive
+    /// structured [`VmError::OutOfMemory`] when the error is
+    /// unhandled.
+    fn unwind_throw_with_uncaught(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        value: Value,
+        mut uncaught_error: Option<VmError>,
+    ) -> Result<(), VmError> {
         let display = render_thrown_value(&value, &self.gc_heap);
         let payload = value;
         loop {
             let Some(frame) = stack.last_mut() else {
-                return Err(VmError::Uncaught { value: display });
+                return Err(uncaught_error
+                    .take()
+                    .unwrap_or(VmError::Uncaught { value: display }));
             };
             let Some(handler) = frame.handlers.pop() else {
                 // No in-frame try-handler. Async frames absorb
@@ -6183,13 +6318,14 @@ impl Interpreter {
             match current {
                 Value::BoundFunction(bound) => {
                     hops += 1;
+                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
                     let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound.bound_args.len() + effective_args.len());
-                    combined.extend(bound.bound_args.iter().cloned());
+                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
+                    combined.extend(bound_args);
                     combined.extend(effective_args);
-                    effective_this = bound.bound_this.clone();
+                    effective_this = bound_this;
                     effective_args = combined;
-                    current = bound.target.clone();
+                    current = target;
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
@@ -6200,7 +6336,9 @@ impl Interpreter {
         }
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
-            return (native.call)(self, &argv).map_err(native_to_vm_error);
+            let call = native.call(&self.gc_heap);
+            let mut ctx = NativeCtx::new(self);
+            return call(&mut ctx, &argv).map_err(native_to_vm_error);
         }
         let (function_id, parent_upvalues, this_for_callee) = match current {
             Value::Function { function_id } => {
@@ -6855,11 +6993,8 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::Undefined);
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let bound = std::rc::Rc::new(BoundFunction {
-                    target: callee.clone(),
-                    bound_this: this_value,
-                    bound_args,
-                });
+                let bound =
+                    BoundFunction::new(&mut self.gc_heap, callee.clone(), this_value, bound_args)?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::BoundFunction(bound))?;
                 frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -6872,7 +7007,7 @@ impl Interpreter {
             // foundation defers source preservation to a follow-up.
             // <https://tc39.es/ecma262/#sec-function.prototype.tostring>
             "toString" => {
-                let display = function_to_string(module, callee);
+                let display = function_to_string(module, callee, &self.gc_heap);
                 let s = JsString::from_str(&display, &self.string_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
                 let frame = &mut stack[top_idx];
@@ -7332,9 +7467,11 @@ impl Interpreter {
         };
         let module_rc = std::rc::Rc::new(module);
         let module_clone = std::rc::Rc::clone(&module_rc);
-        let native = std::rc::Rc::new(NativeFunction::new(
+        let native = NativeFunction::new(
+            &mut self.gc_heap,
             "anonymous",
-            move |interp: &mut Interpreter, call_args: &[Value]| {
+            move |ctx: &mut NativeCtx<'_>, call_args: &[Value]| {
+                let interp = ctx.interp_mut();
                 interp
                     .invoke_eval_function(&module_clone, function_id, call_args)
                     .map_err(|err| crate::native_function::NativeError::TypeError {
@@ -7342,7 +7479,7 @@ impl Interpreter {
                         reason: format!("{err}"),
                     })
             },
-        ));
+        )?;
         Ok(Value::NativeFunction(native))
     }
 
@@ -8415,14 +8552,18 @@ fn render_thrown_value(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
 /// §20.2.3.5 — render a callable as a string. Foundation returns
 /// the canonical placeholder `function <name>() { [native code] }`
 /// for every callable shape; source-faithful output is filed.
-fn function_to_string(module: &BytecodeModule, callee: &Value) -> String {
+fn function_to_string(
+    module: &BytecodeModule,
+    callee: &Value,
+    gc_heap: &otter_gc::GcHeap,
+) -> String {
     let display = match callee {
         Value::Function { function_id } | Value::Closure { function_id, .. } => module
             .functions
             .get(*function_id as usize)
             .map(|f| f.name.as_str())
             .unwrap_or("anonymous"),
-        Value::NativeFunction(n) => n.name,
+        Value::NativeFunction(n) => n.name(gc_heap),
         Value::ClassConstructor(c) => match &c.ctor {
             Value::Function { function_id } | Value::Closure { function_id, .. } => module
                 .functions
@@ -8487,8 +8628,10 @@ fn bound_function_intrinsic_property(
     bound: &BoundFunction,
     name: &str,
     heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    let inner = match &bound.target {
+    let (target, _, bound_args) = bound.parts(gc_heap);
+    let inner = match &target {
         Value::Function { function_id } | Value::Closure { function_id, .. } => Some(
             module
                 .functions
@@ -8506,7 +8649,7 @@ fn bound_function_intrinsic_property(
         }
         "length" => {
             let raw = inner.map(|f| f.param_count as i32).unwrap_or(0);
-            let bound_count = bound.bound_args.len() as i32;
+            let bound_count = bound_args.len() as i32;
             Value::Number(NumberValue::from_i32(
                 raw.saturating_sub(bound_count).max(0),
             ))
@@ -8911,14 +9054,23 @@ fn seed_array(seed: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Vec<Value>, Vm
 ///   subsequent in-place mutations through the same `JsArray`,
 ///   matching real-engine `Array.prototype[Symbol.iterator]`
 ///   semantics.
-fn make_array_iterator_factory(array: JsArray) -> Value {
-    native_value("Array[Symbol.iterator]", move |vm, _| {
-        let state = IteratorState::Array { array, index: 0 };
-        Ok(Value::Iterator(alloc_iterator_state(
-            vm.gc_heap_mut(),
-            state,
-        )?))
-    })
+fn make_array_iterator_factory(
+    array: JsArray,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    native_value_with_captures(
+        heap,
+        "Array[Symbol.iterator]",
+        smallvec::smallvec![Value::Array(array)],
+        move |ctx, _| {
+            let vm = ctx.interp_mut();
+            let state = IteratorState::Array { array, index: 0 };
+            Ok(Value::Iterator(alloc_iterator_state(
+                vm.gc_heap_mut(),
+                state,
+            )?))
+        },
+    )
 }
 
 /// Generator resume entry per ECMA-262 §27.5.3.
@@ -8992,10 +9144,10 @@ fn proxy_static_call(
             };
             let proxy = crate::proxy::JsProxy::new(target, handler);
             let proxy_handle = proxy.clone();
-            let revoke = native_function::native_value("revoke", move |_, _| {
+            let revoke = native_function::native_value(gc_heap, "revoke", move |_, _| {
                 proxy_handle.revoke();
                 Ok(Value::Undefined)
-            });
+            })?;
             let obj = crate::object::alloc_object(gc_heap)?;
             crate::object::set(obj, gc_heap, "proxy", Value::Proxy(proxy));
             crate::object::set(obj, gc_heap, "revoke", revoke);
@@ -9226,7 +9378,10 @@ fn construct_prototype(callee: &Value, gc_heap: &otter_gc::GcHeap) -> Option<JsO
             Some(Value::Object(p)) => Some(p),
             _ => None,
         },
-        Value::BoundFunction(b) => construct_prototype(&b.target, gc_heap),
+        Value::BoundFunction(b) => {
+            let (target, _, _) = b.parts(gc_heap);
+            construct_prototype(&target, gc_heap)
+        }
         _ => None,
     }
 }
@@ -9459,14 +9614,16 @@ mod tests {
             upvalues: std::rc::Rc::from(Vec::new()),
             bound_this: None,
         }));
-        let bound = std::rc::Rc::new(BoundFunction {
-            target: Value::Function { function_id: 7 },
-            bound_this: Value::Undefined,
-            bound_args: SmallVec::new(),
-        });
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let bound = BoundFunction::new(
+            &mut heap,
+            Value::Function { function_id: 7 },
+            Value::Undefined,
+            SmallVec::new(),
+        )
+        .expect("bound");
         assert!(is_callable(&Value::BoundFunction(bound)));
         assert!(!is_callable(&Value::Number(NumberValue::Smi(1))));
-        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         assert!(!is_callable(&Value::Object(
             crate::object::alloc_object(&mut heap).unwrap()
         )));

@@ -16,6 +16,7 @@
 #   bash scripts/test262-safe.sh                     # full sweep
 #   bash scripts/test262-safe.sh --shard 3/8         # one shard
 #   bash scripts/test262-safe.sh --filter built-ins/Math
+#   bash scripts/test262-safe.sh built-ins/Array     # shorthand for --filter
 #   bash scripts/test262-safe.sh --allow-debug ...   # debug build OK
 #
 # The runner refuses to launch on debug builds without --allow-debug.
@@ -27,14 +28,58 @@ set -uo pipefail
 ALLOW_DEBUG=0
 PROFILE_FLAG="--release"
 PASSTHROUGH=()
+FILTER_SEEN=0
+EXPECT_VALUE_FOR=""
+
+normalize_filter() {
+    case "$1" in
+        built-ins/Array)
+            printf '%s\n' "built-ins/Array/"
+            ;;
+        *)
+            printf '%s\n' "$1"
+            ;;
+    esac
+}
+
 for arg in "$@"; do
+    if [[ -n "$EXPECT_VALUE_FOR" ]]; then
+        if [[ "$EXPECT_VALUE_FOR" == "--filter" ]]; then
+            PASSTHROUGH+=("$(normalize_filter "$arg")")
+        else
+            PASSTHROUGH+=("$arg")
+        fi
+        EXPECT_VALUE_FOR=""
+        continue
+    fi
     case "$arg" in
         --allow-debug)
             ALLOW_DEBUG=1
             PROFILE_FLAG=""
             ;;
-        *)
+        --filter)
+            FILTER_SEEN=1
             PASSTHROUGH+=("$arg")
+            EXPECT_VALUE_FOR="$arg"
+            ;;
+        --filter=*)
+            FILTER_SEEN=1
+            PASSTHROUGH+=("--filter=$(normalize_filter "${arg#--filter=}")")
+            ;;
+        --shard|--timeout|--max-heap-bytes|--output|--config|--cursor|--resume)
+            PASSTHROUGH+=("$arg")
+            EXPECT_VALUE_FOR="$arg"
+            ;;
+        --*)
+            PASSTHROUGH+=("$arg")
+            ;;
+        *)
+            if [[ "$FILTER_SEEN" -eq 0 ]]; then
+                FILTER_SEEN=1
+                PASSTHROUGH+=("--filter" "$(normalize_filter "$arg")")
+            else
+                PASSTHROUGH+=("$arg")
+            fi
             ;;
     esac
 done

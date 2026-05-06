@@ -147,6 +147,14 @@ impl<'rt> NativeCtx<'rt> {
     pub fn heap_mut(&mut self) -> &mut otter_gc::GcHeap {
         self.cx.heap_mut()
     }
+
+    /// Borrow the owning interpreter for native functions that need
+    /// isolate services outside the heap (microtasks, string tables,
+    /// intrinsic registries).
+    #[must_use]
+    pub fn interp_mut(&mut self) -> &mut Interpreter {
+        self.cx.interp
+    }
 }
 
 // `RuntimeCx` and `NativeCtx` are `!Send + !Sync` because they

@@ -656,6 +656,35 @@ pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::O
     })
 }
 
+/// Allocate a fresh empty object for diagnostic delivery after the
+/// heap cap has already fired.
+///
+/// This mirrors [`alloc_object`] but uses
+/// [`otter_gc::GcHeap::alloc_old_diagnostic`] so the VM can throw a
+/// catchable `RangeError` for an allocation failure instead of
+/// immediately losing the error object to the same cap.
+///
+/// # Errors
+///
+/// Surfaces cage exhaustion; heap-cap exhaustion is intentionally
+/// bypassed for this diagnostic object only.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-error-objects>
+pub fn alloc_diagnostic_object(
+    heap: &mut otter_gc::GcHeap,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let shape = ROOT_SHAPE.with(Rc::clone);
+    heap.alloc_old_diagnostic(ObjectBody {
+        shape,
+        slots: SmallVec::new(),
+        prototype: otter_gc::Gc::null(),
+        symbol_props: Vec::new(),
+        extensible: true,
+    })
+}
+
 /// Allocate a fresh empty object whose prototype is `proto`.
 ///
 /// Convenience wrapper around [`alloc_object`] that fires the

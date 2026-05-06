@@ -46,6 +46,7 @@ use std::collections::VecDeque;
 use smallvec::SmallVec;
 
 use crate::{Frame, Value};
+use otter_gc::raw::RawGc;
 
 /// Hard cap on tasks drained per single drain call. Past this we
 /// return [`MicrotaskError::Runaway`] so a misbehaving JS program
@@ -272,7 +273,7 @@ impl MicrotaskQueue {
 
 impl Microtask {
     /// Trace every GC-bearing value slot held by this queued task.
-    pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut otter_gc::RawGc)) {
+    pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.callee.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
         for arg in &self.args {
@@ -295,7 +296,7 @@ impl Microtask {
 
 impl MicrotaskQueue {
     /// Trace every queued isolate-local task.
-    pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut otter_gc::RawGc)) {
+    pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         for task in &self.pending {
             task.trace_gc_slots(visitor);
         }

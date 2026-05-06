@@ -38,6 +38,7 @@ use std::time::Instant;
 
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::ephemeron::EphemeronRegistry;
+use crate::external::ExternalMemory;
 use crate::finalize::WeakFinalizationRegistry;
 use crate::handle::{GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
@@ -48,6 +49,7 @@ use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, Page, page_base_from
 use crate::scavenger::ScavengeStats;
 use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
 use crate::stats::{GcStats, TYPE_TAG_COUNT};
+use crate::store::GcStore;
 use crate::trace::{TraceTable, Traceable};
 
 /// Type alias for the higher-order visitor closure used by the
@@ -236,6 +238,20 @@ impl GcHeap {
         Ok(())
     }
 
+    /// Reserve native / backing-store bytes with RAII release.
+    ///
+    /// Use this for memory not represented by GC cell sizes: typed
+    /// array buffers, host-owned native allocations, module source
+    /// caches, or container backing storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutOfMemory`] when the configured cap cannot
+    /// accommodate the reservation after one emergency collection.
+    pub fn reserve_external(&mut self, bytes: u64) -> Result<ExternalMemory, OutOfMemory> {
+        ExternalMemory::new(self, bytes)
+    }
+
     /// Reserve off-slot bytes without running an emergency
     /// collection.
     ///
@@ -350,6 +366,7 @@ impl GcHeap {
     }
 
     /// Snapshot registered weak collection tables.
+    #[doc(hidden)]
     #[must_use]
     pub fn ephemeron_tables_snapshot(&self) -> Vec<RawGc> {
         self.ephemerons.snapshot()
@@ -362,12 +379,14 @@ impl GcHeap {
     }
 
     /// Snapshot registered `WeakRef` body handles.
+    #[doc(hidden)]
     #[must_use]
     pub fn weak_refs_snapshot(&self) -> Vec<RawGc> {
         self.weak_finalization.weak_refs_snapshot()
     }
 
     /// Snapshot registered `FinalizationRegistry` body handles.
+    #[doc(hidden)]
     #[must_use]
     pub fn finalization_registries_snapshot(&self) -> Vec<RawGc> {
         self.weak_finalization.finalization_registries_snapshot()
@@ -398,6 +417,7 @@ impl GcHeap {
     }
 
     /// Reference to the trace table (used by tests).
+    #[doc(hidden)]
     pub fn trace_table(&self) -> &TraceTable {
         &self.trace_table
     }
@@ -806,6 +826,7 @@ impl GcHeap {
     ///
     /// Returns `true` when at least one previously-white object was
     /// discovered.
+    #[doc(hidden)]
     pub fn mark_additional(&mut self, additions: impl IntoIterator<Item = RawGc>) -> bool {
         let mut discovered = false;
         for raw in additions {
@@ -830,6 +851,7 @@ impl GcHeap {
     }
 
     /// Returns true iff `raw` is marked in the current full-GC cycle.
+    #[doc(hidden)]
     #[must_use]
     pub fn is_marked(&self, raw: RawGc) -> bool {
         if raw.is_null() {
@@ -840,6 +862,7 @@ impl GcHeap {
     }
 
     /// Type tag for a raw heap object.
+    #[doc(hidden)]
     #[must_use]
     pub fn raw_type_tag(&self, raw: RawGc) -> Option<u8> {
         if raw.is_null() {
@@ -850,6 +873,7 @@ impl GcHeap {
     }
 
     /// Type-check and cast a raw heap object to `Gc<T>`.
+    #[doc(hidden)]
     #[must_use]
     pub fn cast_raw_if_type<T: Traceable>(&self, raw: RawGc) -> Option<Gc<T>> {
         if self.raw_type_tag(raw)? != T::TYPE_TAG {
@@ -1034,10 +1058,29 @@ impl GcHeap {
         }
     }
 
+    /// Record the outgoing edges established by storing `value` into
+    /// `parent`.
+    ///
+    /// This is the safe contributor-facing mutation hook. Callers do
+    /// not provide raw slot pointers and do not call barriers
+    /// manually; they only pass the parent object and the value that
+    /// was just stored. The heap computes a conservative slot address
+    /// inside the parent payload for card-table marking.
+    pub fn record_write<T: ?Sized, V: GcStore + ?Sized>(&mut self, parent: Gc<T>, value: &V) {
+        if parent.is_null() {
+            return;
+        }
+        let slot = parent_payload_slot(parent);
+        let mut record = |edge: crate::GcEdge| {
+            self.write_barrier_raw(parent, slot, edge.raw());
+        };
+        value.visit_gc_edges(&mut record);
+    }
+
     /// Type-erased write barrier for callers that hold the
     /// child as a [`RawGc`] rather than a typed `Gc<U>`.
     /// Equivalent to [`Self::write_barrier`] otherwise.
-    pub fn write_barrier_raw<T: ?Sized>(
+    pub(crate) fn write_barrier_raw<T: ?Sized>(
         &mut self,
         parent: Gc<T>,
         slot_addr: *mut RawGc,
@@ -1106,6 +1149,11 @@ impl GcHeap {
     pub fn page_header_size() -> usize {
         PAGE_HEADER_SIZE
     }
+}
+
+fn parent_payload_slot<T: ?Sized>(parent: Gc<T>) -> *mut RawGc {
+    let body_base = parent.as_header_ptr() as *mut u8;
+    body_base.wrapping_add(std::mem::size_of::<GcHeader>()) as *mut RawGc
 }
 
 impl std::fmt::Debug for GcHeap {

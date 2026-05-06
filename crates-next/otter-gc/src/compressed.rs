@@ -180,9 +180,12 @@ impl<T: ?Sized> Gc<T> {
         self.offset == 0
     }
 
-    /// Type-erases `self` into a [`RawGc`] (the slot type used by
-    /// trace functions when they don't statically know the
-    /// element type).
+    /// Type-erases `self` into the collector backend slot type.
+    ///
+    /// Normal contributor code must not persist or inspect this
+    /// value. It exists for audited VM adapter layers and the
+    /// collector's own root/trace walkers.
+    #[doc(hidden)]
     #[inline]
     pub const fn raw(self) -> RawGc {
         RawGc(self.offset)
@@ -278,6 +281,7 @@ impl<T: ?Sized> std::hash::Hash for Gc<T> {
 /// Used inside trace functions which walk slot pointers without
 /// knowing the element type, and in the marker / scavenger
 /// worklists (which only ever read the `GcHeader`).
+#[doc(hidden)]
 #[repr(transparent)]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct RawGc(pub u32);

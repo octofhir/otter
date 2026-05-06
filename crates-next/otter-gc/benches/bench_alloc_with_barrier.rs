@@ -3,8 +3,9 @@
 //! Target: ≤ 30 ns per iteration.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeap, RawGc, init_cage_with_size};
+use otter_gc::{Gc, GcHeap, init_cage_with_size};
 
 struct Pair {
     next: Gc<Pair>,

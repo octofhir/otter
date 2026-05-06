@@ -1,5 +1,6 @@
-//! Rooting handles: `Local<'gc, T>`, `HandleScope<'gc>`, and the
-//! internal persistent-handle table behind branded `Root<'iso, T>`.
+//! Rooting handles: `Local<'gc, T>`, `HandleScope<'gc>`,
+//! `EscapableHandleScope<'gc>`, and the internal persistent-handle
+//! table behind branded `Root<'iso, T>`.
 //!
 //! Phase-1 GC is moving (the scavenger relocates young objects).
 //! Native code that holds a `Gc<T>` across a safepoint must root
@@ -10,6 +11,8 @@
 //!
 //! - [`HandleScope`] — RAII scope that bounds the lifetime of
 //!   every [`Local`] created inside it.
+//! - [`EscapableHandleScope`] — nested handle scope with one explicit
+//!   escape slot for returning a local to its parent scope.
 //! - [`Local`] — typed root; backed by an entry on the
 //!   [`HandleStack`].
 //! - `GlobalHandle` — crate-internal explicit-drop root used by
@@ -86,6 +89,18 @@ impl HandleStack {
             }
             *top += 1;
             idx
+        }
+    }
+
+    /// Overwrite an existing live entry.
+    fn write(&self, idx: u32, raw: RawGc) {
+        // SAFETY: GcHeap is single-threaded; callers only pass
+        // indices allocated by `push` and still live in the current
+        // scope chain.
+        unsafe {
+            let entries = &mut *self.entries.get();
+            debug_assert!((idx as usize) < entries.len());
+            entries[idx as usize] = raw;
         }
     }
 
@@ -213,6 +228,80 @@ impl Drop for HandleScope<'_> {
     }
 }
 
+/// Nested handle scope that can return exactly one [`Local`] to the
+/// parent scope.
+///
+/// The escape slot is reserved before the nested scope starts, so
+/// dropping the nested scope truncates only its temporaries and keeps
+/// the escaped handle live in the parent scope. This mirrors the V8
+/// `EscapableHandleScope` shape without exposing raw handle-table
+/// entries to native authors.
+///
+/// # Example
+///
+/// ```
+/// use otter_gc::test_support::OpaqueLeaf;
+/// use otter_gc::{EscapableHandleScope, GcHeap};
+///
+/// let mut heap = GcHeap::new().unwrap();
+/// heap.register_traceable::<OpaqueLeaf>();
+/// let gc = heap.alloc(OpaqueLeaf { payload: 94 }).unwrap();
+/// let stack = heap.handle_stack();
+///
+/// let escaped = {
+///     let mut inner = EscapableHandleScope::new(stack);
+///     let local = inner.local(gc);
+///     inner.escape(&local)
+/// };
+///
+/// assert_eq!(escaped.get().offset(), gc.offset());
+/// ```
+pub struct EscapableHandleScope<'gc> {
+    scope: HandleScope<'gc>,
+    escape_idx: u32,
+    escaped: bool,
+}
+
+impl<'gc> EscapableHandleScope<'gc> {
+    /// Open an escapable scope on `stack`.
+    ///
+    /// The returned scope reserves one parent-visible slot. Use
+    /// [`Self::local`] for temporaries and [`Self::escape`] for the
+    /// single value that must survive the nested scope.
+    pub fn new(stack: &'gc HandleStack) -> Self {
+        let escape_idx = stack.push(RawGc::NULL);
+        Self {
+            scope: HandleScope::new(stack),
+            escape_idx,
+            escaped: false,
+        }
+    }
+
+    /// Root a temporary value inside the nested scope.
+    pub fn local<T: ?Sized>(&self, gc: Gc<T>) -> Local<'gc, T> {
+        self.scope.local(gc)
+    }
+
+    /// Escape `local` into the parent scope.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug and release builds if called more than once.
+    /// A second escape would make ownership of the reserved slot
+    /// ambiguous; callers that need multiple values should escape a
+    /// container object.
+    pub fn escape<T: ?Sized>(&mut self, local: &Local<'gc, T>) -> Local<'gc, T> {
+        assert!(!self.escaped, "EscapableHandleScope::escape called twice");
+        self.escaped = true;
+        self.scope.stack().write(self.escape_idx, local.raw());
+        Local {
+            idx: self.escape_idx,
+            stack: self.scope.stack,
+            _t: PhantomData,
+        }
+    }
+}
+
 /// Typed local handle. Lifetime-bound to its [`HandleScope`].
 pub struct Local<'gc, T: ?Sized> {
     idx: u32,
@@ -238,7 +327,11 @@ impl<T: ?Sized> Local<'_, T> {
         }
     }
 
-    /// Compressed form of the current value.
+    /// Compressed backend form of the current value.
+    ///
+    /// Normal contributor code should use [`Self::get`]. Raw access is
+    /// retained only for collector/root adapter code.
+    #[doc(hidden)]
     pub fn raw(&self) -> RawGc {
         // SAFETY: see [`Local::get`].
         unsafe {

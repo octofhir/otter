@@ -51,8 +51,8 @@
 //! - Accessor descriptors never carry a `writable` bit — its slot is
 //!   reused as a discriminator (always `false`).
 //! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
-//!   prototype assignment, and every symbol-property write fires
-//!   [`otter_gc::GcHeap::write_barrier_raw`] inline so the
+//!   prototype assignment, and every symbol-property write records
+//!   the store through [`otter_gc::GcHeap::record_write`] so the
 //!   generational and incremental marker observe the new pointer.
 //!
 //! # See also
@@ -72,6 +72,7 @@ use smallvec::SmallVec;
 use crate::Value;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 // ---------- property attribute flags ---------------------------------------
 
@@ -530,8 +531,8 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 /// the pre-77 `Rc<RefCell<…>>` envelope. Mutation flows through
 /// [`otter_gc::GcHeap::with_payload`] (writers) and reads through
 /// [`otter_gc::GcHeap::read_payload`] (readers). Every store of a
-/// `Gc<…>`-bearing field fires
-/// [`otter_gc::GcHeap::write_barrier_raw`] inline.
+/// `Gc<…>`-bearing field is recorded through
+/// [`otter_gc::GcHeap::record_write`].
 ///
 /// # Spec
 ///
@@ -583,13 +584,13 @@ impl otter_gc::SafeTraceable for ObjectBody {
     /// Shape keys are interned `String` leaves and their containing
     /// [`Shape`] is `Rc`-shared, not GC-managed, so they are not
     /// traced — see the type doc on [`ObjectBody`].
-    fn trace_slots_safe(&self, v: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, v: &mut SlotVisitor<'_>) {
         // Prototype: `Gc<ObjectBody>` (null ≡ no prototype).
         // `Gc<T>` is `#[repr(transparent)]` over `u32`, so the
         // field's storage address is a `*mut RawGc` slot the
         // scavenger may rewrite.
         if !self.prototype.is_null() {
-            let p = &self.prototype as *const JsObject as *mut otter_gc::RawGc;
+            let p = &self.prototype as *const JsObject as *mut RawGc;
             v(p);
         }
         // Property slots.
@@ -979,10 +980,10 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// flag: this path is only used by code that owns the object and
 /// is allowed to seed it (`Error.prototype.message`, etc.).
 ///
-/// Fires the GC write barrier when `value` carries a `Gc<…>`
-/// handle so the marker / scavenger see the new edge.
+/// Records the GC store when `value` carries a `Gc<…>` handle so the
+/// marker / scavenger see the new edge.
 pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
-    let child_raw = value.as_gc_raw();
+    let barrier_value = value.clone();
     heap.with_payload(obj, |body| {
         if let Some(offset) = body.shape.offset_of(key) {
             let slot = &mut body.slots[offset as usize];
@@ -993,17 +994,7 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
         body.shape = new_shape;
         body.slots.push(PropertySlot::data_default(value));
     });
-    if let Some(child) = child_raw {
-        // We do not have a stable slot address inside the SmallVec
-        // (the vector may have reallocated above). Pass the body
-        // base as the slot address — the barrier only uses it for
-        // card-bit derivation, and the body lives at a fixed
-        // offset behind the header.
-        let body_base = obj.as_header_ptr() as *mut u8;
-        let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-            as *mut otter_gc::RawGc;
-        heap.write_barrier_raw(obj, slot_ptr, child);
-    }
+    heap.record_write(obj, &barrier_value);
 }
 
 /// Replace the prototype. `None` detaches the chain (encoded as
@@ -1017,14 +1008,7 @@ pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<J
     heap.with_payload(obj, |body| {
         body.prototype = new_proto;
     });
-    if !new_proto.is_null() {
-        let body_base = obj.as_header_ptr() as *mut u8;
-        // Slot pointer = base of payload; sufficient for the
-        // barrier's card-bit derivation.
-        let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-            as *mut otter_gc::RawGc;
-        heap.write_barrier_raw(obj, slot_ptr, new_proto.raw());
-    }
+    heap.record_write(obj, &new_proto);
 }
 
 /// Remove an own property. Per ECMA-262 §10.1.10 OrdinaryDelete:
@@ -1063,7 +1047,7 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
 /// Fires the GC write barrier when `value` carries a `Gc<…>`
 /// handle.
 pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, value: Value) {
-    let child_raw = value.as_gc_raw();
+    let barrier_value = value.clone();
     heap.with_payload(obj, |body| {
         for (existing_key, slot) in body.symbol_props.iter_mut() {
             if existing_key.ptr_eq(&key) {
@@ -1073,12 +1057,7 @@ pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, val
         }
         body.symbol_props.push((key, value));
     });
-    if let Some(child) = child_raw {
-        let body_base = obj.as_header_ptr() as *mut u8;
-        let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-            as *mut otter_gc::RawGc;
-        heap.write_barrier_raw(obj, slot_ptr, child);
-    }
+    heap.record_write(obj, &barrier_value);
 }
 
 /// Remove a symbol-keyed own property.
@@ -1126,10 +1105,7 @@ pub fn define_own_property(
     key: &str,
     descriptor: PropertyDescriptor,
 ) -> bool {
-    // Compute child raws *before* the `with_payload` borrow because
-    // the barrier needs the heap mutable, but `as_gc_raw` is a pure
-    // read.
-    let raws = descriptor_gc_children(&descriptor);
+    let barrier_descriptor = descriptor.clone();
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = body.shape.offset_of(key) {
             let existing = body.slots[offset as usize].clone();
@@ -1151,42 +1127,25 @@ pub fn define_own_property(
         }
     });
     if success {
-        // Fire one barrier per outgoing GC reference established
-        // by the new slot (data value, getter, setter). The slot
-        // address is approximated by the body base — sufficient
-        // for card-bit derivation.
-        for child in raws {
-            let body_base = obj.as_header_ptr() as *mut u8;
-            let slot_ptr = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-                as *mut otter_gc::RawGc;
-            heap.write_barrier_raw(obj, slot_ptr, child);
-        }
+        heap.record_write(obj, &barrier_descriptor);
     }
     success
 }
 
-/// Collect every `Gc<…>` raw offset that `descriptor` would
-/// install. Used by [`define_own_property`] to drive the write
-/// barrier without holding `&mut body` and `&mut heap`
-/// simultaneously.
-fn descriptor_gc_children(desc: &PropertyDescriptor) -> SmallVec<[otter_gc::RawGc; 3]> {
-    let mut out = SmallVec::new();
-    match &desc.kind {
-        DescriptorKind::Data { value } => {
-            if let Some(c) = value.as_gc_raw() {
-                out.push(c);
-            }
-        }
-        DescriptorKind::Accessor { getter, setter } => {
-            if let Some(g) = getter.as_ref().and_then(Value::as_gc_raw) {
-                out.push(g);
-            }
-            if let Some(s) = setter.as_ref().and_then(Value::as_gc_raw) {
-                out.push(s);
+impl otter_gc::GcStore for PropertyDescriptor {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
+        match &self.kind {
+            DescriptorKind::Data { value } => value.visit_gc_edges(visitor),
+            DescriptorKind::Accessor { getter, setter } => {
+                if let Some(getter) = getter {
+                    getter.visit_gc_edges(visitor);
+                }
+                if let Some(setter) = setter {
+                    setter.visit_gc_edges(visitor);
+                }
             }
         }
     }
-    out
 }
 
 /// Resolve a `[[Set]]` against `obj` as receiver — walks the

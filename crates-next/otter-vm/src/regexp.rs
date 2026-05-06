@@ -35,6 +35,7 @@
 
 use std::cell::Cell;
 
+use otter_gc::raw::{RawGc, SlotVisitor};
 use regress::{Flags, Regex};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsRegExpBody`].
@@ -192,7 +193,7 @@ pub struct JsRegExpBody {
 impl otter_gc::SafeTraceable for JsRegExpBody {
     const TYPE_TAG: u8 = REGEXP_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::SlotVisitor<'_>) {}
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 /// Cheap-to-clone JS regex handle.
@@ -242,7 +243,7 @@ impl JsRegExp {
 
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
-    pub fn raw(&self) -> otter_gc::RawGc {
+    pub(crate) fn raw(&self) -> RawGc {
         self.inner.raw()
     }
 
@@ -309,8 +310,8 @@ impl JsRegExp {
     }
 
     /// Trace this handle as a root slot.
-    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
-        let p = self as *const JsRegExp as *mut otter_gc::RawGc;
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        let p = self as *const JsRegExp as *mut RawGc;
         visitor(p);
     }
 }

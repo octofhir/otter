@@ -33,6 +33,7 @@
 
 use crate::Value;
 use crate::microtask::{Microtask, MicrotaskKind};
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`PurePromiseBody`].
 pub const PURE_PROMISE_BODY_TYPE_TAG: u8 = 0x19;
@@ -56,7 +57,7 @@ impl PromiseState {
         !matches!(self, Self::Pending)
     }
 
-    fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         match self {
             Self::Fulfilled(value) | Self::Rejected(value) => value.trace_value_slots(visitor),
             Self::Pending => {}
@@ -76,11 +77,18 @@ pub struct PromiseReaction {
 }
 
 impl PromiseReaction {
-    fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         self.capability.promise.trace_value_slots(visitor);
         self.capability.resolve.trace_value_slots(visitor);
         self.capability.reject.trace_value_slots(visitor);
         self.handler.trace_value_slots(visitor);
+    }
+}
+
+impl otter_gc::GcStore for PromiseReaction {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
+        self.capability.visit_gc_edges(visitor);
+        self.handler.visit_gc_edges(visitor);
     }
 }
 
@@ -117,38 +125,44 @@ pub enum PromiseReactionHandler {
 }
 
 impl PromiseReactionHandler {
-    fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         match self {
             Self::Call(Some(handler)) => handler.trace_value_slots(visitor),
             Self::Call(None) => {}
             Self::AsyncResume { parked, .. } => {
-                let p = parked as *const crate::generator::ParkedFrame as *mut otter_gc::RawGc;
+                let p = parked as *const crate::generator::ParkedFrame as *mut RawGc;
                 visitor(p);
             }
             Self::AsyncGenResume { parked, owner, .. } => {
-                let p = parked as *const crate::generator::ParkedFrame as *mut otter_gc::RawGc;
+                let p = parked as *const crate::generator::ParkedFrame as *mut RawGc;
                 visitor(p);
                 owner.trace_value_slots(visitor);
             }
         }
     }
+}
 
-    fn gc_children(&self) -> impl Iterator<Item = otter_gc::RawGc> + '_ {
-        let mut out: smallvec::SmallVec<[otter_gc::RawGc; 4]> = smallvec::SmallVec::new();
+impl otter_gc::GcStore for PromiseReactionHandler {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
         match self {
             Self::Call(Some(handler)) => {
-                if let Some(raw) = handler.as_gc_raw() {
-                    out.push(raw);
-                }
+                handler.visit_gc_edges(visitor);
             }
             Self::Call(None) => {}
-            Self::AsyncResume { parked, .. } => out.push(parked.raw()),
+            Self::AsyncResume { parked, .. } => {
+                if let Some(edge) = otter_gc::GcEdge::from_gc(*parked) {
+                    visitor(edge);
+                }
+            }
             Self::AsyncGenResume { parked, owner, .. } => {
-                out.push(parked.raw());
-                out.push(owner.raw());
+                if let Some(edge) = otter_gc::GcEdge::from_gc(*parked) {
+                    visitor(edge);
+                }
+                if let Some(edge) = otter_gc::GcEdge::from_raw(owner.raw()) {
+                    visitor(edge);
+                }
             }
         }
-        out.into_iter()
     }
 }
 
@@ -171,6 +185,14 @@ pub struct PromiseCapability {
     pub resolve: Value,
     /// Native function: `reject(reason)` settles `promise` as rejected.
     pub reject: Value,
+}
+
+impl otter_gc::GcStore for PromiseCapability {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
+        self.promise.visit_gc_edges(visitor);
+        self.resolve.visit_gc_edges(visitor);
+        self.reject.visit_gc_edges(visitor);
+    }
 }
 
 /// Output of [`JsPromise::fulfill`] / [`JsPromise::reject`].
@@ -242,7 +264,7 @@ pub struct PurePromiseBody {
 impl otter_gc::SafeTraceable for PurePromiseBody {
     const TYPE_TAG: u8 = PURE_PROMISE_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         self.state.trace_value_slots(visitor);
         for reaction in self
             .fulfill_reactions
@@ -299,7 +321,7 @@ impl PurePromise {
 
     /// Raw handle used by root tracing.
     #[must_use]
-    pub fn raw(&self) -> otter_gc::RawGc {
+    pub(crate) fn raw(&self) -> RawGc {
         self.inner.raw()
     }
 
@@ -412,7 +434,7 @@ impl JsPromise for PurePromise {
     }
 
     fn fulfill(&self, heap: &mut otter_gc::GcHeap, value: Value) -> PromiseSettleJobs {
-        let child_raw = value.as_gc_raw();
+        let barrier_value = value.clone();
         let reactions: Vec<PromiseReaction> = heap.with_payload(self.inner, |body| {
             if body.state.is_settled() {
                 return Vec::new();
@@ -422,9 +444,7 @@ impl JsPromise for PurePromise {
             body.reject_reactions.clear();
             taken
         });
-        if let Some(child) = child_raw {
-            heap.write_barrier_raw(self.inner, promise_payload_slot(self.inner), child);
-        }
+        heap.record_write(self.inner, &barrier_value);
         PromiseSettleJobs {
             jobs: reactions
                 .into_iter()
@@ -434,7 +454,7 @@ impl JsPromise for PurePromise {
     }
 
     fn reject(&self, heap: &mut otter_gc::GcHeap, reason: Value) -> PromiseSettleJobs {
-        let child_raw = reason.as_gc_raw();
+        let barrier_reason = reason.clone();
         let reactions: Vec<PromiseReaction> = heap.with_payload(self.inner, |body| {
             if body.state.is_settled() {
                 return Vec::new();
@@ -444,9 +464,7 @@ impl JsPromise for PurePromise {
             body.fulfill_reactions.clear();
             taken
         });
-        if let Some(child) = child_raw {
-            heap.write_barrier_raw(self.inner, promise_payload_slot(self.inner), child);
-        }
+        heap.record_write(self.inner, &barrier_reason);
         PromiseSettleJobs {
             jobs: reactions
                 .into_iter()
@@ -540,7 +558,7 @@ impl JsPromiseHandle {
 
     /// Raw handle used by root tracing.
     #[must_use]
-    pub fn raw(&self) -> otter_gc::RawGc {
+    pub(crate) fn raw(&self) -> RawGc {
         match self.inner {
             PromiseRepr::Pure(p) => p.raw(),
         }
@@ -555,8 +573,8 @@ impl JsPromiseHandle {
     }
 
     /// Trace this handle as a root slot.
-    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
-        let p = self as *const JsPromiseHandle as *mut otter_gc::RawGc;
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        let p = self as *const JsPromiseHandle as *mut RawGc;
         visitor(p);
     }
 
@@ -705,23 +723,7 @@ fn record_reaction_barriers(
     heap: &mut otter_gc::GcHeap,
     reaction: &PromiseReaction,
 ) {
-    let slot = promise_payload_slot(parent);
-    for child in [
-        reaction.capability.promise.as_gc_raw(),
-        reaction.capability.resolve.as_gc_raw(),
-        reaction.capability.reject.as_gc_raw(),
-    ]
-    .into_iter()
-    .flatten()
-    .chain(reaction.handler.gc_children())
-    {
-        heap.write_barrier_raw(parent, slot, child);
-    }
-}
-
-fn promise_payload_slot(promise: otter_gc::Gc<PurePromiseBody>) -> *mut otter_gc::RawGc {
-    let body_base = promise.as_header_ptr() as *mut u8;
-    body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>()) as *mut otter_gc::RawGc
+    heap.record_write(parent, reaction);
 }
 
 #[cfg(test)]

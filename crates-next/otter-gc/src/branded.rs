@@ -176,6 +176,7 @@ impl<'iso, T: ?Sized> Weak<'iso, T> {
     }
 
     /// Raw weak metadata for diagnostics/tests.
+    #[doc(hidden)]
     #[must_use]
     pub const fn raw(self) -> RawGc {
         self.raw

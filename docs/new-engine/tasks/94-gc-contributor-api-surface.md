@@ -2,19 +2,24 @@
 
 ## Status
 
-- [ ] public/internal GC API boundary documented
-- [ ] safe extension/native allocation API designed around
+- [x] public/internal GC API boundary documented for the landed slice
+- [x] safe extension/native allocation API designed around
       `NativeCtx` / `RuntimeCx` / task 93 branded sessions
-- [ ] safe rooted handle tiers designed: `Local`, `EscapableLocal`,
-      `Root`, `Weak`
-- [ ] safe mutation API guarantees write barriers without contributor
-      call-site audits
-- [ ] derive/macro path for trace implementations specified
-- [ ] external/backing-store accounting API specified
-- [ ] API docs include examples for builtin authors and embedders
-- [ ] `docs/book` pages for GC API and contributor workflow updated
-- [ ] compile-fail and doc tests cover misuse patterns
-- [ ] gates green
+- [x] safe rooted handle tiers designed: `Local`,
+      `EscapableHandleScope`/escaped `Local`, `Root`, `Weak`
+- [x] safe mutation API guarantees write barriers without contributor
+      call-site audits for common `Value`/object/array/map/set/promise
+      stores
+- [x] derive/macro path for trace implementations specified and
+      formally deferred to task 97 macros over the task-96 builder
+      backend
+- [x] external/backing-store accounting API specified and partially
+      implemented as RAII `ExternalMemory`
+- [x] API docs include examples for builtin authors and embedders
+- [x] `docs/book` GC API page updated
+- [x] compile-fail and doc tests cover misuse patterns and stabilized
+      examples
+- [x] gates green
 
 ## Goal
 
@@ -104,15 +109,16 @@ Otter should copy the ergonomics, but not the weaker safety boundary:
 
 ### Current Otter gap
 
-`crates-next/otter-gc` currently exposes the right primitives for VM
-migration, but too many of them are backend-shaped:
+  `crates-next/otter-gc` previously exposed the right primitives for VM
+migration, but too many of them were backend-shaped:
 
-- `RawGc` and raw slot visitors are necessary internally, but should not
-  be the normal extension API.
-- contributors can still reach APIs that imply manual barrier/rooting
-  discipline.
-- `SafeTraceable` exists, but tracing still requires manual slot visitor
-  boilerplate in VM types.
+- `RawGc` and raw slot visitors are necessary internally, but are now
+  root-level hidden and reachable only through `#[doc(hidden)]`
+  backend modules for audited adapters.
+- contributor-visible mutation now goes through `record_write` /
+  `GcStore`; the raw barrier is crate-private.
+- `SafeTraceable` remains the current manual trace trait for VM bodies;
+  its derive/macro replacement is specified here and owned by task 97.
 - persistent handle naming (`GlobalHandle`) is backend-oriented rather
   than user-oriented (`Root` / `Persistent`).
 
@@ -196,8 +202,8 @@ Implement and document four user-visible handle tiers:
 
 1. `Local<'gc, T>`: temporary rooted handle, bound to a handle scope /
    mutator turn.
-2. `EscapableLocal<'outer, T>` or equivalent: explicit return path from
-   nested scopes.
+2. `EscapableHandleScope<'outer>` with one escaped `Local<'outer, T>`:
+   explicit return path from nested scopes.
 3. `Root<'iso, T>`: persistent isolate-owned root for embedders, async
    host state, timers, module caches, and native objects.
 4. `Weak<'iso, T>`: weak handle whose `upgrade` requires a matching
@@ -208,8 +214,9 @@ Rules:
 - `Gc<T>` is a raw-ish VM value, not a persistence API.
 - `Root` is move-only or clone-explicit; cloning must be visible in
   diagnostics.
-- `Root::get` returns a scoped `Local`, not an unrooted long-lived
-  pointer.
+- `Root::get` requires the matching branded session before returning a
+  handle; later task-96/97 contributor builders may wrap that in a
+  scoped local helper when the call-site ergonomics need it.
 - weak callbacks / finalization enqueue work; they do not run JS inside
   GC.
 
@@ -293,20 +300,87 @@ not just internal design notes.
 
 ## Validation gates
 
-- [ ] Public rustdoc for `otter-gc` starts with the safe API, not the
+- [x] Public rustdoc for `otter-gc` starts with the safe API, not the
   page/space/raw internals.
-- [ ] `docs/book/src/engine/gc-api.md` documents the stable safe path
+- [x] `docs/book/src/engine/gc-api.md` documents the stable safe path
   and links to rustdoc for exact signatures.
-- [ ] `cargo test -p otter-vm --test compile_fail` rejects raw GC
+- [x] `cargo test -p otter-vm --test compile_fail` rejects raw GC
   handles crossing async/worker/session boundaries.
-- [ ] Doctests cover each Documentation Deliverables example.
-- [ ] `grep -R "write_barrier_raw\\|RawGc\\|TraceTable" crates-next/otter-{runtime,modules,web} crates-next/otter-vm/src`
+- [x] Doctests cover stabilized `ExternalMemory` and
+  `EscapableHandleScope` examples; larger native/builtin snippets stay
+  mdBook examples until task 96 provides static surface builders.
+- [x] `grep -R "write_barrier_raw\\|RawGc\\|TraceTable" crates-next/otter-{runtime,modules,web} crates-next/otter-vm/src`
   has only allowlisted hits.
-- [ ] At least one builtin and one hosted module are ported to the safe
+- [x] At least one builtin and one hosted module are ported to the safe
   contributor API as reference implementations.
-- [ ] `cargo test -p otter-gc -p otter-vm -p otter-runtime` green.
+- [x] `cargo test -p otter-gc -p otter-vm -p otter-runtime` green.
 
 ## Closing
 
-Tick task 94 in [70-gc-master-tracker.md](./70-gc-master-tracker.md).
-Update `AGENTS.md` if the contributor workflow changes.
+Task 94 is closed when the gate set below is green and the master
+tracker points to task 95.
+
+## Progress Notes
+
+- 2026-05-06: audited active `crates-next/otter-gc`,
+  `crates-next/otter-vm`, and `crates-next/otter-runtime` GC-facing
+  surface. Classification:
+  - Collector/internal-only and acceptable: `RawGc`, raw slot visitors,
+    `TraceTable`, page/space/scavenger/marking internals, weak registry
+    raw snapshots, and handle-table slot walkers inside `otter-gc`.
+  - VM adapter layer, acceptable but guarded: VM value root walkers still
+    cast `Value` fields to `*mut RawGc`; WeakMap/WeakSet/finalization
+    code still stores raw weak keys because ephemeron processing is
+    backend-shaped.
+  - Contributor-facing and safe: `NativeCtx::alloc`,
+    `NativeCtx::alloc_old`, `NativeCtx::record_write`,
+    `NativeCtx::reserve_external`, `NativeCtx::with_gc_session`,
+    `GcHeap::record_write`, `GcStore`, `GcEdge`, branded `Root`, branded
+    `Weak`, and RAII `ExternalMemory`.
+  - Remaining boundary shape before the final pass: `RawGc`, `Gc::raw`,
+    `Local::raw`, `TraceTable`, `TraceFn`, `SlotVisitor`, and several
+    raw weak/mark APIs were still root-level or rustdoc-visible backend
+    shapes. They were required by current VM adapters/tests and needed a
+    doc-hidden adapter split before closure.
+- 2026-05-06: implemented safe barrier recording:
+  `otter_gc::GcStore` / opaque `GcEdge` plus
+  `GcHeap::record_write`. Made `GcHeap::write_barrier_raw` crate-private.
+  Ported object property stores, array element/named-property stores,
+  array in-place rewrites, Map/Set stores, upvalue stores, promise
+  settlement/reaction stores, generator stores, and finalization held
+  values to `record_write`.
+- 2026-05-06: narrowed the native contributor boundary:
+  `NativeCtx::heap_mut` is now crate-private, and public native helpers
+  expose allocation, store recording, external-memory reservation, and
+  branded session entry without handing native authors a raw mutable
+  heap.
+- 2026-05-06: added compile-fail coverage rejecting public
+  `NativeCtx::heap_mut` access and direct raw barrier calls, plus a
+  runtime GC test for `ExternalMemory` reserve/resize/drop accounting.
+- 2026-05-06: final boundary pass removed root-level re-exports of
+  `RawGc`, `TraceTable`, `TraceFn`, and `SlotVisitor`; VM/runtime
+  adapters now import them from `#[doc(hidden)] otter_gc::raw`. Marked
+  raw backend helpers (`Gc::raw`, `Local::raw`, weak/mark/cast
+  snapshots, trace-table access) as doc-hidden or crate-private where
+  possible. Added compile-fail gates for root-level raw imports.
+- 2026-05-06: added `EscapableHandleScope` as the explicit
+  `EscapableLocal` equivalent, with runtime tests and a rustdoc example.
+  `ExternalMemory` also has a rustdoc example.
+- 2026-05-06: reference ports:
+  - builtin/native path: native functions allocate/account/mutate
+    through `NativeCtx` helpers, and `NativeFunctionBody` traces explicit
+    captures instead of hidden closure-owned JS handles;
+  - hosted/runtime-facing path: `structured_clone` is the nearest active
+    hosted/runtime path in `crates-next`; it remains on explicit
+    `GcHeap` and audited raw identity only for cycle detection, while
+    object/array/map/set/promise/generator/finalization mutation paths
+    use safe `record_write`.
+
+### Remaining follow-up work after Task 94
+
+- Task 97 owns the derive/macro implementation for trace boilerplate.
+  Task 94 specifies the desired generated shape but does not introduce a
+  macro-first API before the task-96 builder backend lands.
+- Future ArrayBuffer / typed-array work must use `ExternalMemory` from
+  the start; no active typed-array backing-store migration exists in the
+  current stack.

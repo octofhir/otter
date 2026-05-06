@@ -35,6 +35,7 @@ use indexmap::IndexMap;
 use crate::Value;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`MapBody`].
 pub const MAP_BODY_TYPE_TAG: u8 = 0x13;
@@ -217,7 +218,7 @@ pub struct MapBody {
 impl otter_gc::SafeTraceable for MapBody {
     const TYPE_TAG: u8 = MAP_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         for (key, (original_key, value)) in &self.entries {
             trace_map_key(key, visitor);
             original_key.trace_value_slots(visitor);
@@ -265,8 +266,8 @@ pub fn map_set(
     key: Value,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let key_raw = key.as_gc_raw();
-    let value_raw = value.as_gc_raw();
+    let barrier_key = key.clone();
+    let barrier_value = value.clone();
     let k = MapKey::from_value(&key);
     let exists = heap.read_payload(map, |body| body.entries.contains_key(&k));
     if !exists {
@@ -280,13 +281,9 @@ pub fn map_set(
         }
     });
     if !exists {
-        if let Some(child) = key_raw {
-            heap.write_barrier_raw(map, map_payload_slot(map), child);
-        }
+        heap.record_write(map, &barrier_key);
     }
-    if let Some(child) = value_raw {
-        heap.write_barrier_raw(map, map_payload_slot(map), child);
-    }
+    heap.record_write(map, &barrier_value);
     Ok(())
 }
 
@@ -352,7 +349,7 @@ pub struct SetBody {
 impl otter_gc::SafeTraceable for SetBody {
     const TYPE_TAG: u8 = SET_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         for (key, value) in &self.entries {
             trace_map_key(key, visitor);
             value.trace_value_slots(visitor);
@@ -390,7 +387,7 @@ pub fn set_add(
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let value_raw = value.as_gc_raw();
+    let barrier_value = value.clone();
     let k = MapKey::from_value(&value);
     let exists = heap.read_payload(set, |body| body.entries.contains_key(&k));
     if !exists {
@@ -402,9 +399,7 @@ pub fn set_add(
         }
     });
     if !exists {
-        if let Some(child) = value_raw {
-            heap.write_barrier_raw(set, set_payload_slot(set), child);
-        }
+        heap.record_write(set, &barrier_value);
     }
     Ok(())
 }
@@ -438,13 +433,13 @@ pub type JsWeakMap = otter_gc::Gc<WeakMapBody>;
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsWeakMap`] handle.
 pub struct WeakMapBody {
-    entries: IndexMap<otter_gc::RawGc, Value>,
+    entries: IndexMap<RawGc, Value>,
 }
 
 impl otter_gc::SafeTraceable for WeakMapBody {
     const TYPE_TAG: u8 = WEAK_MAP_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
         // Ephemeron entries are not ordinary strong edges. The VM
         // fixpoint marks values only after the key is already live.
     }
@@ -507,13 +502,13 @@ pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsWeakSet`] handle.
 pub struct WeakSetBody {
-    entries: IndexMap<otter_gc::RawGc, ()>,
+    entries: IndexMap<RawGc, ()>,
 }
 
 impl otter_gc::SafeTraceable for WeakSetBody {
     const TYPE_TAG: u8 = WEAK_SET_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
         // WeakSet keys are weak and never traced as strong edges.
     }
 }
@@ -627,24 +622,14 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
 }
 
 /// Project an object-shaped [`Value`] to a migrated GC key.
-fn object_gc_key(value: &Value) -> Result<otter_gc::RawGc, CollectionError> {
+fn object_gc_key(value: &Value) -> Result<RawGc, CollectionError> {
     value.as_gc_raw().ok_or(CollectionError::NonObjectKey)
 }
 
-fn trace_map_key(key: &MapKey, visitor: &mut otter_gc::SlotVisitor<'_>) {
+fn trace_map_key(key: &MapKey, visitor: &mut SlotVisitor<'_>) {
     if let MapKey::ObjectValue(value) = key {
         value.trace_value_slots(visitor);
     }
-}
-
-fn map_payload_slot(map: JsMap) -> *mut otter_gc::RawGc {
-    (map.as_header_ptr() as *mut u8).wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-        as *mut otter_gc::RawGc
-}
-
-fn set_payload_slot(set: JsSet) -> *mut otter_gc::RawGc {
-    (set.as_header_ptr() as *mut u8).wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-        as *mut otter_gc::RawGc
 }
 
 fn reserve_map_for_target_len(

@@ -269,6 +269,14 @@ pub fn console_log(args: &[RegisterValue]) -> Result<RegisterValue, VmNativeCall
 }
 ```
 
+Native/builtin contributors on the active stack should allocate and
+mutate through the explicit context APIs (`NativeCtx::alloc[_old]`,
+`NativeCtx::record_write`, `NativeCtx::reserve_external`, and branded
+`GcSession` entry). Use `EscapableHandleScope` when returning one
+`Local` out of a nested handle scope. Do not expose or call raw heap
+mutation, raw slot visitors, `otter_gc::raw::*`, or manual write
+barriers from contributor-facing code.
+
 ## Platform Support
 
 Pure Rust implementation - no external JavaScript engine dependencies.

@@ -29,6 +29,7 @@
 //! - [Task 82](../../../docs/new-engine/tasks/82-migrate-promise-iterator-generator.md)
 
 use crate::Frame;
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`GeneratorBody`].
 pub const GENERATOR_BODY_TYPE_TAG: u8 = 0x1a;
@@ -68,7 +69,7 @@ pub struct GeneratorBody {
 impl otter_gc::SafeTraceable for GeneratorBody {
     const TYPE_TAG: u8 = GENERATOR_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         if let Some(frame) = &self.frame {
             frame.trace_frame_slots(visitor);
         }
@@ -92,7 +93,7 @@ pub struct ParkedFrameBody {
 impl otter_gc::SafeTraceable for ParkedFrameBody {
     const TYPE_TAG: u8 = PARKED_FRAME_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         if let Some(frame) = &self.frame {
             frame.trace_frame_slots(visitor);
         }
@@ -116,7 +117,7 @@ impl JsGenerator {
 
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
-    pub fn raw(&self) -> otter_gc::RawGc {
+    pub(crate) fn raw(&self) -> RawGc {
         self.inner.raw()
     }
 
@@ -133,8 +134,8 @@ impl JsGenerator {
     }
 
     /// Trace this handle as a root slot.
-    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
-        let p = self as *const JsGenerator as *mut otter_gc::RawGc;
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        let p = self as *const JsGenerator as *mut RawGc;
         visitor(p);
     }
 
@@ -179,15 +180,13 @@ impl JsGenerator {
         resume_dst: u16,
         yielded: crate::Value,
     ) {
-        let child_raw = yielded.as_gc_raw();
+        let barrier_value = yielded.clone();
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
             body.resume_dst = resume_dst;
             body.yielded = Some(yielded);
         });
-        if let Some(child) = child_raw {
-            heap.write_barrier_raw(self.inner, generator_payload_slot(self.inner), child);
-        }
+        heap.record_write(self.inner, &barrier_value);
     }
 
     /// Take the last yielded value.
@@ -220,17 +219,11 @@ impl JsGenerator {
         heap: &mut otter_gc::GcHeap,
         capability: crate::promise::PromiseCapability,
     ) {
-        let raws = [
-            capability.promise.as_gc_raw(),
-            capability.resolve.as_gc_raw(),
-            capability.reject.as_gc_raw(),
-        ];
+        let barrier_capability = capability.clone();
         heap.with_payload(self.inner, |body| {
             body.pending_request = Some(capability);
         });
-        for child in raws.into_iter().flatten() {
-            heap.write_barrier_raw(self.inner, generator_payload_slot(self.inner), child);
-        }
+        heap.record_write(self.inner, &barrier_capability);
     }
 
     /// Clear the pending async-generator request.
@@ -282,9 +275,4 @@ pub fn alloc_parked_frame(
 /// consumed it.
 pub fn take_parked_frame(parked: ParkedFrame, heap: &mut otter_gc::GcHeap) -> Option<Box<Frame>> {
     heap.with_payload(parked, |body| body.frame.take())
-}
-
-fn generator_payload_slot(generator: otter_gc::Gc<GeneratorBody>) -> *mut otter_gc::RawGc {
-    let body_base = generator.as_header_ptr() as *mut u8;
-    body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>()) as *mut otter_gc::RawGc
 }

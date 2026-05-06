@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 
 use crate::Value;
 use crate::number::NumberValue;
+use otter_gc::raw::SlotVisitor;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ArrayBody`].
 ///
@@ -58,7 +59,7 @@ pub struct ArrayBody {
 impl otter_gc::SafeTraceable for ArrayBody {
     const TYPE_TAG: u8 = ARRAY_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         for element in &self.elements {
             element.trace_value_slots(visitor);
         }
@@ -143,16 +144,14 @@ pub fn set(
     idx: usize,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let child_raw = value.as_gc_raw();
+    let barrier_value = value.clone();
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         heap.with_payload(arr, |body| {
             let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
         });
-        if let Some(child) = child_raw {
-            heap.write_barrier_raw(arr, array_payload_slot(arr), child);
-        }
+        heap.record_write(arr, &barrier_value);
         return Ok(());
     }
     reserve_for_target_len(arr, heap, target_len)?;
@@ -168,9 +167,7 @@ pub fn set(
         }
         body.elements.push(value);
     });
-    if let Some(child) = child_raw {
-        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
-    }
+    heap.record_write(arr, &barrier_value);
     Ok(())
 }
 
@@ -185,7 +182,7 @@ pub fn push(
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<usize, otter_gc::OutOfMemory> {
-    let child_raw = value.as_gc_raw();
+    let barrier_value = value.clone();
     let target_len = len(arr, heap).saturating_add(1);
     reserve_for_target_len(arr, heap, target_len)?;
     let new_len = heap.with_payload(arr, |body| {
@@ -194,9 +191,7 @@ pub fn push(
         body.elements.push(value);
         body.elements.len()
     });
-    if let Some(child) = child_raw {
-        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
-    }
+    heap.record_write(arr, &barrier_value);
     Ok(new_len)
 }
 
@@ -222,14 +217,12 @@ pub fn set_named_property(
     if let Ok(idx) = key.parse::<usize>() {
         return set(arr, heap, idx, value);
     }
-    let child_raw = value.as_gc_raw();
+    let barrier_value = value.clone();
     heap.with_payload(arr, |body| {
         let map = body.named_properties.get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), value);
     });
-    if let Some(child) = child_raw {
-        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
-    }
+    heap.record_write(arr, &barrier_value);
     Ok(())
 }
 
@@ -279,12 +272,11 @@ pub(crate) fn with_elements_mut<R>(
 ) -> R {
     let (out, children) = heap.with_payload(arr, |body| {
         let out = f(&mut body.elements);
-        let children: SmallVec<[otter_gc::RawGc; 8]> =
-            body.elements.iter().filter_map(Value::as_gc_raw).collect();
+        let children: SmallVec<[Value; 8]> = body.elements.iter().cloned().collect();
         (out, children)
     });
     for child in children {
-        heap.write_barrier_raw(arr, array_payload_slot(arr), child);
+        heap.record_write(arr, &child);
     }
     out
 }
@@ -372,11 +364,6 @@ fn spilled_capacity_bytes(capacity: usize) -> usize {
     } else {
         capacity.saturating_mul(mem::size_of::<Value>())
     }
-}
-
-fn array_payload_slot(arr: JsArray) -> *mut otter_gc::RawGc {
-    (arr.as_header_ptr() as *mut u8).wrapping_add(mem::size_of::<otter_gc::GcHeader>())
-        as *mut otter_gc::RawGc
 }
 
 impl ArrayBody {

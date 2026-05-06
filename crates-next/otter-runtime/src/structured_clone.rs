@@ -29,7 +29,8 @@
 
 use std::collections::HashSet;
 
-use otter_gc::{GcHeap, RawGc};
+use otter_gc::GcHeap;
+use otter_gc::raw::RawGc;
 use otter_vm::error_classes::ErrorKind;
 use otter_vm::number::NumberValue;
 use otter_vm::{Value, array, collections, object};

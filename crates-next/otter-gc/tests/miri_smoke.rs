@@ -3,8 +3,9 @@
 //! small to keep miri runtime bounded; the full set of
 //! integration tests exercises the rest under miri too.
 
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeap, HandleScope, RawGc};
+use otter_gc::{Gc, GcHeap, HandleScope};
 
 struct Cell {
     next: Gc<Cell>,

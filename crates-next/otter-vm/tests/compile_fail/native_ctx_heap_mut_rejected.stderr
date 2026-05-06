@@ -1,0 +1,10 @@
+error[E0624]: method `heap_mut` is private
+ --> tests/compile_fail/native_ctx_heap_mut_rejected.rs:2:17
+  |
+2 |     let _ = ctx.heap_mut();
+  |                 ^^^^^^^^ private method
+  |
+ ::: src/runtime_cx.rs
+  |
+  |     pub(crate) fn heap_mut(&mut self) -> &mut otter_gc::GcHeap {
+  |     ---------------------------------------------------------- private method defined here

@@ -43,6 +43,7 @@ use crate::promise::{
     PromiseThenOutcome,
 };
 use crate::{Interpreter, Microtask, Value};
+use otter_gc::raw::SlotVisitor;
 
 /// Foundation `Promise` constructor body. Builds a pending
 /// promise, hands native resolve/reject to the executor, and
@@ -185,7 +186,7 @@ fn static_all(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
         };
         let trace_slots = {
             let slots = slots.clone();
-            std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+            std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
                 for value in slots.borrow().iter().flatten() {
                     value.trace_value_slots(visitor);
                 }
@@ -343,7 +344,7 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Result<Value,
             let heap = heap.clone();
             let trace_slots = {
                 let slots = slots.clone();
-                std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+                std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
                     for value in slots.borrow().iter().flatten() {
                         value.trace_value_slots(visitor);
                     }
@@ -373,7 +374,7 @@ fn static_all_settled(interp: &mut Interpreter, args: &[Value]) -> Result<Value,
             let heap = heap.clone();
             let trace_slots = {
                 let slots = slots.clone();
-                std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+                std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
                     for value in slots.borrow().iter().flatten() {
                         value.trace_value_slots(visitor);
                     }
@@ -530,7 +531,7 @@ fn static_any(interp: &mut Interpreter, args: &[Value]) -> Result<Value, NativeE
             let registry = registry.clone();
             let trace_errors = {
                 let errors = errors.clone();
-                std::rc::Rc::new(move |visitor: &mut otter_gc::SlotVisitor<'_>| {
+                std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
                     for value in errors.borrow().iter().flatten() {
                         value.trace_value_slots(visitor);
                     }

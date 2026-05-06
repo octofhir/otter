@@ -144,8 +144,60 @@ impl<'rt> NativeCtx<'rt> {
 
     /// Borrow the GC heap mutably.
     #[must_use]
-    pub fn heap_mut(&mut self) -> &mut otter_gc::GcHeap {
+    pub(crate) fn heap_mut(&mut self) -> &mut otter_gc::GcHeap {
         self.cx.heap_mut()
+    }
+
+    /// Allocate a GC payload through the owning isolate.
+    ///
+    /// This is the safe allocation path for native/builtin authors:
+    /// allocation stays tied to the active [`NativeCtx`] instead of a
+    /// thread-local heap lookup or a raw `GcHeap` borrow.
+    pub fn alloc<T: otter_gc::Traceable>(
+        &mut self,
+        value: T,
+    ) -> Result<otter_gc::Gc<T>, otter_gc::OutOfMemory> {
+        self.heap_mut().alloc(value)
+    }
+
+    /// Allocate a long-lived GC payload directly in old-space.
+    ///
+    /// This mirrors the VM's current migration constraints for
+    /// handles stored in non-moving Rust containers.
+    pub fn alloc_old<T: otter_gc::Traceable>(
+        &mut self,
+        value: T,
+    ) -> Result<otter_gc::Gc<T>, otter_gc::OutOfMemory> {
+        self.heap_mut().alloc_old(value)
+    }
+
+    /// Record a GC-bearing value store into `parent`.
+    pub fn record_write<T: ?Sized, V: otter_gc::GcStore + ?Sized>(
+        &mut self,
+        parent: otter_gc::Gc<T>,
+        value: &V,
+    ) {
+        self.heap_mut().record_write(parent, value);
+    }
+
+    /// Reserve native/off-object memory with RAII release.
+    pub fn reserve_external(
+        &mut self,
+        bytes: u64,
+    ) -> Result<otter_gc::ExternalMemory, otter_gc::OutOfMemory> {
+        self.heap_mut().reserve_external(bytes)
+    }
+
+    /// Enter a branded GC session for root/weak operations.
+    ///
+    /// Persistent roots and weak handles created inside the closure
+    /// carry the fresh isolate brand and can only be read/upgraded
+    /// through a matching session.
+    pub fn with_gc_session<R>(
+        &mut self,
+        f: impl for<'iso> FnOnce(otter_gc::GcSession<'iso, '_>) -> R,
+    ) -> R {
+        otter_gc::with_gc_session(self.heap_mut(), f)
     }
 
     /// Borrow the owning interpreter for native functions that need

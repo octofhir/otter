@@ -36,6 +36,7 @@ use std::rc::Rc;
 use smallvec::SmallVec;
 
 use crate::{NativeCtx, Value};
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
 /// [`NativeFunctionBody`].
@@ -57,7 +58,7 @@ pub type NativeFn =
 
 /// Optional tracing hook for native payloads whose Rust-side state
 /// owns JS values outside the fixed capture list.
-pub type NativeTraceFn = dyn Fn(&mut otter_gc::SlotVisitor<'_>);
+pub type NativeTraceFn = dyn Fn(&mut SlotVisitor<'_>);
 
 /// Heap payload for [`Value::NativeFunction`].
 pub struct NativeFunctionBody {
@@ -77,7 +78,7 @@ pub struct NativeFunctionBody {
 impl otter_gc::SafeTraceable for NativeFunctionBody {
     const TYPE_TAG: u8 = NATIVE_FUNCTION_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         for value in &self.captures {
             value.trace_value_slots(visitor);
         }
@@ -144,7 +145,7 @@ impl NativeFunction {
 
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
-    pub fn raw(&self) -> otter_gc::RawGc {
+    pub(crate) fn raw(&self) -> RawGc {
         self.inner.raw()
     }
 
@@ -180,8 +181,8 @@ impl NativeFunction {
     }
 
     /// Trace this handle as a root slot.
-    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
-        let p = self as *const NativeFunction as *mut otter_gc::RawGc;
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        let p = self as *const NativeFunction as *mut RawGc;
         visitor(p);
     }
 }

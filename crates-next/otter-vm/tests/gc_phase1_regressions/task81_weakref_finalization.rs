@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use otter_bytecode::{BytecodeModule, SourceKind};
+use otter_gc::raw::RawGc;
 use otter_vm::native_value;
 use otter_vm::object::{OBJECT_BODY_TYPE_TAG, alloc_object};
 use otter_vm::weak_refs::{
@@ -15,11 +16,11 @@ use otter_vm::{Interpreter, Value};
 
 fn full_gc_with_roots(
     heap: &mut otter_gc::GcHeap,
-    roots: &mut [&mut otter_gc::RawGc],
+    roots: &mut [&mut RawGc],
 ) -> Vec<otter_vm::weak_refs::FinalizationJob> {
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::RawGc)| {
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         for slot in roots.iter_mut() {
-            visitor(*slot as *mut otter_gc::RawGc);
+            visitor(*slot as *mut RawGc);
         }
     };
     heap.mark_phase(&mut visit);

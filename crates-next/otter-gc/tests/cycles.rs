@@ -3,8 +3,9 @@
 //!
 //! Synthetic `Cons { car: u32, cdr: Gc<Cons> }`.
 
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeap, HandleScope, RawGc};
+use otter_gc::{Gc, GcHeap, HandleScope};
 
 #[derive(Debug)]
 struct Cons {

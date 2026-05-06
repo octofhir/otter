@@ -1,0 +1,5 @@
+error[E0425]: cannot find type `RawGc` in crate `otter_gc`
+ --> tests/compile_fail/root_raw_gc_import_rejected.rs:2:32
+  |
+2 |     let _raw: Option<otter_gc::RawGc> = None;
+  |                                ^^^^^ not found in `otter_gc`

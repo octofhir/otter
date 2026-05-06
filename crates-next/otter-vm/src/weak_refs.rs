@@ -40,6 +40,7 @@ use crate::collections::{
 };
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::object::{OBJECT_BODY_TYPE_TAG, ObjectBody};
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`WeakRefBody`].
 pub const WEAK_REF_BODY_TYPE_TAG: u8 = 0x17;
@@ -57,13 +58,13 @@ pub type JsFinalizationRegistry = otter_gc::Gc<FinalizationRegistryBody>;
 /// GC-allocated payload backing every [`JsWeakRef`].
 #[derive(Debug, Clone, Copy)]
 pub struct WeakRefBody {
-    target: otter_gc::RawGc,
+    target: RawGc,
 }
 
 impl otter_gc::SafeTraceable for WeakRefBody {
     const TYPE_TAG: u8 = WEAK_REF_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
         // The target is weak by spec and is cleared by
         // `process_weak_refs_and_finalizers` after marking.
     }
@@ -72,9 +73,9 @@ impl otter_gc::SafeTraceable for WeakRefBody {
 /// One registered finalization cell.
 #[derive(Debug, Clone)]
 pub struct FinalizerCell {
-    target: otter_gc::RawGc,
+    target: RawGc,
     held_value: Value,
-    unregister_token: Option<otter_gc::RawGc>,
+    unregister_token: Option<RawGc>,
 }
 
 /// GC-allocated payload backing every [`JsFinalizationRegistry`].
@@ -87,7 +88,7 @@ pub struct FinalizationRegistryBody {
 impl otter_gc::SafeTraceable for FinalizationRegistryBody {
     const TYPE_TAG: u8 = FINALIZATION_REGISTRY_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         self.cleanup_callback.trace_value_slots(visitor);
         for cell in &self.cells {
             cell.held_value.trace_value_slots(visitor);
@@ -159,6 +160,7 @@ pub fn finalization_registry_register(
     if held_value.as_gc_raw() == Some(target_raw) {
         return Err(crate::VmError::TypeMismatch);
     }
+    let barrier_held_value = held_value.clone();
     let unregister_token = match unregister_token {
         Some(Value::Undefined) | None => None,
         Some(value) => Some(weak_target_raw(value)?),
@@ -170,16 +172,9 @@ pub fn finalization_registry_register(
             unregister_token,
         });
     });
-    // `held_value` is stored strongly in an old-space body. Fire the
-    // barrier after the store when it carries a GC handle.
-    if let Some(child) = heap.read_payload(registry, |body| {
-        body.cells
-            .last()
-            .and_then(|cell| cell.held_value.as_gc_raw())
-    }) {
-        let slot = finalization_registry_payload_slot(registry);
-        heap.write_barrier_raw(registry, slot, child);
-    }
+    // `held_value` is stored strongly in an old-space body. Record
+    // the store after mutation when it carries a GC handle.
+    heap.record_write(registry, &barrier_held_value);
     Ok(())
 }
 
@@ -226,7 +221,7 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
         let target = heap.read_payload(weak_ref, |body| body.target);
         if !target.is_null() && !heap.is_marked(target) {
             heap.with_payload(weak_ref, |body| {
-                body.target = otter_gc::RawGc::NULL;
+                body.target = RawGc::NULL;
             });
         }
     }
@@ -274,11 +269,11 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
     jobs
 }
 
-fn weak_target_raw(value: &Value) -> Result<otter_gc::RawGc, crate::VmError> {
+fn weak_target_raw(value: &Value) -> Result<RawGc, crate::VmError> {
     value.as_gc_raw().ok_or(crate::VmError::TypeMismatch)
 }
 
-fn raw_to_value(heap: &otter_gc::GcHeap, raw: otter_gc::RawGc) -> Option<Value> {
+fn raw_to_value(heap: &otter_gc::GcHeap, raw: RawGc) -> Option<Value> {
     match heap.raw_type_tag(raw)? {
         OBJECT_BODY_TYPE_TAG => heap.cast_raw_if_type::<ObjectBody>(raw).map(Value::Object),
         ARRAY_BODY_TYPE_TAG => heap.cast_raw_if_type::<ArrayBody>(raw).map(Value::Array),
@@ -298,11 +293,6 @@ fn raw_to_value(heap: &otter_gc::GcHeap, raw: otter_gc::RawGc) -> Option<Value> 
             .map(Value::FinalizationRegistry),
         _ => None,
     }
-}
-
-fn finalization_registry_payload_slot(registry: JsFinalizationRegistry) -> *mut otter_gc::RawGc {
-    (registry.as_header_ptr() as *mut u8).wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-        as *mut otter_gc::RawGc
 }
 
 fn receiver_weak_ref(args: &IntrinsicArgs<'_>) -> Result<JsWeakRef, IntrinsicError> {

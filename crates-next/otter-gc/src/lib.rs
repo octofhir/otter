@@ -15,6 +15,7 @@
 //! - [`page`] — 256 KiB pages, card table.
 //! - [`space`] — `NewSpace`, `OldSpace`, `LargeObjectSpace`.
 //! - [`trace`] — `TraceTable`, `Traceable` trait.
+//! - [`store`] — safe write-barrier child enumeration for VM stores.
 //! - [`marking`] — tri-color worklist.
 //! - [`scavenger`] — Cheney BFS scavenger.
 //! - [`barrier`] — write barriers.
@@ -22,6 +23,7 @@
 //!   roots.
 //! - [`branded`] — experimental isolate-branded session/root API.
 //! - [`heap`] — `GcHeap` orchestrator.
+//! - [`external`] — RAII accounting for native backing stores.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`oom`] — `OutOfMemory` error.
 //! - [`stats`] — per-heap counters and per-type rows.
@@ -58,35 +60,58 @@
 /// same.
 pub const OBJECT_ALIGNMENT: usize = 8;
 
+#[doc(hidden)]
 pub mod barrier;
 pub mod branded;
+#[doc(hidden)]
 pub mod compressed;
 pub mod devtools_snapshot;
+#[doc(hidden)]
 pub mod ephemeron;
+pub mod external;
+#[doc(hidden)]
 pub mod finalize;
 pub mod handle;
 pub mod header;
 pub mod heap;
+#[doc(hidden)]
 pub mod marking;
 pub mod oom;
 pub mod page;
+#[doc(hidden)]
 pub mod scavenger;
 pub mod snapshot;
 pub mod space;
 pub mod stats;
+pub mod store;
 pub mod test_support;
+#[doc(hidden)]
 pub mod trace;
 
 pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
-pub use compressed::{Gc, RawGc, cage_base, cage_size, init_cage_with_size};
-pub use handle::{HandleScope, HandleStack, Local};
+pub use compressed::{Gc, cage_base, cage_size, init_cage_with_size};
+pub use external::ExternalMemory;
+pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
 pub use heap::{EmptyRoots, GcHeap, HeapStats, Roots};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use snapshot::{HeapSnapshot, SnapshotObject};
 pub use stats::{GcStats, TYPE_TAG_COUNT, TypeStats};
-pub use trace::{SafeTraceable, SlotVisitor, TraceFn, TraceTable, Traceable};
+pub use store::{GcEdge, GcStore};
+pub use trace::{SafeTraceable, Traceable};
+
+/// Raw collector backend types used by audited VM adapter layers.
+///
+/// Normal builtin/native/module authors should not import this module.
+/// Use [`Gc`], [`Local`], [`Root`], [`Weak`], [`GcStore`], and
+/// context methods such as `NativeCtx::record_write` instead.
+#[doc(hidden)]
+pub mod raw {
+    pub use crate::compressed::RawGc;
+    pub use crate::heap::RootSlotVisitor;
+    pub use crate::trace::{SlotVisitor, TraceFn, TraceTable};
+}
 
 // ---------------------------------------------------------------------------
 // `!Send + !Sync` static assertions.

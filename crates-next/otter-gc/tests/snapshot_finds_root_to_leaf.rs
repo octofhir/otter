@@ -7,8 +7,9 @@
 //! - GC architecture plan §7 ("Leak diagnosis"), §1.2 NF6.
 //! - Task 74 — GC stats, heap snapshot, retained-size walker.
 
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeader, GcHeap, HandleScope, RawGc};
+use otter_gc::{Gc, GcHeader, GcHeap, HandleScope};
 
 #[derive(Debug)]
 struct Node {

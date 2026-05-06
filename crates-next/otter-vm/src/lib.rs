@@ -103,6 +103,8 @@ pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
 pub use runtime_cx::NativeCtx;
 
+use otter_gc::raw::{RawGc, SlotVisitor};
+
 // ---------------------------------------------------------------------------
 // `!Send + !Sync` static assertions for the new-engine VM.
 //
@@ -440,26 +442,26 @@ pub enum IteratorState {
 impl otter_gc::SafeTraceable for IteratorState {
     const TYPE_TAG: u8 = ITERATOR_STATE_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         match self {
             IteratorState::Array { array, .. } => {
-                let p = array as *const JsArray as *mut otter_gc::RawGc;
+                let p = array as *const JsArray as *mut RawGc;
                 visitor(p);
             }
             IteratorState::String { .. } | IteratorState::Exhausted => {}
             IteratorState::User { iterator } => iterator.trace_value_slots(visitor),
             IteratorState::Map { source, mapper } => {
-                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                let p = source as *const IteratorHandle as *mut RawGc;
                 visitor(p);
                 mapper.trace_value_slots(visitor);
             }
             IteratorState::Filter { source, predicate } => {
-                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                let p = source as *const IteratorHandle as *mut RawGc;
                 visitor(p);
                 predicate.trace_value_slots(visitor);
             }
             IteratorState::Take { source, .. } | IteratorState::Drop { source, .. } => {
-                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                let p = source as *const IteratorHandle as *mut RawGc;
                 visitor(p);
             }
             IteratorState::Generator { handle } => handle.trace_value_slots(visitor),
@@ -468,11 +470,11 @@ impl otter_gc::SafeTraceable for IteratorState {
                 mapper,
                 inner,
             } => {
-                let p = source as *const IteratorHandle as *mut otter_gc::RawGc;
+                let p = source as *const IteratorHandle as *mut RawGc;
                 visitor(p);
                 mapper.trace_value_slots(visitor);
                 if let Some(inner) = inner {
-                    let p = inner as *const IteratorHandle as *mut otter_gc::RawGc;
+                    let p = inner as *const IteratorHandle as *mut RawGc;
                     visitor(p);
                 }
             }
@@ -513,7 +515,7 @@ pub struct BoundFunctionBody {
 impl otter_gc::SafeTraceable for BoundFunctionBody {
     const TYPE_TAG: u8 = BOUND_FUNCTION_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         self.target.trace_value_slots(visitor);
         self.bound_this.trace_value_slots(visitor);
         for arg in &self.bound_args {
@@ -548,7 +550,7 @@ impl BoundFunction {
 
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
-    pub fn raw(&self) -> otter_gc::RawGc {
+    pub(crate) fn raw(&self) -> RawGc {
         self.inner.raw()
     }
 
@@ -578,8 +580,8 @@ impl BoundFunction {
     }
 
     /// Trace this handle as a root slot.
-    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
-        let p = self as *const BoundFunction as *mut otter_gc::RawGc;
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        let p = self as *const BoundFunction as *mut RawGc;
         visitor(p);
     }
 }
@@ -635,7 +637,7 @@ impl otter_gc::SafeTraceable for UpvalueCellBody {
     /// [`Value::trace_value_slots`]. Each subsequent migration
     /// task (77–83) adds its variant arm there and the trace
     /// here picks it up automatically.
-    fn trace_slots_safe(&self, v: &mut otter_gc::SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, v: &mut SlotVisitor<'_>) {
         self.value.trace_value_slots(v);
     }
 }
@@ -682,19 +684,11 @@ pub fn read_upvalue(heap: &otter_gc::GcHeap, cell: UpvalueCell) -> Value {
 /// As tasks 77+ add `Gc<…>` arms to [`Value`], the barrier
 /// becomes load-bearing without changes to this call site.
 pub fn store_upvalue(heap: &mut otter_gc::GcHeap, cell: UpvalueCell, value: Value) {
-    let child_raw = value.as_gc_raw();
+    let barrier_value = value.clone();
     heap.with_payload(cell, |body| {
         body.value = value;
     });
-    if let Some(child) = child_raw {
-        // Slot pointer = base of payload; payload's first (and
-        // only) field is `value`. Pointer arithmetic is safe
-        // (raw casts), provenance flows from `as_header_ptr`.
-        let body_base = cell.as_header_ptr() as *mut u8;
-        let value_slot = body_base.wrapping_add(std::mem::size_of::<otter_gc::GcHeader>())
-            as *mut otter_gc::RawGc;
-        heap.write_barrier_raw(cell, value_slot, child);
-    }
+    heap.record_write(cell, &barrier_value);
 }
 
 impl Value {
@@ -708,7 +702,7 @@ impl Value {
     /// here so [`store_upvalue`] (and any future barrier
     /// caller) starts firing automatically.
     #[must_use]
-    pub fn as_gc_raw(&self) -> Option<otter_gc::RawGc> {
+    pub(crate) fn as_gc_raw(&self) -> Option<RawGc> {
         match self {
             // Task 77 — `JsObject` is a `Gc<ObjectBody>` handle.
             Value::Object(o) => Some(o.raw()),
@@ -749,11 +743,11 @@ impl Value {
     /// slot visitor — it does not need to write through the
     /// pointer for old-space objects (no movement), but Phase 2
     /// scavenger may rewrite slots.
-    pub fn trace_value_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         match self {
             Value::Closure { upvalues, .. } => {
                 for slot in upvalues.iter() {
-                    let p = slot as *const UpvalueCell as *mut otter_gc::RawGc;
+                    let p = slot as *const UpvalueCell as *mut RawGc;
                     visitor(p);
                 }
             }
@@ -762,43 +756,43 @@ impl Value {
             // can rewrite the offset in place when the body
             // moves (Phase 2; today old-space objects pinned).
             Value::Object(o) => {
-                let p = o as *const JsObject as *mut otter_gc::RawGc;
+                let p = o as *const JsObject as *mut RawGc;
                 visitor(p);
             }
             Value::Array(a) => {
-                let p = a as *const JsArray as *mut otter_gc::RawGc;
+                let p = a as *const JsArray as *mut RawGc;
                 visitor(p);
             }
             Value::Map(m) => {
-                let p = m as *const JsMap as *mut otter_gc::RawGc;
+                let p = m as *const JsMap as *mut RawGc;
                 visitor(p);
             }
             Value::Set(s) => {
-                let p = s as *const JsSet as *mut otter_gc::RawGc;
+                let p = s as *const JsSet as *mut RawGc;
                 visitor(p);
             }
             Value::WeakMap(m) => {
-                let p = m as *const JsWeakMap as *mut otter_gc::RawGc;
+                let p = m as *const JsWeakMap as *mut RawGc;
                 visitor(p);
             }
             Value::WeakSet(s) => {
-                let p = s as *const JsWeakSet as *mut otter_gc::RawGc;
+                let p = s as *const JsWeakSet as *mut RawGc;
                 visitor(p);
             }
             Value::WeakRef(w) => {
-                let p = w as *const JsWeakRef as *mut otter_gc::RawGc;
+                let p = w as *const JsWeakRef as *mut RawGc;
                 visitor(p);
             }
             Value::FinalizationRegistry(r) => {
-                let p = r as *const JsFinalizationRegistry as *mut otter_gc::RawGc;
+                let p = r as *const JsFinalizationRegistry as *mut RawGc;
                 visitor(p);
             }
             Value::Promise(promise) => {
-                let p = promise as *const JsPromiseHandle as *mut otter_gc::RawGc;
+                let p = promise as *const JsPromiseHandle as *mut RawGc;
                 visitor(p);
             }
             Value::Iterator(iterator) => {
-                let p = iterator as *const IteratorHandle as *mut otter_gc::RawGc;
+                let p = iterator as *const IteratorHandle as *mut RawGc;
                 visitor(p);
             }
             Value::Generator(generator) => {
@@ -1033,6 +1027,23 @@ impl Value {
     /// See [`JsString::from_str`].
     pub fn from_str(s: &str, heap: &StringHeap) -> Result<Self, StringError> {
         Ok(Self::String(JsString::from_str(s, heap)?))
+    }
+}
+
+impl otter_gc::GcStore for Value {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
+        if let Value::Closure { upvalues, .. } = self {
+            for cell in upvalues.iter() {
+                if let Some(edge) = otter_gc::GcEdge::from_gc(*cell) {
+                    visitor(edge);
+                }
+            }
+        }
+        if let Some(raw) = self.as_gc_raw()
+            && let Some(edge) = otter_gc::GcEdge::from_raw(raw)
+        {
+            visitor(edge);
+        }
     }
 }
 
@@ -1489,12 +1500,12 @@ impl Frame {
 
     /// Trace locals, register window, receiver, parked side-channel
     /// values, and nested generator / async state held by this frame.
-    pub(crate) fn trace_frame_slots(&self, visitor: &mut otter_gc::SlotVisitor<'_>) {
+    pub(crate) fn trace_frame_slots(&self, visitor: &mut SlotVisitor<'_>) {
         for value in &self.registers {
             value.trace_value_slots(visitor);
         }
         for slot in self.upvalues.iter() {
-            let p = slot as *const UpvalueCell as *mut otter_gc::RawGc;
+            let p = slot as *const UpvalueCell as *mut RawGc;
             visitor(p);
         }
         self.this_value.trace_value_slots(visitor);
@@ -1508,7 +1519,7 @@ impl Frame {
             value.trace_value_slots(visitor);
         }
         if let Some(obj) = &self.construct_target {
-            let p = obj as *const JsObject as *mut otter_gc::RawGc;
+            let p = obj as *const JsObject as *mut RawGc;
             visitor(p);
         }
         if let Some(async_state) = &self.async_state {
@@ -2159,12 +2170,12 @@ impl Interpreter {
     /// **Debug / test only** — production embedders let the GC
     /// trigger itself.
     pub fn force_gc(&mut self) {
-        let mut roots: Vec<*mut otter_gc::RawGc> = Vec::new();
+        let mut roots: Vec<*mut RawGc> = Vec::new();
         {
             let state = crate::runtime_state::RuntimeState::new(self);
             state.trace_roots(&mut |slot| roots.push(slot));
         }
-        let mut visit = |sv: &mut dyn FnMut(*mut otter_gc::RawGc)| {
+        let mut visit = |sv: &mut dyn FnMut(*mut RawGc)| {
             for &p in &roots {
                 sv(p);
             }

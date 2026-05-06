@@ -8,8 +8,9 @@
 use std::mem::size_of;
 
 use otter_gc::compressed::cage_base_addr;
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{GcHeap, RawGc, cage_size};
+use otter_gc::{GcHeap, cage_size};
 
 struct Bytes32 {
     #[allow(dead_code)]

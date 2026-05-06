@@ -43,7 +43,7 @@ use crate::regexp::JsRegExp;
 use crate::symbol::{JsSymbol, SymbolRegistry, WellKnownSymbols};
 use crate::weak_refs::{JsFinalizationRegistry, JsWeakRef};
 use crate::{AsyncFrameState, BoundFunction, Frame, IteratorState};
-use otter_gc::RawGc;
+use otter_gc::raw::RawGc;
 
 /// Visitor passed by the GC root walker. Receives the **slot
 /// pointer** (`*mut RawGc`), not the value, so the scavenger

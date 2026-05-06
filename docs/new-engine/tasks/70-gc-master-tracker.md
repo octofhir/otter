@@ -7,7 +7,7 @@
 - [x] Runtime binding — explicit VM context + Tokio-first public handle (tasks 76A, 85)
 - [x] Workers / isolate pools (task 92)
 - [x] Compile-time GC safety hardening (task 93)
-- [ ] Contributor-facing GC/VM API surface (task 94)
+- [x] Contributor-facing GC/VM API surface (task 94)
 - [ ] Contributor book / plugin and macro guide (task 95)
 - [ ] Phase 2 — incremental marking + concurrent sweeping + pretenuring (task 86)
 - [ ] Phase 3 — Mark-Compact + memory reducer + sticky mark-bit (tasks 88, 89, 90)
@@ -54,7 +54,7 @@ later tasks assume earlier ones have landed.
 | 85 | ✅ closed (2026-05-06) | Tokio-first `EventLoop` trait + default `TokioEventLoop`; public `Otter` / `RuntimeHandle` are `Send + Sync`; isolate runner owns the `!Send` VM and GC. |
 | 92 | ✅ closed (2026-05-06) | Worker isolates and isolate pools; current GC handles cannot cross worker boundaries; communication payload shape is owned structured clone / transfer-list metadata. Branded `Root` / `Weak` / `GcSession` follow-up moved to task 93. |
 | 93 | ✅ closed (2026-05-06) | Compile-time-branded GC session/root/weak API inspired by Oscars/gc-arena: cross-isolate, worker, async, public runtime, and native persistent-handle misuse fail at compile time or are removed from the public boundary. |
-| 94 | [94-gc-contributor-api-surface.md](./94-gc-contributor-api-surface.md) | Clean safe GC/VM API for engine contributors and extension authors: V8-style handle tiers, Boa-style derive ergonomics, Otter-branded safety, and narrow unsafe internals. |
+| 94 | ✅ closed (2026-05-06) | Safe contributor GC/VM API surface: `NativeCtx` allocation/accounting/session helpers, `record_write`/`GcStore`, `ExternalMemory`, `EscapableHandleScope`, root-level raw import rejection, and doc-hidden raw backend adapters. |
 | 95 | [95-contributor-book-and-extension-guides.md](./95-contributor-book-and-extension-guides.md) | mdBook contributor guide covering engine architecture, GC API, hosted modules, JS surface builders, startup performance, future plugin system, and macros. |
 
 ## Post-GC production API / startup

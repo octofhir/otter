@@ -2,8 +2,9 @@
 //! check.
 
 use otter_gc::devtools_snapshot::write_heap_snapshot;
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeap, HandleScope, RawGc};
+use otter_gc::{Gc, GcHeap, HandleScope};
 
 struct Cell {
     next: Gc<Cell>,

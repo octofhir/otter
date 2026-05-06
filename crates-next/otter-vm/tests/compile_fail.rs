@@ -51,4 +51,8 @@ fn compile_fail_branded_gc_session_invariants() {
     t.compile_fail("tests/compile_fail/native_closure_gc_capture_rejected.rs");
     t.compile_fail("tests/compile_fail/unbranded_global_handle_creation_rejected.rs");
     t.compile_fail("tests/compile_fail/unbranded_global_handle_type_rejected.rs");
+    t.compile_fail("tests/compile_fail/native_ctx_heap_mut_rejected.rs");
+    t.compile_fail("tests/compile_fail/raw_write_barrier_rejected.rs");
+    t.compile_fail("tests/compile_fail/root_raw_gc_import_rejected.rs");
+    t.compile_fail("tests/compile_fail/root_trace_table_import_rejected.rs");
 }

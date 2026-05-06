@@ -5,7 +5,7 @@
 //! values become strong only after their key is marked through
 //! another path.
 
-use otter_gc::RawGc;
+use otter_gc::raw::RawGc;
 use otter_vm::Value;
 use otter_vm::collections::{
     alloc_weak_map, alloc_weak_set, run_ephemeron_fixpoint, weak_map_get, weak_map_has,

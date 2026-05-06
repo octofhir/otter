@@ -1,8 +1,9 @@
 //! Trace table: register two type tags, allocate one of each,
 //! verify a full GC traces correctly via the registered fns.
 
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeap, HandleScope, RawGc};
+use otter_gc::{Gc, GcHeap, HandleScope};
 
 struct Leaf;
 impl Traceable for Leaf {

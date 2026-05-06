@@ -2,8 +2,9 @@
 //! survived and all reads through the locals see the new
 //! offsets.
 
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{GcHeap, HandleScope, RawGc};
+use otter_gc::{GcHeap, HandleScope};
 
 #[derive(Debug)]
 struct Cell {

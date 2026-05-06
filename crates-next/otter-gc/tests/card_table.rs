@@ -3,8 +3,9 @@
 //! references the young object. The card returns to clean after
 //! the scavenge.
 
+use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeap, HandleScope, Page, RawGc};
+use otter_gc::{Gc, GcHeap, HandleScope, Page};
 
 struct Box1 {
     child: Gc<Box1>,

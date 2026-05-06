@@ -19,6 +19,7 @@
 //! - [`scavenger`] — Cheney BFS scavenger.
 //! - [`barrier`] — write barriers.
 //! - [`handle`] — `Local`, `HandleScope`, `GlobalHandle`.
+//! - [`branded`] — experimental isolate-branded session/root API.
 //! - [`heap`] — `GcHeap` orchestrator.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`oom`] — `OutOfMemory` error.
@@ -57,6 +58,7 @@
 pub const OBJECT_ALIGNMENT: usize = 8;
 
 pub mod barrier;
+pub mod branded;
 pub mod compressed;
 pub mod devtools_snapshot;
 pub mod ephemeron;
@@ -74,6 +76,7 @@ pub mod stats;
 pub mod test_support;
 pub mod trace;
 
+pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
 pub use compressed::{Gc, RawGc, cage_base, cage_size, init_cage_with_size};
 pub use handle::{GlobalHandle, GlobalHandleTable, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};

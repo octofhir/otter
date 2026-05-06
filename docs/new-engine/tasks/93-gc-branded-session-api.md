@@ -2,18 +2,18 @@
 
 ## Status
 
-- [ ] design note added to `docs/new-engine/gc-architecture.md`
-- [ ] experimental `GcSession<'iso, 'gc>` / `MutationSession<'iso, 'gc>`
+- [x] design note added to `docs/new-engine/gc-architecture.md`
+- [x] experimental `GcSession<'iso, 'gc>` / `MutationSession<'iso, 'gc>`
       API sketched behind a non-default feature or internal module
-- [ ] persistent `Root<'iso, T>` wrapper specified over `GlobalHandle<T>`
-- [ ] weak upgrade requires a matching session/context
-- [ ] compile-fail tests reject cross-isolate roots, weak upgrades,
+- [x] persistent `Root<'iso, T>` wrapper specified over `GlobalHandle<T>`
+- [x] weak upgrade requires a matching session/context
+- [x] compile-fail tests reject cross-isolate roots, weak upgrades,
       worker messages, and native closures
-- [ ] task-92 worker follow-up covered: `Root<'iso, T>`,
+- [x] task-92 worker follow-up covered: `Root<'iso, T>`,
       `Weak<'iso, T>`, and `GcSession<'_, '_>` cannot cross worker
       boundaries or be dereferenced through another worker's brand
-- [ ] migration guidance written for tasks 85, 92, and future FFI work
-- [ ] gates green
+- [x] migration guidance written for tasks 85, 92, and future FFI work
+- [ ] gates green; broad persistent-handle migration remains open
 
 ## Goal
 
@@ -160,15 +160,52 @@ Add trybuild fixtures that prove:
 
 ## Validation gates
 
-- [ ] `cargo test -p otter-vm --test compile_fail` covers every misuse
+- [x] `cargo test -p otter-vm --test compile_fail` covers every misuse
   category in 93.5.
-- [ ] `cargo test -p otter-gc -p otter-vm -p otter-runtime` green.
+- [x] `cargo test -p otter-gc -p otter-vm -p otter-runtime` green.
 - [ ] No public API stores `Gc<T>` where `Root<'iso, T>` is required
   for persistence across a safepoint, async boundary, or worker queue.
-- [ ] No product-code thread-local heap lookup is reintroduced.
-- [ ] Worker task 92 gates still hold after branded roots land.
-- [ ] Worker-boundary compile-fail tests cover `Root<'iso, T>`,
+- [x] No product-code thread-local heap lookup is reintroduced.
+- [x] Worker task 92 gates still hold after branded roots land.
+- [x] Worker-boundary compile-fail tests cover `Root<'iso, T>`,
   `Weak<'iso, T>`, and `GcSession<'_, '_>` after those types exist.
+
+## Migration guidance
+
+- Task 85 / runtime async boundary: public `RuntimeHandle` remains the
+  sendable boundary. Branded `GcSession<'iso, 'gc>` must stay on the
+  isolate runner and must not cross `.await`; async host operations that
+  eventually need GC access must re-enter the owning isolate before
+  dereferencing roots.
+- Task 92 / workers: worker messages stay structured-clone payloads or
+  transfer-list metadata. `Root<'iso, T>`, `Weak<'iso, T>`, and
+  `GcSession<'_, '_>` are rejected at the worker message boundary.
+- Future FFI work: any brand erasure belongs only at the unsafe outer FFI
+  boundary. The adapter must immediately re-enter the owning isolate and
+  recover a matching branded session before calling `Root::get` or
+  `Weak::upgrade`.
+
+## Progress Notes
+
+- 2026-05-06: added `otter_gc::branded` with invariant isolate brands,
+  `GcSession` / `MutationSession`, `Root` over `GlobalHandle`, and
+  `Weak` with context-required upgrade. The first slice is an
+  experimental API layer over the existing collector; broad VM/runtime
+  migration to require `Root<'iso, T>` for every persistent handle is
+  still open.
+- 2026-05-06: added trybuild coverage for cross-isolate root reads,
+  cross-isolate weak upgrades, `GcSession` across async send futures,
+  native closures capturing branded roots, and task-92 worker messages
+  carrying branded root/weak/session values.
+- 2026-05-06: required validation is green for the branded API slice:
+  `cargo test -p otter-vm --test compile_fail`,
+  `cargo test -p otter-runtime --test compile_fail`,
+  `cargo test -p otter-gc -p otter-vm -p otter-runtime`,
+  workspace clippy, workspace tests, engine suite, and CLI async smokes.
+  Task 93 remains open because active public VM/runtime APIs have not
+  yet been migrated/audited to require `Root<'iso, T>` for every
+  persistent handle across safepoints, async boundaries, worker queues,
+  native callbacks, timers, and future FFI.
 
 ## Closing
 

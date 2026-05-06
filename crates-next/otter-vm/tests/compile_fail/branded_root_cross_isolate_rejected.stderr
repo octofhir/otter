@@ -1,0 +1,29 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/compile_fail/branded_root_cross_isolate_rejected.rs:12:21
+   |
+ 9 |         let root = left_session.root(otter_gc::Gc::<otter_gc::test_support::OpaqueLeaf>::null());
+   |             ---- `root` declared here, outside of the closure body
+10 |
+11 |         otter_gc::with_gc_session(&mut right, |right_session| {
+   |                                                ------------- `right_session` is a reference that is only valid in the closure body
+12 |             let _ = root.get(&right_session);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^ `right_session` escapes the closure body here
+   |
+   = note: requirement occurs because of the type `Root<'_, OpaqueLeaf>`, which makes the generic argument `'_` invariant
+   = note: the struct `Root<'iso, T>` is invariant over the parameter `'iso`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/compile_fail/branded_root_cross_isolate_rejected.rs:12:21
+   |
+ 8 |     otter_gc::with_gc_session(&mut left, |left_session| {
+   |                                           ------------
+   |                                           |
+   |                                           `left_session` is a reference that is only valid in the closure body
+   |                                           has type `GcSession<'1, '_>`
+...
+12 |             let _ = root.get(&right_session);
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |                     |
+   |                     `left_session` escapes the closure body here
+   |                     argument requires that `'1` must outlive `'static`

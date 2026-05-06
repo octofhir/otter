@@ -360,6 +360,47 @@ every minor GC). `Gc<T>` is `NonNull<GcHeader>`. Two consequences:
 `Gc<T>` is still `Copy` and `Send`-free. `Local<'gc, T>` is a
 zero-cost wrapper that proves rooting at compile time.
 
+### 4.5 Branded isolate sessions
+
+Task 93 adds a type-level isolate brand above the page-based heap:
+
+```rust
+with_gc_session(&mut heap, |mut cx: GcSession<'iso, 'gc>| {
+    let object: Gc<T> = cx.alloc(value)?;
+    let root: Root<'iso, T> = cx.root(object);
+    let again: Gc<T> = root.get(&cx);
+});
+```
+
+The brand has two jobs:
+
+1. `Root<'iso, T>` and `Weak<'iso, T>` are tied to the isolate that
+   created them. Reading a root or upgrading a weak handle requires a
+   matching `GcSession<'iso, '_>`, so cross-worker / cross-isolate
+   dereference is a compile-time error instead of a runtime discipline
+   rule.
+2. The short `'gc` session lifetime marks the active mutator turn. A
+   session must not cross `.await`, be stored in a native callback, or
+   be sent through a worker queue. Async host code may carry owned
+   public data; any GC dereference must re-enter the owning isolate and
+   obtain a fresh matching session first.
+
+The branded layer does **not** change collector layout. `Root` wraps the
+existing moving-GC-compatible global handle table; `Weak` wraps raw weak
+metadata and fixes the context-required upgrade shape before the VM's
+weak APIs migrate. Heap access remains explicit through `&mut GcHeap` /
+`GcSession`; no thread-local heap lookup is permitted.
+
+Migration rule:
+
+- raw `Gc<T>` is for intra-turn VM implementation details only;
+- `Local<'gc, T>` roots values across safepoints inside one handle scope;
+- `Root<'iso, T>` is required for persistence across turns, async host
+  work, native closure storage, FFI handles, timers, or worker-adjacent
+  state;
+- worker messages remain structured-clone payloads or transfer-list
+  metadata, never branded GC/session objects.
+
 ---
 
 ## 5. Write / read barriers

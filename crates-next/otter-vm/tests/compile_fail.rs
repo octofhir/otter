@@ -40,3 +40,12 @@ fn compile_fail_send_sync_invariants() {
     t.compile_fail("tests/compile_fail/value_is_not_send.rs");
     t.compile_fail("tests/compile_fail/frame_is_not_send.rs");
 }
+
+#[test]
+fn compile_fail_branded_gc_session_invariants() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/branded_root_cross_isolate_rejected.rs");
+    t.compile_fail("tests/compile_fail/branded_weak_cross_isolate_rejected.rs");
+    t.compile_fail("tests/compile_fail/branded_session_across_await_rejected.rs");
+    t.compile_fail("tests/compile_fail/branded_root_native_closure_rejected.rs");
+}

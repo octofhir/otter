@@ -8,8 +8,8 @@
 //!    `ignored_tests`).
 //! 2. Parse frontmatter; on parse failure → [`Outcome::Fail`].
 //! 3. Skip via `skip_features` (config-driven).
-//! 4. Skip `flags: [noStrict]`-only tests because the active runner
-//!    executes strict-mode tests.
+//! 4. Skip via `skip_flags` (config-driven; root config skips
+//!    `noStrict` for the active strict-mode profile).
 //! 5. Build a fresh `Runtime` with the configured heap cap.
 //! 6. Compile + run the harness preamble (cached per-worker).
 //! 7. Compile + run the test body. `flags: [module]` routes through
@@ -317,15 +317,16 @@ pub fn run_one(
         );
     }
 
-    // 6. Strict-mode policy. The active runner executes strict-mode
-    //    tests, so `noStrict`-only tests skip.
-    if frontmatter.is_no_strict() && !frontmatter.is_only_strict() && !frontmatter.is_module() {
+    // 6. Configured flag policy. The root config currently skips
+    //    `noStrict` to keep legacy sloppy-mode tests out of the
+    //    active strict-mode conformance profile.
+    if let Some(flag) = exec.config.first_skipped_flag(&frontmatter.flags) {
         return result_with(
             rel_path,
             esid,
             features,
             Outcome::Skipped {
-                feature: "foundation-always-strict".to_string(),
+                feature: format!("flag:{flag}"),
             },
             start,
         );

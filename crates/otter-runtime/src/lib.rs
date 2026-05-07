@@ -1818,6 +1818,9 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             heap_limit_bytes,
         },
         VmError::TypeMismatch => runtime_diagnostic(DiagnosticKind::Type, "TYPE_MISMATCH", display),
+        VmError::TypeError { message } => {
+            runtime_diagnostic(DiagnosticKind::Type, "TYPE_ERROR", message)
+        }
         VmError::UnknownIntrinsic { name } => runtime_diagnostic(
             DiagnosticKind::Type,
             "UNKNOWN_METHOD",

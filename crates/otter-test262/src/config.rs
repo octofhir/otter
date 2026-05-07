@@ -2,8 +2,8 @@
 //!
 //! The format is the one the project has used since the legacy
 //! runner: `timeout_secs`, `max_heap_bytes_per_test`, `skip_features`,
-//! `ignored_tests`, `known_panics`. The new-engine runner reads
-//! exactly this file — no renames, no parallel formats.
+//! `skip_flags`, `ignored_tests`, `known_panics`. The new-engine
+//! runner reads exactly this file — no renames, no parallel formats.
 //!
 //! Resolution rules (CLI flags always win over config defaults):
 //! 1. `--config <path>` if supplied;
@@ -33,6 +33,11 @@ pub struct Test262Config {
     /// `features:` tokens whose tests are reported as
     /// `Skipped(<feature>)`.
     pub skip_features: Vec<String>,
+
+    /// `flags:` tokens whose tests are reported as skipped. Used
+    /// for policy decisions such as keeping sloppy-only `noStrict`
+    /// tests out of the active strict-mode conformance profile.
+    pub skip_flags: Vec<String>,
 
     /// Test-path substrings whose matching tests skip with reason
     /// `"ignored by config"`.
@@ -109,6 +114,18 @@ impl Test262Config {
             .iter()
             .any(|pattern| test_path.contains(pattern.as_str()))
     }
+
+    /// Return the first configured `flags:` token present in
+    /// `test_flags`.
+    #[must_use]
+    pub fn first_skipped_flag<'a>(&'a self, test_flags: &'a [String]) -> Option<&'a str> {
+        self.skip_flags.iter().find_map(|skipped| {
+            test_flags
+                .iter()
+                .any(|flag| flag == skipped)
+                .then_some(skipped.as_str())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +138,7 @@ mod tests {
 timeout_secs = 10
 max_heap_bytes_per_test = 536870912
 skip_features = ["Atomics", "SharedArrayBuffer"]
+skip_flags = ["noStrict"]
 ignored_tests = ["staging/sm/Math"]
 known_panics = ["S15.10.2.8_A3_T15"]
 "#;
@@ -128,6 +146,10 @@ known_panics = ["S15.10.2.8_A3_T15"]
         assert_eq!(cfg.timeout_secs, Some(10));
         assert_eq!(cfg.max_heap_bytes_per_test, Some(536_870_912));
         assert_eq!(cfg.skip_features.len(), 2);
+        assert_eq!(
+            cfg.first_skipped_flag(&["noStrict".to_string()]),
+            Some("noStrict")
+        );
         assert!(cfg.is_ignored("staging/sm/Math/foo.js"));
         assert!(cfg.is_known_panic("RegExp/S15.10.2.8_A3_T15.js"));
     }

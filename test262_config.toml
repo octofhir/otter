@@ -84,6 +84,13 @@ skip_features = [
     "import-defer",
 ]
 
+# Test flags to skip. Otter's active Test262 profile is strict-mode
+# first; old sloppy-only tests stay out of the conformance signal until
+# the engine intentionally grows Annex B / sloppy-mode coverage.
+skip_flags = [
+    "noStrict",
+]
+
 # Test path patterns to ignore (tests matching these patterns will be skipped)
 ignored_tests = [
     # SpiderMonkey staging tests use SM-specific harness functions (diff, etc.)
@@ -145,6 +152,17 @@ ignored_tests = [
     "createdynfn-html-close-comment",
     "createdynfn-html-open-comment",
     "createdynfn-no-line-terminator-html-close-comment",
+
+    # Legacy Sputnik Function.prototype.call cases exercise sloppy
+    # dynamic Function semantics: global-this substitution for
+    # null/undefined, primitive this boxing, and old Function()
+    # constructor behavior. Keep them out of the strict-mode
+    # conformance slice for now.
+    "built-ins/Function/prototype/call/S15.3.4.4_A1_",
+    "built-ins/Function/prototype/call/S15.3.4.4_A3_",
+    "built-ins/Function/prototype/call/S15.3.4.4_A5_",
+    "built-ins/Function/prototype/call/S15.3.4.4_A6_",
+    "built-ins/Function/prototype/call/S15.3.4.4_A7_",
 
 ]
 

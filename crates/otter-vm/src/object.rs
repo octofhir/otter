@@ -929,6 +929,18 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) ->
     })
 }
 
+/// Return whether `obj` has an own symbol-keyed property.
+///
+/// This is the symbol-keyed counterpart to [`lookup_own`]'s
+/// `PropertyLookup::Absent` probe and intentionally does not walk
+/// the prototype chain.
+#[must_use]
+pub fn has_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> bool {
+    heap.read_payload(obj, |body| {
+        body.symbol_props.iter().any(|(k, _)| k.ptr_eq(key))
+    })
+}
+
 /// Look up a symbol-keyed property with prototype-chain walk.
 #[must_use]
 pub fn get_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Option<Value> {

@@ -27,8 +27,10 @@
 use crate::Value;
 use crate::array::{self, JsArray};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::js_surface::{Attr, MethodSpec};
 use crate::number::NumberValue;
 use crate::string::JsString;
+use crate::{NativeCall, NativeCtx, NativeError};
 
 fn receiver_array(args: &IntrinsicArgs<'_>) -> Result<JsArray, IntrinsicError> {
     match args.receiver {
@@ -433,6 +435,88 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     ARRAY_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Array, name)
 }
+
+/// Static `Array.prototype` methods whose implementations do not
+/// require JS callback dispatch.
+pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
+    method("push", 1, native_push),
+    method("pop", 0, native_pop),
+    method("shift", 0, native_shift),
+    method("unshift", 1, native_unshift),
+    method("slice", 2, native_slice),
+    method("concat", 1, native_concat),
+    method("join", 1, native_join),
+    method("includes", 1, native_includes),
+    method("indexOf", 1, native_index_of),
+    method("lastIndexOf", 1, native_last_index_of),
+    method("at", 1, native_at),
+    method("reverse", 0, native_reverse),
+    method("fill", 3, native_fill),
+    method("flat", 1, native_flat),
+    method("splice", 2, native_splice),
+    method("sort", 1, native_sort),
+];
+
+const fn method(
+    name: &'static str,
+    length: u8,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        length,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(call),
+    }
+}
+
+fn native_array_method(
+    name: &'static str,
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let receiver = ctx.this_value().clone();
+    let string_heap = ctx.interp_mut().string_heap_clone();
+    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
+        name,
+        reason: "unknown Array.prototype method".to_string(),
+    })?;
+    (entry.impl_fn)(&IntrinsicArgs {
+        receiver: &receiver,
+        args,
+        string_heap: &string_heap,
+        gc_heap: std::cell::RefCell::new(ctx.heap_mut()),
+    })
+    .map_err(|err| NativeError::TypeError {
+        name,
+        reason: err.to_string(),
+    })
+}
+
+macro_rules! native_array {
+    ($fn_name:ident, $js_name:literal) => {
+        fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            native_array_method($js_name, ctx, args)
+        }
+    };
+}
+
+native_array!(native_push, "push");
+native_array!(native_pop, "pop");
+native_array!(native_shift, "shift");
+native_array!(native_unshift, "unshift");
+native_array!(native_slice, "slice");
+native_array!(native_concat, "concat");
+native_array!(native_join, "join");
+native_array!(native_includes, "includes");
+native_array!(native_index_of, "indexOf");
+native_array!(native_last_index_of, "lastIndexOf");
+native_array!(native_at, "at");
+native_array!(native_reverse, "reverse");
+native_array!(native_fill, "fill");
+native_array!(native_flat, "flat");
+native_array!(native_splice, "splice");
+native_array!(native_sort, "sort");
 
 #[cfg(test)]
 mod tests {

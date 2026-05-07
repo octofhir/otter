@@ -1,3 +1,356 @@
+error[E0277]: `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>`
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<otter_vm::ClassConstructor>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<otter_vm::ClassConstructor>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<otter_vm::ClassConstructor>`
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<num_bigint::bigint::BigInt>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<num_bigint::bigint::BigInt>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<num_bigint::bigint::BigInt>`
+note: required because it appears within the type `BigIntValue`
+ --> src/bigint/mod.rs
+  |
+  | pub struct BigIntValue {
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<SymbolBody>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<SymbolBody>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<SymbolBody>`
+note: required because it appears within the type `JsSymbol`
+ --> src/symbol.rs
+  |
+  | pub struct JsSymbol {
+  |            ^^^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<TemporalPayload>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<TemporalPayload>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<TemporalPayload>`
+note: required because it appears within the type `JsTemporal`
+ --> src/temporal/payload.rs
+  |
+  | pub struct JsTemporal {
+  |            ^^^^^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<Cell<f64>>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<Cell<f64>>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<Cell<f64>>`
+note: required because it appears within the type `JsDate`
+ --> src/date/mod.rs
+  |
+  | pub struct JsDate {
+  |            ^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<IntlPayload>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<IntlPayload>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<IntlPayload>`
+note: required because it appears within the type `JsIntl`
+ --> src/intl/payload.rs
+  |
+  | pub struct JsIntl {
+  |            ^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<ArrayBufferBody>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<ArrayBufferBody>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<ArrayBufferBody>`
+note: required because it appears within the type `JsArrayBuffer`
+ --> src/binary/array_buffer.rs
+  |
+  | pub struct JsArrayBuffer {
+  |            ^^^^^^^^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<DataViewBody>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<DataViewBody>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<DataViewBody>`
+note: required because it appears within the type `JsDataView`
+ --> src/binary/data_view.rs
+  |
+  | pub struct JsDataView {
+  |            ^^^^^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<TypedArrayBody>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<TypedArrayBody>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<TypedArrayBody>`
+note: required because it appears within the type `JsTypedArray`
+ --> src/binary/typed_array.rs
+  |
+  | pub struct JsTypedArray {
+  |            ^^^^^^^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<ProxyBody>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<ProxyBody>` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<ProxyBody>`
+note: required because it appears within the type `JsProxy`
+ --> src/proxy.rs
+  |
+  | pub struct JsProxy {
+  |            ^^^^^^^
+note: required because it appears within the type `Value`
+ --> src/lib.rs
+  |
+  | pub enum Value {
+  |          ^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `Rc<(dyn for<'a> Fn(&'a str) -> Result<otter_bytecode::BytecodeModule, std::string::String> + 'static)>` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
@@ -49,529 +402,16 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Obje
   |
   | pub struct Gc<T: ?Sized> {
   |            ^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>`
 note: required because it appears within the type `Value`
  --> src/lib.rs
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<otter_vm::ClassConstructor>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<otter_vm::ClassConstructor>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<otter_vm::ClassConstructor>`
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<num_bigint::bigint::BigInt>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<num_bigint::bigint::BigInt>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<num_bigint::bigint::BigInt>`
-note: required because it appears within the type `BigIntValue`
- --> src/bigint/mod.rs
-  |
-  | pub struct BigIntValue {
-  |            ^^^^^^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<SymbolBody>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<SymbolBody>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<SymbolBody>`
-note: required because it appears within the type `JsSymbol`
- --> src/symbol.rs
-  |
-  | pub struct JsSymbol {
-  |            ^^^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<TemporalPayload>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<TemporalPayload>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<TemporalPayload>`
-note: required because it appears within the type `JsTemporal`
- --> src/temporal/payload.rs
-  |
-  | pub struct JsTemporal {
-  |            ^^^^^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<Cell<f64>>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<Cell<f64>>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<Cell<f64>>`
-note: required because it appears within the type `JsDate`
- --> src/date/mod.rs
-  |
-  | pub struct JsDate {
-  |            ^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<IntlPayload>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<IntlPayload>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<IntlPayload>`
-note: required because it appears within the type `JsIntl`
- --> src/intl/payload.rs
-  |
-  | pub struct JsIntl {
-  |            ^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<ArrayBufferBody>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<ArrayBufferBody>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<ArrayBufferBody>`
-note: required because it appears within the type `JsArrayBuffer`
- --> src/binary/array_buffer.rs
-  |
-  | pub struct JsArrayBuffer {
-  |            ^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<DataViewBody>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<DataViewBody>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<DataViewBody>`
-note: required because it appears within the type `JsDataView`
- --> src/binary/data_view.rs
-  |
-  | pub struct JsDataView {
-  |            ^^^^^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<TypedArrayBody>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<TypedArrayBody>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<TypedArrayBody>`
-note: required because it appears within the type `JsTypedArray`
- --> src/binary/typed_array.rs
-  |
-  | pub struct JsTypedArray {
-  |            ^^^^^^^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<ProxyBody>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<ProxyBody>` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `Rc<ProxyBody>`
-note: required because it appears within the type `JsProxy`
- --> src/proxy.rs
-  |
-  | pub struct JsProxy {
-  |            ^^^^^^^
-note: required because it appears within the type `Value`
- --> src/lib.rs
-  |
-  | pub enum Value {
-  |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<str>` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<str>` cannot be sent between threads safely
-  |
-  = help: within `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`, the trait `Send` is not implemented for `Rc<str>`
-  = note: required because it appears within the type `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`
-  = note: required for `hashbrown::raw::RawTable<(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)>` to implement `Send`
-note: required because it appears within the type `hashbrown::map::HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>, RandomState>`
- --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:12
-note: required because it appears within the type `HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>>`
- --> $RUST/std/src/collections/hash/map.rs
-  |
-  | pub struct HashMap<K, V, S = RandomState> {
-  |            ^^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -605,22 +445,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -654,22 +483,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -703,22 +521,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -752,22 +559,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -801,22 +597,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -850,22 +635,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -899,22 +673,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -948,76 +711,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `*mut otter_gc::header::GcHeader` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut otter_gc::header::GcHeader` cannot be sent between threads safely
-  |
-  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*mut otter_gc::header::GcHeader`
-note: required because it appears within the type `PhantomData<*mut otter_gc::header::GcHeader>`
- --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
-note: required because it appears within the type `alloc::raw_vec::RawVec<*mut otter_gc::header::GcHeader>`
- --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
-note: required because it appears within the type `VecDeque<*mut otter_gc::header::GcHeader>`
- --> $RUST/alloc/src/collections/vec_deque/mod.rs
-  |
-  | pub struct VecDeque<
-  |            ^^^^^^^^
-note: required because it appears within the type `otter_gc::marking::MarkingState`
- --> $WORKSPACE/crates/otter-gc/src/marking.rs
-  |
-  | pub struct MarkingState {
-  |            ^^^^^^^^^^^^
-note: required because it appears within the type `otter_gc::heap::GcHeap`
- --> $WORKSPACE/crates/otter-gc/src/heap.rs
-  |
-  | pub struct GcHeap {
-  |            ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -1056,22 +754,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -1110,22 +797,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -1164,22 +840,11 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
-note: required because it appears within the type `Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+note: required because it appears within the type `NativeCallInfo`
  --> src/runtime_cx.rs
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -1218,11 +883,38 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
   |
-  | pub enum Option<T> {
-  |          ^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<str>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<str>` cannot be sent between threads safely
+  |
+  = help: within `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`, the trait `Send` is not implemented for `Rc<str>`
+  = note: required because it appears within the type `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`
+  = note: required for `hashbrown::raw::RawTable<(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)>` to implement `Send`
+note: required because it appears within the type `hashbrown::map::HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>, RandomState>`
+ --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:12
+note: required because it appears within the type `HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>>`
+ --> $RUST/std/src/collections/hash/map.rs
+  |
+  | pub struct HashMap<K, V, S = RandomState> {
+  |            ^^^^^^^
 note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |
@@ -1282,11 +974,54 @@ note: required because it appears within the type `Value`
   |
   | pub enum Value {
   |          ^^^^^
-note: required because it appears within the type `Option<Value>`
- --> $RUST/core/src/option.rs
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
   |
-  | pub enum Option<T> {
-  |          ^^^^^^
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut otter_gc::header::GcHeader` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut otter_gc::header::GcHeader` cannot be sent between threads safely
+  |
+  = help: within `NativeCtx<'static>`, the trait `Send` is not implemented for `*mut otter_gc::header::GcHeader`
+note: required because it appears within the type `PhantomData<*mut otter_gc::header::GcHeader>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `alloc::raw_vec::RawVec<*mut otter_gc::header::GcHeader>`
+ --> $RUST/alloc/src/raw_vec/mod.rs
+  |
+  | pub(crate) struct RawVec<T, A: Allocator = Global> {
+  |                   ^^^^^^
+note: required because it appears within the type `VecDeque<*mut otter_gc::header::GcHeader>`
+ --> $RUST/alloc/src/collections/vec_deque/mod.rs
+  |
+  | pub struct VecDeque<
+  |            ^^^^^^^^
+note: required because it appears within the type `otter_gc::marking::MarkingState`
+ --> $WORKSPACE/crates/otter-gc/src/marking.rs
+  |
+  | pub struct MarkingState {
+  |            ^^^^^^^^^^^^
+note: required because it appears within the type `otter_gc::heap::GcHeap`
+ --> $WORKSPACE/crates/otter-gc/src/heap.rs
+  |
+  | pub struct GcHeap {
+  |            ^^^^^^
 note: required because it appears within the type `Interpreter`
  --> src/lib.rs
   |

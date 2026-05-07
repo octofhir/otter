@@ -62,7 +62,11 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.construct>
         "construct" => {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
-            if !is_callable(&target) && !matches!(&target, Value::ClassConstructor(_)) {
+            if !is_constructor(&target, interp.gc_heap()) {
+                return Err(VmError::NotCallable);
+            }
+            let new_target = args.get(2).cloned().unwrap_or_else(|| target.clone());
+            if !is_constructor(&new_target, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
             let argv: SmallVec<[Value; 8]> = match args.get(1) {
@@ -79,7 +83,7 @@ pub fn call(
             // run_callable_sync.
             let proto = {
                 let heap = interp.gc_heap();
-                construct_prototype(&target, heap)
+                construct_prototype(&new_target, heap)
             };
             let receiver = {
                 let heap = interp.gc_heap_mut();
@@ -274,6 +278,22 @@ fn construct_prototype(callee: &Value, heap: &otter_gc::GcHeap) -> Option<JsObje
             construct_prototype(&target, heap)
         }
         _ => None,
+    }
+}
+
+fn is_constructor(value: &Value, heap: &otter_gc::GcHeap) -> bool {
+    match value {
+        Value::Function { .. } | Value::Closure { .. } | Value::ClassConstructor(_) => true,
+        Value::BoundFunction(bound) => {
+            let (target, _, _) = bound.parts(heap);
+            is_constructor(&target, heap)
+        }
+        // Standard built-in function objects are callable but not
+        // constructors unless explicitly specified. Otter's current
+        // native builtin path does not expose any constructor-shaped
+        // native functions.
+        Value::NativeFunction(_) => false,
+        _ => false,
     }
 }
 

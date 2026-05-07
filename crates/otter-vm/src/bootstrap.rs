@@ -27,9 +27,12 @@
 
 use std::time::{Duration, Instant};
 
-use crate::js_surface::{Attr, JsSurfaceError, NamespaceBuilder, NamespaceSpec};
+use crate::js_surface::{Attr, JsSurfaceError, NamespaceBuilder, NamespaceSpec, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
-use crate::{Value, atomics, console, json, math};
+use crate::{
+    Value, array_prototype, array_statics, atomics, console, function_prototype, json, math,
+    object_statics,
+};
 
 /// Bootstrap feature/capability bitset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,8 +250,16 @@ struct AllocationSnapshot {
 
 /// Deterministic global bootstrap registry.
 pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
-    placeholder("Array"),
-    placeholder("Object"),
+    BootstrapEntry {
+        name: "Array",
+        feature: BootstrapFeatures::CORE,
+        install: install_array,
+    },
+    BootstrapEntry {
+        name: object_statics::OBJECT_SPEC.name,
+        feature: BootstrapFeatures::CORE,
+        install: install_object,
+    },
     BootstrapEntry {
         name: json::JSON_SPEC.name,
         feature: BootstrapFeatures::CORE,
@@ -274,7 +285,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     placeholder("Promise"),
     placeholder("Proxy"),
     placeholder("Reflect"),
-    placeholder("Function"),
+    BootstrapEntry {
+        name: "Function",
+        feature: BootstrapFeatures::CORE,
+        install: install_function,
+    },
     placeholder("ArrayBuffer"),
     placeholder("SharedArrayBuffer"),
     placeholder("DataView"),
@@ -397,6 +412,49 @@ fn install_placeholder(
     Ok(())
 }
 
+fn install_array(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    let array = object::alloc_object(heap)?;
+    let prototype = object::alloc_object(heap)?;
+    object::set(array, heap, "prototype", Value::Object(prototype));
+    {
+        let mut builder = ObjectBuilder::from_object(heap, array);
+        for method in array_statics::ARRAY_STATIC_METHODS {
+            builder.method_from_spec(method)?;
+        }
+    }
+    {
+        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        for method in array_prototype::ARRAY_PROTOTYPE_METHODS {
+            builder.method_from_spec(method)?;
+        }
+    }
+    define_global(global, heap, entry.name, Value::Object(array));
+    Ok(())
+}
+
+fn install_function(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    let function = object::alloc_object(heap)?;
+    let prototype = object::alloc_object(heap)?;
+    object::set(function, heap, "prototype", Value::Object(prototype));
+    {
+        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        for method in function_prototype::FUNCTION_PROTOTYPE_METHODS {
+            builder.method_from_spec(method)?;
+        }
+    }
+    function_prototype::install_restricted_accessors(heap, prototype)?;
+    define_global(global, heap, entry.name, Value::Object(function));
+    Ok(())
+}
+
 fn install_math(
     entry: &BootstrapEntry,
     heap: &mut otter_gc::GcHeap,
@@ -416,6 +474,30 @@ fn install_json(
 ) -> Result<(), JsSurfaceError> {
     let namespace = NamespaceBuilder::from_spec(heap, &json::JSON_SPEC)?.build()?;
     define_global(global, heap, entry.name, Value::Object(namespace));
+    Ok(())
+}
+
+fn install_object(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    let object = object::alloc_object(heap)?;
+    let prototype = object::alloc_object(heap)?;
+    object::set(object, heap, "prototype", Value::Object(prototype));
+    {
+        let mut builder = ObjectBuilder::from_object(heap, object);
+        for method in object_statics::OBJECT_SPEC.methods {
+            builder.method_from_spec(method)?;
+        }
+    }
+    {
+        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        for method in object_statics::OBJECT_PROTOTYPE_METHODS {
+            builder.method_from_spec(method)?;
+        }
+    }
+    define_global(global, heap, entry.name, Value::Object(object));
     Ok(())
 }
 
@@ -466,9 +548,28 @@ fn namespace_native_function_count(spec: &NamespaceSpec) -> usize {
 
 fn record_installed_entry(telemetry: &mut BootstrapTelemetry, entry: &BootstrapEntry) {
     match entry.name {
+        "Array" => {
+            telemetry.entries_installed = telemetry.entries_installed.saturating_add(1);
+            telemetry.objects_installed = telemetry.objects_installed.saturating_add(2);
+            telemetry.prototype_objects_installed =
+                telemetry.prototype_objects_installed.saturating_add(1);
+            telemetry.native_functions_installed = telemetry
+                .native_functions_installed
+                .saturating_add(array_prototype::ARRAY_PROTOTYPE_METHODS.len());
+        }
         "JSON" => telemetry.record_namespace(&json::JSON_SPEC),
+        "Object" => telemetry.record_namespace(&object_statics::OBJECT_SPEC),
         "Math" => telemetry.record_namespace(&math::MATH_SPEC),
         "Atomics" => telemetry.record_namespace(&atomics::ATOMICS_SPEC),
+        "Function" => {
+            telemetry.entries_installed = telemetry.entries_installed.saturating_add(1);
+            telemetry.objects_installed = telemetry.objects_installed.saturating_add(2);
+            telemetry.prototype_objects_installed =
+                telemetry.prototype_objects_installed.saturating_add(1);
+            telemetry.native_functions_installed = telemetry
+                .native_functions_installed
+                .saturating_add(function_prototype::FUNCTION_PROTOTYPE_METHODS.len());
+        }
         "console" => telemetry.record_namespace(&console::CONSOLE_SPEC),
         _ => telemetry.record_placeholder(),
     }
@@ -508,7 +609,7 @@ mod tests {
 
     #[test]
     fn default_bootstrap_telemetry_matches_startup_ratchet() {
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 160;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 180;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 96 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
@@ -524,10 +625,20 @@ mod tests {
         assert_eq!(telemetry.duplicate_name_checks(), BOOTSTRAP_ENTRIES.len());
         assert_eq!(telemetry.duplicate_names_found(), 0);
         assert_eq!(telemetry.strings_interned(), 0);
-        assert_eq!(telemetry.namespace_objects_installed(), 4);
-        assert_eq!(telemetry.native_functions_installed(), 57);
-        assert!(telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS);
-        assert!(telemetry.gc_allocated_bytes() <= MAX_DEFAULT_GC_ALLOCATED_BYTES);
+        assert_eq!(telemetry.namespace_objects_installed(), 5);
+        assert_eq!(telemetry.native_functions_installed(), 96);
+        assert!(
+            telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,
+            "gc_allocations={} max={}",
+            telemetry.gc_allocations(),
+            MAX_DEFAULT_GC_ALLOCATIONS
+        );
+        assert!(
+            telemetry.gc_allocated_bytes() <= MAX_DEFAULT_GC_ALLOCATED_BYTES,
+            "gc_allocated_bytes={} max={}",
+            telemetry.gc_allocated_bytes(),
+            MAX_DEFAULT_GC_ALLOCATED_BYTES
+        );
         assert_eq!(telemetry.phases().len(), BOOTSTRAP_ENTRIES.len() + 1);
     }
 

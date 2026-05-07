@@ -40,8 +40,9 @@ or empty — initialise the submodule first.
 ## Configuration
 
 `test262_config.toml` (the file the project has used since the legacy
-runner) is the single source of truth for skip-lists, ignored test
-patterns, known-panic patterns, and the per-test heap cap. The
+runner) is the single source of truth for skip-lists, skipped
+frontmatter flags, ignored test patterns, known-panic patterns, and
+the per-test heap cap. The
 runner reads it from the repository root by default; pass
 `--config <path>` to override.
 
@@ -51,6 +52,7 @@ The shape is:
 timeout_secs = 10
 max_heap_bytes_per_test = 536870912
 skip_features = ["Atomics", "SharedArrayBuffer", ...]
+skip_flags = ["noStrict"]
 ignored_tests = ["staging/sm/Math", ...]
 known_panics = ["S15.10.2.8_A3_T15", ...]
 ```

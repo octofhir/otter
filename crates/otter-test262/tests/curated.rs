@@ -181,9 +181,20 @@ fn skipped_outcome_for_no_strict_only_test() {
         "skip/no-strict.js",
         "/*---\ndescription: noStrict only\nflags: [noStrict]\n---*/\n1;\n",
     );
-    match drive(&corpus, &path) {
-        Outcome::Skipped { feature } => assert_eq!(feature, "foundation-always-strict"),
-        other => panic!("expected foundation-always-strict skip, got {other:?}"),
+    let mut harness = HarnessCache::new(&corpus.harness_dir);
+    let cfg = ExecConfig {
+        timeout: Duration::from_millis(5_000),
+        max_heap_bytes: 256 * 1024 * 1024,
+        config: {
+            let mut c = Test262Config::default();
+            c.skip_flags.push("noStrict".to_string());
+            c
+        },
+    };
+    let result = run_one(&path, &corpus, &mut harness, &cfg);
+    match result.outcome {
+        Outcome::Skipped { feature } => assert_eq!(feature, "flag:noStrict"),
+        other => panic!("expected flag:noStrict skip, got {other:?}"),
     }
 }
 

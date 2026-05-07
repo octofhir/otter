@@ -509,11 +509,13 @@ pub enum Op {
     LoadGlobalOrThrow,
 
     /// `r<dst> = arguments` — materialise the current frame's
-    /// incoming argument list as a fresh JsArray. Operand:
+    /// incoming argument list as an unmapped arguments object. Operand:
     /// `Register(dst)`. The dispatcher populates `frame.incoming_args`
     /// at call entry only when the callee was compiled with
     /// `needs_arguments = true`, so this opcode is only emitted
-    /// inside such functions.
+    /// inside such functions. The object exposes indexed own data
+    /// properties, a non-enumerable `length`, and a restricted
+    /// `callee` accessor.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-arguments-exotic-objects>
     /// (foundation lowers the unmapped variant for strict-mode

@@ -26,6 +26,7 @@
 //! - [Frontend and bytecode dumps](../../../docs/book/src/engine/frontend.md)
 
 pub mod abstract_ops;
+pub mod arguments_object;
 pub mod array;
 pub mod array_prototype;
 pub mod array_statics;
@@ -40,6 +41,7 @@ pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod bootstrap;
 pub mod error_classes;
+pub mod function_prototype;
 pub mod gc_trace;
 pub mod generator;
 pub mod global_functions;
@@ -91,8 +93,8 @@ pub use js_surface::{
 };
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_function::{
-    NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, native_value,
-    native_value_static, native_value_with_captures,
+    NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
+    native_value, native_value_static, native_value_with_captures,
 };
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
@@ -1554,6 +1556,11 @@ pub enum VmError {
     /// `STRING_CONCAT` on a non-string register). Indicates a
     /// compiler bug at this slice.
     TypeMismatch,
+    /// User-visible `TypeError` with operation context.
+    TypeError {
+        /// Human-readable diagnostic.
+        message: String,
+    },
     /// String allocation failed because the heap cap was hit.
     OutOfMemory {
         /// Bytes the allocation requested.
@@ -1628,6 +1635,7 @@ impl std::fmt::Display for VmError {
             VmError::MissingReturn => write!(f, "function did not RETURN"),
             VmError::InvalidOperand => write!(f, "invalid operand"),
             VmError::TypeMismatch => write!(f, "operand type mismatch"),
+            VmError::TypeError { message } => write!(f, "{message}"),
             VmError::OutOfMemory {
                 requested_bytes,
                 heap_limit_bytes,
@@ -1922,6 +1930,39 @@ impl Interpreter {
         self.console_sink.clone()
     }
 
+    /// Return the realm's shared `%ThrowTypeError%` function.
+    ///
+    /// Bootstrap installs it as the getter/setter for
+    /// `Function.prototype.caller`; unmapped arguments objects reuse
+    /// that exact function object for `callee` so Test262's
+    /// well-known-intrinsic identity checks observe one realm-local
+    /// intrinsic.
+    fn restricted_throw_type_error(&self) -> Result<Value, VmError> {
+        let prototype = self.function_prototype_object()?;
+        match object::get_own_descriptor(prototype, &self.gc_heap, "caller") {
+            Some(object::PropertyDescriptor {
+                kind:
+                    object::DescriptorKind::Accessor {
+                        getter: Some(getter),
+                        ..
+                    },
+                ..
+            }) => Ok(getter),
+            _ => Err(VmError::TypeMismatch),
+        }
+    }
+
+    fn function_prototype_object(&self) -> Result<JsObject, VmError> {
+        let function_ctor = match object::get(self.global_this, &self.gc_heap, "Function") {
+            Some(Value::Object(obj)) => obj,
+            _ => return Err(VmError::TypeMismatch),
+        };
+        match object::get(function_ctor, &self.gc_heap, "prototype") {
+            Some(Value::Object(obj)) => Ok(obj),
+            _ => Err(VmError::TypeMismatch),
+        }
+    }
+
     /// Resolve a property read on a `Value::Function` /
     /// `Value::Closure`. Honours user-installed properties via the
     /// `function_user_props` side table, lazily allocates
@@ -1966,7 +2007,33 @@ impl Interpreter {
         if name == "name" || name == "length" {
             return function_intrinsic_property(module, function_id, name, &self.string_heap);
         }
+        if let Some(value) = self
+            .load_function_prototype_method(name)
+            .or_else(|| self.load_object_prototype_method(name))
+        {
+            return Ok(value);
+        }
         Ok(Value::Undefined)
+    }
+
+    fn load_global_prototype_method(&self, constructor_name: &str, name: &str) -> Option<Value> {
+        let constructor = crate::object::get(self.global_this, &self.gc_heap, constructor_name)?;
+        let Value::Object(constructor_obj) = constructor else {
+            return None;
+        };
+        let prototype = crate::object::get(constructor_obj, &self.gc_heap, "prototype")?;
+        let Value::Object(prototype_obj) = prototype else {
+            return None;
+        };
+        crate::object::get(prototype_obj, &self.gc_heap, name)
+    }
+
+    fn load_function_prototype_method(&self, name: &str) -> Option<Value> {
+        self.load_global_prototype_method("Function", name)
+    }
+
+    fn load_object_prototype_method(&self, name: &str) -> Option<Value> {
+        self.load_global_prototype_method("Object", name)
     }
 
     /// Borrow the per-interpreter table of well-known symbol
@@ -2409,9 +2476,35 @@ impl Interpreter {
         // Native callables run inline at the drain site: no frame
         // push, no return register. Errors propagate as RunError.
         if let Value::NativeFunction(native) = &current {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
-            let mut ctx = NativeCtx::new(self);
+            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
+                return match self.run_vm_intrinsic_sync(
+                    module,
+                    intrinsic,
+                    effective_this,
+                    effective_args,
+                ) {
+                    Ok(value) => {
+                        self.settle_microtask_capability(result_capability, Ok(value));
+                        Ok(())
+                    }
+                    Err(vm_err) => {
+                        if result_capability.is_some() {
+                            let reason = vm_err_to_value(&vm_err);
+                            self.settle_microtask_capability(result_capability, Err(reason));
+                            Ok(())
+                        } else {
+                            Err(RunError {
+                                error: vm_err,
+                                frames: Vec::new(),
+                            })
+                        }
+                    }
+                };
+            }
+            let argv: Vec<Value> = effective_args.into_iter().collect();
+            let call_info = NativeCallInfo::call(effective_this.clone());
+            let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             return match call.invoke(&mut ctx, &argv) {
                 Ok(value) => {
                     self.settle_microtask_capability(result_capability, Ok(value));
@@ -2651,6 +2744,13 @@ impl Interpreter {
         let is_oom = matches!(err, VmError::OutOfMemory { .. });
         let (kind, message) = match err {
             VmError::TypeMismatch => (error_classes::ErrorKind::TypeError, "operand type mismatch"),
+            VmError::TypeError { message } => {
+                dynamic_message = message.clone();
+                (
+                    error_classes::ErrorKind::TypeError,
+                    dynamic_message.as_str(),
+                )
+            }
             VmError::NotCallable => (
                 error_classes::ErrorKind::TypeError,
                 "value is not a function",
@@ -2978,6 +3078,28 @@ impl Interpreter {
                     let result = self.build_function_constructor(&args)?;
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, result)?;
+                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    continue;
+                }
+                Op::CollectArguments => {
+                    // §10.4.4.6 CreateUnmappedArgumentsObject.
+                    // This path runs before the in-frame borrow so
+                    // we can look up the realm's shared
+                    // `%ThrowTypeError%` function and allocate the
+                    // descriptor-backed arguments object.
+                    let dst = register_operand(operands.first())?;
+                    let elements = {
+                        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                        std::mem::take(&mut frame.incoming_args)
+                    };
+                    let thrower = self.restricted_throw_type_error()?;
+                    let obj = crate::arguments_object::create_unmapped(
+                        &mut self.gc_heap,
+                        elements,
+                        thrower,
+                    )?;
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    write_register(frame, dst, Value::Object(obj))?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     continue;
                 }
@@ -3330,19 +3452,19 @@ impl Interpreter {
                             self.function_property_get(module, fid, &name)?
                         }
                         Value::NativeFunction(native) if name == "name" || name == "length" => {
-                            if name == "name" {
-                                let s = JsString::from_str(
-                                    native.name(&self.gc_heap),
-                                    &self.string_heap,
-                                )
-                                .map_err(|_| VmError::TypeMismatch)?;
-                                Value::String(s)
-                            } else {
-                                Value::Number(NumberValue::from_i32(
-                                    native.length(&self.gc_heap) as i32
-                                ))
+                            match native.own_property_descriptor(
+                                &self.gc_heap,
+                                &self.string_heap,
+                                &name,
+                            )? {
+                                Some(desc) => descriptor_value(&desc),
+                                None => Value::Undefined,
                             }
                         }
+                        Value::NativeFunction(_) => self
+                            .load_function_prototype_method(&name)
+                            .or_else(|| self.load_object_prototype_method(&name))
+                            .unwrap_or(Value::Undefined),
                         Value::BoundFunction(bound) if name == "name" || name == "length" => {
                             bound_function_intrinsic_property(
                                 module,
@@ -3352,6 +3474,10 @@ impl Interpreter {
                                 &self.gc_heap,
                             )?
                         }
+                        Value::BoundFunction(_) => self
+                            .load_function_prototype_method(&name)
+                            .or_else(|| self.load_object_prototype_method(&name))
+                            .unwrap_or(Value::Undefined),
                         Value::RegExp(r) => regexp_prototype::load_property(
                             r,
                             &self.gc_heap,
@@ -3423,7 +3549,47 @@ impl Interpreter {
                             };
                             Some(bag)
                         }
-                        _ => return Err(VmError::TypeMismatch),
+                        Value::NativeFunction(native) if name == "name" || name == "length" => {
+                            match native.own_property_descriptor(
+                                &self.gc_heap,
+                                &self.string_heap,
+                                &name,
+                            )? {
+                                Some(desc) if !desc.writable() => {
+                                    return Err(VmError::TypeError {
+                                        message: format!(
+                                            "Cannot assign to read-only property '{name}' of function {}",
+                                            native.name(&self.gc_heap)
+                                        ),
+                                    });
+                                }
+                                _ => {
+                                    let desc = crate::object::PropertyDescriptor::data(
+                                        value.clone(),
+                                        true,
+                                        false,
+                                        true,
+                                    );
+                                    if !native.define_own_property(&mut self.gc_heap, &name, desc) {
+                                        return Err(VmError::TypeError {
+                                            message: format!(
+                                                "Cannot define property '{name}' on function {}",
+                                                native.name(&self.gc_heap)
+                                            ),
+                                        });
+                                    }
+                                    None
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(VmError::TypeError {
+                                message: format!(
+                                    "Cannot set property '{name}' on {}",
+                                    value_kind_name(other)
+                                ),
+                            });
+                        }
                     };
                     if let Some(target) = target {
                         crate::object::set(target, &mut self.gc_heap, &name, value);
@@ -3435,11 +3601,20 @@ impl Interpreter {
                     let obj_reg = register_operand(operands.get(1))?;
                     let name_idx = const_operand(operands.get(2))?;
                     let name = lookup_string_constant(module, name_idx)?;
-                    let obj = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => *o,
-                        _ => return Err(VmError::TypeMismatch),
+                    let removed = match read_register(frame, obj_reg)? {
+                        Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, &name),
+                        Value::NativeFunction(native) => {
+                            native.delete_own_property(&mut self.gc_heap, &name)
+                        }
+                        other => {
+                            return Err(VmError::TypeError {
+                                message: format!(
+                                    "Cannot delete property '{name}' of {}",
+                                    value_kind_name(other)
+                                ),
+                            });
+                        }
                     };
-                    let removed = crate::object::delete(obj, &mut self.gc_heap, &name);
                     write_register(frame, dst, Value::Boolean(removed))?;
                     frame.pc += 1;
                 }
@@ -3451,6 +3626,9 @@ impl Interpreter {
                             Some(p) => Value::Object(p),
                             None => Value::Null,
                         },
+                        Value::NativeFunction(_) => {
+                            Value::Object(self.function_prototype_object()?)
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     write_register(frame, dst, result)?;
@@ -3516,6 +3694,27 @@ impl Interpreter {
                         (Value::Object(obj), Value::String(key)) => {
                             crate::object::get(*obj, &self.gc_heap, &key.to_lossy_string())
                                 .unwrap_or(Value::Undefined)
+                        }
+                        // Computed numeric property access on
+                        // ordinary objects, e.g. `arguments[0]`,
+                        // uses ToPropertyKey(number) -> decimal
+                        // string.
+                        (Value::Object(obj), Value::Number(n)) => {
+                            let key = n.to_display_string();
+                            crate::object::get(*obj, &self.gc_heap, &key)
+                                .unwrap_or(Value::Undefined)
+                        }
+                        // Computed access to built-in function
+                        // metadata, e.g. `Function.prototype.call["name"]`.
+                        (Value::NativeFunction(native), Value::String(key)) => {
+                            match native.own_property_descriptor(
+                                &self.gc_heap,
+                                &self.string_heap,
+                                &key.to_lossy_string(),
+                            )? {
+                                Some(desc) => descriptor_value(&desc),
+                                None => Value::Undefined,
+                            }
                         }
                         // `arr[Symbol.iterator]` — return a native
                         // callable producing the foundation
@@ -3593,6 +3792,52 @@ impl Interpreter {
                                 &key.to_lossy_string(),
                                 value,
                             );
+                        }
+                        // Computed numeric property write on
+                        // ordinary objects, e.g. `arguments[0] = v`.
+                        (Value::Object(obj), Value::Number(n)) => {
+                            crate::object::set(
+                                *obj,
+                                &mut self.gc_heap,
+                                &n.to_display_string(),
+                                value,
+                            );
+                        }
+                        // Computed write to built-in function
+                        // metadata follows the same descriptor path
+                        // as `f.name = ...`.
+                        (Value::NativeFunction(native), Value::String(key)) => {
+                            let key = key.to_lossy_string();
+                            match native.own_property_descriptor(
+                                &self.gc_heap,
+                                &self.string_heap,
+                                &key,
+                            )? {
+                                Some(desc) if !desc.writable() => {
+                                    return Err(VmError::TypeError {
+                                        message: format!(
+                                            "Cannot assign to read-only property '{key}' of function {}",
+                                            native.name(&self.gc_heap)
+                                        ),
+                                    });
+                                }
+                                _ => {
+                                    let desc = crate::object::PropertyDescriptor::data(
+                                        value.clone(),
+                                        true,
+                                        false,
+                                        true,
+                                    );
+                                    if !native.define_own_property(&mut self.gc_heap, &key, desc) {
+                                        return Err(VmError::TypeError {
+                                            message: format!(
+                                                "Cannot define property '{key}' on function {}",
+                                                native.name(&self.gc_heap)
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
                         }
                         // Numeric-indexed array write.
                         (Value::Array(arr), Value::Number(n)) => {
@@ -4442,14 +4687,9 @@ impl Interpreter {
                     frame.pc += 1;
                 }
                 Op::CollectArguments => {
-                    // §10.4.4 Arguments Exotic Objects (foundation
-                    // lowers the unmapped variant). Wrap the captured argv as
-                    // a fresh JsArray. Drain so the frame's copy is released
-                    // after the (typically single) materialisation.
+                    // Handled before the in-frame borrow above.
                     let dst = register_operand(operands.first())?;
-                    let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.incoming_args);
-                    let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
-                    write_register(frame, dst, Value::Array(array))?;
+                    write_register(frame, dst, Value::Undefined)?;
                     frame.pc += 1;
                 }
                 Op::ImportNamespace => {
@@ -4770,23 +5010,28 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let obj_reg = register_operand(operands.get(1))?;
                     let idx_reg = register_operand(operands.get(2))?;
-                    let obj = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => *o,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let removed = match read_register(frame, idx_reg)?.clone() {
-                        Value::Symbol(sym) => {
-                            crate::object::delete_symbol(obj, &mut self.gc_heap, &sym)
+                    let obj = read_register(frame, obj_reg)?.clone();
+                    let idx = read_register(frame, idx_reg)?.clone();
+                    let removed = match (&obj, idx) {
+                        (Value::Object(obj), Value::Symbol(sym)) => {
+                            crate::object::delete_symbol(*obj, &mut self.gc_heap, &sym)
                         }
-                        Value::String(s) => {
-                            crate::object::delete(obj, &mut self.gc_heap, &s.to_lossy_string())
+                        (Value::Object(obj), Value::String(s)) => {
+                            crate::object::delete(*obj, &mut self.gc_heap, &s.to_lossy_string())
                         }
-                        Value::Number(n) => match n.as_smi() {
+                        (Value::Object(obj), Value::Number(n)) => match n.as_smi() {
                             Some(v) if v >= 0 => {
-                                crate::object::delete(obj, &mut self.gc_heap, &v.to_string())
+                                crate::object::delete(*obj, &mut self.gc_heap, &v.to_string())
                             }
-                            _ => false,
+                            _ => crate::object::delete(
+                                *obj,
+                                &mut self.gc_heap,
+                                &n.to_display_string(),
+                            ),
                         },
+                        (Value::NativeFunction(native), Value::String(s)) => {
+                            native.delete_own_property(&mut self.gc_heap, &s.to_lossy_string())
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     write_register(frame, dst, Value::Boolean(removed))?;
@@ -5023,8 +5268,15 @@ impl Interpreter {
         // dst, and advance pc on the caller frame. No stack frame
         // is created — the closure cannot itself push frames.
         if let Value::NativeFunction(native) = &current {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
+            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
+                let result =
+                    self.run_vm_intrinsic_sync(module, intrinsic, effective_this, effective_args)?;
+                let top_idx = stack.len() - 1;
+                write_register(&mut stack[top_idx], dst, result)?;
+                return Ok(());
+            }
+            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
             let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
@@ -5625,6 +5877,9 @@ impl Interpreter {
             crate::object::set_prototype(receiver, &mut self.gc_heap, Some(proto));
         }
         let this_value = Value::Object(receiver);
+        if matches!(callee, Value::NativeFunction(_)) {
+            return Err(VmError::NotCallable);
+        }
         if let Value::ClassConstructor(class) = &callee
             && let Value::NativeFunction(native) = &class.ctor
         {
@@ -5993,6 +6248,20 @@ impl Interpreter {
                 return Ok(());
             }
         }
+        if let Value::NativeFunction(native) = &recv_value
+            && let Some(result) = native_function_object_prototype_intercept(
+                native,
+                &name,
+                &arg_values,
+                &self.gc_heap,
+                &self.string_heap,
+            )?
+        {
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
+        }
 
         // §20.2.3 Function.prototype canonical methods —
         // `call` / `apply` / `bind` / `toString`. They are
@@ -6058,7 +6327,9 @@ impl Interpreter {
         // `Function.prototype.{call, apply, bind, toString}` on a
         // callable receiver that doesn't expose the method as a
         // property — fallback path.
-        if is_callable(&recv_value) {
+        if matches!(name.as_str(), "call" | "apply" | "bind" | "toString")
+            && is_callable(&recv_value)
+        {
             return self.dispatch_function_method(
                 stack,
                 module,
@@ -6445,9 +6716,18 @@ impl Interpreter {
             }
         }
         if let Value::NativeFunction(native) = &current {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
-            let mut ctx = NativeCtx::new(self);
+            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
+                return self.run_vm_intrinsic_sync(
+                    module,
+                    intrinsic,
+                    effective_this,
+                    effective_args,
+                );
+            }
+            let argv: Vec<Value> = effective_args.into_iter().collect();
+            let call_info = NativeCallInfo::call(effective_this.clone());
+            let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
         }
         let (function_id, parent_upvalues, this_for_callee) = match current {
@@ -7058,6 +7338,63 @@ impl Interpreter {
         };
         let result = self.run_callable_sync(module, &trap_fn, Value::Object(handler), args)?;
         Ok(Some(result))
+    }
+
+    fn run_vm_intrinsic_sync(
+        &mut self,
+        module: &BytecodeModule,
+        intrinsic: VmIntrinsicFunction,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        match intrinsic {
+            VmIntrinsicFunction::FunctionPrototypeCall => {
+                if !is_callable(&this_value) {
+                    return Err(VmError::NotCallable);
+                }
+                let mut iter = args.into_iter();
+                let receiver = iter.next().unwrap_or(Value::Undefined);
+                let forwarded: SmallVec<[Value; 8]> = iter.collect();
+                self.run_callable_sync(module, &this_value, receiver, forwarded)
+            }
+            VmIntrinsicFunction::FunctionPrototypeApply => {
+                if !is_callable(&this_value) {
+                    return Err(VmError::NotCallable);
+                }
+                let mut iter = args.into_iter();
+                let receiver = iter.next().unwrap_or(Value::Undefined);
+                let forwarded: SmallVec<[Value; 8]> = match iter.next() {
+                    None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
+                    Some(Value::Array(arr)) => {
+                        crate::array::with_elements(arr, &self.gc_heap, |elements| {
+                            elements.iter().cloned().collect()
+                        })
+                    }
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                self.run_callable_sync(module, &this_value, receiver, forwarded)
+            }
+            VmIntrinsicFunction::FunctionPrototypeBind => {
+                if !is_callable(&this_value) {
+                    return Err(VmError::NotCallable);
+                }
+                let mut iter = args.into_iter();
+                let receiver = iter.next().unwrap_or(Value::Undefined);
+                let bound_args: SmallVec<[Value; 4]> = iter.collect();
+                let bound =
+                    BoundFunction::new(&mut self.gc_heap, this_value, receiver, bound_args)?;
+                Ok(Value::BoundFunction(bound))
+            }
+            VmIntrinsicFunction::FunctionPrototypeToString => {
+                if !is_callable(&this_value) {
+                    return Err(VmError::NotCallable);
+                }
+                let display = function_to_string(module, &this_value, &self.gc_heap);
+                let s = JsString::from_str(&display, &self.string_heap)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                Ok(Value::String(s))
+            }
+        }
     }
 
     fn dispatch_function_method(
@@ -8503,7 +8840,9 @@ fn temporal_to_vm_error(err: temporal::TemporalError) -> VmError {
 fn native_to_vm_error(err: NativeError) -> VmError {
     match err {
         NativeError::Thrown { name: _, message } => VmError::Uncaught { value: message },
-        NativeError::TypeError { .. } => VmError::TypeMismatch,
+        NativeError::TypeError { name, reason } => VmError::TypeError {
+            message: format!("{name}: {reason}"),
+        },
     }
 }
 
@@ -8903,6 +9242,73 @@ fn object_prototype_intercept(
         // <https://tc39.es/ecma262/#sec-object.prototype.valueof>
         "valueOf" => Ok(Some(Value::Object(*obj))),
         _ => Ok(None),
+    }
+}
+
+fn native_function_object_prototype_intercept(
+    native: &NativeFunction,
+    name: &str,
+    args: &SmallVec<[Value; 8]>,
+    gc_heap: &otter_gc::GcHeap,
+    string_heap: &StringHeap,
+) -> Result<Option<Value>, VmError> {
+    match name {
+        "hasOwnProperty" => {
+            let key = property_key_from_arg(args.first())?;
+            Ok(Some(Value::Boolean(
+                native
+                    .own_property_descriptor(gc_heap, string_heap, &key)?
+                    .is_some(),
+            )))
+        }
+        "propertyIsEnumerable" => {
+            let _key = property_key_from_arg(args.first())?;
+            Ok(Some(Value::Boolean(false)))
+        }
+        "isPrototypeOf" => Ok(Some(Value::Boolean(false))),
+        _ => Ok(None),
+    }
+}
+
+fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {
+    match &desc.kind {
+        crate::object::DescriptorKind::Data { value } => value.clone(),
+        crate::object::DescriptorKind::Accessor { .. } => Value::Undefined,
+    }
+}
+
+fn value_kind_name(value: &Value) -> &'static str {
+    match value {
+        Value::Undefined => "undefined",
+        Value::Null => "null",
+        Value::Boolean(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Symbol(_) => "symbol",
+        Value::BigInt(_) => "bigint",
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
+        Value::Function { .. } | Value::Closure { .. } => "function",
+        Value::NativeFunction(_) => "function",
+        Value::BoundFunction(_) => "function",
+        Value::ClassConstructor(_) => "class constructor",
+        Value::RegExp(_) => "regexp",
+        Value::Date(_) => "date",
+        Value::Promise(_) => "promise",
+        Value::Proxy(_) => "proxy",
+        Value::Map(_) => "map",
+        Value::Set(_) => "set",
+        Value::WeakMap(_) => "weakmap",
+        Value::WeakSet(_) => "weakset",
+        Value::WeakRef(_) => "weakref",
+        Value::FinalizationRegistry(_) => "finalization registry",
+        Value::Generator(_) => "generator",
+        Value::Iterator(_) => "iterator",
+        Value::Temporal(_) => "temporal",
+        Value::Intl(_) => "intl",
+        Value::ArrayBuffer(_) => "arraybuffer",
+        Value::DataView(_) => "dataview",
+        Value::TypedArray(_) => "typedarray",
     }
 }
 

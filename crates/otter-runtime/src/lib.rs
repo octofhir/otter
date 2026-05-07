@@ -30,6 +30,7 @@ pub mod event_loop;
 pub mod handle;
 pub mod module_graph;
 pub mod module_loader;
+mod package_graph_resolver;
 pub mod structured_clone;
 pub mod surface;
 pub mod worker;
@@ -1211,32 +1212,7 @@ impl Runtime {
     ) -> Result<ExecutionResult, OtterError> {
         let start = std::time::Instant::now();
         let entry_path = entry_path.as_ref();
-        let loader = match &self.config.loader {
-            Some(cfg) => {
-                let mut cfg = cfg.clone();
-                cfg.hosted_specifiers.extend(
-                    self.config
-                        .hosted_modules
-                        .iter()
-                        .map(|m| m.specifier().to_string()),
-                );
-                module_loader::ModuleLoader::with_config(cfg)
-            }
-            None => {
-                let base_dir = entry_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let mut cfg = module_loader::LoaderConfig::new(base_dir);
-                cfg.hosted_specifiers = self
-                    .config
-                    .hosted_modules
-                    .iter()
-                    .map(|m| m.specifier().to_string())
-                    .collect();
-                module_loader::ModuleLoader::with_config(cfg)
-            }
-        };
+        let loader = self.module_loader_for_entry(entry_path);
         let linked =
             module_graph::load_program(&loader, entry_path).map_err(|e| OtterError::Compile {
                 diagnostics: vec![Diagnostic::syntax(e.to_string())],
@@ -1294,6 +1270,83 @@ impl Runtime {
             (Ok(v), Ok(())) => v,
         };
         Ok(ExecutionResult::from_vm_value(value, start.elapsed()))
+    }
+
+    fn module_loader_for_entry(&self, entry_path: &Path) -> module_loader::ModuleLoader {
+        match &self.config.loader {
+            Some(cfg) => {
+                let mut cfg = cfg.clone();
+                cfg.hosted_specifiers.extend(
+                    self.config
+                        .hosted_modules
+                        .iter()
+                        .map(|m| m.specifier().to_string()),
+                );
+                module_loader::ModuleLoader::with_config(cfg)
+            }
+            None => {
+                let base_dir = entry_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let mut cfg = module_loader::LoaderConfig::new(base_dir);
+                cfg.hosted_specifiers = self
+                    .config
+                    .hosted_modules
+                    .iter()
+                    .map(|m| m.specifier().to_string())
+                    .collect();
+                module_loader::ModuleLoader::with_config(cfg)
+            }
+        }
+    }
+
+    /// Parse and compile a file without executing it.
+    ///
+    /// Module-shaped inputs use the same [`module_loader`] and module graph
+    /// pipeline as [`Self::run_file`]. Script-shaped inputs use the same
+    /// script compiler path, stopping before interpreter dispatch.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn check_file(&mut self, path: impl AsRef<Path>) -> Result<(), OtterError> {
+        let path = path.as_ref();
+        let source = SourceInput::from_path(path)?;
+        if source_path_has_module_extension(path) {
+            return self.check_module(path);
+        }
+        let specifier = path.to_string_lossy().to_string();
+        if !source_path_has_script_extension(path) {
+            let module = with_program(&source.text, source.kind, |program| {
+                if program_looks_like_module(program) {
+                    return Ok(None);
+                }
+                compile_script_program(program, source.kind, &specifier)
+                    .map(Some)
+                    .map_err(map_compile_error)
+            })
+            .map_err(|e| {
+                map_compile_error(otter_compiler::CompileError::Syntax {
+                    messages: e.messages,
+                })
+            })??;
+            if module.is_some() {
+                return Ok(());
+            }
+            return self.check_module(path);
+        }
+        compile_script_source(&source.text, source.kind, &specifier)
+            .map(|_| ())
+            .map_err(map_compile_error)
+    }
+
+    fn check_module(&self, entry_path: &Path) -> Result<(), OtterError> {
+        let loader = self.module_loader_for_entry(entry_path);
+        module_graph::load_program(&loader, entry_path)
+            .map(|_| ())
+            .map_err(|e| OtterError::Compile {
+                diagnostics: vec![Diagnostic::syntax(e.to_string())],
+            })
     }
 
     /// Run a file from disk, detecting script vs module shape.
@@ -1377,6 +1430,18 @@ impl Otter {
     /// See [`OtterError`] variants.
     pub async fn run_file(&self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
         self.handle.run_file(path.as_ref().to_path_buf()).await
+    }
+
+    /// Parse and compile a file without executing it.
+    ///
+    /// Module-shaped files use the same loader and package-graph resolution as
+    /// [`Self::run_file`], so CLI `check` and `run` report resolver failures
+    /// from the same path.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub async fn check_file(&self, path: impl AsRef<Path>) -> Result<(), OtterError> {
+        self.handle.check_file(path.as_ref().to_path_buf()).await
     }
 
     /// Run an ES module entry file from disk.
@@ -2197,6 +2262,87 @@ mod tests {
         otter
             .blocking_run_file(dir.path().join("entry.ts"))
             .unwrap();
+    }
+
+    #[test]
+    fn module_program_imports_package_from_loader_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        let dep = dir.path().join("store/dep");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("index.js"), "export let value = 11;\n").unwrap();
+        std::fs::write(
+            app.join("entry.ts"),
+            "import { value } from \"dep\";\nfunction fail() { return undefined.x; }\nif (value !== 11) fail();\n",
+        )
+        .unwrap();
+
+        let mut graph = module_loader::LoaderPackageGraph::new();
+        graph.insert_package(module_loader::LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app.clone(),
+            main: None,
+            module: None,
+        });
+        graph.insert_package(module_loader::LoaderPackageRoot {
+            id: "dep@npm:^1.0.0".into(),
+            name: "dep".into(),
+            version: "1.0.0".into(),
+            root: dep,
+            main: Some("index.js".into()),
+            module: None,
+        });
+        graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
+
+        let mut loader = module_loader::LoaderConfig::new(app.clone());
+        loader.enable_node_modules = false;
+        loader.package_graph = Some(graph);
+        let otter = Otter::builder().module_loader(loader).build().unwrap();
+        otter.blocking_run_file(app.join("entry.ts")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_file_imports_package_from_loader_graph_without_running_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        let dep = dir.path().join("store/dep");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("index.js"), "export let value = 13;\n").unwrap();
+        std::fs::write(
+            app.join("entry.ts"),
+            "import { value } from \"dep\";\nfunction fail() { return undefined.x; }\nfail();\nvalue;\n",
+        )
+        .unwrap();
+
+        let mut graph = module_loader::LoaderPackageGraph::new();
+        graph.insert_package(module_loader::LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app.clone(),
+            main: None,
+            module: None,
+        });
+        graph.insert_package(module_loader::LoaderPackageRoot {
+            id: "dep@npm:^1.0.0".into(),
+            name: "dep".into(),
+            version: "1.0.0".into(),
+            root: dep,
+            main: Some("index.js".into()),
+            module: None,
+        });
+        graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
+
+        let mut loader = module_loader::LoaderConfig::new(app.clone());
+        loader.enable_node_modules = false;
+        loader.package_graph = Some(graph);
+        let otter = Otter::builder().module_loader(loader).build().unwrap();
+
+        otter.check_file(app.join("entry.ts")).await.unwrap();
     }
 
     #[test]

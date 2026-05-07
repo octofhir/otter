@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use otter_bytecode::{disasm::disassemble, dump::to_json_pretty};
+use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageManifest, PackageType};
 use otter_runtime::{
     BooleanPermission, CapabilitySet, Diagnostic, OtterError, Permission, SourceInput,
@@ -461,8 +462,8 @@ async fn main() -> ExitCode {
         (Some(Command::Eval(args)), _) => {
             run_eval(&args.expression, args.print, json, &caps, &startup_timer).await
         }
-        (Some(Command::Check(args)), _) => run_check(&args.file, json),
-        (Some(Command::Test(args)), _) => run_test(args, json),
+        (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps).await,
+        (Some(Command::Test(args)), _) => run_test(args, json).await,
         (Some(Command::Info), _) => run_info(json),
         // Shorthand: `otter <file>`.
         (None, Some(positional)) => {
@@ -537,7 +538,9 @@ async fn run_file(
     // detection is AST-based (see `Otter::run_file` for the
     // shared helper used in the embedder Layer-A path).
     //
-    let otter = cli_otter_builder(caps).build()?;
+    let otter = cli_otter_builder(caps)
+        .module_loader(cli_loader_config_for_entry(path).await)
+        .build()?;
     startup_timer.mark("runtime_build");
     let result = otter.run_file(path).await?;
     startup_timer.mark("runtime_run_file");
@@ -668,7 +671,7 @@ async fn resolve_run_script(project_root: &Path, target: &str) -> Result<RunTarg
 }
 
 async fn resolve_run_bin(project_root: &Path, target: &str) -> Result<RunTarget, OtterError> {
-    let graph = otter_pm::resolve_local_project(project_root)
+    let graph = otter_pm::resolve_installed_project(project_root)
         .await
         .map_err(map_pm_error)?
         .graph;
@@ -788,8 +791,76 @@ fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
         .with_web_apis()
 }
 
-fn run_check(path: &std::path::Path, json: bool) -> Result<ExitCode, OtterError> {
-    compile_source_for_cli(path)?;
+async fn cli_loader_config_for_entry(path: &Path) -> otter_runtime::module_loader::LoaderConfig {
+    let base_dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut config = otter_runtime::module_loader::LoaderConfig::new(base_dir);
+    if let Some(project_root) = find_project_root_for_entry(path).await
+        && let Ok(resolution) = otter_pm::resolve_installed_project(project_root).await
+    {
+        config.package_graph = Some(loader_graph_from_pm(&resolution.graph));
+    }
+    config
+}
+
+async fn find_project_root_for_entry(path: &Path) -> Option<PathBuf> {
+    let mut cursor = match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
+        _ => path
+            .parent()
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())?,
+    };
+    loop {
+        let manifest = cursor.join(PACKAGE_JSON);
+        match tokio::fs::try_exists(&manifest).await {
+            Ok(true) => return Some(cursor),
+            Ok(false) => {}
+            Err(_) => return None,
+        }
+        if !cursor.pop() {
+            return std::env::current_dir().ok();
+        }
+    }
+}
+
+fn loader_graph_from_pm(
+    graph: &otter_pm::PackageGraph,
+) -> otter_runtime::module_loader::LoaderPackageGraph {
+    let mut loader_graph = otter_runtime::module_loader::LoaderPackageGraph::new();
+    for package in graph.packages.values() {
+        loader_graph.insert_package(otter_runtime::module_loader::LoaderPackageRoot {
+            id: package.id.as_str().to_string(),
+            name: package.name.clone(),
+            version: package.version.clone(),
+            root: package.root.clone(),
+            main: package.manifest.main.clone(),
+            module: package.manifest.module.clone(),
+        });
+    }
+    for (from, dependencies) in &graph.dependencies {
+        for (name, target) in dependencies {
+            loader_graph.insert_dependency(
+                from.as_str().to_string(),
+                name.clone(),
+                target.as_str().to_string(),
+            );
+        }
+    }
+    loader_graph
+}
+
+async fn run_check(
+    path: &std::path::Path,
+    json: bool,
+    caps: &CapabilitySet,
+) -> Result<ExitCode, OtterError> {
+    let otter = cli_otter_builder(caps)
+        .module_loader(cli_loader_config_for_entry(path).await)
+        .build()?;
+    otter.check_file(path).await?;
     if json {
         println!("{{\"ok\":true}}");
     }
@@ -856,30 +927,66 @@ async fn run_pm_init(args: InitArgs, json: bool) -> Result<ExitCode, OtterError>
 }
 
 async fn run_pm_install(root: &Path, json: bool) -> Result<ExitCode, OtterError> {
-    let changed = otter_pm::write_local_lockfile(root)
-        .await
-        .map_err(map_pm_error)?;
+    let cache_root = root.join(".otter").join("cache");
+    let report = otter_pm::install_local_project(
+        root,
+        &otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata")),
+        &otter_pm::HttpRegistryMetadataClient::new(),
+        &otter_pm::FsPackageStore::new(cache_root),
+        &otter_pm::HttpTarballClient::new(),
+    )
+    .await
+    .map_err(map_pm_error)?;
+    print_install_report(root, &report, json);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: bool) {
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "ok": true,
                 "lockfile": root.join(otter_pm_lockfile::LOCKFILE_NAME),
-                "lockfileChanged": changed
+                "lockfileChanged": report.lockfile_changed,
+                "addedPackages": report.added_packages,
+                "reusedPackages": report.reused_packages,
+                "linkedBins": report.linked_bins
             })
         );
-    } else if changed {
+    } else if report.lockfile_changed {
         println!(
             "wrote {}",
             root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
+        );
+        println!(
+            "installed {} package{}, reused {}",
+            report.added_packages,
+            if report.added_packages == 1 { "" } else { "s" },
+            report.reused_packages
+        );
+        println!(
+            "linked {} bin{}",
+            report.linked_bins,
+            if report.linked_bins == 1 { "" } else { "s" }
         );
     } else {
         println!(
             "{} is up to date",
             root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
         );
+        println!(
+            "installed {} package{}, reused {}",
+            report.added_packages,
+            if report.added_packages == 1 { "" } else { "s" },
+            report.reused_packages
+        );
+        println!(
+            "linked {} bin{}",
+            report.linked_bins,
+            if report.linked_bins == 1 { "" } else { "s" }
+        );
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
@@ -908,16 +1015,26 @@ async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
         .write_to_dir(&args.root)
         .await
         .map_err(|err| pm_config_error(err.to_string()))?;
-    let lockfile_changed = otter_pm::write_local_lockfile(&args.root)
-        .await
-        .map_err(map_pm_error)?;
+    let cache_root = args.root.join(".otter").join("cache");
+    let report = otter_pm::install_local_project(
+        &args.root,
+        &otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata")),
+        &otter_pm::HttpRegistryMetadataClient::new(),
+        &otter_pm::FsPackageStore::new(cache_root),
+        &otter_pm::HttpTarballClient::new(),
+    )
+    .await
+    .map_err(map_pm_error)?;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "ok": true,
                 "added": added,
-                "lockfileChanged": lockfile_changed
+                "lockfileChanged": report.lockfile_changed,
+                "addedPackages": report.added_packages,
+                "reusedPackages": report.reused_packages,
+                "linkedBins": report.linked_bins
             })
         );
     } else {
@@ -928,6 +1045,7 @@ async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
                 item["range"].as_str().unwrap()
             );
         }
+        print_install_report(&args.root, &report, false);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -938,6 +1056,7 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
             "otter remove requires at least one package",
         ));
     }
+    let previous_lockfile = read_lockfile_if_present(&args.root).await?;
     let mut manifest = PackageManifest::read_from_dir(&args.root)
         .await
         .map_err(map_manifest_error)?;
@@ -955,13 +1074,28 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
     let lockfile_changed = otter_pm::write_local_lockfile(&args.root)
         .await
         .map_err(map_pm_error)?;
+    let current_lockfile = read_lockfile_if_present(&args.root)
+        .await?
+        .unwrap_or_else(otter_pm_lockfile::Lockfile::new);
+    let prune = if let Some(previous_lockfile) = previous_lockfile {
+        otter_pm::prune_removed_registry_packages(&args.root, &previous_lockfile, &current_lockfile)
+            .await
+            .map_err(map_pm_error)?
+    } else {
+        otter_pm::PruneReport {
+            removed_packages: 0,
+            removed_bins: 0,
+        }
+    };
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "ok": true,
                 "removed": removed,
-                "lockfileChanged": lockfile_changed
+                "lockfileChanged": lockfile_changed,
+                "removedPackages": prune.removed_packages,
+                "removedBins": prune.removed_bins
             })
         );
     } else {
@@ -969,8 +1103,27 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
             "removed {removed} dependency entr{}",
             if removed == 1 { "y" } else { "ies" }
         );
+        println!(
+            "pruned {} package{}, {} bin{}",
+            prune.removed_packages,
+            if prune.removed_packages == 1 { "" } else { "s" },
+            prune.removed_bins,
+            if prune.removed_bins == 1 { "" } else { "s" }
+        );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+async fn read_lockfile_if_present(root: &Path) -> Result<Option<Lockfile>, OtterError> {
+    let path = root.join(otter_pm_lockfile::LOCKFILE_NAME);
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(pm_io_error(&path, err)),
+    };
+    Lockfile::parse_toml(&text)
+        .map(Some)
+        .map_err(map_lockfile_error)
 }
 
 fn build_init_manifest(args: &InitArgs) -> Result<PackageManifest, OtterError> {
@@ -1074,6 +1227,10 @@ fn map_manifest_error(err: otter_pm_manifest::ManifestError) -> OtterError {
     pm_config_error(err.to_string())
 }
 
+fn map_lockfile_error(err: otter_pm_lockfile::LockfileError) -> OtterError {
+    pm_config_error(err.to_string())
+}
+
 fn map_pm_error(err: otter_pm::PackageManagerError) -> OtterError {
     pm_config_error(err.to_string())
 }
@@ -1115,7 +1272,7 @@ fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
     }
 }
 
-fn run_test(args: TestArgs, json: bool) -> Result<ExitCode, OtterError> {
+async fn run_test(args: TestArgs, json: bool) -> Result<ExitCode, OtterError> {
     let suite = match args.suite.as_str() {
         "engine" => Suite::Engine,
         "smoke" => Suite::Smoke,
@@ -1128,10 +1285,18 @@ fn run_test(args: TestArgs, json: bool) -> Result<ExitCode, OtterError> {
             });
         }
     };
+    let root_override = args.root;
+    let loader_config = cli_loader_config_for_entry(
+        root_override
+            .as_deref()
+            .unwrap_or_else(|| suite.default_root()),
+    )
+    .await;
     let opts = RunOptions {
         suite,
         filter: args.filter,
-        root_override: args.root,
+        root_override,
+        loader_config: Some(loader_config),
     };
     let report = otter_test::run_suite(&opts)?;
     print_test_report(&report, json);
@@ -1277,13 +1442,22 @@ mod tests {
         )
         .await
         .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("tools/file-tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("tools/file-tool/package.json"),
+            r#"{"name":"file-tool","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
         run_pm_add(
             AddArgs {
                 root: tmp.path().to_path_buf(),
                 dev: false,
                 peer: false,
                 optional: false,
-                packages: vec!["left-pad@^1.3.0".to_string()],
+                packages: vec!["file-tool@file:tools/file-tool".to_string()],
             },
             true,
         )
@@ -1292,11 +1466,11 @@ mod tests {
         let manifest = tokio::fs::read_to_string(tmp.path().join(PACKAGE_JSON))
             .await
             .unwrap();
-        assert!(manifest.contains("\"left-pad\": \"^1.3.0\""));
+        assert!(manifest.contains("\"file-tool\": \"file:tools/file-tool\""));
         let lockfile = tokio::fs::read_to_string(tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME))
             .await
             .unwrap();
-        assert!(lockfile.contains("left-pad@npm:^1.3.0"));
+        assert!(lockfile.contains("file-tool@file:tools/file-tool"));
     }
 
     #[tokio::test]
@@ -1387,5 +1561,193 @@ mod tests {
             RunTarget::Bin(bin) => assert!(bin.path.ends_with("packages/tool/tool.ts")),
             other => panic!("expected bin, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_target_force_bin_resolves_installed_registry_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
+            r#"lockfile_version = 1
+
+[packages."tool@npm:^1.0.0"]
+name = "tool"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."tool@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz"
+
+[packages."tool@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","bin":{"tool":"./tool.ts"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/.bin"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("node_modules/.bin/tool"), "undefined;")
+            .await
+            .unwrap();
+        let args = RunArgs {
+            target: "tool".to_string(),
+            script: false,
+            bin: true,
+            args: Vec::new(),
+        };
+        let resolved = resolve_run_target(tmp.path(), &args).await.unwrap();
+        match resolved {
+            RunTarget::Bin(bin) => assert!(bin.path.ends_with("node_modules/.bin/tool")),
+            other => panic!("expected bin, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_uses_installed_package_graph_for_bare_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("entry.ts"),
+            r#"import { value } from "tool";
+function fail() { return undefined.x; }
+fail();
+value;
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
+            r#"lockfile_version = 1
+
+[packages."tool@npm:^1.0.0"]
+name = "tool"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."tool@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz"
+
+[packages."tool@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","main":"index.js"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/index.js"),
+            "export let value = 17;\n",
+        )
+        .await
+        .unwrap();
+
+        run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_uses_installed_package_graph_for_bare_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let suite_root = tmp.path().join("tests");
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(&suite_root).await.unwrap();
+        tokio::fs::write(
+            suite_root.join("uses-tool.ts"),
+            r#"import { value } from "tool";
+function fail() { return undefined.x; }
+if (value !== 17) fail();
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
+            r#"lockfile_version = 1
+
+[packages."tool@npm:^1.0.0"]
+name = "tool"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."tool@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz"
+
+[packages."tool@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","main":"index.js"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/index.js"),
+            "export let value = 17;\n",
+        )
+        .await
+        .unwrap();
+
+        let code = run_test(
+            TestArgs {
+                suite: "engine".to_string(),
+                filter: None,
+                root: Some(suite_root),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 }

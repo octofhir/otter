@@ -5,7 +5,8 @@
 //!     ../../../docs/book/src/contributing/test-harness.md
 //!   ). The harness supports TOML metadata, `engine`, `smoke`, and
 //! `test262` suites, exit-code assertions, a fresh runtime per
-//! fixture, and NDJSON `--json` output.
+//! fixture, optional caller-provided module-loader configuration, and NDJSON
+//! `--json` output.
 //!
 //! # Contents
 //! - [`Suite`] — suite enum (`Engine`, `Smoke`, `Test262`).
@@ -19,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use otter_runtime::{Otter, OtterError};
+use otter_runtime::{OtterError, Runtime, module_loader::LoaderConfig};
 use serde::{Deserialize, Serialize};
 
 /// Stable JSON wire-format version for the harness output.
@@ -69,6 +70,10 @@ pub struct RunOptions {
     pub filter: Option<String>,
     /// Optional override for the suite root.
     pub root_override: Option<PathBuf>,
+    /// Optional runtime loader config. Callers may provide an installed
+    /// package graph without making this harness depend on package-manager
+    /// crates. The fixture parent directory replaces `base_dir` per test.
+    pub loader_config: Option<LoaderConfig>,
 }
 
 impl RunOptions {
@@ -227,7 +232,7 @@ pub fn run_suite(opts: &RunOptions) -> Result<Report, OtterError> {
         }
 
         let start = std::time::Instant::now();
-        let record = run_fixture(&path, &display_name);
+        let record = run_fixture(&path, &display_name, opts.loader_config.as_ref());
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         match &record.outcome {
@@ -319,7 +324,7 @@ fn discover(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), OtterError> {
     Ok(())
 }
 
-fn run_fixture(path: &Path, display: &str) -> TestRecord {
+fn run_fixture(path: &Path, display: &str, loader_config: Option<&LoaderConfig>) -> TestRecord {
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -339,8 +344,21 @@ fn run_fixture(path: &Path, display: &str) -> TestRecord {
     let expected_exit = metadata.expect.exit_code.unwrap_or(0);
     let display_name = metadata.name.clone().unwrap_or_else(|| display.to_string());
 
-    let otter = Otter::new();
-    let outcome = match otter.blocking_run_file(path) {
+    let mut runtime = match build_fixture_runtime(path, loader_config) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return TestRecord {
+                kind: "test",
+                name: display_name,
+                path: display.to_string(),
+                outcome: Outcome::Crash {
+                    reason: err.to_string(),
+                },
+                duration_ms: 0,
+            };
+        }
+    };
+    let outcome = match runtime.run_file(path) {
         Ok(_) => {
             if expected_exit == 0 {
                 Outcome::Passed
@@ -369,6 +387,21 @@ fn run_fixture(path: &Path, display: &str) -> TestRecord {
         outcome,
         duration_ms: 0,
     }
+}
+
+fn build_fixture_runtime(
+    path: &Path,
+    loader_config: Option<&LoaderConfig>,
+) -> Result<Runtime, OtterError> {
+    let Some(loader_config) = loader_config else {
+        return Runtime::builder().build();
+    };
+    let mut loader_config = loader_config.clone();
+    loader_config.base_dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    Runtime::builder().module_loader(loader_config).build()
 }
 
 fn parse_metadata(source: &str) -> Option<FixtureMetadata> {

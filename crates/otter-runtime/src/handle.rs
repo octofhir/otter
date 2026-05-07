@@ -42,6 +42,7 @@ use crate::{ExecutionResult, OtterError, Runtime, RuntimeConfig, SourceInput};
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
 
 type RunReply = oneshot::Sender<Result<ExecutionResult, OtterError>>;
+type CheckReply = oneshot::Sender<Result<(), OtterError>>;
 
 type CommandId = u64;
 
@@ -174,6 +175,11 @@ enum RuntimeMessage {
 }
 
 enum RuntimeCommand {
+    CheckFile {
+        id: CommandId,
+        path: PathBuf,
+        reply: CheckReply,
+    },
     RunFile {
         id: CommandId,
         path: PathBuf,
@@ -294,6 +300,22 @@ impl RuntimeHandle {
             reply,
         }))?;
         self.await_run_reply(rx).await
+    }
+
+    /// Parse and compile a file through the isolate runner without executing
+    /// user code.
+    ///
+    /// # Errors
+    /// See [`OtterError`].
+    pub async fn check_file(&self, path: impl Into<PathBuf>) -> Result<(), OtterError> {
+        let (reply, rx) = oneshot::channel();
+        let id = self.next_command_id();
+        self.submit(RuntimeMessage::Command(RuntimeCommand::CheckFile {
+            id,
+            path: path.into(),
+            reply,
+        }))?;
+        self.await_check_reply(rx).await
     }
 
     /// Run a JavaScript or TypeScript source bundle through the
@@ -654,6 +676,52 @@ impl RuntimeHandle {
             }),
         }
     }
+
+    async fn await_check_reply(
+        &self,
+        rx: oneshot::Receiver<Result<(), OtterError>>,
+    ) -> Result<(), OtterError> {
+        let timeout = self.inner.command_timeout;
+        let outcome = if timeout == Duration::ZERO {
+            rx.await
+        } else {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    self.inner
+                        .counters
+                        .timed_out_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .counters
+                        .failed_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.interrupt();
+                    return Err(OtterError::timeout_after(timeout));
+                }
+            }
+        };
+        match outcome {
+            Ok(Ok(())) => {
+                self.inner
+                    .counters
+                    .completed_commands
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                self.inner
+                    .counters
+                    .failed_commands
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+            Err(_) => Err(OtterError::Internal {
+                code: "RUNTIME_REPLY_DROPPED".to_string(),
+                message: "runtime isolate dropped command reply".to_string(),
+            }),
+        }
+    }
 }
 
 impl Drop for RuntimeHandleInner {
@@ -830,6 +898,9 @@ impl IsolateRunner {
         self.counters.running_command.store(true, Ordering::Relaxed);
         self.runtime.interrupt_handle().reset();
         match command {
+            RuntimeCommand::CheckFile { path, reply, .. } => {
+                send_check_reply(reply, self.runtime.check_file(path), &self.counters);
+            }
             RuntimeCommand::RunFile { path, reply, .. } => {
                 send_run_reply(reply, self.runtime.run_file(path), &self.counters);
             }
@@ -872,7 +943,8 @@ impl IsolateRunner {
 impl RuntimeCommand {
     fn id(&self) -> CommandId {
         match self {
-            RuntimeCommand::RunFile { id, .. }
+            RuntimeCommand::CheckFile { id, .. }
+            | RuntimeCommand::RunFile { id, .. }
             | RuntimeCommand::RunScript { id, .. }
             | RuntimeCommand::RunModule { id, .. }
             | RuntimeCommand::Eval { id, .. } => *id,
@@ -885,6 +957,12 @@ fn send_run_reply(
     result: Result<ExecutionResult, OtterError>,
     counters: &RuntimeCounters,
 ) {
+    if reply.send(result).is_err() {
+        counters.cancelled_waiters.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn send_check_reply(reply: CheckReply, result: Result<(), OtterError>, counters: &RuntimeCounters) {
     if reply.send(result).is_err() {
         counters.cancelled_waiters.fetch_add(1, Ordering::Relaxed);
     }

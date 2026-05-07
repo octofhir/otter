@@ -46,13 +46,16 @@ toml        = "0.9"
 semver      = "1"
 base64      = "0.22"
 sha2        = "0.10"
+reqwest     = { version = "0.13.3", default-features = false, features = ["rustls", "http2", "json", "gzip"] }
+flate2      = "1.1.9"
+tar         = "0.4.45"
 
 # CLI / diagnostics / tracing.
 clap                = { version = "4", features = ["derive"] }
 miette              = { version = "7", features = ["fancy"] }
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
-tokio               = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util", "process"] }
+tokio               = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util", "process", "net"] }
 
 # Collections / utilities.
 smallvec    = "1"

@@ -1,0 +1,16 @@
+{
+  "name": "fixture-app",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "entry.ts",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "otter test --root tests"
+  },
+  "dependencies": {
+    "fixture-tool": "^1.0.0",
+    "workspace-lib": "workspace:*"
+  }
+}

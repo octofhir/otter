@@ -29,19 +29,38 @@ cargo install otterjs
 ## CLI Usage
 
 ```bash
-# Run a file
+# Create or update a package project
+otter init -y
+otter add left-pad
+otter install
+otter outdated
+
+# Run a file, package script, or local package binary
 otter run app.ts
 otter app.ts                    # shorthand
+otter run test                  # package.json#scripts.test
+otter run eslint                # local node_modules/.bin/eslint
+
+# Check and test through the same module resolver
+otter check app.ts
+otter test
+
+# Diagnose without changing the package graph
+otter --dump-bytecode=json app.ts
 
 # Evaluate inline code
 otter -e "console.log('hi')"
 
-# Runtime info and init
+# Runtime info
 otter info
-otter init
 ```
 
-The current CLI intentionally keeps a smaller active surface. `repl`, `test`, and `build` are not active commands at this stage.
+The active developer loop is `init -> install/add/remove -> run/check/test -> diagnose/profile`.
+`run` is the single execution command for files, package scripts, and package
+binaries; there is no separate `exec` or `build` command in the current surface.
+Otter writes `otter-lock`, and can read `pnpm-lock.yaml`,
+`npm-shrinkwrap.json`, and `package-lock.json` for migration when `otter-lock`
+is not present.
 
 ### Permissions
 

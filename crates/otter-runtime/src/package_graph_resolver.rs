@@ -9,16 +9,22 @@
 //! # Contents
 //! - [`resolve_from_package_graph`] resolves one bare specifier from an
 //!   importer directory and import kind.
+//! - [`resolve_imports_from_package_graph`] resolves one `#` package import
+//!   specifier from the containing package scope.
 //! - package `exports` helpers implement the foundation string, subpath-map,
 //!   and condition-object forms for graph-backed packages.
+//! - package `imports` helpers implement exact string and condition-object
+//!   forms for graph-backed packages.
 //!
 //! # Invariants
 //! - Only packages present in the graph dependency edges are considered.
+//! - Package `imports` specifiers only resolve inside the longest containing
+//!   package root and only for targets rooted at `./`.
 //! - When a package declares `exports`, non-exported subpaths are blocked
 //!   instead of falling through to filesystem subpath lookup.
 //! - The longest containing package root wins for nested packages.
-//! - Missing graph entries return `Ok(None)` so the loader can fall back to its
-//!   filesystem resolver.
+//! - Graph-contained importers never fall through to filesystem package lookup
+//!   for bare package specifiers.
 //!
 //! # See also
 //! - [`crate::module_loader`] for the host loader surface.
@@ -27,14 +33,72 @@
 use std::path::{Path, PathBuf};
 
 use crate::module_loader::{
-    ImportKind, LoaderPackageGraph, LoaderPackageRoot, resolve_with_extensions,
+    ImportKind, LoaderPackageDependencyKind, LoaderPackageGraph, LoaderPackageRoot,
+    resolve_with_configured_extensions,
 };
+
+/// Immutable index for longest-root package-scope lookup.
+///
+/// Built once by [`crate::module_loader::ModuleLoader`] from the read-only
+/// loader DTO, then reused for `exports` and `imports` resolution.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PackageScopeCache {
+    roots: Vec<PackageScopeRoot>,
+}
+
+#[derive(Debug, Clone)]
+struct PackageScopeRoot {
+    root: PathBuf,
+    depth: usize,
+    package_id: String,
+}
+
+impl PackageScopeCache {
+    /// Build a scope cache from graph package roots.
+    #[must_use]
+    pub(crate) fn from_graph(graph: &LoaderPackageGraph) -> Self {
+        let mut roots = graph
+            .packages
+            .values()
+            .map(|package| {
+                let root =
+                    std::fs::canonicalize(&package.root).unwrap_or_else(|_| package.root.clone());
+                PackageScopeRoot {
+                    depth: root.components().count(),
+                    root,
+                    package_id: package.id.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by(|a, b| {
+            b.depth
+                .cmp(&a.depth)
+                .then_with(|| a.package_id.cmp(&b.package_id))
+        });
+        Self { roots }
+    }
+
+    pub(crate) fn containing_package<'a>(
+        &self,
+        graph: &'a LoaderPackageGraph,
+        importer_dir: &Path,
+    ) -> Option<&'a LoaderPackageRoot> {
+        let importer_dir =
+            std::fs::canonicalize(importer_dir).unwrap_or_else(|_| importer_dir.into());
+        self.roots
+            .iter()
+            .find(|scope| importer_dir.starts_with(&scope.root))
+            .and_then(|scope| graph.package(&scope.package_id))
+    }
+}
 
 /// Resolve `specifier` from `importer_dir` through a package graph.
 ///
-/// Returns `Ok(None)` when the graph does not contain enough information for
-/// this specifier. In that case the caller should continue with the normal
-/// `node_modules` resolver.
+/// Returns `Ok(None)` when the specifier is not a bare package specifier or
+/// the importer is outside the graph. Once an importer is inside a graph
+/// package, undeclared bare dependencies are hard resolver errors and must not
+/// fall through to disk `node_modules` lookup.
+#[cfg(test)]
 pub(crate) fn resolve_from_package_graph(
     graph: &LoaderPackageGraph,
     specifier: &str,
@@ -42,44 +106,199 @@ pub(crate) fn resolve_from_package_graph(
     kind: ImportKind,
     conditions: &[String],
 ) -> Result<Option<PathBuf>, String> {
+    let scope_cache = PackageScopeCache::from_graph(graph);
+    resolve_from_package_graph_with_scope_cache(
+        graph,
+        &scope_cache,
+        specifier,
+        importer_dir,
+        kind,
+        conditions,
+        crate::module_loader::DEFAULT_EXTENSIONS,
+    )
+}
+
+/// Resolve `specifier` from `importer_dir` through a package graph using a
+/// prebuilt package-scope cache.
+pub(crate) fn resolve_from_package_graph_with_scope_cache<S: AsRef<str>>(
+    graph: &LoaderPackageGraph,
+    scope_cache: &PackageScopeCache,
+    specifier: &str,
+    importer_dir: &Path,
+    kind: ImportKind,
+    conditions: &[String],
+    extensions: &[S],
+) -> Result<Option<PathBuf>, String> {
     let Some((package_name, subpath)) = split_package_specifier(specifier) else {
         return Ok(None);
     };
-    let Some(importer_package) = containing_package(graph, importer_dir) else {
+    let Some(importer_package) = scope_cache.containing_package(graph, importer_dir) else {
         return Ok(None);
     };
-    let Some(dependencies) = graph.dependencies.get(&importer_package.id) else {
-        return Ok(None);
+    let (target, dependency_kind) = if package_name == importer_package.name {
+        (importer_package, LoaderPackageDependencyKind::Runtime)
+    } else {
+        let Some(target_id) = graph
+            .dependencies
+            .get(&importer_package.id)
+            .and_then(|dependencies| dependencies.get(package_name))
+        else {
+            return Err(format!(
+                "package `{}` does not declare dependency `{package_name}`",
+                importer_package.name
+            ));
+        };
+        let dependency_kind = graph
+            .dependency_kind(&importer_package.id, package_name)
+            .unwrap_or(LoaderPackageDependencyKind::Runtime);
+        let Some(target) = graph.package(target_id) else {
+            if dependency_kind == LoaderPackageDependencyKind::Peer
+                && let Some(peer_target) = installed_package_by_name(graph, package_name)
+            {
+                return finish_package_resolution(
+                    importer_package,
+                    package_name,
+                    peer_target,
+                    dependency_kind,
+                    subpath,
+                    kind,
+                    conditions,
+                    extensions,
+                );
+            }
+            return Err(format!(
+                "package `{}` dependency `{package_name}` points to missing graph package `{target_id}`",
+                importer_package.name
+            ));
+        };
+        if dependency_kind == LoaderPackageDependencyKind::Peer
+            && !target.root.exists()
+            && let Some(peer_target) = installed_package_by_name(graph, package_name)
+        {
+            (peer_target, dependency_kind)
+        } else {
+            (target, dependency_kind)
+        }
     };
-    let Some(target_id) = dependencies.get(package_name) else {
-        return Ok(None);
-    };
-    let Some(target) = graph.package(target_id) else {
-        return Ok(None);
-    };
+    finish_package_resolution(
+        importer_package,
+        package_name,
+        target,
+        dependency_kind,
+        subpath,
+        kind,
+        conditions,
+        extensions,
+    )
+}
+
+fn finish_package_resolution<S: AsRef<str>>(
+    importer_package: &LoaderPackageRoot,
+    package_name: &str,
+    target: &LoaderPackageRoot,
+    dependency_kind: LoaderPackageDependencyKind,
+    subpath: Option<&str>,
+    kind: ImportKind,
+    conditions: &[String],
+    extensions: &[S],
+) -> Result<Option<PathBuf>, String> {
+    ensure_dependency_root_installed(importer_package, package_name, target, dependency_kind)?;
     let candidate = package_entry_candidate(target, subpath, kind, conditions)?;
-    let resolved = resolve_with_extensions(&candidate)?;
+    let resolved = resolve_with_configured_extensions(&candidate, extensions)?;
     ensure_within_package(target, &resolved)?;
     Ok(Some(resolved))
 }
 
-fn containing_package<'a>(
+fn installed_package_by_name<'a>(
     graph: &'a LoaderPackageGraph,
-    importer_dir: &Path,
+    package_name: &str,
 ) -> Option<&'a LoaderPackageRoot> {
-    let importer_dir = std::fs::canonicalize(importer_dir).unwrap_or_else(|_| importer_dir.into());
     graph
         .packages
         .values()
-        .filter_map(|package| {
-            let root =
-                std::fs::canonicalize(&package.root).unwrap_or_else(|_| package.root.clone());
-            importer_dir
-                .starts_with(&root)
-                .then_some((root.components().count(), package))
-        })
-        .max_by_key(|(depth, _)| *depth)
-        .map(|(_, package)| package)
+        .find(|package| package.name == package_name && package.root.exists())
+}
+
+fn ensure_dependency_root_installed(
+    importer: &LoaderPackageRoot,
+    dependency_name: &str,
+    target: &LoaderPackageRoot,
+    dependency_kind: LoaderPackageDependencyKind,
+) -> Result<(), String> {
+    if target.root.exists() {
+        return Ok(());
+    }
+    if dependency_kind == LoaderPackageDependencyKind::Optional {
+        return Err(format!(
+            "optional dependency `{dependency_name}` for package `{}` is not installed at `{}`",
+            importer.name,
+            target.root.display()
+        ));
+    }
+    if dependency_kind == LoaderPackageDependencyKind::Peer {
+        return Err(format!(
+            "peer dependency `{dependency_name}` for package `{}` is not installed at `{}`",
+            importer.name,
+            target.root.display()
+        ));
+    }
+    Err(format!(
+        "dependency `{dependency_name}` for package `{}` is not installed at `{}`",
+        importer.name,
+        target.root.display()
+    ))
+}
+
+/// Resolve a package `imports` specifier (`#alias`) from the containing
+/// package scope.
+///
+/// Returns `Ok(None)` when no containing graph package exists. Once an
+/// importer is inside a graph package, missing or invalid import mappings are
+/// hard resolver errors and must not fall back to `node_modules`.
+#[cfg(test)]
+pub(crate) fn resolve_imports_from_package_graph(
+    graph: &LoaderPackageGraph,
+    specifier: &str,
+    importer_dir: &Path,
+    conditions: &[String],
+) -> Result<Option<PathBuf>, String> {
+    let scope_cache = PackageScopeCache::from_graph(graph);
+    resolve_imports_from_package_graph_with_scope_cache(
+        graph,
+        &scope_cache,
+        specifier,
+        importer_dir,
+        conditions,
+        crate::module_loader::DEFAULT_EXTENSIONS,
+    )
+}
+
+/// Resolve a package `imports` specifier using a prebuilt package-scope cache.
+pub(crate) fn resolve_imports_from_package_graph_with_scope_cache<S: AsRef<str>>(
+    graph: &LoaderPackageGraph,
+    scope_cache: &PackageScopeCache,
+    specifier: &str,
+    importer_dir: &Path,
+    conditions: &[String],
+    extensions: &[S],
+) -> Result<Option<PathBuf>, String> {
+    if !specifier.starts_with('#') {
+        return Ok(None);
+    }
+    let Some(importer_package) = scope_cache.containing_package(graph, importer_dir) else {
+        return Ok(None);
+    };
+    let Some(imports) = &importer_package.imports else {
+        return Err(format!(
+            "package `{}` has no imports map for specifier `{specifier}`",
+            importer_package.name
+        ));
+    };
+    let target = resolve_package_imports_value(importer_package, imports, specifier, conditions)?;
+    let candidate = package_target_candidate(importer_package, &target, "import", specifier)?;
+    let resolved = resolve_with_configured_extensions(&candidate, extensions)?;
+    ensure_within_package(importer_package, &resolved)?;
+    Ok(Some(resolved))
 }
 
 fn package_entry_candidate(
@@ -124,13 +343,7 @@ fn package_exports_candidate(
         .map(|subpath| format!("./{subpath}"))
         .unwrap_or_else(|| ".".to_string());
     let target = resolve_package_exports_value(package, exports, &export_subpath, conditions)?;
-    let Some(relative) = target.strip_prefix("./") else {
-        return Err(format!(
-            "bad export target for package `{}` subpath `{}`: `{}` must start with `./`",
-            package.name, export_subpath, target
-        ));
-    };
-    Ok(package.root.join(relative))
+    package_target_candidate(package, &target, "export", &export_subpath)
 }
 
 fn resolve_package_exports_value(
@@ -196,6 +409,74 @@ fn resolve_conditional_export(
     }
 }
 
+fn resolve_package_imports_value(
+    package: &LoaderPackageRoot,
+    value: &serde_json::Value,
+    specifier: &str,
+    conditions: &[String],
+) -> Result<String, String> {
+    let serde_json::Value::Object(map) = value else {
+        return Err(format!(
+            "unsupported imports map for package `{}`; expected object",
+            package.name
+        ));
+    };
+    let Some(target) = map.get(specifier) else {
+        return Err(format!(
+            "package `{}` imports map has no entry for `{specifier}`",
+            package.name
+        ));
+    };
+    resolve_conditional_import(package, target, specifier, conditions)
+}
+
+fn resolve_conditional_import(
+    package: &LoaderPackageRoot,
+    value: &serde_json::Value,
+    specifier: &str,
+    conditions: &[String],
+) -> Result<String, String> {
+    match value {
+        serde_json::Value::String(target) => Ok(target.clone()),
+        serde_json::Value::Object(map) => {
+            for condition in conditions {
+                if let Some(target) = map.get(condition) {
+                    return resolve_conditional_import(package, target, specifier, conditions);
+                }
+            }
+            Err(format!(
+                "no matching import condition for package `{}` specifier `{}`; active conditions: {}",
+                package.name,
+                specifier,
+                conditions.join(", ")
+            ))
+        }
+        serde_json::Value::Null => Err(format!(
+            "package `{}` imports map blocks specifier `{specifier}`",
+            package.name
+        )),
+        _ => Err(format!(
+            "unsupported import target for package `{}` specifier `{specifier}`",
+            package.name
+        )),
+    }
+}
+
+fn package_target_candidate(
+    package: &LoaderPackageRoot,
+    target: &str,
+    target_kind: &str,
+    specifier: &str,
+) -> Result<PathBuf, String> {
+    let Some(relative) = target.strip_prefix("./") else {
+        return Err(format!(
+            "bad {target_kind} target for package `{}` specifier `{specifier}`: `{target}` must start with `./`",
+            package.name
+        ));
+    };
+    Ok(package.root.join(relative))
+}
+
 fn is_exports_subpath_map(map: &serde_json::Map<String, serde_json::Value>) -> bool {
     map.keys().any(|key| key == "." || key.starts_with("./"))
 }
@@ -222,7 +503,11 @@ fn ensure_within_package(package: &LoaderPackageRoot, resolved: &Path) -> Result
 }
 
 fn split_package_specifier(specifier: &str) -> Option<(&str, Option<&str>)> {
-    if specifier.starts_with('.') || specifier.starts_with('/') || specifier.contains("://") {
+    if specifier.starts_with('.')
+        || specifier.starts_with('/')
+        || specifier.starts_with('#')
+        || specifier.contains("://")
+    {
         return None;
     }
     if specifier.starts_with('@') {
@@ -433,5 +718,175 @@ mod tests {
         .expect_err("exports must block unexported package subpaths");
 
         assert!(err.contains("does not export subpath `./private.js`"));
+    }
+
+    #[test]
+    fn package_imports_string_mapping_resolves_from_containing_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        std::fs::create_dir_all(app_root.join("src")).unwrap();
+        std::fs::write(app_root.join("src/alias.ts"), "export let x = 1;\n").unwrap();
+        let mut graph = LoaderPackageGraph::new();
+        graph.insert_package(LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({ "#alias": "./src/alias.ts" })),
+            package_type: None,
+        });
+
+        let resolved =
+            resolve_imports_from_package_graph(&graph, "#alias", &app_root, &esm_conditions())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(app_root.join("src/alias.ts")).unwrap()
+        );
+    }
+
+    #[test]
+    fn package_imports_condition_mapping_prefers_otter() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        std::fs::create_dir_all(&app_root).unwrap();
+        std::fs::write(app_root.join("otter.ts"), "export let x = 1;\n").unwrap();
+        std::fs::write(app_root.join("index.ts"), "export let x = 2;\n").unwrap();
+        let mut graph = LoaderPackageGraph::new();
+        graph.insert_package(LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({
+                "#alias": {
+                    "otter": "./otter.ts",
+                    "default": "./index.ts"
+                }
+            })),
+            package_type: None,
+        });
+
+        let resolved =
+            resolve_imports_from_package_graph(&graph, "#alias", &app_root, &esm_conditions())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(app_root.join("otter.ts")).unwrap()
+        );
+    }
+
+    #[test]
+    fn package_imports_missing_alias_reports_stable_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        std::fs::create_dir_all(&app_root).unwrap();
+        let mut graph = LoaderPackageGraph::new();
+        graph.insert_package(LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({ "#known": "./known.ts" })),
+            package_type: None,
+        });
+
+        let err =
+            resolve_imports_from_package_graph(&graph, "#missing", &app_root, &esm_conditions())
+                .expect_err("missing package import must report a resolver diagnostic");
+
+        assert_eq!(err, "package `app` imports map has no entry for `#missing`");
+    }
+
+    #[test]
+    fn package_imports_invalid_target_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        std::fs::create_dir_all(&app_root).unwrap();
+        let mut graph = LoaderPackageGraph::new();
+        graph.insert_package(LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({ "#alias": "../escape.ts" })),
+            package_type: None,
+        });
+
+        let err =
+            resolve_imports_from_package_graph(&graph, "#alias", &app_root, &esm_conditions())
+                .expect_err("invalid package import target must be rejected");
+
+        assert_eq!(
+            err,
+            "bad import target for package `app` specifier `#alias`: `../escape.ts` must start with `./`"
+        );
+    }
+
+    #[test]
+    fn package_scope_cache_uses_longest_containing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        let nested_root = app_root.join("packages/nested");
+        std::fs::create_dir_all(&app_root).unwrap();
+        std::fs::create_dir_all(&nested_root).unwrap();
+        std::fs::write(app_root.join("app.ts"), "export let x = 1;\n").unwrap();
+        std::fs::write(nested_root.join("nested.ts"), "export let x = 2;\n").unwrap();
+        let mut graph = LoaderPackageGraph::new();
+        graph.insert_package(LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({ "#alias": "./app.ts" })),
+            package_type: None,
+        });
+        graph.insert_package(LoaderPackageRoot {
+            id: "nested@workspace:packages/nested".into(),
+            name: "nested".into(),
+            version: "0.1.0".into(),
+            root: nested_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({ "#alias": "./nested.ts" })),
+            package_type: None,
+        });
+        let scope_cache = PackageScopeCache::from_graph(&graph);
+
+        let resolved = resolve_imports_from_package_graph_with_scope_cache(
+            &graph,
+            &scope_cache,
+            "#alias",
+            &nested_root,
+            &esm_conditions(),
+            crate::module_loader::DEFAULT_EXTENSIONS,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(nested_root.join("nested.ts")).unwrap()
+        );
     }
 }

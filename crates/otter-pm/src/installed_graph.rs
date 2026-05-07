@@ -6,7 +6,8 @@
 //!
 //! # Contents
 //! - [`resolve_installed_project`] rebuilds a read-only [`PackageGraph`] from
-//!   `package.json`, `otter-lock`, and already materialized `node_modules`.
+//!   `package.json`, `otter-lock` or compatible npm/pnpm lockfiles, and
+//!   already materialized `node_modules`.
 //! - [`prune_removed_registry_packages`] removes registry package roots and
 //!   project-local bin links that disappeared from the lockfile.
 //!
@@ -23,7 +24,9 @@
 
 use std::path::Path;
 
-use otter_pm_lockfile::{LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind};
+use otter_pm_lockfile::{
+    LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind, project_lockfile_candidates,
+};
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest};
 
 use crate::{
@@ -33,24 +36,15 @@ use crate::{
 };
 
 /// Resolve local/workspace/file packages plus already installed registry
-/// packages from `otter-lock` and `node_modules`.
+/// packages from the first supported project lockfile and `node_modules`.
 pub async fn resolve_installed_project(
     project_root: impl AsRef<Path>,
 ) -> Result<LocalResolution, PackageManagerError> {
     let project_root = project_root.as_ref();
     let mut resolution = resolve_local_project(project_root).await?;
-    let lockfile_path = project_root.join(otter_pm_lockfile::LOCKFILE_NAME);
-    let lockfile_text = match tokio::fs::read_to_string(&lockfile_path).await {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(resolution),
-        Err(err) => {
-            return Err(PackageManagerError::Io {
-                path: lockfile_path,
-                message: err.to_string(),
-            });
-        }
+    let Some(lockfile) = read_project_lockfile(project_root).await? else {
+        return Ok(resolution);
     };
-    let lockfile = Lockfile::parse_toml(&lockfile_text)?;
     for (id, package) in &lockfile.packages {
         let Some(ResolvedSource {
             kind: ResolvedSourceKind::Registry,
@@ -99,6 +93,27 @@ pub async fn resolve_installed_project(
     }
     resolution.lockfile = lockfile;
     Ok(resolution)
+}
+
+async fn read_project_lockfile(
+    project_root: &Path,
+) -> Result<Option<Lockfile>, PackageManagerError> {
+    for (path, format) in project_lockfile_candidates(project_root) {
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(PackageManagerError::Io {
+                    path,
+                    message: err.to_string(),
+                });
+            }
+        };
+        return Lockfile::parse_format(format, &text)
+            .map(Some)
+            .map_err(PackageManagerError::from);
+    }
+    Ok(None)
 }
 
 /// Remove registry package roots and `.bin` links that existed in a previous

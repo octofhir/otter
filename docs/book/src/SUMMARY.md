@@ -15,6 +15,10 @@
 - [Frontend And Compilation](engine/frontend.md)
 - [GC API](engine/gc-api.md)
 
+# Package Manager
+
+- [Development Loop](package-manager/development-loop.md)
+
 # Extensions And Plugins
 
 - [Overview](extensions/overview.md)

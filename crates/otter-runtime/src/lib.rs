@@ -1315,7 +1315,19 @@ impl Runtime {
         if source_path_has_module_extension(path) {
             return self.check_module(path);
         }
+        let package_type = {
+            let loader = self.module_loader_for_entry(path);
+            source_path_package_type(path, &loader)
+        };
+        if package_type == Some(module_loader::LoaderPackageType::Module) {
+            return self.check_module(path);
+        }
         let specifier = path.to_string_lossy().to_string();
+        if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
+            return compile_script_source(&source.text, source.kind, &specifier)
+                .map(|_| ())
+                .map_err(map_compile_error);
+        }
         if !source_path_has_script_extension(path) {
             let module = with_program(&source.text, source.kind, |program| {
                 if program_looks_like_module(program) {
@@ -1359,7 +1371,17 @@ impl Runtime {
         if source_path_has_module_extension(path) {
             return self.run_module(path);
         }
+        let package_type = {
+            let loader = self.module_loader_for_entry(path);
+            source_path_package_type(path, &loader)
+        };
+        if package_type == Some(module_loader::LoaderPackageType::Module) {
+            return self.run_module(path);
+        }
         let specifier = path.to_string_lossy().to_string();
+        if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
+            return self.run_script(source, &specifier);
+        }
         if !source_path_has_script_extension(path) {
             let start = std::time::Instant::now();
             let module = with_program(&source.text, source.kind, |program| {
@@ -1822,6 +1844,16 @@ fn source_path_has_script_extension(path: &Path) -> bool {
         path.extension().and_then(|ext| ext.to_str()),
         Some("cjs" | "cts")
     )
+}
+
+fn source_path_package_type(
+    path: &Path,
+    loader: &module_loader::ModuleLoader,
+) -> Option<module_loader::LoaderPackageType> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("js" | "ts" | "jsx" | "tsx") => loader.package_type_for_path(path),
+        _ => None,
+    }
 }
 
 fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
@@ -2308,6 +2340,75 @@ mod tests {
         loader.package_graph = Some(graph);
         let otter = Otter::builder().module_loader(loader).build().unwrap();
         otter.blocking_run_file(app.join("entry.ts")).unwrap();
+    }
+
+    #[test]
+    fn module_program_imports_package_import_alias_from_loader_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(app.join("src/alias.ts"), "export let value = 19;\n").unwrap();
+        std::fs::write(
+            app.join("entry.ts"),
+            "import { value } from \"#alias\";\nfunction fail() { return undefined.x; }\nif (value !== 19) fail();\n",
+        )
+        .unwrap();
+
+        let mut graph = module_loader::LoaderPackageGraph::new();
+        graph.insert_package(module_loader::LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(serde_json::json!({ "#alias": "./src/alias.ts" })),
+            package_type: None,
+        });
+
+        let mut loader = module_loader::LoaderConfig::new(app.clone());
+        loader.enable_node_modules = false;
+        loader.package_graph = Some(graph);
+        let otter = Otter::builder().module_loader(loader).build().unwrap();
+        otter.blocking_run_file(app.join("entry.ts")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn commonjs_package_type_forces_script_parse_for_ambiguous_js() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("dep.js"), "export let value = 1;\n").unwrap();
+        std::fs::write(
+            app.join("entry.js"),
+            "import { value } from \"./dep.js\";\nvalue;\n",
+        )
+        .unwrap();
+
+        let mut graph = module_loader::LoaderPackageGraph::new();
+        graph.insert_package(module_loader::LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: None,
+            package_type: Some(module_loader::LoaderPackageType::CommonJs),
+        });
+
+        let mut loader = module_loader::LoaderConfig::new(app.clone());
+        loader.enable_node_modules = false;
+        loader.package_graph = Some(graph);
+        let otter = Otter::builder().module_loader(loader).build().unwrap();
+
+        let err = otter
+            .check_file(app.join("entry.js"))
+            .await
+            .expect_err("commonjs package type should parse ambiguous .js as script");
+        assert!(matches!(err, OtterError::Compile { .. }));
     }
 
     #[tokio::test]

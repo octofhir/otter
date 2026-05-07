@@ -1991,6 +1991,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installed_project_can_import_package_lock_without_otter_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        write(
+            &project.join("package.json"),
+            r#"{"name":"app","version":"0.1.0","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await;
+        write(
+            &project.join("package-lock.json"),
+            r#"{
+  "name": "app",
+  "version": "0.1.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "app",
+      "version": "0.1.0",
+      "dependencies": {
+        "tool": "^1.0.0"
+      }
+    },
+    "node_modules/tool": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/tool/-/tool-1.2.0.tgz",
+      "integrity": "sha512-tool"
+    }
+  }
+}"#,
+        )
+        .await;
+        write(
+            &project.join("node_modules/tool/package.json"),
+            r#"{"name":"tool","version":"1.2.0"}"#,
+        )
+        .await;
+
+        let resolution = resolve_installed_project(&project).await.unwrap();
+        let app = PackageId::root_workspace("app");
+        let tool = PackageId::registry("tool", "^1.0.0");
+
+        assert!(resolution.graph.package(&tool).is_some());
+        assert_eq!(
+            resolution
+                .graph
+                .dependencies
+                .get(&app)
+                .and_then(|deps| deps.get("tool")),
+            Some(&tool)
+        );
+        assert_eq!(
+            resolution
+                .lockfile
+                .packages
+                .get("tool@npm:^1.0.0")
+                .map(|package| package.version.as_str()),
+            Some("1.2.0")
+        );
+    }
+
+    #[tokio::test]
     async fn http_clients_fetch_registry_metadata_and_tarballs() {
         let metadata = r#"{
           "name": "pkg",

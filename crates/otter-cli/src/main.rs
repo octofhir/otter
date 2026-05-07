@@ -4,7 +4,7 @@
 //! phase command surface from
 //! [the public runtime architecture](../../../docs/book/src/engine/architecture.md):
 //! `run`, `<file>` shorthand, `eval`, `-e`, `-p`, `check`, `test`,
-//! `install`, `add`, `remove`, `init`, `info`, `--dump-bytecode[=json]`. Slice tasks `09`+ extend
+//! `install`, `add`, `remove`, `outdated`, `init`, `info`, `--dump-bytecode[=json]`. Slice tasks `09`+ extend
 //! behavior; this binary owns the argument parsing and exit-code
 //! mapping.
 //!
@@ -19,6 +19,8 @@
 //! - JSON outputs (`--json`, `--dump-bytecode=json`, error payloads)
 //!   match the documented CLI and bytecode-dump wire formats.
 
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,12 +29,13 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use otter_bytecode::{disasm::disassemble, dump::to_json_pretty};
 use otter_pm_lockfile::Lockfile;
-use otter_pm_manifest::{PACKAGE_JSON, PackageManifest, PackageType};
+use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
 use otter_runtime::{
     BooleanPermission, CapabilitySet, Diagnostic, OtterError, Permission, SourceInput,
 };
 use otter_test::{Report, RunOptions, Suite};
 use otter_web::WebApiBuilderExt;
+use semver::{Version, VersionReq};
 
 /// Otter — JS/TS engine (foundation phase).
 #[derive(Debug, Parser)]
@@ -312,6 +315,8 @@ enum Command {
     Add(AddArgs),
     /// Remove dependencies from `package.json`, then refresh `otter-lock`.
     Remove(RemoveArgs),
+    /// Check registry versions newer than the installed lockfile.
+    Outdated(OutdatedArgs),
     /// Create a new `package.json`.
     Init(InitArgs),
     /// Evaluate an expression.
@@ -371,6 +376,22 @@ struct RemoveArgs {
     root: PathBuf,
     /// Package names to remove from all dependency buckets.
     packages: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct OutdatedArgs {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    /// Include devDependencies.
+    #[arg(long)]
+    dev: bool,
+    /// Include peerDependencies.
+    #[arg(long)]
+    peer: bool,
+    /// Include optionalDependencies.
+    #[arg(long)]
+    optional: bool,
 }
 
 #[derive(Debug, Args)]
@@ -458,6 +479,7 @@ async fn main() -> ExitCode {
         (Some(Command::Install(args)), _) => run_pm_install(&args.root, json).await,
         (Some(Command::Add(args)), _) => run_pm_add(args, json).await,
         (Some(Command::Remove(args)), _) => run_pm_remove(args, json).await,
+        (Some(Command::Outdated(args)), _) => run_pm_outdated(args, json).await,
         (Some(Command::Init(args)), _) => run_pm_init(args, json).await,
         (Some(Command::Eval(args)), _) => {
             run_eval(&args.expression, args.print, json, &caps, &startup_timer).await
@@ -680,7 +702,7 @@ async fn resolve_run_bin(project_root: &Path, target: &str) -> Result<RunTarget,
         [] => Err(pm_config_error(format!(
             "unknown local package binary `{target}`"
         ))),
-        [bin] => Ok(RunTarget::Bin(bin.clone())),
+        [bin] => Ok(RunTarget::Bin(resolve_bin_source_path(&graph, bin))),
         many => Err(pm_config_error(format!(
             "ambiguous local package binary `{target}`\n  candidates:\n{}",
             many.iter()
@@ -689,6 +711,31 @@ async fn resolve_run_bin(project_root: &Path, target: &str) -> Result<RunTarget,
                 .join("\n")
         ))),
     }
+}
+
+fn resolve_bin_source_path(
+    graph: &otter_pm::PackageGraph,
+    bin: &otter_pm::PackageBin,
+) -> otter_pm::PackageBin {
+    let Some(package) = graph.package(&bin.package) else {
+        return bin.clone();
+    };
+    let Some(bin_manifest) = &package.manifest.bin else {
+        return bin.clone();
+    };
+    let source_path = match bin_manifest {
+        PackageBinManifest::Path(path) => Some(package.root.join(path)),
+        PackageBinManifest::Map(bins) => bins.get(&bin.name).map(|path| package.root.join(path)),
+    }
+    .filter(|path| path.exists());
+    source_path.map_or_else(
+        || bin.clone(),
+        |path| otter_pm::PackageBin {
+            package: bin.package.clone(),
+            name: bin.name.clone(),
+            path,
+        },
+    )
 }
 
 async fn run_package_script(
@@ -853,14 +900,38 @@ fn loader_graph_from_pm(
     }
     for (from, dependencies) in &graph.dependencies {
         for (name, target) in dependencies {
-            loader_graph.insert_dependency(
+            let kind = graph
+                .dependency_kind(from, name)
+                .map(loader_dependency_kind_from_pm)
+                .unwrap_or(otter_runtime::module_loader::LoaderPackageDependencyKind::Runtime);
+            loader_graph.insert_dependency_with_kind(
                 from.as_str().to_string(),
                 name.clone(),
                 target.as_str().to_string(),
+                kind,
             );
         }
     }
     loader_graph
+}
+
+fn loader_dependency_kind_from_pm(
+    kind: otter_pm::PackageDependencyKind,
+) -> otter_runtime::module_loader::LoaderPackageDependencyKind {
+    match kind {
+        otter_pm::PackageDependencyKind::Runtime => {
+            otter_runtime::module_loader::LoaderPackageDependencyKind::Runtime
+        }
+        otter_pm::PackageDependencyKind::Development => {
+            otter_runtime::module_loader::LoaderPackageDependencyKind::Development
+        }
+        otter_pm::PackageDependencyKind::Peer => {
+            otter_runtime::module_loader::LoaderPackageDependencyKind::Peer
+        }
+        otter_pm::PackageDependencyKind::Optional => {
+            otter_runtime::module_loader::LoaderPackageDependencyKind::Optional
+        }
+    }
 }
 
 async fn run_check(
@@ -1125,16 +1196,300 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
     Ok(ExitCode::SUCCESS)
 }
 
-async fn read_lockfile_if_present(root: &Path) -> Result<Option<Lockfile>, OtterError> {
-    let path = root.join(otter_pm_lockfile::LOCKFILE_NAME);
-    let text = match tokio::fs::read_to_string(&path).await {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(pm_io_error(&path, err)),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutdatedPackage {
+    name: String,
+    bucket: &'static str,
+    current: String,
+    wanted: String,
+    latest: String,
+    range: String,
+    bump: VersionBump,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum VersionBump {
+    Patch,
+    Minor,
+    Major,
+    Unknown,
+}
+
+impl VersionBump {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Minor => "minor",
+            Self::Major => "major",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+async fn run_pm_outdated(args: OutdatedArgs, json: bool) -> Result<ExitCode, OtterError> {
+    let manifest = PackageManifest::read_from_dir(&args.root)
+        .await
+        .map_err(map_manifest_error)?;
+    let lockfile = read_lockfile_if_present(&args.root)
+        .await?
+        .unwrap_or_else(otter_pm_lockfile::Lockfile::new);
+    let cache_root = args.root.join(".otter").join("cache");
+    let cache = otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata"));
+    let client = otter_pm::HttpRegistryMetadataClient::new();
+    let rows = collect_outdated_packages(&manifest, &lockfile, &cache, &client, &args).await?;
+    print_outdated_report(&rows, json);
+    Ok(if rows.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+async fn collect_outdated_packages(
+    manifest: &PackageManifest,
+    lockfile: &Lockfile,
+    cache: &otter_pm::FsRegistryMetadataCache,
+    client: &impl otter_pm::RegistryMetadataClient,
+    args: &OutdatedArgs,
+) -> Result<Vec<OutdatedPackage>, OtterError> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (bucket, dependencies) in manifest.dependency_buckets() {
+        if !outdated_includes_bucket(args, bucket) {
+            continue;
+        }
+        for (name, range) in dependencies {
+            if !seen.insert(name.clone()) || !is_registry_range(range) {
+                continue;
+            }
+            let metadata = cache
+                .get_or_fetch(name, client)
+                .await
+                .map_err(map_pm_error)?;
+            let current =
+                current_locked_version(lockfile, name).unwrap_or_else(|| "<missing>".to_string());
+            let wanted =
+                wanted_registry_version(&metadata, range).unwrap_or_else(|| current.clone());
+            let latest = latest_registry_version(&metadata).unwrap_or_else(|| wanted.clone());
+            if current == wanted && current == latest {
+                continue;
+            }
+            rows.push(OutdatedPackage {
+                name: name.clone(),
+                bucket,
+                current: current.clone(),
+                wanted: wanted.clone(),
+                latest: latest.clone(),
+                range: range.clone(),
+                bump: classify_bump(&current, &latest),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.bucket.cmp(b.bucket)));
+    Ok(rows)
+}
+
+fn outdated_includes_bucket(args: &OutdatedArgs, bucket: &str) -> bool {
+    match bucket {
+        "dependencies" => true,
+        "devDependencies" => args.dev,
+        "peerDependencies" => args.peer,
+        "optionalDependencies" => args.optional,
+        _ => false,
+    }
+}
+
+fn is_registry_range(range: &str) -> bool {
+    !(range.starts_with("workspace:")
+        || range.starts_with("file:")
+        || range.starts_with("http://")
+        || range.starts_with("https://")
+        || range.ends_with(".tgz")
+        || range.ends_with(".tar.gz"))
+}
+
+fn current_locked_version(lockfile: &Lockfile, name: &str) -> Option<String> {
+    lockfile
+        .packages
+        .values()
+        .find(|package| package.name == name)
+        .map(|package| package.version.clone())
+}
+
+fn wanted_registry_version(
+    metadata: &otter_pm::NpmRegistryMetadata,
+    range: &str,
+) -> Option<String> {
+    if let Some(version) = metadata.versions.get(range) {
+        return Some(version.version.clone());
+    }
+    let req = normalize_npm_range_for_cli(range)
+        .and_then(|normalized| VersionReq::parse(&normalized).ok())?;
+    let mut versions = semver_versions(metadata);
+    versions.retain(|version| req.matches(version));
+    versions.pop().map(|version| version.to_string())
+}
+
+fn latest_registry_version(metadata: &otter_pm::NpmRegistryMetadata) -> Option<String> {
+    metadata
+        .dist_tags
+        .get("latest")
+        .filter(|version| metadata.versions.contains_key(*version))
+        .cloned()
+        .or_else(|| {
+            semver_versions(metadata)
+                .pop()
+                .map(|version| version.to_string())
+        })
+}
+
+fn semver_versions(metadata: &otter_pm::NpmRegistryMetadata) -> Vec<Version> {
+    let mut versions = metadata
+        .versions
+        .keys()
+        .filter_map(|version| Version::parse(version).ok())
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions
+}
+
+fn normalize_npm_range_for_cli(range: &str) -> Option<String> {
+    let trimmed = range.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed {
+        "*" | "latest" => Some("*".to_string()),
+        value if value.starts_with('^') || value.starts_with('~') => Some(value.to_string()),
+        value if value.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
+            Some(format!("={value}"))
+        }
+        value => Some(value.to_string()),
+    }
+}
+
+fn classify_bump(current: &str, latest: &str) -> VersionBump {
+    let (Ok(current), Ok(latest)) = (Version::parse(current), Version::parse(latest)) else {
+        return VersionBump::Unknown;
     };
-    Lockfile::parse_toml(&text)
-        .map(Some)
-        .map_err(map_lockfile_error)
+    if latest.major != current.major {
+        VersionBump::Major
+    } else if latest.minor != current.minor {
+        VersionBump::Minor
+    } else if latest.patch != current.patch {
+        VersionBump::Patch
+    } else {
+        VersionBump::Unknown
+    }
+}
+
+fn print_outdated_report(rows: &[OutdatedPackage], json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": rows.is_empty(),
+                "outdated": rows.iter().map(|row| serde_json::json!({
+                    "name": row.name,
+                    "bucket": row.bucket,
+                    "current": row.current,
+                    "wanted": row.wanted,
+                    "latest": row.latest,
+                    "range": row.range,
+                    "bump": row.bump.label()
+                })).collect::<Vec<_>>()
+            })
+        );
+        return;
+    }
+    if rows.is_empty() {
+        println!("all dependencies are up to date");
+        return;
+    }
+    print!("{}", render_outdated_table(rows));
+}
+
+fn render_outdated_table(rows: &[OutdatedPackage]) -> String {
+    let headers = [
+        "Package",
+        "Current",
+        "Wanted",
+        "Latest",
+        "Bump",
+        "Dependency",
+    ];
+    let mut widths = headers.map(str::len);
+    for row in rows {
+        let values = [
+            row.name.as_str(),
+            row.current.as_str(),
+            row.wanted.as_str(),
+            row.latest.as_str(),
+            row.bump.label(),
+            row.bucket,
+        ];
+        for (idx, value) in values.iter().enumerate() {
+            widths[idx] = widths[idx].max(value.len());
+        }
+    }
+    let mut table = String::new();
+    push_table_border(&mut table, "┌", "┬", "┐", &widths);
+    push_table_row(&mut table, &headers, &widths);
+    push_table_border(&mut table, "├", "┼", "┤", &widths);
+    for row in rows {
+        let values = [
+            row.name.as_str(),
+            row.current.as_str(),
+            row.wanted.as_str(),
+            row.latest.as_str(),
+            row.bump.label(),
+            row.bucket,
+        ];
+        push_table_row(&mut table, &values, &widths);
+    }
+    push_table_border(&mut table, "└", "┴", "┘", &widths);
+    table
+}
+
+fn push_table_row(table: &mut String, values: &[&str; 6], widths: &[usize; 6]) {
+    table.push('│');
+    for (idx, value) in values.iter().enumerate() {
+        write!(table, " {:<width$} │", value, width = widths[idx]).expect("write table row");
+    }
+    table.push('\n');
+}
+
+fn push_table_border(
+    table: &mut String,
+    left: &str,
+    junction: &str,
+    right: &str,
+    widths: &[usize; 6],
+) {
+    table.push_str(left);
+    for (idx, width) in widths.iter().enumerate() {
+        table.push_str(&"─".repeat(width + 2));
+        table.push_str(if idx + 1 == widths.len() {
+            right
+        } else {
+            junction
+        });
+    }
+    table.push('\n');
+}
+
+async fn read_lockfile_if_present(root: &Path) -> Result<Option<Lockfile>, OtterError> {
+    for (path, format) in otter_pm_lockfile::project_lockfile_candidates(root) {
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(pm_io_error(&path, err)),
+        };
+        return Lockfile::parse_format(format, &text)
+            .map(Some)
+            .map_err(map_lockfile_error);
+    }
+    Ok(None)
 }
 
 fn build_init_manifest(args: &InitArgs) -> Result<PackageManifest, OtterError> {
@@ -1439,6 +1794,187 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pm_graph_adapter_preserves_dependency_edge_kinds() {
+        let mut graph = otter_pm::PackageGraph::new();
+        let app_id = otter_pm::PackageId::root_workspace("app");
+        let dev_id = otter_pm::PackageId::registry("dev-tool", "^1.0.0");
+        graph.insert_package(otter_pm::PackageRoot {
+            id: app_id.clone(),
+            name: "app".to_string(),
+            version: "0.1.0".to_string(),
+            root: PathBuf::from("/app"),
+            manifest: PackageManifest::default(),
+        });
+        graph.insert_package(otter_pm::PackageRoot {
+            id: dev_id.clone(),
+            name: "dev-tool".to_string(),
+            version: "1.0.0".to_string(),
+            root: PathBuf::from("/app/node_modules/dev-tool"),
+            manifest: PackageManifest::default(),
+        });
+        graph.insert_dependency_with_kind(
+            app_id.clone(),
+            "dev-tool",
+            dev_id,
+            otter_pm::PackageDependencyKind::Development,
+        );
+
+        let loader_graph = loader_graph_from_pm(&graph);
+
+        assert_eq!(
+            loader_graph.dependency_kind(app_id.as_str(), "dev-tool"),
+            Some(otter_runtime::module_loader::LoaderPackageDependencyKind::Development)
+        );
+    }
+
+    #[test]
+    fn outdated_semver_report_distinguishes_wanted_latest_and_bump() {
+        let manifest =
+            PackageManifest::parse_json(r#"{"dependencies":{"alpha":"^1.0.0","beta":"~1.2.0"}}"#)
+                .unwrap();
+        let lockfile = Lockfile::parse_toml(
+            r#"lockfile_version = 1
+
+[packages."alpha@npm:^1.0.0"]
+name = "alpha"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."beta@npm:~1.2.0"]
+name = "beta"
+version = "1.2.0"
+integrity = "sha512-test"
+"#,
+        )
+        .unwrap();
+        let args = OutdatedArgs {
+            root: PathBuf::from("."),
+            dev: false,
+            peer: false,
+            optional: false,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cache = otter_pm::FsRegistryMetadataCache::new(tmp.path());
+        rt.block_on(async {
+            cache
+                .write(&registry_metadata(
+                    "alpha",
+                    "2.0.0",
+                    ["1.0.0", "1.1.0", "2.0.0"],
+                ))
+                .await
+                .unwrap();
+            cache
+                .write(&registry_metadata(
+                    "beta",
+                    "1.2.3",
+                    ["1.2.0", "1.2.3", "1.3.0"],
+                ))
+                .await
+                .unwrap();
+        });
+        let client = otter_pm::FileRegistryMetadataClient::new(tmp.path());
+
+        let rows = rt
+            .block_on(collect_outdated_packages(
+                &manifest, &lockfile, &cache, &client, &args,
+            ))
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        let alpha = rows.iter().find(|row| row.name == "alpha").unwrap();
+        assert_eq!(alpha.current, "1.0.0");
+        assert_eq!(alpha.wanted, "1.1.0");
+        assert_eq!(alpha.latest, "2.0.0");
+        assert_eq!(alpha.bump, VersionBump::Major);
+        let beta = rows.iter().find(|row| row.name == "beta").unwrap();
+        assert_eq!(beta.wanted, "1.2.3");
+        assert_eq!(beta.latest, "1.2.3");
+        assert_eq!(beta.bump, VersionBump::Patch);
+
+        let table = render_outdated_table(&rows);
+        assert!(table.contains("┌"));
+        assert!(table.contains("│ Package"));
+        assert!(table.contains("│ alpha"));
+        assert!(table.contains("major"));
+        assert!(table.contains("└"));
+    }
+
+    #[tokio::test]
+    async fn cli_lockfile_reader_accepts_package_lock_for_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("package-lock.json"),
+            r#"{
+  "name": "app",
+  "version": "0.1.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "app",
+      "version": "0.1.0",
+      "dependencies": {
+        "tool": "^1.0.0"
+      }
+    },
+    "node_modules/tool": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/tool/-/tool-1.2.0.tgz",
+      "integrity": "sha512-tool"
+    }
+  }
+}"#,
+        )
+        .await
+        .unwrap();
+
+        let lockfile = read_lockfile_if_present(tmp.path()).await.unwrap().unwrap();
+        assert_eq!(
+            lockfile
+                .packages
+                .get("tool@npm:^1.0.0")
+                .map(|package| package.version.as_str()),
+            Some("1.2.0")
+        );
+    }
+
+    fn registry_metadata<const N: usize>(
+        name: &str,
+        latest: &str,
+        versions: [&str; N],
+    ) -> otter_pm::NpmRegistryMetadata {
+        let mut dist_tags = std::collections::BTreeMap::new();
+        dist_tags.insert("latest".to_string(), latest.to_string());
+        let versions = versions
+            .into_iter()
+            .map(|version| {
+                (
+                    version.to_string(),
+                    otter_pm::NpmPackageVersion {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        dependencies: Default::default(),
+                        peer_dependencies: Default::default(),
+                        optional_dependencies: Default::default(),
+                        bin: None,
+                        scripts: Default::default(),
+                        dist: Default::default(),
+                    },
+                )
+            })
+            .collect();
+        otter_pm::NpmRegistryMetadata {
+            name: name.to_string(),
+            dist_tags,
+            versions,
+        }
+    }
+
     #[tokio::test]
     async fn pm_init_and_install_write_manifest_and_lockfile() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1631,6 +2167,84 @@ trust = "untrusted"
     }
 
     #[tokio::test]
+    async fn run_installed_registry_bin_resolves_relative_imports_from_package_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
+            r#"lockfile_version = 1
+
+[packages."tool@npm:^1.0.0"]
+name = "tool"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."tool@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz"
+
+[packages."tool@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","type":"module","bin":{"tool":"./tool.ts"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/tool.ts"),
+            r#"import { value } from "./helper.ts";
+function fail() { return undefined.x; }
+if (value !== 53) fail();
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/helper.ts"),
+            "export let value = 53;\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/.bin"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("node_modules/.bin/tool"), "undefined;")
+            .await
+            .unwrap();
+
+        let resolved = resolve_run_bin(tmp.path(), "tool").await.unwrap();
+        let bin = match resolved {
+            RunTarget::Bin(bin) => bin,
+            other => panic!("expected bin, got {other:?}"),
+        };
+        let startup_timer = CliStartupTimer::from_env();
+        let code = run_file(
+            &bin.path,
+            false,
+            None,
+            &CapabilitySet::default(),
+            &startup_timer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
     async fn check_uses_installed_package_graph_for_bare_imports() {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(
@@ -1680,6 +2294,415 @@ trust = "untrusted"
         tokio::fs::write(
             tmp.path().join("node_modules/tool/index.js"),
             "export let value = 17;\n",
+        )
+        .await
+        .unwrap();
+
+        run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_uses_package_json_imports_from_pm_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r##"{
+              "name":"app",
+              "type":"module",
+              "imports":{
+                "#alias":{
+                  "otter":"./src/otter.ts",
+                  "default":"./src/default.ts"
+                }
+              }
+            }"##,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("entry.ts"),
+            r##"import { value } from "#alias";
+function fail() { return undefined.x; }
+if (value !== 23) fail();
+"##,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("src/otter.ts"), "export let value = 23;\n")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("src/default.ts"), "export let value = 0;\n")
+            .await
+            .unwrap();
+
+        run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_package_uses_own_imports_from_pm_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("entry.ts"),
+            r#"import { value } from "tool";
+function fail() { return undefined.x; }
+if (value !== 31) fail();
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
+            r#"lockfile_version = 1
+
+[packages."tool@npm:^1.0.0"]
+name = "tool"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."tool@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz"
+
+[packages."tool@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/package.json"),
+            r##"{
+              "name":"tool",
+              "version":"1.0.0",
+              "main":"index.js",
+              "imports":{
+                "#internal":{
+                  "otter":"./otter.js",
+                  "default":"./default.js"
+                }
+              }
+            }"##,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/index.js"),
+            r##"import { internal } from "#internal";
+export let value = internal;
+"##,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/otter.js"),
+            "export let internal = 31;\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/default.js"),
+            "export let internal = 0;\n",
+        )
+        .await
+        .unwrap();
+
+        run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pm_graph_blocks_undeclared_disk_package_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join(PACKAGE_JSON), r#"{"name":"app"}"#)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("entry.ts"), r#"import "hidden";"#)
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/hidden"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/hidden/package.json"),
+            r#"{"name":"hidden","version":"1.0.0","main":"index.js"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/hidden/index.js"),
+            "undefined;\n",
+        )
+        .await
+        .unwrap();
+
+        let err = run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .expect_err("undeclared disk package must be blocked by PM graph");
+
+        match err {
+            OtterError::Compile { diagnostics } => {
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("does not declare dependency `hidden`")
+                }));
+            }
+            other => panic!("expected compile diagnostic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_dependency_missing_reports_pm_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","optionalDependencies":{"maybe-native":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("entry.ts"), r#"import "maybe-native";"#)
+            .await
+            .unwrap();
+
+        let err = run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .expect_err("missing optional dependency should report PM diagnostic");
+
+        match err {
+            OtterError::Compile { diagnostics } => {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.message.contains(
+                            "optional dependency `maybe-native` for package `app` is not installed"
+                        ))
+                );
+            }
+            other => panic!("expected compile diagnostic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_dependency_missing_reports_pm_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","peerDependencies":{"react":"^19.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("entry.ts"), r#"import "react";"#)
+            .await
+            .unwrap();
+
+        let err = run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .expect_err("missing peer dependency should report PM diagnostic");
+
+        match err {
+            OtterError::Compile { diagnostics } => {
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("peer dependency `react` for package `app` is not installed")
+                }));
+            }
+            other => panic!("expected compile diagnostic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_package_peer_dependency_uses_available_project_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","dependencies":{"plugin":"^1.0.0","react":"^19.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("entry.ts"),
+            r#"import { value } from "plugin";
+function fail() { return undefined.x; }
+if (value !== 61) fail();
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
+            r#"lockfile_version = 1
+
+[packages."plugin@npm:^1.0.0"]
+name = "plugin"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."plugin@npm:^1.0.0".dependencies]
+react = "react@npm:^18.0.0"
+
+[packages."plugin@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/plugin/-/plugin-1.0.0.tgz"
+
+[packages."plugin@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+
+[packages."react@npm:^19.0.0"]
+name = "react"
+version = "19.0.0"
+integrity = "sha512-test"
+
+[packages."react@npm:^19.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/react/-/react-19.0.0.tgz"
+
+[packages."react@npm:^19.0.0".lifecycle]
+trust = "untrusted"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/plugin"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/plugin/package.json"),
+            r#"{"name":"plugin","version":"1.0.0","main":"index.js","peerDependencies":{"react":"^18.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/plugin/index.js"),
+            r#"import { answer } from "react";
+export let value = answer;
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/react"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/react/package.json"),
+            r#"{"name":"react","version":"19.0.0","main":"index.js"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/react/index.js"),
+            "export let answer = 61;\n",
+        )
+        .await
+        .unwrap();
+
+        run_check(
+            &tmp.path().join("entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_package_can_self_reference_without_dependency_edge() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("entry.ts"),
+            r#"import { value } from "tool";
+function fail() { return undefined.x; }
+if (value !== 41) fail();
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME),
+            r#"lockfile_version = 1
+
+[packages."tool@npm:^1.0.0"]
+name = "tool"
+version = "1.0.0"
+integrity = "sha512-test"
+
+[packages."tool@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.npmjs.org/tool/-/tool-1.0.0.tgz"
+
+[packages."tool@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("node_modules/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","main":"index.js"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/index.js"),
+            r#"import { inner } from "tool/self.js";
+export let value = inner;
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("node_modules/tool/self.js"),
+            "export let inner = 41;\n",
         )
         .await
         .unwrap();
@@ -1790,7 +2813,7 @@ trust = "untrusted"
         };
         let resolved = resolve_run_target(&fixture, &args).await.unwrap();
         match resolved {
-            RunTarget::Bin(bin) => assert!(bin.path.ends_with("node_modules/.bin/fixture-tool")),
+            RunTarget::Bin(bin) => assert!(bin.path.ends_with("node_modules/fixture-tool/bin.js")),
             other => panic!("expected fixture-tool bin, got {other:?}"),
         }
     }

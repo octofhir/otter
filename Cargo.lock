@@ -1756,6 +1756,7 @@ dependencies = [
  "otter-runtime",
  "otter-test",
  "otter-web",
+ "semver",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1838,6 +1839,8 @@ name = "otter-pm-lockfile"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "serde_yaml",
  "thiserror",
  "toml",
 ]

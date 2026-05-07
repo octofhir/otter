@@ -1,0 +1,14 @@
+lockfile_version = 1
+
+[packages."fixture-tool@npm:^1.0.0"]
+name = "fixture-tool"
+version = "1.0.0"
+integrity = "sha512-fixture"
+
+[packages."fixture-tool@npm:^1.0.0".resolved]
+kind = "registry"
+reference = "https://registry.example.test/fixture-tool/-/fixture-tool-1.0.0.tgz"
+
+[packages."fixture-tool@npm:^1.0.0".lifecycle]
+trust = "untrusted"
+

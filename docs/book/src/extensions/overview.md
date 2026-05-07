@@ -4,8 +4,8 @@ Otter's extension model is layered:
 
 1. hosted modules inside the workspace;
 2. native bindings compiled with the engine;
-3. future out-of-tree plugin packages;
-4. possible future ABI/FFI boundary for dynamically loaded plugins.
+3. source-level plugin packages when a stable extension crate exists;
+4. ABI/FFI plugins only with explicit versioning and ownership rules.
 
 All layers must preserve the same runtime rules:
 
@@ -29,18 +29,18 @@ the centralized `otter-vm::bootstrap` registry. New JS-visible surfaces
 should use that path unless capability checks or delicate install order
 require a small manual installer that still calls the same builders.
 
-Breaking changes to extension APIs are allowed while the new engine is in
-`crates-next/*` if they improve safety, startup, or steady-state
+Breaking changes to extension APIs are allowed while the active engine API is
+pre-stable if they improve safety, startup, or steady-state
 performance.
 
-The future plugin system remains design-only until the API is stable
-enough to document here fully.
+Plugin details stay design-only until the API is stable enough to document
+here fully.
 
 ## Extension Checklist
 
 For any new JS-visible API:
 
-- choose the active `crates-next/*` crate that owns the behavior;
+- choose the active `crates/*` crate that owns the behavior;
 - decide whether the surface is a global, builtin class, namespace,
   hosted module, or runtime-only helper;
 - enforce permissions at the Rust boundary;

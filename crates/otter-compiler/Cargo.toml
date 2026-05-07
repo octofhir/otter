@@ -1,0 +1,23 @@
+[package]
+name = "otter-compiler"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "AST → bytecode lowering for the Otter foundation engine."
+
+[lints]
+workspace = true
+
+[dependencies]
+otter-bytecode = { workspace = true }
+otter-syntax = { workspace = true }
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_ast_visit = { workspace = true }
+oxc_span = { workspace = true }
+oxc_syntax = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+num-bigint = { workspace = true }
+regress = { workspace = true }

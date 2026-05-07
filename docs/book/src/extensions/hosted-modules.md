@@ -8,11 +8,35 @@ Use hosted modules for Otter-owned APIs such as:
 - `otter:kv`;
 - `otter:sql`;
 - `otter:ffi`;
-- future standard-facing or runtime-specific modules.
+- standard-facing or runtime-specific modules.
 
 Hosted modules must enforce capabilities at the Rust boundary. Do not
 trust JavaScript wrappers or TypeScript declarations as the only
 permission check.
+
+The hosted module crate is `crates/otter-modules`.
+
+## Resolution
+
+Hosted modules are registered on the runtime builder:
+
+```rust,ignore
+let mut runtime = otter_runtime::Runtime::builder()
+    .hosted_modules(otter_modules::hosted_modules().iter().copied())
+    .build()?;
+```
+
+The module loader resolves registered `otter:*` specifiers directly to
+their specifier string. The module graph creates a hosted module namespace
+instead of reading a source file, so JavaScript can import the surface with
+normal ESM syntax:
+
+```javascript
+import { openKv } from "otter:kv";
+const store = openKv(":memory:");
+```
+
+Unregistered `otter:*` specifiers fail resolution.
 
 ## File Layout
 
@@ -43,7 +67,7 @@ Hosted module native functions should:
 Do not move VM values, handles, contexts, frames, or handle scopes into
 Rust futures.
 
-## Bootstrap
+## Bootstrap And Builders
 
 The production builder/spec flow handles namespace installation. Hosted
 modules should use `NamespaceSpec` /
@@ -52,6 +76,24 @@ registration centralized and easy to audit. If capability enforcement or
 bootstrap order is delicate, prefer explicit manual code over hiding
 control flow behind a macro.
 
-Hosted-module macros may arrive later, but those macros must generate
-static specs and ordinary Rust functions. They must not invent a separate
-loader registry.
+Module namespaces that need runtime capabilities install through
+`ObjectBuilder` with `NativeCall::Dynamic` closures that capture owned,
+`Send + Sync` host data such as a cloned `CapabilitySet`. This is still a
+static registration path: the module specifier list is fixed, resolution is
+centralized, and no per-call metadata parser or hot-path dynamic registry is
+introduced.
+
+Macros are appropriate when they generate the same static specs and builder
+calls a manual implementation would write. If a module surface needs new macro
+ergonomics, add the macro over the builder API rather than bypassing it.
+
+## Active Modules
+
+The current active slices are:
+
+- `otter:kv`: `openKv` / `kv`, with in-memory and file-backed JSON stores.
+- `otter:sql`: `openSql` / `sql`, backed by SQLite.
+- `otter:ffi`: `dlopen`, permission-checked library loading metadata.
+
+`otter:kv` and `otter:sql` have module-graph tests that import the module
+specifier and execute the exported native functions.

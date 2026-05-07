@@ -22,6 +22,12 @@ Production builtins should use
 Dynamic closures are reserved for embedder cases that need captured Rust
 state and can still trace explicit JS captures.
 
+Hosted module namespace installers may use `ObjectBuilder` plus
+`NativeCall::Dynamic` when the native function needs owned runtime state,
+such as a cloned capability set or an `Arc<Mutex<...>>` around host-owned
+database state. The closure must not capture `RuntimeCx`, `NativeCtx`,
+`Value`, `Gc<T>`, `Local<'gc, T>`, frames, or handle scopes.
+
 ## Embedder Console Sink
 
 `globalThis.console` is installed through the same static namespace spec
@@ -64,7 +70,8 @@ fn read_flag(
     check_permission(ctx, "env")?;
     let name = expect_string(args.first())?;
     let value = read_allowed_env(name)?;
-    Ok(otter_vm::Value::String(ctx.interp_mut().intern_string(&value)?))
+    let heap = ctx.interp_mut().string_heap_clone();
+    Ok(otter_vm::Value::String(otter_vm::JsString::from_str(&value, &heap)?))
 }
 ```
 

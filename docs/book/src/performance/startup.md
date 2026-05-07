@@ -20,9 +20,9 @@ cargo bench -p otter-cli --bench cold_start -- --sample-size 10 --measurement-ti
 
 Benchmark sources:
 
-- `crates-next/otter-vm/benches/bootstrap.rs`;
-- `crates-next/otter-runtime/benches/startup.rs`;
-- `crates-next/otter-cli/benches/cold_start.rs`.
+- `crates/otter-vm/benches/bootstrap.rs`;
+- `crates/otter-runtime/benches/startup.rs`;
+- `crates/otter-cli/benches/cold_start.rs`.
 
 Bootstrap telemetry should be opt-in and default-off. Useful counters are:
 

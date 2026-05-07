@@ -1,662 +1,336 @@
-use std::collections::HashSet;
+//! `otter:kv` host storage.
+//!
+//! The active slice provides an owned Rust `KvStore` and a static namespace spec
+//! for the hosted-module loader. File-backed stores persist a JSON object and
+//! enforce runtime read/write capabilities before opening or mutating paths.
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use otter_macros::{burrow, dive, lodge};
-use otter_runtime::{ObjectHandle, RegisterValue, RuntimeState, VmNativeCallError};
-use otter_vm::object::HeapValueKind;
-use otter_vm::payload::{VmTrace, VmValueTracer};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use otter_runtime::CapabilitySet;
+use otter_vm::array;
+use otter_vm::{Attr, Interpreter, NativeCall, NativeCtx, NativeError, ObjectBuilder, Value};
+use serde_json::Value as JsonValue;
 
+/// Errors produced by `otter:kv`.
 #[derive(Debug, thiserror::Error)]
 pub enum KvError {
-    #[error("database error: {0}")]
-    Database(String),
+    /// Filesystem permission denied.
+    #[error("permission denied for `{path}`")]
+    PermissionDenied {
+        /// Path that was rejected.
+        path: PathBuf,
+    },
+    /// The persisted JSON file was not an object.
+    #[error("kv backing file must contain a JSON object")]
+    InvalidBacking,
+    /// Filesystem error.
+    #[error("io error: {0}")]
+    Io(String),
+    /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
-    #[error("invalid path: {0}")]
-    InvalidPath(String),
-    #[error("store is closed")]
-    Closed,
 }
 
+/// Result alias for `otter:kv`.
 pub type KvResult<T> = Result<T, KvError>;
 
-const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
-const MAX_JSON_DEPTH: usize = 64;
-const JSON_INTERRUPT_POLL_INTERVAL: usize = 4096;
-static MEMORY_STORE_ID: AtomicU64 = AtomicU64::new(1);
-
-fn check_json_interrupt(runtime: &RuntimeState, index: usize) -> Result<(), VmNativeCallError> {
-    if index.is_multiple_of(JSON_INTERRUPT_POLL_INTERVAL) {
-        runtime.check_interrupt()?;
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
+/// Permission-gated key/value store.
+#[derive(Debug, Clone)]
 pub struct KvStore {
-    db: Database,
-    path: Box<str>,
-    is_memory: bool,
-    backing_path: Option<PathBuf>,
+    path: Option<PathBuf>,
+    entries: BTreeMap<String, JsonValue>,
+    can_write: bool,
 }
 
 impl KvStore {
-    pub fn open(path: &str) -> KvResult<Self> {
-        let (path_string, is_memory, backing_path) = if path.is_empty() || path == ":memory:" {
-            (
-                ":memory:".to_string(),
-                true,
-                Some(next_memory_backing_path()),
-            )
-        } else {
-            let path = Path::new(path);
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-                && !parent.exists()
-            {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| KvError::InvalidPath(error.to_string()))?;
-            }
-            (
-                path.to_string_lossy().into_owned(),
-                false,
-                Some(path.to_path_buf()),
-            )
-        };
-
-        let db = Database::create(
-            backing_path
-                .as_ref()
-                .expect("kv store backing path should be initialized"),
-        )
-        .map_err(|error| KvError::Database(error.to_string()))?;
-
-        let write_txn = db
-            .begin_write()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        {
-            let _table = write_txn
-                .open_table(TABLE)
-                .map_err(|error| KvError::Database(error.to_string()))?;
+    /// Open an in-memory store.
+    #[must_use]
+    pub fn memory() -> Self {
+        Self {
+            path: None,
+            entries: BTreeMap::new(),
+            can_write: true,
         }
-        write_txn
-            .commit()
-            .map_err(|error| KvError::Database(error.to_string()))?;
+    }
 
+    /// Open a file-backed store after checking read/write capabilities.
+    ///
+    /// An absent file starts as an empty object but still requires write
+    /// permission because the store may create it on first mutation.
+    pub fn open(path: impl AsRef<Path>, capabilities: &CapabilitySet) -> KvResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        if !capabilities.read.matches_path(&path) || !capabilities.write.matches_path(&path) {
+            return Err(KvError::PermissionDenied { path });
+        }
+        let entries = if path.exists() {
+            let text =
+                std::fs::read_to_string(&path).map_err(|err| KvError::Io(err.to_string()))?;
+            let value: JsonValue = serde_json::from_str(&text)
+                .map_err(|err| KvError::Serialization(err.to_string()))?;
+            json_object_to_map(value)?
+        } else {
+            BTreeMap::new()
+        };
         Ok(Self {
-            db,
-            path: path_string.into_boxed_str(),
-            is_memory,
-            backing_path,
+            path: Some(path),
+            entries,
+            can_write: true,
         })
     }
 
-    pub fn path(&self) -> &str {
-        &self.path
+    /// Store a JSON value under `key`.
+    pub fn set(&mut self, key: impl Into<String>, value: JsonValue) -> KvResult<()> {
+        self.require_write()?;
+        self.entries.insert(key.into(), value);
+        self.flush()
     }
 
-    pub fn is_memory(&self) -> bool {
-        self.is_memory
+    /// Return a cloned JSON value for `key`.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<JsonValue> {
+        self.entries.get(key).cloned()
     }
 
-    pub fn set(&self, key: &str, value: &JsonValue) -> KvResult<()> {
-        let serialized =
-            serde_json::to_vec(value).map_err(|error| KvError::Serialization(error.to_string()))?;
-
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(TABLE)
-                .map_err(|error| KvError::Database(error.to_string()))?;
-            table
-                .insert(key, serialized.as_slice())
-                .map_err(|error| KvError::Database(error.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-
-        Ok(())
+    /// Return whether `key` exists.
+    #[must_use]
+    pub fn has(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
     }
 
-    pub fn get(&self, key: &str) -> KvResult<Option<JsonValue>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        let table = read_txn
-            .open_table(TABLE)
-            .map_err(|error| KvError::Database(error.to_string()))?;
-
-        match table.get(key) {
-            Ok(Some(guard)) => serde_json::from_slice(guard.value())
-                .map(Some)
-                .map_err(|error| KvError::Serialization(error.to_string())),
-            Ok(None) => Ok(None),
-            Err(error) => Err(KvError::Database(error.to_string())),
-        }
+    /// Delete `key`, returning whether it existed.
+    pub fn delete(&mut self, key: &str) -> KvResult<bool> {
+        self.require_write()?;
+        let existed = self.entries.remove(key).is_some();
+        self.flush()?;
+        Ok(existed)
     }
 
-    pub fn has(&self, key: &str) -> KvResult<bool> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        let table = read_txn
-            .open_table(TABLE)
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        match table.get(key) {
-            Ok(Some(_)) => Ok(true),
-            Ok(None) => Ok(false),
-            Err(error) => Err(KvError::Database(error.to_string())),
+    /// Clear every key.
+    pub fn clear(&mut self) -> KvResult<()> {
+        self.require_write()?;
+        self.entries.clear();
+        self.flush()
+    }
+
+    /// Keys in deterministic order.
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+
+    /// Entry count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn require_write(&self) -> KvResult<()> {
+        if self.can_write {
+            Ok(())
+        } else {
+            Err(KvError::PermissionDenied {
+                path: self.path.clone().unwrap_or_default(),
+            })
         }
     }
 
-    pub fn delete(&self, key: &str) -> KvResult<bool> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        let removed = {
-            let mut table = write_txn
-                .open_table(TABLE)
-                .map_err(|error| KvError::Database(error.to_string()))?;
-            table
-                .remove(key)
-                .map_err(|error| KvError::Database(error.to_string()))?
-                .is_some()
+    fn flush(&self) -> KvResult<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
         };
-        write_txn
-            .commit()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        Ok(removed)
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|err| KvError::Io(err.to_string()))?;
+        }
+        let text = serde_json::to_string_pretty(&self.entries)
+            .map_err(|err| KvError::Serialization(err.to_string()))?;
+        std::fs::write(path, text).map_err(|err| KvError::Io(err.to_string()))
     }
+}
 
-    pub fn keys(&self) -> KvResult<Vec<String>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        let table = read_txn
-            .open_table(TABLE)
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        let mut keys = Vec::new();
-        let iter = table
+fn json_object_to_map(value: JsonValue) -> KvResult<BTreeMap<String, JsonValue>> {
+    match value {
+        JsonValue::Object(map) => Ok(map.into_iter().collect()),
+        _ => Err(KvError::InvalidBacking),
+    }
+}
+
+/// Install the `otter:kv` namespace object.
+pub fn install_kv_module(
+    interp: &mut Interpreter,
+    capabilities: &CapabilitySet,
+) -> Result<otter_vm::JsObject, String> {
+    let caps = capabilities.clone();
+    let open = std::sync::Arc::new(
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            open_kv(ctx, args, &caps)
+        },
+    );
+    let mut builder = ObjectBuilder::new(interp.gc_heap_mut()).map_err(|err| err.to_string())?;
+    builder
+        .method(
+            "openKv",
+            1,
+            NativeCall::Dynamic(open.clone()),
+            Attr::builtin_function(),
+        )
+        .map_err(|err| err.to_string())?
+        .method("kv", 1, NativeCall::Dynamic(open), Attr::builtin_function())
+        .map_err(|err| err.to_string())?;
+    Ok(builder.build())
+}
+
+fn open_kv(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    capabilities: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let path = crate::arg_string(args, 0, "openKv")?;
+    let store = if path.is_empty() || path == ":memory:" {
+        KvStore::memory()
+    } else {
+        KvStore::open(&path, capabilities)
+            .map_err(|err| crate::type_error("openKv", err.to_string()))?
+    };
+    let store = Arc::new(Mutex::new(store));
+    let object = build_store_object(ctx, store)?;
+    Ok(Value::Object(object))
+}
+
+fn build_store_object(
+    ctx: &mut NativeCtx<'_>,
+    store: Arc<Mutex<KvStore>>,
+) -> Result<otter_vm::JsObject, NativeError> {
+    let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
+    builder
+        .method(
+            "set",
+            2,
+            NativeCall::Dynamic(method_set(store.clone())),
+            Attr::builtin_function(),
+        )
+        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
+        .method(
+            "get",
+            1,
+            NativeCall::Dynamic(method_get(store.clone())),
+            Attr::builtin_function(),
+        )
+        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
+        .method(
+            "has",
+            1,
+            NativeCall::Dynamic(method_has(store.clone())),
+            Attr::builtin_function(),
+        )
+        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
+        .method(
+            "delete",
+            1,
+            NativeCall::Dynamic(method_delete(store.clone())),
+            Attr::builtin_function(),
+        )
+        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
+        .method(
+            "keys",
+            0,
+            NativeCall::Dynamic(method_keys(store.clone())),
+            Attr::builtin_function(),
+        )
+        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
+        .method(
+            "clear",
+            0,
+            NativeCall::Dynamic(method_clear(store)),
+            Attr::builtin_function(),
+        )
+        .map_err(|err| crate::type_error("KvStore", err.to_string()))?;
+    Ok(builder.build())
+}
+
+fn method_set(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
+    Arc::new(move |_ctx, args, _captures| {
+        let key = crate::arg_string(args, 0, "KvStore.set")?;
+        let value = args
+            .get(1)
+            .map(crate::value_to_json)
+            .transpose()?
+            .unwrap_or(JsonValue::Null);
+        store
+            .lock()
+            .map_err(|_| crate::type_error("KvStore.set", "store lock poisoned"))?
+            .set(key, value)
+            .map_err(|err| crate::type_error("KvStore.set", err.to_string()))?;
+        Ok(Value::Undefined)
+    })
+}
+
+fn method_get(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
+    Arc::new(move |ctx, args, _captures| {
+        let key = crate::arg_string(args, 0, "KvStore.get")?;
+        let value = store
+            .lock()
+            .map_err(|_| crate::type_error("KvStore.get", "store lock poisoned"))?
+            .get(&key)
+            .unwrap_or(JsonValue::Null);
+        crate::json_to_value(ctx, value)
+    })
+}
+
+fn method_has(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
+    Arc::new(move |_ctx, args, _captures| {
+        let key = crate::arg_string(args, 0, "KvStore.has")?;
+        let has = store
+            .lock()
+            .map_err(|_| crate::type_error("KvStore.has", "store lock poisoned"))?
+            .has(&key);
+        Ok(Value::Boolean(has))
+    })
+}
+
+fn method_delete(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
+    Arc::new(move |_ctx, args, _captures| {
+        let key = crate::arg_string(args, 0, "KvStore.delete")?;
+        let deleted = store
+            .lock()
+            .map_err(|_| crate::type_error("KvStore.delete", "store lock poisoned"))?
+            .delete(&key)
+            .map_err(|err| crate::type_error("KvStore.delete", err.to_string()))?;
+        Ok(Value::Boolean(deleted))
+    })
+}
+
+fn method_keys(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
+    Arc::new(move |ctx, _args, _captures| {
+        let keys = store
+            .lock()
+            .map_err(|_| crate::type_error("KvStore.keys", "store lock poisoned"))?
+            .keys();
+        let values = keys
             .iter()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        for item in iter {
-            let (key, _) = item.map_err(|error| KvError::Database(error.to_string()))?;
-            keys.push(key.value().to_string());
-        }
-        Ok(keys)
-    }
-
-    pub fn len(&self) -> KvResult<usize> {
-        self.keys().map(|keys| keys.len())
-    }
-
-    pub fn is_empty(&self) -> KvResult<bool> {
-        self.len().map(|n| n == 0)
-    }
-
-    pub fn clear(&self) -> KvResult<()> {
-        let keys = self.keys()?;
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(TABLE)
-                .map_err(|error| KvError::Database(error.to_string()))?;
-            for key in keys {
-                table
-                    .remove(key.as_str())
-                    .map_err(|error| KvError::Database(error.to_string()))?;
-            }
-        }
-        write_txn
-            .commit()
-            .map_err(|error| KvError::Database(error.to_string()))?;
-        Ok(())
-    }
+            .map(|key| crate::string_value(ctx, key))
+            .collect::<Result<Vec<_>, _>>()?;
+        let array = array::from_elements(ctx.interp_mut().gc_heap_mut(), values)?;
+        Ok(Value::Array(array))
+    })
 }
 
-impl Drop for KvStore {
-    fn drop(&mut self) {
-        if self.is_memory
-            && let Some(path) = self.backing_path.take()
-        {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct KvStorePayload {
-    store: Option<KvStore>,
-    path: Box<str>,
-    is_memory: bool,
-}
-
-impl VmTrace for KvStorePayload {
-    fn trace(&self, _tracer: &mut dyn VmValueTracer) {}
-}
-
-lodge!(
-    kv_module,
-    module_specifiers = ["otter:kv"],
-    default = function(kv_open as "kv"),
-    functions = [
-        ("kv", kv_open),
-        ("openKv", kv_open as "openKv"),
-    ],
-);
-
-#[dive(name = "kv", length = 1)]
-fn kv_open(
-    _this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let path = args
-        .first()
-        .copied()
-        .filter(|value| *value != RegisterValue::undefined())
-        .map(|value| runtime.js_to_string_infallible(value).into_string())
-        .unwrap_or_else(|| ":memory:".to_string());
-
-    let store = KvStore::open(&path).map_err(|error| kv_error(runtime, error))?;
-    let is_memory = store.is_memory();
-    let path_value = store.path().to_string().into_boxed_str();
-    let object = runtime.alloc_native_object(KvStorePayload {
-        store: Some(store),
-        path: path_value,
-        is_memory,
-    }).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
-
-    let members = burrow! {
-        fns = [
-            kv_set,
-            kv_get,
-            kv_delete,
-            kv_has,
-            kv_keys,
-            kv_clear,
-            kv_close,
-            kv_size,
-            kv_path,
-            kv_is_memory,
-            kv_closed
-        ]
-    };
-    runtime.install_burrow(object, &members)?;
-
-    Ok(RegisterValue::from_object_handle(object.0))
-}
-
-#[dive(name = "set", length = 2)]
-fn kv_set(
-    this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let key = required_string_arg(runtime, args.first(), "kv.set: missing key")?;
-    let value = *args
-        .get(1)
-        .ok_or_else(|| throw_type_error(runtime, "kv.set: missing value"))?;
-    let json = register_to_json(value, runtime, 0, &mut HashSet::new())?;
-    with_store_mut(runtime, this, |store| store.set(&key, &json))?;
-    Ok(RegisterValue::undefined())
-}
-
-#[dive(name = "get", length = 1)]
-fn kv_get(
-    this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let key = required_string_arg(runtime, args.first(), "kv.get: missing key")?;
-    let value = with_store_mut(runtime, this, |store| store.get(&key))?;
-    match value {
-        Some(value) => json_to_register(&value, runtime, 0),
-        None => Ok(RegisterValue::undefined()),
-    }
-}
-
-#[dive(name = "delete", length = 1)]
-fn kv_delete(
-    this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let key = required_string_arg(runtime, args.first(), "kv.delete: missing key")?;
-    let deleted = with_store_mut(runtime, this, |store| store.delete(&key))?;
-    Ok(RegisterValue::from_bool(deleted))
-}
-
-#[dive(name = "has", length = 1)]
-fn kv_has(
-    this: &RegisterValue,
-    args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let key = required_string_arg(runtime, args.first(), "kv.has: missing key")?;
-    let has = with_store_mut(runtime, this, |store| store.has(&key))?;
-    Ok(RegisterValue::from_bool(has))
-}
-
-#[dive(name = "keys", length = 0)]
-fn kv_keys(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let keys = with_store_mut(runtime, this, |store| store.keys())?;
-    let mut elements = Vec::with_capacity(keys.len());
-    for key in keys {
-        let handle = runtime
-            .alloc_string(key)
-            .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-        elements.push(RegisterValue::from_object_handle(handle.0));
-    }
-    let array = runtime
-        .alloc_array_with_elements(&elements)
-        .map_err(|e| VmNativeCallError::Internal(format!("{e:?}").into()))?;
-    Ok(RegisterValue::from_object_handle(array.0))
-}
-
-#[dive(name = "clear", length = 0)]
-fn kv_clear(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    with_store_mut(runtime, this, |store| store.clear())?;
-    Ok(RegisterValue::undefined())
-}
-
-#[dive(name = "close", length = 0)]
-fn kv_close(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let payload = match runtime.native_payload_mut_from_value::<KvStorePayload>(this) {
-        Ok(payload) => payload,
-        Err(_) => {
-            return Err(throw_type_error(
-                runtime,
-                "kv.close: receiver is not a KV store",
-            ));
-        }
-    };
-    payload.store.take();
-    Ok(RegisterValue::undefined())
-}
-
-#[dive(name = "size", getter)]
-fn kv_size(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let size = with_store_mut(runtime, this, |store| store.len())?;
-    Ok(RegisterValue::from_number(size as f64))
-}
-
-#[dive(name = "path", getter)]
-fn kv_path(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let path = {
-        let payload = match runtime.native_payload_mut_from_value::<KvStorePayload>(this) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return Err(throw_type_error(
-                    runtime,
-                    "kv.path: receiver is not a KV store",
-                ));
-            }
-        };
-        payload.path.clone()
-    };
-    Ok(RegisterValue::from_object_handle(
-        runtime.alloc_string(path).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
-    ))
-}
-
-#[dive(name = "isMemory", getter)]
-fn kv_is_memory(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let is_memory = {
-        let payload = match runtime.native_payload_mut_from_value::<KvStorePayload>(this) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return Err(throw_type_error(
-                    runtime,
-                    "kv.isMemory: receiver is not a KV store",
-                ));
-            }
-        };
-        payload.is_memory
-    };
-    Ok(RegisterValue::from_bool(is_memory))
-}
-
-#[dive(name = "closed", getter)]
-fn kv_closed(
-    this: &RegisterValue,
-    _args: &[RegisterValue],
-    runtime: &mut RuntimeState,
-) -> Result<RegisterValue, VmNativeCallError> {
-    let closed = {
-        let payload = match runtime.native_payload_mut_from_value::<KvStorePayload>(this) {
-            Ok(payload) => payload,
-            Err(_) => {
-                return Err(throw_type_error(
-                    runtime,
-                    "kv.closed: receiver is not a KV store",
-                ));
-            }
-        };
-        payload.store.is_none()
-    };
-    Ok(RegisterValue::from_bool(closed))
-}
-
-fn register_to_json(
-    value: RegisterValue,
-    runtime: &mut RuntimeState,
-    depth: usize,
-    seen: &mut HashSet<ObjectHandle>,
-) -> Result<JsonValue, VmNativeCallError> {
-    runtime.check_interrupt()?;
-    if depth > MAX_JSON_DEPTH {
-        return Err(throw_type_error(
-            runtime,
-            "kv.set: value exceeds maximum JSON nesting depth",
-        ));
-    }
-    if value == RegisterValue::undefined() {
-        return Err(throw_type_error(
-            runtime,
-            "kv.set: undefined values are not supported",
-        ));
-    }
-    if value == RegisterValue::null() {
-        return Ok(JsonValue::Null);
-    }
-    if let Some(boolean) = value.as_bool() {
-        return Ok(JsonValue::Bool(boolean));
-    }
-    if let Some(number) = value.as_number() {
-        let number = JsonNumber::from_f64(number).ok_or_else(|| {
-            throw_type_error(runtime, "kv.set: non-finite numbers are not supported")
-        })?;
-        return Ok(JsonValue::Number(number));
-    }
-
-    let Some(handle) = value.as_object_handle().map(ObjectHandle) else {
-        return Err(throw_type_error(runtime, "kv.set: unsupported value type"));
-    };
-
-    if !seen.insert(handle) {
-        return Err(throw_type_error(
-            runtime,
-            "kv.set: cyclic values are not supported",
-        ));
-    }
-
-    let result = match runtime.objects().kind(handle) {
-        Ok(HeapValueKind::String) => Ok(JsonValue::String(
-            runtime.js_to_string_infallible(value).into_string(),
-        )),
-        Ok(HeapValueKind::Array) => {
-            let elements = runtime.array_to_args(handle)?;
-            let mut values = Vec::with_capacity(elements.len());
-            for (index, element) in elements.into_iter().enumerate() {
-                check_json_interrupt(runtime, index)?;
-                values.push(register_to_json(element, runtime, depth + 1, seen)?);
-            }
-            Ok(JsonValue::Array(values))
-        }
-        Ok(HeapValueKind::Object) => {
-            let mut map = JsonMap::new();
-            for (index, key) in runtime
-                .enumerable_own_property_keys(handle)?
-                .into_iter()
-                .enumerate()
-            {
-                check_json_interrupt(runtime, index)?;
-                let Some(name) = runtime.property_names().get(key).map(str::to_owned) else {
-                    continue;
-                };
-                let property = runtime.own_property_value(handle, key)?;
-                map.insert(name, register_to_json(property, runtime, depth + 1, seen)?);
-            }
-            Ok(JsonValue::Object(map))
-        }
-        Ok(_) | Err(_) => Err(throw_type_error(runtime, "kv.set: unsupported object type")),
-    };
-
-    seen.remove(&handle);
-    result
-}
-
-fn json_to_register(
-    value: &JsonValue,
-    runtime: &mut RuntimeState,
-    depth: usize,
-) -> Result<RegisterValue, VmNativeCallError> {
-    runtime.check_interrupt()?;
-    if depth > MAX_JSON_DEPTH {
-        return Err(throw_type_error(
-            runtime,
-            "kv.get: stored value exceeds maximum JSON nesting depth",
-        ));
-    }
-
-    match value {
-        JsonValue::Null => Ok(RegisterValue::null()),
-        JsonValue::Bool(boolean) => Ok(RegisterValue::from_bool(*boolean)),
-        JsonValue::Number(number) => {
-            if let Some(integer) = number.as_i64()
-                && let Ok(integer) = i32::try_from(integer)
-            {
-                return Ok(RegisterValue::from_i32(integer));
-            }
-            let as_f64 = number
-                .as_f64()
-                .ok_or_else(|| throw_type_error(runtime, "kv.get: invalid numeric value"))?;
-            Ok(RegisterValue::from_number(as_f64))
-        }
-        JsonValue::String(string) => Ok(RegisterValue::from_object_handle(
-            runtime.alloc_string(string.clone()).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
-        )),
-        JsonValue::Array(values) => {
-            let mut elements = Vec::with_capacity(values.len());
-            for (index, value) in values.iter().enumerate() {
-                check_json_interrupt(runtime, index)?;
-                elements.push(json_to_register(value, runtime, depth + 1)?);
-            }
-            Ok(RegisterValue::from_object_handle(
-                runtime.alloc_array_with_elements(&elements).map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?.0,
-            ))
-        }
-        JsonValue::Object(entries) => {
-            let object = runtime.alloc_object().map_err(|e| otter_runtime::VmNativeCallError::Internal(format!("{e:?}").into()))?;
-            for (index, (key, value)) in entries.iter().enumerate() {
-                check_json_interrupt(runtime, index)?;
-                let property = runtime.intern_property_name(key);
-                let value = json_to_register(value, runtime, depth + 1)?;
-                runtime
-                    .objects_mut()
-                    .set_property(object, property, value)
-                    .map_err(|error| {
-                        VmNativeCallError::Internal(
-                            format!("kv.get: failed to materialize object property: {error:?}")
-                                .into(),
-                        )
-                    })?;
-            }
-            Ok(RegisterValue::from_object_handle(object.0))
-        }
-    }
-}
-
-fn with_store_mut<T>(
-    runtime: &mut RuntimeState,
-    this: &RegisterValue,
-    f: impl FnOnce(&mut KvStore) -> KvResult<T>,
-) -> Result<T, VmNativeCallError> {
-    let payload = match runtime.native_payload_mut_from_value::<KvStorePayload>(this) {
-        Ok(payload) => payload,
-        Err(_) => return Err(throw_type_error(runtime, "receiver is not a KV store")),
-    };
-    let store = match payload.store.as_mut() {
-        Some(store) => store,
-        None => return Err(throw_type_error(runtime, "KV store is closed")),
-    };
-    f(store).map_err(|error| kv_error(runtime, error))
-}
-
-fn required_string_arg(
-    runtime: &mut RuntimeState,
-    value: Option<&RegisterValue>,
-    message: &str,
-) -> Result<String, VmNativeCallError> {
-    let value = *value.ok_or_else(|| throw_type_error(runtime, message))?;
-    Ok(runtime.js_to_string_infallible(value).into_string())
-}
-
-fn throw_type_error(runtime: &mut RuntimeState, message: &str) -> VmNativeCallError {
-    match runtime.alloc_type_error(message) {
-        Ok(error) => VmNativeCallError::Thrown(RegisterValue::from_object_handle(error.0)),
-        Err(_) => VmNativeCallError::Internal(message.into()),
-    }
-}
-
-fn kv_error(runtime: &mut RuntimeState, error: KvError) -> VmNativeCallError {
-    throw_type_error(runtime, &error.to_string())
-}
-
-fn next_memory_backing_path() -> PathBuf {
-    let unique = MEMORY_STORE_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "otter-modules-kv-{}-{}.redb",
-        std::process::id(),
-        unique
-    ))
+fn method_clear(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
+    Arc::new(move |_ctx, _args, _captures| {
+        store
+            .lock()
+            .map_err(|_| crate::type_error("KvStore.clear", "store lock poisoned"))?
+            .clear()
+            .map_err(|err| crate::type_error("KvStore.clear", err.to_string()))?;
+        Ok(Value::Undefined)
+    })
 }

@@ -5,8 +5,8 @@ engine and extension work should use the safe context API rather than raw
 collector internals.
 
 The landed contributor API is the safe context surface. Trace
-derive/macros are future work; do not invent a macro-first GC API before
-the backend is stable.
+derive/macros must generate normal trace code over the safe visitor path;
+do not invent a macro-first GC API that exposes raw collector internals.
 
 ## Handle Tiers
 
@@ -103,7 +103,7 @@ let escaped = {
 ```
 
 The runnable copy of this pattern is covered by
-`crates-next/otter-gc/tests/book_gc_api_examples.rs` and the
+`crates/otter-gc/tests/book_gc_api_examples.rs` and the
 `EscapableHandleScope` rustdoc example.
 
 ## External Memory
@@ -120,7 +120,7 @@ This covers typed-array backing stores, host buffers, large module source
 caches, and native resources.
 
 The runnable copy of this pattern is covered by
-`crates-next/otter-gc/tests/book_gc_api_examples.rs` and the
+`crates/otter-gc/tests/book_gc_api_examples.rs` and the
 `ExternalMemory` rustdoc example.
 
 ## Worker And Async Boundaries
@@ -134,8 +134,8 @@ and only then touch JS values.
 ## Trace Ergonomics
 
 Today, VM payloads implement the current tracing traits manually or reuse
-existing wrappers. A future `GcTrace` derive must generate normal trace
-code over the safe visitor path. Until then, do not add contributor macros
+existing wrappers. `GcTrace` derive macros must generate normal trace
+code over the safe visitor path. Do not add contributor macros
 that expose raw trace tables, raw slot visitors, or manual barrier calls.
 
 ## Internal Only

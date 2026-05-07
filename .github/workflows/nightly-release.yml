@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build artifacts but skip publishing the release'
+        type: boolean
+        default: false
 
 concurrency:
   group: nightly-release
@@ -14,11 +19,31 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  NIGHTLY_TAG: nightly
 
 jobs:
+  prepare:
+    name: Compute nightly version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      suffix: ${{ steps.version.outputs.suffix }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+      date: ${{ steps.version.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          DATE=$(date -u +'%Y%m%d')
+          SHORT_SHA=$(git rev-parse --short=7 "$GITHUB_SHA")
+          SUFFIX="${DATE}-${SHORT_SHA}"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "suffix=${SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-${SUFFIX}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.name }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -57,35 +82,43 @@ jobs:
 
       - name: Package Unix
         if: matrix.archive == 'tar.gz'
+        env:
+          PKG_NAME: ${{ matrix.name }}-${{ needs.prepare.outputs.suffix }}
         run: |
-          mkdir -p dist/${{ matrix.name }}
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.name }}/otter
-          tar -C dist -czf dist/${{ matrix.name }}.tar.gz ${{ matrix.name }}
-          shasum -a 256 dist/${{ matrix.name }}.tar.gz > dist/${{ matrix.name }}.tar.gz.sha256
+          mkdir -p "dist/${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${PKG_NAME}/otter"
+          tar -C dist -czf "dist/${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          shasum -a 256 "dist/${PKG_NAME}.tar.gz" > "dist/${PKG_NAME}.tar.gz.sha256"
 
       - name: Package Windows
         if: matrix.archive == 'zip'
         shell: pwsh
+        env:
+          PKG_NAME: ${{ matrix.name }}-${{ needs.prepare.outputs.suffix }}
         run: |
-          New-Item -ItemType Directory -Force dist/${{ matrix.name }}
-          Copy-Item target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.name }}/otter.exe
-          Compress-Archive -Path dist/${{ matrix.name }} -DestinationPath dist/${{ matrix.name }}.zip -Force
-          Get-FileHash dist/${{ matrix.name }}.zip -Algorithm SHA256 |
-            ForEach-Object { $_.Hash.ToLower() + '  ' + '${{ matrix.name }}.zip' } |
-            Set-Content dist/${{ matrix.name }}.zip.sha256
+          New-Item -ItemType Directory -Force "dist/$env:PKG_NAME"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$env:PKG_NAME/otter.exe"
+          Compress-Archive -Path "dist/$env:PKG_NAME" -DestinationPath "dist/$env:PKG_NAME.zip" -Force
+          Get-FileHash "dist/$env:PKG_NAME.zip" -Algorithm SHA256 |
+            ForEach-Object { $_.Hash.ToLower() + '  ' + "$env:PKG_NAME.zip" } |
+            Set-Content "dist/$env:PKG_NAME.zip.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: ${{ matrix.name }}-${{ needs.prepare.outputs.suffix }}
           path: |
-            dist/${{ matrix.name }}.${{ matrix.archive }}
-            dist/${{ matrix.name }}.${{ matrix.archive }}.sha256
+            dist/${{ matrix.name }}-${{ needs.prepare.outputs.suffix }}.${{ matrix.archive }}
+            dist/${{ matrix.name }}-${{ needs.prepare.outputs.suffix }}.${{ matrix.archive }}.sha256
 
   release:
     name: Publish nightly
-    needs: build
+    needs: [prepare, build]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
     runs-on: ubuntu-latest
+    env:
+      NIGHTLY_TAG: ${{ needs.prepare.outputs.tag }}
+      ROLLING_TAG: nightly
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,19 +128,27 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Move nightly tag
-        run: |
-          git tag -f "$NIGHTLY_TAG" "$GITHUB_SHA"
-          git push -f origin "refs/tags/$NIGHTLY_TAG"
-
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete "$NIGHTLY_TAG" --cleanup-tag --yes || true
-          git push -f origin "refs/tags/$NIGHTLY_TAG"
+          git tag -f "$NIGHTLY_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$NIGHTLY_TAG"
           gh release create "$NIGHTLY_TAG" artifacts/* \
-            --title "Otter Nightly" \
+            --title "Otter Nightly ${NIGHTLY_TAG#nightly-}" \
             --notes "Automated nightly build from ${GITHUB_SHA}." \
+            --prerelease \
+            --latest=false
+
+      - name: Update rolling nightly pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$ROLLING_TAG" --yes --cleanup-tag || true
+          git tag -f "$ROLLING_TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$ROLLING_TAG"
+          gh release create "$ROLLING_TAG" artifacts/* \
+            --title "Otter Nightly (latest)" \
+            --notes "Rolling pointer to most recent nightly: ${NIGHTLY_TAG} (${GITHUB_SHA})." \
             --prerelease \
             --latest=false

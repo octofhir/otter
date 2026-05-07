@@ -19,14 +19,12 @@ observable by users.
 
 Preserve active-stack boundaries:
 
-- VM/runtime work belongs in `crates-next/otter-gc`, `crates-next/otter-vm`, and
-  `crates-next/otter-runtime`.
-- Standards-facing Web APIs should move into the active Web API crate when that
-  crate is revived.
-- Otter-hosted modules should move from `crates/otter-modules` into active-stack
-  product crates before they are linked into the current runtime.
-- Parked compatibility crates are reference code only; do not add active
-  path-dependencies on legacy `crates/*`.
+- VM/runtime work belongs in `crates/otter-gc`, `crates/otter-vm`, and
+  `crates/otter-runtime`.
+- Standards-facing Web APIs belong in `crates/otter-web`.
+- Otter-hosted modules belong in `crates/otter-modules`.
+- Do not add active path-dependencies on code outside the active `crates/*`
+  stack.
 
 For large ports, add a short status block when it helps review:
 

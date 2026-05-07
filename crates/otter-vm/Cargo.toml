@@ -1,0 +1,43 @@
+[package]
+name = "otter-vm"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Interpreter and value model for the Otter foundation engine."
+
+[lints]
+workspace = true
+
+[dependencies]
+otter-bytecode = { workspace = true }
+otter-gc = { workspace = true }
+serde = { workspace = true }
+smallvec = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+regress = { workspace = true }
+temporal_rs = { workspace = true }
+icu_collator = { workspace = true }
+icu_decimal = { workspace = true }
+icu_datetime = { workspace = true }
+icu_locale = { workspace = true }
+icu_calendar = { workspace = true }
+icu_experimental = { workspace = true }
+fixed_decimal = { workspace = true }
+writeable = { workspace = true }
+static_assertions = "1.1"
+
+[dev-dependencies]
+criterion = { workspace = true }
+trybuild = "1.0"
+
+[[bench]]
+name = "dispatch"
+harness = false
+
+[[bench]]
+name = "bootstrap"
+harness = false

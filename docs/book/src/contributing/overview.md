@@ -1,8 +1,6 @@
 # Contributing Overview
 
-Otter's active engine lives under `crates-next/`. The remaining crates
-under `crates/` are product/reference crates that are not wired into the
-active build graph unless a product task explicitly revives them.
+Otter's active engine and product crates live under `crates/`.
 
 Start with:
 
@@ -21,23 +19,22 @@ stabilizes, document how to use it here.
 ## Choosing A Crate
 
 - GC storage, tracing, handles, weak/finalization, heap stats, snapshots,
-  and external-memory accounting belong in `crates-next/otter-gc`.
+  and external-memory accounting belong in `crates/otter-gc`.
 - Value representation, object model, bytecode execution, intrinsics,
   native callable dispatch, and source/compiler integration belong in
-  `crates-next/otter-vm`.
+  `crates/otter-vm`.
 - Public embedding, capabilities, event-loop handles, worker/isolate
   runners, and host-operation scheduling belong in
-  `crates-next/otter-runtime`.
-- CLI behavior belongs in `crates-next/otter-cli`.
-- New Web/API/module/product crates belong under `crates-next/*`.
+  `crates/otter-runtime`.
+- CLI behavior belongs in `crates/otter-cli`.
+- New Web/API/module/product crates belong under `crates/*`.
 
-Do not introduce a parallel runtime stack, copied parked modules, or path
-dependencies from active crates into `crates/*`.
+Do not introduce a parallel runtime stack or copied compatibility modules.
 
 ## Working Rules
 
 - Keep changes vertical and reviewable.
-- Prefer breaking interim `crates-next/*` APIs over preserving unsafe,
+- Prefer improving active APIs over preserving unsafe,
   slow, startup-heavy, or confusing compatibility shims.
 - Do not add thread-local heap lookup or context-free GC access.
 - Keep `unsafe` code inside `otter-gc`. Other active crates keep
@@ -87,9 +84,9 @@ Match test depth to risk:
 - public JS-visible behavior: engine fixtures and targeted Test262;
 - contributor APIs: rustdoc examples or book-backed integration tests.
 
-Book examples for APIs that exist today should either compile through
-normal cargo gates or point at the exact test file that backs them. Future
-APIs are shown as `ignore` snippets until their backend surface lands.
+Book examples for active APIs should either compile through normal cargo gates
+or point at the exact test file that backs them. Design-only snippets are
+shown as `ignore`.
 
 ## Closing Work
 

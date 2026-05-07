@@ -1,29 +1,27 @@
 [workspace]
 resolver = "3"
-# Active engine crates live in `crates-next/*`. The legacy stack under
-# `crates/*` is reference-only or product-specific and is intentionally
-# excluded from the workspace build graph.
 members = [
-    "crates-next/otter-bytecode",
-    "crates-next/otter-syntax",
-    "crates-next/otter-compiler",
-    "crates-next/otter-gc",
-    "crates-next/otter-macros",
-    "crates-next/otter-vm",
-    "crates-next/otter-runtime",
-    "crates-next/otter-test",
-    "crates-next/otter-test262",
-    "crates-next/otter-cli",
+    "crates/otter-bytecode",
+    "crates/otter-syntax",
+    "crates/otter-compiler",
+    "crates/otter-gc",
+    "crates/otter-macros",
+    "crates/otter-vm",
+    "crates/otter-runtime",
+    "crates/otter-test",
+    "crates/otter-test262",
+    "crates/otter-cli",
+    "crates/otter-modules",
+    "crates/otter-web",
 ]
 exclude = [
-    "crates/*",
+    "crates-legacy/*",
 ]
 
 [workspace.package]
 edition = "2024"
 publish = false
 license = "MIT"
-rust-version = "1.85"
 
 [workspace.dependencies]
 oxc_allocator   = "0.129"
@@ -77,14 +75,14 @@ regress     = { git = "https://github.com/octoshikari/regress", features = ["utf
 criterion   = { version = "0.8", features = ["html_reports"] }
 
 # Workspace-internal crates.
-otter-bytecode  = { path = "crates-next/otter-bytecode" }
-otter-syntax    = { path = "crates-next/otter-syntax" }
-otter-compiler  = { path = "crates-next/otter-compiler" }
-otter-gc        = { path = "crates-next/otter-gc" }
-otter-macros    = { path = "crates-next/otter-macros" }
-otter-vm        = { path = "crates-next/otter-vm" }
-otter-runtime   = { path = "crates-next/otter-runtime" }
-otter-test      = { path = "crates-next/otter-test" }
+otter-bytecode  = { path = "crates/otter-bytecode" }
+otter-syntax    = { path = "crates/otter-syntax" }
+otter-compiler  = { path = "crates/otter-compiler" }
+otter-gc        = { path = "crates/otter-gc" }
+otter-macros    = { path = "crates/otter-macros" }
+otter-vm        = { path = "crates/otter-vm" }
+otter-runtime   = { path = "crates/otter-runtime" }
+otter-test      = { path = "crates/otter-test" }
 
 [workspace.lints.rust]
 unsafe_code         = "forbid"

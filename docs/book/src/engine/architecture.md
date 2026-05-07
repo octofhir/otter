@@ -53,7 +53,7 @@ runtime machinery.
 Blocking APIs are convenience adapters. They may block the caller while the
 same async-capable runtime handle drives the isolate, but they must not grow
 a second sync-only engine path that bypasses timers, host ops, workers,
-module loading, or future async Web APIs.
+module loading, or async Web APIs.
 
 `Runtime` remains the local isolate layer for tests, compile/check/dump
 workflows, and low-level embedders that deliberately drive the VM in-process.

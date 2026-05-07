@@ -119,10 +119,10 @@ test262-full *args:
 test262-conformance:
     cargo run --profile test262 -p otter-test262 --bin gen-conformance
 
-# === Test262 (new engine, crates-next/otter-test262) ===
+# === Test262 (active engine, crates/otter-test262) ===
 #
 # The canonical conformance surface for the foundation runtime.
-# See docs/new-engine/tasks/100-test262-conformance.md.
+# See docs/book/src/contributing/test-harness.md.
 
 # Walk vendor/test262 without executing any tests (slice 101).
 test262-next-dry *args:

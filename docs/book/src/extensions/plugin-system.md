@@ -31,7 +31,7 @@ The supported layers should arrive in this order:
    ownership rules are explicit.
 
 The first two layers are source-level Rust APIs. They may change while the
-engine is under `crates-next/*`. Dynamic plugins require a much stricter
+engine API is pre-stable. Dynamic plugins require a much stricter
 compatibility contract and are deferred.
 
 ## Non-Negotiables

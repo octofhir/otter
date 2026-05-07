@@ -1,13 +1,15 @@
 [package]
 name = "otter-web"
 version = "0.1.0"
-edition = "2024"
-description = "Web API surfaces for the new Otter runtime stack"
-license = "MIT"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Web API surfaces for the active Otter runtime stack."
 
 [dependencies]
-otter-macros = { path = "../otter-macros" }
-otter-runtime = { path = "../otter-runtime" }
-otter-vm = { path = "../otter-vm" }
-reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
+otter-vm = { workspace = true }
+thiserror = { workspace = true }
 url = "2"
+
+[dev-dependencies]
+otter-runtime = { workspace = true }

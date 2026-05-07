@@ -1,6 +1,6 @@
 # Test Harness
 
-The active `otter test` harness lives in `crates-next/otter-test` and is
+The active `otter test` harness lives in `crates/otter-test` and is
 exposed through the CLI. It discovers JavaScript and TypeScript fixtures,
 runs each fixture in a fresh runtime, and reports structured outcomes.
 

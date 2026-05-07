@@ -23,13 +23,13 @@
 - [JS Surface Builders](extensions/js-surface-builders.md)
 - [Plugin System](extensions/plugin-system.md)
 
+# Web APIs
+
+- [Contribution Workflow](web/contributing.md)
+
 # Performance
 
 - [Startup](performance/startup.md)
-
-# Runtime Products
-
-- [Package Management](runtime/package-management.md)
 
 # Deployment
 

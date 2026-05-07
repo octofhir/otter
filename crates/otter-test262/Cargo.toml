@@ -1,0 +1,44 @@
+[package]
+name = "otter-test262"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+license.workspace = true
+description = "Test262 conformance runner for the active Otter stack."
+
+[lib]
+name = "otter_test262"
+path = "src/lib.rs"
+
+[[bin]]
+name = "otter-test262"
+path = "src/main.rs"
+
+[dependencies]
+# Active runtime / VM surface.
+otter-runtime = { workspace = true }
+
+# Parsing helpers (frontmatter + reports).
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yaml  = "0.9"
+toml        = { workspace = true }
+
+# CLI + traversal + parallelism. The test262 driver is CPU-bound per
+# worker and the per-test isolation rules out shared async runtime state.
+clap        = { workspace = true }
+walkdir     = "2"
+ignore      = "0.4"
+rayon       = "1.10"
+indicatif   = "0.18"
+
+# Errors.
+anyhow      = "1"
+thiserror   = { workspace = true }
+
+# Module-flagged tests need an on-disk entry; we stage them in a
+# scratch directory.
+tempfile    = "3"
+
+# RFC-3339 timestamps for baseline `ran_at` field.
+chrono      = { version = "0.4", default-features = false, features = ["clock", "serde"] }

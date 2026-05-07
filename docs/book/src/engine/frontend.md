@@ -2,9 +2,9 @@
 
 Otter parses JavaScript and TypeScript through OXC. The active frontend stack is:
 
-- `crates-next/otter-syntax`: source kind detection, OXC parse options, and parse-once callbacks.
-- `crates-next/otter-compiler`: AST-to-bytecode lowering and TypeScript erasure.
-- `crates-next/otter-bytecode`: bytecode module, disassembly, and JSON dump formats.
+- `crates/otter-syntax`: source kind detection, OXC parse options, and parse-once callbacks.
+- `crates/otter-compiler`: AST-to-bytecode lowering and TypeScript erasure.
+- `crates/otter-bytecode`: bytecode module, disassembly, and JSON dump formats.
 
 Do not regex-parse JavaScript or TypeScript source. Consumers that need to inspect
 module syntax or other AST properties should use `otter_syntax::with_program` and

@@ -19,7 +19,7 @@ mdbook build docs/book
 ```
 
 The docs examples that exercise current GC APIs are backed by Rust tests in
-`crates-next/otter-gc`; run them with the normal task gates:
+`crates/otter-gc`; run them with the normal task gates:
 
 ```bash
 cargo test -p otter-gc

@@ -7,7 +7,7 @@ Guidance for coding agents (Claude Code / Codex CLI / etc.) when working in this
 
 Otter is an embeddable TypeScript/JavaScript engine for Rust applications built on a custom bytecode VM. It provides a safe runtime for executing TypeScript/JavaScript code with native Rust integration, plus a standalone CLI.
 
-**Workspace naming:** the active CLI crate is `otter-cli` under `crates-next/`; legacy `crates/*` paths are reference-only unless a task explicitly says otherwise.
+**Workspace naming:** the active CLI crate is `otter-cli` under `crates/`; legacy `crates-legacy/*` paths are reference-only unless a task explicitly says otherwise.
 
 > **Note:** The VM is under active development. Some features (full Web APIs) are being added incrementally.
 
@@ -15,10 +15,10 @@ Otter is an embeddable TypeScript/JavaScript engine for Rust applications built 
 
 The active runtime stack is:
 
-- `crates-next/otter-gc`
-- `crates-next/otter-vm`
-- `crates-next/otter-runtime`
-- product crates under `crates-next/*`
+- `crates/otter-gc`
+- `crates/otter-vm`
+- `crates/otter-runtime`
+- product crates under `crates/*`
 
 Do not introduce parallel engine/runtime stacks through copied modules, renamed
 crates, or path dependencies.
@@ -46,20 +46,20 @@ Repository rules:
 ## Repository Map (where to change what)
 
 ### Core Runtime Crates
-- `crates-next/otter-gc`: garbage collector.
-- `crates-next/otter-vm`: VM, interpreter, value model, intrinsics, source compiler.
-- `crates-next/otter-runtime`: public runtime and embedding surface.
+- `crates/otter-gc`: garbage collector.
+- `crates/otter-vm`: VM, interpreter, value model, intrinsics, source compiler.
+- `crates/otter-runtime`: public runtime and embedding surface.
 
 ### Supporting crates
-- `crates-next/otter-bytecode`: bytecode representation and disassembly.
-- `crates-next/otter-syntax` / `crates-next/otter-compiler`: frontend and lowering.
-- `crates-next/otter-test` / `crates-next/otter-test262`: active test harnesses.
-- `crates-next/otter-cli`: CLI (`otter`).
-- Future macro / module / Web API crates must be added under `crates-next/*`, not under legacy `crates/*`.
+- `crates/otter-bytecode`: bytecode representation and disassembly.
+- `crates/otter-syntax` / `crates/otter-compiler`: frontend and lowering.
+- `crates/otter-test` / `crates/otter-test262`: active test harnesses.
+- `crates/otter-cli`: CLI (`otter`).
+- Future macro / module / Web API crates must be added under `crates/*`, not under legacy `crates-legacy/*`.
 
 ### Parked Compatibility Shims
-- `crates/otter-nodejs`
-- `crates/otter-node-compat`
+- `crates-legacy/otter-nodejs`
+- `crates-legacy/otter-node-compat`
 
 ## File Naming Conventions
 
@@ -96,7 +96,7 @@ This separation:
 
 New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the descriptor/spec/builder/bootstrap flow documented in `docs/book/src/extensions/js-surface-builders.md`.
 
-- Add new bootstrap work in `crates-next/otter-vm` / `crates-next/otter-runtime`.
+- Add new bootstrap work in `crates/otter-vm` / `crates/otter-runtime`.
 - Keep global installation centralized; do not scatter ad-hoc global mutation across unrelated modules.
 - Prefer static specs plus mutator-bound builders over one-off registration functions when exposing JS-visible constructors, prototypes, and namespaces.
 - High-level APIs must compile down to the same runtime shape as handwritten static specs: no per-call allocation, runtime metadata parsing, or hot-path dynamic registry.
@@ -236,17 +236,17 @@ otter-vm
 otter-gc
 ```
 
-Supporting crates should live under `crates-next/*`. Legacy crates under
-`crates/*` are reference-only and must not be added to the active build
+Supporting crates should live under `crates/*`. Legacy crates under
+`crates-legacy/*` are reference-only and must not be added to the active build
 graph.
 
 ### Key Architectural Constraints
 
 1. **GC Safety**: Values must be properly rooted when stored across GC boundaries. Use the active GC/reference types and rooting patterns.
 
-2. **Value Representation**: The value model lives in `crates-next/otter-vm/src/value.rs`.
+2. **Value Representation**: The value model lives in `crates/otter-vm/src/lib.rs`.
 
-3. **Object Model**: The object model lives in `crates-next/otter-vm/src/object.rs`.
+3. **Object Model**: The object model lives in `crates/otter-vm/src/object.rs`.
 
 4. **Async ops require Tokio**: async ops are scheduled onto a Tokio runtime handle (thread-local).
 

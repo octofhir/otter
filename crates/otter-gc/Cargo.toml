@@ -1,0 +1,61 @@
+[package]
+name = "otter-gc"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Production-grade page-based generational tracing GC for the Otter new-engine VM."
+
+[lints.rust]
+# `unsafe_code` ban lifted for this crate per the mdBook GC API docs. Every
+# other `crates/*` crate keeps the workspace `forbid(unsafe_code)`.
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[dependencies]
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+static_assertions = "1.1"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+criterion = { workspace = true }
+
+# Criterion benches — listed explicitly so the custom main
+# takes precedence over libtest.
+[[bench]]
+name = "bench_alloc_young_bump"
+harness = false
+
+[[bench]]
+name = "bench_alloc_with_barrier"
+harness = false
+
+[[bench]]
+name = "bench_scavenge_4mb"
+harness = false
+
+[[bench]]
+name = "bench_collect_full_256mb"
+harness = false
+
+[[bench]]
+name = "bench_card_table_dirty_scan"
+harness = false
+
+[[bench]]
+name = "bench_handle_scope_overhead"
+harness = false
+
+[[bench]]
+name = "bench_pointer_compress_decompress"
+harness = false
+
+[[bench]]
+name = "bench_backing_store_accounting"
+harness = false

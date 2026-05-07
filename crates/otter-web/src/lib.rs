@@ -27,8 +27,9 @@ pub mod request_response;
 pub mod url;
 
 use otter_runtime::{
-    GlobalClass,
-    module_api::{JsString, NativeCtx, NativeError, Value},
+    GlobalClass, OtterBuilder, RuntimeBuilder, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeValue as Value, runtime_arg_to_string,
+    runtime_string_value, runtime_type_error,
 };
 
 /// Static descriptor for a Web API class/global.
@@ -44,23 +45,23 @@ pub struct WebApiClass {
 pub static WEB_API_CLASSES: &[WebApiClass] = &[
     WebApiClass {
         name: "URL",
-        spec: GlobalClass::from_raw(&url::URL_CLASS_SPEC),
+        spec: GlobalClass::from_runtime(&url::URL_CLASS_SPEC),
     },
     WebApiClass {
         name: "Headers",
-        spec: GlobalClass::from_raw(&headers::HEADERS_CLASS_SPEC),
+        spec: GlobalClass::from_runtime(&headers::HEADERS_CLASS_SPEC),
     },
     WebApiClass {
         name: "Blob",
-        spec: GlobalClass::from_raw(&blob::BLOB_CLASS_SPEC),
+        spec: GlobalClass::from_runtime(&blob::BLOB_CLASS_SPEC),
     },
     WebApiClass {
         name: "Request",
-        spec: GlobalClass::from_raw(&request_response::REQUEST_CLASS_SPEC),
+        spec: GlobalClass::from_runtime(&request_response::REQUEST_CLASS_SPEC),
     },
     WebApiClass {
         name: "Response",
-        spec: GlobalClass::from_raw(&request_response::RESPONSE_CLASS_SPEC),
+        spec: GlobalClass::from_runtime(&request_response::RESPONSE_CLASS_SPEC),
     },
 ];
 
@@ -70,24 +71,45 @@ pub const fn web_api_classes() -> &'static [WebApiClass] {
     WEB_API_CLASSES
 }
 
-pub(crate) fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
-    NativeError::TypeError {
-        name,
-        reason: reason.into(),
+/// Register active Web API globals on a runtime builder.
+#[must_use]
+pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
+    builder.global_classes(WEB_API_CLASSES.iter().map(|class| class.spec))
+}
+
+/// Register active Web API globals on a Layer-A builder.
+#[must_use]
+pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
+    builder.global_classes(WEB_API_CLASSES.iter().map(|class| class.spec))
+}
+
+/// Ergonomic extension trait for enabling Web APIs on builders.
+pub trait WebApiBuilderExt: Sized {
+    /// Register URL, Headers, Blob, Request, and Response globals.
+    #[must_use]
+    fn with_web_apis(self) -> Self;
+}
+
+impl WebApiBuilderExt for RuntimeBuilder {
+    fn with_web_apis(self) -> Self {
+        with_web_apis(self)
     }
+}
+
+impl WebApiBuilderExt for OtterBuilder {
+    fn with_web_apis(self) -> Self {
+        with_web_apis_for_otter(self)
+    }
+}
+
+pub(crate) fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
+    runtime_type_error(name, reason)
 }
 
 pub(crate) fn arg_string(args: &[Value], index: usize) -> String {
-    match args.get(index) {
-        Some(Value::String(value)) => value.to_lossy_string(),
-        Some(Value::Undefined) | None => String::new(),
-        Some(value) => value.display_string(),
-    }
+    runtime_arg_to_string(args, index)
 }
 
 pub(crate) fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
-    let heap = ctx.interp_mut().string_heap_clone();
-    Ok(Value::String(
-        JsString::from_str(value, &heap).map_err(|err| type_error("string", err.to_string()))?,
-    ))
+    runtime_string_value(ctx, value)
 }

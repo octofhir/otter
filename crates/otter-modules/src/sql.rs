@@ -5,11 +5,14 @@
 
 use std::path::{Path, PathBuf};
 
-use otter_runtime::module_api::{
-    Attr, JsObject, NativeCall, NativeCtx, NativeError, NumberValue, ObjectBuilder, Value, array,
-    object,
-};
 use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
+use otter_runtime::{
+    RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNumberValue as NumberValue,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_alloc_object,
+    runtime_array_from_elements, runtime_set_property, runtime_this_object,
+    runtime_with_host_data_mut,
+};
 use rusqlite::types::{ToSqlOutput, Value as SqliteValue, ValueRef};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
@@ -190,16 +193,8 @@ pub fn install_sql_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
             open_sql(ctx, args, &caps)
         },
     );
-    ctx.method(
-        "openSql",
-        1,
-        HostedNativeCall::from_raw(NativeCall::Dynamic(open.clone())),
-    )?
-    .method(
-        "sql",
-        1,
-        HostedNativeCall::from_raw(NativeCall::Dynamic(open)),
-    )?;
+    ctx.method("openSql", 1, HostedNativeCall::dynamic(open.clone()))?
+        .method("sql", 1, HostedNativeCall::dynamic(open))?;
     Ok(())
 }
 
@@ -223,41 +218,22 @@ fn build_database_object(
     ctx: &mut NativeCtx<'_>,
     db: SqlDatabase,
 ) -> Result<JsObject, NativeError> {
-    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), db)?;
-    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
+    let mut builder = ObjectBuilder::from_host_data(ctx, db)?;
     builder
-        .method(
-            "execute",
-            1,
-            NativeCall::Static(method_execute),
-            Attr::builtin_function(),
-        )
+        .builtin_method("execute", 1, method_execute)
         .map_err(|err| crate::type_error("SqlDatabase", err.to_string()))?
-        .method(
-            "query",
-            1,
-            NativeCall::Static(method_query),
-            Attr::builtin_function(),
-        )
+        .builtin_method("query", 1, method_query)
         .map_err(|err| crate::type_error("SqlDatabase", err.to_string()))?
-        .method(
-            "queryOne",
-            1,
-            NativeCall::Static(method_query_one),
-            Attr::builtin_function(),
-        )
+        .builtin_method("queryOne", 1, method_query_one)
         .map_err(|err| crate::type_error("SqlDatabase", err.to_string()))?;
     Ok(builder.build())
 }
 
 fn database_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
-    match ctx.this_value().clone() {
-        Value::Object(object) => Ok(object),
-        _ => Err(crate::type_error(name, "invalid SqlDatabase receiver")),
-    }
+    runtime_this_object(ctx, name, "SqlDatabase")
 }
 
-fn host_error(name: &'static str, err: object::HostObjectError) -> NativeError {
+fn host_error(name: &'static str, err: RuntimeHostObjectError) -> NativeError {
     crate::type_error(name, err.to_string())
 }
 
@@ -269,12 +245,9 @@ fn method_execute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     let object = database_receiver(ctx, "SqlDatabase.execute")?;
     let sql = crate::arg_string(args, 0, "SqlDatabase.execute")?;
     let params = js_params(rest_args(args))?;
-    let result = object::with_host_data_mut::<SqlDatabase, _>(
-        object,
-        ctx.interp_mut().gc_heap_mut(),
-        |db| db.execute(&sql, &params),
-    )
-    .map_err(|err| host_error("SqlDatabase.execute", err))?;
+    let result =
+        runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.execute(&sql, &params))
+            .map_err(|err| host_error("SqlDatabase.execute", err))?;
     let affected =
         result.map_err(|err| crate::type_error("SqlDatabase.execute", err.to_string()))?;
     Ok(Value::Number(NumberValue::from_f64(affected as f64)))
@@ -284,12 +257,9 @@ fn method_query(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let object = database_receiver(ctx, "SqlDatabase.query")?;
     let sql = crate::arg_string(args, 0, "SqlDatabase.query")?;
     let params = js_params(rest_args(args))?;
-    let result = object::with_host_data_mut::<SqlDatabase, _>(
-        object,
-        ctx.interp_mut().gc_heap_mut(),
-        |db| db.query(&sql, &params),
-    )
-    .map_err(|err| host_error("SqlDatabase.query", err))?;
+    let result =
+        runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.query(&sql, &params))
+            .map_err(|err| host_error("SqlDatabase.query", err))?;
     let rows = result.map_err(|err| crate::type_error("SqlDatabase.query", err.to_string()))?;
     json_rows_to_array(ctx, rows)
 }
@@ -298,12 +268,9 @@ fn method_query_one(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     let object = database_receiver(ctx, "SqlDatabase.queryOne")?;
     let sql = crate::arg_string(args, 0, "SqlDatabase.queryOne")?;
     let params = js_params(rest_args(args))?;
-    let result = object::with_host_data_mut::<SqlDatabase, _>(
-        object,
-        ctx.interp_mut().gc_heap_mut(),
-        |db| db.query_one(&sql, &params),
-    )
-    .map_err(|err| host_error("SqlDatabase.queryOne", err))?;
+    let result =
+        runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.query_one(&sql, &params))
+            .map_err(|err| host_error("SqlDatabase.queryOne", err))?;
     match result.map_err(|err| crate::type_error("SqlDatabase.queryOne", err.to_string()))? {
         Some(row) => json_row_to_object(ctx, row).map(Value::Object),
         None => Ok(Value::Null),
@@ -319,12 +286,12 @@ fn json_rows_to_array(ctx: &mut NativeCtx<'_>, rows: Vec<JsonValue>) -> Result<V
         .into_iter()
         .map(|row| json_row_to_object(ctx, row).map(Value::Object))
         .collect::<Result<Vec<_>, _>>()?;
-    let arr = array::from_elements(ctx.interp_mut().gc_heap_mut(), values)?;
+    let arr = runtime_array_from_elements(ctx, values)?;
     Ok(Value::Array(arr))
 }
 
 fn json_row_to_object(ctx: &mut NativeCtx<'_>, row: JsonValue) -> Result<JsObject, NativeError> {
-    let object = object::alloc_object(ctx.interp_mut().gc_heap_mut())?;
+    let object = runtime_alloc_object(ctx)?;
     let JsonValue::Object(map) = row else {
         return Err(crate::type_error(
             "SqlDatabase.query",
@@ -333,7 +300,7 @@ fn json_row_to_object(ctx: &mut NativeCtx<'_>, row: JsonValue) -> Result<JsObjec
     };
     for (name, value) in map {
         let value = crate::json_to_value(ctx, value)?;
-        object::set(object, ctx.interp_mut().gc_heap_mut(), &name, value);
+        runtime_set_property(ctx, object, &name, value);
     }
     Ok(object)
 }

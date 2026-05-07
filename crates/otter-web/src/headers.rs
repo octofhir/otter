@@ -2,9 +2,12 @@
 
 use std::collections::BTreeMap;
 
-use otter_runtime::module_api::{
-    Attr, ClassSpec, ConstructorSpec, JsObject, MethodSpec, NativeCall, NativeCtx, NativeError,
-    ObjectBuilder, Value, object,
+use otter_runtime::{
+    RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeHostObjectError,
+    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
+    runtime_constructor, runtime_method, runtime_this_object, runtime_with_host_data,
+    runtime_with_host_data_mut,
 };
 
 /// Headers validation error.
@@ -98,37 +101,26 @@ fn normalize_value(value: &str) -> String {
 }
 
 /// Static Headers class spec.
-pub static HEADERS_CLASS_SPEC: ClassSpec = ClassSpec {
-    constructor: ConstructorSpec {
-        name: "Headers",
-        length: 0,
-        call: NativeCall::Static(headers_constructor_native),
-        static_methods: &[],
-        prototype_methods: &[
-            method("append", 2, headers_append_native),
-            method("delete", 1, headers_delete_native),
-            method("get", 1, headers_get_native),
-            method("has", 1, headers_has_native),
-            method("set", 2, headers_set_native),
-            method("entries", 0, headers_entries_native),
-        ],
-        attrs: Attr::global_binding(),
-    },
-    prototype_accessors: &[],
-};
+static HEADERS_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] = &[
+    runtime_method("append", 2, headers_append_native),
+    runtime_method("delete", 1, headers_delete_native),
+    runtime_method("get", 1, headers_get_native),
+    runtime_method("has", 1, headers_has_native),
+    runtime_method("set", 2, headers_set_native),
+    runtime_method("entries", 0, headers_entries_native),
+];
 
-const fn method(
-    name: &'static str,
-    length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
-) -> MethodSpec {
-    MethodSpec {
-        name,
-        length,
-        attrs: Attr::builtin_function(),
-        call: NativeCall::Static(call),
-    }
-}
+pub static HEADERS_CLASS_SPEC: ClassSpec = runtime_class(
+    runtime_constructor(
+        "Headers",
+        0,
+        headers_constructor_native,
+        &[],
+        HEADERS_PROTOTYPE_METHODS,
+        Attr::global_binding(),
+    ),
+    &[],
+);
 
 fn headers_constructor_native(
     ctx: &mut NativeCtx<'_>,
@@ -138,13 +130,10 @@ fn headers_constructor_native(
 }
 
 fn headers_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
-    match ctx.this_value().clone() {
-        Value::Object(object) => Ok(object),
-        _ => Err(crate::type_error(name, "invalid Headers receiver")),
-    }
+    runtime_this_object(ctx, name, "Headers")
 }
 
-fn host_error(name: &'static str, err: object::HostObjectError) -> NativeError {
+fn host_error(name: &'static str, err: RuntimeHostObjectError) -> NativeError {
     crate::type_error(name, err.to_string())
 }
 
@@ -152,11 +141,9 @@ fn headers_append_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     let object = headers_receiver(ctx, "Headers.prototype.append")?;
     let name = crate::arg_string(args, 0);
     let value = crate::arg_string(args, 1);
-    let result = object::with_host_data_mut::<Headers, _>(
-        object,
-        ctx.interp_mut().gc_heap_mut(),
-        |headers| headers.append(&name, &value),
-    )
+    let result = runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| {
+        headers.append(&name, &value)
+    })
     .map_err(|err| host_error("Headers.prototype.append", err))?;
     result.map_err(|err| crate::type_error("Headers.prototype.append", err.to_string()))?;
     Ok(Value::Undefined)
@@ -165,12 +152,9 @@ fn headers_append_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 fn headers_delete_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.delete")?;
     let name = crate::arg_string(args, 0);
-    let result = object::with_host_data_mut::<Headers, _>(
-        object,
-        ctx.interp_mut().gc_heap_mut(),
-        |headers| headers.delete(&name),
-    )
-    .map_err(|err| host_error("Headers.prototype.delete", err))?;
+    let result =
+        runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| headers.delete(&name))
+            .map_err(|err| host_error("Headers.prototype.delete", err))?;
     result.map_err(|err| crate::type_error("Headers.prototype.delete", err.to_string()))?;
     Ok(Value::Undefined)
 }
@@ -178,9 +162,8 @@ fn headers_delete_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 fn headers_get_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.get")?;
     let name = crate::arg_string(args, 0);
-    let result =
-        object::with_host_data::<Headers, _>(object, ctx.heap(), |headers| headers.get(&name))
-            .map_err(|err| host_error("Headers.prototype.get", err))?;
+    let result = runtime_with_host_data::<Headers, _>(ctx, object, |headers| headers.get(&name))
+        .map_err(|err| host_error("Headers.prototype.get", err))?;
     match result.map_err(|err| crate::type_error("Headers.prototype.get", err.to_string()))? {
         Some(value) => crate::string_value(ctx, &value),
         None => Ok(Value::Null),
@@ -190,9 +173,8 @@ fn headers_get_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 fn headers_has_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.has")?;
     let name = crate::arg_string(args, 0);
-    let result =
-        object::with_host_data::<Headers, _>(object, ctx.heap(), |headers| headers.has(&name))
-            .map_err(|err| host_error("Headers.prototype.has", err))?;
+    let result = runtime_with_host_data::<Headers, _>(ctx, object, |headers| headers.has(&name))
+        .map_err(|err| host_error("Headers.prototype.has", err))?;
     Ok(Value::Boolean(result.map_err(|err| {
         crate::type_error("Headers.prototype.has", err.to_string())
     })?))
@@ -202,19 +184,16 @@ fn headers_set_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let object = headers_receiver(ctx, "Headers.prototype.set")?;
     let name = crate::arg_string(args, 0);
     let value = crate::arg_string(args, 1);
-    let result = object::with_host_data_mut::<Headers, _>(
-        object,
-        ctx.interp_mut().gc_heap_mut(),
-        |headers| headers.set(&name, &value),
-    )
-    .map_err(|err| host_error("Headers.prototype.set", err))?;
+    let result =
+        runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| headers.set(&name, &value))
+            .map_err(|err| host_error("Headers.prototype.set", err))?;
     result.map_err(|err| crate::type_error("Headers.prototype.set", err.to_string()))?;
     Ok(Value::Undefined)
 }
 
 fn headers_entries_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.entries")?;
-    let entries = object::with_host_data::<Headers, _>(object, ctx.heap(), Headers::entries)
+    let entries = runtime_with_host_data::<Headers, _>(ctx, object, Headers::entries)
         .map_err(|err| host_error("Headers.prototype.entries", err))?;
     let text = entries
         .into_iter()
@@ -228,55 +207,14 @@ pub(crate) fn headers_object(
     ctx: &mut NativeCtx<'_>,
     state: Headers,
 ) -> Result<Value, NativeError> {
-    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
-    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
+    let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
     builder
-        .method(
-            "append",
-            2,
-            NativeCall::Static(headers_append_native),
-            Attr::builtin_function(),
-        )
-        .and_then(|builder| {
-            builder.method(
-                "delete",
-                1,
-                NativeCall::Static(headers_delete_native),
-                Attr::builtin_function(),
-            )
-        })
-        .and_then(|builder| {
-            builder.method(
-                "get",
-                1,
-                NativeCall::Static(headers_get_native),
-                Attr::builtin_function(),
-            )
-        })
-        .and_then(|builder| {
-            builder.method(
-                "has",
-                1,
-                NativeCall::Static(headers_has_native),
-                Attr::builtin_function(),
-            )
-        })
-        .and_then(|builder| {
-            builder.method(
-                "set",
-                2,
-                NativeCall::Static(headers_set_native),
-                Attr::builtin_function(),
-            )
-        })
-        .and_then(|builder| {
-            builder.method(
-                "entries",
-                0,
-                NativeCall::Static(headers_entries_native),
-                Attr::builtin_function(),
-            )
-        })
+        .builtin_method("append", 2, headers_append_native)
+        .and_then(|builder| builder.builtin_method("delete", 1, headers_delete_native))
+        .and_then(|builder| builder.builtin_method("get", 1, headers_get_native))
+        .and_then(|builder| builder.builtin_method("has", 1, headers_has_native))
+        .and_then(|builder| builder.builtin_method("set", 2, headers_set_native))
+        .and_then(|builder| builder.builtin_method("entries", 0, headers_entries_native))
         .map_err(|err| crate::type_error("Headers", err.to_string()))?;
-    Ok(Value::Object(object))
+    Ok(Value::Object(builder.build()))
 }

@@ -29,6 +29,7 @@ use otter_runtime::{
     BooleanPermission, CapabilitySet, Diagnostic, OtterError, Permission, SourceInput,
 };
 use otter_test::{Report, RunOptions, Suite};
+use otter_web::WebApiBuilderExt;
 
 /// Otter — JS/TS engine (foundation phase).
 #[derive(Debug, Parser)]
@@ -473,9 +474,7 @@ async fn run_file(
     // detection is AST-based (see `Otter::run_file` for the
     // shared helper used in the embedder Layer-A path).
     //
-    let otter = otter_runtime::Otter::builder()
-        .capabilities(caps.clone())
-        .build()?;
+    let otter = cli_otter_builder(caps).build()?;
     startup_timer.mark("runtime_build");
     let result = otter.run_file(path).await?;
     startup_timer.mark("runtime_run_file");
@@ -495,9 +494,7 @@ async fn run_eval(
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
-    let otter = otter_runtime::Otter::builder()
-        .capabilities(caps.clone())
-        .build()?;
+    let otter = cli_otter_builder(caps).build()?;
     startup_timer.mark("runtime_build");
     let result = otter.eval(source).await?;
     startup_timer.mark("runtime_eval");
@@ -510,6 +507,12 @@ async fn run_eval(
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
+    otter_runtime::Otter::builder()
+        .capabilities(caps.clone())
+        .with_web_apis()
 }
 
 fn run_check(path: &std::path::Path, json: bool) -> Result<ExitCode, OtterError> {

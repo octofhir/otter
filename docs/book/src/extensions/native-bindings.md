@@ -17,18 +17,27 @@ The current safe path is:
   completion back to the isolate.
 
 Specs/builders expose functions, classes, namespaces, and accessors.
-Production builtins should use
-`NativeCall::Static(NativeFastFn)` through `MethodSpec` by default.
-Dynamic closures are reserved for embedder cases that need captured Rust
-state and can still trace explicit JS captures.
+Production builtins should use runtime-owned helpers such as
+`runtime_method(...)`, `RuntimeObjectBuilder::builtin_method(...)`, or
+`runtime_native_static(...)` by default. Dynamic closures are reserved for
+embedder cases that need captured Rust state and can still trace explicit JS
+captures.
 
 Hosted module namespace installers should use `HostedModuleCtx` and attach
 long-lived Rust state to receiver objects through the runtime host-object
 primitive. Namespace-level closures may capture owned configuration such as a
 cloned capability set, but per-instance state should live on the JS object and
-be reached through `NativeCtx::this_value()`. Closures must not capture
+be reached through `runtime_this_object(...)` plus
+`runtime_with_host_data(_mut)`. Closures must not capture
 `RuntimeCx`, `NativeCtx`, `Value`, `Gc<T>`, `Local<'gc, T>`, frames, or handle
 scopes.
+
+Source/module loading is separate from filesystem I/O permissions. Following
+Deno's model, the entrypoint and statically analyzable local module graph are
+code loading, not `fs_read`. Runtime APIs that expose arbitrary file reads
+must still enforce `CapabilitySet::read`; future non-analyzable dynamic local
+imports and remote imports should use an explicit import policy rather than
+piggybacking on ordinary file I/O.
 
 ## Embedder Console Sink
 
@@ -65,17 +74,19 @@ must not store VM values, GC handles, or native contexts.
 ## Synchronous Native Shape
 
 ```rust,ignore
-use otter_runtime::module_api::{JsString, NativeCtx, NativeError, Value};
+use otter_runtime::{
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeValue as Value,
+    runtime_arg_to_string, runtime_string_value,
+};
 
 fn read_flag(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     check_permission(ctx, "env")?;
-    let name = expect_string(args.first())?;
+    let name = runtime_arg_to_string(args, 0);
     let value = read_allowed_env(name)?;
-    let heap = ctx.interp_mut().string_heap_clone();
-    Ok(Value::String(JsString::from_str(&value, &heap)?))
+    runtime_string_value(ctx, &value)
 }
 ```
 
@@ -87,20 +98,17 @@ To expose that function as a static builtin, put it behind a spec and let
 bootstrap or a mutator-bound builder install it:
 
 ```rust,ignore
-use otter_runtime::module_api::{Attr, MethodSpec, NativeCall};
-
-static READ_FLAG: MethodSpec = MethodSpec {
-    name: "readFlag",
-    length: 1,
-    attrs: Attr::builtin_function(),
-    call: NativeCall::Static(read_flag),
+use otter_runtime::{
+    RuntimeMethodSpec as MethodSpec, runtime_method,
 };
+
+static READ_FLAG: MethodSpec = runtime_method("readFlag", 1, read_flag);
 ```
 
 ## Async Native Shape
 
 ```rust,ignore
-use otter_runtime::module_api::NativeCtx;
+use otter_runtime::RuntimeNativeCtx as NativeCtx;
 
 fn start_async_read(ctx: &mut NativeCtx<'_>, path: PathBuf) -> Result<OpId, Error> {
     check_read_permission(ctx, &path)?;

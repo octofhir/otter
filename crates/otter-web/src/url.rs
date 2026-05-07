@@ -1,8 +1,11 @@
 //! WHATWG URL host-side record.
 
-use otter_runtime::module_api::{
-    Attr, ClassSpec, ConstructorSpec, JsObject, MethodSpec, NativeCall, NativeCtx, NativeError,
-    ObjectBuilder, Value, object,
+use otter_runtime::{
+    RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeJsObject as JsObject,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
+    runtime_constructor, runtime_method, runtime_optional_arg_to_string, runtime_this_object,
+    runtime_with_host_data,
 };
 use url::Url;
 
@@ -117,46 +120,34 @@ impl WebUrl {
 }
 
 /// Static URL class spec.
-pub static URL_CLASS_SPEC: ClassSpec = ClassSpec {
-    constructor: ConstructorSpec {
-        name: "URL",
-        length: 1,
-        call: NativeCall::Static(url_constructor_native),
-        static_methods: &[],
-        prototype_methods: &[MethodSpec {
-            name: "toString",
-            length: 0,
-            attrs: Attr::builtin_function(),
-            call: NativeCall::Static(url_to_string_native),
-        }],
-        attrs: Attr::global_binding(),
-    },
-    prototype_accessors: &[],
-};
+static URL_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] =
+    &[runtime_method("toString", 0, url_to_string_native)];
+
+pub static URL_CLASS_SPEC: ClassSpec = runtime_class(
+    runtime_constructor(
+        "URL",
+        1,
+        url_constructor_native,
+        &[],
+        URL_PROTOTYPE_METHODS,
+        Attr::global_binding(),
+    ),
+    &[],
+);
 
 fn url_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let input = crate::arg_string(args, 0);
-    let base = match args.get(1) {
-        Some(Value::String(value)) => Some(
-            WebUrl::parse(&value.to_lossy_string(), None)
-                .map_err(|err| crate::type_error("URL", err.to_string()))?,
-        ),
-        Some(Value::Undefined) | None => None,
-        Some(value) => Some(
-            WebUrl::parse(&value.display_string(), None)
-                .map_err(|err| crate::type_error("URL", err.to_string()))?,
-        ),
-    };
+    let base = runtime_optional_arg_to_string(args, 1)
+        .map(|value| WebUrl::parse(&value, None))
+        .transpose()
+        .map_err(|err| crate::type_error("URL", err.to_string()))?;
     let url = WebUrl::parse(&input, base.as_ref())
         .map_err(|err| crate::type_error("URL", err.to_string()))?;
     url_object(ctx, url)
 }
 
 fn url_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
-    match ctx.this_value().clone() {
-        Value::Object(object) => Ok(object),
-        _ => Err(crate::type_error(name, "invalid URL receiver")),
-    }
+    runtime_this_object(ctx, name, "URL")
 }
 
 fn url_state<R>(
@@ -165,7 +156,7 @@ fn url_state<R>(
     f: impl FnOnce(&WebUrl) -> R,
 ) -> Result<R, NativeError> {
     let object = url_receiver(ctx, name)?;
-    object::with_host_data::<WebUrl, _>(object, ctx.heap(), f)
+    runtime_with_host_data::<WebUrl, _>(ctx, object, f)
         .map_err(|err| crate::type_error(name, err.to_string()))
 }
 
@@ -182,23 +173,16 @@ pub(crate) fn url_object(ctx: &mut NativeCtx<'_>, state: WebUrl) -> Result<Value
     let pathname = crate::string_value(ctx, &state.pathname())?;
     let search = crate::string_value(ctx, &state.search())?;
     let hash = crate::string_value(ctx, &state.hash())?;
-    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
-    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
+    let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
     builder
-        .method(
-            "toString",
-            0,
-            NativeCall::Static(url_to_string_native),
-            Attr::builtin_function(),
-        )
-        .and_then(|builder| builder.property("href", href, Attr::data()))
-        .and_then(|builder| builder.property("protocol", protocol, Attr::data()))
-        .and_then(|builder| builder.property("origin", origin, Attr::data()))
-        .and_then(|builder| builder.property("host", host, Attr::data()))
-        .and_then(|builder| builder.property("pathname", pathname, Attr::data()))
-        .and_then(|builder| builder.property("search", search, Attr::data()))
-        .and_then(|builder| builder.property("hash", hash, Attr::data()))
+        .builtin_method("toString", 0, url_to_string_native)
+        .and_then(|builder| builder.data_property("href", href))
+        .and_then(|builder| builder.data_property("protocol", protocol))
+        .and_then(|builder| builder.data_property("origin", origin))
+        .and_then(|builder| builder.data_property("host", host))
+        .and_then(|builder| builder.data_property("pathname", pathname))
+        .and_then(|builder| builder.data_property("search", search))
+        .and_then(|builder| builder.data_property("hash", hash))
         .map_err(|err| crate::type_error("URL", err.to_string()))?;
-    let object = builder.build();
-    Ok(Value::Object(object))
+    Ok(Value::Object(builder.build()))
 }

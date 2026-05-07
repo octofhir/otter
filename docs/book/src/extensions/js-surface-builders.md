@@ -3,10 +3,10 @@
 Otter's preferred contributor API for JavaScript-visible surfaces is a
 static spec plus mutator-bound builder flow.
 
-The examples below document the required generated/runtime shape. The first
-production slice is implemented in
-`otter-vm::js_surface` and `otter-vm::bootstrap`; `Math`, `JSON`,
-`Atomics`, and `console` are installed through this path.
+The examples below document the required generated/runtime shape. Product
+crates should use the runtime-owned facade in `otter_runtime`; the VM keeps the
+static backend and centralized bootstrap internals. `Math`, `JSON`, `Atomics`,
+`console`, and active Web API classes are installed through this path.
 
 The goal is high-level ergonomics without runtime overhead:
 
@@ -25,9 +25,11 @@ The goal is high-level ergonomics without runtime overhead:
 The intended model is:
 
 ```rust
-use otter_vm::{
-    Attr, ConstSpec, ConstValue, MethodSpec, NamespaceSpec, NativeCall,
-    NativeCtx, NativeError, Value,
+use otter_runtime::{
+    RuntimeAttr as Attr, RuntimeConstValue as ConstValue,
+    RuntimeConstSpec, RuntimeMethodSpec, RuntimeNamespaceSpec as NamespaceSpec,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeValue as Value, runtime_constant, runtime_method, runtime_namespace,
 };
 
 fn math_abs(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -35,32 +37,26 @@ fn math_abs(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     Ok(Value::Undefined)
 }
 
-static MATH_SPEC: NamespaceSpec = NamespaceSpec {
-    name: "Math",
-    methods: &[
-        MethodSpec {
-            name: "abs",
-            length: 1,
-            attrs: Attr::builtin_function(),
-            call: NativeCall::Static(math_abs),
-        },
-    ],
-    constants: &[
-        ConstSpec {
-            name: "PI",
-            value: ConstValue::Number(std::f64::consts::PI),
-            attrs: Attr::read_only(),
-        },
-    ],
-    accessors: &[],
-    attrs: Attr::global_binding(),
-};
+static MATH_METHODS: [RuntimeMethodSpec; 1] = [runtime_method("abs", 1, math_abs)];
+
+static MATH_CONSTANTS: [RuntimeConstSpec; 1] =
+    [runtime_constant("PI", ConstValue::Number(std::f64::consts::PI))];
+
+static MATH_SPEC: NamespaceSpec = runtime_namespace(
+    "Math",
+    &MATH_METHODS,
+    &[],
+    &MATH_CONSTANTS,
+    Attr::global_binding(),
+);
 ```
 
 Builders are lifetime-bound to the current mutator turn:
 
 ```rust,ignore
-let namespace = NamespaceBuilder::from_spec(heap, &MATH_SPEC)?.build()?;
+let mut object = otter_runtime::RuntimeObjectBuilder::new(ctx)?;
+object.builtin_method("abs", 1, math_abs)?;
+let namespace = object.build();
 ```
 
 Do not store builders, contexts, `Value`, `Gc<T>`, `Local<'gc, T>`, or VM
@@ -68,19 +64,19 @@ frames in async host futures.
 
 ## Spec Records
 
-- `Attr`: writable/enumerable/configurable attributes with explicit
+- `RuntimeAttr`: writable/enumerable/configurable attributes with explicit
   defaults and helpers such as `builtin_function`, `read_only`, and
   `global_binding`;
-- `ConstValue` / `ConstSpec`: static primitive values and constant/data
+- `RuntimeConstValue` / `RuntimeConstSpec`: static primitive values and constant/data
   properties;
-- `PropertySpec`: data properties and constants;
-- `MethodSpec`: exported name, `.length`, attributes, and native call
+- `RuntimePropertySpec`: data properties and constants;
+- `RuntimeMethodSpec`: exported name, `.length`, attributes, and native call
   target;
-- `AccessorSpec`: getter/setter pair and accessor attributes;
-- `ConstructorSpec`: constructor function, prototype, statics, and
+- `RuntimeAccessorSpec`: getter/setter pair and accessor attributes;
+- `RuntimeConstructorSpec`: constructor function, prototype, statics, and
   prototype methods;
-- `ClassSpec`: class-shaped constructor/prototype/static surface;
-- `NamespaceSpec`: namespace object or hosted module namespace.
+- `RuntimeClassSpec`: class-shaped constructor/prototype/static surface;
+- `RuntimeNamespaceSpec`: namespace object or hosted module namespace.
 
 Specs contain only static metadata and native targets. They must not hold
 `Gc<T>`, `Local<'gc, T>`, `RuntimeCx`, `NativeCtx`, VM frames, or runtime
@@ -102,17 +98,18 @@ modules.
 Native call storage is split into a static fast path and a dynamic path:
 
 ```rust,ignore
-use otter_vm::{NativeCall, NativeFastFn, NativeFn};
+use otter_runtime::{RuntimeNativeCall, RuntimeNativeFastFn, RuntimeNativeFn};
 use std::sync::Arc;
 
-pub enum NativeCall {
-    Static(NativeFastFn),
-    Dynamic(Arc<NativeFn>),
+pub enum RuntimeNativeCall {
+    Static(RuntimeNativeFastFn),
+    Dynamic(Arc<RuntimeNativeFn>),
 }
 ```
 
 Spec-declared builtins and macro-generated builtins should use
-`NativeCall::Static` by default. Use dynamic closures only when the
+`runtime_method(...)`, `RuntimeObjectBuilder::builtin_method(...)`, or
+`runtime_native_static(...)` by default. Use dynamic closures only when the
 embedder needs captured Rust state, and keep traced JS captures explicit.
 Crate-internal VM helpers may still use local unchecked constructors for
 audited isolate-local payloads.
@@ -125,8 +122,8 @@ The first migrated namespaces are `Math`, `JSON`, `Atomics`, and
 - `globalThis.Math` is installed from `math::MATH_SPEC`;
 - Math constants use non-writable, non-enumerable, non-configurable
   descriptors;
-- Math methods are `Value::NativeFunction` values using
-  `NativeCall::Static` and explicit `.length`;
+- Math methods are `Value::NativeFunction` values using the static
+  function-pointer path and explicit `.length`;
 - direct `Math.abs(...)` calls still use the existing `Op::MathCall`
   compiler fast path, while method reads such as `Math.abs.length` and
   extracted calls use the installed namespace object.
@@ -135,6 +132,11 @@ The first migrated namespaces are `Math`, `JSON`, `Atomics`, and
   specs;
 - `console` output is routed through an embedder-overridable
   `ConsoleSink`; the default sink writes with `println!` / `eprintln!`.
+- Active Web API classes use `runtime_class`, `runtime_constructor`,
+  `runtime_method`, and `RuntimeObjectBuilder::from_host_data` from
+  `otter_runtime`. Embedders can enable the active Web globals with
+  `otter_web::WebApiBuilderExt::with_web_apis`; the CLI enables that preset by
+  default while keeping `otter-runtime` independent of `otter-web`.
 
 ## Performance Rules
 

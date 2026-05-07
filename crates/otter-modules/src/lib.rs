@@ -15,7 +15,7 @@
 //! - Permission checks happen at the Rust boundary before host resources open.
 //! - Host state is owned Rust data; no VM values, handles, or contexts are
 //!   stored in futures or long-lived module state.
-//! - JS surfaces are static specs using `NativeCall::Static`.
+//! - JS surfaces use runtime-owned static native method helpers.
 //!
 //! # See also
 //! - [Hosted modules](../../../docs/book/src/extensions/hosted-modules.md)
@@ -24,8 +24,11 @@ pub mod ffi;
 pub mod kv;
 pub mod sql;
 
-use otter_runtime::module_api::{JsString, NativeCtx, NativeError, NumberValue, Value};
-use otter_runtime::{HostedModule, HostedModuleInstall};
+use otter_runtime::{
+    HostedModule, HostedModuleInstall, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNumberValue as NumberValue, RuntimeValue as Value,
+    runtime_arg_to_string, runtime_string_value, runtime_type_error,
+};
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 
 /// Active `otter:*` hosted modules in deterministic install order.
@@ -48,25 +51,15 @@ pub const fn hosted_modules() -> &'static [HostedModule] {
 }
 
 fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
-    NativeError::TypeError {
-        name,
-        reason: reason.into(),
-    }
+    runtime_type_error(name, reason)
 }
 
 fn arg_string(args: &[Value], index: usize, _name: &'static str) -> Result<String, NativeError> {
-    match args.get(index) {
-        Some(Value::String(value)) => Ok(value.to_lossy_string()),
-        Some(Value::Undefined) | None => Ok(String::new()),
-        Some(value) => Ok(value.display_string()),
-    }
+    Ok(runtime_arg_to_string(args, index))
 }
 
 fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
-    let heap = ctx.interp_mut().string_heap_clone();
-    Ok(Value::String(
-        JsString::from_str(value, &heap).map_err(|err| type_error("string", err.to_string()))?,
-    ))
+    runtime_string_value(ctx, value)
 }
 
 fn json_to_value(ctx: &mut NativeCtx<'_>, value: JsonValue) -> Result<Value, NativeError> {

@@ -83,6 +83,7 @@ otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }
 otter-runtime   = { path = "crates/otter-runtime" }
 otter-test      = { path = "crates/otter-test" }
+otter-web       = { path = "crates/otter-web" }
 
 [workspace.lints.rust]
 unsafe_code         = "forbid"

@@ -1267,6 +1267,7 @@ dependencies = [
  "otter-compiler",
  "otter-runtime",
  "otter-test",
+ "otter-web",
  "serde_json",
  "tokio",
 ]

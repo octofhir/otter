@@ -28,29 +28,14 @@
 pub mod error;
 pub mod event_loop;
 pub mod handle;
-#[doc(hidden)]
-pub mod module_api {
-    //! Low-level runtime adapter for active hosted-module migration.
-    //!
-    //! Product crates should treat this module as an implementation detail. It
-    //! exists so hosted modules can depend on `otter-runtime` instead of
-    //! depending directly on `otter-vm` while the runtime-owned builder API is
-    //! being introduced.
-
-    pub use otter_vm::array;
-    pub use otter_vm::object;
-    pub use otter_vm::{
-        AccessorSpec, Attr, ClassSpec, ConstructorSpec, Interpreter, JsObject, MethodSpec,
-        NativeCall, NativeCtx, NativeError, NativeFn, ObjectBuilder, Value,
-    };
-    pub use otter_vm::{number::NumberValue, string::JsString};
-}
 pub mod module_graph;
 pub mod module_loader;
 pub mod structured_clone;
+pub mod surface;
 pub mod worker;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use otter_bytecode::BytecodeModule;
@@ -75,6 +60,18 @@ pub use structured_clone::{
     StructuredCloneTransferKind, StructuredCloneTransferList, StructuredCloneTransferListError,
     StructuredCloneValue,
 };
+pub use surface::{
+    RuntimeAccessorSpec, RuntimeAttr, RuntimeClassSpec, RuntimeConstSpec, RuntimeConstValue,
+    RuntimeConstructorSpec, RuntimeHostObjectData, RuntimeHostObjectError, RuntimeJsObject,
+    RuntimeJsString, RuntimeMethodSpec, RuntimeNamespaceSpec, RuntimeNativeCall, RuntimeNativeCtx,
+    RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNumberValue,
+    RuntimeObjectBuilder, RuntimePropertySpec, RuntimeSurfaceError, RuntimeValue, runtime_accessor,
+    runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements, runtime_class,
+    runtime_constant, runtime_constructor, runtime_getter, runtime_method,
+    runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,
+    runtime_optional_arg_to_string, runtime_property, runtime_set_property, runtime_string_value,
+    runtime_this_object, runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
+};
 pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
 };
@@ -85,7 +82,7 @@ pub use worker::{
 /// single runtime mutator turn. The context owns the namespace object builder
 /// and exposes configured capabilities for boundary checks.
 pub struct HostedModuleCtx<'rt> {
-    builder: otter_vm::ObjectBuilder<'rt>,
+    builder: RuntimeObjectBuilder<'rt>,
     capabilities: &'rt CapabilitySet,
 }
 
@@ -95,7 +92,7 @@ impl<'rt> HostedModuleCtx<'rt> {
         capabilities: &'rt CapabilitySet,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
-            builder: otter_vm::ObjectBuilder::new(interp.gc_heap_mut())?,
+            builder: RuntimeObjectBuilder::new_in_interpreter(interp)?,
             capabilities,
         })
     }
@@ -121,9 +118,43 @@ impl<'rt> HostedModuleCtx<'rt> {
             .method(
                 name,
                 length,
-                call.into_raw(),
-                module_api::Attr::builtin_function(),
+                call.into_runtime(),
+                RuntimeAttr::builtin_function(),
             )
+            .map_err(|err| err.to_string())?;
+        Ok(self)
+    }
+
+    /// Define a static builtin method on the module namespace object.
+    pub fn builtin_method(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: RuntimeNativeFastFn,
+    ) -> Result<&mut Self, String> {
+        self.method(name, length, HostedNativeCall::static_fn(call))
+    }
+
+    /// Define an ordinary data property on the module namespace object.
+    pub fn property(
+        &mut self,
+        name: &'static str,
+        value: RuntimeValue,
+    ) -> Result<&mut Self, String> {
+        self.builder
+            .data_property(name, value)
+            .map_err(|err| err.to_string())?;
+        Ok(self)
+    }
+
+    /// Define a read-only data property on the module namespace object.
+    pub fn readonly_property(
+        &mut self,
+        name: &'static str,
+        value: RuntimeValue,
+    ) -> Result<&mut Self, String> {
+        self.builder
+            .readonly_property(name, value)
             .map_err(|err| err.to_string())?;
         Ok(self)
     }
@@ -144,18 +175,29 @@ pub type HostedModuleBuilderInstall = for<'rt> fn(&mut HostedModuleCtx<'rt>) -> 
 /// signatures.
 #[derive(Debug, Clone)]
 pub struct HostedNativeCall {
-    raw: module_api::NativeCall,
+    raw: RuntimeNativeCall,
 }
 
 impl HostedNativeCall {
-    /// Low-level adapter from the current native call backend.
-    #[doc(hidden)]
+    /// Build a hosted native call from a static function pointer.
     #[must_use]
-    pub const fn from_raw(raw: module_api::NativeCall) -> Self {
-        Self { raw }
+    pub const fn static_fn(raw: RuntimeNativeFastFn) -> Self {
+        Self {
+            raw: RuntimeNativeCall::Static(raw),
+        }
     }
 
-    fn into_raw(self) -> module_api::NativeCall {
+    /// Build a hosted native call from a captured-state dynamic native
+    /// function. Use this only where the hosted module needs immutable
+    /// runtime-owned captures such as capability snapshots.
+    #[must_use]
+    pub fn dynamic(raw: Arc<RuntimeNativeFn>) -> Self {
+        Self {
+            raw: RuntimeNativeCall::Dynamic(raw),
+        }
+    }
+
+    fn into_runtime(self) -> RuntimeNativeCall {
         self.raw
     }
 }
@@ -226,15 +268,14 @@ impl HostedModule {
 /// class specs directly.
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalClass {
-    raw: &'static otter_vm::ClassSpec,
+    raw: &'static RuntimeClassSpec,
 }
 
 impl GlobalClass {
-    /// Build a runtime global class handle from the current static class-spec
-    /// backend.
-    #[doc(hidden)]
+    /// Build a runtime global class handle from a runtime-owned static class
+    /// spec.
     #[must_use]
-    pub const fn from_raw(raw: &'static otter_vm::ClassSpec) -> Self {
+    pub const fn from_runtime(raw: &'static RuntimeClassSpec) -> Self {
         Self { raw }
     }
 
@@ -244,7 +285,7 @@ impl GlobalClass {
         self.raw.constructor.name
     }
 
-    fn raw(self) -> &'static otter_vm::ClassSpec {
+    fn raw(self) -> &'static RuntimeClassSpec {
         self.raw
     }
 }
@@ -1491,6 +1532,20 @@ impl OtterBuilder {
     #[must_use]
     pub fn module_loader(mut self, loader: module_loader::LoaderConfig) -> Self {
         self.runtime = self.runtime.module_loader(loader);
+        self
+    }
+
+    /// Register one class-shaped global described by a static spec.
+    #[must_use]
+    pub fn global_class(mut self, spec: GlobalClass) -> Self {
+        self.runtime = self.runtime.global_class(spec);
+        self
+    }
+
+    /// Register multiple class-shaped globals.
+    #[must_use]
+    pub fn global_classes(mut self, specs: impl IntoIterator<Item = GlobalClass>) -> Self {
+        self.runtime = self.runtime.global_classes(specs);
         self
     }
 

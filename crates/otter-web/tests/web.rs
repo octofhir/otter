@@ -3,7 +3,7 @@ use otter_web::blob::Blob;
 use otter_web::headers::Headers;
 use otter_web::request_response::{Request, Response};
 use otter_web::url::WebUrl;
-use otter_web::web_api_classes;
+use otter_web::{WebApiBuilderExt, web_api_classes};
 
 #[test]
 fn web_api_specs_are_static_and_ordered() {
@@ -75,10 +75,7 @@ fn request_response_hold_owned_fetch_records() {
 
 #[test]
 fn web_api_globals_install_and_run_through_runtime_builder() {
-    let mut runtime = Runtime::builder()
-        .global_classes(web_api_classes().iter().map(|class| class.spec))
-        .build()
-        .unwrap();
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = runtime
         .eval(SourceInput::from_javascript(
             r#"

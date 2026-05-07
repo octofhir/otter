@@ -1,8 +1,11 @@
 //! Fetch Request and Response host-side records.
 
-use otter_runtime::module_api::{
-    Attr, ClassSpec, ConstructorSpec, JsObject, MethodSpec, NativeCall, NativeCtx, NativeError,
-    NumberValue, ObjectBuilder, Value, object,
+use otter_runtime::{
+    RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeHostObjectError,
+    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeNumberValue as NumberValue, RuntimeObjectBuilder as ObjectBuilder,
+    RuntimeValue as Value, runtime_class, runtime_constructor, runtime_method,
+    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
 };
 
 use crate::blob::Blob;
@@ -124,90 +127,74 @@ impl Response {
 }
 
 /// Static Request class spec.
-pub static REQUEST_CLASS_SPEC: ClassSpec = ClassSpec {
-    constructor: ConstructorSpec {
-        name: "Request",
-        length: 1,
-        call: NativeCall::Static(request_constructor_native),
-        static_methods: &[],
-        prototype_methods: &[method("clone", 0, request_clone_native)],
-        attrs: Attr::global_binding(),
-    },
-    prototype_accessors: &[],
-};
+static REQUEST_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] =
+    &[runtime_method("clone", 0, request_clone_native)];
+
+pub static REQUEST_CLASS_SPEC: ClassSpec = runtime_class(
+    runtime_constructor(
+        "Request",
+        1,
+        request_constructor_native,
+        &[],
+        REQUEST_PROTOTYPE_METHODS,
+        Attr::global_binding(),
+    ),
+    &[],
+);
 
 /// Static Response class spec.
-pub static RESPONSE_CLASS_SPEC: ClassSpec = ClassSpec {
-    constructor: ConstructorSpec {
-        name: "Response",
-        length: 0,
-        call: NativeCall::Static(response_constructor_native),
-        static_methods: &[method("json", 1, response_json_native)],
-        prototype_methods: &[method("clone", 0, response_clone_native)],
-        attrs: Attr::global_binding(),
-    },
-    prototype_accessors: &[],
-};
+static RESPONSE_STATIC_METHODS: &[otter_runtime::RuntimeMethodSpec] =
+    &[runtime_method("json", 1, response_json_native)];
 
-const fn method(
-    name: &'static str,
-    length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
-) -> MethodSpec {
-    MethodSpec {
-        name,
-        length,
-        attrs: Attr::builtin_function(),
-        call: NativeCall::Static(call),
-    }
-}
+static RESPONSE_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] =
+    &[runtime_method("clone", 0, response_clone_native)];
+
+pub static RESPONSE_CLASS_SPEC: ClassSpec = runtime_class(
+    runtime_constructor(
+        "Response",
+        0,
+        response_constructor_native,
+        RESPONSE_STATIC_METHODS,
+        RESPONSE_PROTOTYPE_METHODS,
+        Attr::global_binding(),
+    ),
+    &[],
+);
 
 fn request_constructor_native(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let input = crate::arg_string(args, 0);
-    let method = match args.get(1) {
-        Some(Value::String(value)) => Some(value.to_lossy_string()),
-        Some(Value::Undefined) | None => None,
-        Some(value) => Some(value.display_string()),
-    };
-    let body = match args.get(2) {
-        Some(Value::String(value)) => Some(Blob::new(value.to_lossy_string().into_bytes(), "")),
-        _ => None,
-    };
+    let method = runtime_optional_arg_to_string(args, 1);
+    let body =
+        runtime_optional_arg_to_string(args, 2).map(|value| Blob::new(value.into_bytes(), ""));
     let request = Request::new(&input, method.as_deref(), body)
         .map_err(|err| crate::type_error("Request", err.to_string()))?;
     request_object(ctx, request)
 }
 
 fn request_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
-    match ctx.this_value().clone() {
-        Value::Object(object) => Ok(object),
-        _ => Err(crate::type_error(name, "invalid Request receiver")),
-    }
+    runtime_this_object(ctx, name, "Request")
 }
 
 fn response_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
-    match ctx.this_value().clone() {
-        Value::Object(object) => Ok(object),
-        _ => Err(crate::type_error(name, "invalid Response receiver")),
-    }
+    runtime_this_object(ctx, name, "Response")
 }
 
-fn host_error(name: &'static str, err: object::HostObjectError) -> NativeError {
+fn host_error(name: &'static str, err: RuntimeHostObjectError) -> NativeError {
     crate::type_error(name, err.to_string())
 }
 
 fn request_snapshot(ctx: &NativeCtx<'_>, name: &'static str) -> Result<Request, NativeError> {
     let object = request_receiver(ctx, name)?;
-    object::with_host_data::<Request, _>(object, ctx.heap(), Clone::clone)
+    runtime_with_host_data::<Request, _>(ctx, object, Clone::clone)
         .map_err(|err| host_error(name, err))
 }
 
 fn response_snapshot(ctx: &NativeCtx<'_>, name: &'static str) -> Result<Response, NativeError> {
     let object = response_receiver(ctx, name)?;
-    object::with_host_data::<Response, _>(object, ctx.heap(), Clone::clone)
+    runtime_with_host_data::<Response, _>(ctx, object, Clone::clone)
         .map_err(|err| host_error(name, err))
 }
 
@@ -219,10 +206,8 @@ fn response_constructor_native(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let body = match args.first() {
-        Some(Value::String(value)) => Some(Blob::new(value.to_lossy_string().into_bytes(), "")),
-        _ => None,
-    };
+    let body =
+        runtime_optional_arg_to_string(args, 0).map(|value| Blob::new(value.into_bytes(), ""));
     let status = match args.get(1) {
         Some(Value::Number(value)) => value.as_f64() as u16,
         _ => 200,
@@ -256,23 +241,15 @@ fn request_object(ctx: &mut NativeCtx<'_>, state: Request) -> Result<Value, Nati
         Some(body) => crate::blob::blob_object(ctx, body.clone())?,
         None => Value::Null,
     };
-    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
-    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
+    let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
     builder
-        .property("method", method, Attr::read_only())
-        .and_then(|builder| builder.property("url", url, Attr::read_only()))
-        .and_then(|builder| builder.property("headers", headers, Attr::read_only()))
-        .and_then(|builder| builder.property("body", body, Attr::read_only()))
-        .and_then(|builder| {
-            builder.method(
-                "clone",
-                0,
-                NativeCall::Static(request_clone_native),
-                Attr::builtin_function(),
-            )
-        })
+        .readonly_property("method", method)
+        .and_then(|builder| builder.readonly_property("url", url))
+        .and_then(|builder| builder.readonly_property("headers", headers))
+        .and_then(|builder| builder.readonly_property("body", body))
+        .and_then(|builder| builder.builtin_method("clone", 0, request_clone_native))
         .map_err(|err| crate::type_error("Request", err.to_string()))?;
-    Ok(Value::Object(object))
+    Ok(Value::Object(builder.build()))
 }
 
 fn response_object(ctx: &mut NativeCtx<'_>, state: Response) -> Result<Value, NativeError> {
@@ -283,21 +260,13 @@ fn response_object(ctx: &mut NativeCtx<'_>, state: Response) -> Result<Value, Na
         Some(body) => crate::blob::blob_object(ctx, body.clone())?,
         None => Value::Null,
     };
-    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
-    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
+    let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
     builder
-        .property("status", status, Attr::read_only())
-        .and_then(|builder| builder.property("statusText", status_text, Attr::read_only()))
-        .and_then(|builder| builder.property("headers", headers, Attr::read_only()))
-        .and_then(|builder| builder.property("body", body, Attr::read_only()))
-        .and_then(|builder| {
-            builder.method(
-                "clone",
-                0,
-                NativeCall::Static(response_clone_native),
-                Attr::builtin_function(),
-            )
-        })
+        .readonly_property("status", status)
+        .and_then(|builder| builder.readonly_property("statusText", status_text))
+        .and_then(|builder| builder.readonly_property("headers", headers))
+        .and_then(|builder| builder.readonly_property("body", body))
+        .and_then(|builder| builder.builtin_method("clone", 0, response_clone_native))
         .map_err(|err| crate::type_error("Response", err.to_string()))?;
-    Ok(Value::Object(object))
+    Ok(Value::Object(builder.build()))
 }

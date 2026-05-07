@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libloading::Library;
-use otter_runtime::module_api::{Attr, NativeCall, NativeCtx, NativeError, ObjectBuilder, Value};
 use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
+use otter_runtime::{
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
+};
 
 /// Errors produced by `otter:ffi`.
 #[derive(Debug, thiserror::Error)]
@@ -199,11 +202,7 @@ pub fn install_ffi_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
             open_library(ctx, args, &caps)
         },
     );
-    ctx.method(
-        "dlopen",
-        1,
-        HostedNativeCall::from_raw(NativeCall::Dynamic(dlopen)),
-    )?;
+    ctx.method("dlopen", 1, HostedNativeCall::dynamic(dlopen))?;
     Ok(())
 }
 
@@ -220,9 +219,9 @@ fn open_library(
     let library = unsafe { FfiLibrary::open(&path, signatures, capabilities) }
         .map_err(|err| crate::type_error("dlopen", err.to_string()))?;
     let path_value = crate::string_value(ctx, &library.path().display().to_string())?;
-    let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
+    let mut builder = ObjectBuilder::new(ctx)?;
     builder
-        .property("path", path_value, Attr::data())
+        .data_property("path", path_value)
         .map_err(|err| crate::type_error("dlopen", err.to_string()))?;
     let object = builder.build();
     Ok(Value::Object(object))

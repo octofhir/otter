@@ -30,15 +30,17 @@ not become the public embedding contract.
 - [x] Move `otter-modules` off direct `otter-vm` dependencies.
 - [x] Replace `RuntimeBuilder::global_class(&'static otter_vm::ClassSpec)` with a
   runtime-owned global surface API.
-- [ ] Add runtime-owned builder primitives for namespaces, classes, methods,
+- [x] Add runtime-owned builder primitives for namespaces, classes, methods,
   accessors, constants, and prototypes.
 - [x] Add a host-owned object primitive so Web APIs do not use per-instance
   `Arc<Mutex<_>>` dynamic closures to hold state.
 - [x] Add native method call context with receiver and constructor/new-target
   information.
-- [ ] Make capability defaults and source/module loading deny-by-default at the
-  Rust boundary.
-- [ ] Add compile-fail tests for non-`Send`/non-`Sync` VM session types and async
+- [ ] Add a Deno-style import/module-loading policy: entrypoint and statically
+  analyzable local module graph loads are allowed as code loading, while
+  privileged host I/O remains deny-by-default and future non-analyzable dynamic
+  imports / remote imports require explicit import capabilities.
+- [x] Add compile-fail tests for non-`Send`/non-`Sync` VM session types and async
   boundary misuse.
 
 ## P1: Async, modules, and bootstrap
@@ -51,7 +53,7 @@ not become the public embedding contract.
   rejecting cycles during graph construction.
 - [ ] Add dynamic import loading through the same capability-aware module loader
   used by static imports.
-- [ ] Centralize Web API bootstrap through runtime surface specs; product crates
+- [x] Centralize Web API bootstrap through runtime surface specs; product crates
   should provide specs, not mutate globals ad hoc.
 - [ ] Define a stable error taxonomy for load, parse, compile, permission, and
   runtime failures.
@@ -83,10 +85,33 @@ not become the public embedding contract.
 7. [x] Replace Web API `Arc<Mutex<_>>` state closures with receiver-based host
    objects.
 8. [x] Move `otter-web` off direct `otter-vm` dependencies.
+9. [x] Add runtime-owned surface helpers and migrate `otter-web` URL, Headers,
+   Blob, Request, and Response class specs to them.
+10. [x] Migrate `otter:kv`, `otter:sql`, and `otter:ffi` away from product-code
+    bridge imports and raw hosted-call dynamic
+    adapters.
+11. [x] Move `HostedModuleCtx`, `HostedNativeCall`, and `GlobalClass` internals
+    onto runtime-owned surface types; keep VM object/class builders contained
+    in the runtime surface backend.
+12. [x] Add an `otter-web` builder preset for Web API globals and enable it by
+    default in the CLI without adding an `otter-runtime -> otter-web`
+    dependency.
 
-## Temporary bridge policy
+## Bridge Policy
 
-During migration, runtime may contain hidden VM adapter entry points so existing
-product crates keep building. These entry points must be documented as temporary,
-must not be promoted in docs, and must be removed once the runtime-owned builder
-API covers the same behavior.
+Runtime-owned aliases may still point at the VM backend while the public value
+and context facade matures, but product crates should not use VM-shaped bridge
+modules or raw hosted-call adapters.
+
+Current backend bridges:
+
+- `RuntimeValue`, `RuntimeNativeCtx`, and static spec names are currently
+  runtime-owned aliases over the VM backend. This is the accepted intermediate
+  until the public value/context facade is split further.
+
+Removed bridges:
+
+- `otter_runtime::module_api` has been removed from the active public surface.
+- `HostedNativeCall::from_raw` and `GlobalClass::from_raw` have been removed;
+  runtime/product code uses `HostedNativeCall::static_fn`,
+  `HostedNativeCall::dynamic`, and `GlobalClass::from_runtime`.

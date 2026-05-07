@@ -70,16 +70,21 @@ Rust futures.
 ## Bootstrap And Builders
 
 The production builder/spec flow handles namespace installation. Hosted
-modules should use `NamespaceSpec` /
-`NamespaceBuilder` when their surface is a plain namespace. Keep module
-registration centralized and easy to audit. If capability enforcement or
-bootstrap order is delicate, prefer explicit manual code over hiding
-control flow behind a macro.
+modules should use runtime-owned specs such as `RuntimeNamespaceSpec` or the
+`HostedModuleCtx` / `RuntimeObjectBuilder` API when their surface needs
+capability-aware installation. Keep module registration centralized and easy
+to audit. If capability enforcement or bootstrap order is delicate, prefer
+explicit manual code over hiding control flow behind a macro.
 
 Module namespaces that need runtime capabilities install through
-`ObjectBuilder` with `NativeCall::Dynamic` closures that capture owned,
-`Send + Sync` host data such as a cloned `CapabilitySet`. This is still a
-static registration path: the module specifier list is fixed, resolution is
+`HostedModuleCtx::method` with `HostedNativeCall::dynamic(...)` closures that
+capture owned, `Send + Sync` host data such as a cloned `CapabilitySet`.
+Plain namespace exports should use `HostedModuleCtx::builtin_method`,
+`HostedModuleCtx::property`, and `HostedModuleCtx::readonly_property`.
+Receiver-backed resource objects should be created with
+`RuntimeObjectBuilder::from_host_data(ctx, data)` and accessed through
+`runtime_with_host_data` / `runtime_with_host_data_mut`. This is still a static
+registration path: the module specifier list is fixed, resolution is
 centralized, and no per-call metadata parser or hot-path dynamic registry is
 introduced.
 

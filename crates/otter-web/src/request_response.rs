@@ -1,10 +1,8 @@
 //! Fetch Request and Response host-side records.
 
-use std::sync::{Arc, Mutex};
-
-use otter_vm::{
-    Attr, ClassSpec, ConstructorSpec, MethodSpec, NativeCall, NativeCtx, NativeError,
-    ObjectBuilder, Value,
+use otter_runtime::module_api::{
+    Attr, ClassSpec, ConstructorSpec, JsObject, MethodSpec, NativeCall, NativeCtx, NativeError,
+    NumberValue, ObjectBuilder, Value, object,
 };
 
 use crate::blob::Blob;
@@ -180,14 +178,41 @@ fn request_constructor_native(
     };
     let request = Request::new(&input, method.as_deref(), body)
         .map_err(|err| crate::type_error("Request", err.to_string()))?;
-    request_object(ctx, Arc::new(Mutex::new(request)))
+    request_object(ctx, request)
 }
 
-fn request_clone_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Request.prototype.clone",
-        "invalid Request receiver",
-    ))
+fn request_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
+    match ctx.this_value().clone() {
+        Value::Object(object) => Ok(object),
+        _ => Err(crate::type_error(name, "invalid Request receiver")),
+    }
+}
+
+fn response_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
+    match ctx.this_value().clone() {
+        Value::Object(object) => Ok(object),
+        _ => Err(crate::type_error(name, "invalid Response receiver")),
+    }
+}
+
+fn host_error(name: &'static str, err: object::HostObjectError) -> NativeError {
+    crate::type_error(name, err.to_string())
+}
+
+fn request_snapshot(ctx: &NativeCtx<'_>, name: &'static str) -> Result<Request, NativeError> {
+    let object = request_receiver(ctx, name)?;
+    object::with_host_data::<Request, _>(object, ctx.heap(), Clone::clone)
+        .map_err(|err| host_error(name, err))
+}
+
+fn response_snapshot(ctx: &NativeCtx<'_>, name: &'static str) -> Result<Response, NativeError> {
+    let object = response_receiver(ctx, name)?;
+    object::with_host_data::<Response, _>(object, ctx.heap(), Clone::clone)
+        .map_err(|err| host_error(name, err))
+}
+
+fn request_clone_native(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    request_object(ctx, request_snapshot(ctx, "Request.prototype.clone")?)
 }
 
 fn response_constructor_native(
@@ -205,14 +230,11 @@ fn response_constructor_native(
     let status_text = crate::arg_string(args, 2);
     let response = Response::new(status, status_text, body)
         .map_err(|err| crate::type_error("Response", err.to_string()))?;
-    response_object(ctx, Arc::new(Mutex::new(response)))
+    response_object(ctx, response)
 }
 
-fn response_clone_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Response.prototype.clone",
-        "invalid Response receiver",
-    ))
+fn response_clone_native(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    response_object(ctx, response_snapshot(ctx, "Response.prototype.clone")?)
 }
 
 fn response_json_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -223,26 +245,19 @@ fn response_json_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
         Some(Blob::new(body.into_bytes(), "application/json")),
     )
     .map_err(|err| crate::type_error("Response.json", err.to_string()))?;
-    response_object(ctx, Arc::new(Mutex::new(response)))
+    response_object(ctx, response)
 }
 
-fn request_object(
-    ctx: &mut NativeCtx<'_>,
-    state: Arc<Mutex<Request>>,
-) -> Result<Value, NativeError> {
-    let snapshot = state
-        .lock()
-        .map_err(|_| crate::type_error("Request", "Request state lock poisoned"))?
-        .clone();
-    let method = crate::string_value(ctx, snapshot.method())?;
-    let url = crate::string_value(ctx, &snapshot.url())?;
-    let headers =
-        crate::headers::headers_object(ctx, Arc::new(Mutex::new(snapshot.headers().clone())))?;
-    let body = match snapshot.body() {
-        Some(body) => crate::blob::blob_object(ctx, Arc::new(Mutex::new(body.clone())))?,
+fn request_object(ctx: &mut NativeCtx<'_>, state: Request) -> Result<Value, NativeError> {
+    let method = crate::string_value(ctx, state.method())?;
+    let url = crate::string_value(ctx, &state.url())?;
+    let headers = crate::headers::headers_object(ctx, state.headers().clone())?;
+    let body = match state.body() {
+        Some(body) => crate::blob::blob_object(ctx, body.clone())?,
         None => Value::Null,
     };
-    let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
+    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
+    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
     builder
         .property("method", method, Attr::read_only())
         .and_then(|builder| builder.property("url", url, Attr::read_only()))
@@ -252,45 +267,24 @@ fn request_object(
             builder.method(
                 "clone",
                 0,
-                NativeCall::Dynamic(Arc::new({
-                    let state = state.clone();
-                    move |ctx, _args, _captures| {
-                        let request = state
-                            .lock()
-                            .map_err(|_| {
-                                crate::type_error(
-                                    "Request.prototype.clone",
-                                    "Request state lock poisoned",
-                                )
-                            })?
-                            .clone();
-                        request_object(ctx, Arc::new(Mutex::new(request)))
-                    }
-                })),
+                NativeCall::Static(request_clone_native),
                 Attr::builtin_function(),
             )
         })
         .map_err(|err| crate::type_error("Request", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::Object(object))
 }
 
-fn response_object(
-    ctx: &mut NativeCtx<'_>,
-    state: Arc<Mutex<Response>>,
-) -> Result<Value, NativeError> {
-    let snapshot = state
-        .lock()
-        .map_err(|_| crate::type_error("Response", "Response state lock poisoned"))?
-        .clone();
-    let status = Value::Number(otter_vm::NumberValue::from_f64(snapshot.status() as f64));
-    let status_text = crate::string_value(ctx, snapshot.status_text())?;
-    let headers =
-        crate::headers::headers_object(ctx, Arc::new(Mutex::new(snapshot.headers().clone())))?;
-    let body = match snapshot.body() {
-        Some(body) => crate::blob::blob_object(ctx, Arc::new(Mutex::new(body.clone())))?,
+fn response_object(ctx: &mut NativeCtx<'_>, state: Response) -> Result<Value, NativeError> {
+    let status = Value::Number(NumberValue::from_f64(state.status() as f64));
+    let status_text = crate::string_value(ctx, state.status_text())?;
+    let headers = crate::headers::headers_object(ctx, state.headers().clone())?;
+    let body = match state.body() {
+        Some(body) => crate::blob::blob_object(ctx, body.clone())?,
         None => Value::Null,
     };
-    let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
+    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
+    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
     builder
         .property("status", status, Attr::read_only())
         .and_then(|builder| builder.property("statusText", status_text, Attr::read_only()))
@@ -300,24 +294,10 @@ fn response_object(
             builder.method(
                 "clone",
                 0,
-                NativeCall::Dynamic(Arc::new({
-                    let state = state.clone();
-                    move |ctx, _args, _captures| {
-                        let response = state
-                            .lock()
-                            .map_err(|_| {
-                                crate::type_error(
-                                    "Response.prototype.clone",
-                                    "Response state lock poisoned",
-                                )
-                            })?
-                            .clone();
-                        response_object(ctx, Arc::new(Mutex::new(response)))
-                    }
-                })),
+                NativeCall::Static(response_clone_native),
                 Attr::builtin_function(),
             )
         })
         .map_err(|err| crate::type_error("Response", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::Object(object))
 }

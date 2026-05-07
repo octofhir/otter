@@ -106,7 +106,7 @@ pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbo
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
-pub use runtime_cx::NativeCtx;
+pub use runtime_cx::{NativeCallInfo, NativeCtx};
 
 use otter_gc::raw::{RawGc, SlotVisitor};
 
@@ -5025,7 +5025,8 @@ impl Interpreter {
         if let Value::NativeFunction(native) = &current {
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
-            let mut ctx = NativeCtx::new(self);
+            let call_info = NativeCallInfo::call(effective_this.clone());
+            let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
@@ -5629,7 +5630,8 @@ impl Interpreter {
         {
             let argv: Vec<Value> = args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
-            let mut ctx = NativeCtx::new(self);
+            let call_info = NativeCallInfo::construct(this_value.clone(), Some(callee.clone()));
+            let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let constructed = match result {
                 Value::Object(_) => result,
@@ -9667,6 +9669,34 @@ mod tests {
         assert!(!is_callable(&Value::Object(
             crate::object::alloc_object(&mut heap).unwrap()
         )));
+    }
+
+    #[test]
+    fn native_call_context_receives_method_receiver() {
+        fn return_this(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(ctx.this_value().clone())
+        }
+
+        let module = module_with(vec![], 1);
+        let mut interp = Interpreter::new();
+        let callee = native_value_static(interp.gc_heap_mut(), "returnThis", 0, return_this)
+            .expect("native");
+        let receiver = Value::Object(crate::object::alloc_object(interp.gc_heap_mut()).unwrap());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(&module.functions[0]));
+
+        interp
+            .invoke(
+                &mut stack,
+                &module,
+                &callee,
+                receiver.clone(),
+                SmallVec::new(),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(stack[0].registers[0], receiver);
     }
 
     #[test]

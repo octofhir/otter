@@ -9,7 +9,6 @@ description = "Otter-hosted modules for the active runtime stack."
 [dependencies]
 libloading = "0.8"
 otter-runtime = { workspace = true }
-otter-vm = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

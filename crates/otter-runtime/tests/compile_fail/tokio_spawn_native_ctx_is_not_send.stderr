@@ -23,54 +23,6 @@ error: future cannot be sent between threads safely
 8 | |     });
   | |______^ future created by async block is not `Send`
   |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `Rc<(dyn for<'a> Fn(&'a str) -> Result<otter_bytecode::BytecodeModule, std::string::String> + 'static)>`
-note: captured value is not `Send`
- --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
-  |
-7 |         std::hint::black_box(ctx);
-  |                              ^^^ has type `NativeCtx<'_>` which is not `Send`
-note: required by a bound in `tokio::spawn`
- --> $CARGO/tokio-$VERSION/src/task/spawn.rs
-  |
-  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-  |            ----- required by a bound in this function
-  |     where
-  |         F: Future + Send + 'static,
-  |                     ^^^^ required by this bound in `spawn`
-
-error: future cannot be sent between threads safely
- --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
-  |
-5 | /     tokio::spawn(async move {
-6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-7 | |         std::hint::black_box(ctx);
-8 | |     });
-  | |______^ future created by async block is not `Send`
-  |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const ObjectBody`
-note: captured value is not `Send`
- --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
-  |
-7 |         std::hint::black_box(ctx);
-  |                              ^^^ has type `NativeCtx<'_>` which is not `Send`
-note: required by a bound in `tokio::spawn`
- --> $CARGO/tokio-$VERSION/src/task/spawn.rs
-  |
-  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-  |            ----- required by a bound in this function
-  |     where
-  |         F: Future + Send + 'static,
-  |                     ^^^^ required by this bound in `spawn`
-
-error: future cannot be sent between threads safely
- --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
-  |
-5 | /     tokio::spawn(async move {
-6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-7 | |         std::hint::black_box(ctx);
-8 | |     });
-  | |______^ future created by async block is not `Send`
-  |
   = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
@@ -326,46 +278,45 @@ note: required by a bound in `tokio::spawn`
   |         F: Future + Send + 'static,
   |                     ^^^^ required by this bound in `spawn`
 
-error[E0277]: `Rc<str>` cannot be sent between threads safely
+error: future cannot be sent between threads safely
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
   |
 5 | /     tokio::spawn(async move {
 6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 7 | |         std::hint::black_box(ctx);
 8 | |     });
-  | |______^ `Rc<str>` cannot be sent between threads safely
+  | |______^ future created by async block is not `Send`
   |
-  = help: within `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`, the trait `Send` is not implemented for `Rc<str>`
-  = note: required because it appears within the type `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`
-  = note: required for `hashbrown::raw::RawTable<(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)>` to implement `Send`
-note: required because it appears within the type `hashbrown::map::HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>, RandomState>`
- --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:12
-note: required because it appears within the type `HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>>`
- --> $RUST/std/src/collections/hash/map.rs
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `Rc<(dyn for<'a> Fn(&'a str) -> Result<otter_bytecode::BytecodeModule, std::string::String> + 'static)>`
+note: captured value is not `Send`
+ --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |
-  | pub struct HashMap<K, V, S = RandomState> {
-  |            ^^^^^^^
-note: required because it appears within the type `Interpreter`
- --> $WORKSPACE/crates/otter-vm/src/lib.rs
+7 |         std::hint::black_box(ctx);
+  |                              ^^^ has type `NativeCtx<'_>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+ --> $CARGO/tokio-$VERSION/src/task/spawn.rs
   |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&mut Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'_>`
- --> $WORKSPACE/crates/otter-vm/src/runtime_cx.rs
+  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+  |            ----- required by a bound in this function
+  |     where
+  |         F: Future + Send + 'static,
+  |                     ^^^^ required by this bound in `spawn`
+
+error: future cannot be sent between threads safely
+ --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
   |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'_>`
- --> $WORKSPACE/crates/otter-vm/src/runtime_cx.rs
+5 | /     tokio::spawn(async move {
+6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+7 | |         std::hint::black_box(ctx);
+8 | |     });
+  | |______^ future created by async block is not `Send`
   |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required because it's used within this `async` block
- --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const ObjectBody`
+note: captured value is not `Send`
+ --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |
-5 |     tokio::spawn(async move {
-  |                  ^^^^^^^^^^
+7 |         std::hint::black_box(ctx);
+  |                              ^^^ has type `NativeCtx<'_>` which is not `Send`
 note: required by a bound in `tokio::spawn`
  --> $CARGO/tokio-$VERSION/src/task/spawn.rs
   |
@@ -576,30 +527,6 @@ error: future cannot be sent between threads safely
 8 | |     });
   | |______^ future created by async block is not `Send`
   |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*mut otter_gc::header::GcHeader`
-note: captured value is not `Send`
- --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
-  |
-7 |         std::hint::black_box(ctx);
-  |                              ^^^ has type `NativeCtx<'_>` which is not `Send`
-note: required by a bound in `tokio::spawn`
- --> $CARGO/tokio-$VERSION/src/task/spawn.rs
-  |
-  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-  |            ----- required by a bound in this function
-  |     where
-  |         F: Future + Send + 'static,
-  |                     ^^^^ required by this bound in `spawn`
-
-error: future cannot be sent between threads safely
- --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
-  |
-5 | /     tokio::spawn(async move {
-6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-7 | |         std::hint::black_box(ctx);
-8 | |     });
-  | |______^ future created by async block is not `Send`
-  |
   = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const BoundFunctionBody`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
@@ -687,6 +614,55 @@ note: required by a bound in `tokio::spawn`
   |         F: Future + Send + 'static,
   |                     ^^^^ required by this bound in `spawn`
 
+error[E0277]: `Rc<str>` cannot be sent between threads safely
+ --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
+  |
+5 | /     tokio::spawn(async move {
+6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+7 | |         std::hint::black_box(ctx);
+8 | |     });
+  | |______^ `Rc<str>` cannot be sent between threads safely
+  |
+  = help: within `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`, the trait `Send` is not implemented for `Rc<str>`
+  = note: required because it appears within the type `(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)`
+  = note: required for `hashbrown::raw::RawTable<(Rc<str>, otter_gc::compressed::Gc<ObjectBody>)>` to implement `Send`
+note: required because it appears within the type `hashbrown::map::HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>, RandomState>`
+ --> /rust/deps/hashbrown-0.16.1/src/map.rs:185:12
+note: required because it appears within the type `HashMap<Rc<str>, otter_gc::compressed::Gc<ObjectBody>>`
+ --> $RUST/std/src/collections/hash/map.rs
+  |
+  | pub struct HashMap<K, V, S = RandomState> {
+  |            ^^^^^^^
+note: required because it appears within the type `Interpreter`
+ --> $WORKSPACE/crates/otter-vm/src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&mut Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeCx<'_>`
+ --> $WORKSPACE/crates/otter-vm/src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeCx<'rt> {
+  |                   ^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'_>`
+ --> $WORKSPACE/crates/otter-vm/src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required because it's used within this `async` block
+ --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18
+  |
+5 |     tokio::spawn(async move {
+  |                  ^^^^^^^^^^
+note: required by a bound in `tokio::spawn`
+ --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+  |
+  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+  |            ----- required by a bound in this function
+  |     where
+  |         F: Future + Send + 'static,
+  |                     ^^^^ required by this bound in `spawn`
+
 error: future cannot be sent between threads safely
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
   |
@@ -697,6 +673,30 @@ error: future cannot be sent between threads safely
   | |______^ future created by async block is not `Send`
   |
   = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*const PurePromiseBody`
+note: captured value is not `Send`
+ --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
+  |
+7 |         std::hint::black_box(ctx);
+  |                              ^^^ has type `NativeCtx<'_>` which is not `Send`
+note: required by a bound in `tokio::spawn`
+ --> $CARGO/tokio-$VERSION/src/task/spawn.rs
+  |
+  |     pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+  |            ----- required by a bound in this function
+  |     where
+  |         F: Future + Send + 'static,
+  |                     ^^^^ required by this bound in `spawn`
+
+error: future cannot be sent between threads safely
+ --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:5
+  |
+5 | /     tokio::spawn(async move {
+6 | |         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+7 | |         std::hint::black_box(ctx);
+8 | |     });
+  | |______^ future created by async block is not `Send`
+  |
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `*mut otter_gc::header::GcHeader`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |

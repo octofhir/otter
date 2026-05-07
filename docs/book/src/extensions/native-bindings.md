@@ -22,11 +22,13 @@ Production builtins should use
 Dynamic closures are reserved for embedder cases that need captured Rust
 state and can still trace explicit JS captures.
 
-Hosted module namespace installers may use `ObjectBuilder` plus
-`NativeCall::Dynamic` when the native function needs owned runtime state,
-such as a cloned capability set or an `Arc<Mutex<...>>` around host-owned
-database state. The closure must not capture `RuntimeCx`, `NativeCtx`,
-`Value`, `Gc<T>`, `Local<'gc, T>`, frames, or handle scopes.
+Hosted module namespace installers should use `HostedModuleCtx` and attach
+long-lived Rust state to receiver objects through the runtime host-object
+primitive. Namespace-level closures may capture owned configuration such as a
+cloned capability set, but per-instance state should live on the JS object and
+be reached through `NativeCtx::this_value()`. Closures must not capture
+`RuntimeCx`, `NativeCtx`, `Value`, `Gc<T>`, `Local<'gc, T>`, frames, or handle
+scopes.
 
 ## Embedder Console Sink
 
@@ -41,7 +43,7 @@ the runtime:
 
 ```rust,ignore
 use std::sync::Arc;
-use otter_vm::{ConsoleLevel, ConsoleSink};
+use otter_runtime::{ConsoleLevel, ConsoleSink};
 
 #[derive(Debug)]
 struct TracingConsole;
@@ -63,15 +65,17 @@ must not store VM values, GC handles, or native contexts.
 ## Synchronous Native Shape
 
 ```rust,ignore
+use otter_runtime::module_api::{JsString, NativeCtx, NativeError, Value};
+
 fn read_flag(
-    ctx: &mut otter_vm::NativeCtx<'_>,
-    args: &[otter_vm::Value],
-) -> Result<otter_vm::Value, otter_vm::NativeError> {
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
     check_permission(ctx, "env")?;
     let name = expect_string(args.first())?;
     let value = read_allowed_env(name)?;
     let heap = ctx.interp_mut().string_heap_clone();
-    Ok(otter_vm::Value::String(otter_vm::JsString::from_str(&value, &heap)?))
+    Ok(Value::String(JsString::from_str(&value, &heap)?))
 }
 ```
 
@@ -83,7 +87,7 @@ To expose that function as a static builtin, put it behind a spec and let
 bootstrap or a mutator-bound builder install it:
 
 ```rust,ignore
-use otter_vm::{Attr, MethodSpec, NativeCall};
+use otter_runtime::module_api::{Attr, MethodSpec, NativeCall};
 
 static READ_FLAG: MethodSpec = MethodSpec {
     name: "readFlag",
@@ -96,7 +100,9 @@ static READ_FLAG: MethodSpec = MethodSpec {
 ## Async Native Shape
 
 ```rust,ignore
-fn start_async_read(ctx: &mut otter_vm::NativeCtx<'_>, path: PathBuf) -> Result<OpId, Error> {
+use otter_runtime::module_api::NativeCtx;
+
+fn start_async_read(ctx: &mut NativeCtx<'_>, path: PathBuf) -> Result<OpId, Error> {
     check_read_permission(ctx, &path)?;
     let op_id = create_pending_promise(ctx)?;
     let handle = ctx.interp_mut().runtime_handle().clone();

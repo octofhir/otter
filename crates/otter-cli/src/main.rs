@@ -182,9 +182,7 @@ struct PermissionFlags {
 }
 
 impl PermissionFlags {
-    /// Build a [`CapabilitySet`] starting from `CapabilitySet::default()`
-    /// (sensible defaults — see the type's docs) and apply CLI
-    /// overrides on top.
+    /// Build a deny-by-default [`CapabilitySet`] and apply CLI overrides on top.
     fn into_capabilities(self) -> CapabilitySet {
         if self.allow_all {
             return CapabilitySet::allow_all();

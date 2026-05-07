@@ -36,7 +36,7 @@
 
 use std::marker::PhantomData;
 
-use crate::Interpreter;
+use crate::{Interpreter, Value};
 
 /// Internal VM context. Carried explicitly through the dispatch
 /// loop and built-in helper signatures so every algorithm sees the
@@ -97,6 +97,42 @@ impl<'rt> RuntimeCx<'rt> {
     }
 }
 
+/// Call-site metadata for native bindings.
+///
+/// The values are snapshots for the active call only. Native code may inspect
+/// them synchronously, but must not store them or move them into async work.
+#[derive(Debug, Clone)]
+pub struct NativeCallInfo {
+    this_value: Value,
+    new_target: Option<Value>,
+}
+
+impl NativeCallInfo {
+    /// Ordinary function/method call metadata.
+    #[must_use]
+    pub fn call(this_value: Value) -> Self {
+        Self {
+            this_value,
+            new_target: None,
+        }
+    }
+
+    /// Constructor call metadata.
+    #[must_use]
+    pub fn construct(this_value: Value, new_target: Option<Value>) -> Self {
+        Self {
+            this_value,
+            new_target,
+        }
+    }
+
+    /// Foundation default for legacy callers.
+    #[must_use]
+    pub fn default_call() -> Self {
+        Self::call(Value::Undefined)
+    }
+}
+
 /// Public-to-native binding context. Handed to `#[dive]` /
 /// `#[js_namespace]` entry points so native code allocates and
 /// mutates against the right isolate without reaching for
@@ -112,6 +148,7 @@ impl<'rt> RuntimeCx<'rt> {
 /// crates use this instead of ad-hoc runtime handles.
 pub struct NativeCtx<'rt> {
     pub(crate) cx: RuntimeCx<'rt>,
+    call_info: NativeCallInfo,
 }
 
 impl<'rt> NativeCtx<'rt> {
@@ -119,9 +156,37 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     #[allow(dead_code)] // wired in by tasks 82-83 native-binding migration
     pub(crate) fn new(interp: &'rt mut Interpreter) -> Self {
+        Self::new_with_call_info(interp, NativeCallInfo::default_call())
+    }
+
+    /// Build a native context with explicit call-site metadata.
+    #[must_use]
+    pub(crate) fn new_with_call_info(
+        interp: &'rt mut Interpreter,
+        call_info: NativeCallInfo,
+    ) -> Self {
         Self {
             cx: RuntimeCx::new(interp),
+            call_info,
         }
+    }
+
+    /// Return the JavaScript receiver for the active native call.
+    #[must_use]
+    pub fn this_value(&self) -> &Value {
+        &self.call_info.this_value
+    }
+
+    /// Return `new.target` for constructor calls.
+    #[must_use]
+    pub fn new_target(&self) -> Option<&Value> {
+        self.call_info.new_target.as_ref()
+    }
+
+    /// Whether this native call is executing as a constructor.
+    #[must_use]
+    pub fn is_construct_call(&self) -> bool {
+        self.call_info.new_target.is_some()
     }
 
     /// Borrow the GC heap immutably.

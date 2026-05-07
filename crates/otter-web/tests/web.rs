@@ -12,11 +12,8 @@ fn web_api_specs_are_static_and_ordered() {
         specs.iter().map(|spec| spec.name).collect::<Vec<_>>(),
         ["URL", "Headers", "Blob", "Request", "Response"]
     );
-    assert_eq!(specs[0].spec.constructor.name, "URL");
-    assert_eq!(
-        specs[2].spec.constructor.prototype_methods[0].name,
-        "arrayBuffer"
-    );
+    assert_eq!(specs[0].spec.name(), "URL");
+    assert_eq!(specs[2].spec.name(), "Blob");
 }
 
 #[test]

@@ -6,11 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
-use otter_runtime::CapabilitySet;
-use otter_vm::array;
-use otter_vm::{Attr, Interpreter, NativeCall, NativeCtx, NativeError, ObjectBuilder, Value};
+use otter_runtime::module_api::{
+    Attr, JsObject, NativeCall, NativeCtx, NativeError, ObjectBuilder, Value, array, object,
+};
+use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
 use serde_json::Value as JsonValue;
 
 /// Errors produced by `otter:kv`.
@@ -165,28 +165,24 @@ fn json_object_to_map(value: JsonValue) -> KvResult<BTreeMap<String, JsonValue>>
 }
 
 /// Install the `otter:kv` namespace object.
-pub fn install_kv_module(
-    interp: &mut Interpreter,
-    capabilities: &CapabilitySet,
-) -> Result<otter_vm::JsObject, String> {
-    let caps = capabilities.clone();
+pub fn install_kv_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
+    let caps = ctx.capabilities().clone();
     let open = std::sync::Arc::new(
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
             open_kv(ctx, args, &caps)
         },
     );
-    let mut builder = ObjectBuilder::new(interp.gc_heap_mut()).map_err(|err| err.to_string())?;
-    builder
-        .method(
-            "openKv",
-            1,
-            NativeCall::Dynamic(open.clone()),
-            Attr::builtin_function(),
-        )
-        .map_err(|err| err.to_string())?
-        .method("kv", 1, NativeCall::Dynamic(open), Attr::builtin_function())
-        .map_err(|err| err.to_string())?;
-    Ok(builder.build())
+    ctx.method(
+        "openKv",
+        1,
+        HostedNativeCall::from_raw(NativeCall::Dynamic(open.clone())),
+    )?
+    .method(
+        "kv",
+        1,
+        HostedNativeCall::from_raw(NativeCall::Dynamic(open)),
+    )?;
+    Ok(())
 }
 
 fn open_kv(
@@ -201,136 +197,137 @@ fn open_kv(
         KvStore::open(&path, capabilities)
             .map_err(|err| crate::type_error("openKv", err.to_string()))?
     };
-    let store = Arc::new(Mutex::new(store));
     let object = build_store_object(ctx, store)?;
     Ok(Value::Object(object))
 }
 
-fn build_store_object(
-    ctx: &mut NativeCtx<'_>,
-    store: Arc<Mutex<KvStore>>,
-) -> Result<otter_vm::JsObject, NativeError> {
-    let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
+fn build_store_object(ctx: &mut NativeCtx<'_>, store: KvStore) -> Result<JsObject, NativeError> {
+    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), store)?;
+    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
     builder
         .method(
             "set",
             2,
-            NativeCall::Dynamic(method_set(store.clone())),
+            NativeCall::Static(method_set),
             Attr::builtin_function(),
         )
         .map_err(|err| crate::type_error("KvStore", err.to_string()))?
         .method(
             "get",
             1,
-            NativeCall::Dynamic(method_get(store.clone())),
+            NativeCall::Static(method_get),
             Attr::builtin_function(),
         )
         .map_err(|err| crate::type_error("KvStore", err.to_string()))?
         .method(
             "has",
             1,
-            NativeCall::Dynamic(method_has(store.clone())),
+            NativeCall::Static(method_has),
             Attr::builtin_function(),
         )
         .map_err(|err| crate::type_error("KvStore", err.to_string()))?
         .method(
             "delete",
             1,
-            NativeCall::Dynamic(method_delete(store.clone())),
+            NativeCall::Static(method_delete),
             Attr::builtin_function(),
         )
         .map_err(|err| crate::type_error("KvStore", err.to_string()))?
         .method(
             "keys",
             0,
-            NativeCall::Dynamic(method_keys(store.clone())),
+            NativeCall::Static(method_keys),
             Attr::builtin_function(),
         )
         .map_err(|err| crate::type_error("KvStore", err.to_string()))?
         .method(
             "clear",
             0,
-            NativeCall::Dynamic(method_clear(store)),
+            NativeCall::Static(method_clear),
             Attr::builtin_function(),
         )
         .map_err(|err| crate::type_error("KvStore", err.to_string()))?;
     Ok(builder.build())
 }
 
-fn method_set(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
-    Arc::new(move |_ctx, args, _captures| {
-        let key = crate::arg_string(args, 0, "KvStore.set")?;
-        let value = args
-            .get(1)
-            .map(crate::value_to_json)
-            .transpose()?
-            .unwrap_or(JsonValue::Null);
-        store
-            .lock()
-            .map_err(|_| crate::type_error("KvStore.set", "store lock poisoned"))?
-            .set(key, value)
-            .map_err(|err| crate::type_error("KvStore.set", err.to_string()))?;
-        Ok(Value::Undefined)
-    })
+fn store_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
+    match ctx.this_value().clone() {
+        Value::Object(object) => Ok(object),
+        _ => Err(crate::type_error(name, "invalid KvStore receiver")),
+    }
 }
 
-fn method_get(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
-    Arc::new(move |ctx, args, _captures| {
-        let key = crate::arg_string(args, 0, "KvStore.get")?;
-        let value = store
-            .lock()
-            .map_err(|_| crate::type_error("KvStore.get", "store lock poisoned"))?
-            .get(&key)
-            .unwrap_or(JsonValue::Null);
-        crate::json_to_value(ctx, value)
-    })
+fn host_error(name: &'static str, err: object::HostObjectError) -> NativeError {
+    crate::type_error(name, err.to_string())
 }
 
-fn method_has(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
-    Arc::new(move |_ctx, args, _captures| {
-        let key = crate::arg_string(args, 0, "KvStore.has")?;
-        let has = store
-            .lock()
-            .map_err(|_| crate::type_error("KvStore.has", "store lock poisoned"))?
-            .has(&key);
-        Ok(Value::Boolean(has))
-    })
+fn method_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = store_receiver(ctx, "KvStore.set")?;
+    let key = crate::arg_string(args, 0, "KvStore.set")?;
+    let value = args
+        .get(1)
+        .map(crate::value_to_json)
+        .transpose()?
+        .unwrap_or(JsonValue::Null);
+    let result =
+        object::with_host_data_mut::<KvStore, _>(object, ctx.interp_mut().gc_heap_mut(), |store| {
+            store.set(key, value)
+        })
+        .map_err(|err| host_error("KvStore.set", err))?;
+    result.map_err(|err| crate::type_error("KvStore.set", err.to_string()))?;
+    Ok(Value::Undefined)
 }
 
-fn method_delete(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
-    Arc::new(move |_ctx, args, _captures| {
-        let key = crate::arg_string(args, 0, "KvStore.delete")?;
-        let deleted = store
-            .lock()
-            .map_err(|_| crate::type_error("KvStore.delete", "store lock poisoned"))?
-            .delete(&key)
-            .map_err(|err| crate::type_error("KvStore.delete", err.to_string()))?;
-        Ok(Value::Boolean(deleted))
+fn method_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = store_receiver(ctx, "KvStore.get")?;
+    let key = crate::arg_string(args, 0, "KvStore.get")?;
+    let value = object::with_host_data::<KvStore, _>(object, ctx.heap(), |store| {
+        store.get(&key).unwrap_or(JsonValue::Null)
     })
+    .map_err(|err| host_error("KvStore.get", err))?;
+    crate::json_to_value(ctx, value)
 }
 
-fn method_keys(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
-    Arc::new(move |ctx, _args, _captures| {
-        let keys = store
-            .lock()
-            .map_err(|_| crate::type_error("KvStore.keys", "store lock poisoned"))?
-            .keys();
-        let values = keys
-            .iter()
-            .map(|key| crate::string_value(ctx, key))
-            .collect::<Result<Vec<_>, _>>()?;
-        let array = array::from_elements(ctx.interp_mut().gc_heap_mut(), values)?;
-        Ok(Value::Array(array))
-    })
+fn method_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = store_receiver(ctx, "KvStore.has")?;
+    let key = crate::arg_string(args, 0, "KvStore.has")?;
+    let has = object::with_host_data::<KvStore, _>(object, ctx.heap(), |store| store.has(&key))
+        .map_err(|err| host_error("KvStore.has", err))?;
+    Ok(Value::Boolean(has))
 }
 
-fn method_clear(store: Arc<Mutex<KvStore>>) -> Arc<otter_vm::NativeFn> {
-    Arc::new(move |_ctx, _args, _captures| {
-        store
-            .lock()
-            .map_err(|_| crate::type_error("KvStore.clear", "store lock poisoned"))?
-            .clear()
-            .map_err(|err| crate::type_error("KvStore.clear", err.to_string()))?;
-        Ok(Value::Undefined)
-    })
+fn method_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = store_receiver(ctx, "KvStore.delete")?;
+    let key = crate::arg_string(args, 0, "KvStore.delete")?;
+    let result =
+        object::with_host_data_mut::<KvStore, _>(object, ctx.interp_mut().gc_heap_mut(), |store| {
+            store.delete(&key)
+        })
+        .map_err(|err| host_error("KvStore.delete", err))?;
+    let deleted = result.map_err(|err| crate::type_error("KvStore.delete", err.to_string()))?;
+    Ok(Value::Boolean(deleted))
+}
+
+fn method_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let object = store_receiver(ctx, "KvStore.keys")?;
+    let keys = object::with_host_data::<KvStore, _>(object, ctx.heap(), KvStore::keys)
+        .map_err(|err| host_error("KvStore.keys", err))?;
+    let values = keys
+        .iter()
+        .map(|key| crate::string_value(ctx, key))
+        .collect::<Result<Vec<_>, _>>()?;
+    let array = array::from_elements(ctx.interp_mut().gc_heap_mut(), values)?;
+    Ok(Value::Array(array))
+}
+
+fn method_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let object = store_receiver(ctx, "KvStore.clear")?;
+    let result = object::with_host_data_mut::<KvStore, _>(
+        object,
+        ctx.interp_mut().gc_heap_mut(),
+        KvStore::clear,
+    )
+    .map_err(|err| host_error("KvStore.clear", err))?;
+    result.map_err(|err| crate::type_error("KvStore.clear", err.to_string()))?;
+    Ok(Value::Undefined)
 }

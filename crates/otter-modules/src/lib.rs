@@ -24,26 +24,21 @@ pub mod ffi;
 pub mod kv;
 pub mod sql;
 
-use otter_runtime::HostedModule;
-use otter_vm::number::NumberValue;
-use otter_vm::string::JsString;
-use otter_vm::{NativeCtx, NativeError, Value};
+use otter_runtime::module_api::{JsString, NativeCtx, NativeError, NumberValue, Value};
+use otter_runtime::{HostedModule, HostedModuleInstall};
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 
 /// Active `otter:*` hosted modules in deterministic install order.
 pub const HOSTED_MODULES: &[HostedModule] = &[
-    HostedModule {
-        specifier: "otter:kv",
-        install: kv::install_kv_module,
-    },
-    HostedModule {
-        specifier: "otter:sql",
-        install: sql::install_sql_module,
-    },
-    HostedModule {
-        specifier: "otter:ffi",
-        install: ffi::install_ffi_module,
-    },
+    HostedModule::new("otter:kv", HostedModuleInstall::new(kv::install_kv_module)),
+    HostedModule::new(
+        "otter:sql",
+        HostedModuleInstall::new(sql::install_sql_module),
+    ),
+    HostedModule::new(
+        "otter:ffi",
+        HostedModuleInstall::new(ffi::install_ffi_module),
+    ),
 ];
 
 /// Return active hosted module installers.

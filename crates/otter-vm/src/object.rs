@@ -58,6 +58,7 @@
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
+use std::any::Any;
 use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -68,6 +69,32 @@ use crate::Value;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
 use otter_gc::raw::{RawGc, SlotVisitor};
+
+/// Rust-owned data attached to a JavaScript object.
+///
+/// Host object data is isolate-local object state. It must not hold VM `Value`,
+/// `Gc`, `Local`, `NativeCtx`, or async futures; if JS values need to be held
+/// across GC, use explicit GC-managed payloads and trace hooks instead.
+pub trait HostObjectData: Any {}
+
+impl<T: Any> HostObjectData for T {}
+
+/// Host object access failure.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostObjectError {
+    /// Object has no host-owned payload.
+    #[error("object has no host data")]
+    Missing,
+    /// Object has host data, but not the requested Rust type.
+    #[error("host data type mismatch: expected {expected}, found {found}")]
+    TypeMismatch {
+        /// Requested Rust type.
+        expected: &'static str,
+        /// Stored Rust type.
+        found: &'static str,
+    },
+}
 
 // ---------- property attribute flags ---------------------------------------
 
@@ -551,6 +578,8 @@ pub struct ObjectBody {
     /// not modelled in this slice — `Object.defineProperty` only
     /// accepts string keys today.
     symbol_props: Vec<(JsSymbol, Value)>,
+    /// Rust-owned payload for host-backed objects.
+    host_data: Option<Box<dyn Any>>,
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
     extensible: bool,
@@ -563,6 +592,7 @@ impl std::fmt::Debug for ObjectBody {
             .field("slot_count", &self.slots.len())
             .field("has_prototype", &!self.prototype.is_null())
             .field("symbol_props", &self.symbol_props.len())
+            .field("has_host_data", &self.host_data.is_some())
             .field("extensible", &self.extensible)
             .finish()
     }
@@ -648,6 +678,7 @@ pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::O
         slots: SmallVec::new(),
         prototype: otter_gc::Gc::null(),
         symbol_props: Vec::new(),
+        host_data: None,
         extensible: true,
     })
 }
@@ -677,6 +708,28 @@ pub fn alloc_diagnostic_object(
         slots: SmallVec::new(),
         prototype: otter_gc::Gc::null(),
         symbol_props: Vec::new(),
+        host_data: None,
+        extensible: true,
+    })
+}
+
+/// Allocate a fresh object backed by Rust-owned host data.
+///
+/// The host data is isolate-local and intentionally not traced. It must not own
+/// JS `Value` / `Gc` handles. Native methods should access it through
+/// [`with_host_data`] / [`with_host_data_mut`] using the receiver from
+/// [`crate::NativeCtx::this_value`].
+pub fn alloc_host_object<T: HostObjectData>(
+    heap: &mut otter_gc::GcHeap,
+    data: T,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let shape = ROOT_SHAPE.with(Rc::clone);
+    heap.alloc_old(ObjectBody {
+        shape,
+        slots: SmallVec::new(),
+        prototype: otter_gc::Gc::null(),
+        symbol_props: Vec::new(),
+        host_data: Some(Box::new(data)),
         extensible: true,
     })
 }
@@ -895,6 +948,53 @@ pub fn get_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Opt
         current = prototype(proto, heap);
     }
     None
+}
+
+/// Borrow typed host data attached to `obj`.
+///
+/// The callback runs under an immutable object-payload borrow. Do not attempt
+/// to re-enter object mutation from inside `f`.
+pub fn with_host_data<T, R>(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    f: impl FnOnce(&T) -> R,
+) -> Result<R, HostObjectError>
+where
+    T: HostObjectData,
+{
+    heap.read_payload(obj, |body| {
+        let data = body.host_data.as_ref().ok_or(HostObjectError::Missing)?;
+        data.downcast_ref::<T>()
+            .map(f)
+            .ok_or_else(|| HostObjectError::TypeMismatch {
+                expected: std::any::type_name::<T>(),
+                found: "<unknown host data>",
+            })
+    })
+}
+
+/// Mutably borrow typed host data attached to `obj`.
+///
+/// The callback runs under a mutable object-payload borrow. Native methods
+/// should copy primitive results out before allocating new JS values.
+pub fn with_host_data_mut<T, R>(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<R, HostObjectError>
+where
+    T: HostObjectData,
+{
+    heap.with_payload(obj, |body| {
+        let data = body.host_data.as_mut().ok_or(HostObjectError::Missing)?;
+        let typed = data
+            .downcast_mut::<T>()
+            .ok_or_else(|| HostObjectError::TypeMismatch {
+                expected: std::any::type_name::<T>(),
+                found: "<unknown host data>",
+            })?;
+        Ok(f(typed))
+    })
 }
 
 /// Borrow the current hidden class.
@@ -1492,6 +1592,44 @@ mod tests {
         set(a, &mut heap, "x", Value::Boolean(true));
         assert_eq!(a, b);
         assert!(matches!(get(b, &heap, "x"), Some(Value::Boolean(true))));
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Counter {
+        value: u32,
+    }
+
+    #[test]
+    fn host_object_data_downcasts_and_mutates() {
+        let mut heap = fresh_heap();
+        let object = alloc_host_object(&mut heap, Counter { value: 1 }).unwrap();
+
+        assert_eq!(
+            with_host_data::<Counter, _>(object, &heap, |counter| counter.value).unwrap(),
+            1
+        );
+        with_host_data_mut::<Counter, _>(object, &mut heap, |counter| {
+            counter.value += 41;
+        })
+        .unwrap();
+        assert_eq!(
+            with_host_data::<Counter, _>(object, &heap, |counter| counter.value).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn host_object_data_reports_missing_or_wrong_type() {
+        let mut heap = fresh_heap();
+        let ordinary = alloc_object(&mut heap).unwrap();
+        assert_eq!(
+            with_host_data::<Counter, _>(ordinary, &heap, |_| ()).unwrap_err(),
+            HostObjectError::Missing
+        );
+
+        let object = alloc_host_object(&mut heap, "not a counter".to_string()).unwrap();
+        let err = with_host_data::<Counter, _>(object, &heap, |_| ()).unwrap_err();
+        assert!(matches!(err, HostObjectError::TypeMismatch { .. }));
     }
 
     #[test]

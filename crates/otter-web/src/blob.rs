@@ -1,10 +1,8 @@
 //! WHATWG Blob host-side bytes.
 
-use std::sync::{Arc, Mutex};
-
-use otter_vm::{
-    AccessorSpec, Attr, ClassSpec, ConstructorSpec, MethodSpec, NativeCall, NativeCtx, NativeError,
-    ObjectBuilder, Value,
+use otter_runtime::module_api::{
+    AccessorSpec, Attr, ClassSpec, ConstructorSpec, JsObject, MethodSpec, NativeCall, NativeCtx,
+    NativeError, NumberValue, ObjectBuilder, Value, object,
 };
 
 /// Owned Blob data.
@@ -114,58 +112,68 @@ const fn method(
 fn blob_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let text = crate::arg_string(args, 0);
     let content_type = crate::arg_string(args, 1);
-    blob_object(
-        ctx,
-        Arc::new(Mutex::new(Blob::new(text.into_bytes(), content_type))),
-    )
+    blob_object(ctx, Blob::new(text.into_bytes(), content_type))
 }
 
-fn blob_array_buffer_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Blob.prototype.arrayBuffer",
-        "invalid Blob receiver",
-    ))
+fn blob_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
+    match ctx.this_value().clone() {
+        Value::Object(object) => Ok(object),
+        _ => Err(crate::type_error(name, "invalid Blob receiver")),
+    }
 }
 
-fn blob_slice_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Blob.prototype.slice",
-        "invalid Blob receiver",
-    ))
+fn host_error(name: &'static str, err: object::HostObjectError) -> NativeError {
+    crate::type_error(name, err.to_string())
 }
 
-fn blob_text_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Blob.prototype.text",
-        "invalid Blob receiver",
-    ))
+fn blob_snapshot(ctx: &NativeCtx<'_>, name: &'static str) -> Result<Blob, NativeError> {
+    let object = blob_receiver(ctx, name)?;
+    object::with_host_data::<Blob, _>(object, ctx.heap(), Clone::clone)
+        .map_err(|err| host_error(name, err))
 }
 
-fn blob_size_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Blob.prototype.size",
-        "invalid Blob receiver",
-    ))
-}
-
-fn blob_type_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Blob.prototype.type",
-        "invalid Blob receiver",
-    ))
-}
-
-pub(crate) fn blob_object(
+fn blob_array_buffer_native(
     ctx: &mut NativeCtx<'_>,
-    state: Arc<Mutex<Blob>>,
+    _args: &[Value],
 ) -> Result<Value, NativeError> {
-    let snapshot = state
-        .lock()
-        .map_err(|_| crate::type_error("Blob", "Blob state lock poisoned"))?
-        .clone();
-    let content_type = crate::string_value(ctx, snapshot.content_type())?;
-    let size = Value::Number(otter_vm::NumberValue::from_f64(snapshot.size() as f64));
-    let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
+    let text = blob_snapshot(ctx, "Blob.prototype.arrayBuffer")?.text();
+    crate::string_value(ctx, &text)
+}
+
+fn blob_slice_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let blob = blob_snapshot(ctx, "Blob.prototype.slice")?;
+    let start = arg_usize(args, 0).unwrap_or(0);
+    let end = arg_usize(args, 1);
+    let content_type = match args.get(2) {
+        Some(Value::String(value)) => Some(value.to_lossy_string()),
+        Some(Value::Undefined) | None => None,
+        Some(value) => Some(value.display_string()),
+    };
+    blob_object(ctx, blob.slice(start, end, content_type.as_deref()))
+}
+
+fn blob_text_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let text = blob_snapshot(ctx, "Blob.prototype.text")?.text();
+    crate::string_value(ctx, &text)
+}
+
+fn blob_size_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let size = blob_snapshot(ctx, "Blob.prototype.size")?.size();
+    Ok(Value::Number(NumberValue::from_f64(size as f64)))
+}
+
+fn blob_type_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let content_type = blob_snapshot(ctx, "Blob.prototype.type")?
+        .content_type()
+        .to_string();
+    crate::string_value(ctx, &content_type)
+}
+
+pub(crate) fn blob_object(ctx: &mut NativeCtx<'_>, state: Blob) -> Result<Value, NativeError> {
+    let content_type = crate::string_value(ctx, state.content_type())?;
+    let size = Value::Number(NumberValue::from_f64(state.size() as f64));
+    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
+    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
     builder
         .property("size", size, Attr::read_only())
         .and_then(|builder| builder.property("type", content_type, Attr::read_only()))
@@ -173,18 +181,7 @@ pub(crate) fn blob_object(
             builder.method(
                 "text",
                 0,
-                NativeCall::Dynamic(Arc::new({
-                    let state = state.clone();
-                    move |ctx, _args, _captures| {
-                        let text = state
-                            .lock()
-                            .map_err(|_| {
-                                crate::type_error("Blob.prototype.text", "Blob state lock poisoned")
-                            })?
-                            .text();
-                        crate::string_value(ctx, &text)
-                    }
-                })),
+                NativeCall::Static(blob_text_native),
                 Attr::builtin_function(),
             )
         })
@@ -192,21 +189,7 @@ pub(crate) fn blob_object(
             builder.method(
                 "arrayBuffer",
                 0,
-                NativeCall::Dynamic(Arc::new({
-                    let state = state.clone();
-                    move |ctx, _args, _captures| {
-                        let text = state
-                            .lock()
-                            .map_err(|_| {
-                                crate::type_error(
-                                    "Blob.prototype.arrayBuffer",
-                                    "Blob state lock poisoned",
-                                )
-                            })?
-                            .text();
-                        crate::string_value(ctx, &text)
-                    }
-                })),
+                NativeCall::Static(blob_array_buffer_native),
                 Attr::builtin_function(),
             )
         })
@@ -214,33 +197,12 @@ pub(crate) fn blob_object(
             builder.method(
                 "slice",
                 2,
-                NativeCall::Dynamic(Arc::new({
-                    let state = state.clone();
-                    move |ctx, args, _captures| {
-                        let start = arg_usize(args, 0).unwrap_or(0);
-                        let end = arg_usize(args, 1);
-                        let content_type = match args.get(2) {
-                            Some(Value::String(value)) => Some(value.to_lossy_string()),
-                            Some(Value::Undefined) | None => None,
-                            Some(value) => Some(value.display_string()),
-                        };
-                        let blob = state
-                            .lock()
-                            .map_err(|_| {
-                                crate::type_error(
-                                    "Blob.prototype.slice",
-                                    "Blob state lock poisoned",
-                                )
-                            })?
-                            .slice(start, end, content_type.as_deref());
-                        blob_object(ctx, Arc::new(Mutex::new(blob)))
-                    }
-                })),
+                NativeCall::Static(blob_slice_native),
                 Attr::builtin_function(),
             )
         })
         .map_err(|err| crate::type_error("Blob", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::Object(object))
 }
 
 fn arg_usize(args: &[Value], index: usize) -> Option<usize> {

@@ -1,11 +1,10 @@
 //! WHATWG Headers host-side list.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 
-use otter_vm::{
-    Attr, ClassSpec, ConstructorSpec, MethodSpec, NativeCall, NativeCtx, NativeError,
-    ObjectBuilder, Value,
+use otter_runtime::module_api::{
+    Attr, ClassSpec, ConstructorSpec, JsObject, MethodSpec, NativeCall, NativeCtx, NativeError,
+    ObjectBuilder, Value, object,
 };
 
 /// Headers validation error.
@@ -135,220 +134,149 @@ fn headers_constructor_native(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    headers_object(ctx, Arc::new(Mutex::new(Headers::new())))
+    headers_object(ctx, Headers::new())
 }
 
-fn headers_append_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Headers.prototype.append",
-        "invalid Headers receiver",
-    ))
+fn headers_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
+    match ctx.this_value().clone() {
+        Value::Object(object) => Ok(object),
+        _ => Err(crate::type_error(name, "invalid Headers receiver")),
+    }
 }
 
-fn headers_delete_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Headers.prototype.delete",
-        "invalid Headers receiver",
-    ))
+fn host_error(name: &'static str, err: object::HostObjectError) -> NativeError {
+    crate::type_error(name, err.to_string())
 }
 
-fn headers_get_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Headers.prototype.get",
-        "invalid Headers receiver",
-    ))
+fn headers_append_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = headers_receiver(ctx, "Headers.prototype.append")?;
+    let name = crate::arg_string(args, 0);
+    let value = crate::arg_string(args, 1);
+    let result = object::with_host_data_mut::<Headers, _>(
+        object,
+        ctx.interp_mut().gc_heap_mut(),
+        |headers| headers.append(&name, &value),
+    )
+    .map_err(|err| host_error("Headers.prototype.append", err))?;
+    result.map_err(|err| crate::type_error("Headers.prototype.append", err.to_string()))?;
+    Ok(Value::Undefined)
 }
 
-fn headers_has_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Headers.prototype.has",
-        "invalid Headers receiver",
-    ))
+fn headers_delete_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = headers_receiver(ctx, "Headers.prototype.delete")?;
+    let name = crate::arg_string(args, 0);
+    let result = object::with_host_data_mut::<Headers, _>(
+        object,
+        ctx.interp_mut().gc_heap_mut(),
+        |headers| headers.delete(&name),
+    )
+    .map_err(|err| host_error("Headers.prototype.delete", err))?;
+    result.map_err(|err| crate::type_error("Headers.prototype.delete", err.to_string()))?;
+    Ok(Value::Undefined)
 }
 
-fn headers_set_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Headers.prototype.set",
-        "invalid Headers receiver",
-    ))
+fn headers_get_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = headers_receiver(ctx, "Headers.prototype.get")?;
+    let name = crate::arg_string(args, 0);
+    let result =
+        object::with_host_data::<Headers, _>(object, ctx.heap(), |headers| headers.get(&name))
+            .map_err(|err| host_error("Headers.prototype.get", err))?;
+    match result.map_err(|err| crate::type_error("Headers.prototype.get", err.to_string()))? {
+        Some(value) => crate::string_value(ctx, &value),
+        None => Ok(Value::Null),
+    }
 }
 
-fn headers_entries_native(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-    Err(crate::type_error(
-        "Headers.prototype.entries",
-        "invalid Headers receiver",
-    ))
+fn headers_has_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = headers_receiver(ctx, "Headers.prototype.has")?;
+    let name = crate::arg_string(args, 0);
+    let result =
+        object::with_host_data::<Headers, _>(object, ctx.heap(), |headers| headers.has(&name))
+            .map_err(|err| host_error("Headers.prototype.has", err))?;
+    Ok(Value::Boolean(result.map_err(|err| {
+        crate::type_error("Headers.prototype.has", err.to_string())
+    })?))
+}
+
+fn headers_set_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let object = headers_receiver(ctx, "Headers.prototype.set")?;
+    let name = crate::arg_string(args, 0);
+    let value = crate::arg_string(args, 1);
+    let result = object::with_host_data_mut::<Headers, _>(
+        object,
+        ctx.interp_mut().gc_heap_mut(),
+        |headers| headers.set(&name, &value),
+    )
+    .map_err(|err| host_error("Headers.prototype.set", err))?;
+    result.map_err(|err| crate::type_error("Headers.prototype.set", err.to_string()))?;
+    Ok(Value::Undefined)
+}
+
+fn headers_entries_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let object = headers_receiver(ctx, "Headers.prototype.entries")?;
+    let entries = object::with_host_data::<Headers, _>(object, ctx.heap(), Headers::entries)
+        .map_err(|err| host_error("Headers.prototype.entries", err))?;
+    let text = entries
+        .into_iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::string_value(ctx, &text)
 }
 
 pub(crate) fn headers_object(
     ctx: &mut NativeCtx<'_>,
-    state: Arc<Mutex<Headers>>,
+    state: Headers,
 ) -> Result<Value, NativeError> {
-    let object = {
-        let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
-        builder
-            .method(
-                "append",
-                2,
-                NativeCall::Dynamic(Arc::new({
-                    let state = state.clone();
-                    move |_ctx, args, _captures| {
-                        let name = crate::arg_string(args, 0);
-                        let value = crate::arg_string(args, 1);
-                        state
-                            .lock()
-                            .map_err(|_| {
-                                crate::type_error(
-                                    "Headers.prototype.append",
-                                    "Headers state lock poisoned",
-                                )
-                            })?
-                            .append(&name, &value)
-                            .map_err(|err| {
-                                crate::type_error("Headers.prototype.append", err.to_string())
-                            })?;
-                        Ok(Value::Undefined)
-                    }
-                })),
+    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
+    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
+    builder
+        .method(
+            "append",
+            2,
+            NativeCall::Static(headers_append_native),
+            Attr::builtin_function(),
+        )
+        .and_then(|builder| {
+            builder.method(
+                "delete",
+                1,
+                NativeCall::Static(headers_delete_native),
                 Attr::builtin_function(),
             )
-            .and_then(|builder| {
-                builder.method(
-                    "delete",
-                    1,
-                    NativeCall::Dynamic(Arc::new({
-                        let state = state.clone();
-                        move |_ctx, args, _captures| {
-                            let name = crate::arg_string(args, 0);
-                            state
-                                .lock()
-                                .map_err(|_| {
-                                    crate::type_error(
-                                        "Headers.prototype.delete",
-                                        "Headers state lock poisoned",
-                                    )
-                                })?
-                                .delete(&name)
-                                .map_err(|err| {
-                                    crate::type_error("Headers.prototype.delete", err.to_string())
-                                })?;
-                            Ok(Value::Undefined)
-                        }
-                    })),
-                    Attr::builtin_function(),
-                )
-            })
-            .and_then(|builder| {
-                builder.method(
-                    "get",
-                    1,
-                    NativeCall::Dynamic(Arc::new({
-                        let state = state.clone();
-                        move |ctx, args, _captures| {
-                            let name = crate::arg_string(args, 0);
-                            let value = state
-                                .lock()
-                                .map_err(|_| {
-                                    crate::type_error(
-                                        "Headers.prototype.get",
-                                        "Headers state lock poisoned",
-                                    )
-                                })?
-                                .get(&name)
-                                .map_err(|err| {
-                                    crate::type_error("Headers.prototype.get", err.to_string())
-                                })?;
-                            match value {
-                                Some(value) => crate::string_value(ctx, &value),
-                                None => Ok(Value::Null),
-                            }
-                        }
-                    })),
-                    Attr::builtin_function(),
-                )
-            })
-            .and_then(|builder| {
-                builder.method(
-                    "has",
-                    1,
-                    NativeCall::Dynamic(Arc::new({
-                        let state = state.clone();
-                        move |_ctx, args, _captures| {
-                            let name = crate::arg_string(args, 0);
-                            let has = state
-                                .lock()
-                                .map_err(|_| {
-                                    crate::type_error(
-                                        "Headers.prototype.has",
-                                        "Headers state lock poisoned",
-                                    )
-                                })?
-                                .has(&name)
-                                .map_err(|err| {
-                                    crate::type_error("Headers.prototype.has", err.to_string())
-                                })?;
-                            Ok(Value::Boolean(has))
-                        }
-                    })),
-                    Attr::builtin_function(),
-                )
-            })
-            .and_then(|builder| {
-                builder.method(
-                    "set",
-                    2,
-                    NativeCall::Dynamic(Arc::new({
-                        let state = state.clone();
-                        move |_ctx, args, _captures| {
-                            let name = crate::arg_string(args, 0);
-                            let value = crate::arg_string(args, 1);
-                            state
-                                .lock()
-                                .map_err(|_| {
-                                    crate::type_error(
-                                        "Headers.prototype.set",
-                                        "Headers state lock poisoned",
-                                    )
-                                })?
-                                .set(&name, &value)
-                                .map_err(|err| {
-                                    crate::type_error("Headers.prototype.set", err.to_string())
-                                })?;
-                            Ok(Value::Undefined)
-                        }
-                    })),
-                    Attr::builtin_function(),
-                )
-            })
-            .and_then(|builder| {
-                builder.method(
-                    "entries",
-                    0,
-                    NativeCall::Dynamic(Arc::new({
-                        let state = state.clone();
-                        move |ctx, _args, _captures| {
-                            let entries = state
-                                .lock()
-                                .map_err(|_| {
-                                    crate::type_error(
-                                        "Headers.prototype.entries",
-                                        "Headers state lock poisoned",
-                                    )
-                                })?
-                                .entries();
-                            let text = entries
-                                .into_iter()
-                                .map(|(name, value)| format!("{name}: {value}"))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            crate::string_value(ctx, &text)
-                        }
-                    })),
-                    Attr::builtin_function(),
-                )
-            })
-            .map_err(|err| crate::type_error("Headers", err.to_string()))?;
-        builder.build()
-    };
+        })
+        .and_then(|builder| {
+            builder.method(
+                "get",
+                1,
+                NativeCall::Static(headers_get_native),
+                Attr::builtin_function(),
+            )
+        })
+        .and_then(|builder| {
+            builder.method(
+                "has",
+                1,
+                NativeCall::Static(headers_has_native),
+                Attr::builtin_function(),
+            )
+        })
+        .and_then(|builder| {
+            builder.method(
+                "set",
+                2,
+                NativeCall::Static(headers_set_native),
+                Attr::builtin_function(),
+            )
+        })
+        .and_then(|builder| {
+            builder.method(
+                "entries",
+                0,
+                NativeCall::Static(headers_entries_native),
+                Attr::builtin_function(),
+            )
+        })
+        .map_err(|err| crate::type_error("Headers", err.to_string()))?;
     Ok(Value::Object(object))
 }

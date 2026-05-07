@@ -7,9 +7,8 @@ license.workspace = true
 description = "Web API surfaces for the active Otter runtime stack."
 
 [dependencies]
-otter-vm = { workspace = true }
+otter-runtime = { workspace = true }
 thiserror = { workspace = true }
 url = "2"
 
 [dev-dependencies]
-otter-runtime = { workspace = true }

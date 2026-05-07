@@ -11,9 +11,9 @@ use serde_json::json;
 fn hosted_module_specs_are_static_and_ordered() {
     let specs = hosted_modules();
     assert_eq!(specs.len(), 3);
-    assert_eq!(specs[0].specifier, "otter:kv");
-    assert_eq!(specs[1].specifier, "otter:sql");
-    assert_eq!(specs[2].specifier, "otter:ffi");
+    assert_eq!(specs[0].specifier(), "otter:kv");
+    assert_eq!(specs[1].specifier(), "otter:sql");
+    assert_eq!(specs[2].specifier(), "otter:ffi");
 }
 
 #[test]

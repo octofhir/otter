@@ -26,38 +26,41 @@ pub mod headers;
 pub mod request_response;
 pub mod url;
 
-use otter_vm::{ClassSpec, JsString, NativeCtx, NativeError, Value};
+use otter_runtime::{
+    GlobalClass,
+    module_api::{JsString, NativeCtx, NativeError, Value},
+};
 
 /// Static descriptor for a Web API class/global.
 #[derive(Debug, Clone, Copy)]
 pub struct WebApiClass {
     /// Global constructor name.
     pub name: &'static str,
-    /// Static class spec.
-    pub spec: &'static ClassSpec,
+    /// Runtime-owned global class surface.
+    pub spec: GlobalClass,
 }
 
 /// Active Web API class specs in deterministic bootstrap order.
 pub static WEB_API_CLASSES: &[WebApiClass] = &[
     WebApiClass {
         name: "URL",
-        spec: &url::URL_CLASS_SPEC,
+        spec: GlobalClass::from_raw(&url::URL_CLASS_SPEC),
     },
     WebApiClass {
         name: "Headers",
-        spec: &headers::HEADERS_CLASS_SPEC,
+        spec: GlobalClass::from_raw(&headers::HEADERS_CLASS_SPEC),
     },
     WebApiClass {
         name: "Blob",
-        spec: &blob::BLOB_CLASS_SPEC,
+        spec: GlobalClass::from_raw(&blob::BLOB_CLASS_SPEC),
     },
     WebApiClass {
         name: "Request",
-        spec: &request_response::REQUEST_CLASS_SPEC,
+        spec: GlobalClass::from_raw(&request_response::REQUEST_CLASS_SPEC),
     },
     WebApiClass {
         name: "Response",
-        spec: &request_response::RESPONSE_CLASS_SPEC,
+        spec: GlobalClass::from_raw(&request_response::RESPONSE_CLASS_SPEC),
     },
 ];
 

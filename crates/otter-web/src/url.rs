@@ -1,10 +1,8 @@
 //! WHATWG URL host-side record.
 
-use std::sync::{Arc, Mutex};
-
-use otter_vm::{
-    Attr, ClassSpec, ConstructorSpec, MethodSpec, NativeCall, NativeCtx, NativeError,
-    ObjectBuilder, Value,
+use otter_runtime::module_api::{
+    Attr, ClassSpec, ConstructorSpec, JsObject, MethodSpec, NativeCall, NativeCtx, NativeError,
+    ObjectBuilder, Value, object,
 };
 use url::Url;
 
@@ -151,49 +149,46 @@ fn url_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     };
     let url = WebUrl::parse(&input, base.as_ref())
         .map_err(|err| crate::type_error("URL", err.to_string()))?;
-    url_object(ctx, Arc::new(Mutex::new(url)))
+    url_object(ctx, url)
 }
 
-fn url_to_string_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    match args.first() {
-        Some(Value::String(value)) => crate::string_value(ctx, &value.to_lossy_string()),
-        Some(value) => crate::string_value(ctx, &value.display_string()),
-        None => crate::string_value(ctx, ""),
+fn url_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
+    match ctx.this_value().clone() {
+        Value::Object(object) => Ok(object),
+        _ => Err(crate::type_error(name, "invalid URL receiver")),
     }
 }
 
-pub(crate) fn url_object(
-    ctx: &mut NativeCtx<'_>,
-    state: Arc<Mutex<WebUrl>>,
-) -> Result<Value, NativeError> {
-    let snapshot = state
-        .lock()
-        .map_err(|_| crate::type_error("URL", "URL state lock poisoned"))?
-        .clone();
-    let href = crate::string_value(ctx, &snapshot.href())?;
-    let protocol = crate::string_value(ctx, &snapshot.protocol())?;
-    let origin = crate::string_value(ctx, &snapshot.origin())?;
-    let host = crate::string_value(ctx, &snapshot.host())?;
-    let pathname = crate::string_value(ctx, &snapshot.pathname())?;
-    let search = crate::string_value(ctx, &snapshot.search())?;
-    let hash = crate::string_value(ctx, &snapshot.hash())?;
-    let mut builder = ObjectBuilder::new_in_ctx(ctx)?;
+fn url_state<R>(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+    f: impl FnOnce(&WebUrl) -> R,
+) -> Result<R, NativeError> {
+    let object = url_receiver(ctx, name)?;
+    object::with_host_data::<WebUrl, _>(object, ctx.heap(), f)
+        .map_err(|err| crate::type_error(name, err.to_string()))
+}
+
+fn url_to_string_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let href = url_state(ctx, "URL.prototype.toString", WebUrl::href)?;
+    crate::string_value(ctx, &href)
+}
+
+pub(crate) fn url_object(ctx: &mut NativeCtx<'_>, state: WebUrl) -> Result<Value, NativeError> {
+    let href = crate::string_value(ctx, &state.href())?;
+    let protocol = crate::string_value(ctx, &state.protocol())?;
+    let origin = crate::string_value(ctx, &state.origin())?;
+    let host = crate::string_value(ctx, &state.host())?;
+    let pathname = crate::string_value(ctx, &state.pathname())?;
+    let search = crate::string_value(ctx, &state.search())?;
+    let hash = crate::string_value(ctx, &state.hash())?;
+    let object = object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), state)?;
+    let mut builder = ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object);
     builder
         .method(
             "toString",
             0,
-            NativeCall::Dynamic(Arc::new({
-                let state = state.clone();
-                move |ctx, _args, _captures| {
-                    let href = state
-                        .lock()
-                        .map_err(|_| {
-                            crate::type_error("URL.prototype.toString", "URL state lock poisoned")
-                        })?
-                        .href();
-                    crate::string_value(ctx, &href)
-                }
-            })),
+            NativeCall::Static(url_to_string_native),
             Attr::builtin_function(),
         )
         .and_then(|builder| builder.property("href", href, Attr::data()))

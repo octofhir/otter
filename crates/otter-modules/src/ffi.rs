@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libloading::Library;
-use otter_runtime::CapabilitySet;
-use otter_vm::{Attr, Interpreter, NativeCall, NativeCtx, NativeError, ObjectBuilder, Value};
+use otter_runtime::module_api::{Attr, NativeCall, NativeCtx, NativeError, ObjectBuilder, Value};
+use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
 
 /// Errors produced by `otter:ffi`.
 #[derive(Debug, thiserror::Error)]
@@ -192,26 +192,19 @@ impl FfiLibrary {
 }
 
 /// Install the `otter:ffi` namespace object.
-pub fn install_ffi_module(
-    interp: &mut Interpreter,
-    capabilities: &CapabilitySet,
-) -> Result<otter_vm::JsObject, String> {
-    let caps = capabilities.clone();
+pub fn install_ffi_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
+    let caps = ctx.capabilities().clone();
     let dlopen = std::sync::Arc::new(
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
             open_library(ctx, args, &caps)
         },
     );
-    let mut builder = ObjectBuilder::new(interp.gc_heap_mut()).map_err(|err| err.to_string())?;
-    builder
-        .method(
-            "dlopen",
-            1,
-            NativeCall::Dynamic(dlopen),
-            Attr::builtin_function(),
-        )
-        .map_err(|err| err.to_string())?;
-    Ok(builder.build())
+    ctx.method(
+        "dlopen",
+        1,
+        HostedNativeCall::from_raw(NativeCall::Dynamic(dlopen)),
+    )?;
+    Ok(())
 }
 
 fn open_library(

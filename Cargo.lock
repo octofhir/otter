@@ -1318,7 +1318,6 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "otter-runtime",
- "otter-vm",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -1422,7 +1421,6 @@ name = "otter-web"
 version = "0.1.0"
 dependencies = [
  "otter-runtime",
- "otter-vm",
  "thiserror",
  "url",
 ]

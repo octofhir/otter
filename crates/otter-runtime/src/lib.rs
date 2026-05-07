@@ -28,6 +28,23 @@
 pub mod error;
 pub mod event_loop;
 pub mod handle;
+#[doc(hidden)]
+pub mod module_api {
+    //! Low-level runtime adapter for active hosted-module migration.
+    //!
+    //! Product crates should treat this module as an implementation detail. It
+    //! exists so hosted modules can depend on `otter-runtime` instead of
+    //! depending directly on `otter-vm` while the runtime-owned builder API is
+    //! being introduced.
+
+    pub use otter_vm::array;
+    pub use otter_vm::object;
+    pub use otter_vm::{
+        AccessorSpec, Attr, ClassSpec, ConstructorSpec, Interpreter, JsObject, MethodSpec,
+        NativeCall, NativeCtx, NativeError, NativeFn, ObjectBuilder, Value,
+    };
+    pub use otter_vm::{number::NumberValue, string::JsString};
+}
 pub mod module_graph;
 pub mod module_loader;
 pub mod structured_clone;
@@ -51,6 +68,7 @@ pub use event_loop::{
     TimerRequest, TimerToken, TokioEventLoop,
 };
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
+pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use structured_clone::{
     StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
     StructuredCloneProperty, StructuredCloneTransfer, StructuredCloneTransferId,
@@ -61,20 +79,174 @@ pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
 };
 
+/// Runtime-owned hosted module installation context.
+///
+/// Installers use this context to populate the hosted module namespace during a
+/// single runtime mutator turn. The context owns the namespace object builder
+/// and exposes configured capabilities for boundary checks.
+pub struct HostedModuleCtx<'rt> {
+    builder: otter_vm::ObjectBuilder<'rt>,
+    capabilities: &'rt CapabilitySet,
+}
+
+impl<'rt> HostedModuleCtx<'rt> {
+    fn new(
+        interp: &'rt mut Interpreter,
+        capabilities: &'rt CapabilitySet,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            builder: otter_vm::ObjectBuilder::new(interp.gc_heap_mut())?,
+            capabilities,
+        })
+    }
+
+    /// Return the configured capability set for this runtime.
+    #[must_use]
+    pub const fn capabilities(&self) -> &CapabilitySet {
+        self.capabilities
+    }
+
+    /// Define a native method on the module namespace object.
+    ///
+    /// This is a temporary low-level method while the stable hosted module
+    /// builder API is being expanded. It routes through the same static VM
+    /// builder backend as other JS-visible surfaces.
+    pub fn method(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: HostedNativeCall,
+    ) -> Result<&mut Self, String> {
+        self.builder
+            .method(
+                name,
+                length,
+                call.into_raw(),
+                module_api::Attr::builtin_function(),
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(self)
+    }
+
+    fn build(self) -> JsObject {
+        self.builder.build()
+    }
+}
+
+/// Runtime-owned hosted module installer callback.
+pub type HostedModuleBuilderInstall = for<'rt> fn(&mut HostedModuleCtx<'rt>) -> Result<(), String>;
+
+/// Opaque native call target for hosted module builders.
+///
+/// This is the runtime-facing call handle used by [`HostedModuleCtx`]. The
+/// current implementation still adapts to the native call backend, but the
+/// hosted module builder API no longer exposes that VM enum in its method
+/// signatures.
+#[derive(Debug, Clone)]
+pub struct HostedNativeCall {
+    raw: module_api::NativeCall,
+}
+
+impl HostedNativeCall {
+    /// Low-level adapter from the current native call backend.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_raw(raw: module_api::NativeCall) -> Self {
+        Self { raw }
+    }
+
+    fn into_raw(self) -> module_api::NativeCall {
+        self.raw
+    }
+}
+
 /// Runtime-hosted module installer.
 ///
-/// Product crates provide these installers; the runtime only stores and invokes
-/// them by specifier. Installers receive the active isolate and configured
-/// capabilities and must return a fully-populated module namespace object.
-pub type HostedModuleInstall = fn(&mut Interpreter, &CapabilitySet) -> Result<JsObject, String>;
+/// This is an opaque runtime-owned handle. Product crates should construct it
+/// through runtime APIs instead of exposing VM installer details as part of
+/// their public surface.
+#[derive(Debug, Clone, Copy)]
+pub struct HostedModuleInstall {
+    raw: HostedModuleBuilderInstall,
+}
+
+impl HostedModuleInstall {
+    /// Build an installer from a runtime-owned hosted module context callback.
+    #[must_use]
+    pub const fn new(raw: HostedModuleBuilderInstall) -> Self {
+        Self { raw }
+    }
+
+    fn install(
+        self,
+        interp: &mut Interpreter,
+        capabilities: &CapabilitySet,
+    ) -> Result<JsObject, String> {
+        let mut ctx = HostedModuleCtx::new(interp, capabilities)
+            .map_err(|err| format!("out of memory: {err}"))?;
+        (self.raw)(&mut ctx)?;
+        Ok(ctx.build())
+    }
+}
 
 /// One runtime-hosted module.
 #[derive(Debug, Clone, Copy)]
 pub struct HostedModule {
     /// Module specifier, for example `otter:kv`.
-    pub specifier: &'static str,
+    specifier: &'static str,
     /// Namespace installer.
-    pub install: HostedModuleInstall,
+    install: HostedModuleInstall,
+}
+
+impl HostedModule {
+    /// Create a hosted module spec from an opaque runtime installer.
+    #[must_use]
+    pub const fn new(specifier: &'static str, install: HostedModuleInstall) -> Self {
+        Self { specifier, install }
+    }
+
+    /// Module specifier, for example `otter:kv`.
+    #[must_use]
+    pub const fn specifier(self) -> &'static str {
+        self.specifier
+    }
+
+    fn install(
+        self,
+        interp: &mut Interpreter,
+        capabilities: &CapabilitySet,
+    ) -> Result<JsObject, String> {
+        self.install.install(interp, capabilities)
+    }
+}
+
+/// Runtime-owned class-shaped global surface.
+///
+/// Product crates expose this opaque handle to embedders instead of exposing VM
+/// class specs directly.
+#[derive(Debug, Clone, Copy)]
+pub struct GlobalClass {
+    raw: &'static otter_vm::ClassSpec,
+}
+
+impl GlobalClass {
+    /// Build a runtime global class handle from the current static class-spec
+    /// backend.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn from_raw(raw: &'static otter_vm::ClassSpec) -> Self {
+        Self { raw }
+    }
+
+    /// Constructor/global name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.raw.constructor.name
+    }
+
+    fn raw(self) -> &'static otter_vm::ClassSpec {
+        self.raw
+    }
 }
 
 /// Default heap cap (256 MiB) when none is configured.
@@ -187,23 +359,24 @@ impl ExecutionResult {
 ///   allow / deny patterns narrow the set further. Most users
 ///   never need this state.
 ///
-/// **Defaults are practical, not paranoid.** [`CapabilitySet::default`]
-/// (used by [`Otter::new`] and [`RuntimeBuilder::default`]) gives:
+/// [`CapabilitySet::default`] is deny-by-default. Embedders must opt in to
+/// capabilities explicitly, or use [`CapabilitySet::allow_all`] for trusted
+/// development scenarios.
 ///
 /// | Capability | Default | Why |
 /// | --- | --- | --- |
-/// | `read` | `AllowAll` | Imports / module loading must work without forcing the user to spell out every directory. |
+/// | `read` | `Deny` | Filesystem access is a host resource and must be explicit. |
 /// | `write` | `Deny` | Filesystem mutation is rare in scripts and dangerous by default. |
 /// | `net` | `Deny` | Network access is opt-in. |
 /// | `env` | `Deny` | Environment variables may contain secrets. |
 /// | `run` | `Deny` | Subprocess execution is opt-in. |
 /// | `ffi` | `Deny` | Native library loading is opt-in. |
-/// | `hrtime` | `Allow` | High-resolution time is low-risk and commonly used. |
+/// | `hrtime` | `Deny` | High-resolution time can be a side-channel and should be explicit. |
 ///
 /// Two convenience presets:
 ///
-/// - [`CapabilitySet::sandbox`] — deny everything. Use this when
-///   running untrusted code. Equivalent to the CLI's `--sandbox`.
+/// - [`CapabilitySet::sandbox`] — deny everything. Equivalent to
+///   [`CapabilitySet::default`] and the CLI's `--sandbox`.
 /// - [`CapabilitySet::allow_all`] — allow everything unconditionally.
 ///   Equivalent to the CLI's `--allow-all`.
 ///
@@ -212,9 +385,8 @@ impl ExecutionResult {
 /// **boolean form** (`--allow-net`) which upgrades the capability to
 /// `AllowAll`.
 ///
-/// The harness slice (task 07) **stores** these values but does not
-/// enforce them yet. Enforcement lands with later slices when the
-/// capability surface becomes observable.
+/// Runtime and product crates must enforce these checks at the Rust boundary
+/// before opening host resources or starting host work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilitySet {
     /// Filesystem read permission.
@@ -235,15 +407,7 @@ pub struct CapabilitySet {
 
 impl Default for CapabilitySet {
     fn default() -> Self {
-        Self {
-            read: Permission::AllowAll,
-            write: Permission::Deny,
-            net: Permission::Deny,
-            env: Permission::Deny,
-            run: Permission::Deny,
-            ffi: Permission::Deny,
-            hrtime: BooleanPermission::Allow,
-        }
+        Self::sandbox()
     }
 }
 
@@ -525,6 +689,18 @@ mod permission_tests {
     }
 
     #[test]
+    fn capability_default_is_deny_by_default() {
+        let caps = CapabilitySet::default();
+        assert!(caps.read.is_deny());
+        assert!(caps.write.is_deny());
+        assert!(caps.net.is_deny());
+        assert!(caps.env.is_deny());
+        assert!(caps.run.is_deny());
+        assert!(caps.ffi.is_deny());
+        assert!(!caps.hrtime.is_allowed());
+    }
+
+    #[test]
     fn builtin_secret_patterns_always_denied() {
         // Even with allow-all, secret-named env vars stay denied.
         let caps = CapabilitySet::allow_all();
@@ -602,8 +778,8 @@ pub(crate) struct RuntimeConfig {
     capabilities: CapabilitySet,
     loader: Option<module_loader::LoaderConfig>,
     hosted_modules: Vec<HostedModule>,
-    global_classes: Vec<&'static otter_vm::ClassSpec>,
-    console_sink: otter_vm::ConsoleSinkHandle,
+    global_classes: Vec<GlobalClass>,
+    console_sink: ConsoleSinkHandle,
 }
 
 impl Default for RuntimeConfig {
@@ -691,17 +867,14 @@ impl RuntimeBuilder {
 
     /// Register one class-shaped global described by a static spec.
     #[must_use]
-    pub fn global_class(mut self, spec: &'static otter_vm::ClassSpec) -> Self {
+    pub fn global_class(mut self, spec: GlobalClass) -> Self {
         self.config.global_classes.push(spec);
         self
     }
 
     /// Register multiple class-shaped globals.
     #[must_use]
-    pub fn global_classes(
-        mut self,
-        specs: impl IntoIterator<Item = &'static otter_vm::ClassSpec>,
-    ) -> Self {
+    pub fn global_classes(mut self, specs: impl IntoIterator<Item = GlobalClass>) -> Self {
         self.config.global_classes.extend(specs);
         self
     }
@@ -713,7 +886,7 @@ impl RuntimeBuilder {
     /// through `eprintln!`. Embedders can replace it with a sink
     /// backed by `tracing`, structured logs, or test capture.
     #[must_use]
-    pub fn console_sink(mut self, sink: otter_vm::ConsoleSinkHandle) -> Self {
+    pub fn console_sink(mut self, sink: ConsoleSinkHandle) -> Self {
         self.config.console_sink = sink;
         self
     }
@@ -759,7 +932,7 @@ impl Runtime {
         interp.set_console_sink(config.console_sink.clone());
         for spec in &config.global_classes {
             interp
-                .install_global_class(spec)
+                .install_global_class(spec.raw())
                 .map_err(|err| OtterError::Internal {
                     code: "GLOBAL_CLASS_BOOTSTRAP".to_string(),
                     message: err.to_string(),
@@ -1004,7 +1177,7 @@ impl Runtime {
                     self.config
                         .hosted_modules
                         .iter()
-                        .map(|m| m.specifier.to_string()),
+                        .map(|m| m.specifier().to_string()),
                 );
                 module_loader::ModuleLoader::with_config(cfg)
             }
@@ -1018,7 +1191,7 @@ impl Runtime {
                     .config
                     .hosted_modules
                     .iter()
-                    .map(|m| m.specifier.to_string())
+                    .map(|m| m.specifier().to_string())
                     .collect();
                 module_loader::ModuleLoader::with_config(cfg)
             }
@@ -1040,13 +1213,13 @@ impl Runtime {
                 .config
                 .hosted_modules
                 .iter()
-                .find(|hosted| hosted.specifier == init.url)
+                .find(|hosted| hosted.specifier() == init.url)
             {
-                (hosted.install)(&mut self.interp, &self.config.capabilities).map_err(
-                    |message| OtterError::Config {
+                hosted
+                    .install(&mut self.interp, &self.config.capabilities)
+                    .map_err(|message| OtterError::Config {
                         reason: ConfigError::ConflictingCapabilities { message },
-                    },
-                )?
+                    })?
             } else {
                 otter_vm::object::alloc_object(self.interp.gc_heap_mut())?
             };
@@ -1323,7 +1496,7 @@ impl OtterBuilder {
 
     /// Override the implementation behind `console.*`.
     #[must_use]
-    pub fn console_sink(mut self, sink: otter_vm::ConsoleSinkHandle) -> Self {
+    pub fn console_sink(mut self, sink: ConsoleSinkHandle) -> Self {
         self.runtime = self.runtime.console_sink(sink);
         self
     }

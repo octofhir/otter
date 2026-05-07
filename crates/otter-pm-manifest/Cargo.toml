@@ -1,0 +1,21 @@
+[package]
+name = "otter-pm-manifest"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "package.json and workspace manifest model for Otter package management."
+
+[lints]
+workspace = true
+
+[dependencies]
+globset = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

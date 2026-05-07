@@ -4,7 +4,7 @@
 //! phase command surface from
 //! [the public runtime architecture](../../../docs/book/src/engine/architecture.md):
 //! `run`, `<file>` shorthand, `eval`, `-e`, `-p`, `check`, `test`,
-//! `info`, `--dump-bytecode[=json]`. Slice tasks `09`+ extend
+//! `install`, `add`, `remove`, `init`, `info`, `--dump-bytecode[=json]`. Slice tasks `09`+ extend
 //! behavior; this binary owns the argument parsing and exit-code
 //! mapping.
 //!
@@ -19,12 +19,14 @@
 //! - JSON outputs (`--json`, `--dump-bytecode=json`, error payloads)
 //!   match the documented CLI and bytecode-dump wire formats.
 
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use otter_bytecode::{disasm::disassemble, dump::to_json_pretty};
+use otter_pm_manifest::{PACKAGE_JSON, PackageManifest, PackageType};
 use otter_runtime::{
     BooleanPermission, CapabilitySet, Diagnostic, OtterError, Permission, SourceInput,
 };
@@ -303,6 +305,14 @@ fn parse_strings(s: &str) -> Vec<String> {
 enum Command {
     /// Run a script file.
     Run(RunArgs),
+    /// Write or verify the project `otter-lock` without executing lifecycle scripts.
+    Install(InstallArgs),
+    /// Add dependencies to `package.json`, then refresh `otter-lock`.
+    Add(AddArgs),
+    /// Remove dependencies from `package.json`, then refresh `otter-lock`.
+    Remove(RemoveArgs),
+    /// Create a new `package.json`.
+    Init(InitArgs),
     /// Evaluate an expression.
     Eval(EvalArgs),
     /// Compile / type-check without executing.
@@ -315,11 +325,67 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// Script path (`.js`, `.mjs`, `.cjs`, `.ts`, `.mts`, `.cts`).
-    file: PathBuf,
-    /// Forwarded script arguments (recorded only; unused this slice).
+    /// File path, package script, or local package binary.
+    target: String,
+    /// Force package.json#scripts resolution.
+    #[arg(long, conflicts_with = "bin")]
+    script: bool,
+    /// Force local package binary resolution.
+    #[arg(long, conflicts_with = "script")]
+    bin: bool,
+    /// Forwarded target arguments.
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct InstallArgs {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct AddArgs {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    /// Add to devDependencies.
+    #[arg(long, conflicts_with_all = ["peer", "optional"])]
+    dev: bool,
+    /// Add to peerDependencies.
+    #[arg(long, conflicts_with_all = ["dev", "optional"])]
+    peer: bool,
+    /// Add to optionalDependencies.
+    #[arg(long, conflicts_with_all = ["dev", "peer"])]
+    optional: bool,
+    /// Package specs, for example `react@^19` or `@scope/pkg@1`.
+    packages: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct RemoveArgs {
+    /// Project root.
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    /// Package names to remove from all dependency buckets.
+    packages: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    /// Project root.
+    #[arg(default_value = ".")]
+    root: PathBuf,
+    /// Package name. Defaults to the directory name.
+    #[arg(long)]
+    name: Option<String>,
+    /// Initial package version.
+    #[arg(long, default_value = "0.1.0")]
+    version: String,
+    /// Accept defaults without prompting.
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -386,15 +452,12 @@ async fn main() -> ExitCode {
     let result = match (cli.command, cli.args.first().cloned()) {
         // Explicit subcommand.
         (Some(Command::Run(args)), _) => {
-            run_file(
-                &args.file,
-                json,
-                dump_mode.as_deref(),
-                &caps,
-                &startup_timer,
-            )
-            .await
+            run_target(args, json, dump_mode.as_deref(), &caps, &startup_timer).await
         }
+        (Some(Command::Install(args)), _) => run_pm_install(&args.root, json).await,
+        (Some(Command::Add(args)), _) => run_pm_add(args, json).await,
+        (Some(Command::Remove(args)), _) => run_pm_remove(args, json).await,
+        (Some(Command::Init(args)), _) => run_pm_init(args, json).await,
         (Some(Command::Eval(args)), _) => {
             run_eval(&args.expression, args.print, json, &caps, &startup_timer).await
         }
@@ -487,6 +550,216 @@ async fn run_file(
     Ok(ExitCode::SUCCESS)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunTarget {
+    File(PathBuf),
+    Script {
+        project_root: PathBuf,
+        name: String,
+        command: String,
+    },
+    Bin(otter_pm::PackageBin),
+}
+
+async fn run_target(
+    args: RunArgs,
+    json: bool,
+    dump_mode: Option<&str>,
+    caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
+) -> Result<ExitCode, OtterError> {
+    let project_root = std::env::current_dir().map_err(|err| pm_config_error(err.to_string()))?;
+    let target_args = args.args.clone();
+    match resolve_run_target(&project_root, &args).await? {
+        RunTarget::File(path) => run_file(&path, json, dump_mode, caps, startup_timer).await,
+        RunTarget::Script {
+            project_root,
+            name: _,
+            command,
+        } => {
+            if dump_mode.is_some() {
+                return Err(pm_config_error(
+                    "--dump-bytecode only supports file targets in this slice",
+                ));
+            }
+            run_package_script(&project_root, &command, &target_args, json).await
+        }
+        RunTarget::Bin(bin) => run_file(&bin.path, json, dump_mode, caps, startup_timer).await,
+    }
+}
+
+async fn resolve_run_target(project_root: &Path, args: &RunArgs) -> Result<RunTarget, OtterError> {
+    if args.script {
+        return resolve_run_script(project_root, &args.target).await;
+    }
+    if args.bin {
+        return resolve_run_bin(project_root, &args.target).await;
+    }
+    if args.target.starts_with("http://") || args.target.starts_with("https://") {
+        return Err(pm_config_error(
+            "remote URL entrypoints are not supported in this slice",
+        ));
+    }
+
+    if let Some(path) = explicit_file_target(&args.target).await? {
+        return Ok(RunTarget::File(path));
+    }
+
+    let script = resolve_run_script(project_root, &args.target).await.ok();
+    let bin = resolve_run_bin(project_root, &args.target).await.ok();
+    match (script, bin) {
+        (Some(_script), Some(bin)) => Err(pm_config_error(format!(
+            "ambiguous run target `{}`\n  candidates:\n  - package script: package.json#scripts.{} (use `otter run --script {}`)\n  - local package binary: {} (use `otter run --bin {}`)",
+            args.target,
+            args.target,
+            args.target,
+            match &bin {
+                RunTarget::Bin(bin) => bin.path.display().to_string(),
+                _ => unreachable!("resolve_run_bin only returns Bin"),
+            },
+            args.target
+        ))),
+        (Some(script), None) => Ok(script),
+        (None, Some(bin)) => Ok(bin),
+        (None, None) => Ok(RunTarget::File(PathBuf::from(&args.target))),
+    }
+}
+
+async fn explicit_file_target(target: &str) -> Result<Option<PathBuf>, OtterError> {
+    if let Some(path) = target.strip_prefix("file://") {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Ok(None);
+    }
+    let path = PathBuf::from(target);
+    if path.is_absolute()
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.contains('/')
+        || target.contains('\\')
+    {
+        Ok(Some(path))
+    } else if tokio::fs::try_exists(&path)
+        .await
+        .map_err(|err| pm_io_error(&path, err))?
+    {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn resolve_run_script(project_root: &Path, target: &str) -> Result<RunTarget, OtterError> {
+    let manifest = PackageManifest::read_from_dir(project_root)
+        .await
+        .map_err(map_manifest_error)?;
+    let command = manifest.scripts.get(target).cloned().ok_or_else(|| {
+        pm_config_error(format!(
+            "unknown package script `{target}`; available scripts: {}",
+            candidate_list(manifest.scripts.keys())
+        ))
+    })?;
+    Ok(RunTarget::Script {
+        project_root: project_root.to_path_buf(),
+        name: target.to_string(),
+        command,
+    })
+}
+
+async fn resolve_run_bin(project_root: &Path, target: &str) -> Result<RunTarget, OtterError> {
+    let graph = otter_pm::resolve_local_project(project_root)
+        .await
+        .map_err(map_pm_error)?
+        .graph;
+    let bins = graph.resolve_bin(target);
+    match bins {
+        [] => Err(pm_config_error(format!(
+            "unknown local package binary `{target}`"
+        ))),
+        [bin] => Ok(RunTarget::Bin(bin.clone())),
+        many => Err(pm_config_error(format!(
+            "ambiguous local package binary `{target}`\n  candidates:\n{}",
+            many.iter()
+                .map(|bin| format!("  - {} ({})", bin.path.display(), bin.package))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))),
+    }
+}
+
+async fn run_package_script(
+    project_root: &Path,
+    command: &str,
+    args: &[String],
+    json: bool,
+) -> Result<ExitCode, OtterError> {
+    let command = command_with_args(command, args);
+    let status = shell_command(&command)
+        .current_dir(project_root)
+        .status()
+        .await
+        .map_err(|err| pm_config_error(format!("package script failed to start: {err}")))?;
+    let code = status.code().unwrap_or(1).clamp(0, 255) as u8;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": status.success(),
+                "exitCode": code
+            })
+        );
+    }
+    Ok(ExitCode::from(code))
+}
+
+fn shell_command(command: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let mut process = tokio::process::Command::new("cmd");
+        process.arg("/C").arg(command);
+        process
+    }
+    #[cfg(not(windows))]
+    {
+        let mut process = tokio::process::Command::new("sh");
+        process.arg("-c").arg(command);
+        process
+    }
+}
+
+fn command_with_args(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return command.to_string();
+    }
+    let mut out = command.to_string();
+    for arg in args {
+        out.push(' ');
+        out.push_str(&shell_quote(arg));
+    }
+    out
+}
+
+fn shell_quote(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn candidate_list<'a>(items: impl Iterator<Item = &'a String>) -> String {
+    let items = items.cloned().collect::<Vec<_>>();
+    if items.is_empty() {
+        "<none>".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
 async fn run_eval(
     source: &str,
     print: bool,
@@ -542,6 +815,279 @@ fn compile_source_for_cli(
     let source = SourceInput::from_path(path)?;
     let specifier = path.to_string_lossy().to_string();
     otter_compiler::compile_source(&source.text, source.kind, &specifier).map_err(map_compile_error)
+}
+
+async fn run_pm_init(args: InitArgs, json: bool) -> Result<ExitCode, OtterError> {
+    tokio::fs::create_dir_all(&args.root)
+        .await
+        .map_err(|err| pm_io_error(&args.root, err))?;
+    let manifest_path = args.root.join(PACKAGE_JSON);
+    if tokio::fs::try_exists(&manifest_path)
+        .await
+        .map_err(|err| pm_io_error(&manifest_path, err))?
+    {
+        return Err(pm_config_error(format!(
+            "{} already exists",
+            manifest_path.display()
+        )));
+    }
+    let manifest = build_init_manifest(&args)?;
+    let name = manifest
+        .name
+        .clone()
+        .unwrap_or_else(|| default_package_name(&args.root));
+    manifest
+        .write_to_dir(&args.root)
+        .await
+        .map_err(|err| pm_config_error(err.to_string()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "path": manifest_path,
+                "name": name
+            })
+        );
+    } else {
+        println!("created {}", manifest_path.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_pm_install(root: &Path, json: bool) -> Result<ExitCode, OtterError> {
+    let changed = otter_pm::write_local_lockfile(root)
+        .await
+        .map_err(map_pm_error)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "lockfile": root.join(otter_pm_lockfile::LOCKFILE_NAME),
+                "lockfileChanged": changed
+            })
+        );
+    } else if changed {
+        println!(
+            "wrote {}",
+            root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
+        );
+    } else {
+        println!(
+            "{} is up to date",
+            root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
+    if args.packages.is_empty() {
+        return Err(pm_config_error("otter add requires at least one package"));
+    }
+    let mut manifest = PackageManifest::read_from_dir(&args.root)
+        .await
+        .map_err(map_manifest_error)?;
+    let bucket = if args.dev {
+        &mut manifest.dev_dependencies
+    } else if args.peer {
+        &mut manifest.peer_dependencies
+    } else if args.optional {
+        &mut manifest.optional_dependencies
+    } else {
+        &mut manifest.dependencies
+    };
+    let mut added = Vec::new();
+    for spec in &args.packages {
+        let (name, range) = parse_package_spec(spec);
+        bucket.insert(name.clone(), range.clone());
+        added.push(serde_json::json!({ "name": name, "range": range }));
+    }
+    manifest
+        .write_to_dir(&args.root)
+        .await
+        .map_err(|err| pm_config_error(err.to_string()))?;
+    let lockfile_changed = otter_pm::write_local_lockfile(&args.root)
+        .await
+        .map_err(map_pm_error)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "added": added,
+                "lockfileChanged": lockfile_changed
+            })
+        );
+    } else {
+        for item in added {
+            println!(
+                "added {}@{}",
+                item["name"].as_str().unwrap(),
+                item["range"].as_str().unwrap()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterError> {
+    if args.packages.is_empty() {
+        return Err(pm_config_error(
+            "otter remove requires at least one package",
+        ));
+    }
+    let mut manifest = PackageManifest::read_from_dir(&args.root)
+        .await
+        .map_err(map_manifest_error)?;
+    let mut removed = 0usize;
+    for package in &args.packages {
+        removed += usize::from(manifest.dependencies.remove(package).is_some());
+        removed += usize::from(manifest.dev_dependencies.remove(package).is_some());
+        removed += usize::from(manifest.peer_dependencies.remove(package).is_some());
+        removed += usize::from(manifest.optional_dependencies.remove(package).is_some());
+    }
+    manifest
+        .write_to_dir(&args.root)
+        .await
+        .map_err(|err| pm_config_error(err.to_string()))?;
+    let lockfile_changed = otter_pm::write_local_lockfile(&args.root)
+        .await
+        .map_err(map_pm_error)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "removed": removed,
+                "lockfileChanged": lockfile_changed
+            })
+        );
+    } else {
+        println!(
+            "removed {removed} dependency entr{}",
+            if removed == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn build_init_manifest(args: &InitArgs) -> Result<PackageManifest, OtterError> {
+    let default_name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| default_package_name(&args.root));
+    if args.yes {
+        return Ok(PackageManifest {
+            name: Some(default_name),
+            version: Some(args.version.clone()),
+            package_type: Some(PackageType::Module),
+            main: Some("index.ts".to_string()),
+            ..PackageManifest::default()
+        });
+    }
+
+    let name = prompt_with_default("package name", &default_name)?;
+    let version = prompt_with_default("version", &args.version)?;
+    let package_type = loop {
+        let value = prompt_with_default("type (module/commonjs)", "module")?;
+        match value.as_str() {
+            "module" => break PackageType::Module,
+            "commonjs" => break PackageType::CommonJs,
+            other => eprintln!("invalid package type `{other}`; expected `module` or `commonjs`"),
+        }
+    };
+    let main = prompt_with_default("entry point", "index.ts")?;
+    let module = prompt_optional("module entry point")?;
+    let test = prompt_optional("test script")?;
+
+    let mut manifest = PackageManifest {
+        name: Some(name),
+        version: Some(version),
+        package_type: Some(package_type),
+        main: Some(main),
+        module,
+        ..PackageManifest::default()
+    };
+    if let Some(test) = test {
+        manifest.scripts.insert("test".to_string(), test);
+    }
+    Ok(manifest)
+}
+
+fn prompt_with_default(label: &str, default: &str) -> Result<String, OtterError> {
+    print!("{label} ({default}): ");
+    io::stdout()
+        .flush()
+        .map_err(|err| pm_config_error(err.to_string()))?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| pm_config_error(err.to_string()))?;
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn prompt_optional(label: &str) -> Result<Option<String>, OtterError> {
+    print!("{label}: ");
+    io::stdout()
+        .flush()
+        .map_err(|err| pm_config_error(err.to_string()))?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| pm_config_error(err.to_string()))?;
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_string()))
+    }
+}
+
+fn parse_package_spec(spec: &str) -> (String, String) {
+    let split = if spec.starts_with('@') {
+        spec[1..].rfind('@').map(|index| index + 1)
+    } else {
+        spec.rfind('@').filter(|index| *index > 0)
+    };
+    match split {
+        Some(index) => (spec[..index].to_string(), spec[index + 1..].to_string()),
+        None => (spec.to_string(), "*".to_string()),
+    }
+}
+
+fn default_package_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != ".")
+        .unwrap_or("otter-app")
+        .to_string()
+}
+
+fn map_manifest_error(err: otter_pm_manifest::ManifestError) -> OtterError {
+    pm_config_error(err.to_string())
+}
+
+fn map_pm_error(err: otter_pm::PackageManagerError) -> OtterError {
+    pm_config_error(err.to_string())
+}
+
+fn pm_io_error(path: &Path, err: std::io::Error) -> OtterError {
+    pm_config_error(format!("I/O failed for `{}`: {err}", path.display()))
+}
+
+fn pm_config_error(message: impl Into<String>) -> OtterError {
+    OtterError::Config {
+        reason: otter_runtime::ConfigError::ConflictingCapabilities {
+            message: message.into(),
+        },
+    }
 }
 
 fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
@@ -698,6 +1244,148 @@ mod tests {
                 assert_eq!(args.expression, "40 + 2");
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn package_spec_parser_handles_scoped_ranges() {
+        assert_eq!(
+            parse_package_spec("@scope/pkg@^1.2.3"),
+            ("@scope/pkg".to_string(), "^1.2.3".to_string())
+        );
+        assert_eq!(
+            parse_package_spec("@scope/pkg"),
+            ("@scope/pkg".to_string(), "*".to_string())
+        );
+        assert_eq!(
+            parse_package_spec("react@^19"),
+            ("react".to_string(), "^19".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn pm_init_and_install_write_manifest_and_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_pm_init(
+            InitArgs {
+                root: tmp.path().to_path_buf(),
+                name: Some("app".to_string()),
+                version: "0.1.0".to_string(),
+                yes: true,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        run_pm_add(
+            AddArgs {
+                root: tmp.path().to_path_buf(),
+                dev: false,
+                peer: false,
+                optional: false,
+                packages: vec!["left-pad@^1.3.0".to_string()],
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        let manifest = tokio::fs::read_to_string(tmp.path().join(PACKAGE_JSON))
+            .await
+            .unwrap();
+        assert!(manifest.contains("\"left-pad\": \"^1.3.0\""));
+        let lockfile = tokio::fs::read_to_string(tmp.path().join(otter_pm_lockfile::LOCKFILE_NAME))
+            .await
+            .unwrap();
+        assert!(lockfile.contains("left-pad@npm:^1.3.0"));
+    }
+
+    #[tokio::test]
+    async fn run_target_resolves_existing_file_before_package_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("task.ts"), "undefined;")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","scripts":{"task.ts":"echo script"}}"#,
+        )
+        .await
+        .unwrap();
+        let args = RunArgs {
+            target: tmp.path().join("task.ts").to_string_lossy().to_string(),
+            script: false,
+            bin: false,
+            args: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_run_target(tmp.path(), &args).await.unwrap(),
+            RunTarget::File(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_target_reports_script_bin_ambiguity() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{
+              "name":"app",
+              "workspaces":["packages/*"],
+              "scripts":{"tool":"echo script"}
+            }"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("packages/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("packages/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","bin":{"tool":"./tool.ts"}}"#,
+        )
+        .await
+        .unwrap();
+        let args = RunArgs {
+            target: "tool".to_string(),
+            script: false,
+            bin: false,
+            args: Vec::new(),
+        };
+        let err = resolve_run_target(tmp.path(), &args).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("ambiguous run target `tool`"));
+        assert!(message.contains("otter run --script tool"));
+        assert!(message.contains("otter run --bin tool"));
+    }
+
+    #[tokio::test]
+    async fn run_target_force_bin_resolves_workspace_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","workspaces":["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("packages/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("packages/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","bin":"./tool.ts"}"#,
+        )
+        .await
+        .unwrap();
+        let args = RunArgs {
+            target: "tool".to_string(),
+            script: false,
+            bin: true,
+            args: Vec::new(),
+        };
+        let resolved = resolve_run_target(tmp.path(), &args).await.unwrap();
+        match resolved {
+            RunTarget::Bin(bin) => assert!(bin.path.ends_with("packages/tool/tool.ts")),
+            other => panic!("expected bin, got {other:?}"),
         }
     }
 }

@@ -838,6 +838,17 @@ fn loader_graph_from_pm(
             root: package.root.clone(),
             main: package.manifest.main.clone(),
             module: package.manifest.module.clone(),
+            exports: package.manifest.exports.clone(),
+            imports: package.manifest.imports.clone(),
+            package_type: package
+                .manifest
+                .package_type
+                .map(|package_type| match package_type {
+                    PackageType::Module => otter_runtime::module_loader::LoaderPackageType::Module,
+                    PackageType::CommonJs => {
+                        otter_runtime::module_loader::LoaderPackageType::CommonJs
+                    }
+                }),
         });
     }
     for (from, dependencies) in &graph.dependencies {
@@ -1749,5 +1760,207 @@ trust = "untrusted"
         .unwrap();
 
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn direct_file_shorthand_parses_as_positional_without_run_subcommand() {
+        let cli = Cli::try_parse_from(["otter", "app.ts"]).expect("parse shorthand");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.args, vec!["app.ts".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn fixture_project_covers_development_loop_resolution() {
+        let fixture = workspace_root()
+            .join("tests")
+            .join("fixtures")
+            .join("pkg")
+            .join("development-loop");
+        let entry = fixture.join("entry.ts");
+
+        run_check(&entry, false, &CapabilitySet::default())
+            .await
+            .unwrap();
+
+        let args = RunArgs {
+            target: "fixture-tool".to_string(),
+            script: false,
+            bin: true,
+            args: Vec::new(),
+        };
+        let resolved = resolve_run_target(&fixture, &args).await.unwrap();
+        match resolved {
+            RunTarget::Bin(bin) => assert!(bin.path.ends_with("node_modules/.bin/fixture-tool")),
+            other => panic!("expected fixture-tool bin, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_snapshots_cover_development_loop_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let startup_timer = CliStartupTimer::from_env();
+
+        write_fixture(
+            &tmp.path().join("missing-pkg/package.json"),
+            r#"{"name":"missing-pkg-app","type":"module"}"#,
+        );
+        write_fixture(
+            &tmp.path().join("missing-pkg/entry.ts"),
+            r#"import "missing-package";"#,
+        );
+        let missing = run_check(
+            &tmp.path().join("missing-pkg/entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_error_snapshot(
+            &missing,
+            "missing package",
+            "compile",
+            "cannot resolve `missing-package`",
+        );
+
+        write_fixture(
+            &tmp.path().join("bad-export/package.json"),
+            r#"{"name":"bad-export-app","type":"module","dependencies":{"bad-export":"file:packages/bad-export"}}"#,
+        );
+        write_fixture(
+            &tmp.path().join("bad-export/entry.ts"),
+            r#"import "bad-export";"#,
+        );
+        write_fixture(
+            &tmp.path()
+                .join("bad-export/packages/bad-export/package.json"),
+            r#"{"name":"bad-export","type":"module","exports":"dist/index.js"}"#,
+        );
+        write_fixture(
+            &tmp.path()
+                .join("bad-export/packages/bad-export/dist/index.js"),
+            "export const value = 1;\n",
+        );
+        let bad_export = run_check(
+            &tmp.path().join("bad-export/entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_error_snapshot(&bad_export, "bad export", "compile", "must start with `./`");
+
+        write_fixture(
+            &tmp.path().join("condition-miss/package.json"),
+            r#"{"name":"condition-miss-app","type":"module","dependencies":{"conditioned":"file:packages/conditioned"}}"#,
+        );
+        write_fixture(
+            &tmp.path().join("condition-miss/entry.ts"),
+            r#"import "conditioned";"#,
+        );
+        write_fixture(
+            &tmp.path()
+                .join("condition-miss/packages/conditioned/package.json"),
+            r#"{"name":"conditioned","type":"module","exports":{".":{"browser":"./browser.js"}}}"#,
+        );
+        write_fixture(
+            &tmp.path()
+                .join("condition-miss/packages/conditioned/browser.js"),
+            "export const value = 1;\n",
+        );
+        let condition_miss = run_check(
+            &tmp.path().join("condition-miss/entry.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_error_snapshot(
+            &condition_miss,
+            "condition miss",
+            "compile",
+            "no matching export condition",
+        );
+
+        write_fixture(&tmp.path().join("syntax.ts"), "function {\n");
+        let syntax = run_check(
+            &tmp.path().join("syntax.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_error_snapshot(&syntax, "syntax error", "compile", "compile failed");
+
+        write_fixture(&tmp.path().join("compile.ts"), "enum E { A }\n");
+        let compile = run_check(
+            &tmp.path().join("compile.ts"),
+            false,
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_error_snapshot(&compile, "compile error", "compile", "TSEnumDeclaration");
+
+        write_fixture(&tmp.path().join("runtime.ts"), "throw 'boom';\n");
+        let runtime = run_file(
+            &tmp.path().join("runtime.ts"),
+            false,
+            None,
+            &CapabilitySet::default(),
+            &startup_timer,
+        )
+        .await
+        .unwrap_err();
+        assert_error_snapshot(&runtime, "runtime throw", "runtime", "boom");
+
+        let capability = OtterError::Capability {
+            capability: "fs_read".to_string(),
+            detail: Some("read blocked by snapshot test".to_string()),
+        };
+        assert_error_snapshot(&capability, "blocked capability", "capability", "fs_read");
+
+        let install = run_pm_install(&tmp.path().join("install-failure"), false)
+            .await
+            .unwrap_err();
+        assert_error_snapshot(
+            &install,
+            "package install failure",
+            "config",
+            "package.json",
+        );
+    }
+
+    fn assert_error_snapshot(
+        err: &OtterError,
+        label: &str,
+        expected_kind: &str,
+        expected_text: &str,
+    ) {
+        let json = err.to_json().expect("error JSON");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse error JSON");
+        assert_eq!(
+            value["error"]["kind"], expected_kind,
+            "{label} JSON kind changed: {json}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(expected_text) || json.contains(expected_text),
+            "{label} diagnostic changed\ntext: {text}\njson: {json}"
+        );
+    }
+
+    fn write_fixture(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate lives under workspace/crates/otter-cli")
+            .to_path_buf()
     }
 }

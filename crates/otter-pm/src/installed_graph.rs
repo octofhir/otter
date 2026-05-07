@@ -27,8 +27,9 @@ use otter_pm_lockfile::{LockedPackage, Lockfile, ResolvedSource, ResolvedSourceK
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest};
 
 use crate::{
-    LocalResolution, PackageBin, PackageGraph, PackageId, PackageManagerError, PackageRoot,
-    binary_name_from_package_name, cache_key, package_name_path, resolve_local_project,
+    LocalResolution, PackageBin, PackageDependencyKind, PackageGraph, PackageId,
+    PackageManagerError, PackageRoot, binary_name_from_package_name, cache_key, package_name_path,
+    resolve_local_project,
 };
 
 /// Resolve local/workspace/file packages plus already installed registry
@@ -88,10 +89,11 @@ pub async fn resolve_installed_project(
         )
         .await?;
         for (dependency_name, target_id) in &package.dependencies {
-            resolution.graph.insert_dependency(
+            resolution.graph.insert_dependency_with_kind(
                 package_id.clone(),
                 dependency_name.clone(),
                 PackageId::new(target_id.clone()),
+                dependency_kind_from_manifest(&manifest, dependency_name),
             );
         }
     }
@@ -249,4 +251,19 @@ fn is_installed_registry_package(package: &LockedPackage) -> bool {
             ..
         })
     )
+}
+
+fn dependency_kind_from_manifest(
+    manifest: &PackageManifest,
+    dependency_name: &str,
+) -> PackageDependencyKind {
+    if manifest.peer_dependencies.contains_key(dependency_name) {
+        PackageDependencyKind::Peer
+    } else if manifest.optional_dependencies.contains_key(dependency_name) {
+        PackageDependencyKind::Optional
+    } else if manifest.dev_dependencies.contains_key(dependency_name) {
+        PackageDependencyKind::Development
+    } else {
+        PackageDependencyKind::Runtime
+    }
 }

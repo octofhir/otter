@@ -2286,6 +2286,9 @@ mod tests {
             root: app.clone(),
             main: None,
             module: None,
+            exports: None,
+            imports: None,
+            package_type: None,
         });
         graph.insert_package(module_loader::LoaderPackageRoot {
             id: "dep@npm:^1.0.0".into(),
@@ -2294,6 +2297,9 @@ mod tests {
             root: dep,
             main: Some("index.js".into()),
             module: None,
+            exports: None,
+            imports: None,
+            package_type: None,
         });
         graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
 
@@ -2326,6 +2332,9 @@ mod tests {
             root: app.clone(),
             main: None,
             module: None,
+            exports: None,
+            imports: None,
+            package_type: None,
         });
         graph.insert_package(module_loader::LoaderPackageRoot {
             id: "dep@npm:^1.0.0".into(),
@@ -2334,6 +2343,9 @@ mod tests {
             root: dep,
             main: Some("index.js".into()),
             module: None,
+            exports: None,
+            imports: None,
+            package_type: None,
         });
         graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
 

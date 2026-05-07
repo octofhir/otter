@@ -26,16 +26,16 @@
 //! - [`otter-pm-manifest`](../../otter-pm-manifest/src/lib.rs)
 //! - [`otter-pm-lockfile`](../../otter-pm-lockfile/src/lib.rs)
 
+mod install;
 mod installed_graph;
+mod registry;
+mod tarball;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use base64::Engine;
-use flate2::read::GzDecoder;
 use otter_pm_lockfile::{
     LifecycleMetadata, LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind, TrustState,
 };
@@ -43,11 +43,17 @@ use otter_pm_manifest::{
     DependencySet, PACKAGE_JSON, PackageBinManifest, PackageManifest, discover_workspaces,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
 
+pub use install::{ExtractedPackage, FsPackageStore, InstalledPackage};
 pub use installed_graph::{prune_removed_registry_packages, resolve_installed_project};
-
-const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
+pub use registry::{
+    FileRegistryMetadataClient, FsRegistryMetadataCache, HttpRegistryMetadataClient, NpmDist,
+    NpmPackageVersion, NpmRegistryMetadata, RegistryMetadataClient,
+};
+pub use tarball::{
+    CachedTarball, FileTarballClient, FsTarballCache, HttpTarballClient, TarballFetchClient,
+    TarballSource,
+};
 
 /// Package-manager error type.
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +170,12 @@ impl PackageId {
         Self(format!("{name}@npm:{range}"))
     }
 
+    /// Build a tarball package id.
+    #[must_use]
+    pub fn tarball(name: &str, reference: &str) -> Self {
+        Self(format!("{name}@tarball:{reference}"))
+    }
+
     /// Borrow the id as text.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -203,6 +215,20 @@ pub struct PackageBin {
     pub path: PathBuf,
 }
 
+/// Dependency edge kind recorded in the package graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PackageDependencyKind {
+    /// `dependencies`.
+    Runtime,
+    /// `devDependencies`.
+    Development,
+    /// `peerDependencies`.
+    Peer,
+    /// `optionalDependencies`.
+    Optional,
+}
+
 /// Read-only package graph model consumed by runtime resolution and CLI run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PackageGraph {
@@ -210,6 +236,8 @@ pub struct PackageGraph {
     pub packages: BTreeMap<PackageId, PackageRoot>,
     /// Package dependencies keyed by source package id, then dependency name.
     pub dependencies: BTreeMap<PackageId, BTreeMap<String, PackageId>>,
+    /// Dependency edge kinds keyed by source package id, then dependency name.
+    pub dependency_kinds: BTreeMap<PackageId, BTreeMap<String, PackageDependencyKind>>,
     /// Local package binaries keyed by binary name.
     pub bins: BTreeMap<String, Vec<PackageBin>>,
 }
@@ -233,10 +261,35 @@ impl PackageGraph {
         name: impl Into<String>,
         target: PackageId,
     ) {
+        self.insert_dependency_with_kind(from, name, target, PackageDependencyKind::Runtime);
+    }
+
+    /// Insert a dependency edge with explicit dependency kind.
+    pub fn insert_dependency_with_kind(
+        &mut self,
+        from: PackageId,
+        name: impl Into<String>,
+        target: PackageId,
+        kind: PackageDependencyKind,
+    ) {
+        let name = name.into();
         self.dependencies
+            .entry(from.clone())
+            .or_default()
+            .insert(name.clone(), target);
+        self.dependency_kinds
             .entry(from)
             .or_default()
-            .insert(name.into(), target);
+            .insert(name, kind);
+    }
+
+    /// Return the recorded kind for one dependency edge.
+    #[must_use]
+    pub fn dependency_kind(&self, from: &PackageId, name: &str) -> Option<PackageDependencyKind> {
+        self.dependency_kinds
+            .get(from)
+            .and_then(|dependencies| dependencies.get(name))
+            .copied()
     }
 
     /// Insert a package binary.
@@ -319,601 +372,6 @@ pub struct LocalResolution {
     pub lockfile: Lockfile,
 }
 
-/// npm registry metadata subset needed by Otter package resolution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NpmRegistryMetadata {
-    /// Package name.
-    pub name: String,
-    /// npm dist-tags, for example `latest`.
-    #[serde(rename = "dist-tags", default)]
-    pub dist_tags: BTreeMap<String, String>,
-    /// Published versions keyed by semver version.
-    #[serde(default)]
-    pub versions: BTreeMap<String, NpmPackageVersion>,
-}
-
-/// One npm package version metadata entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NpmPackageVersion {
-    /// Package name.
-    pub name: String,
-    /// Package version.
-    pub version: String,
-    /// Runtime dependencies.
-    #[serde(default)]
-    pub dependencies: DependencySet,
-    /// Peer dependencies.
-    #[serde(rename = "peerDependencies", default)]
-    pub peer_dependencies: DependencySet,
-    /// Optional dependencies.
-    #[serde(rename = "optionalDependencies", default)]
-    pub optional_dependencies: DependencySet,
-    /// Package binaries.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bin: Option<PackageBinManifest>,
-    /// Lifecycle scripts.
-    #[serde(default)]
-    pub scripts: BTreeMap<String, String>,
-    /// Distribution metadata.
-    #[serde(default)]
-    pub dist: NpmDist,
-}
-
-/// npm `dist` metadata for a version.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NpmDist {
-    /// Tarball URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tarball: Option<String>,
-    /// Subresource integrity string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub integrity: Option<String>,
-    /// Legacy SHA1 shasum.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shasum: Option<String>,
-}
-
-/// Source of npm registry metadata.
-pub trait RegistryMetadataClient {
-    /// Fetch metadata for `package` without blocking the async runtime.
-    fn fetch_metadata<'a>(
-        &'a self,
-        package: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<NpmRegistryMetadata, PackageManagerError>> + Send + 'a>>;
-}
-
-/// Deterministic filesystem cache for npm registry metadata.
-#[derive(Debug, Clone)]
-pub struct FsRegistryMetadataCache {
-    root: PathBuf,
-}
-
-impl FsRegistryMetadataCache {
-    /// Create a metadata cache rooted at `root`.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    /// Return the cache file path for one package.
-    #[must_use]
-    pub fn metadata_path(&self, package: &str) -> PathBuf {
-        self.root.join(format!("{}.json", cache_key(package)))
-    }
-
-    /// Read cached metadata if present.
-    pub async fn read(
-        &self,
-        package: &str,
-    ) -> Result<Option<NpmRegistryMetadata>, PackageManagerError> {
-        let path = self.metadata_path(package);
-        let text = match tokio::fs::read_to_string(&path).await {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(PackageManagerError::Io {
-                    path,
-                    message: err.to_string(),
-                });
-            }
-        };
-        parse_registry_metadata(package, &text).map(Some)
-    }
-
-    /// Write metadata into the cache using stable JSON formatting.
-    pub async fn write(&self, metadata: &NpmRegistryMetadata) -> Result<(), PackageManagerError> {
-        tokio::fs::create_dir_all(&self.root)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: self.root.clone(),
-                message: err.to_string(),
-            })?;
-        let path = self.metadata_path(&metadata.name);
-        let mut text = serde_json::to_string_pretty(metadata).map_err(|err| {
-            PackageManagerError::RegistryMetadata {
-                package: metadata.name.clone(),
-                message: err.to_string(),
-            }
-        })?;
-        text.push('\n');
-        tokio::fs::write(&path, text)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path,
-                message: err.to_string(),
-            })
-    }
-
-    /// Read from cache, otherwise fetch through `client` and cache the result.
-    pub async fn get_or_fetch(
-        &self,
-        package: &str,
-        client: &impl RegistryMetadataClient,
-    ) -> Result<NpmRegistryMetadata, PackageManagerError> {
-        if let Some(metadata) = self.read(package).await? {
-            return Ok(metadata);
-        }
-        let metadata = client.fetch_metadata(package).await?;
-        self.write(&metadata).await?;
-        Ok(metadata)
-    }
-}
-
-/// File-backed registry client for deterministic tests and offline fixtures.
-#[derive(Debug, Clone)]
-pub struct FileRegistryMetadataClient {
-    root: PathBuf,
-}
-
-impl FileRegistryMetadataClient {
-    /// Create a file-backed metadata client rooted at `root`.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    fn path(&self, package: &str) -> PathBuf {
-        self.root.join(format!("{}.json", cache_key(package)))
-    }
-}
-
-impl RegistryMetadataClient for FileRegistryMetadataClient {
-    fn fetch_metadata<'a>(
-        &'a self,
-        package: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<NpmRegistryMetadata, PackageManagerError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let path = self.path(package);
-            let text =
-                tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|err| PackageManagerError::Io {
-                        path,
-                        message: err.to_string(),
-                    })?;
-            parse_registry_metadata(package, &text)
-        })
-    }
-}
-
-/// Async HTTP-backed npm registry metadata client.
-#[derive(Debug, Clone)]
-pub struct HttpRegistryMetadataClient {
-    client: reqwest::Client,
-    registry_base: String,
-}
-
-impl HttpRegistryMetadataClient {
-    /// Build a client against the default npm registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_base_url(DEFAULT_NPM_REGISTRY)
-    }
-
-    /// Build a client against an explicit registry base URL.
-    #[must_use]
-    pub fn with_base_url(registry_base: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            registry_base: registry_base.into().trim_end_matches('/').to_string(),
-        }
-    }
-
-    fn metadata_url(&self, package: &str) -> String {
-        format!(
-            "{}/{}",
-            self.registry_base,
-            npm_registry_package_path(package)
-        )
-    }
-}
-
-impl Default for HttpRegistryMetadataClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RegistryMetadataClient for HttpRegistryMetadataClient {
-    fn fetch_metadata<'a>(
-        &'a self,
-        package: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<NpmRegistryMetadata, PackageManagerError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let url = self.metadata_url(package);
-            let response = self
-                .client
-                .get(&url)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .send()
-                .await
-                .map_err(|err| PackageManagerError::Http {
-                    url: url.clone(),
-                    message: err.to_string(),
-                })?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(PackageManagerError::Http {
-                    url,
-                    message: format!("registry returned {status}"),
-                });
-            }
-            let text = response
-                .text()
-                .await
-                .map_err(|err| PackageManagerError::Http {
-                    url: url.clone(),
-                    message: err.to_string(),
-                })?;
-            parse_registry_metadata(package, &text)
-        })
-    }
-}
-
-/// Tarball source selected from registry metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TarballSource {
-    /// Tarball URL.
-    pub url: String,
-    /// Optional SRI integrity string.
-    pub integrity: Option<String>,
-}
-
-/// Tarball cache result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachedTarball {
-    /// Content-addressed local path.
-    pub path: PathBuf,
-    /// Tarball size in bytes.
-    pub bytes: u64,
-    /// `true` when a cache hit avoided fetch/write work.
-    pub reused: bool,
-}
-
-/// Source of tarball bytes.
-pub trait TarballFetchClient {
-    /// Fetch tarball bytes from `url` without blocking the async runtime.
-    fn fetch_tarball<'a>(
-        &'a self,
-        url: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PackageManagerError>> + Send + 'a>>;
-}
-
-/// File-backed tarball client for deterministic offline tests.
-#[derive(Debug, Clone)]
-pub struct FileTarballClient {
-    root: PathBuf,
-}
-
-impl FileTarballClient {
-    /// Create a file-backed tarball client rooted at `root`.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    fn path(&self, url: &str) -> PathBuf {
-        self.root.join(cache_key(url))
-    }
-}
-
-impl TarballFetchClient for FileTarballClient {
-    fn fetch_tarball<'a>(
-        &'a self,
-        url: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PackageManagerError>> + Send + 'a>> {
-        Box::pin(async move {
-            let path = self.path(url);
-            tokio::fs::read(&path)
-                .await
-                .map_err(|err| PackageManagerError::Io {
-                    path,
-                    message: err.to_string(),
-                })
-        })
-    }
-}
-
-/// Async HTTP-backed tarball fetch client.
-#[derive(Debug, Clone, Default)]
-pub struct HttpTarballClient {
-    client: reqwest::Client,
-}
-
-impl HttpTarballClient {
-    /// Build an HTTP tarball client.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
-    }
-}
-
-impl TarballFetchClient for HttpTarballClient {
-    fn fetch_tarball<'a>(
-        &'a self,
-        url: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, PackageManagerError>> + Send + 'a>> {
-        Box::pin(async move {
-            let response =
-                self.client
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|err| PackageManagerError::Http {
-                        url: url.to_string(),
-                        message: err.to_string(),
-                    })?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(PackageManagerError::Http {
-                    url: url.to_string(),
-                    message: format!("registry returned {status}"),
-                });
-            }
-            response
-                .bytes()
-                .await
-                .map(|bytes| bytes.to_vec())
-                .map_err(|err| PackageManagerError::Http {
-                    url: url.to_string(),
-                    message: err.to_string(),
-                })
-        })
-    }
-}
-
-/// Content-addressed tarball cache.
-#[derive(Debug, Clone)]
-pub struct FsTarballCache {
-    root: PathBuf,
-}
-
-impl FsTarballCache {
-    /// Create a tarball cache rooted at `root`.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    /// Return the deterministic cache path for a tarball source.
-    #[must_use]
-    pub fn tarball_path(&self, source: &TarballSource) -> PathBuf {
-        self.root.join(tarball_cache_key(source))
-    }
-
-    /// Cache-first tarball fetch path. This is the install hot path:
-    /// existing verified cache entries avoid fetches and writes.
-    pub async fn get_or_fetch(
-        &self,
-        source: &TarballSource,
-        client: &impl TarballFetchClient,
-    ) -> Result<CachedTarball, PackageManagerError> {
-        tokio::fs::create_dir_all(&self.root)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: self.root.clone(),
-                message: err.to_string(),
-            })?;
-        let path = self.tarball_path(source);
-        if tokio::fs::try_exists(&path)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: path.clone(),
-                message: err.to_string(),
-            })?
-        {
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|err| PackageManagerError::Io {
-                    path: path.clone(),
-                    message: err.to_string(),
-                })?;
-            verify_tarball_integrity(source, &bytes)?;
-            return Ok(CachedTarball {
-                path,
-                bytes: bytes.len() as u64,
-                reused: true,
-            });
-        }
-
-        let bytes = client.fetch_tarball(&source.url).await?;
-        verify_tarball_integrity(source, &bytes)?;
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        tokio::fs::write(&tmp, &bytes)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: tmp.clone(),
-                message: err.to_string(),
-            })?;
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
-        Ok(CachedTarball {
-            path,
-            bytes: bytes.len() as u64,
-            reused: false,
-        })
-    }
-}
-
-/// Extracted package cache and project install materializer.
-#[derive(Debug, Clone)]
-pub struct FsPackageStore {
-    tarballs: FsTarballCache,
-    packages_root: PathBuf,
-}
-
-impl FsPackageStore {
-    /// Create a package store under `cache_root`.
-    #[must_use]
-    pub fn new(cache_root: impl Into<PathBuf>) -> Self {
-        let cache_root = cache_root.into();
-        Self {
-            tarballs: FsTarballCache::new(cache_root.join("tarballs")),
-            packages_root: cache_root.join("packages"),
-        }
-    }
-
-    /// Return the deterministic extracted package cache root for a tarball.
-    #[must_use]
-    pub fn extracted_package_path(&self, source: &TarballSource) -> PathBuf {
-        self.packages_root.join(tarball_cache_key(source))
-    }
-
-    /// Fetch, verify, and extract one package into the content-addressed cache.
-    pub async fn get_or_fetch_and_extract(
-        &self,
-        source: &TarballSource,
-        client: &impl TarballFetchClient,
-    ) -> Result<ExtractedPackage, PackageManagerError> {
-        let cached_tarball = self.tarballs.get_or_fetch(source, client).await?;
-        tokio::fs::create_dir_all(&self.packages_root)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: self.packages_root.clone(),
-                message: err.to_string(),
-            })?;
-        let root = self.extracted_package_path(source);
-        if tokio::fs::try_exists(root.join(PACKAGE_JSON))
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: root.clone(),
-                message: err.to_string(),
-            })?
-        {
-            return Ok(ExtractedPackage {
-                root,
-                tarball: cached_tarball,
-                reused: true,
-            });
-        }
-
-        let tmp = self.packages_root.join(format!(
-            ".tmp-{}-{}",
-            tarball_cache_key(source),
-            std::process::id()
-        ));
-        let archive_path = cached_tarball.path.clone();
-        let root_for_task = root.clone();
-        let tmp_for_task = tmp.clone();
-        tokio::task::spawn_blocking(move || {
-            extract_tgz_package(&archive_path, &tmp_for_task, &root_for_task)
-        })
-        .await
-        .map_err(|err| PackageManagerError::Archive {
-            path: root.clone(),
-            message: err.to_string(),
-        })??;
-
-        Ok(ExtractedPackage {
-            root,
-            tarball: cached_tarball,
-            reused: false,
-        })
-    }
-
-    /// Materialize all registry tarballs from `lockfile` into `node_modules`.
-    pub async fn materialize_registry_packages(
-        &self,
-        project_root: impl AsRef<Path>,
-        lockfile: &Lockfile,
-        client: &impl TarballFetchClient,
-    ) -> Result<Vec<InstalledPackage>, PackageManagerError> {
-        let project_root = project_root.as_ref();
-        let mut packages = registry_tarball_packages(lockfile);
-        packages.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut installed = Vec::with_capacity(packages.len());
-        for (id, package, source) in packages {
-            let extracted = self.get_or_fetch_and_extract(&source, client).await?;
-            let install_root = project_root
-                .join("node_modules")
-                .join(package_name_path(&package.name));
-            let state_root = project_root.join("node_modules").join(".otter-state");
-            let marker = state_root.join(format!("{}.source", cache_key(&id)));
-            let fingerprint = install_fingerprint(&source);
-            let reused_install =
-                existing_install_matches(&install_root, &marker, &fingerprint).await?;
-            if !reused_install {
-                materialize_install_root(&extracted.root, &install_root, &marker, &fingerprint)
-                    .await?;
-            }
-            let linked_bins = link_package_bins(project_root, &PackageId::new(&id), &install_root)
-                .await?
-                .len();
-            installed.push(InstalledPackage {
-                package_id: id,
-                name: package.name,
-                source,
-                cache_root: extracted.root,
-                installed_root: install_root,
-                reused_cache: extracted.reused && extracted.tarball.reused,
-                reused_install,
-                linked_bins,
-            });
-        }
-        Ok(installed)
-    }
-}
-
-/// Extracted package cache entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtractedPackage {
-    /// Extracted package root with npm's leading `package/` prefix stripped.
-    pub root: PathBuf,
-    /// Backing cached tarball.
-    pub tarball: CachedTarball,
-    /// `true` when extraction was already present.
-    pub reused: bool,
-}
-
-/// Project-local installed package entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledPackage {
-    /// Lockfile package id.
-    pub package_id: String,
-    /// Package name.
-    pub name: String,
-    /// Tarball source.
-    pub source: TarballSource,
-    /// Content-addressed extracted cache root.
-    pub cache_root: PathBuf,
-    /// Project-local install root.
-    pub installed_root: PathBuf,
-    /// `true` when both tarball and extracted package cache were reused.
-    pub reused_cache: bool,
-    /// `true` when `node_modules` materialization was already current.
-    pub reused_install: bool,
-    /// Number of linked binaries for this package.
-    pub linked_bins: usize,
-}
-
 /// Resolve, cache metadata, download/extract registry tarballs, materialize
 /// `node_modules`, and write a deterministic `otter-lock`.
 pub async fn install_local_project(
@@ -924,25 +382,113 @@ pub async fn install_local_project(
     tarball_client: &impl TarballFetchClient,
 ) -> Result<InstallReport, PackageManagerError> {
     let project_root = project_root.as_ref();
-    let resolution =
+    let mut resolution =
         resolve_local_project_with_registry_metadata(project_root, metadata_cache, metadata_client)
             .await?;
+    let mut final_installed = BTreeMap::new();
+    let mut added_package_ids = BTreeSet::new();
+    let mut completed = false;
+    for _ in 0..32 {
+        let installed = package_store
+            .materialize_registry_packages(project_root, &resolution.lockfile, tarball_client)
+            .await?;
+        for package in &installed {
+            if !package.reused_install {
+                added_package_ids.insert(package.package_id.clone());
+            }
+            final_installed.insert(package.package_id.clone(), package.clone());
+        }
+        if !apply_tarball_manifest_metadata(project_root, &mut resolution, &installed).await? {
+            completed = true;
+            break;
+        }
+        enrich_resolution_with_registry_metadata(&mut resolution, metadata_cache, metadata_client)
+            .await?;
+    }
+    if !completed {
+        return Err(PackageManagerError::Backend {
+            backend: "install",
+            message: "dependency graph did not converge after 32 tarball metadata passes"
+                .to_string(),
+        });
+    }
     let lockfile_changed = write_lockfile_if_changed(project_root, &resolution.lockfile).await?;
-    let installed = package_store
-        .materialize_registry_packages(project_root, &resolution.lockfile, tarball_client)
-        .await?;
     Ok(InstallReport {
-        added_packages: installed
-            .iter()
-            .filter(|package| !package.reused_install)
-            .count(),
-        reused_packages: installed
-            .iter()
-            .filter(|package| package.reused_install)
-            .count(),
-        linked_bins: installed.iter().map(|package| package.linked_bins).sum(),
+        added_packages: added_package_ids.len(),
+        reused_packages: final_installed
+            .len()
+            .saturating_sub(added_package_ids.len()),
+        linked_bins: final_installed
+            .values()
+            .map(|package| package.linked_bins)
+            .sum(),
         lockfile_changed,
     })
+}
+
+async fn apply_tarball_manifest_metadata(
+    project_root: &Path,
+    resolution: &mut LocalResolution,
+    installed: &[InstalledPackage],
+) -> Result<bool, PackageManagerError> {
+    let mut changed = false;
+    for package in installed {
+        let Some(locked) = resolution.lockfile.packages.get(&package.package_id) else {
+            continue;
+        };
+        if !matches!(
+            &locked.resolved,
+            Some(ResolvedSource {
+                kind: ResolvedSourceKind::Tarball,
+                ..
+            })
+        ) {
+            continue;
+        }
+        let manifest = PackageManifest::read_from_dir(&package.installed_root).await?;
+        let id = PackageId::new(&package.package_id);
+        if let Some(root) = resolution.graph.packages.get_mut(&id) {
+            root.name = manifest.name.clone().unwrap_or_else(|| root.name.clone());
+            root.version = manifest
+                .version
+                .clone()
+                .unwrap_or_else(|| root.version.clone());
+            root.manifest = manifest.clone();
+        }
+        insert_bins_for_manifest(
+            &mut resolution.graph,
+            &id,
+            &package.installed_root,
+            &manifest,
+        );
+
+        let before = resolution.lockfile.clone();
+        if let Some(locked) = resolution.lockfile.packages.get_mut(&package.package_id) {
+            if let Some(name) = &manifest.name {
+                locked.name = name.clone();
+            }
+            if let Some(version) = &manifest.version {
+                locked.version = version.clone();
+            }
+            locked.lifecycle = LifecycleMetadata {
+                scripts: manifest.scripts.clone(),
+                trust: TrustState::Untrusted,
+            };
+        }
+        let workspace_by_name: BTreeMap<String, &otter_pm_manifest::WorkspacePackage> =
+            BTreeMap::new();
+        resolve_manifest_dependencies(
+            project_root,
+            &mut resolution.graph,
+            &mut resolution.lockfile,
+            &id,
+            &manifest,
+            &workspace_by_name,
+        )
+        .await?;
+        changed |= before != resolution.lockfile;
+    }
+    Ok(changed)
 }
 
 /// Resolve the current local project into a deterministic graph and
@@ -1147,13 +693,13 @@ pub async fn enrich_resolution_with_registry_metadata(
             scripts: version.scripts.clone(),
             trust: TrustState::Untrusted,
         };
-        for (dep_name, dep_range) in &version.dependencies {
-            let dep_id = PackageId::registry(dep_name, dep_range);
+        for (dep_name, dep_range, dependency_kind) in registry_dependency_edges(&version) {
+            let dep_id = PackageId::registry(&dep_name, &dep_range);
             package
                 .dependencies
                 .entry(dep_name.clone())
                 .or_insert_with(|| dep_id.to_string());
-            dependency_edges.push((dep_name.clone(), dep_range.clone(), dep_id));
+            dependency_edges.push((dep_name.clone(), dep_range.clone(), dep_id, dependency_kind));
         }
 
         if let Some(root) = resolution.graph.packages.get_mut(&graph_id) {
@@ -1168,7 +714,7 @@ pub async fn enrich_resolution_with_registry_metadata(
             let manifest = root.manifest.clone();
             insert_bins_for_manifest(&mut resolution.graph, &graph_id, &root_path, &manifest);
         }
-        for (dep_name, dep_range, dep_id) in dependency_edges {
+        for (dep_name, dep_range, dep_id, dependency_kind) in dependency_edges {
             ensure_registry_package(
                 &project_root,
                 &mut resolution.graph,
@@ -1177,12 +723,41 @@ pub async fn enrich_resolution_with_registry_metadata(
                 &dep_name,
                 &dep_range,
             );
-            resolution
-                .graph
-                .insert_dependency(graph_id.clone(), dep_name, dep_id);
+            resolution.graph.insert_dependency_with_kind(
+                graph_id.clone(),
+                dep_name,
+                dep_id,
+                dependency_kind,
+            );
         }
     }
     Ok(())
+}
+
+fn registry_dependency_edges(
+    version: &NpmPackageVersion,
+) -> Vec<(String, String, PackageDependencyKind)> {
+    let mut edges = Vec::new();
+    edges.extend(
+        version
+            .dependencies
+            .iter()
+            .map(|(name, range)| (name.clone(), range.clone(), PackageDependencyKind::Runtime)),
+    );
+    edges.extend(
+        version
+            .peer_dependencies
+            .iter()
+            .map(|(name, range)| (name.clone(), range.clone(), PackageDependencyKind::Peer)),
+    );
+    edges.extend(
+        version
+            .optional_dependencies
+            .iter()
+            .map(|(name, range)| (name.clone(), range.clone(), PackageDependencyKind::Optional)),
+    );
+    edges.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+    edges
 }
 
 /// Fetch all registry tarballs referenced by an enriched lockfile into a
@@ -1206,13 +781,15 @@ pub async fn cache_registry_tarballs(
     Ok(cached)
 }
 
-fn registry_tarball_packages(lockfile: &Lockfile) -> Vec<(String, LockedPackage, TarballSource)> {
+pub(crate) fn registry_tarball_packages(
+    lockfile: &Lockfile,
+) -> Vec<(String, LockedPackage, TarballSource)> {
     lockfile
         .packages
         .iter()
         .filter_map(|(id, package)| match &package.resolved {
             Some(ResolvedSource {
-                kind: ResolvedSourceKind::Registry,
+                kind: ResolvedSourceKind::Registry | ResolvedSourceKind::Tarball,
                 reference,
             }) if is_tarball_reference(reference) => Some((
                 id.clone(),
@@ -1227,233 +804,6 @@ fn registry_tarball_packages(lockfile: &Lockfile) -> Vec<(String, LockedPackage,
         .collect()
 }
 
-async fn existing_install_matches(
-    install_root: &Path,
-    marker: &Path,
-    fingerprint: &str,
-) -> Result<bool, PackageManagerError> {
-    if !tokio::fs::try_exists(install_root)
-        .await
-        .map_err(|err| PackageManagerError::Io {
-            path: install_root.to_path_buf(),
-            message: err.to_string(),
-        })?
-    {
-        return Ok(false);
-    }
-    match tokio::fs::read_to_string(marker).await {
-        Ok(text) => Ok(text == fingerprint),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(PackageManagerError::Io {
-            path: marker.to_path_buf(),
-            message: err.to_string(),
-        }),
-    }
-}
-
-async fn materialize_install_root(
-    source_root: &Path,
-    install_root: &Path,
-    marker: &Path,
-    fingerprint: &str,
-) -> Result<(), PackageManagerError> {
-    let tmp_root = install_root
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(".otter-install-tmp-{}", std::process::id()));
-    let source_root = source_root.to_path_buf();
-    let install_root = install_root.to_path_buf();
-    let install_root_for_error = install_root.clone();
-    let marker = marker.to_path_buf();
-    let fingerprint = fingerprint.to_string();
-    tokio::task::spawn_blocking(move || {
-        copy_package_tree(&source_root, &tmp_root, &install_root)?;
-        let marker_parent = marker
-            .parent()
-            .ok_or_else(|| PackageManagerError::Archive {
-                path: marker.clone(),
-                message: "marker has no parent directory".to_string(),
-            })?;
-        std::fs::create_dir_all(marker_parent).map_err(|err| PackageManagerError::Io {
-            path: marker_parent.to_path_buf(),
-            message: err.to_string(),
-        })?;
-        std::fs::write(&marker, fingerprint).map_err(|err| PackageManagerError::Io {
-            path: marker,
-            message: err.to_string(),
-        })
-    })
-    .await
-    .map_err(|err| PackageManagerError::Archive {
-        path: install_root_for_error,
-        message: err.to_string(),
-    })?
-}
-
-fn copy_package_tree(
-    source_root: &Path,
-    tmp_root: &Path,
-    install_root: &Path,
-) -> Result<(), PackageManagerError> {
-    if tmp_root.exists() {
-        std::fs::remove_dir_all(tmp_root).map_err(|err| PackageManagerError::Io {
-            path: tmp_root.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    if let Some(parent) = tmp_root.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
-            path: parent.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    copy_dir_recursive(source_root, tmp_root)?;
-    if install_root.exists() {
-        std::fs::remove_dir_all(install_root).map_err(|err| PackageManagerError::Io {
-            path: install_root.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    if let Some(parent) = install_root.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
-            path: parent.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    std::fs::rename(tmp_root, install_root).map_err(|err| PackageManagerError::Io {
-        path: install_root.to_path_buf(),
-        message: err.to_string(),
-    })
-}
-
-fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), PackageManagerError> {
-    std::fs::create_dir_all(destination).map_err(|err| PackageManagerError::Io {
-        path: destination.to_path_buf(),
-        message: err.to_string(),
-    })?;
-    for entry in std::fs::read_dir(source).map_err(|err| PackageManagerError::Io {
-        path: source.to_path_buf(),
-        message: err.to_string(),
-    })? {
-        let entry = entry.map_err(|err| PackageManagerError::Io {
-            path: source.to_path_buf(),
-            message: err.to_string(),
-        })?;
-        let file_type = entry.file_type().map_err(|err| PackageManagerError::Io {
-            path: entry.path(),
-            message: err.to_string(),
-        })?;
-        let target = destination.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &target).map_err(|err| PackageManagerError::Io {
-                path: target,
-                message: err.to_string(),
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn extract_tgz_package(
-    archive_path: &Path,
-    tmp_root: &Path,
-    final_root: &Path,
-) -> Result<(), PackageManagerError> {
-    if tmp_root.exists() {
-        std::fs::remove_dir_all(tmp_root).map_err(|err| PackageManagerError::Io {
-            path: tmp_root.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    if final_root.exists() {
-        std::fs::remove_dir_all(final_root).map_err(|err| PackageManagerError::Io {
-            path: final_root.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    std::fs::create_dir_all(tmp_root).map_err(|err| PackageManagerError::Io {
-        path: tmp_root.to_path_buf(),
-        message: err.to_string(),
-    })?;
-    let file = std::fs::File::open(archive_path).map_err(|err| PackageManagerError::Io {
-        path: archive_path.to_path_buf(),
-        message: err.to_string(),
-    })?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|err| PackageManagerError::Archive {
-            path: archive_path.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    for entry in entries {
-        let mut entry = entry.map_err(|err| PackageManagerError::Archive {
-            path: archive_path.to_path_buf(),
-            message: err.to_string(),
-        })?;
-        let path = entry.path().map_err(|err| PackageManagerError::Archive {
-            path: archive_path.to_path_buf(),
-            message: err.to_string(),
-        })?;
-        let relative = archive_relative_path(&path)?;
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let destination = tmp_root.join(relative);
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_dir() {
-            std::fs::create_dir_all(&destination).map_err(|err| PackageManagerError::Io {
-                path: destination,
-                message: err.to_string(),
-            })?;
-        } else if entry_type.is_file() {
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
-                    path: parent.to_path_buf(),
-                    message: err.to_string(),
-                })?;
-            }
-            entry
-                .unpack(&destination)
-                .map_err(|err| PackageManagerError::Archive {
-                    path: destination,
-                    message: err.to_string(),
-                })?;
-        }
-    }
-    if let Some(parent) = final_root.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| PackageManagerError::Io {
-            path: parent.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    }
-    std::fs::rename(tmp_root, final_root).map_err(|err| PackageManagerError::Io {
-        path: final_root.to_path_buf(),
-        message: err.to_string(),
-    })
-}
-
-fn archive_relative_path(path: &Path) -> Result<PathBuf, PackageManagerError> {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) if part == "package" && out.as_os_str().is_empty() => {}
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(PackageManagerError::Archive {
-                    path: path.to_path_buf(),
-                    message: "archive path escapes package root".to_string(),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Resolver backend interface.
 pub trait PackageResolver {
     /// Resolve a project manifest into a package graph and lockfile.
@@ -1463,16 +813,6 @@ pub trait PackageResolver {
     ) -> Pin<
         Box<dyn Future<Output = Result<(PackageGraph, Lockfile), PackageManagerError>> + Send + 'a>,
     >;
-}
-
-fn parse_registry_metadata(
-    package: &str,
-    text: &str,
-) -> Result<NpmRegistryMetadata, PackageManagerError> {
-    serde_json::from_str(text).map_err(|err| PackageManagerError::RegistryMetadata {
-        package: package.to_string(),
-        message: err.to_string(),
-    })
 }
 
 fn select_registry_version(
@@ -1576,16 +916,7 @@ fn is_tarball_reference(reference: &str) -> bool {
         || reference.starts_with("https://")
 }
 
-fn npm_registry_package_path(package: &str) -> String {
-    if let Some((scope, name)) = package.split_once('/') {
-        if scope.starts_with('@') {
-            return format!("{scope}%2f{name}");
-        }
-    }
-    cache_key(package)
-}
-
-fn install_fingerprint(source: &TarballSource) -> String {
+pub(crate) fn install_fingerprint(source: &TarballSource) -> String {
     format!(
         "{}\n{}\n",
         source.url,
@@ -1606,49 +937,6 @@ pub(crate) fn cache_key(package: &str) -> String {
     out
 }
 
-fn tarball_cache_key(source: &TarballSource) -> String {
-    if let Some(integrity) = &source.integrity {
-        return cache_key(integrity);
-    }
-    format!("url-{}", cache_key(&source.url))
-}
-
-fn verify_tarball_integrity(
-    source: &TarballSource,
-    bytes: &[u8],
-) -> Result<(), PackageManagerError> {
-    let Some(integrity) = &source.integrity else {
-        return Ok(());
-    };
-    for part in integrity.split_whitespace() {
-        if verify_one_integrity(part, bytes).unwrap_or(false) {
-            return Ok(());
-        }
-    }
-    Err(PackageManagerError::Integrity {
-        url: source.url.clone(),
-        message: "no supported digest matched".to_string(),
-    })
-}
-
-fn verify_one_integrity(integrity: &str, bytes: &[u8]) -> Result<bool, PackageManagerError> {
-    let Some((algorithm, encoded)) = integrity.split_once('-') else {
-        return Ok(false);
-    };
-    let expected = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|err| PackageManagerError::Integrity {
-            url: integrity.to_string(),
-            message: err.to_string(),
-        })?;
-    let actual = match algorithm {
-        "sha512" => Sha512::digest(bytes).to_vec(),
-        "sha256" => Sha256::digest(bytes).to_vec(),
-        _ => return Ok(false),
-    };
-    Ok(actual == expected)
-}
-
 async fn resolve_manifest_dependencies(
     project_root: &Path,
     graph: &mut PackageGraph,
@@ -1657,13 +945,14 @@ async fn resolve_manifest_dependencies(
     manifest: &PackageManifest,
     workspace_by_name: &BTreeMap<String, &otter_pm_manifest::WorkspacePackage>,
 ) -> Result<(), PackageManagerError> {
-    for (_, dependencies) in manifest.dependency_buckets() {
+    for (bucket_name, dependencies) in manifest.dependency_buckets() {
         resolve_dependency_bucket(
             project_root,
             graph,
             lockfile,
             from,
             dependencies,
+            dependency_kind_for_bucket(bucket_name),
             workspace_by_name,
         )
         .await?;
@@ -1677,6 +966,7 @@ async fn resolve_dependency_bucket(
     lockfile: &mut Lockfile,
     from: &PackageId,
     dependencies: &DependencySet,
+    dependency_kind: PackageDependencyKind,
     workspace_by_name: &BTreeMap<String, &otter_pm_manifest::WorkspacePackage>,
 ) -> Result<(), PackageManagerError> {
     for (name, range) in dependencies {
@@ -1685,14 +975,30 @@ async fn resolve_dependency_bucket(
                 .get(name)
                 .map(|workspace| PackageId::workspace(name, &workspace.relative_root))
                 .unwrap_or_else(|| PackageId::registry(name, range))
+        } else if range
+            .strip_prefix("file:")
+            .is_some_and(is_tarball_reference)
+        {
+            let id = PackageId::tarball(name, range);
+            ensure_tarball_package(project_root, graph, lockfile, &id, name, range);
+            id
         } else if let Some(file_path) = range.strip_prefix("file:") {
             resolve_file_dependency(project_root, graph, lockfile, name, file_path).await?
+        } else if is_tarball_reference(range) {
+            let id = PackageId::tarball(name, range);
+            ensure_tarball_package(project_root, graph, lockfile, &id, name, range);
+            id
         } else {
             let id = PackageId::registry(name, range);
             ensure_registry_package(project_root, graph, lockfile, &id, name, range);
             id
         };
-        graph.insert_dependency(from.clone(), name.clone(), target.clone());
+        graph.insert_dependency_with_kind(
+            from.clone(),
+            name.clone(),
+            target.clone(),
+            dependency_kind,
+        );
         if let Some(package) = lockfile.packages.get_mut(from.as_str()) {
             package
                 .dependencies
@@ -1700,6 +1006,15 @@ async fn resolve_dependency_bucket(
         }
     }
     Ok(())
+}
+
+fn dependency_kind_for_bucket(bucket_name: &str) -> PackageDependencyKind {
+    match bucket_name {
+        "devDependencies" => PackageDependencyKind::Development,
+        "peerDependencies" => PackageDependencyKind::Peer,
+        "optionalDependencies" => PackageDependencyKind::Optional,
+        _ => PackageDependencyKind::Runtime,
+    }
 }
 
 async fn resolve_file_dependency(
@@ -1785,6 +1100,43 @@ fn ensure_registry_package(
     );
 }
 
+fn ensure_tarball_package(
+    project_root: &Path,
+    graph: &mut PackageGraph,
+    lockfile: &mut Lockfile,
+    id: &PackageId,
+    name: &str,
+    reference: &str,
+) {
+    if graph.packages.contains_key(id) {
+        return;
+    }
+    let manifest = PackageManifest {
+        name: Some(name.to_string()),
+        version: Some(reference.to_string()),
+        ..PackageManifest::default()
+    };
+    graph.insert_package(PackageRoot {
+        id: id.clone(),
+        name: name.to_string(),
+        version: reference.to_string(),
+        root: project_root
+            .join("node_modules")
+            .join(package_name_path(name)),
+        manifest: manifest.clone(),
+    });
+    lockfile.packages.insert(
+        id.to_string(),
+        locked_package(
+            name,
+            reference,
+            ResolvedSourceKind::Tarball,
+            reference,
+            &manifest,
+        ),
+    );
+}
+
 fn ensure_file_package(
     graph: &mut PackageGraph,
     lockfile: &mut Lockfile,
@@ -1864,131 +1216,6 @@ fn insert_bins_for_manifest(
     }
 }
 
-async fn link_package_bins(
-    project_root: &Path,
-    package_id: &PackageId,
-    package_root: &Path,
-) -> Result<Vec<PackageBin>, PackageManagerError> {
-    let manifest_path = package_root.join(PACKAGE_JSON);
-    if !tokio::fs::try_exists(&manifest_path)
-        .await
-        .map_err(|err| PackageManagerError::Io {
-            path: manifest_path.clone(),
-            message: err.to_string(),
-        })?
-    {
-        return Ok(Vec::new());
-    }
-    let manifest = PackageManifest::read_from_dir(package_root).await?;
-    let Some(bin_manifest) = &manifest.bin else {
-        return Ok(Vec::new());
-    };
-    let bin_root = project_root.join("node_modules").join(".bin");
-    tokio::fs::create_dir_all(&bin_root)
-        .await
-        .map_err(|err| PackageManagerError::Io {
-            path: bin_root.clone(),
-            message: err.to_string(),
-        })?;
-    let bins = bin_entries(package_id, package_root, &manifest, bin_manifest);
-    for bin in &bins {
-        link_bin_file(&bin.path, &bin_root.join(&bin.name)).await?;
-    }
-    Ok(bins
-        .into_iter()
-        .map(|bin| PackageBin {
-            package: bin.package,
-            name: bin.name.clone(),
-            path: bin_root.join(bin.name),
-        })
-        .collect())
-}
-
-fn bin_entries(
-    package_id: &PackageId,
-    package_root: &Path,
-    manifest: &PackageManifest,
-    bin: &PackageBinManifest,
-) -> Vec<PackageBin> {
-    match bin {
-        PackageBinManifest::Path(path) => manifest
-            .name
-            .as_ref()
-            .map(|name| {
-                let binary_name = binary_name_from_package_name(name);
-                PackageBin {
-                    package: package_id.clone(),
-                    name: binary_name.to_string(),
-                    path: package_root.join(path),
-                }
-            })
-            .into_iter()
-            .collect(),
-        PackageBinManifest::Map(bins) => bins
-            .iter()
-            .map(|(name, path)| PackageBin {
-                package: package_id.clone(),
-                name: name.clone(),
-                path: package_root.join(path),
-            })
-            .collect(),
-    }
-}
-
-async fn link_bin_file(source: &Path, target: &Path) -> Result<(), PackageManagerError> {
-    let source = tokio::fs::canonicalize(source)
-        .await
-        .map_err(|err| PackageManagerError::Io {
-            path: source.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    if let Some(parent) = target.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: parent.to_path_buf(),
-                message: err.to_string(),
-            })?;
-    }
-    match tokio::fs::remove_file(target).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(PackageManagerError::Io {
-                path: target.to_path_buf(),
-                message: err.to_string(),
-            });
-        }
-    }
-    #[cfg(unix)]
-    {
-        let source_for_error = source.clone();
-        let target = target.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            std::os::unix::fs::symlink(&source, &target).map_err(|err| PackageManagerError::Io {
-                path: target,
-                message: err.to_string(),
-            })
-        })
-        .await
-        .map_err(|err| PackageManagerError::Io {
-            path: source_for_error,
-            message: err.to_string(),
-        })??;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::fs::copy(&source, target)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: target.to_path_buf(),
-                message: err.to_string(),
-            })?;
-        Ok(())
-    }
-}
-
 pub(crate) fn binary_name_from_package_name(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
@@ -2028,6 +1255,9 @@ pub trait PackageInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use base64::Engine;
+    use sha2::{Digest, Sha512};
 
     fn manifest(name: &str) -> PackageManifest {
         PackageManifest {
@@ -2113,6 +1343,10 @@ mod tests {
         assert_eq!(
             resolved.graph.dependencies[&app]["left-pad"],
             PackageId::registry("left-pad", "^1.3.0")
+        );
+        assert_eq!(
+            resolved.graph.dependency_kind(&app, "left-pad"),
+            Some(PackageDependencyKind::Runtime)
         );
         assert_eq!(resolved.graph.resolve_bin("lib").len(), 1);
         assert_eq!(resolved.graph.resolve_bin("file-tool").len(), 1);
@@ -2208,6 +1442,137 @@ mod tests {
             "node postinstall.js"
         );
         assert_eq!(resolution.graph.resolve_bin("left-pad").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_project_resolution_records_dependency_edge_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join("package.json"),
+            r#"{
+              "name": "app",
+              "dependencies": { "runtime-dep": "^1.0.0" },
+              "devDependencies": { "dev-dep": "^2.0.0" },
+              "peerDependencies": { "peer-dep": "^3.0.0" },
+              "optionalDependencies": { "optional-dep": "^4.0.0" }
+            }"#,
+        )
+        .await;
+
+        let resolved = resolve_local_project(tmp.path()).await.unwrap();
+        let app = PackageId::root_workspace("app");
+
+        assert_eq!(
+            resolved.graph.dependency_kind(&app, "runtime-dep"),
+            Some(PackageDependencyKind::Runtime)
+        );
+        assert_eq!(
+            resolved.graph.dependency_kind(&app, "dev-dep"),
+            Some(PackageDependencyKind::Development)
+        );
+        assert_eq!(
+            resolved.graph.dependency_kind(&app, "peer-dep"),
+            Some(PackageDependencyKind::Peer)
+        );
+        assert_eq!(
+            resolved.graph.dependency_kind(&app, "optional-dep"),
+            Some(PackageDependencyKind::Optional)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_metadata_records_peer_optional_edges_and_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = tmp.path().join("registry");
+        write(
+            &tmp.path().join("project/package.json"),
+            r#"{"name":"app","dependencies":{"pkg-a":"^1.0.0"}}"#,
+        )
+        .await;
+        write(
+            &fixture.join("pkg-a.json"),
+            r#"{
+              "name": "pkg-a",
+              "dist-tags": { "latest": "1.0.0" },
+              "versions": {
+                "1.0.0": {
+                  "name": "pkg-a",
+                  "version": "1.0.0",
+                  "dependencies": { "pkg-b": "^1.0.0" },
+                  "peerDependencies": { "pkg-peer": "^2.0.0" },
+                  "optionalDependencies": { "pkg-optional": "^3.0.0" }
+                }
+              }
+            }"#,
+        )
+        .await;
+        write(
+            &fixture.join("pkg-b.json"),
+            r#"{
+              "name": "pkg-b",
+              "dist-tags": { "latest": "1.0.0" },
+              "versions": {
+                "1.0.0": {
+                  "name": "pkg-b",
+                  "version": "1.0.0",
+                  "dependencies": { "pkg-a": "^1.0.0" }
+                }
+              }
+            }"#,
+        )
+        .await;
+        write(
+            &fixture.join("pkg-peer.json"),
+            r#"{
+              "name": "pkg-peer",
+              "dist-tags": { "latest": "2.0.0" },
+              "versions": { "2.0.0": { "name": "pkg-peer", "version": "2.0.0" } }
+            }"#,
+        )
+        .await;
+        write(
+            &fixture.join("pkg-optional.json"),
+            r#"{
+              "name": "pkg-optional",
+              "dist-tags": { "latest": "3.0.0" },
+              "versions": { "3.0.0": { "name": "pkg-optional", "version": "3.0.0" } }
+            }"#,
+        )
+        .await;
+
+        let mut resolution = resolve_local_project(tmp.path().join("project"))
+            .await
+            .unwrap();
+        enrich_resolution_with_registry_metadata(
+            &mut resolution,
+            &FsRegistryMetadataCache::new(tmp.path().join("cache")),
+            &FileRegistryMetadataClient::new(&fixture),
+        )
+        .await
+        .unwrap();
+
+        let pkg_a = PackageId::registry("pkg-a", "^1.0.0");
+        let pkg_b = PackageId::registry("pkg-b", "^1.0.0");
+        assert_eq!(
+            resolution.graph.dependencies[&pkg_a]["pkg-b"],
+            PackageId::registry("pkg-b", "^1.0.0")
+        );
+        assert_eq!(
+            resolution.graph.dependency_kind(&pkg_a, "pkg-b"),
+            Some(PackageDependencyKind::Runtime)
+        );
+        assert_eq!(
+            resolution.graph.dependency_kind(&pkg_a, "pkg-peer"),
+            Some(PackageDependencyKind::Peer)
+        );
+        assert_eq!(
+            resolution.graph.dependency_kind(&pkg_a, "pkg-optional"),
+            Some(PackageDependencyKind::Optional)
+        );
+        assert_eq!(
+            resolution.lockfile.packages[&pkg_b.to_string()].dependencies["pkg-a"],
+            pkg_a.to_string()
+        );
     }
 
     #[tokio::test]
@@ -2462,6 +1827,125 @@ mod tests {
         let bins = graph.resolve_bin("tool");
         assert_eq!(bins.len(), 1);
         assert!(bins[0].path.ends_with("node_modules/.bin/tool"));
+    }
+
+    #[tokio::test]
+    async fn install_local_project_materializes_direct_tarball_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let registry = tmp.path().join("registry");
+        let tarballs = tmp.path().join("tarballs");
+        let url = "https://registry.example.test/tool/-/tool-1.0.0.tgz";
+        let dep_url = "https://registry.example.test/dep/-/dep-1.0.0.tgz";
+        let tarball = npm_tgz(&[
+            (
+                "package/package.json",
+                r#"{"name":"tool","version":"1.0.0","dependencies":{"dep":"^1.0.0"},"scripts":{"postinstall":"node setup.js"},"bin":{"tool":"./bin.js"}}"#,
+            ),
+            ("package/bin.js", "#!/usr/bin/env otter\nundefined;\n"),
+        ]);
+        let dep_tarball = npm_tgz(&[
+            (
+                "package/package.json",
+                r#"{"name":"dep","version":"1.0.0"}"#,
+            ),
+            ("package/index.js", "export let value = 1;\n"),
+        ]);
+        let dep_integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&dep_tarball))
+        );
+        write(
+            &project.join("package.json"),
+            &format!(r#"{{"name":"app","dependencies":{{"tool":"{url}"}}}}"#),
+        )
+        .await;
+        write(
+            &registry.join("dep.json"),
+            &format!(
+                r#"{{
+                  "name": "dep",
+                  "dist-tags": {{ "latest": "1.0.0" }},
+                  "versions": {{
+                    "1.0.0": {{
+                      "name": "dep",
+                      "version": "1.0.0",
+                      "dist": {{
+                        "tarball": "{dep_url}",
+                        "integrity": "{dep_integrity}"
+                      }}
+                    }}
+                  }}
+                }}"#
+            ),
+        )
+        .await;
+        write_bytes(&tarballs.join(cache_key(url)), &tarball).await;
+        write_bytes(&tarballs.join(cache_key(dep_url)), &dep_tarball).await;
+
+        let report = install_local_project(
+            &project,
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(&registry),
+            &FsPackageStore::new(tmp.path().join("package-cache")),
+            &FileTarballClient::new(&tarballs),
+        )
+        .await
+        .unwrap();
+        let lockfile = tokio::fs::read_to_string(project.join("otter-lock"))
+            .await
+            .unwrap();
+
+        assert_eq!(report.added_packages, 2);
+        assert!(lockfile.contains(
+            "[packages.\"tool@tarball:https://registry.example.test/tool/-/tool-1.0.0.tgz\"]"
+        ));
+        assert!(lockfile.contains("version = \"1.0.0\""));
+        assert!(lockfile.contains("kind = \"tarball\""));
+        assert!(lockfile.contains("postinstall = \"node setup.js\""));
+        assert!(lockfile.contains("dep = \"dep@npm:^1.0.0\""));
+        assert!(project.join("node_modules/dep/index.js").is_file());
+        assert!(project.join("node_modules/tool/bin.js").is_file());
+        assert!(project.join("node_modules/.bin/tool").is_file());
+    }
+
+    #[tokio::test]
+    async fn install_local_project_materializes_file_tarball_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let tarball = npm_tgz(&[
+            (
+                "package/package.json",
+                r#"{"name":"tool","version":"1.0.0","bin":{"tool":"./bin.js"}}"#,
+            ),
+            ("package/bin.js", "#!/usr/bin/env otter\nundefined;\n"),
+        ]);
+        write(
+            &project.join("package.json"),
+            r#"{"name":"app","dependencies":{"tool":"file:tool-1.0.0.tgz"}}"#,
+        )
+        .await;
+        write_bytes(&project.join("tool-1.0.0.tgz"), &tarball).await;
+
+        let report = install_local_project(
+            &project,
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(tmp.path().join("registry")),
+            &FsPackageStore::new(tmp.path().join("package-cache")),
+            &HttpTarballClient::new(),
+        )
+        .await
+        .unwrap();
+        let lockfile = tokio::fs::read_to_string(project.join("otter-lock"))
+            .await
+            .unwrap();
+
+        assert_eq!(report.added_packages, 1);
+        assert!(lockfile.contains("[packages.\"tool@tarball:file:tool-1.0.0.tgz\"]"));
+        assert!(lockfile.contains("reference = \"file:tool-1.0.0.tgz\""));
+        assert!(lockfile.contains("version = \"1.0.0\""));
+        assert!(project.join("node_modules/tool/bin.js").is_file());
+        assert!(project.join("node_modules/.bin/tool").is_file());
     }
 
     #[tokio::test]

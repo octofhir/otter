@@ -134,6 +134,21 @@ pub struct LoaderPackageRoot {
     pub main: Option<String>,
     /// `package.json#module`, when known.
     pub module: Option<String>,
+    /// `package.json#exports`, when known.
+    pub exports: Option<serde_json::Value>,
+    /// `package.json#imports`, when known.
+    pub imports: Option<serde_json::Value>,
+    /// `package.json#type`, when known.
+    pub package_type: Option<LoaderPackageType>,
+}
+
+/// JavaScript package module mode from `package.json#type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderPackageType {
+    /// ECMAScript module package scope.
+    Module,
+    /// CommonJS package scope.
+    CommonJs,
 }
 
 /// Resolve / load failure modes. The runtime maps these onto the
@@ -200,11 +215,11 @@ pub struct LoaderConfig {
     pub extensions: Vec<String>,
     /// Condition names the ESM resolver matches against
     /// `package.json#exports`. Default:
-    /// `["import", "module", "node", "default"]`.
+    /// `["otter", "import", "node", "default"]`.
     pub esm_conditions: Vec<String>,
     /// Condition names the CJS resolver matches against
     /// `package.json#exports`. Default:
-    /// `["require", "node", "default"]`.
+    /// `["otter", "require", "node", "default"]`.
     pub cjs_conditions: Vec<String>,
     /// `true` when the loader is allowed to walk `node_modules`
     /// for bare specifiers. The default, but embedders that want
@@ -230,12 +245,17 @@ impl LoaderConfig {
                 .map(|e| format!(".{e}"))
                 .collect(),
             esm_conditions: vec![
+                "otter".into(),
                 "import".into(),
-                "module".into(),
                 "node".into(),
                 "default".into(),
             ],
-            cjs_conditions: vec!["require".into(), "node".into(), "default".into()],
+            cjs_conditions: vec![
+                "otter".into(),
+                "require".into(),
+                "node".into(),
+                "default".into(),
+            ],
             enable_node_modules: true,
             hosted_specifiers: Vec::new(),
             package_graph: None,
@@ -390,14 +410,18 @@ impl ModuleLoader {
         let bare = specifier.strip_prefix("npm:").unwrap_or(specifier);
         let dir = referrer_dir(referrer).unwrap_or_else(|| self.config.base_dir.clone());
         if let Some(graph) = &self.config.package_graph {
-            if let Some(path) =
-                package_graph_resolver::resolve_from_package_graph(graph, bare, &dir, kind)
-                    .map_err(|message| LoaderError::Resolve {
-                        specifier: specifier.to_string(),
-                        referrer: referrer.unwrap_or("<entry>").to_string(),
-                        message,
-                    })?
-            {
+            let conditions = match kind {
+                ImportKind::Esm => &self.config.esm_conditions,
+                ImportKind::Cjs => &self.config.cjs_conditions,
+            };
+            if let Some(path) = package_graph_resolver::resolve_from_package_graph(
+                graph, bare, &dir, kind, conditions,
+            )
+            .map_err(|message| LoaderError::Resolve {
+                specifier: specifier.to_string(),
+                referrer: referrer.unwrap_or("<entry>").to_string(),
+                message,
+            })? {
                 return Ok(format!("file://{}", path.display()));
             }
         }
@@ -612,6 +636,9 @@ mod tests {
             root: app.clone(),
             main: None,
             module: None,
+            exports: None,
+            imports: None,
+            package_type: None,
         });
         graph.insert_package(LoaderPackageRoot {
             id: "dep@npm:^1.0.0".into(),
@@ -620,6 +647,9 @@ mod tests {
             root: dep.clone(),
             main: Some("main.js".into()),
             module: None,
+            exports: None,
+            imports: None,
+            package_type: None,
         });
         graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
 

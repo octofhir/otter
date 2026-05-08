@@ -323,17 +323,19 @@ Acceptance:
 
 ### P0.4 Compiler/Bytecode Contract
 
-- [ ] Define and freeze the `ResolvedSource -> CompiledModule` contract on the
+- [x] Define and freeze the `ResolvedSource -> CompiledModule` contract on the
   `otter-compiler`/`otter-runtime` boundary.
-- [ ] Move source-span ownership into `CompiledModule` metadata. Runtime
+- [x] Move source-span ownership into `CompiledModule` metadata. Runtime
   registers spans into a session-owned source-map table at compile time.
-- [ ] Add bytecode disassembly snapshots for every new opcode (extend the
+- [x] Add bytecode disassembly snapshots for every new opcode (extend the
   existing `otter-bytecode::disasm` snapshot tests).
-- [ ] Add import/export metadata emission (`imports`, `exports`,
+- [x] Add import/export metadata emission (`imports`, `exports`,
   `live_binding_slots`).
-- [ ] Allocate the module record in runtime before evaluation begins.
-- [ ] Keep TypeScript execution as a first-class path: `.ts/.tsx/.mts/.cts`
+- [x] Allocate the module record in runtime before evaluation begins.
+- [x] Keep TypeScript execution as a first-class path: `.ts/.tsx/.mts/.cts`
   parses by default, type syntax is stripped/lowered while preserving spans.
+- [x] Stabilize compile diagnostics with source URL, byte range, diagnostic
+  code, and help text; CLI human output renders through OXC miette.
 
 Acceptance:
 

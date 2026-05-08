@@ -21,7 +21,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use otter_bytecode::BytecodeModule;
+use otter_compiler::CompiledModule;
 
 use crate::module_loader::{ImportKind, ResolvedSource};
 use crate::{CapabilitySet, Diagnostic, OtterError, SourceInput};
@@ -149,18 +149,18 @@ where
 
 /// Runtime compile hook.
 pub trait RuntimeCompileHook: Send + Sync + 'static {
-    /// Compile an already loaded source into bytecode.
-    fn compile(&self, request: RuntimeCompileRequest<'_>) -> Result<BytecodeModule, OtterError>;
+    /// Compile an already loaded source into bytecode plus metadata.
+    fn compile(&self, request: RuntimeCompileRequest<'_>) -> Result<CompiledModule, OtterError>;
 }
 
 impl<F> RuntimeCompileHook for F
 where
-    F: for<'a> Fn(RuntimeCompileRequest<'a>) -> Result<BytecodeModule, OtterError>
+    F: for<'a> Fn(RuntimeCompileRequest<'a>) -> Result<CompiledModule, OtterError>
         + Send
         + Sync
         + 'static,
 {
-    fn compile(&self, request: RuntimeCompileRequest<'_>) -> Result<BytecodeModule, OtterError> {
+    fn compile(&self, request: RuntimeCompileRequest<'_>) -> Result<CompiledModule, OtterError> {
         self(request)
     }
 }
@@ -361,7 +361,7 @@ pub fn default_check_capability(
 pub fn default_compile_source(
     source: &SourceInput,
     specifier: &str,
-) -> Result<BytecodeModule, OtterError> {
-    crate::compile_script_source(&source.text, source.kind, specifier)
-        .map_err(crate::map_compile_error)
+) -> Result<CompiledModule, OtterError> {
+    otter_compiler::compile_source_to_module(&source.text, source.kind, specifier)
+        .map_err(|err| crate::map_compile_error(err, specifier))
 }

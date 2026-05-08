@@ -27,15 +27,17 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
-use otter_bytecode::{disasm::disassemble, dump::to_json_pretty};
+use otter_bytecode::disasm::disassemble;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
-use otter_runtime::{
-    BooleanPermission, CapabilitySet, Diagnostic, OtterError, Permission, SourceInput,
-};
+use otter_runtime::{BooleanPermission, CapabilitySet, OtterError, Permission};
 use otter_test::{Report, RunOptions, Suite};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
+
+mod error_render;
+
+use error_render::emit_error;
 
 /// Otter — JS/TS engine (foundation phase).
 #[derive(Debug, Parser)]
@@ -553,7 +555,7 @@ async fn run_file(
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
     if let Some(mode) = dump_mode {
-        return run_dump(path, mode);
+        return run_dump(path, mode, caps, startup_timer).await;
     }
     // Route module-shaped files through the module-graph
     // pipeline; fall back to script execution otherwise. The
@@ -949,25 +951,53 @@ async fn run_check(
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_dump(path: &std::path::Path, mode: &str) -> Result<ExitCode, OtterError> {
-    let module = compile_source_for_cli(path)?;
+async fn run_dump(
+    path: &std::path::Path,
+    mode: &str,
+    caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
+) -> Result<ExitCode, OtterError> {
+    let mut runtime = otter_runtime::Runtime::builder()
+        .capabilities(caps.clone())
+        .with_web_apis()
+        .module_loader(cli_loader_config_for_entry(path).await)
+        .build()?;
+    startup_timer.mark("runtime_build");
+    let compiled = runtime.dump_file(path)?;
+    startup_timer.mark("runtime_dump_file");
     let text = match mode {
-        "json" => to_json_pretty(&module).map_err(|e| OtterError::Internal {
+        "json" => compiled_dump_json(&compiled).map_err(|e| OtterError::Internal {
             code: "DUMP_JSON".to_string(),
             message: e.to_string(),
         })?,
-        _ => disassemble(&module),
+        _ => disassemble(&compiled.bytecode),
     };
     print!("{text}");
     Ok(ExitCode::SUCCESS)
 }
 
-fn compile_source_for_cli(
-    path: &std::path::Path,
-) -> Result<otter_bytecode::BytecodeModule, OtterError> {
-    let source = SourceInput::from_path(path)?;
-    let specifier = path.to_string_lossy().to_string();
-    otter_compiler::compile_source(&source.text, source.kind, &specifier).map_err(map_compile_error)
+fn compiled_dump_json(
+    compiled: &otter_runtime::CompiledProgram,
+) -> Result<String, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct Dump<'a> {
+        #[serde(rename = "otterBytecodeDumpVersion")]
+        version: u32,
+        #[serde(flatten)]
+        bytecode: &'a otter_bytecode::BytecodeModule,
+        metadata: &'a [otter_runtime::CompiledModuleMetadata],
+        entry_url: Option<&'a str>,
+    }
+
+    let dump = Dump {
+        version: otter_bytecode::dump::DUMP_SCHEMA_VERSION,
+        bytecode: &compiled.bytecode,
+        metadata: &compiled.metadata,
+        entry_url: compiled.entry_url.as_deref(),
+    };
+    let mut text = serde_json::to_string_pretty(&dump)?;
+    text.push('\n');
+    Ok(text)
 }
 
 async fn run_pm_init(args: InitArgs, json: bool) -> Result<ExitCode, OtterError> {
@@ -1636,31 +1666,6 @@ fn pm_config_error(message: impl Into<String>) -> OtterError {
     }
 }
 
-fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
-    use otter_compiler::CompileError;
-    match err {
-        CompileError::Syntax { messages } => OtterError::Compile {
-            diagnostics: vec![Diagnostic::syntax(messages.join("; "))],
-        },
-        CompileError::Unsupported { node, span } => OtterError::Compile {
-            diagnostics: vec![Diagnostic::unsupported(
-                format!("unsupported AST node: {node}"),
-                span,
-            )],
-        },
-        CompileError::TypeScriptUnsupported { node, span } => OtterError::Compile {
-            diagnostics: vec![Diagnostic::ts_unsupported(
-                format!("typescript {node} is not supported in foundation"),
-                span,
-            )],
-        },
-        _ => OtterError::Internal {
-            code: "COMPILE_UNKNOWN".to_string(),
-            message: "unknown compiler error variant".to_string(),
-        },
-    }
-}
-
 async fn run_test(args: TestArgs, json: bool) -> Result<ExitCode, OtterError> {
     let suite = match args.suite.as_str() {
         "engine" => Suite::Engine,
@@ -1755,17 +1760,6 @@ fn outcome_label(outcome: &otter_test::Outcome) -> &'static str {
         CapabilityDenied { .. } => "CAP",
         Skipped { .. } => "SKIP",
         Crash { .. } => "CRASH",
-    }
-}
-
-fn emit_error(err: &OtterError, json: bool) {
-    if json {
-        match err.to_json() {
-            Ok(s) => eprintln!("{s}"),
-            Err(_) => eprintln!("error: {err}"),
-        }
-    } else {
-        eprintln!("error: {err}");
     }
 }
 

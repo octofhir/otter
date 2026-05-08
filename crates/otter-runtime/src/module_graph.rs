@@ -47,8 +47,10 @@ use otter_bytecode::{
     BytecodeModule, Constant, Function, Instruction, ModuleInit, ModuleResolution, Op, Operand,
     SourceKind as BytecodeSourceKind, SpanEntry,
 };
-use otter_compiler::{ModuleHostInfo, compile_module_fragment};
-use otter_syntax::{Parsed, SourceKind, parse};
+use otter_compiler::{
+    CompileError, CompiledModuleMetadata, ModuleHostInfo, compile_module_fragment_to_module,
+};
+use otter_syntax::{Parsed, SourceKind, SyntaxError, parse};
 use oxc_ast::ast::Expression;
 use oxc_ast_visit::Visit;
 
@@ -67,20 +69,20 @@ pub enum GraphError {
     #[error("{0}")]
     Loader(#[from] LoaderError),
     /// Parse failed for a module.
-    #[error("parse failed for `{url}`: {message}")]
+    #[error("parse failed for `{url}`: {error}")]
     Parse {
         /// Module URL.
         url: String,
-        /// Joined OXC diagnostic messages.
-        message: String,
+        /// Structured parser error.
+        error: SyntaxError,
     },
     /// Compiler rejected the module fragment.
-    #[error("compile failed for `{url}`: {message}")]
+    #[error("compile failed for `{url}`: {error}")]
     Compile {
         /// Module URL.
         url: String,
-        /// Compiler diagnostic message.
-        message: String,
+        /// Structured compiler error.
+        error: CompileError,
     },
     /// Cyclic-import detection / depth-limit hit.
     #[error("RangeError: module graph cycle or depth limit reached at `{url}`")]
@@ -96,6 +98,8 @@ pub enum GraphError {
 struct ModuleNode {
     /// Compiled fragment from `compile_module_fragment`.
     fragment: BytecodeModule,
+    /// Compiler-owned metadata for this unlinked source module.
+    metadata: CompiledModuleMetadata,
     /// `(specifier_text → target_url)` pairs, mirroring
     /// `fragment.module_resolutions` — used by the topological
     /// sort to walk to dependencies.
@@ -117,10 +121,10 @@ fn nodes_key_for(fragment: &BytecodeModule) -> String {
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-imports>,
 ///       <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>.
-fn collect_specifiers(parsed: &Parsed) -> Result<Vec<String>, GraphError> {
+fn collect_specifiers(parsed: &Parsed, url: &str) -> Result<Vec<String>, GraphError> {
     let program = parsed.program().map_err(|e| GraphError::Parse {
-        url: "<unknown>".to_string(),
-        message: e.messages.join("; "),
+        url: url.to_string(),
+        error: e,
     })?;
     let mut visitor = SpecifierVisitor::default();
     for stmt in &program.body {
@@ -198,6 +202,7 @@ fn build_module_set(
                 url.clone(),
                 ModuleNode {
                     fragment: hosted_module_fragment(&url),
+                    metadata: CompiledModuleMetadata::default(),
                     deps: Vec::new(),
                 },
             );
@@ -209,9 +214,9 @@ fn build_module_set(
         }
         let parsed = parse(text, kind).map_err(|e| GraphError::Parse {
             url: url.clone(),
-            message: e.messages.join("; "),
+            error: e,
         })?;
-        let specifiers = collect_specifiers(&parsed)?;
+        let specifiers = collect_specifiers(&parsed, &url)?;
         let mut resolved_imports: HashMap<String, String> = HashMap::new();
         let mut deps: Vec<(String, String)> = Vec::with_capacity(specifiers.len());
         for spec in &specifiers {
@@ -227,13 +232,20 @@ fn build_module_set(
             module_url: url.clone(),
             resolved_imports,
         };
-        let fragment =
-            compile_module_fragment(&parsed, &host).map_err(|e| GraphError::Compile {
+        let compiled =
+            compile_module_fragment_to_module(&parsed, &host).map_err(|e| GraphError::Compile {
                 url: url.clone(),
-                message: format!("{e:?}"),
+                error: e,
             })?;
         let _ = url; // url is the BTreeMap key; ModuleNode itself doesn't need it
-        nodes.insert(nodes_key_for(&fragment), ModuleNode { fragment, deps });
+        nodes.insert(
+            nodes_key_for(&compiled.bytecode),
+            ModuleNode {
+                fragment: compiled.bytecode,
+                metadata: compiled.metadata,
+                deps,
+            },
+        );
     }
     Ok(nodes)
 }
@@ -333,6 +345,8 @@ pub struct LinkedProgram {
     pub module: BytecodeModule,
     /// Canonical URL of the entry module — useful for telemetry.
     pub entry_url: String,
+    /// Per-source compiler metadata for linked modules before bytecode merge.
+    pub metadata: Vec<CompiledModuleMetadata>,
 }
 
 /// Top-level entry: load the dependency graph rooted at `entry_path`,
@@ -389,8 +403,21 @@ pub fn load_program(loader: &ModuleLoader, entry_path: &Path) -> Result<LinkedPr
     let nodes = build_module_set(loader, entry_url.clone(), entry_kind, entry_text)?;
     let order = topological_order(&nodes, &entry_url)?;
     let module = link(&nodes, &order, &entry_url);
+    let metadata = order
+        .iter()
+        .filter_map(|url| {
+            nodes
+                .get(url)
+                .map(|node| node.metadata.clone())
+                .filter(|metadata| !metadata.source_url.is_empty())
+        })
+        .collect();
 
-    Ok(LinkedProgram { module, entry_url })
+    Ok(LinkedProgram {
+        module,
+        entry_url,
+        metadata,
+    })
 }
 
 /// Merge fragments into one `BytecodeModule`, prepending a

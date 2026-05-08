@@ -25,6 +25,8 @@
 //! # See also
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
+mod diagnostic;
+
 use std::path::Path;
 
 use oxc_allocator::Allocator;
@@ -32,7 +34,8 @@ use oxc_ast::ast::Program;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+
+pub use diagnostic::{SyntaxDiagnostic, SyntaxError};
 
 /// Source-language flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,9 +126,7 @@ impl Parsed {
         );
         let ret = parser.parse();
         if !ret.errors.is_empty() {
-            return Err(SyntaxError {
-                messages: ret.errors.iter().map(|e| e.to_string()).collect(),
-            });
+            return Err(SyntaxError::from_oxc(&ret.errors));
         }
         Ok(ret.program)
     }
@@ -151,9 +152,7 @@ pub fn parse(source: impl Into<String>, kind: SourceKind) -> Result<Parsed, Synt
         );
         let ret = parser.parse();
         if !ret.errors.is_empty() {
-            return Err(SyntaxError {
-                messages: ret.errors.iter().map(|e| e.to_string()).collect(),
-            });
+            return Err(SyntaxError::from_oxc(&ret.errors));
         }
     }
     Ok(parsed)
@@ -180,19 +179,9 @@ pub fn with_program<R>(
     });
     let ret = parser.parse();
     if !ret.errors.is_empty() {
-        return Err(SyntaxError {
-            messages: ret.errors.iter().map(|e| e.to_string()).collect(),
-        });
+        return Err(SyntaxError::from_oxc(&ret.errors));
     }
     Ok(f(&ret.program))
-}
-
-/// Errors produced by the OXC frontend.
-#[derive(Debug, Clone, Error, Serialize, Deserialize)]
-#[error("syntax error: {}", .messages.join("; "))]
-pub struct SyntaxError {
-    /// One message per parser diagnostic.
-    pub messages: Vec<String>,
 }
 
 #[cfg(test)]

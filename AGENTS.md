@@ -30,6 +30,23 @@ Repository rules:
 - Prefer vertical slices and small ports over large framework rewrites.
 - Keep parked compatibility shims out of the active workspace build graph.
 
+## Module Size And Boundary Hygiene
+
+Do not grow kilometer-long `lib.rs` files. New non-trivial runtime,
+compiler, resolver, package-manager, or diagnostics behavior belongs in a
+focused module with an LLM-friendly top-level `//!` docstring that explains:
+short purpose, `# Contents`, `# Invariants`, and `# See also` when relevant.
+Keep `lib.rs` as the crate map, public re-export surface, and small glue only.
+When touching an already oversized `lib.rs`, prefer extracting the new work to a
+named module instead of adding more large type/function blocks.
+
+Do not expose `Rc`, `RefCell`, raw VM handles, or other single-threaded interior
+mutability types across runtime/compiler/package-manager public boundaries.
+New boundary DTOs should be owned data (`String`, `Vec`, maps with deterministic
+ordering where needed) and remain `Send`/`Sync` friendly. Existing internal
+compiler builder state that uses `Rc<RefCell<_>>` is legacy implementation
+detail; do not expand it or copy the pattern into runtime/session APIs.
+
 ## Agent Checklist (per task)
 
 1. **Confirm intent + constraints**: Web API compatibility? sandbox/permissions? performance target? platform?

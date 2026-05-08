@@ -37,16 +37,24 @@
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
 mod capture;
+mod compiled_module;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use compiled_module::collect_module_metadata;
+pub use compiled_module::{
+    CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
+    CompiledSourceSpan, LiveBindingSlot,
+};
 use otter_bytecode::{
     BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind as BytecodeSourceKind,
     SpanEntry,
 };
-use otter_syntax::{Parsed, SourceKind as SyntaxSourceKind, with_program};
+use otter_syntax::{
+    Parsed, SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, with_program,
+};
 use oxc_ast::ast::{
     AssignmentOperator, AssignmentTarget, BinaryOperator, Expression, LogicalOperator, Program,
     SimpleAssignmentTarget, Statement, UnaryOperator, UpdateOperator,
@@ -149,10 +157,20 @@ pub struct ModuleHostInfo {
 /// Returns [`CompileError`] when the AST contains constructs outside
 /// the foundation subset (see [`CompileError::Unsupported`]).
 pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule, CompileError> {
-    let program = parsed.program().map_err(|e| CompileError::Syntax {
-        messages: e.messages,
-    })?;
+    let program = parsed.program().map_err(CompileError::from)?;
     compile_program(&program, parsed.kind, module_specifier)
+}
+
+/// Compile a parsed script into the frozen runtime boundary product.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing or lowering fails.
+pub fn compile_to_module(
+    parsed: &Parsed,
+    module_specifier: &str,
+) -> Result<CompiledModule, CompileError> {
+    let bytecode = compile(parsed, module_specifier)?;
+    Ok(CompiledModule::from_bytecode(bytecode))
 }
 
 /// Compile source text through a single OXC parse.
@@ -171,9 +189,22 @@ pub fn compile_source(
     with_program(source, kind, |program| {
         compile_parsed_program(program, kind, module_specifier)
     })
-    .map_err(|e| CompileError::Syntax {
-        messages: e.messages,
-    })?
+    .map_err(CompileError::from)?
+}
+
+/// Compile source text into the frozen runtime boundary product.
+///
+/// This is the preferred compiler/runtime contract for loaded script sources.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing or lowering fails.
+pub fn compile_source_to_module(
+    source: &str,
+    kind: SyntaxSourceKind,
+    module_specifier: &str,
+) -> Result<CompiledModule, CompileError> {
+    let bytecode = compile_source(source, kind, module_specifier)?;
+    Ok(CompiledModule::from_bytecode(bytecode))
 }
 
 /// Compile an already parsed OXC program.
@@ -191,6 +222,20 @@ pub fn compile_parsed_program(
     module_specifier: &str,
 ) -> Result<BytecodeModule, CompileError> {
     compile_program(program, source_kind, module_specifier)
+}
+
+/// Compile an already parsed OXC program into the frozen runtime boundary
+/// product.
+///
+/// # Errors
+/// Returns [`CompileError`] when lowering fails.
+pub fn compile_parsed_program_to_module(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
+    module_specifier: &str,
+) -> Result<CompiledModule, CompileError> {
+    let bytecode = compile_parsed_program(program, source_kind, module_specifier)?;
+    Ok(CompiledModule::from_bytecode(bytecode))
 }
 
 fn compile_program(
@@ -344,9 +389,7 @@ pub fn compile_module_fragment(
     parsed: &Parsed,
     host: &ModuleHostInfo,
 ) -> Result<BytecodeModule, CompileError> {
-    let program = parsed.program().map_err(|e| CompileError::Syntax {
-        messages: e.messages,
-    })?;
+    let program = parsed.program().map_err(CompileError::from)?;
 
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let init_is_async = module_body_uses_top_level_await(&program.body);
@@ -638,6 +681,33 @@ pub fn compile_module_fragment(
     })
 }
 
+/// Compile a parsed ES module into the frozen runtime boundary product.
+///
+/// The returned metadata owns source spans plus import/export/live-binding
+/// information for the original module fragment. Runtime linkers may merge the
+/// bytecode payload, but they should keep this metadata as the per-source
+/// diagnostics record.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing or lowering fails.
+pub fn compile_module_fragment_to_module(
+    parsed: &Parsed,
+    host: &ModuleHostInfo,
+) -> Result<CompiledModule, CompileError> {
+    let program = parsed.program().map_err(CompileError::from)?;
+    let module_metadata = collect_module_metadata(&program, host);
+    let bytecode = compile_module_fragment(parsed, host)?;
+    let mut metadata = CompiledModuleMetadata::from_bytecode(
+        &bytecode,
+        host.module_url.clone(),
+        bytecode_source_kind(parsed.kind),
+    );
+    metadata.imports = module_metadata.imports;
+    metadata.exports = module_metadata.exports;
+    metadata.live_binding_slots = module_metadata.live_binding_slots;
+    Ok(CompiledModule::new(bytecode, metadata))
+}
+
 fn bytecode_source_kind(kind: SyntaxSourceKind) -> BytecodeSourceKind {
     if kind.is_typescript() {
         BytecodeSourceKind::TypeScript
@@ -819,7 +889,7 @@ fn find_module_import_binding(cx: &Compiler, name: &str) -> Option<(ImportBindin
 /// - `IdentifierName` (`export { a }`),
 /// - `IdentifierReference` (`export { a as b }`'s `a`),
 /// - `StringLiteral` (`export { "a" as b }`).
-fn module_export_name_to_str(name: &oxc_ast::ast::ModuleExportName<'_>) -> String {
+pub(crate) fn module_export_name_to_str(name: &oxc_ast::ast::ModuleExportName<'_>) -> String {
     match name {
         oxc_ast::ast::ModuleExportName::IdentifierName(id) => id.name.as_str().to_string(),
         oxc_ast::ast::ModuleExportName::IdentifierReference(id) => id.name.as_str().to_string(),
@@ -9841,6 +9911,8 @@ pub enum CompileError {
     Syntax {
         /// One message per OXC parser diagnostic.
         messages: Vec<String>,
+        /// Structured parser diagnostics with byte ranges and help text.
+        diagnostics: Vec<SyntaxDiagnostic>,
     },
     /// The AST node is recognized but not supported by this slice.
     #[error("unsupported {node} at offset {}-{}", .span.0, .span.1)]
@@ -9860,6 +9932,15 @@ pub enum CompileError {
         /// Source span of the offending node.
         span: (u32, u32),
     },
+}
+
+impl From<SyntaxError> for CompileError {
+    fn from(error: SyntaxError) -> Self {
+        Self::Syntax {
+            messages: error.messages,
+            diagnostics: error.diagnostics,
+        }
+    }
 }
 
 #[cfg(test)]

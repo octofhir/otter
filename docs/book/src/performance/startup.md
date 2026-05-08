@@ -74,12 +74,12 @@ The CLI cold-start bench also includes bucket cases:
 - `info`: process + clap + dispatch baseline with no runtime/compiler touch;
 - `dump_tiny_js_file`: compile-only first-touch frontend/compiler baseline.
 
-The compile-only path is split from the runtime path. `otter check` and
-`otter --dump-bytecode` call the compiler directly and do not construct a
-`Runtime`, interpreter, or GC heap. Ambiguous `.js` / `.ts` file execution uses
-one OXC parse for module-syntax detection and script compilation; `.mjs` /
-`.mts` route directly to the module graph and `.cjs` / `.cts` route directly to
-script execution.
+The compile-only path still avoids VM evaluation. `otter check` and
+`otter --dump-bytecode` construct a runtime session so package graph and module
+resolution match `run`, but they stop after compilation/linking and do not
+dispatch bytecode. Ambiguous `.js` / `.ts` file execution uses one OXC parse for
+module-syntax detection and script compilation; `.mjs` / `.mts` route directly
+to the module graph and `.cjs` / `.cts` route directly to script execution.
 
 After the cage-reuse fix, `cargo bench -p otter-runtime --bench
 startup -- --sample-size 10 --measurement-time 2 --warm-up-time 1` completed

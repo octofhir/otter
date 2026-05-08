@@ -52,12 +52,15 @@
 //! - [Engine architecture](../../../docs/book/src/engine/architecture.md)
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
+pub mod compiled_program;
+pub mod diagnostics;
 pub mod error;
 pub mod event_loop;
 pub mod handle;
 pub mod hooks;
 pub mod module_graph;
 pub mod module_loader;
+mod module_records;
 mod package_graph_resolver;
 pub mod structured_clone;
 pub mod surface;
@@ -72,12 +75,15 @@ use std::time::Duration;
 use otter_bytecode::{BytecodeModule, SpanEntry};
 use otter_compiler::{
     compile_parsed_program as compile_script_program, compile_source as compile_script_source,
+    compile_source_to_module as compile_script_source_to_module,
 };
 use otter_gc::GcStats;
-use otter_syntax::{SourceKind, detect_source_kind, with_program};
+use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
 use otter_vm::{Interpreter, InterruptFlag, JsObject};
 use serde::{Deserialize, Serialize};
 
+pub use compiled_program::CompiledProgram;
+pub use diagnostics::{Diagnostic, DiagnosticKind, StackFrame};
 pub use error::{ConfigError, IoErrorKind, OtterError, error_schema_version};
 pub use event_loop::{
     EventLoop, HostFuture, HostJoinHandle, HostOpCompletion, RuntimeLiveness, RuntimeWake,
@@ -89,6 +95,10 @@ pub use hooks::{
     RuntimeCompileRequest, RuntimeDiagnosticHook, RuntimeHooks, RuntimeJobHook, RuntimeJobKind,
     RuntimeJobRequest, RuntimeLoadHook, RuntimeLoadRequest, RuntimeResolveHook,
     RuntimeResolveRequest, default_check_capability, default_compile_source,
+};
+pub use otter_compiler::{
+    CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
+    CompiledSourceSpan, LiveBindingSlot,
 };
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use structured_clone::{
@@ -919,18 +929,16 @@ struct RuntimeSourceMapTable {
 }
 
 impl RuntimeSourceMapTable {
-    fn record_bytecode(&self, module: &BytecodeModule) {
+    fn record_compiled_metadata(&self, metadata: &CompiledModuleMetadata) {
         let mut by_module_url = self.by_module_url.borrow_mut();
-        for function in &module.functions {
-            let url = if function.module_url.is_empty() {
-                module.module.clone()
-            } else {
-                function.module_url.clone()
-            };
+        for span in &metadata.spans {
             by_module_url
-                .entry(url)
+                .entry(span.module_url.clone())
                 .or_default()
-                .extend(function.spans.iter().copied());
+                .push(SpanEntry {
+                    pc: span.pc,
+                    span: span.span,
+                });
         }
     }
 
@@ -1196,6 +1204,7 @@ impl Runtime {
             config,
             module_loader,
             module_graph: RuntimeModuleGraphState::default(),
+            module_records: module_records::RuntimeModuleRecords::default(),
             source_maps: RuntimeSourceMapTable::default(),
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
@@ -1210,6 +1219,7 @@ pub struct Runtime {
     config: RuntimeConfig,
     module_loader: RuntimeModuleLoaderState,
     module_graph: RuntimeModuleGraphState,
+    module_records: module_records::RuntimeModuleRecords,
     source_maps: RuntimeSourceMapTable,
     diagnostics: RuntimeDiagnosticsSink,
     package_manager: RuntimePackageManagerHandle,
@@ -1333,8 +1343,8 @@ impl Runtime {
         specifier: &str,
     ) -> Result<ExecutionResult, OtterError> {
         let start = std::time::Instant::now();
-        let module = self.compile_source(&source, specifier)?;
-        self.run_compiled_script_since(module, start)
+        let compiled = self.compile_source(&source, specifier)?;
+        self.run_compiled_script_since(compiled.bytecode, start)
     }
 
     fn run_compiled_script_since(
@@ -1404,7 +1414,7 @@ impl Runtime {
     ///
     /// # Errors
     /// See [`OtterError`] variants.
-    pub fn dump(&self, source: SourceInput, specifier: &str) -> Result<BytecodeModule, OtterError> {
+    pub fn dump(&self, source: SourceInput, specifier: &str) -> Result<CompiledModule, OtterError> {
         self.compile_source(&source, specifier)
     }
 
@@ -1412,8 +1422,8 @@ impl Runtime {
         &self,
         source: &SourceInput,
         specifier: &str,
-    ) -> Result<BytecodeModule, OtterError> {
-        let module = if let Some(hook) = self.config.hooks.compile_hook() {
+    ) -> Result<CompiledModule, OtterError> {
+        let compiled = if let Some(hook) = self.config.hooks.compile_hook() {
             let resolved = module_loader::ResolvedSource {
                 url: specifier.to_string(),
                 kind: source.kind,
@@ -1422,11 +1432,12 @@ impl Runtime {
             };
             hook.compile(RuntimeCompileRequest { source: &resolved })?
         } else {
-            compile_script_source(&source.text, source.kind, specifier)
-                .map_err(map_compile_error)?
+            compile_script_source_to_module(&source.text, source.kind, specifier)
+                .map_err(|err| map_compile_error(err, specifier))?
         };
-        self.source_maps.record_bytecode(&module);
-        Ok(module)
+        self.source_maps
+            .record_compiled_metadata(&compiled.metadata);
+        Ok(compiled)
     }
 
     /// Load + link + execute the module-graph rooted at `entry_path`.
@@ -1462,62 +1473,56 @@ impl Runtime {
         let linked = self
             .module_graph
             .load_program(&loader, entry_path)
-            .map_err(|e| OtterError::Compile {
-                diagnostics: vec![Diagnostic::syntax(e.to_string())],
-            })?;
+            .map_err(map_graph_error)?;
 
-        // Pre-populate the per-run module-env registry. Every
-        // module URL gets a fresh JsObject; <entry> resolves via
-        // self-loop ImportNamespace edges and stores into the
-        // env as the body runs.
-        self.interp.reset_module_state();
         let mut module = linked.module;
-        self.source_maps.record_bytecode(&module);
-        let entry_url = linked.entry_url.clone();
-        for init in &module.module_inits {
-            let env = if let Some(hosted) = self
-                .config
-                .hosted_modules
-                .iter()
-                .find(|hosted| hosted.specifier() == init.url)
-            {
-                hosted
-                    .install(&mut self.interp, &self.config.capabilities)
-                    .map_err(|message| OtterError::Config {
-                        reason: ConfigError::ConflictingCapabilities { message },
-                    })?
-            } else {
-                otter_vm::object::alloc_object(self.interp.gc_heap_mut())?
-            };
-            self.interp
-                .register_module_env(std::rc::Rc::from(init.url.as_str()), env);
-            // Self-loop edge: <entry>'s referrer is the entry's URL
-            // (the synthesized <entry> function carries empty
-            // module_url, so the dispatcher uses an empty string;
-            // we add edges keyed on both shapes).
-            module
-                .module_resolutions
-                .push(otter_bytecode::ModuleResolution {
-                    referrer: entry_url.clone(),
-                    specifier: init.url.clone(),
-                    target: init.url.clone(),
-                });
-            module
-                .module_resolutions
-                .push(otter_bytecode::ModuleResolution {
-                    referrer: String::new(),
-                    specifier: init.url.clone(),
-                    target: init.url.clone(),
-                });
+        for metadata in &linked.metadata {
+            self.source_maps.record_compiled_metadata(metadata);
         }
+        let entry_url = linked.entry_url.clone();
+        self.module_records.allocate_for_bytecode(
+            &mut self.interp,
+            &module,
+            &self.config.hosted_modules,
+            &self.config.capabilities,
+        )?;
+        self.module_records
+            .for_each_record(|url, _function_id, _env| {
+                // Self-loop edge: <entry>'s referrer is the entry's URL
+                // (the synthesized <entry> function carries empty
+                // module_url, so the dispatcher uses an empty string;
+                // we add edges keyed on both shapes).
+                module
+                    .module_resolutions
+                    .push(otter_bytecode::ModuleResolution {
+                        referrer: entry_url.clone(),
+                        specifier: url.to_string(),
+                        target: url.to_string(),
+                    });
+                module
+                    .module_resolutions
+                    .push(otter_bytecode::ModuleResolution {
+                        referrer: String::new(),
+                        specifier: url.to_string(),
+                        target: url.to_string(),
+                    });
+            });
 
+        self.module_records.mark_evaluating();
         let script_outcome = self.interp.run(&module);
         let drain_outcome = self.interp.drain_microtasks(&module);
         let value = match (script_outcome, drain_outcome) {
-            (Err(script_err), _) => return Err(map_vm_error(script_err)),
-            (Ok(_), Err(drain_err)) => return Err(map_vm_error(drain_err)),
+            (Err(script_err), _) => {
+                self.module_records.mark_errored();
+                return Err(map_vm_error(script_err));
+            }
+            (Ok(_), Err(drain_err)) => {
+                self.module_records.mark_errored();
+                return Err(map_vm_error(drain_err));
+            }
             (Ok(v), Ok(())) => v,
         };
+        self.module_records.mark_evaluated();
         Ok(ExecutionResult::from_vm_value(value, start.elapsed()))
     }
 
@@ -1554,7 +1559,7 @@ impl Runtime {
         if package_type == Some(module_loader::LoaderPackageType::CommonJs) {
             return compile_script_source(&source.text, source.kind, &specifier)
                 .map(|_| ())
-                .map_err(map_compile_error);
+                .map_err(|err| map_compile_error(err, &specifier));
         }
         if !source_path_has_script_extension(path) {
             let module = with_program(&source.text, source.kind, |program| {
@@ -1563,13 +1568,9 @@ impl Runtime {
                 }
                 compile_script_program(program, source.kind, &specifier)
                     .map(Some)
-                    .map_err(map_compile_error)
+                    .map_err(|err| map_compile_error(err, &specifier))
             })
-            .map_err(|e| {
-                map_compile_error(otter_compiler::CompileError::Syntax {
-                    messages: e.messages,
-                })
-            })??;
+            .map_err(|err| map_syntax_error(err, &specifier))??;
             if module.is_some() {
                 return Ok(());
             }
@@ -1577,7 +1578,7 @@ impl Runtime {
         }
         compile_script_source(&source.text, source.kind, &specifier)
             .map(|_| ())
-            .map_err(map_compile_error)
+            .map_err(|err| map_compile_error(err, &specifier))
     }
 
     fn check_module(&mut self, entry_path: &Path) -> Result<(), OtterError> {
@@ -1585,10 +1586,10 @@ impl Runtime {
         let linked = self
             .module_graph
             .load_program(&loader, entry_path)
-            .map_err(|e| OtterError::Compile {
-                diagnostics: vec![Diagnostic::syntax(e.to_string())],
-            })?;
-        self.source_maps.record_bytecode(&linked.module);
+            .map_err(map_graph_error)?;
+        for metadata in &linked.metadata {
+            self.source_maps.record_compiled_metadata(metadata);
+        }
         Ok(())
     }
 
@@ -1621,13 +1622,9 @@ impl Runtime {
                 }
                 compile_script_program(program, source.kind, &specifier)
                     .map(Some)
-                    .map_err(map_compile_error)
+                    .map_err(|err| map_compile_error(err, &specifier))
             })
-            .map_err(|e| {
-                map_compile_error(otter_compiler::CompileError::Syntax {
-                    messages: e.messages,
-                })
-            })??;
+            .map_err(|err| map_syntax_error(err, &specifier))??;
             if let Some(module) = module {
                 return self.run_compiled_script_since(module, start);
             }
@@ -1892,100 +1889,6 @@ impl Default for Otter {
     }
 }
 
-/// Stable diagnostic shape (foundation subset).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Diagnostic {
-    /// Machine-readable kind.
-    pub kind: DiagnosticKind,
-    /// Stable code (`TS_UNSUPPORTED`, `OOM_HEAP_LIMIT`, …).
-    pub code: String,
-    /// Human-readable summary.
-    pub message: String,
-    /// Optional source span.
-    pub span: Option<(u32, u32)>,
-    /// Stack frames when relevant.
-    #[serde(default)]
-    pub frames: Vec<StackFrame>,
-    /// Optional cause chain.
-    #[serde(default)]
-    pub cause: Option<Box<Diagnostic>>,
-}
-
-impl Diagnostic {
-    /// Construct a syntax-class diagnostic.
-    #[must_use]
-    pub fn syntax(message: impl Into<String>) -> Self {
-        Self {
-            kind: DiagnosticKind::Syntax,
-            code: "SYNTAX_ERROR".to_string(),
-            message: message.into(),
-            span: None,
-            frames: Vec::new(),
-            cause: None,
-        }
-    }
-
-    /// Construct a TS-unsupported diagnostic.
-    #[must_use]
-    pub fn ts_unsupported(message: impl Into<String>, span: (u32, u32)) -> Self {
-        Self {
-            kind: DiagnosticKind::Syntax,
-            code: "TS_UNSUPPORTED".to_string(),
-            message: message.into(),
-            span: Some(span),
-            frames: Vec::new(),
-            cause: None,
-        }
-    }
-
-    /// Construct a generic "feature not in this slice" diagnostic.
-    #[must_use]
-    pub fn unsupported(message: impl Into<String>, span: (u32, u32)) -> Self {
-        Self {
-            kind: DiagnosticKind::Syntax,
-            code: "FEATURE_NOT_IN_SLICE".to_string(),
-            message: message.into(),
-            span: Some(span),
-            frames: Vec::new(),
-            cause: None,
-        }
-    }
-}
-
-/// Diagnostic category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum DiagnosticKind {
-    /// Syntax / TypeScript erasure / compile-time.
-    Syntax,
-    /// `TypeError`.
-    Type,
-    /// `ReferenceError`.
-    Reference,
-    /// `RangeError`.
-    Range,
-    /// Heap cap hit.
-    OutOfMemory,
-    /// Timeout fired.
-    Timeout,
-    /// Capability denied.
-    Capability,
-    /// Internal bug.
-    Internal,
-}
-
-/// Single stack frame.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StackFrame {
-    /// Function name; `"<main>"` for the script entry.
-    pub function: String,
-    /// Module specifier.
-    pub module: String,
-    /// Source span within `module`.
-    pub span: Option<(u32, u32)>,
-}
-
 /// AST-based "is this a module?" detection.
 ///
 /// Parses the source through `otter-syntax` (the same OXC frontend
@@ -2087,23 +1990,101 @@ fn source_path_package_type(
     }
 }
 
-fn map_compile_error(err: otter_compiler::CompileError) -> OtterError {
+pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
+    match err {
+        module_graph::GraphError::Loader(err) => OtterError::Compile {
+            diagnostics: vec![
+                Diagnostic::syntax(err.to_string())
+                    .with_code("MODULE_RESOLUTION_ERROR")
+                    .with_help(
+                        "check the import specifier and package/module loader configuration",
+                    ),
+            ],
+        },
+        module_graph::GraphError::Parse { url, error } => map_syntax_error(error, &url),
+        module_graph::GraphError::Compile { url, error } => map_compile_error(error, &url),
+        module_graph::GraphError::Cycle { url } => OtterError::Compile {
+            diagnostics: vec![
+                Diagnostic::syntax(format!(
+                    "module graph cycle or depth limit reached at `{url}`"
+                ))
+                .with_code("MODULE_GRAPH_CYCLE")
+                .with_source_url(url)
+                .with_help("break the import cycle or reduce module graph depth"),
+            ],
+        },
+    }
+}
+
+fn map_syntax_error(err: SyntaxError, source_url: &str) -> OtterError {
+    let diagnostics = if err.diagnostics.is_empty() {
+        vec![
+            Diagnostic::syntax(err.messages.join("; "))
+                .with_source_url(source_url)
+                .with_help("fix the syntax error in the source file"),
+        ]
+    } else {
+        err.diagnostics
+            .iter()
+            .map(|diagnostic| map_syntax_diagnostic(diagnostic, source_url))
+            .collect()
+    };
+    OtterError::Compile { diagnostics }
+}
+
+fn map_syntax_diagnostic(diagnostic: &SyntaxDiagnostic, source_url: &str) -> Diagnostic {
+    let mut mapped = Diagnostic::syntax(diagnostic.message.clone())
+        .with_code(diagnostic.code.clone())
+        .with_source_url(source_url);
+    if let Some(range) = diagnostic.range {
+        mapped = mapped.with_range(range);
+    }
+    mapped.with_help(
+        diagnostic
+            .help
+            .clone()
+            .unwrap_or_else(|| "fix the syntax error in the source file".to_string()),
+    )
+}
+
+pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &str) -> OtterError {
     use otter_compiler::CompileError;
     match err {
-        CompileError::Syntax { messages } => OtterError::Compile {
-            diagnostics: vec![Diagnostic::syntax(messages.join("; "))],
-        },
+        CompileError::Syntax {
+            messages,
+            diagnostics,
+        } => {
+            if diagnostics.is_empty() {
+                OtterError::Compile {
+                    diagnostics: vec![
+                        Diagnostic::syntax(messages.join("; "))
+                            .with_source_url(source_url)
+                            .with_help("fix the syntax error in the source file"),
+                    ],
+                }
+            } else {
+                OtterError::Compile {
+                    diagnostics: diagnostics
+                        .iter()
+                        .map(|diagnostic| map_syntax_diagnostic(diagnostic, source_url))
+                        .collect(),
+                }
+            }
+        }
         CompileError::Unsupported { node, span } => OtterError::Compile {
-            diagnostics: vec![Diagnostic::unsupported(
-                format!("unsupported AST node: {node}"),
-                span,
-            )],
+            diagnostics: vec![
+                Diagnostic::unsupported(format!("unsupported AST node: {node}"), span)
+                    .with_source_url(source_url),
+            ],
         },
         CompileError::TypeScriptUnsupported { node, span } => OtterError::Compile {
-            diagnostics: vec![Diagnostic::ts_unsupported(
-                format!("typescript {node} is not supported in foundation"),
-                span,
-            )],
+            diagnostics: vec![
+                Diagnostic::ts_unsupported(
+                    format!("typescript {node} is not supported in foundation"),
+                    span,
+                )
+                .with_source_url(source_url),
+            ],
         },
         _ => OtterError::Internal {
             code: "COMPILE_UNKNOWN".to_string(),
@@ -2131,7 +2112,10 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
                 kind,
                 code: code.to_string(),
                 message,
+                source_url: stack_frames.first().map(|frame| frame.module.clone()),
+                range: top_span,
                 span: top_span,
+                help: None,
                 frames: stack_frames.clone(),
                 cause: None,
             },
@@ -2282,6 +2266,78 @@ mod tests {
         assert_eq!(runtime.module_graph.last_module_count, 2);
         assert!(runtime.source_maps.contains_module(&entry_url));
         assert!(runtime.source_maps.contains_module(&dep_url));
+    }
+
+    #[test]
+    fn dump_file_uses_module_graph_and_preserves_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep = dir.path().join("dep.ts");
+        let entry = dir.path().join("entry.ts");
+        std::fs::write(&dep, "export const value = 1;\n").unwrap();
+        std::fs::write(
+            &entry,
+            "import { value } from './dep.ts';\nexport const result = value + 1;\n",
+        )
+        .unwrap();
+
+        let mut runtime = Runtime::builder().build().unwrap();
+        let compiled = runtime.dump_file(&entry).unwrap();
+
+        let entry_url = format!(
+            "file://{}",
+            std::fs::canonicalize(&entry).unwrap().display()
+        );
+        let dep_url = format!("file://{}", std::fs::canonicalize(&dep).unwrap().display());
+        assert_eq!(compiled.entry_url.as_deref(), Some(entry_url.as_str()));
+        assert_eq!(compiled.metadata.len(), 2);
+        assert!(compiled.metadata.iter().any(|metadata| {
+            metadata.source_url == entry_url
+                && metadata.imports.iter().any(|import| {
+                    import.specifier == "./dep.ts"
+                        && import.target.as_deref() == Some(dep_url.as_str())
+                })
+                && metadata
+                    .exports
+                    .iter()
+                    .any(|export| export.name == "result")
+        }));
+        assert!(runtime.source_maps.contains_module(&entry_url));
+        assert!(runtime.source_maps.contains_module(&dep_url));
+    }
+
+    #[test]
+    fn run_module_allocates_records_before_evaluation() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep = dir.path().join("dep.ts");
+        let entry = dir.path().join("entry.ts");
+        std::fs::write(&dep, "export const value = 1;\n").unwrap();
+        std::fs::write(
+            &entry,
+            "import { value } from './dep.ts';\nif (value !== 1) undefined.x;\n",
+        )
+        .unwrap();
+
+        let mut runtime = Runtime::builder().build().unwrap();
+        runtime.run_module(&entry).unwrap();
+
+        let entry_url = format!(
+            "file://{}",
+            std::fs::canonicalize(&entry).unwrap().display()
+        );
+        let dep_url = format!("file://{}", std::fs::canonicalize(&dep).unwrap().display());
+        assert_eq!(runtime.module_records.len(), 2);
+        assert_eq!(
+            runtime.module_records.state(&entry_url),
+            Some(module_records::RuntimeModuleRecordState::Evaluated)
+        );
+        assert_eq!(
+            runtime.module_records.state(&dep_url),
+            Some(module_records::RuntimeModuleRecordState::Evaluated)
+        );
+        assert!(runtime.module_records.env(&entry_url).is_some());
+        assert!(runtime.interp.module_env(&entry_url).is_some());
+        assert!(runtime.module_records.env(&dep_url).is_some());
+        assert!(runtime.interp.module_env(&dep_url).is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

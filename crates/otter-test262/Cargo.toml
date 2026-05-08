@@ -6,6 +6,9 @@ publish = false
 license.workspace = true
 description = "Test262 conformance runner for the active Otter stack."
 
+[lints]
+workspace = true
+
 [lib]
 name = "otter_test262"
 path = "src/lib.rs"

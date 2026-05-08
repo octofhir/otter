@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -52,6 +53,17 @@ pub struct ArrayBody {
     pub(crate) sparse_elements: Option<HashMap<usize, Value>>,
     /// Optional non-index string-keyed own properties.
     pub(crate) named_properties: Option<HashMap<String, Value>>,
+    /// Verbatim slice of input text captured by `JSON.parse` for the
+    /// lazy stringify memcpy fast-path. `Some` only when the array
+    /// originated from `JSON.parse`; the slice spans the closing
+    /// brackets `[…]` exactly.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-json.stringify> §25.5.2
+    pub(crate) source_bytes: Option<Arc<[u8]>>,
+    /// `true` once the array has been mutated since `source_bytes`
+    /// was captured. Always `false` while `source_bytes` is `None`
+    /// (no fast path is in play to invalidate).
+    pub(crate) dirty: bool,
 }
 
 impl otter_gc::SafeTraceable for ArrayBody {
@@ -98,6 +110,34 @@ pub fn from_elements(
     let mut body = ArrayBody::default();
     reserve_elements_for_len(&mut body, heap, collected.len())?;
     body.elements.extend(collected);
+    heap.alloc_old(body)
+}
+
+/// Construct an array from initial elements **and** attach the
+/// verbatim slice of input text the elements were parsed from.
+///
+/// Used exclusively by `JSON.parse`: the captured `source_bytes`
+/// powers the lazy stringify memcpy fast-path that re-emits the
+/// original textual representation without iterating elements
+/// when the array has not been mutated.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-json.parse> §25.5.1
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if either the array shell or
+/// off-slot dense storage reservation would exceed the heap cap.
+pub fn from_elements_with_source(
+    heap: &mut otter_gc::GcHeap,
+    values: impl IntoIterator<Item = Value>,
+    source_bytes: Arc<[u8]>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
+    let collected: Vec<Value> = values.into_iter().collect();
+    let mut body = ArrayBody::default();
+    reserve_elements_for_len(&mut body, heap, collected.len())?;
+    body.elements.extend(collected);
+    body.source_bytes = Some(source_bytes);
+    body.dirty = false;
     heap.alloc_old(body)
 }
 
@@ -173,6 +213,7 @@ pub fn set(
         heap.with_payload(arr, |body| {
             let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
+            body.dirty = true;
         });
         heap.record_write(arr, &barrier_value);
         return Ok(());
@@ -181,6 +222,7 @@ pub fn set(
     heap.with_payload(arr, |body| {
         if idx < body.elements.len() {
             body.elements[idx] = value;
+            body.dirty = true;
             return;
         }
         body.elements
@@ -189,6 +231,7 @@ pub fn set(
             body.elements.push(Value::Hole);
         }
         body.elements.push(value);
+        body.dirty = true;
     });
     heap.record_write(arr, &barrier_value);
     Ok(())
@@ -212,6 +255,7 @@ pub fn push(
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
         body.elements.push(value);
+        body.dirty = true;
         body.elements.len()
     });
     heap.record_write(arr, &barrier_value);
@@ -222,9 +266,15 @@ pub fn push(
 /// and for slots that hold the internal [`Value::Hole`] sentinel.
 #[must_use]
 pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
-    heap.with_payload(arr, |body| match body.elements.pop() {
-        Some(Value::Hole) | None => Value::Undefined,
-        Some(other) => other,
+    heap.with_payload(arr, |body| {
+        let popped = body.elements.pop();
+        if popped.is_some() {
+            body.dirty = true;
+        }
+        match popped {
+            Some(Value::Hole) | None => Value::Undefined,
+            Some(other) => other,
+        }
     })
 }
 
@@ -248,6 +298,7 @@ pub fn set_named_property(
     heap.with_payload(arr, |body| {
         let map = body.named_properties.get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), value);
+        body.dirty = true;
     });
     heap.record_write(arr, &barrier_value);
     Ok(())
@@ -303,6 +354,7 @@ pub(crate) fn with_elements_mut<R>(
 ) -> R {
     let (out, children) = heap.with_payload(arr, |body| {
         let out = f(&mut body.elements);
+        body.dirty = true;
         let children: SmallVec<[Value; 8]> = body.elements.iter().cloned().collect();
         (out, children)
     });
@@ -316,6 +368,45 @@ pub(crate) fn with_elements_mut<R>(
 #[must_use]
 pub fn ptr_eq(a: JsArray, b: JsArray) -> bool {
     a == b
+}
+
+/// Return a clone of the verbatim source-text bytes captured from
+/// `JSON.parse` iff the array still matches that snapshot — i.e.
+/// `source_bytes` is set, the body has not been mutated, and every
+/// element is a primitive whose textual form cannot have drifted
+/// from the captured render (numbers, strings, booleans, null).
+///
+/// Nested arrays / objects mutate independently of their parent, so
+/// the parent's `source_bytes` would render stale data after such a
+/// mutation; we therefore disqualify the fast path here rather than
+/// performing a recursive freshness walk.
+#[must_use]
+pub fn clean_source_bytes(arr: JsArray, heap: &otter_gc::GcHeap) -> Option<Arc<[u8]>> {
+    heap.read_payload(arr, |body| {
+        if body.dirty {
+            return None;
+        }
+        let source = body.source_bytes.as_ref()?;
+        if !body.elements.iter().all(is_render_stable_primitive) {
+            return None;
+        }
+        Some(Arc::clone(source))
+    })
+}
+
+/// `true` for value variants whose JSON serialisation can be read
+/// off the value alone, with no dependency on a separately-mutable
+/// nested object or array. Used by [`clean_source_bytes`] to decide
+/// whether a captured source slice is still safe to re-emit.
+#[inline]
+fn is_render_stable_primitive(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Null
+            | Value::Boolean(_)
+            | Value::Number(_)
+            | Value::String(_)
+    )
 }
 
 /// Convert a numeric computed-property key to an Array index.
@@ -500,6 +591,58 @@ mod tests {
         assert_eq!(pop(a, &mut heap), Value::Boolean(true));
         assert_eq!(pop(a, &mut heap), Value::Undefined);
         assert!(is_empty(a, &heap));
+    }
+
+    #[test]
+    fn clean_source_bytes_fast_path_for_unmutated_primitive_array() {
+        let mut heap = fresh_heap();
+        let bytes: Arc<[u8]> = Arc::from(&b"[1,2,3]"[..]);
+        let a = from_elements_with_source(
+            &mut heap,
+            [
+                Value::Number(NumberValue::from_i32(1)),
+                Value::Number(NumberValue::from_i32(2)),
+                Value::Number(NumberValue::from_i32(3)),
+            ],
+            Arc::clone(&bytes),
+        )
+        .unwrap();
+        // Fresh, unmutated, all primitives → fast path applies.
+        let snapshot = clean_source_bytes(a, &heap).expect("fast path eligible");
+        assert_eq!(&*snapshot, b"[1,2,3]");
+    }
+
+    #[test]
+    fn clean_source_bytes_disqualified_after_mutation() {
+        let mut heap = fresh_heap();
+        let bytes: Arc<[u8]> = Arc::from(&b"[1,2,3]"[..]);
+        let a = from_elements_with_source(
+            &mut heap,
+            [
+                Value::Number(NumberValue::from_i32(1)),
+                Value::Number(NumberValue::from_i32(2)),
+                Value::Number(NumberValue::from_i32(3)),
+            ],
+            Arc::clone(&bytes),
+        )
+        .unwrap();
+        push(a, &mut heap, Value::Number(NumberValue::from_i32(99))).unwrap();
+        assert!(clean_source_bytes(a, &heap).is_none());
+    }
+
+    #[test]
+    fn clean_source_bytes_disqualified_when_holding_compound_element() {
+        let mut heap = fresh_heap();
+        // An array containing a nested array is *not* eligible for
+        // the fast path even when its own dirty bit is clear, because
+        // the nested array can mutate independently and would render
+        // the captured `[…]` slice stale.
+        let inner = alloc_array(&mut heap).unwrap();
+        let bytes: Arc<[u8]> = Arc::from(&b"[[]]"[..]);
+        let outer =
+            from_elements_with_source(&mut heap, [Value::Array(inner)], Arc::clone(&bytes))
+                .unwrap();
+        assert!(clean_source_bytes(outer, &heap).is_none());
     }
 
     #[test]

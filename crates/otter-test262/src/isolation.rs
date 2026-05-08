@@ -56,7 +56,11 @@ pub enum WatchdogOutcome {
     /// [`OtterError::Interrupted`] return path is the canonical
     /// signal but we surface the `wall_ms` separately so the report
     /// can record how long the runaway test was allowed to run.
-    Timeout { wall_ms: u64 },
+    Timeout {
+        /// Wall-clock milliseconds the runaway test was allowed
+        /// to run before the watchdog fired.
+        wall_ms: u64,
+    },
     /// Engine panicked. The string carries the formatted payload
     /// (matches `panic_payload_to_string`).
     Panic(String),

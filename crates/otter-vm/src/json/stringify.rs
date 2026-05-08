@@ -264,6 +264,23 @@ fn emit_value(
         Value::BigInt(_) => return Err(JsonError::BigInt),
         Value::String(s) => write_string_literal(out, &s.to_lossy_string()),
         Value::Array(arr) => {
+            // Lazy stringify memcpy fast-path: an array that came
+            // from `JSON.parse` and has not been mutated since
+            // captures the original textual `[…]` slice on its body.
+            // When every element is a render-stable primitive
+            // (numbers / strings / booleans / null) the captured
+            // bytes are still authoritative, so we re-emit them
+            // verbatim without descending. Pretty-printing changes
+            // layout, so it disables the fast path.
+            //
+            // Spec: <https://tc39.es/ecma262/#sec-json.stringify> §25.5.2
+            if !options.pretty()
+                && let Some(source) = crate::array::clean_source_bytes(*arr, gc_heap)
+                && let Ok(text) = std::str::from_utf8(&source)
+            {
+                out.push_str(text);
+                return Ok(());
+            }
             if stack.len() >= MAX_NESTING_DEPTH {
                 return Err(JsonError::TooDeep {
                     limit: MAX_NESTING_DEPTH,
@@ -393,39 +410,41 @@ fn write_number(out: &mut String, n: NumberValue) {
     out.push_str(&n.to_display_string());
 }
 
-/// Hand-rolled JSON string encoder. Walks bytes of the lossy
-/// UTF-8 view; control chars become `\uXXXX`; ASCII fast path
-/// covers the common case in a tight loop without per-char
-/// branching beyond the escape switch.
+/// Hand-rolled JSON string encoder. Bulk-skips clean ASCII spans
+/// via [`super::scan::find_first_escape`] (8 bytes/iteration) and
+/// only enters the per-byte escape switch for `"`, `\\`, or
+/// control characters. Non-ASCII (≥ 0x80) bytes are forwarded
+/// verbatim — UTF-8 lead and continuation bytes are clean from
+/// the JSON-string viewpoint.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-quotejsonstring> §25.5.2.2
 fn write_string_literal(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
     out.push('"');
     let bytes = s.as_bytes();
     let mut i = 0;
     let mut copy_from = 0;
     while i < bytes.len() {
-        let b = bytes[i];
-        let escape: Option<&'static str> = match b {
-            b'"' => Some("\\\""),
-            b'\\' => Some("\\\\"),
-            b'\n' => Some("\\n"),
-            b'\r' => Some("\\r"),
-            b'\t' => Some("\\t"),
-            0x08 => Some("\\b"),
-            0x0C => Some("\\f"),
-            0x00..=0x1F => None,
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
+        i = super::scan::find_first_escape_pub(bytes, i);
+        if i >= bytes.len() {
+            break;
+        }
         if copy_from < i {
             out.push_str(&s[copy_from..i]);
         }
-        match escape {
-            Some(seq) => out.push_str(seq),
-            None => {
-                let buf = format!("\\u{b:04x}");
-                out.push_str(&buf);
+        let b = bytes[i];
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            _ => {
+                // Remaining bytes hit by the scanner are 0x00..=0x1F
+                // control characters that have no shorthand escape.
+                let _ = write!(out, "\\u{b:04x}");
             }
         }
         i += 1;

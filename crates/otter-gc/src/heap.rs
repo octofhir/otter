@@ -769,7 +769,49 @@ impl GcHeap {
     /// Ephemeron users may call [`Self::mark_additional`] after this
     /// method and before [`Self::sweep_phase`] to run a weak-table
     /// fixpoint.
+    ///
+    /// This convenience wrapper performs the entire mark phase under
+    /// one STW pause; the incremental driver
+    /// ([`Self::start_incremental_mark_phase`] /
+    /// [`Self::incremental_mark_step`] /
+    /// [`Self::finish_incremental_mark_phase`]) splits the same work
+    /// across multiple safepoints so the mutator can run between
+    /// drain steps. Both paths leave the heap in identical states.
     pub fn mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+        self.start_incremental_mark_phase(external_visit);
+        // SAFETY: STW pause; all pushed headers alive.
+        unsafe {
+            self.marking.drain_full(&self.trace_table);
+        }
+    }
+
+    /// Begin an incremental old-gen mark cycle.
+    ///
+    /// Performs the parts of [`Self::mark_phase`] that can only run
+    /// under an STW pause — pre-scavenge, mark-bit reset, root scan
+    /// — then returns with `is_marking == true`. The mutator may
+    /// resume between this call and the matching
+    /// [`Self::finish_incremental_mark_phase`]:
+    ///
+    /// - Pointer stores route through [`Self::write_barrier`] /
+    ///   [`Self::record_write`]; the **insertion** half of the
+    ///   barrier shades any white child the mutator publishes
+    ///   (Dijkstra invariant).
+    /// - New old-gen allocations are stamped black at birth so the
+    ///   mark cycle never traces freshly-published children.
+    ///
+    /// Drain progress is made by repeatedly calling
+    /// [`Self::incremental_mark_step`]. Once the mutator is ready
+    /// to finish, [`Self::finish_incremental_mark_phase`] re-scans
+    /// roots (catching any updates the barrier could not observe —
+    /// e.g. handles popped & re-pushed mid-cycle) and drains to
+    /// completion.
+    ///
+    /// # See also
+    /// - V8 incremental marker — Dijkstra-style insertion barrier
+    ///   with black-on-allocation new-object policy
+    ///   (<https://v8.dev/blog/concurrent-marking>).
+    pub fn start_incremental_mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
         // Scavenge first so survivors are in old / to-space.
         self.collect_minor_internal(external_visit);
 
@@ -800,8 +842,54 @@ impl GcHeap {
         }
 
         self.marking.start_cycle();
+        self.shade_roots(external_visit);
+    }
 
-        // Shade roots.
+    /// Drain at most `budget` gray headers from the marking
+    /// worklist. Returns the number of headers processed (always
+    /// `<= budget`); a return of `0` signals the worklist is
+    /// currently empty, though the insertion barrier may push more
+    /// before [`Self::finish_incremental_mark_phase`] is called.
+    ///
+    /// Calling this outside an active mark cycle is a no-op.
+    #[must_use]
+    pub fn incremental_mark_step(&mut self, budget: usize) -> usize {
+        if !self.marking.is_marking() {
+            return 0;
+        }
+        // SAFETY: every header on the worklist was pushed while
+        // alive. New old-gen allocations during the cycle are
+        // black-at-birth so they never enter the worklist; the
+        // mutator cannot drop a live old-gen object out from under
+        // a gray header (sweep is gated on the matching
+        // `finish_incremental_mark_phase` returning).
+        unsafe { self.marking.drain_with_budget(budget, &self.trace_table) }
+    }
+
+    /// Re-scan roots and drain the worklist to completion.
+    ///
+    /// Pairs with [`Self::start_incremental_mark_phase`]. After
+    /// this returns the heap is in the same state as the end of
+    /// [`Self::mark_phase`]: `is_marking == true` (cleared inside
+    /// [`Self::sweep_phase`]), every reachable old-gen object is
+    /// black, and the worklist is empty.
+    pub fn finish_incremental_mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+        // Re-shade roots — the mutator may have rewritten handles
+        // or globals between mark steps. The barrier covered every
+        // *new* white-child publication, but a slot whose pointer
+        // changed twice (new white → another white) only retains
+        // its final value, so we walk the live root set again to
+        // pick up any white target the barrier already shaded gray
+        // (idempotent) plus any pointer the mutator stored straight
+        // into a root slot (where no barrier fires).
+        self.shade_roots(external_visit);
+        // SAFETY: STW pause covers the final drain.
+        unsafe {
+            self.marking.drain_full(&self.trace_table);
+        }
+    }
+
+    fn shade_roots(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
         let handle_stack: *const HandleStack = &*self.handle_stack;
         let global_handles: *const GlobalHandleTable = &*self.global_handles;
         let marking_ptr = &mut self.marking as *mut MarkingState;
@@ -815,11 +903,6 @@ impl GcHeap {
             (*global_handles).visit_slots(&mut shade);
         }
         external_visit(&mut shade);
-
-        // SAFETY: STW pause; all pushed headers alive.
-        unsafe {
-            self.marking.drain_full(&self.trace_table);
-        }
     }
 
     /// Mark additional raw objects during an active mark phase and

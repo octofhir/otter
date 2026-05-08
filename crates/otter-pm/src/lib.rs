@@ -1090,12 +1090,11 @@ fn select_registry_version(
     if let Some(version) = metadata.versions.get(range) {
         return Ok(version.clone());
     }
-    if matches!(range, "*" | "latest") {
-        if let Some(latest) = metadata.dist_tags.get("latest") {
-            if let Some(version) = metadata.versions.get(latest) {
-                return Ok(version.clone());
-            }
-        }
+    if matches!(range, "*" | "latest")
+        && let Some(latest) = metadata.dist_tags.get("latest")
+        && let Some(version) = metadata.versions.get(latest)
+    {
+        return Ok(version.clone());
     }
     if let Some(version) = select_semver_version(metadata, range) {
         return Ok(version);

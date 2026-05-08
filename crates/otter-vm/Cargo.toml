@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "bootstrap"
 harness = false
+
+[[bench]]
+name = "json_scan"
+harness = false

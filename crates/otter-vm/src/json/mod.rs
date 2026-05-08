@@ -35,6 +35,7 @@
 //! - <https://tc39.es/ecma262/#sec-json-object>
 
 mod parse;
+pub mod scan;
 mod stringify;
 
 pub use parse::{ParseError, parse};
@@ -277,6 +278,42 @@ mod tests {
         let heap = make_heap();
         let bi = Value::BigInt(crate::bigint::BigIntValue::from_decimal("1").unwrap());
         assert!(matches!(stringify(&bi, &heap), Err(JsonError::BigInt)));
+    }
+
+    #[test]
+    fn stringify_uses_source_bytes_for_unmutated_parsed_array() {
+        let mut heap = make_heap();
+        let sheap = StringHeap::default();
+        let parsed = parse("[1,2,3,4]", &sheap, &mut heap).unwrap();
+        // Re-stringify should reproduce the input verbatim.
+        let s = stringify(&parsed, &heap).unwrap().unwrap();
+        assert_eq!(s, "[1,2,3,4]");
+    }
+
+    #[test]
+    fn stringify_observably_equivalent_when_fast_path_disqualified() {
+        let mut heap = make_heap();
+        let sheap = StringHeap::default();
+        let Value::Array(arr) = parse("[1,2,3]", &sheap, &mut heap).unwrap() else {
+            panic!("parsed value should be an array")
+        };
+        // Mutating the array invalidates source_bytes; stringify must
+        // still produce a correct (though re-rendered) result.
+        crate::array::set(arr, &mut heap, 0, Value::Number(NumberValue::from_i32(99))).unwrap();
+        let s = stringify(&Value::Array(arr), &heap).unwrap().unwrap();
+        assert_eq!(s, "[99,2,3]");
+    }
+
+    #[test]
+    fn stringify_pretty_disables_source_bytes_fast_path() {
+        let mut heap = make_heap();
+        let sheap = StringHeap::default();
+        let parsed = parse("[1,2,3]", &sheap, &mut heap).unwrap();
+        let opts = StringifyOptions::from_space(&Value::Number(NumberValue::from_i32(2))).unwrap();
+        let s = stringify_with_options(&parsed, &opts, &heap).unwrap().unwrap();
+        // Pretty output must reflect the indent setting, proving we
+        // did not short-circuit through the captured raw bytes.
+        assert_eq!(s, "[\n  1,\n  2,\n  3\n]");
     }
 
     #[test]

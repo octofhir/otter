@@ -20,6 +20,8 @@
 //!   round-toward-infinity (matches V8's strtod path for huge
 //!   inputs).
 
+use std::sync::Arc;
+
 use crate::Value;
 use crate::number::NumberValue;
 use crate::string::{JsString, StringHeap};
@@ -54,6 +56,10 @@ enum Builder {
         // `true` once we've emitted at least one element so the
         // separator state machine knows whether to demand a `,`.
         has_member: bool,
+        // Byte offset of the opening `[` in the input. Lets
+        // `finish_builder` capture the verbatim slice for the
+        // stringify memcpy fast-path.
+        array_start: usize,
     },
     Object {
         entries: Vec<(String, Value)>,
@@ -164,7 +170,8 @@ fn read_step(
             if cursor.peek() == Some(b'}') {
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
-                return finish_builder(frame, gc_heap, cursor.pos);
+                let bytes = cursor.bytes;
+                return finish_builder(frame, bytes, gc_heap, cursor.pos);
             }
             // Otherwise read the first key.
             let key = read_object_key(cursor)?;
@@ -178,6 +185,7 @@ fn read_step(
             read_step(cursor, stack, heap, gc_heap)
         }
         b'[' => {
+            let array_start = cursor.pos;
             cursor.pos += 1;
             if stack.len() >= MAX_NESTING_DEPTH {
                 return Err(ParseError::at(cursor.pos, "JSON nesting too deep"));
@@ -185,12 +193,14 @@ fn read_step(
             stack.push(Builder::Array {
                 elements: Vec::new(),
                 has_member: false,
+                array_start,
             });
             cursor.skip_ws();
             if cursor.peek() == Some(b']') {
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
-                return finish_builder(frame, gc_heap, cursor.pos);
+                let bytes = cursor.bytes;
+                return finish_builder(frame, bytes, gc_heap, cursor.pos);
             }
             read_step(cursor, stack, heap, gc_heap)
         }
@@ -229,6 +239,7 @@ fn continue_container(
         Builder::Array {
             elements,
             has_member,
+            ..
         } => {
             elements.push(just_read);
             *has_member = true;
@@ -245,7 +256,8 @@ fn continue_container(
                 Some(b']') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
-                    finish_builder(frame, gc_heap, cursor.pos)
+                    let bytes = cursor.bytes;
+                    finish_builder(frame, bytes, gc_heap, cursor.pos)
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -284,7 +296,8 @@ fn continue_container(
                 Some(b'}') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
-                    finish_builder(frame, gc_heap, cursor.pos)
+                    let bytes = cursor.bytes;
+                    finish_builder(frame, bytes, gc_heap, cursor.pos)
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -298,14 +311,27 @@ fn continue_container(
 
 fn finish_builder(
     builder: Builder,
+    bytes: &[u8],
     gc_heap: &mut otter_gc::GcHeap,
     pos: usize,
 ) -> Result<Value, ParseError> {
     match builder {
-        Builder::Array { elements, .. } => Ok(Value::Array(
-            crate::array::from_elements(gc_heap, elements)
-                .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?,
-        )),
+        Builder::Array {
+            elements,
+            array_start,
+            ..
+        } => {
+            // Capture the verbatim source slice spanning `[…]` so a
+            // subsequent `JSON.stringify` of an unmodified parsed
+            // array can re-emit it via memcpy. The slice is
+            // freshly-cloned (not aliased into the input) so the
+            // input buffer is free to drop independently.
+            let source: Arc<[u8]> = Arc::from(&bytes[array_start..pos]);
+            Ok(Value::Array(
+                crate::array::from_elements_with_source(gc_heap, elements, source)
+                    .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?,
+            ))
+        }
         Builder::Object { entries, .. } => {
             let obj = crate::object::alloc_object(gc_heap)
                 .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
@@ -413,32 +439,36 @@ fn read_number(cursor: &mut Cursor<'_>) -> Result<NumberValue, ParseError> {
     Ok(NumberValue::from_f64(f))
 }
 
-/// Read a JSON string. Hot path for ASCII-only payloads stays in
-/// a tight byte loop with no per-char branching beyond the
-/// escape switch. Unicode escapes (`\uXXXX`) and surrogate pairs
-/// fall back to a WTF-16 builder.
+/// Read a JSON string. Hot path for ASCII-only payloads bulk-skips
+/// clean spans via [`super::scan::find_first_escape`] (8 bytes per
+/// iteration) and only inspects bytes that are `"`, `\\`, or
+/// control characters. Unicode escapes (`\uXXXX`) and surrogate
+/// pairs fall back to a WTF-16 builder.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-json.parse> §25.5.1
 fn read_string(cursor: &mut Cursor<'_>, heap: &StringHeap) -> Result<JsString, ParseError> {
     debug_assert_eq!(cursor.peek(), Some(b'"'));
     cursor.pos += 1;
     let start = cursor.pos;
-    // Hot loop: scan ASCII bytes, no escapes, no control chars.
-    while let Some(b) = cursor.peek() {
-        match b {
-            b'"' => {
-                let slice = &cursor.bytes[start..cursor.pos];
-                cursor.pos += 1;
-                let text = std::str::from_utf8(slice)
-                    .map_err(|_| ParseError::at(start, "invalid utf-8 in string"))?;
-                return JsString::from_str(text, heap)
-                    .map_err(|_| ParseError::at(start, "out of memory while interning string"));
-            }
-            b'\\' => break,
-            0x00..=0x1F => {
-                return Err(ParseError::at(cursor.pos, "control character in string"));
-            }
-            _ => cursor.pos += 1,
-        }
+    // SWAR scan over the input until we hit a special byte or end.
+    let next = super::scan::find_first_escape_pub(cursor.bytes, cursor.pos);
+    cursor.pos = next;
+    if cursor.pos >= cursor.bytes.len() {
+        return Err(ParseError::at(cursor.pos, "unterminated string"));
     }
+    let b = cursor.bytes[cursor.pos];
+    if b == b'"' {
+        let slice = &cursor.bytes[start..cursor.pos];
+        cursor.pos += 1;
+        let text = std::str::from_utf8(slice)
+            .map_err(|_| ParseError::at(start, "invalid utf-8 in string"))?;
+        return JsString::from_str(text, heap)
+            .map_err(|_| ParseError::at(start, "out of memory while interning string"));
+    }
+    if b < 0x20 {
+        return Err(ParseError::at(cursor.pos, "control character in string"));
+    }
+    debug_assert_eq!(b, b'\\');
     // Slow path: fall back to a WTF-16 builder seeded with the
     // already-consumed prefix.
     read_string_with_escapes(cursor, start, heap)

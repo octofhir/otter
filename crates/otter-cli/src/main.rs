@@ -660,16 +660,15 @@ async fn explicit_file_target(target: &str) -> Result<Option<PathBuf>, OtterErro
         return Ok(None);
     }
     let path = PathBuf::from(target);
-    if path.is_absolute()
+    let looks_like_path = path.is_absolute()
         || target.starts_with("./")
         || target.starts_with("../")
         || target.contains('/')
-        || target.contains('\\')
-    {
-        Ok(Some(path))
-    } else if tokio::fs::try_exists(&path)
-        .await
-        .map_err(|err| pm_io_error(&path, err))?
+        || target.contains('\\');
+    if looks_like_path
+        || tokio::fs::try_exists(&path)
+            .await
+            .map_err(|err| pm_io_error(&path, err))?
     {
         Ok(Some(path))
     } else {
@@ -1623,8 +1622,8 @@ fn prompt_optional(label: &str) -> Result<Option<String>, OtterError> {
 }
 
 fn parse_package_spec(spec: &str) -> (String, String) {
-    let split = if spec.starts_with('@') {
-        spec[1..].rfind('@').map(|index| index + 1)
+    let split = if let Some(rest) = spec.strip_prefix('@') {
+        rest.rfind('@').map(|index| index + 1)
     } else {
         spec.rfind('@').filter(|index| *index > 0)
     };

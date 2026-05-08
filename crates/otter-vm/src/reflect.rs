@@ -19,7 +19,13 @@ use crate::abstract_ops::is_callable;
 use crate::object::{JsObject, PropertyLookup};
 use crate::object_statics::coerce_to_descriptor;
 use crate::string::JsString;
+use crate::symbol::JsSymbol;
 use crate::{Interpreter, Value, VmError};
+
+enum PropertyKey {
+    String(String),
+    Symbol(JsSymbol),
+}
 
 /// Dispatch `Reflect.<name>(args...)`.
 ///
@@ -113,7 +119,14 @@ pub fn call(
                 coerce_to_descriptor(&desc_obj, heap)?
             };
             let heap = interp.gc_heap_mut();
-            let ok = crate::object::define_own_property(target, heap, &key, descriptor);
+            let ok = match &key {
+                PropertyKey::String(key) => {
+                    crate::object::define_own_property(target, heap, key, descriptor)
+                }
+                PropertyKey::Symbol(sym) => {
+                    crate::object::define_own_symbol_property(target, heap, sym, descriptor)
+                }
+            };
             Ok(Value::Boolean(ok))
         }
         // §28.1.5 Reflect.deleteProperty(target, propertyKey)
@@ -122,7 +135,11 @@ pub fn call(
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let heap = interp.gc_heap_mut();
-            Ok(Value::Boolean(crate::object::delete(target, heap, &key)))
+            let removed = match &key {
+                PropertyKey::String(key) => crate::object::delete(target, heap, key),
+                PropertyKey::Symbol(sym) => crate::object::delete_symbol(target, heap, sym),
+            };
+            Ok(Value::Boolean(removed))
         }
         // §28.1.6 Reflect.get(target, propertyKey[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.get>
@@ -133,7 +150,15 @@ pub fn call(
             // dispatch elsewhere; the simple data-property surface
             // here ignores the third argument.
             let heap = interp.gc_heap();
-            Ok(crate::object::get(target, heap, &key).unwrap_or(Value::Undefined))
+            let value = match &key {
+                PropertyKey::String(key) => {
+                    crate::object::get(target, heap, key).unwrap_or(Value::Undefined)
+                }
+                PropertyKey::Symbol(sym) => {
+                    crate::object::get_symbol(target, heap, sym).unwrap_or(Value::Undefined)
+                }
+            };
+            Ok(value)
         }
         // §28.1.7 Reflect.getOwnPropertyDescriptor(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.getownpropertydescriptor>
@@ -142,7 +167,10 @@ pub fn call(
             let key = expect_property_key(args.get(1))?;
             let lookup = {
                 let heap = interp.gc_heap();
-                crate::object::lookup_own(target, heap, &key)
+                match &key {
+                    PropertyKey::String(key) => crate::object::lookup_own(target, heap, key),
+                    PropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(target, heap, sym),
+                }
             };
             match lookup {
                 PropertyLookup::Absent => Ok(Value::Undefined),
@@ -195,10 +223,17 @@ pub fn call(
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let heap = interp.gc_heap();
-            Ok(Value::Boolean(!matches!(
-                crate::object::lookup(target, heap, &key),
-                PropertyLookup::Absent
-            )))
+            let present = match &key {
+                PropertyKey::String(key) => !matches!(
+                    crate::object::lookup(target, heap, key),
+                    PropertyLookup::Absent
+                ),
+                PropertyKey::Symbol(sym) => !matches!(
+                    crate::object::lookup_symbol(target, heap, sym),
+                    PropertyLookup::Absent
+                ),
+            };
+            Ok(Value::Boolean(present))
         }
         // §28.1.10 Reflect.isExtensible(target)
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>
@@ -213,13 +248,16 @@ pub fn call(
             let target = expect_object(args.first())?;
             let heap = interp.gc_heap();
             let keys: Vec<Value> = crate::object::with_properties(target, heap, |p| {
-                p.keys()
+                let mut keys: Vec<Value> = p
+                    .keys()
                     .map(|k| {
                         JsString::from_str(k, string_heap)
                             .map(Value::String)
                             .unwrap_or(Value::Undefined)
                     })
-                    .collect()
+                    .collect();
+                keys.extend(p.symbol_keys().map(Value::Symbol));
+                keys
             });
             Ok(Value::Array(crate::array::from_elements(
                 interp.gc_heap_mut(),
@@ -240,9 +278,40 @@ pub fn call(
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let value = args.get(2).cloned().unwrap_or(Value::Undefined);
-            let heap = interp.gc_heap_mut();
-            crate::object::set(target, heap, &key, value);
-            Ok(Value::Boolean(true))
+            let receiver = args.get(3).cloned().unwrap_or(Value::Object(target));
+            let outcome = {
+                let heap = interp.gc_heap();
+                match &key {
+                    PropertyKey::String(key) => crate::object::resolve_set(target, heap, key),
+                    PropertyKey::Symbol(sym) => {
+                        crate::object::resolve_symbol_set(target, heap, sym)
+                    }
+                }
+            };
+            let ok = match outcome {
+                crate::object::SetOutcome::AssignData => {
+                    let heap = interp.gc_heap_mut();
+                    match &key {
+                        PropertyKey::String(key) => {
+                            crate::object::ordinary_set_data_property(target, heap, key, value)
+                        }
+                        PropertyKey::Symbol(sym) => {
+                            crate::object::set_symbol(target, heap, sym.clone(), value)
+                        }
+                    }
+                }
+                crate::object::SetOutcome::InvokeSetter { setter } => {
+                    if !is_callable(&setter) {
+                        false
+                    } else {
+                        let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                        interp.run_callable_sync(module, &setter, receiver, argv)?;
+                        true
+                    }
+                }
+                crate::object::SetOutcome::Reject { .. } => false,
+            };
+            Ok(Value::Boolean(ok))
         }
         // §28.1.14 Reflect.setPrototypeOf(target, prototype)
         // <https://tc39.es/ecma262/#sec-reflect.setprototypeof>
@@ -304,13 +373,16 @@ fn expect_object(arg: Option<&Value>) -> Result<JsObject, VmError> {
     }
 }
 
-fn expect_property_key(arg: Option<&Value>) -> Result<String, VmError> {
+fn expect_property_key(arg: Option<&Value>) -> Result<PropertyKey, VmError> {
     match arg {
-        Some(Value::String(s)) => Ok(s.to_lossy_string()),
-        Some(Value::Number(n)) => Ok(n.to_display_string()),
-        Some(Value::Boolean(b)) => Ok((if *b { "true" } else { "false" }).to_string()),
-        Some(Value::Null) => Ok("null".to_string()),
-        Some(Value::Undefined) | None => Ok("undefined".to_string()),
+        Some(Value::String(s)) => Ok(PropertyKey::String(s.to_lossy_string())),
+        Some(Value::Number(n)) => Ok(PropertyKey::String(n.to_display_string())),
+        Some(Value::Boolean(b)) => Ok(PropertyKey::String(
+            (if *b { "true" } else { "false" }).to_string(),
+        )),
+        Some(Value::Null) => Ok(PropertyKey::String("null".to_string())),
+        Some(Value::Undefined) | None => Ok(PropertyKey::String("undefined".to_string())),
+        Some(Value::Symbol(sym)) => Ok(PropertyKey::Symbol(sym.clone())),
         _ => Err(VmError::TypeMismatch),
     }
 }

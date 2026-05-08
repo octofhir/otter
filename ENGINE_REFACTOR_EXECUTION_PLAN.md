@@ -354,7 +354,7 @@ semantics) builds on it, then P1.3 (builtin installation) consumes both.
 ### P1.1 Object/Descriptor Core
 
 - [ ] Make property descriptors the canonical object mutation path.
-- [ ] Ensure property order is deterministic and spec-observable
+- [x] Ensure property order is deterministic and spec-observable
   (integer-indexed keys ascending, then strings in insertion order, then
   symbols in insertion order).
 - [ ] Centralize `[[DefineOwnProperty]]`, `[[GetOwnProperty]]`, `[[Set]]`,
@@ -369,6 +369,13 @@ Acceptance:
   `built-ins/Object/getOwnPropertyDescriptor` do not regress.
 - One internal property-mutation entry point per shape mutation kind; no
   bypass of descriptor enforcement remains.
+
+Next slice notes:
+
+- Remaining special receiver divergence before closing the full
+  descriptor-core checkbox: `NativeFunction` metadata uses its own
+  define/assignment validation, and user `Function`/`Closure` values still
+  lack `Object.defineProperty` routing into their side-table bags.
 
 ### P1.2 Function And Arguments Semantics
 

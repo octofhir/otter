@@ -1195,7 +1195,9 @@ impl Op {
             // dispatcher reads the count and walks the trailing
             // operands.
             Op::NewArray => 2,
-            Op::LoadElement | Op::StoreElement | Op::DeleteElement => 3,
+            Op::LoadElement | Op::DeleteElement => 3,
+            // recv, key, src, scratch_dst for accessor setters.
+            Op::StoreElement => 4,
             Op::CallMethodValue => 4,       // dst, recv, name_const, argc
             Op::MathCall => 3,              // dst, name_const, argc — args follow
             Op::JsonCall => 3,              // dst, name_const, argc — args follow

@@ -98,18 +98,18 @@ check-project project:
 
 # === Test262 Conformance Tests ===
 
-# Run Test262 tests (all). Pass extra args: just test262 --filter foo -vv
-# Uses otter-runtime (new VM). Writes JSONL log to test262_results/run.jsonl
+# Run Test262 tests (all). Pass extra args: just test262 --filter foo
+# Uses otter-runtime (new VM). Writes JSON + Markdown reports under test262_results/.
 test262 *args:
-    cargo run --profile test262 -p otter-test262 --bin test262 -- --log test262_results/run.jsonl {{args}}
+    cargo run -p otter-test262 --bin otter-test262 -- run --output test262_results/run.json {{args}}
 
 # Run Test262 tests with filter (e.g., "literals")
 test262-filter filter:
-    cargo run --profile test262 -p otter-test262 --bin test262 -- --filter {{filter}} -vv --log test262_results/run.jsonl
+    cargo run -p otter-test262 --bin otter-test262 -- run --filter {{filter}} --output test262_results/run.json
 
 # Run Test262 for specific directory (e.g., "built-ins/Math")
 test262-dir dir:
-    cargo run --profile test262 -p otter-test262 --bin test262 -- --subdir {{dir}} -vv --log test262_results/run.jsonl
+    cargo run -p otter-test262 --bin otter-test262 -- run --filter {{dir}} --output test262_results/run.json
 
 # Run full test262 in crash-safe batches, merge results, generate conformance doc
 test262-full *args:
@@ -117,7 +117,7 @@ test262-full *args:
 
 # Generate ES_CONFORMANCE.md from latest test262 results
 test262-conformance:
-    cargo run --profile test262 -p otter-test262 --bin gen-conformance
+    @echo "test262 conformance generation is not wired in the current otter-test262 runner; update ES_CONFORMANCE.md from the generated JSON/Markdown report."
 
 # === Test262 (active engine, crates/otter-test262) ===
 #

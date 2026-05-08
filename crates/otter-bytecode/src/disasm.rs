@@ -393,7 +393,6 @@ mod tests {
             | Op::NewSpread
             | Op::NewCollection
             | Op::LoadElement
-            | Op::StoreElement
             | Op::DeleteElement
             | Op::HasProperty
             | Op::Instanceof
@@ -408,9 +407,12 @@ mod tests {
             | Op::PromiseCall
             | Op::SymbolCall => vec![reg(0), reg(1), reg(2)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
-            Op::CallSpread | Op::New | Op::MakeClass | Op::StoreProperty | Op::TypedArrayCall => {
-                vec![reg(0), reg(1), reg(2), reg(3)]
-            }
+            Op::CallSpread
+            | Op::New
+            | Op::MakeClass
+            | Op::StoreProperty
+            | Op::StoreElement
+            | Op::TypedArrayCall => vec![reg(0), reg(1), reg(2), reg(3)],
             Op::CallMethodValue
             | Op::CallWithThis
             | Op::BindFunction

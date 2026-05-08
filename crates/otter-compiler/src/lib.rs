@@ -1648,6 +1648,23 @@ impl FunctionContext {
         );
     }
 
+    /// Emit `Op::StoreElement obj_reg, key_reg, src_reg, scratch`.
+    /// The scratch slot is reserved for computed-property accessor
+    /// setter dispatch and mirrors `Op::StoreProperty`.
+    fn emit_store_element(&mut self, obj_reg: u16, key_reg: u16, src: u16, span: (u32, u32)) {
+        let scratch = self.alloc_scratch();
+        self.emit(
+            Op::StoreElement,
+            vec![
+                Operand::Register(obj_reg),
+                Operand::Register(key_reg),
+                Operand::Register(src),
+                Operand::Register(scratch),
+            ],
+            span,
+        );
+    }
+
     /// Emit `Op::LoadProperty dst, obj_reg, name_const`. Used by
     /// the module-mode lowering for imported-name reads
     /// (`LoadProperty import_record, "name"`) and `import.meta.url`.
@@ -3093,15 +3110,7 @@ fn compile_assignment(
                 dst
             }
         };
-        cx.emit(
-            Op::StoreElement,
-            vec![
-                Operand::Register(arr_reg),
-                Operand::Register(idx_reg),
-                Operand::Register(new_value),
-            ],
-            span,
-        );
+        cx.emit_store_element(arr_reg, idx_reg, new_value, span);
         return Ok(new_value);
     }
     // §13.15.5 DestructuringAssignmentEvaluation — array / object
@@ -3404,15 +3413,7 @@ fn assign_to_target(
         AssignmentTarget::ComputedMemberExpression(member) => {
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let key_reg = compile_expr(cx, &member.expression, span)?;
-            cx.emit(
-                Op::StoreElement,
-                vec![
-                    Operand::Register(obj_reg),
-                    Operand::Register(key_reg),
-                    Operand::Register(value_reg),
-                ],
-                span,
-            );
+            cx.emit_store_element(obj_reg, key_reg, value_reg, span);
             Ok(())
         }
         other => Err(CompileError::Unsupported {
@@ -5738,15 +5739,7 @@ fn compile_expr(
                                 }
                             };
                             let value_reg = compile_expr(cx, &p.value, key_span)?;
-                            cx.emit(
-                                Op::StoreElement,
-                                vec![
-                                    Operand::Register(dst),
-                                    Operand::Register(key_reg),
-                                    Operand::Register(value_reg),
-                                ],
-                                key_span,
-                            );
+                            cx.emit_store_element(dst, key_reg, value_reg, key_span);
                             continue;
                         }
                         let key_str = match &p.key {
@@ -6171,15 +6164,7 @@ fn compile_expr(
                 UpdateTarget::ComputedMember {
                     obj_reg, key_reg, ..
                 } => {
-                    cx.emit(
-                        Op::StoreElement,
-                        vec![
-                            Operand::Register(obj_reg),
-                            Operand::Register(key_reg),
-                            Operand::Register(next),
-                        ],
-                        span,
-                    );
+                    cx.emit_store_element(obj_reg, key_reg, next, span);
                 }
             }
             // §13.4.2.1 / 13.4.3.1 — postfix returns the pre-
@@ -6387,15 +6372,7 @@ fn bind_for_in_of_head(
         ForStatementLeft::ComputedMemberExpression(member) => {
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let key_reg = compile_expr(cx, &member.expression, span)?;
-            cx.emit(
-                Op::StoreElement,
-                vec![
-                    Operand::Register(obj_reg),
-                    Operand::Register(key_reg),
-                    Operand::Register(src_reg),
-                ],
-                span,
-            );
+            cx.emit_store_element(obj_reg, key_reg, src_reg, span);
             Ok(())
         }
         // TS-only wrapper variants — unwrap the inner target.
@@ -8183,15 +8160,7 @@ fn compile_class(
                         span: method_span,
                     })?;
                 let key_reg = compile_expr(cx, key_expr, method_span)?;
-                cx.emit(
-                    Op::StoreElement,
-                    vec![
-                        Operand::Register(target_reg),
-                        Operand::Register(key_reg),
-                        Operand::Register(m_reg),
-                    ],
-                    method_span,
-                );
+                cx.emit_store_element(target_reg, key_reg, m_reg, method_span);
             }
         }
     }
@@ -8221,15 +8190,7 @@ fn compile_class(
                                 span: pspan,
                             })?;
                     let key_reg = compile_expr(cx, key_expr, pspan)?;
-                    cx.emit(
-                        Op::StoreElement,
-                        vec![
-                            Operand::Register(statics_reg),
-                            Operand::Register(key_reg),
-                            Operand::Register(value_reg),
-                        ],
-                        pspan,
-                    );
+                    cx.emit_store_element(statics_reg, key_reg, value_reg, pspan);
                 } else {
                     let key_str = match &p.key {
                         oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
@@ -8542,15 +8503,7 @@ fn emit_instance_field_inits(
                     span: pspan,
                 })?;
             let key_reg = compile_expr(cx, key_expr, pspan)?;
-            cx.emit(
-                Op::StoreElement,
-                vec![
-                    Operand::Register(this_reg),
-                    Operand::Register(key_reg),
-                    Operand::Register(value_reg),
-                ],
-                pspan,
-            );
+            cx.emit_store_element(this_reg, key_reg, value_reg, pspan);
             continue;
         }
         let key_str = match &p.key {

@@ -70,6 +70,9 @@ use crate::string::JsString;
 use crate::symbol::JsSymbol;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
+mod descriptor_core;
+mod key_order;
+
 /// Rust-owned data attached to a JavaScript object.
 ///
 /// Host object data is isolate-local object state. It must not hold VM `Value`,
@@ -574,10 +577,10 @@ pub struct ObjectBody {
     /// has no niche and the discriminant offset would not give a
     /// `RawGc`-aligned slot).
     prototype: JsObject,
-    /// Symbol-keyed own data properties. Symbol-keyed accessors are
-    /// not modelled in this slice — `Object.defineProperty` only
-    /// accepts string keys today.
-    symbol_props: Vec<(JsSymbol, Value)>,
+    /// Symbol-keyed own properties. Stored outside the string-keyed
+    /// shape because symbols are identity keys, but values still use
+    /// the same descriptor slot representation.
+    symbol_props: Vec<(JsSymbol, PropertySlot)>,
     /// Rust-owned payload for host-backed objects.
     host_data: Option<Box<dyn Any>>,
     /// `[[Extensible]]` internal slot. New keys are rejected when
@@ -633,8 +636,18 @@ impl otter_gc::SafeTraceable for ObjectBody {
             }
         }
         // Symbol-keyed own properties.
-        for (_sym, val) in self.symbol_props.iter() {
-            val.trace_value_slots(v);
+        for (_sym, slot) in self.symbol_props.iter() {
+            match &slot.body {
+                SlotBody::Data { value } => value.trace_value_slots(v),
+                SlotBody::Accessor { getter, setter } => {
+                    if let Some(g) = getter {
+                        g.trace_value_slots(v);
+                    }
+                    if let Some(s) = setter {
+                        s.trace_value_slots(v);
+                    }
+                }
+            }
         }
     }
 }
@@ -925,7 +938,21 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) ->
         body.symbol_props
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
-            .map(|(_, v)| v.clone())
+            .map(|(_, slot)| match &slot.body {
+                SlotBody::Data { value } => value.clone(),
+                SlotBody::Accessor { .. } => Value::Undefined,
+            })
+    })
+}
+
+/// Probe for an **own** symbol-keyed property descriptor body.
+#[must_use]
+pub fn lookup_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> PropertyLookup {
+    heap.read_payload(obj, |body| {
+        body.symbol_props
+            .iter()
+            .find(|(k, _)| k.ptr_eq(key))
+            .map_or(PropertyLookup::Absent, |(_, slot)| slot.to_lookup())
     })
 }
 
@@ -936,9 +963,7 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) ->
 /// the prototype chain.
 #[must_use]
 pub fn has_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> bool {
-    heap.read_payload(obj, |body| {
-        body.symbol_props.iter().any(|(k, _)| k.ptr_eq(key))
-    })
+    !matches!(lookup_own_symbol(obj, heap, key), PropertyLookup::Absent)
 }
 
 /// Look up a symbol-keyed property with prototype-chain walk.
@@ -960,6 +985,44 @@ pub fn get_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Opt
         current = prototype(proto, heap);
     }
     None
+}
+
+/// Symbol-keyed property lookup with prototype-chain walk.
+#[must_use]
+pub fn lookup_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> PropertyLookup {
+    match lookup_own_symbol(obj, heap, key) {
+        PropertyLookup::Absent => {}
+        hit => return hit,
+    }
+    let mut current = prototype(obj, heap);
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if hops >= PROTO_CHAIN_HARD_CAP {
+            return PropertyLookup::Absent;
+        }
+        hops += 1;
+        match lookup_own_symbol(proto, heap, key) {
+            PropertyLookup::Absent => {}
+            hit => return hit,
+        }
+        current = prototype(proto, heap);
+    }
+    PropertyLookup::Absent
+}
+
+/// Read the descriptor for an own symbol-keyed property.
+#[must_use]
+pub fn get_own_symbol_descriptor(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: &JsSymbol,
+) -> Option<PropertyDescriptor> {
+    heap.read_payload(obj, |body| {
+        body.symbol_props
+            .iter()
+            .find(|(k, _)| k.ptr_eq(key))
+            .map(|(_, slot)| slot.to_descriptor())
+    })
 }
 
 /// Borrow typed host data attached to `obj`.
@@ -1104,6 +1167,31 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
     heap.record_write(obj, &barrier_value);
 }
 
+/// Apply the data-write half of ordinary `[[Set]]` after
+/// [`resolve_set`] has selected [`SetOutcome::AssignData`].
+///
+/// Existing own data properties keep their current attributes and
+/// only replace `[[Value]]`. Missing properties are created with
+/// default ordinary data attributes, but only when the receiver is
+/// extensible. Accessor slots and non-writable data slots reject.
+///
+/// This is the runtime assignment path. Construction/bootstrap code
+/// that owns a fresh object may still use [`set`] to seed internal
+/// scaffolding; user-visible assignment should route through this
+/// function after the `[[Set]]` resolver.
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
+pub fn ordinary_set_data_property(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    value: Value,
+) -> bool {
+    descriptor_core::ordinary_set_data_property(obj, heap, key, value)
+}
+
 /// Replace the prototype. `None` detaches the chain (encoded as
 /// [`otter_gc::Gc::null()`] inside the body).
 ///
@@ -1149,32 +1237,26 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
     })
 }
 
-/// Set or overwrite a symbol-keyed own property.
+/// Set or overwrite a symbol-keyed own data property through the
+/// same descriptor-aware `[[Set]]` data-write core as string keys.
 ///
 /// Fires the GC write barrier when `value` carries a `Gc<…>`
 /// handle.
-pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, value: Value) {
-    let barrier_value = value.clone();
-    heap.with_payload(obj, |body| {
-        for (existing_key, slot) in body.symbol_props.iter_mut() {
-            if existing_key.ptr_eq(&key) {
-                *slot = value;
-                return;
-            }
-        }
-        body.symbol_props.push((key, value));
-    });
-    heap.record_write(obj, &barrier_value);
+pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, value: Value) -> bool {
+    descriptor_core::ordinary_set_symbol_data_property(obj, heap, &key, value)
 }
 
 /// Remove a symbol-keyed own property.
 pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &JsSymbol) -> bool {
     heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
+            if !body.symbol_props[pos].1.flags.configurable() {
+                return false;
+            }
             body.symbol_props.remove(pos);
             true
         } else {
-            false
+            true
         }
     })
 }
@@ -1216,7 +1298,7 @@ pub fn define_own_property(
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = body.shape.offset_of(key) {
             let existing = body.slots[offset as usize].clone();
-            match validate_and_apply(&existing, &descriptor) {
+            match descriptor_core::validate_and_apply(&existing, &descriptor) {
                 Some(merged) => {
                     body.slots[offset as usize] = merged;
                     true
@@ -1230,6 +1312,39 @@ pub fn define_own_property(
             let new_shape = Shape::add_property(&body.shape, key);
             body.shape = new_shape;
             body.slots.push(PropertySlot::from_descriptor(descriptor));
+            true
+        }
+    });
+    if success {
+        heap.record_write(obj, &barrier_descriptor);
+    }
+    success
+}
+
+/// Symbol-keyed counterpart to [`define_own_property`].
+pub fn define_own_symbol_property(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &JsSymbol,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    let barrier_descriptor = descriptor.clone();
+    let success = heap.with_payload(obj, |body| {
+        if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
+            let existing = body.symbol_props[pos].1.clone();
+            match descriptor_core::validate_and_apply(&existing, &descriptor) {
+                Some(merged) => {
+                    body.symbol_props[pos].1 = merged;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            if !body.extensible {
+                return false;
+            }
+            body.symbol_props
+                .push((key.clone(), PropertySlot::from_descriptor(descriptor)));
             true
         }
     });
@@ -1332,6 +1447,68 @@ pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutc
     SetOutcome::AssignData
 }
 
+/// Symbol-keyed counterpart to [`resolve_set`].
+pub fn resolve_symbol_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> SetOutcome {
+    match lookup_own_symbol(obj, heap, key) {
+        PropertyLookup::Data { flags, .. } => {
+            if flags.writable() {
+                return SetOutcome::AssignData;
+            }
+            return SetOutcome::Reject {
+                reason: SetRejectReason::NonWritable,
+            };
+        }
+        PropertyLookup::Accessor { setter, .. } => {
+            return match setter {
+                Some(setter) => SetOutcome::InvokeSetter { setter },
+                None => SetOutcome::Reject {
+                    reason: SetRejectReason::AccessorWithoutSetter,
+                },
+            };
+        }
+        PropertyLookup::Absent => {}
+    }
+    let mut current = prototype(obj, heap);
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if hops >= PROTO_CHAIN_HARD_CAP {
+            break;
+        }
+        hops += 1;
+        match lookup_own_symbol(proto, heap, key) {
+            PropertyLookup::Data { flags, .. } => {
+                if flags.writable() {
+                    if !is_extensible(obj, heap) {
+                        return SetOutcome::Reject {
+                            reason: SetRejectReason::NonExtensible,
+                        };
+                    }
+                    return SetOutcome::AssignData;
+                }
+                return SetOutcome::Reject {
+                    reason: SetRejectReason::NonWritable,
+                };
+            }
+            PropertyLookup::Accessor { setter, .. } => {
+                return match setter {
+                    Some(setter) => SetOutcome::InvokeSetter { setter },
+                    None => SetOutcome::Reject {
+                        reason: SetRejectReason::AccessorWithoutSetter,
+                    },
+                };
+            }
+            PropertyLookup::Absent => {}
+        }
+        current = prototype(proto, heap);
+    }
+    if !is_extensible(obj, heap) {
+        return SetOutcome::Reject {
+            reason: SetRejectReason::NonExtensible,
+        };
+    }
+    SetOutcome::AssignData
+}
+
 /// `Object.preventExtensions(o)` core — clears the
 /// `[[Extensible]]` slot. Always succeeds for ordinary objects.
 ///
@@ -1352,6 +1529,9 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
         for slot in body.slots.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
         }
+        for (_, slot) in body.symbol_props.iter_mut() {
+            slot.flags = slot.flags.with_configurable(false);
+        }
     });
 }
 
@@ -1365,6 +1545,12 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
         for slot in body.slots.iter_mut() {
+            slot.flags = slot.flags.with_configurable(false);
+            if matches!(slot.body, SlotBody::Data { .. }) {
+                slot.flags = slot.flags.with_writable(false);
+            }
+        }
+        for (_, slot) in body.symbol_props.iter_mut() {
             slot.flags = slot.flags.with_configurable(false);
             if matches!(slot.body, SlotBody::Data { .. }) {
                 slot.flags = slot.flags.with_writable(false);
@@ -1388,27 +1574,30 @@ pub struct Properties<'a> {
 }
 
 impl<'a> Properties<'a> {
-    /// Iterate every `(key, data-value)` pair in insertion order,
-    /// regardless of enumerability. Accessor slots are surfaced as
-    /// the sentinel `Value::Undefined` — callers that need accessor
-    /// fidelity must consult [`get_own_descriptor`] directly.
+    /// Iterate every `(key, data-value)` pair in ordinary own-key
+    /// order, regardless of enumerability. Accessor slots are
+    /// surfaced as the sentinel `Value::Undefined` — callers that
+    /// need accessor fidelity must consult [`get_own_descriptor`]
+    /// directly.
     pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        self.body
-            .shape
-            .keys()
-            .zip(self.body.slots.iter())
-            .map(|(k, slot)| {
+        key_order::ordinary_own_string_key_indices(self.body)
+            .into_iter()
+            .map(|idx| {
+                let k = self.body.shape.keys[idx].as_str();
+                let slot = &self.body.slots[idx];
                 let value = match &slot.body {
                     SlotBody::Data { value } => value.clone(),
                     SlotBody::Accessor { .. } => Value::Undefined,
                 };
-                (k.as_str(), value)
+                (k, value)
             })
     }
 
-    /// Iterate keys in insertion order.
+    /// Iterate string keys in ordinary own-key order.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.body.shape.keys().map(String::as_str)
+        key_order::ordinary_own_string_key_indices(self.body)
+            .into_iter()
+            .map(|idx| self.body.shape.keys[idx].as_str())
     }
 
     /// Iterate symbol-keyed own properties in insertion order.
@@ -1418,32 +1607,36 @@ impl<'a> Properties<'a> {
         self.body.symbol_props.iter().map(|(k, _)| k.clone())
     }
 
-    /// Iterate `(key, data-value)` pairs, skipping accessor and
-    /// non-enumerable slots. Used by JSON.stringify and `for…in`
-    /// once it lands.
+    /// Iterate `(key, data-value)` pairs in ordinary own-key order,
+    /// skipping accessor and non-enumerable slots. Used by
+    /// JSON.stringify and `for…in` once it lands.
     pub fn enumerable_data_iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        self.body
-            .shape
-            .keys()
-            .zip(self.body.slots.iter())
-            .filter_map(|(k, slot)| {
+        key_order::ordinary_own_string_key_indices(self.body)
+            .into_iter()
+            .filter_map(|idx| {
+                let k = self.body.shape.keys[idx].as_str();
+                let slot = &self.body.slots[idx];
                 if !slot.flags.enumerable() {
                     return None;
                 }
                 match &slot.body {
-                    SlotBody::Data { value } => Some((k.as_str(), value.clone())),
+                    SlotBody::Data { value } => Some((k, value.clone())),
                     SlotBody::Accessor { .. } => None,
                 }
             })
     }
 
-    /// Iterate enumerable own-key names (string-keyed only).
+    /// Iterate enumerable own-key names (string-keyed only) in
+    /// ordinary own-key order.
     pub fn enumerable_keys(&self) -> impl Iterator<Item = &str> {
-        self.body
-            .shape
-            .keys()
-            .zip(self.body.slots.iter())
-            .filter_map(|(k, slot)| slot.flags.enumerable().then_some(k.as_str()))
+        key_order::ordinary_own_string_key_indices(self.body)
+            .into_iter()
+            .filter_map(|idx| {
+                self.body.slots[idx]
+                    .flags
+                    .enumerable()
+                    .then_some(self.body.shape.keys[idx].as_str())
+            })
     }
 }
 
@@ -1456,88 +1649,6 @@ pub fn with_properties<R>(
     f: impl FnOnce(Properties<'_>) -> R,
 ) -> R {
     heap.read_payload(obj, |body| f(Properties { body }))
-}
-
-// ---------- ValidateAndApplyPropertyDescriptor ----------------------------
-
-/// Implements §10.1.6.3 ValidateAndApplyPropertyDescriptor for an
-/// existing slot. Returns `Some(updated)` on success, `None` to
-/// reject.
-fn validate_and_apply(
-    existing: &PropertySlot,
-    incoming: &PropertyDescriptor,
-) -> Option<PropertySlot> {
-    let existing_kind_is_data = matches!(existing.body, SlotBody::Data { .. });
-    let incoming_kind_is_data = matches!(incoming.kind, DescriptorKind::Data { .. });
-
-    // 4.a: every field of `incoming` is identical to `existing` →
-    // no-op success. Skipped for simplicity — we always apply.
-
-    if !existing.flags.configurable() {
-        // 4.b: configurable cannot transition to true.
-        if incoming.flags.configurable() && !existing.flags.configurable() {
-            return None;
-        }
-        // 4.c: enumerable cannot change.
-        if incoming.flags.enumerable() != existing.flags.enumerable() {
-            return None;
-        }
-        // 4.d: kind cannot change (data ↔ accessor).
-        if existing_kind_is_data != incoming_kind_is_data {
-            return None;
-        }
-        // 4.e: data with non-writable rejects writable→true / value change.
-        if existing_kind_is_data {
-            if !existing.flags.writable() {
-                if incoming.flags.writable() {
-                    return None;
-                }
-                if let DescriptorKind::Data { value: incoming_v } = &incoming.kind
-                    && let SlotBody::Data { value: existing_v } = &existing.body
-                    && !same_value(existing_v, incoming_v)
-                {
-                    return None;
-                }
-            }
-        } else {
-            // 4.f: accessor — get / set cannot change.
-            if let DescriptorKind::Accessor {
-                getter: in_get,
-                setter: in_set,
-            } = &incoming.kind
-                && let SlotBody::Accessor {
-                    getter: ex_get,
-                    setter: ex_set,
-                } = &existing.body
-                && (!optional_value_eq(ex_get, in_get) || !optional_value_eq(ex_set, in_set))
-            {
-                return None;
-            }
-        }
-    }
-
-    // Build merged slot.
-    Some(PropertySlot::from_descriptor(PropertyDescriptor {
-        flags: incoming.flags,
-        kind: incoming.kind.clone(),
-    }))
-}
-
-fn optional_value_eq(a: &Option<Value>, b: &Option<Value>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => same_value(x, y),
-        _ => false,
-    }
-}
-
-/// Light SameValue check — distinguishes objects by identity, falls
-/// back to display-string equality for primitives. Used only by the
-/// validator above; the canonical SameValue lives in
-/// [`crate::abstract_ops::same_value`] but pulling that in here would
-/// create an awkward cycle for the slice scope.
-fn same_value(a: &Value, b: &Value) -> bool {
-    crate::abstract_ops::same_value(a, b)
 }
 
 #[cfg(test)]
@@ -1582,6 +1693,23 @@ mod tests {
         let keys: Vec<String> =
             with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
         assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn integer_index_keys_sort_before_strings() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "b", Value::Boolean(true));
+        set(o, &mut heap, "10", Value::Boolean(true));
+        set(o, &mut heap, "2", Value::Boolean(true));
+        set(o, &mut heap, "a", Value::Boolean(true));
+        set(o, &mut heap, "1", Value::Boolean(true));
+        set(o, &mut heap, "01", Value::Boolean(true));
+        set(o, &mut heap, "4294967295", Value::Boolean(true));
+
+        let keys: Vec<String> =
+            with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
+        assert_eq!(keys, vec!["1", "2", "10", "b", "a", "01", "4294967295"]);
     }
 
     #[test]
@@ -1716,6 +1844,70 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_set_data_property_preserves_existing_attrs() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        assert!(define_own_property(
+            o,
+            &mut heap,
+            "x",
+            PropertyDescriptor::data(Value::Boolean(false), true, false, false),
+        ));
+
+        assert!(ordinary_set_data_property(
+            o,
+            &mut heap,
+            "x",
+            Value::Boolean(true)
+        ));
+
+        let got = get_own_descriptor(o, &heap, "x").unwrap();
+        assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(true))));
+        assert!(got.writable());
+        assert!(!got.enumerable());
+        assert!(!got.configurable());
+    }
+
+    #[test]
+    fn ordinary_set_data_property_rejects_non_writable_data() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        assert!(define_own_property(
+            o,
+            &mut heap,
+            "x",
+            PropertyDescriptor::data(Value::Boolean(false), false, true, true),
+        ));
+
+        assert!(!ordinary_set_data_property(
+            o,
+            &mut heap,
+            "x",
+            Value::Boolean(true)
+        ));
+
+        assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(false))));
+    }
+
+    #[test]
+    fn ordinary_set_data_property_respects_extensibility_for_new_keys() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+
+        assert!(ordinary_set_data_property(o, &mut heap, "x", Value::Null));
+        assert!(matches!(get(o, &heap, "x"), Some(Value::Null)));
+
+        prevent_extensions(o, &mut heap);
+        assert!(!ordinary_set_data_property(
+            o,
+            &mut heap,
+            "y",
+            Value::Boolean(true)
+        ));
+        assert!(get(o, &heap, "y").is_none());
+    }
+
+    #[test]
     fn freeze_makes_object_non_writable() {
         let mut heap = fresh_heap();
         let o = alloc_object(&mut heap).unwrap();
@@ -1763,5 +1955,13 @@ mod tests {
         );
         assert!(!delete(o, &mut heap, "x"));
         assert!(get(o, &heap, "x").is_some());
+    }
+
+    #[test]
+    fn delete_symbol_missing_key_succeeds() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        let sym = JsSymbol::new(None);
+        assert!(delete_symbol(o, &mut heap, &sym));
     }
 }

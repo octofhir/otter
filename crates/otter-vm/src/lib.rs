@@ -3009,12 +3009,22 @@ impl Interpreter {
                         continue;
                     }
                 }
+                Op::LoadElement => {
+                    if self.drive_load_element(stack, module, &operands)? {
+                        continue;
+                    }
+                }
                 // §10.1.9 [[Set]] — accessor setter dispatch follows
                 // the same pattern as `LoadProperty`. Non-writable
                 // and non-extensible rejections surface here too.
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
                     if self.drive_store_property(stack, module, &operands)? {
+                        continue;
+                    }
+                }
+                Op::StoreElement => {
+                    if self.drive_store_element(stack, module, &operands)? {
                         continue;
                     }
                 }
@@ -3776,32 +3786,32 @@ impl Interpreter {
                     let recv_reg = register_operand(operands.first())?;
                     let idx_reg = register_operand(operands.get(1))?;
                     let src_reg = register_operand(operands.get(2))?;
+                    let _scratch_reg = register_operand(operands.get(3))?;
                     let recv = read_register(frame, recv_reg)?.clone();
                     let idx_value = read_register(frame, idx_reg)?.clone();
                     let value = read_register(frame, src_reg)?.clone();
                     match (&recv, &idx_value) {
                         // Symbol-keyed write on an object.
                         (Value::Object(obj), Value::Symbol(sym)) => {
-                            crate::object::set_symbol(*obj, &mut self.gc_heap, sym.clone(), value);
+                            if !crate::object::set_symbol(
+                                *obj,
+                                &mut self.gc_heap,
+                                sym.clone(),
+                                value,
+                            ) {
+                                return Err(VmError::TypeMismatch);
+                            }
                         }
                         // Computed string-key write (`obj["k"] = …`).
                         (Value::Object(obj), Value::String(key)) => {
-                            crate::object::set(
-                                *obj,
-                                &mut self.gc_heap,
-                                &key.to_lossy_string(),
-                                value,
-                            );
+                            let key = key.to_lossy_string();
+                            self.store_computed_ordinary_property(*obj, &key, value)?;
                         }
                         // Computed numeric property write on
                         // ordinary objects, e.g. `arguments[0] = v`.
                         (Value::Object(obj), Value::Number(n)) => {
-                            crate::object::set(
-                                *obj,
-                                &mut self.gc_heap,
-                                &n.to_display_string(),
-                                value,
-                            );
+                            let key = n.to_display_string();
+                            self.store_computed_ordinary_property(*obj, &key, value)?;
                         }
                         // Computed write to built-in function
                         // metadata follows the same descriptor path
@@ -8021,18 +8031,53 @@ impl Interpreter {
             ];
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            let result = match self.invoke_proxy_trap(module, &proxy, "get", trap_args)? {
-                Some(v) => v,
-                None => {
-                    let target = proxy.target_object(&mut self.gc_heap);
-                    object::get(target, &self.gc_heap, &name).unwrap_or(Value::Undefined)
-                }
+            if let Some(value) = self.invoke_proxy_trap(module, &proxy, "get", trap_args)? {
+                write_register(&mut stack[top_idx], dst, value)?;
+                return Ok(true);
+            }
+            let Value::Object(target) = proxy.target() else {
+                return Err(VmError::TypeMismatch);
             };
-            write_register(&mut stack[top_idx], dst, result)?;
+            match crate::object::lookup(target, &self.gc_heap, &name) {
+                object::PropertyLookup::Data { value, .. } => {
+                    write_register(&mut stack[top_idx], dst, value)?;
+                }
+                object::PropertyLookup::Accessor { getter, .. } => match getter {
+                    Some(callee) if abstract_ops::is_callable(&callee) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(
+                            stack,
+                            module,
+                            &callee,
+                            Value::Proxy(proxy.clone()),
+                            args,
+                            dst,
+                        )?;
+                    }
+                    _ => {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                },
+                object::PropertyLookup::Absent => {
+                    write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                }
+            }
             return Ok(true);
         }
         let obj = match &receiver {
             Value::Object(o) => *o,
+            Value::ClassConstructor(c) => c.statics,
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let fid = *function_id;
+                match self.function_user_props.get(&fid).copied() {
+                    Some(bag) => bag,
+                    None => {
+                        let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                        self.function_user_props.insert(fid, new_bag);
+                        new_bag
+                    }
+                }
+            }
             _ => return Ok(false),
         };
         match crate::object::lookup(obj, &self.gc_heap, &name) {
@@ -8054,6 +8099,287 @@ impl Interpreter {
             }
             // Data or absent — fall through to the in-frame fast path.
             _ => Ok(false),
+        }
+    }
+
+    /// Drive one tick of [`Op::LoadElement`] for computed ordinary
+    /// object/proxy reads whose resolved descriptor is an accessor.
+    fn drive_load_element(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        enum ComputedPropertyKey {
+            String(String),
+            Symbol(crate::symbol::JsSymbol),
+        }
+
+        let dst = register_operand(operands.first())?;
+        let obj_reg = register_operand(operands.get(1))?;
+        let key_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let key_value = read_register(&stack[top_idx], key_reg)?.clone();
+        let key = match &key_value {
+            Value::String(s) => ComputedPropertyKey::String(s.to_lossy_string()),
+            Value::Number(n) => ComputedPropertyKey::String(n.to_display_string()),
+            Value::Symbol(sym) => ComputedPropertyKey::Symbol(sym.clone()),
+            _ => return Ok(false),
+        };
+
+        if let Value::Proxy(p) = &receiver {
+            let proxy = p.clone();
+            let key_arg = match &key {
+                ComputedPropertyKey::String(key) => {
+                    Value::String(JsString::from_str(key, &self.string_heap)?)
+                }
+                ComputedPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
+            };
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(), key_arg, Value::Proxy(proxy.clone()),];
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            if let Some(value) = self.invoke_proxy_trap(module, &proxy, "get", trap_args)? {
+                write_register(&mut stack[top_idx], dst, value)?;
+                return Ok(true);
+            }
+            let Value::Object(target) = proxy.target() else {
+                return Err(VmError::TypeMismatch);
+            };
+            let lookup = match &key {
+                ComputedPropertyKey::String(key) => {
+                    crate::object::lookup(target, &self.gc_heap, key)
+                }
+                ComputedPropertyKey::Symbol(sym) => {
+                    crate::object::lookup_symbol(target, &self.gc_heap, sym)
+                }
+            };
+            match lookup {
+                object::PropertyLookup::Data { value, .. } => {
+                    write_register(&mut stack[top_idx], dst, value)?;
+                }
+                object::PropertyLookup::Accessor { getter, .. } => match getter {
+                    Some(callee) if abstract_ops::is_callable(&callee) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, module, &callee, Value::Proxy(proxy), args, dst)?;
+                    }
+                    _ => {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                },
+                object::PropertyLookup::Absent => {
+                    write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                }
+            }
+            return Ok(true);
+        }
+
+        let obj = match &receiver {
+            Value::Object(obj) => *obj,
+            Value::ClassConstructor(class) => {
+                if matches!(&key, ComputedPropertyKey::String(key) if key == "prototype") {
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    write_register(&mut stack[top_idx], dst, Value::Object(class.prototype))?;
+                    return Ok(true);
+                }
+                class.statics
+            }
+            _ => return Ok(false),
+        };
+        let lookup = match &key {
+            ComputedPropertyKey::String(key) => crate::object::lookup(obj, &self.gc_heap, key),
+            ComputedPropertyKey::Symbol(sym) => {
+                crate::object::lookup_symbol(obj, &self.gc_heap, sym)
+            }
+        };
+        match lookup {
+            object::PropertyLookup::Data { value, .. } => {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                write_register(&mut stack[top_idx], dst, value)?;
+                Ok(true)
+            }
+            object::PropertyLookup::Accessor { getter, .. } => {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                match getter {
+                    Some(callee) if abstract_ops::is_callable(&callee) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, module, &callee, receiver, args, dst)?;
+                    }
+                    _ => {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Apply descriptor-aware data assignment for computed ordinary-object
+    /// writes (`obj[key] = value`).
+    fn store_computed_ordinary_property(
+        &mut self,
+        obj: JsObject,
+        key: &str,
+        value: Value,
+    ) -> Result<(), VmError> {
+        match crate::object::resolve_set(obj, &self.gc_heap, key) {
+            object::SetOutcome::AssignData => {
+                if object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value) {
+                    Ok(())
+                } else {
+                    Err(VmError::TypeMismatch)
+                }
+            }
+            object::SetOutcome::InvokeSetter { .. } => Err(VmError::TypeMismatch),
+            object::SetOutcome::Reject { .. } => Err(VmError::TypeMismatch),
+        }
+    }
+
+    /// Drive one tick of [`Op::StoreElement`] when a computed
+    /// string, numeric, or symbol property write on an ordinary
+    /// object/proxy must obey §10.1.9 OrdinarySet.
+    fn drive_store_element(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        module: &BytecodeModule,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let obj_reg = register_operand(operands.first())?;
+        let key_reg = register_operand(operands.get(1))?;
+        let src_reg = register_operand(operands.get(2))?;
+        let scratch_reg = register_operand(operands.get(3))?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let key_value = read_register(&stack[top_idx], key_reg)?.clone();
+        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        enum ComputedPropertyKey {
+            String(String),
+            Symbol(crate::symbol::JsSymbol),
+        }
+        let key = match &key_value {
+            Value::String(s) => ComputedPropertyKey::String(s.to_lossy_string()),
+            Value::Number(n) => ComputedPropertyKey::String(n.to_display_string()),
+            Value::Symbol(sym) => ComputedPropertyKey::Symbol(sym.clone()),
+            _ => return Ok(false),
+        };
+        if let Value::Proxy(p) = &receiver {
+            let proxy = p.clone();
+            let key_arg = match &key {
+                ComputedPropertyKey::String(key) => {
+                    Value::String(JsString::from_str(key, &self.string_heap)?)
+                }
+                ComputedPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
+            };
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(),
+                key_arg,
+                value.clone(),
+                Value::Proxy(proxy.clone()),
+            ];
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.invoke_proxy_trap(module, &proxy, "set", trap_args)? {
+                Some(_) => {}
+                None => {
+                    let Value::Object(target) = proxy.target() else {
+                        return Err(VmError::TypeMismatch);
+                    };
+                    let outcome = match &key {
+                        ComputedPropertyKey::String(key) => {
+                            object::resolve_set(target, &self.gc_heap, key)
+                        }
+                        ComputedPropertyKey::Symbol(sym) => {
+                            object::resolve_symbol_set(target, &self.gc_heap, sym)
+                        }
+                    };
+                    match outcome {
+                        object::SetOutcome::AssignData => {
+                            let ok = match &key {
+                                ComputedPropertyKey::String(key) => {
+                                    object::ordinary_set_data_property(
+                                        target,
+                                        &mut self.gc_heap,
+                                        key,
+                                        value,
+                                    )
+                                }
+                                ComputedPropertyKey::Symbol(sym) => object::set_symbol(
+                                    target,
+                                    &mut self.gc_heap,
+                                    sym.clone(),
+                                    value,
+                                ),
+                            };
+                            if !ok {
+                                return Err(VmError::TypeMismatch);
+                            }
+                        }
+                        object::SetOutcome::InvokeSetter { setter } => {
+                            if !abstract_ops::is_callable(&setter) {
+                                return Err(VmError::TypeMismatch);
+                            }
+                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                            args.push(value);
+                            self.invoke(
+                                stack,
+                                module,
+                                &setter,
+                                Value::Proxy(proxy.clone()),
+                                args,
+                                scratch_reg,
+                            )?;
+                        }
+                        object::SetOutcome::Reject { .. } => return Err(VmError::TypeMismatch),
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        let obj = match &receiver {
+            Value::Object(obj) => *obj,
+            Value::ClassConstructor(class) => class.statics,
+            _ => return Ok(false),
+        };
+        let outcome = match &key {
+            ComputedPropertyKey::String(key) => crate::object::resolve_set(obj, &self.gc_heap, key),
+            ComputedPropertyKey::Symbol(sym) => {
+                crate::object::resolve_symbol_set(obj, &self.gc_heap, sym)
+            }
+        };
+        match outcome {
+            object::SetOutcome::AssignData => {
+                let ok = match &key {
+                    ComputedPropertyKey::String(key) => {
+                        object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value)
+                    }
+                    ComputedPropertyKey::Symbol(sym) => {
+                        object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value)
+                    }
+                };
+                if !ok {
+                    return Err(VmError::TypeMismatch);
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                Ok(true)
+            }
+            object::SetOutcome::InvokeSetter { setter } => {
+                if !abstract_ops::is_callable(&setter) {
+                    return Err(VmError::TypeMismatch);
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                Ok(true)
+            }
+            object::SetOutcome::Reject { .. } => Err(VmError::TypeMismatch),
         }
     }
 
@@ -8103,23 +8429,66 @@ impl Interpreter {
                     except for boolean-rejection — foundation accepts. */
                 }
                 None => {
-                    let target = proxy.target_object(&mut self.gc_heap);
-                    object::set(target, &mut self.gc_heap, &name, value);
+                    let Value::Object(target) = proxy.target() else {
+                        return Err(VmError::TypeMismatch);
+                    };
+                    match object::resolve_set(target, &self.gc_heap, &name) {
+                        object::SetOutcome::AssignData => {
+                            if !object::ordinary_set_data_property(
+                                target,
+                                &mut self.gc_heap,
+                                &name,
+                                value,
+                            ) {
+                                return Err(VmError::TypeMismatch);
+                            }
+                        }
+                        object::SetOutcome::InvokeSetter { setter } => {
+                            if !abstract_ops::is_callable(&setter) {
+                                return Err(VmError::TypeMismatch);
+                            }
+                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                            args.push(value);
+                            self.invoke(
+                                stack,
+                                module,
+                                &setter,
+                                Value::Proxy(proxy.clone()),
+                                args,
+                                scratch_reg,
+                            )?;
+                        }
+                        object::SetOutcome::Reject { .. } => return Err(VmError::TypeMismatch),
+                    }
                 }
             }
-            let _ = scratch_reg;
             return Ok(true);
         }
         let obj = match &receiver {
             Value::Object(o) => *o,
+            Value::ClassConstructor(c) => c.statics,
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let fid = *function_id;
+                match self.function_user_props.get(&fid).copied() {
+                    Some(bag) => bag,
+                    None => {
+                        let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                        self.function_user_props.insert(fid, new_bag);
+                        new_bag
+                    }
+                }
+            }
             _ => return Ok(false),
         };
         let outcome = crate::object::resolve_set(obj, &self.gc_heap, &name);
         match outcome {
             object::SetOutcome::AssignData => {
-                // Fall through to the in-frame data-write path so
-                // the existing semantics keep applying.
-                Ok(false)
+                if !object::ordinary_set_data_property(obj, &mut self.gc_heap, &name, value) {
+                    return Err(VmError::TypeMismatch);
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                Ok(true)
             }
             object::SetOutcome::InvokeSetter { setter } => {
                 if !abstract_ops::is_callable(&setter) {

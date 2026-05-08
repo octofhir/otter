@@ -58,9 +58,9 @@ otter info
 The active developer loop is `init -> install/add/remove -> run/check/test -> diagnose/profile`.
 `run` is the single execution command for files, package scripts, and package
 binaries; there is no separate `exec` or `build` command in the current surface.
-Otter writes `otter-lock`, and can read `pnpm-lock.yaml`,
-`npm-shrinkwrap.json`, and `package-lock.json` for migration when `otter-lock`
-is not present.
+Otter writes `otter.lock`. When `otter.lock` is not present, `otter install`
+can import `pnpm-lock.yaml`, `npm-shrinkwrap.json`, or `package-lock.json`,
+materialize the recorded packages, and write the native lockfile.
 
 ### Permissions
 

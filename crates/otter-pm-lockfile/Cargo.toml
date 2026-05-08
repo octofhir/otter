@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Deterministic otter-lock model for Otter package management."
+description = "Deterministic otter.lock model for Otter package management."
 
 [lints]
 workspace = true

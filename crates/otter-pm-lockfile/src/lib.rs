@@ -1,14 +1,14 @@
-//! Deterministic `otter-lock` support for Otter package management.
+//! Deterministic `otter.lock` support for Otter package management.
 //!
 //! This crate owns the active lockfile wire model. The format is
 //! TOML-compatible text and intentionally diffable from the first PM slice.
 //! It records enough graph and lifecycle metadata for install/run integration,
 //! while leaving registry fetch and tarball extraction to later slices. It also
 //! includes read-only migration adapters for npm and pnpm lockfiles so projects
-//! can be inspected before writing a native `otter-lock`.
+//! can be inspected before writing a native `otter.lock`.
 //!
 //! # Contents
-//! - [`LOCKFILE_NAME`] — canonical filename, `otter-lock`.
+//! - [`LOCKFILE_NAME`] — canonical filename, `otter.lock`.
 //! - [`LockfileFormat`] — supported on-disk lockfile formats.
 //! - [`Lockfile`] — top-level graph document.
 //! - [`LockedPackage`] — one resolved package.
@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Canonical lockfile filename.
-pub const LOCKFILE_NAME: &str = "otter-lock";
+pub const LOCKFILE_NAME: &str = "otter.lock";
 
 /// npm lockfile filename.
 pub const PACKAGE_LOCK_JSON: &str = "package-lock.json";
@@ -88,19 +88,19 @@ pub fn project_lockfile_candidates(project_root: &Path) -> Vec<(PathBuf, Lockfil
     .collect()
 }
 
-/// Parse/serialize errors for `otter-lock`.
+/// Parse/serialize errors for `otter.lock`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LockfileError {
     /// TOML parsing failed.
-    #[error("invalid otter-lock TOML: {0}")]
+    #[error("invalid otter.lock TOML: {0}")]
     Parse(String),
     /// TOML serialization failed.
-    #[error("cannot serialize otter-lock: {0}")]
+    #[error("cannot serialize otter.lock: {0}")]
     Serialize(String),
 }
 
-/// A deterministic `otter-lock` package graph.
+/// A deterministic `otter.lock` package graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lockfile {
     /// Wire schema version.
@@ -126,7 +126,7 @@ impl Lockfile {
         Self::default()
     }
 
-    /// Parse from TOML-compatible `otter-lock` text.
+    /// Parse from TOML-compatible `otter.lock` text.
     pub fn parse_toml(text: &str) -> Result<Self, LockfileError> {
         toml::from_str(text).map_err(|err| LockfileError::Parse(err.to_string()))
     }
@@ -548,7 +548,7 @@ fn registry_id(name: &str, reference: &str) -> String {
     format!("{name}@npm:{reference}")
 }
 
-/// One resolved package entry in `otter-lock`.
+/// One resolved package entry in `otter.lock`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockedPackage {
     /// Package name.
@@ -686,8 +686,8 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_name_is_otter_lock() {
-        assert_eq!(LOCKFILE_NAME, "otter-lock");
+    fn lockfile_name_is_otter_dot_lock() {
+        assert_eq!(LOCKFILE_NAME, "otter.lock");
     }
 
     #[test]

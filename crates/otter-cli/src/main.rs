@@ -309,11 +309,11 @@ fn parse_strings(s: &str) -> Vec<String> {
 enum Command {
     /// Run a script file.
     Run(RunArgs),
-    /// Write or verify the project `otter-lock` without executing lifecycle scripts.
+    /// Write or verify the project `otter.lock` without executing lifecycle scripts.
     Install(InstallArgs),
-    /// Add dependencies to `package.json`, then refresh `otter-lock`.
+    /// Add dependencies to `package.json`, then refresh `otter.lock`.
     Add(AddArgs),
-    /// Remove dependencies from `package.json`, then refresh `otter-lock`.
+    /// Remove dependencies from `package.json`, then refresh `otter.lock`.
     Remove(RemoveArgs),
     /// Check registry versions newer than the installed lockfile.
     Outdated(OutdatedArgs),
@@ -1033,10 +1033,14 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
                 "lockfileChanged": report.lockfile_changed,
                 "addedPackages": report.added_packages,
                 "reusedPackages": report.reused_packages,
-                "linkedBins": report.linked_bins
+                "linkedBins": report.linked_bins,
+                "importedLockfile": report.imported_lockfile.map(|format| format.filename())
             })
         );
     } else if report.lockfile_changed {
+        if let Some(format) = report.imported_lockfile {
+            println!("imported {}", root.join(format.filename()).display());
+        }
         println!(
             "wrote {}",
             root.join(otter_pm_lockfile::LOCKFILE_NAME).display()

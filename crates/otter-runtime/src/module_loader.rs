@@ -1,14 +1,12 @@
 //! ES-module loader for the new engine — relative paths plus
 //! npm / `node_modules` / workspace resolution.
 //!
-//! Relative specifiers (`./x`, `../x`) and absolute `file://`
-//! URLs go through a hand-rolled path resolver with a fixed
-//! foundation extension list. Bare specifiers (`import x from
-//! "lodash"`), `@scope/pkg` packages, conditional `exports`
-//! maps, package `imports` maps, `node_modules` walk-up, and
-//! workspace cross-references go through [`oxc_resolver`] or the
-//! installed package graph DTO. The fallback filesystem resolver
-//! mirrors enhanced-resolve / Node.js's resolution algorithm.
+//! Relative specifiers (`./x`, `../x`), bare specifiers (`import x from
+//! "lodash"`), `@scope/pkg` packages, conditional `exports` maps, package
+//! `imports` maps, `node_modules` walk-up, and workspace cross-references go
+//! through [`oxc_resolver`]. Absolute `file://` URLs are canonicalised by the
+//! host loader. Package-manager-aware runs first consult the installed package
+//! graph DTO to enforce declared dependency edges and PM diagnostics.
 //!
 //! # Contents
 //! - [`ModuleLoader`] — resolves + reads a specifier's source.
@@ -34,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use otter_syntax::SourceKind;
-use oxc_resolver::{ResolveOptions, Resolver};
+use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 
 use crate::package_graph_resolver;
 
@@ -65,6 +63,12 @@ fn referrer_dir(referrer: Option<&str>) -> Option<PathBuf> {
         .map(Path::new)
         .and_then(|p| p.parent())
         .map(Path::to_path_buf)
+}
+
+fn referrer_file(referrer: Option<&str>) -> Option<PathBuf> {
+    referrer
+        .and_then(|r| r.strip_prefix("file://"))
+        .map(PathBuf::from)
 }
 
 /// One resolved + loaded module.
@@ -375,8 +379,7 @@ impl LoaderConfig {
 /// 1. If the specifier starts with `file://`, canonicalise the
 ///    path and return as-is.
 /// 2. If it starts with `./` or `../`, resolve against the
-///    referrer's parent directory through the foundation path
-///    resolver (`resolve_with_configured_extensions`).
+///    referrer's parent directory through [`oxc_resolver`].
 /// 3. If it is an absolute filesystem path, canonicalise.
 /// 4. If it starts with `npm:`, strip the prefix and treat as
 ///    a bare specifier (common runtime sugar).
@@ -427,11 +430,15 @@ impl ModuleLoader {
         let esm_options = ResolveOptions {
             extensions: config.extensions.clone(),
             condition_names: config.esm_conditions.clone(),
+            main_fields: vec!["module".into(), "main".into()],
+            tsconfig: Some(TsconfigDiscovery::Auto),
             ..ResolveOptions::default()
         };
         let cjs_options = ResolveOptions {
             extensions: config.extensions.clone(),
             condition_names: config.cjs_conditions.clone(),
+            main_fields: vec!["main".into(), "module".into()],
+            tsconfig: Some(TsconfigDiscovery::Auto),
             ..ResolveOptions::default()
         };
         let package_scope_cache = config
@@ -531,14 +538,32 @@ impl ModuleLoader {
         if specifier.starts_with("./") || specifier.starts_with("../") {
             let referrer_path =
                 referrer_dir(referrer).unwrap_or_else(|| self.config.base_dir.clone());
-            let candidate = referrer_path.join(specifier);
-            let resolved = resolve_with_configured_extensions(&candidate, &self.config.extensions)
-                .map_err(|e| LoaderError::Resolve {
+            let resolver = match kind {
+                ImportKind::Esm => &self.esm_resolver,
+                ImportKind::Cjs => &self.cjs_resolver,
+            };
+            return match resolve_with_oxc(
+                resolver,
+                referrer_file(referrer).as_deref(),
+                &referrer_path,
+                specifier,
+            ) {
+                Ok(resolution) => {
+                    let path = canonicalise(&resolution.full_path()).map_err(|e| {
+                        LoaderError::Resolve {
+                            specifier: specifier.to_string(),
+                            referrer: referrer.unwrap_or("<entry>").to_string(),
+                            message: e,
+                        }
+                    })?;
+                    Ok(format!("file://{}", path.display()))
+                }
+                Err(e) => Err(LoaderError::Resolve {
                     specifier: specifier.to_string(),
                     referrer: referrer.unwrap_or("<entry>").to_string(),
-                    message: e,
-                })?;
-            return Ok(format!("file://{}", resolved.display()));
+                    message: e.to_string(),
+                }),
+            };
         }
         if Path::new(specifier).is_absolute() {
             let path = canonicalise(Path::new(specifier)).map_err(|e| LoaderError::Resolve {
@@ -606,7 +631,7 @@ impl ModuleLoader {
             ImportKind::Esm => &self.esm_resolver,
             ImportKind::Cjs => &self.cjs_resolver,
         };
-        match resolver.resolve(&dir, bare) {
+        match resolve_with_oxc(resolver, referrer_file(referrer).as_deref(), &dir, bare) {
             Ok(resolution) => {
                 let path =
                     canonicalise(&resolution.full_path()).map_err(|e| LoaderError::Resolve {
@@ -679,6 +704,19 @@ impl ModuleLoader {
             message: e.to_string(),
         })?;
         Ok(ResolvedSource { url, kind, text })
+    }
+}
+
+fn resolve_with_oxc(
+    resolver: &Resolver,
+    referrer_file: Option<&Path>,
+    dir: &Path,
+    specifier: &str,
+) -> Result<oxc_resolver::Resolution, oxc_resolver::ResolveError> {
+    if let Some(referrer_file) = referrer_file {
+        resolver.resolve_file(referrer_file, specifier)
+    } else {
+        resolver.resolve(dir, specifier)
     }
 }
 
@@ -1176,6 +1214,92 @@ mod tests {
         let entry = loader.resolve("./entry.ts", None).unwrap();
         let scoped = loader.resolve("@scope/ns", Some(&entry)).unwrap();
         assert!(scoped.ends_with("lib.js"), "got {scoped}");
+    }
+
+    #[test]
+    fn disk_package_main_fields_are_resolved_by_import_kind() {
+        let dir = temp_dir();
+        let pkg = dir.path().join("node_modules").join("dual-main");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"dual-main","main":"cjs.js","module":"esm.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("esm.js"), "export let kind = 'esm';\n").unwrap();
+        std::fs::write(pkg.join("cjs.js"), "module.exports = { kind: 'cjs' };\n").unwrap();
+        std::fs::write(dir.path().join("entry.ts"), "// entry\n").unwrap();
+        let loader = ModuleLoader::new(dir.path().to_path_buf());
+        let entry = loader.resolve("./entry.ts", None).unwrap();
+
+        let esm = loader
+            .resolve_with_kind("dual-main", Some(&entry), ImportKind::Esm)
+            .unwrap();
+        let cjs = loader
+            .resolve_with_kind("dual-main", Some(&entry), ImportKind::Cjs)
+            .unwrap();
+
+        assert!(esm.ends_with("esm.js"), "esm got {esm}");
+        assert!(cjs.ends_with("cjs.js"), "cjs got {cjs}");
+    }
+
+    #[test]
+    fn tsconfig_paths_are_resolved_by_oxc_resolver() {
+        let dir = temp_dir();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{
+              "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                  "@/*": ["src/*"]
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("util.ts"), "export let value = 1;\n").unwrap();
+        std::fs::write(dir.path().join("entry.ts"), "// entry\n").unwrap();
+        let loader = ModuleLoader::new(dir.path().to_path_buf());
+        let entry = loader.resolve("./entry.ts", None).unwrap();
+
+        let resolved = loader.resolve("@/util", Some(&entry)).unwrap();
+
+        assert!(resolved.ends_with("src/util.ts"), "got {resolved}");
+    }
+
+    #[test]
+    fn tsconfig_extends_paths_are_resolved_by_oxc_resolver() {
+        let dir = temp_dir();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.base.json"),
+            r##"{
+              "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                  "#shared/*": ["src/*"]
+                }
+              }
+            }"##,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"extends":"./tsconfig.base.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("shared.ts"), "export let value = 1;\n").unwrap();
+        std::fs::write(dir.path().join("entry.ts"), "// entry\n").unwrap();
+        let loader = ModuleLoader::new(dir.path().to_path_buf());
+        let entry = loader.resolve("./entry.ts", None).unwrap();
+
+        let resolved = loader.resolve("#shared/shared", Some(&entry)).unwrap();
+
+        assert!(resolved.ends_with("src/shared.ts"), "got {resolved}");
     }
 
     #[test]

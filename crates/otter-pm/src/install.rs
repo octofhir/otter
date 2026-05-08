@@ -185,8 +185,10 @@ fn materialization_tarball_url(
     kind: ResolvedSourceKind,
     reference: &str,
 ) -> String {
-    if kind == ResolvedSourceKind::Tarball
-        && let Some(path) = reference.strip_prefix("file:")
+    if matches!(
+        kind,
+        ResolvedSourceKind::Registry | ResolvedSourceKind::Tarball
+    ) && let Some(path) = reference.strip_prefix("file:")
     {
         return project_root.join(path).to_string_lossy().into_owned();
     }

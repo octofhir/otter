@@ -178,7 +178,7 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 
 | ID  | Scope                                                                                               | Status | Commit |
 |-----|-----------------------------------------------------------------------------------------------------|--------|--------|
-| T1  | `otter install` / `otter add` / `otter remove` / `otter outdated` — flat PM CLI, npm registry + tarball, npm/pnpm lockfile import | [x]    | 39b8be4 |
+| T1  | `otter install` / `otter add` / `otter remove` / `otter outdated` — flat PM CLI, npm registry + tarball, npm/pnpm lockfile import + native migration write | [x]    | 39b8be4 |
 | T2  | `otter.lock` format (deterministic, diffable)                                                      | [x]    | 39b8be4 |
 | T3  | Workspace support (monorepo: `workspaces: [...]` in package.json)                                  | [ ]    |        |
 | T4  | `otter build` — TS/JS bundler backed by oxc, outputs ES modules + source maps                     | [ ]    |        |

@@ -22,10 +22,10 @@ first-party `otter build` command in this phase.
 | Command | Behavior |
 |---|---|
 | `otter init [-y]` | Create `package.json` with Otter defaults. |
-| `otter install` | Resolve the project, fetch registry metadata and tarballs, materialize `node_modules`, link package bins, and write `otter-lock`. Lifecycle scripts are recorded but not executed. |
+| `otter install` | Resolve the project or import an existing npm/pnpm lockfile, fetch registry metadata and tarballs, materialize `node_modules`, link package bins, and write `otter.lock`. Lifecycle scripts are recorded but not executed. |
 | `otter add <pkg[@range]>` | Mutate the selected manifest dependency bucket, then run the install flow. |
-| `otter remove <pkg>` | Remove the package from dependency buckets, refresh `otter-lock`, and prune removed registry packages and bin links. |
-| `otter outdated` | Read the manifest, lockfile, and registry metadata, then print a semver-aware outdated table. It does not mutate `package.json`, `otter-lock`, or `node_modules`. |
+| `otter remove <pkg>` | Remove the package from dependency buckets, refresh `otter.lock`, and prune removed registry packages and bin links. |
+| `otter outdated` | Read the manifest, lockfile, and registry metadata, then print a semver-aware outdated table. It does not mutate `package.json`, `otter.lock`, or `node_modules`. |
 | `otter run <target>` | Resolve a path first, then a package script, then a local package binary. |
 | `otter check <file>` | Compile through the same module resolver and package graph as `run`, without executing user code. |
 | `otter test` | Run the test harness through the same runtime session and package graph as `run`. |
@@ -37,11 +37,11 @@ lifecycle script execution remain capability-gated.
 
 ## Lockfile Migration
 
-Otter's native lockfile is `otter-lock`. It is the only lockfile format Otter
+Otter's native lockfile is `otter.lock`. It is the only lockfile format Otter
 writes.
 
-For migration, read paths accept existing npm and pnpm lockfiles when
-`otter-lock` is not present:
+For migration, Otter accepts existing npm and pnpm lockfiles when `otter.lock`
+is not present:
 
 1. `pnpm-lock.yaml`
 2. `npm-shrinkwrap.json`
@@ -50,14 +50,16 @@ For migration, read paths accept existing npm and pnpm lockfiles when
 Those files are normalized into the runtime package graph in memory. This lets
 commands such as `otter run`, `otter check`, `otter test`, `otter remove`, and
 `otter outdated` work against already materialized `node_modules` during a
-migration. Running `otter install` writes a native `otter-lock`; lifecycle
-scripts from foreign lockfiles are not executed.
+migration. `otter install` also consumes the foreign lockfile, materializes the
+recorded tarballs, records package metadata from extracted manifests, and writes
+a native `otter.lock`. Lifecycle scripts from foreign lockfiles are not
+executed.
 
 ## Outdated
 
 `otter outdated` compares three versions:
 
-- `Current`: installed version from `otter-lock`.
+- `Current`: installed version from `otter.lock`.
 - `Wanted`: newest registry version satisfying the manifest range.
 - `Latest`: registry `latest` dist-tag, falling back to the highest semver
   version when the tag is missing.

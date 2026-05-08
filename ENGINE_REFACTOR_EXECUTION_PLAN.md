@@ -107,8 +107,9 @@ plan extends rather than re-files.
 ### Package Manager
 
 - Add active package-manager crates under `crates/*` with the canonical package
-  names `otter-pm-manifest`, `otter-pm-lockfile`, and `otter-pm`. The parked
-  `crates-legacy/otter-pm*` crates remain reference-only until deleted.
+  names `otter-pm-manifest`, `otter-pm-lockfile`, and `otter-pm`. The old
+  parked `crates-legacy/otter-pm*` crates have been deleted; PM reference code
+  is no longer kept under `crates-legacy`.
 - Package manager owns package.json parsing, dependency resolution (npm
   semver, workspace, file, tarball; git deferred), registry fetch, integrity
   verification, tarball extraction, content-addressed cache, lockfile,
@@ -123,10 +124,9 @@ plan extends rather than re-files.
 - Lifecycle scripts are not a P0 execution requirement. P0 records their
   presence, lockfile metadata, and trust state; execution is disabled by
   default until the subprocess/capability policy is explicit and tested.
-- Lockfile filename: `otter-lock`. Format: TOML-compatible deterministic text
+- Lockfile filename: `otter.lock`. Format: TOML-compatible deterministic text
   using the workspace `toml` dependency. It must be diffable from the first
-  slice. Parked `crates-legacy/otter-pm-lockfile` is reference only; do not
-  import it.
+  slice.
 
 ## P0: Core Refactor And Package Manager
 
@@ -165,7 +165,7 @@ Acceptance:
 - [x] `otter-pm-manifest`: package.json + workspace manifest types, parse +
   validate, deterministic serialize. Include npm `workspaces` glob support and
   `pnpm-workspace.yaml` support in P0.
-- [x] `otter-pm-lockfile`: deterministic `otter-lock` (TOML-compatible text)
+- [x] `otter-pm-lockfile`: deterministic `otter.lock` (TOML-compatible text)
   with stable key
   ordering. Roundtrip tests.
 - [x] `otter-pm`: public `PackageGraph`, `PackageId`, `PackageRoot`,
@@ -179,7 +179,7 @@ Acceptance:
 - [x] Add CLI command foundations in `otter-cli`: interactive `otter init`
   (`--yes` for CI), `otter install`, `otter add`, `otter remove`, and
   `otter outdated` for semver-aware dependency freshness diagnostics. Mutating
-  commands refresh manifests plus deterministic `otter-lock`; `outdated` is
+  commands refresh manifests plus deterministic `otter.lock`; `outdated` is
   read-only. These explicit package-manager commands do not require runtime
   capability flags.
 - [x] Define and wire initial `otter run <target> [args...]` resolution:
@@ -204,8 +204,11 @@ Acceptance:
   surface does not list a separate `exec` command.
 - [x] Add read-only migration adapters for `pnpm-lock.yaml`,
   `npm-shrinkwrap.json`, and `package-lock.json`; normalize them into the
-  native in-memory lock graph when `otter-lock` is absent. Otter still writes
-  only `otter-lock`.
+  native in-memory lock graph when `otter.lock` is absent. Otter still writes
+  only `otter.lock`.
+- [x] Make `otter install` consume a compatible npm/pnpm lockfile when
+  `otter.lock` is absent, materialize the recorded tarballs, then write native
+  `otter.lock` so migration is a one-command path.
 - [x] Define `otter run <target> [args...]` resolution order: explicit path or
   URL entrypoint first, `package.json#scripts` second, local package binary
   third. Ambiguous targets must produce a diagnostic with the candidates and
@@ -270,28 +273,37 @@ Acceptance:
 - [ ] Build the runtime resolver on top of `oxc_resolver` (already a workspace
   dep and used in `crates/otter-runtime/src/module_loader.rs`); do not write a
   parallel resolver.
+  - [x] Route filesystem relative specifiers, disk bare package lookup,
+    conditional `exports`/`imports`, and disk package `module`/`main` fields
+    through `oxc_resolver`; keep runtime-local code only for `file://`
+    canonicalization and PM graph DTO gating/diagnostics.
 - [x] Add a `PackageGraph` lookup hook so the resolver consults the PM
-  `otter-lock` graph instead of walking only `node_modules` on disk.
+  `otter.lock` graph instead of walking only `node_modules` on disk.
   - [x] Enforce graph-gated bare package imports for graph-contained
     importers while allowing package self-reference by package name.
 - [x] Implement package scope lookup from `package.json` (cached per
   directory).
   - [x] Add runtime-local package scope cache for graph-backed package roots
     with longest containing root wins.
-- [ ] Implement ESM/CJS package-type detection (`type` field, file extension).
+- [x] Implement ESM/CJS package-type detection (`type` field, file extension).
   - [x] Use graph-backed nearest package `type` for ambiguous
     `.js`/`.ts`/`.jsx`/`.tsx` entry files while preserving hard
     `.mjs`/`.mts` and `.cjs`/`.cts` extension overrides.
 - [ ] Implement `exports`, `imports`, `main`, `module`, conditional resolution
   for the foundation condition set (`default`, `import`, `node`, `otter`).
+  - [x] Disk package `exports` / `imports` / `main` / `module` resolution goes
+    through `oxc_resolver` with ESM and CJS condition/main-field sets.
   - [x] Package `imports` foundation: exact `#alias` string mappings and
     condition-object mappings through `LoaderPackageRoot.imports`.
 - [x] Implement extension probing through the fixed ordered list already in
   `LoaderConfig`.
-- [ ] Implement JSON module loading (`with { type: 'json' }` plus
+- [x] Implement JSON module loading (`with { type: 'json' }` plus
   `.json` extension behaviour).
 - [ ] Implement `tsconfig.json` `extends`, `baseUrl`, `paths`, plus
   `compilerOptions.jsx` reading at resolve time.
+  - [x] Resolve `extends`, `baseUrl`, and `paths` through
+    `oxc_resolver::TsconfigDiscovery::Auto` using importer-file-aware
+    resolution.
 - [ ] Add resolver diagnostics with exact importer/specifier/condition context.
 
 Acceptance:
@@ -521,12 +533,12 @@ cargo run -p otter-cli -- test
   builders.
 - [ ] Remove runtime bridges once the runtime hook set owns them.
 - [ ] Remove stale docs that describe compatibility shims as current behavior.
-- [ ] After active PM crates land, decide whether to delete parked
-  `crates-legacy/otter-pm*` or keep them with a documented exit condition.
+- [x] Delete parked `crates-legacy/otter-pm*`; active PM crates under
+  `crates/*` are the only package-manager implementation.
 
 ## Open Questions
 
 - None for P0.2 naming and UX: active crate names are `otter-pm-manifest`,
-  `otter-pm-lockfile`, `otter-pm`; lockfile filename is `otter-lock`;
+  `otter-pm-lockfile`, `otter-pm`; lockfile filename is `otter.lock`;
   package-manager commands do not require runtime capability flags;
   `pnpm-workspace.yaml` is P0.

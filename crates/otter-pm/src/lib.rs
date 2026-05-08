@@ -352,6 +352,8 @@ pub struct InstallReport {
     pub linked_bins: usize,
     /// Whether the lockfile changed.
     pub lockfile_changed: bool,
+    /// Source lockfile format imported during this install, if any.
+    pub imported_lockfile: Option<otter_pm_lockfile::LockfileFormat>,
 }
 
 /// Result of pruning packages no longer present in the lockfile.
@@ -373,7 +375,7 @@ pub struct LocalResolution {
 }
 
 /// Resolve, cache metadata, download/extract registry tarballs, materialize
-/// `node_modules`, and write a deterministic `otter-lock`.
+/// `node_modules`, and write a deterministic `otter.lock`.
 pub async fn install_local_project(
     project_root: impl AsRef<Path>,
     metadata_cache: &FsRegistryMetadataCache,
@@ -382,9 +384,35 @@ pub async fn install_local_project(
     tarball_client: &impl TarballFetchClient,
 ) -> Result<InstallReport, PackageManagerError> {
     let project_root = project_root.as_ref();
-    let mut resolution =
-        resolve_local_project_with_registry_metadata(project_root, metadata_cache, metadata_client)
+    let (mut resolution, imported_lockfile) =
+        if !tokio::fs::try_exists(project_root.join(otter_pm_lockfile::LOCKFILE_NAME))
+            .await
+            .map_err(|err| PackageManagerError::Io {
+                path: project_root.join(otter_pm_lockfile::LOCKFILE_NAME),
+                message: err.to_string(),
+            })?
+            && let Some((format, mut lockfile)) = read_migration_lockfile(project_root).await?
+        {
+            enrich_imported_lockfile_with_registry_metadata(
+                &mut lockfile,
+                metadata_cache,
+                metadata_client,
+            )
             .await?;
+            let mut resolution = resolve_local_project(project_root).await?;
+            resolution.lockfile = lockfile;
+            (resolution, Some(format))
+        } else {
+            (
+                resolve_local_project_with_registry_metadata(
+                    project_root,
+                    metadata_cache,
+                    metadata_client,
+                )
+                .await?,
+                None,
+            )
+        };
     let mut final_installed = BTreeMap::new();
     let mut added_package_ids = BTreeSet::new();
     let mut completed = false;
@@ -423,7 +451,81 @@ pub async fn install_local_project(
             .map(|package| package.linked_bins)
             .sum(),
         lockfile_changed,
+        imported_lockfile,
     })
+}
+
+async fn read_migration_lockfile(
+    project_root: &Path,
+) -> Result<Option<(otter_pm_lockfile::LockfileFormat, Lockfile)>, PackageManagerError> {
+    for format in [
+        otter_pm_lockfile::LockfileFormat::Pnpm,
+        otter_pm_lockfile::LockfileFormat::NpmShrinkwrap,
+        otter_pm_lockfile::LockfileFormat::PackageLock,
+    ] {
+        let path = project_root.join(format.filename());
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(PackageManagerError::Io {
+                    path,
+                    message: err.to_string(),
+                });
+            }
+        };
+        let lockfile = Lockfile::parse_format(format, &text)?;
+        return Ok(Some((format, lockfile)));
+    }
+    Ok(None)
+}
+
+async fn enrich_imported_lockfile_with_registry_metadata(
+    lockfile: &mut Lockfile,
+    metadata_cache: &FsRegistryMetadataCache,
+    metadata_client: &impl RegistryMetadataClient,
+) -> Result<(), PackageManagerError> {
+    for package in lockfile.packages.values_mut() {
+        let Some(ResolvedSource {
+            kind: ResolvedSourceKind::Registry,
+            reference,
+        }) = &package.resolved
+        else {
+            continue;
+        };
+        let has_tarball = is_tarball_reference(reference);
+        let needs_metadata = !has_tarball || package.integrity.is_none();
+        if !needs_metadata {
+            continue;
+        }
+        let metadata = metadata_cache
+            .get_or_fetch(&package.name, metadata_client)
+            .await?;
+        let version = metadata.versions.get(&package.version).ok_or_else(|| {
+            PackageManagerError::NoMatchingVersion {
+                package: package.name.clone(),
+                range: format!("={}", package.version),
+            }
+        })?;
+        if !has_tarball {
+            package.resolved = version.dist.tarball.as_ref().map(|tarball| ResolvedSource {
+                kind: ResolvedSourceKind::Registry,
+                reference: tarball.clone(),
+            });
+        }
+        if package.integrity.is_none() {
+            package.integrity = version
+                .dist
+                .integrity
+                .clone()
+                .or_else(|| version.dist.shasum.as_ref().map(|s| format!("sha1-{s}")));
+        }
+        package.lifecycle = LifecycleMetadata {
+            scripts: version.scripts.clone(),
+            trust: TrustState::Untrusted,
+        };
+    }
+    Ok(())
 }
 
 async fn apply_tarball_manifest_metadata(
@@ -436,13 +538,11 @@ async fn apply_tarball_manifest_metadata(
         let Some(locked) = resolution.lockfile.packages.get(&package.package_id) else {
             continue;
         };
-        if !matches!(
-            &locked.resolved,
-            Some(ResolvedSource {
-                kind: ResolvedSourceKind::Tarball,
-                ..
-            })
-        ) {
+        if !locked
+            .resolved
+            .as_ref()
+            .is_some_and(|source| is_tarball_reference(&source.reference))
+        {
             continue;
         }
         let manifest = PackageManifest::read_from_dir(&package.installed_root).await?;
@@ -470,8 +570,13 @@ async fn apply_tarball_manifest_metadata(
             if let Some(version) = &manifest.version {
                 locked.version = version.clone();
             }
+            let lifecycle_scripts = if manifest.scripts.is_empty() {
+                locked.lifecycle.scripts.clone()
+            } else {
+                manifest.scripts.clone()
+            };
             locked.lifecycle = LifecycleMetadata {
-                scripts: manifest.scripts.clone(),
+                scripts: lifecycle_scripts,
                 trust: TrustState::Untrusted,
             };
         }
@@ -594,7 +699,7 @@ pub async fn resolve_local_project(
     Ok(LocalResolution { graph, lockfile })
 }
 
-/// Write a deterministic `otter-lock` for the local project and return whether
+/// Write a deterministic `otter.lock` for the local project and return whether
 /// the bytes changed.
 pub async fn write_local_lockfile(
     project_root: impl AsRef<Path>,
@@ -605,7 +710,7 @@ pub async fn write_local_lockfile(
 }
 
 /// Resolve a local project with registry metadata enrichment, write
-/// deterministic `otter-lock`, and return whether the bytes changed.
+/// deterministic `otter.lock`, and return whether the bytes changed.
 pub async fn write_local_lockfile_with_registry_metadata(
     project_root: impl AsRef<Path>,
     cache: &FsRegistryMetadataCache,
@@ -912,6 +1017,9 @@ fn infer_project_root(graph: &PackageGraph) -> PathBuf {
 fn is_tarball_reference(reference: &str) -> bool {
     reference.ends_with(".tgz")
         || reference.ends_with(".tar.gz")
+        || reference
+            .strip_prefix("file:")
+            .is_some_and(|path| path.ends_with(".tgz") || path.ends_with(".tar.gz"))
         || reference.starts_with("http://")
         || reference.starts_with("https://")
 }
@@ -1797,7 +1905,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let lockfile_first = tokio::fs::read_to_string(project.join("otter-lock"))
+        let lockfile_first = tokio::fs::read_to_string(project.join("otter.lock"))
             .await
             .unwrap();
         let second = install_local_project(
@@ -1809,12 +1917,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let lockfile_second = tokio::fs::read_to_string(project.join("otter-lock"))
+        let lockfile_second = tokio::fs::read_to_string(project.join("otter.lock"))
             .await
             .unwrap();
 
         assert!(first.lockfile_changed);
         assert_eq!(first.added_packages, 1);
+        assert_eq!(first.imported_lockfile, None);
         assert_eq!(first.linked_bins, 1);
         assert!(!second.lockfile_changed);
         assert_eq!(second.reused_packages, 1);
@@ -1827,6 +1936,79 @@ mod tests {
         let bins = graph.resolve_bin("tool");
         assert_eq!(bins.len(), 1);
         assert!(bins[0].path.ends_with("node_modules/.bin/tool"));
+    }
+
+    #[tokio::test]
+    async fn install_local_project_imports_package_lock_without_reresolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let tarballs = tmp.path().join("tarballs");
+        let tarball = npm_tgz(&[
+            (
+                "package/package.json",
+                r#"{"name":"tool","version":"1.2.0","scripts":{"postinstall":"node setup.js"},"bin":{"tool":"./bin.js"}}"#,
+            ),
+            ("package/bin.js", "#!/usr/bin/env otter\nundefined;\n"),
+        ]);
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tarball))
+        );
+        let url = "https://registry.npmjs.org/tool/-/tool-1.2.0.tgz";
+        write(
+            &project.join("package.json"),
+            r#"{"name":"app","version":"0.1.0","dependencies":{"tool":"^1.0.0"}}"#,
+        )
+        .await;
+        write(
+            &project.join("package-lock.json"),
+            &format!(
+                r#"{{
+  "name": "app",
+  "version": "0.1.0",
+  "lockfileVersion": 3,
+  "packages": {{
+    "": {{
+      "name": "app",
+      "version": "0.1.0",
+      "dependencies": {{ "tool": "^1.0.0" }}
+    }},
+    "node_modules/tool": {{
+      "version": "1.2.0",
+      "resolved": "{url}",
+      "integrity": "{integrity}"
+    }}
+  }}
+}}"#
+            ),
+        )
+        .await;
+        write_bytes(&tarballs.join(cache_key(url)), &tarball).await;
+
+        let report = install_local_project(
+            &project,
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(tmp.path().join("registry")),
+            &FsPackageStore::new(tmp.path().join("package-cache")),
+            &FileTarballClient::new(&tarballs),
+        )
+        .await
+        .unwrap();
+        let lockfile = tokio::fs::read_to_string(project.join("otter.lock"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.imported_lockfile,
+            Some(otter_pm_lockfile::LockfileFormat::PackageLock)
+        );
+        assert!(report.lockfile_changed);
+        assert_eq!(report.added_packages, 1);
+        assert!(lockfile.contains("[packages.\"tool@npm:^1.0.0\"]"));
+        assert!(lockfile.contains("version = \"1.2.0\""));
+        assert!(lockfile.contains("postinstall = \"node setup.js\""));
+        assert!(project.join("node_modules/tool/bin.js").is_file());
+        assert!(project.join("node_modules/.bin/tool").is_file());
     }
 
     #[tokio::test]
@@ -1892,7 +2074,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let lockfile = tokio::fs::read_to_string(project.join("otter-lock"))
+        let lockfile = tokio::fs::read_to_string(project.join("otter.lock"))
             .await
             .unwrap();
 
@@ -1936,7 +2118,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let lockfile = tokio::fs::read_to_string(project.join("otter-lock"))
+        let lockfile = tokio::fs::read_to_string(project.join("otter.lock"))
             .await
             .unwrap();
 
@@ -1991,7 +2173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_project_can_import_package_lock_without_otter_lock() {
+    async fn installed_project_can_import_package_lock_without_otter_lockfile() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         write(

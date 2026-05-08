@@ -6,7 +6,7 @@
 //!
 //! # Contents
 //! - [`resolve_installed_project`] rebuilds a read-only [`PackageGraph`] from
-//!   `package.json`, `otter-lock` or compatible npm/pnpm lockfiles, and
+//!   `package.json`, `otter.lock` or compatible npm/pnpm lockfiles, and
 //!   already materialized `node_modules`.
 //! - [`prune_removed_registry_packages`] removes registry package roots and
 //!   project-local bin links that disappeared from the lockfile.

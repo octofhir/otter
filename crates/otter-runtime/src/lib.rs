@@ -2297,6 +2297,36 @@ mod tests {
     }
 
     #[test]
+    fn module_program_imports_json_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.json"), r#"{"answer":42}"#).unwrap();
+        std::fs::write(
+            dir.path().join("entry.ts"),
+            "import data from \"./data.json\";\nfunction fail() { return undefined.x; }\nif (data.answer !== 42) fail();\n",
+        )
+        .unwrap();
+
+        Otter::new()
+            .blocking_run_file(dir.path().join("entry.ts"))
+            .unwrap();
+    }
+
+    #[test]
+    fn module_program_imports_json_with_type_attribute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.json"), r#"{"answer":42}"#).unwrap();
+        std::fs::write(
+            dir.path().join("entry.ts"),
+            "import data from \"./data.json\" with { type: \"json\" };\nfunction fail() { return undefined.x; }\nif (data.answer !== 42) fail();\n",
+        )
+        .unwrap();
+
+        Otter::new()
+            .blocking_run_file(dir.path().join("entry.ts"))
+            .unwrap();
+    }
+
+    #[test]
     fn module_program_imports_package_from_loader_graph() {
         let dir = tempfile::tempdir().unwrap();
         let app = dir.path().join("app");

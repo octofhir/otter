@@ -1,0 +1,35 @@
+error[E0277]: `Rc<Cell<u32>>` cannot be shared between threads safely
+  --> tests/compile_fail/runtime_hook_non_send_sync_rejected.rs:12:32
+   |
+12 | impl RuntimeDiagnosticHook for LocalDiagnosticHook {
+   |                                ^^^^^^^^^^^^^^^^^^^ `Rc<Cell<u32>>` cannot be shared between threads safely
+   |
+   = help: within `LocalDiagnosticHook`, the trait `Sync` is not implemented for `Rc<Cell<u32>>`
+note: required because it appears within the type `LocalDiagnosticHook`
+  --> tests/compile_fail/runtime_hook_non_send_sync_rejected.rs:8:8
+   |
+ 8 | struct LocalDiagnosticHook {
+   |        ^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `RuntimeDiagnosticHook`
+  --> src/hooks.rs
+   |
+   | pub trait RuntimeDiagnosticHook: Send + Sync + 'static {
+   |                                         ^^^^ required by this bound in `RuntimeDiagnosticHook`
+
+error[E0277]: `Rc<Cell<u32>>` cannot be sent between threads safely
+  --> tests/compile_fail/runtime_hook_non_send_sync_rejected.rs:12:32
+   |
+12 | impl RuntimeDiagnosticHook for LocalDiagnosticHook {
+   |                                ^^^^^^^^^^^^^^^^^^^ `Rc<Cell<u32>>` cannot be sent between threads safely
+   |
+   = help: within `LocalDiagnosticHook`, the trait `Send` is not implemented for `Rc<Cell<u32>>`
+note: required because it appears within the type `LocalDiagnosticHook`
+  --> tests/compile_fail/runtime_hook_non_send_sync_rejected.rs:8:8
+   |
+ 8 | struct LocalDiagnosticHook {
+   |        ^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `RuntimeDiagnosticHook`
+  --> src/hooks.rs
+   |
+   | pub trait RuntimeDiagnosticHook: Send + Sync + 'static {
+   |                                  ^^^^ required by this bound in `RuntimeDiagnosticHook`

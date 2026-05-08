@@ -22,7 +22,7 @@ first-party `otter build` command in this phase.
 | Command | Behavior |
 |---|---|
 | `otter init [-y]` | Create `package.json` with Otter defaults. |
-| `otter install` | Resolve the project or import an existing npm/pnpm lockfile, fetch registry metadata and tarballs, materialize `node_modules`, link package bins, and write `otter.lock`. Lifecycle scripts are recorded but not executed. |
+| `otter install` | Resolve the project or import an existing npm/pnpm lockfile, fetch registry metadata and tarballs, materialize `node_modules`, link package bins, run install lifecycle hooks, and write `otter.lock`. |
 | `otter add <pkg[@range]>` | Mutate the selected manifest dependency bucket, then run the install flow. |
 | `otter remove <pkg>` | Remove the package from dependency buckets, refresh `otter.lock`, and prune removed registry packages and bin links. |
 | `otter outdated` | Read the manifest, lockfile, and registry metadata, then print a semver-aware outdated table. It does not mutate `package.json`, `otter.lock`, or `node_modules`. |
@@ -31,9 +31,9 @@ first-party `otter build` command in this phase.
 | `otter test` | Run the test harness through the same runtime session and package graph as `run`. |
 
 Package-manager commands are explicit first-party CLI operations. Registry
-network access and project/cache filesystem writes are not gated by runtime
-capability flags. Runtime APIs, dynamic imports, hosted APIs, and future
-lifecycle script execution remain capability-gated.
+network access, project/cache filesystem writes, and install lifecycle
+subprocesses are not gated by runtime capability flags. Runtime APIs, dynamic
+imports, and hosted APIs remain capability-gated.
 
 ## Lockfile Migration
 
@@ -51,9 +51,24 @@ Those files are normalized into the runtime package graph in memory. This lets
 commands such as `otter run`, `otter check`, `otter test`, `otter remove`, and
 `otter outdated` work against already materialized `node_modules` during a
 migration. `otter install` also consumes the foreign lockfile, materializes the
-recorded tarballs, records package metadata from extracted manifests, and writes
-a native `otter.lock`. Lifecycle scripts from foreign lockfiles are not
-executed.
+recorded tarballs, records package metadata from extracted manifests, runs
+available install lifecycle hooks, and writes a native `otter.lock`.
+
+## Lifecycle Hooks
+
+Otter runs package lifecycle scripts during explicit package-manager installs.
+The install hook subset follows pnpm's dependency install path:
+
+1. `preinstall`
+2. `install`
+3. `postinstall`
+
+Ordinary package scripts such as `build`, `test`, or `prepare` are not treated
+as install lifecycle hooks. For extracted package tarballs, Otter also records
+and runs pnpm/npm-compatible implicit `install = "node-gyp rebuild"` when a
+package has `binding.gyp` and no explicit `preinstall` or `install` script.
+Lifecycle scripts run with the package root as the working directory and
+project-local `node_modules/.bin` on `PATH`.
 
 ## Outdated
 

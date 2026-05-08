@@ -48,6 +48,13 @@ pub const PNPM_LOCK_YAML: &str = "pnpm-lock.yaml";
 /// Current lockfile schema version.
 pub const LOCKFILE_VERSION: u32 = 1;
 
+/// pnpm-style install lifecycle hooks recorded for future execution policy.
+///
+/// pnpm's install-time package hook runner checks `preinstall`, then `install`,
+/// then `postinstall`. Otter records the same hook subset and order, but does
+/// not execute any lifecycle scripts in P0.
+pub const INSTALL_LIFECYCLE_SCRIPT_ORDER: &[&str] = &["preinstall", "install", "postinstall"];
+
 /// Supported on-disk lockfile formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockfileFormat {
@@ -595,6 +602,9 @@ pub enum ResolvedSourceKind {
 /// Recorded lifecycle script policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleMetadata {
+    /// Install lifecycle hooks present, in pnpm execution order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
     /// Lifecycle scripts present in the package manifest.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scripts: BTreeMap<String, String>,
@@ -605,10 +615,68 @@ pub struct LifecycleMetadata {
 impl Default for LifecycleMetadata {
     fn default() -> Self {
         Self {
+            hooks: Vec::new(),
             scripts: BTreeMap::new(),
             trust: TrustState::Untrusted,
         }
     }
+}
+
+impl LifecycleMetadata {
+    /// Record install lifecycle scripts from `package.json#scripts`.
+    ///
+    /// This follows pnpm's install hook subset (`preinstall`, `install`,
+    /// `postinstall`) and deliberately ignores ordinary user scripts such as
+    /// `build` or `test`.
+    #[must_use]
+    pub fn from_scripts(scripts: &BTreeMap<String, String>, trust: TrustState) -> Self {
+        let hooks = install_lifecycle_script_names(scripts);
+        let scripts = install_lifecycle_scripts(scripts);
+        Self {
+            hooks,
+            scripts,
+            trust,
+        }
+    }
+
+    /// Build lifecycle metadata from an already filtered install-script map.
+    #[must_use]
+    pub fn from_install_scripts(scripts: BTreeMap<String, String>, trust: TrustState) -> Self {
+        let hooks = install_lifecycle_script_names(&scripts);
+        Self {
+            hooks,
+            scripts,
+            trust,
+        }
+    }
+}
+
+/// Extract install lifecycle hook names in pnpm execution order.
+#[must_use]
+pub fn install_lifecycle_script_names(scripts: &BTreeMap<String, String>) -> Vec<String> {
+    INSTALL_LIFECYCLE_SCRIPT_ORDER
+        .iter()
+        .filter(|name| {
+            scripts
+                .get(**name)
+                .is_some_and(|script| script.as_str() != "npx only-allow pnpm")
+        })
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// Extract install lifecycle scripts in pnpm execution order.
+#[must_use]
+pub fn install_lifecycle_scripts(scripts: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    INSTALL_LIFECYCLE_SCRIPT_ORDER
+        .iter()
+        .filter_map(|name| {
+            scripts
+                .get(*name)
+                .filter(|script| script.as_str() != "npx only-allow pnpm")
+                .map(|script| ((*name).to_string(), script.clone()))
+        })
+        .collect()
 }
 
 /// Lifecycle script trust state.
@@ -647,10 +715,7 @@ mod tests {
                     kind: ResolvedSourceKind::Workspace,
                     reference: ".".to_string(),
                 }),
-                lifecycle: LifecycleMetadata {
-                    scripts,
-                    trust: TrustState::Trusted,
-                },
+                lifecycle: LifecycleMetadata::from_install_scripts(scripts, TrustState::Trusted),
             },
         );
         packages.insert(
@@ -688,6 +753,33 @@ mod tests {
     #[test]
     fn lockfile_name_is_otter_dot_lock() {
         assert_eq!(LOCKFILE_NAME, "otter.lock");
+    }
+
+    #[test]
+    fn lifecycle_metadata_records_only_install_hooks_in_pnpm_order() {
+        let mut scripts = BTreeMap::new();
+        scripts.insert("build".to_string(), "tsc".to_string());
+        scripts.insert("postinstall".to_string(), "node post.js".to_string());
+        scripts.insert("preinstall".to_string(), "node pre.js".to_string());
+        scripts.insert("test".to_string(), "vitest".to_string());
+        scripts.insert("install".to_string(), "npx only-allow pnpm".to_string());
+
+        let lifecycle = LifecycleMetadata::from_scripts(&scripts, TrustState::Untrusted);
+
+        assert_eq!(
+            lifecycle.hooks,
+            vec!["preinstall".to_string(), "postinstall".to_string()]
+        );
+        assert_eq!(
+            lifecycle.scripts.get("preinstall").map(String::as_str),
+            Some("node pre.js")
+        );
+        assert_eq!(
+            lifecycle.scripts.get("postinstall").map(String::as_str),
+            Some("node post.js")
+        );
+        assert!(!lifecycle.scripts.contains_key("build"));
+        assert!(!lifecycle.scripts.contains_key("install"));
     }
 
     #[test]

@@ -279,10 +279,7 @@ fn compile_program(
     }
     drop(cx);
 
-    let kind = match source_kind {
-        SyntaxSourceKind::JavaScript => BytecodeSourceKind::JavaScript,
-        SyntaxSourceKind::TypeScript => BytecodeSourceKind::TypeScript,
-    };
+    let kind = bytecode_source_kind(source_kind);
 
     let ModuleBuilder {
         functions,
@@ -609,10 +606,7 @@ pub fn compile_module_fragment(
     }
     drop(cx);
 
-    let kind = match parsed.kind {
-        SyntaxSourceKind::JavaScript => BytecodeSourceKind::JavaScript,
-        SyntaxSourceKind::TypeScript => BytecodeSourceKind::TypeScript,
-    };
+    let kind = bytecode_source_kind(parsed.kind);
 
     let ModuleBuilder {
         functions,
@@ -642,6 +636,14 @@ pub fn compile_module_fragment(
         module_resolutions,
         module_inits: Vec::new(),
     })
+}
+
+fn bytecode_source_kind(kind: SyntaxSourceKind) -> BytecodeSourceKind {
+    if kind.is_typescript() {
+        BytecodeSourceKind::TypeScript
+    } else {
+        BytecodeSourceKind::JavaScript
+    }
 }
 
 /// Compile the inner declaration of an `export <decl>` statement

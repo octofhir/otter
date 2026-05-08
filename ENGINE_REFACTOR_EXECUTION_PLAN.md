@@ -119,11 +119,11 @@ plan extends rather than re-files.
   must not mutate installs during VM execution unless an explicit
   command/session policy enables it.
 - Package-manager install/update/remove commands do not gate normal registry
-  network access or project/cache filesystem writes through runtime
-  capabilities. They are explicit CLI actions.
-- Lifecycle scripts are not a P0 execution requirement. P0 records their
-  presence, lockfile metadata, and trust state; execution is disabled by
-  default until the subprocess/capability policy is explicit and tested.
+  network access, project/cache filesystem writes, or install lifecycle
+  subprocesses through runtime capabilities. They are explicit CLI actions.
+- Lifecycle scripts use the pnpm-style install subset (`preinstall`, `install`,
+  `postinstall`) and are executed only by explicit package-manager install
+  operations, not by runtime module loading.
 - Lockfile filename: `otter.lock`. Format: TOML-compatible deterministic text
   using the workspace `toml` dependency. It must be diffable from the first
   slice.
@@ -132,21 +132,24 @@ plan extends rather than re-files.
 
 ### P0.1 Runtime Session Boundary
 
-- [ ] Add a runtime-session section to `crates/otter-runtime` module-level docs
+- [x] Add a runtime-session section to `crates/otter-runtime` module-level docs
   that names the existing `Runtime`/`RuntimeBuilder` as the session owner.
-- [ ] Pull module-loader/module-graph state that currently lives on ad-hoc
+- [x] Pull module-loader/module-graph state that currently lives on ad-hoc
   paths into `Runtime`-owned fields (loader, graph, source-map table,
   diagnostics sink, PM handle).
-- [ ] Define and land the runtime hook trait set: `resolve`, `load`, `compile`,
+- [x] Define and land the runtime hook trait set: `resolve`, `load`, `compile`,
   `enqueue_job`, `emit_diagnostic`, `check_capability`. Compile-fail tests for
   non-`Send`/non-`Sync` misuse already exist
   (`crates/otter-vm/tests/compile_fail/`); extend them to cover the new hooks.
-- [ ] Extend the existing dependency-direction test
+- [x] Extend the existing dependency-direction test
   (`crates/otter-runtime/tests/dependency_graph.rs`) to fail if any active
   product crate gains a direct `otter-vm` dependency.
-- [ ] Remove old bridge APIs (`module_api`, raw VM-shaped installers) once the
+- [x] Remove old bridge APIs (`module_api`, raw VM-shaped installers) once the
   new hooks compile through CLI execution. List the symbols deleted in the
   slice commit.
+  - Removed bridge symbols are listed in `RUNTIME_PUBLIC_API_PLAN.md`:
+    `otter_runtime::module_api`, `HostedNativeCall::from_raw`, and
+    `GlobalClass::from_raw`.
 
 Acceptance:
 
@@ -227,8 +230,9 @@ Acceptance:
   `pnpm-workspace.yaml`.
 - [x] Implement bin linking into a project-local `node_modules/.bin/`
   equivalent and a `PackageGraph::resolve_bin` lookup for `otter run`.
-- [x] Record lifecycle scripts and trusted/untrusted state in the lockfile;
-  do not execute scripts in P0.
+- [x] Record and execute pnpm-style install lifecycle hooks
+  (`preinstall`, `install`, `postinstall`) during explicit package-manager
+  install operations.
 
 Acceptance:
 
@@ -242,8 +246,8 @@ Acceptance:
   package-manager commands.
 - `otter check`, `otter test`, and `otter run` resolve installed package
   imports through the same package graph.
-- Lifecycle scripts are not executed in P0; fixtures prove script metadata is
-  recorded and reported as trusted/untrusted.
+- Lifecycle scripts execute in P0 only from explicit package-manager install
+  commands; runtime execution and module loading never trigger them.
 - No active crate gains a path dependency on `crates-legacy/*`.
 
 ### P0.2b Development Loop Without bundling work
@@ -270,7 +274,7 @@ Acceptance:
 
 ### P0.3 Module Resolver And Package Graph
 
-- [ ] Build the runtime resolver on top of `oxc_resolver` (already a workspace
+- [x] Build the runtime resolver on top of `oxc_resolver` (already a workspace
   dep and used in `crates/otter-runtime/src/module_loader.rs`); do not write a
   parallel resolver.
   - [x] Route filesystem relative specifiers, disk bare package lookup,
@@ -289,22 +293,26 @@ Acceptance:
   - [x] Use graph-backed nearest package `type` for ambiguous
     `.js`/`.ts`/`.jsx`/`.tsx` entry files while preserving hard
     `.mjs`/`.mts` and `.cjs`/`.cts` extension overrides.
-- [ ] Implement `exports`, `imports`, `main`, `module`, conditional resolution
+- [x] Implement `exports`, `imports`, `main`, `module`, conditional resolution
   for the foundation condition set (`default`, `import`, `node`, `otter`).
   - [x] Disk package `exports` / `imports` / `main` / `module` resolution goes
     through `oxc_resolver` with ESM and CJS condition/main-field sets.
   - [x] Package `imports` foundation: exact `#alias` string mappings and
     condition-object mappings through `LoaderPackageRoot.imports`.
+  - [x] Graph-backed package `exports` / `imports` pattern keys resolve through
+    the same condition set and exact-key precedence.
 - [x] Implement extension probing through the fixed ordered list already in
   `LoaderConfig`.
 - [x] Implement JSON module loading (`with { type: 'json' }` plus
   `.json` extension behaviour).
-- [ ] Implement `tsconfig.json` `extends`, `baseUrl`, `paths`, plus
+- [x] Implement `tsconfig.json` `extends`, `baseUrl`, `paths`, plus
   `compilerOptions.jsx` reading at resolve time.
   - [x] Resolve `extends`, `baseUrl`, and `paths` through
     `oxc_resolver::TsconfigDiscovery::Auto` using importer-file-aware
     resolution.
-- [ ] Add resolver diagnostics with exact importer/specifier/condition context.
+  - [x] Read merged `compilerOptions.jsx` through `oxc_resolver` tsconfig
+    discovery, including `extends`, when loading source for compilation.
+- [x] Add resolver diagnostics with exact importer/specifier/condition context.
 
 Acceptance:
 

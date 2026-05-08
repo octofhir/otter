@@ -11,10 +11,10 @@
 //!   importer directory and import kind.
 //! - [`resolve_imports_from_package_graph`] resolves one `#` package import
 //!   specifier from the containing package scope.
-//! - package `exports` helpers implement the foundation string, subpath-map,
-//!   and condition-object forms for graph-backed packages.
-//! - package `imports` helpers implement exact string and condition-object
-//!   forms for graph-backed packages.
+//! - package `exports` helpers implement the foundation string, exact subpath,
+//!   pattern subpath, and condition-object forms for graph-backed packages.
+//! - package `imports` helpers implement exact and pattern string plus
+//!   condition-object forms for graph-backed packages.
 //!
 //! # Invariants
 //! - Only packages present in the graph dependency edges are considered.
@@ -144,8 +144,10 @@ pub(crate) fn resolve_from_package_graph_with_scope_cache<S: AsRef<str>>(
             .and_then(|dependencies| dependencies.get(package_name))
         else {
             return Err(format!(
-                "package `{}` does not declare dependency `{package_name}`",
-                importer_package.name
+                "package `{}` does not declare dependency `{package_name}` (id `{}`, root `{}`)",
+                importer_package.name,
+                importer_package.id,
+                importer_package.root.display()
             ));
         };
         let dependency_kind = graph
@@ -167,8 +169,8 @@ pub(crate) fn resolve_from_package_graph_with_scope_cache<S: AsRef<str>>(
                 );
             }
             return Err(format!(
-                "package `{}` dependency `{package_name}` points to missing graph package `{target_id}`",
-                importer_package.name
+                "package `{}` (id `{}`) dependency `{package_name}` points to missing graph package `{target_id}`",
+                importer_package.name, importer_package.id
             ));
         };
         if dependency_kind == LoaderPackageDependencyKind::Peer
@@ -230,22 +232,25 @@ fn ensure_dependency_root_installed(
     }
     if dependency_kind == LoaderPackageDependencyKind::Optional {
         return Err(format!(
-            "optional dependency `{dependency_name}` for package `{}` is not installed at `{}`",
+            "optional dependency `{dependency_name}` for package `{}` is not installed at `{}` (package id `{}`)",
             importer.name,
-            target.root.display()
+            target.root.display(),
+            importer.id
         ));
     }
     if dependency_kind == LoaderPackageDependencyKind::Peer {
         return Err(format!(
-            "peer dependency `{dependency_name}` for package `{}` is not installed at `{}`",
+            "peer dependency `{dependency_name}` for package `{}` is not installed at `{}` (package id `{}`)",
             importer.name,
-            target.root.display()
+            target.root.display(),
+            importer.id
         ));
     }
     Err(format!(
-        "dependency `{dependency_name}` for package `{}` is not installed at `{}`",
+        "dependency `{dependency_name}` for package `{}` is not installed at `{}` (package id `{}`)",
         importer.name,
-        target.root.display()
+        target.root.display(),
+        importer.id
     ))
 }
 
@@ -290,8 +295,10 @@ pub(crate) fn resolve_imports_from_package_graph_with_scope_cache<S: AsRef<str>>
     };
     let Some(imports) = &importer_package.imports else {
         return Err(format!(
-            "package `{}` has no imports map for specifier `{specifier}`",
-            importer_package.name
+            "package `{}` has no imports map for specifier `{specifier}` (id `{}`, root `{}`)",
+            importer_package.name,
+            importer_package.id,
+            importer_package.root.display()
         ));
     };
     let target = resolve_package_imports_value(importer_package, imports, specifier, conditions)?;
@@ -362,15 +369,32 @@ fn resolve_package_exports_value(
         }
         serde_json::Value::Object(map) => {
             if is_exports_subpath_map(map) {
-                let Some(target) = map.get(export_subpath) else {
+                if let Some(target) = map.get(export_subpath) {
+                    return resolve_conditional_export(
+                        package,
+                        target,
+                        export_subpath,
+                        None,
+                        conditions,
+                    );
+                }
+                let Some((target, replacement)) =
+                    pattern_match_entry(map, export_subpath, export_pattern_key)
+                else {
                     return Err(blocked_export_message(package, export_subpath));
                 };
-                return resolve_conditional_export(package, target, export_subpath, conditions);
+                return resolve_conditional_export(
+                    package,
+                    target,
+                    export_subpath,
+                    Some(&replacement),
+                    conditions,
+                );
             }
             if export_subpath != "." {
                 return Err(blocked_export_message(package, export_subpath));
             }
-            resolve_conditional_export(package, value, export_subpath, conditions)
+            resolve_conditional_export(package, value, export_subpath, None, conditions)
         }
         serde_json::Value::Null => Err(blocked_export_message(package, export_subpath)),
         _ => Err(format!(
@@ -384,19 +408,29 @@ fn resolve_conditional_export(
     package: &LoaderPackageRoot,
     value: &serde_json::Value,
     export_subpath: &str,
+    pattern_replacement: Option<&str>,
     conditions: &[String],
 ) -> Result<String, String> {
     match value {
-        serde_json::Value::String(target) => Ok(target.clone()),
+        serde_json::Value::String(target) => Ok(apply_pattern_replacement(
+            target,
+            pattern_replacement.unwrap_or_default(),
+        )),
         serde_json::Value::Object(map) => {
             for condition in conditions {
                 if let Some(target) = map.get(condition) {
-                    return resolve_conditional_export(package, target, export_subpath, conditions);
+                    return resolve_conditional_export(
+                        package,
+                        target,
+                        export_subpath,
+                        pattern_replacement,
+                        conditions,
+                    );
                 }
             }
             Err(format!(
-                "no matching export condition for package `{}` subpath `{}`; active conditions: {}",
-                package.name,
+                "no matching export condition for {} subpath `{}`; active conditions: {}",
+                package_label(package),
                 export_subpath,
                 conditions.join(", ")
             ))
@@ -421,39 +455,61 @@ fn resolve_package_imports_value(
             package.name
         ));
     };
-    let Some(target) = map.get(specifier) else {
-        return Err(format!(
-            "package `{}` imports map has no entry for `{specifier}`",
-            package.name
-        ));
+    let (target, pattern_replacement) = if let Some(target) = map.get(specifier) {
+        (target, None)
+    } else {
+        let Some((target, replacement)) = pattern_match_entry(map, specifier, import_pattern_key)
+        else {
+            return Err(format!(
+                "package `{}` imports map has no entry for `{specifier}` (id `{}`)",
+                package.name, package.id
+            ));
+        };
+        (target, Some(replacement))
     };
-    resolve_conditional_import(package, target, specifier, conditions)
+    resolve_conditional_import(
+        package,
+        target,
+        specifier,
+        pattern_replacement.as_deref(),
+        conditions,
+    )
 }
 
 fn resolve_conditional_import(
     package: &LoaderPackageRoot,
     value: &serde_json::Value,
     specifier: &str,
+    pattern_replacement: Option<&str>,
     conditions: &[String],
 ) -> Result<String, String> {
     match value {
-        serde_json::Value::String(target) => Ok(target.clone()),
+        serde_json::Value::String(target) => Ok(apply_pattern_replacement(
+            target,
+            pattern_replacement.unwrap_or_default(),
+        )),
         serde_json::Value::Object(map) => {
             for condition in conditions {
                 if let Some(target) = map.get(condition) {
-                    return resolve_conditional_import(package, target, specifier, conditions);
+                    return resolve_conditional_import(
+                        package,
+                        target,
+                        specifier,
+                        pattern_replacement,
+                        conditions,
+                    );
                 }
             }
             Err(format!(
-                "no matching import condition for package `{}` specifier `{}`; active conditions: {}",
-                package.name,
+                "no matching import condition for {} specifier `{}`; active conditions: {}",
+                package_label(package),
                 specifier,
                 conditions.join(", ")
             ))
         }
         serde_json::Value::Null => Err(format!(
-            "package `{}` imports map blocks specifier `{specifier}`",
-            package.name
+            "package `{}` imports map blocks specifier `{specifier}` (id `{}`)",
+            package.name, package.id
         )),
         _ => Err(format!(
             "unsupported import target for package `{}` specifier `{specifier}`",
@@ -481,11 +537,73 @@ fn is_exports_subpath_map(map: &serde_json::Map<String, serde_json::Value>) -> b
     map.keys().any(|key| key == "." || key.starts_with("./"))
 }
 
+fn export_pattern_key(key: &str) -> bool {
+    key.starts_with("./") && key.contains('*')
+}
+
+fn import_pattern_key(key: &str) -> bool {
+    key.starts_with('#') && key.contains('*')
+}
+
+fn pattern_match_entry<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    specifier: &str,
+    is_pattern_key: impl Fn(&str) -> bool,
+) -> Option<(&'a serde_json::Value, String)> {
+    map.iter()
+        .filter_map(|(key, target)| {
+            if !is_pattern_key(key) {
+                return None;
+            }
+            pattern_replacement(key, specifier).map(|replacement| {
+                let specificity = pattern_specificity(key);
+                (specificity, key.as_str(), target, replacement)
+            })
+        })
+        .max_by(
+            |(left_specificity, left_key, _, _), (right_specificity, right_key, _, _)| {
+                left_specificity
+                    .cmp(right_specificity)
+                    .then_with(|| right_key.cmp(left_key))
+            },
+        )
+        .map(|(_, _, target, replacement)| (target, replacement))
+}
+
+fn pattern_replacement(pattern: &str, specifier: &str) -> Option<String> {
+    let (prefix, suffix) = pattern.split_once('*')?;
+    if !specifier.starts_with(prefix) || !specifier.ends_with(suffix) {
+        return None;
+    }
+    let replacement_end = specifier.len().checked_sub(suffix.len())?;
+    if replacement_end < prefix.len() {
+        return None;
+    }
+    Some(specifier[prefix.len()..replacement_end].to_string())
+}
+
+fn pattern_specificity(pattern: &str) -> (usize, usize) {
+    let (prefix, suffix) = pattern.split_once('*').unwrap_or((pattern, ""));
+    (prefix.len(), suffix.len())
+}
+
+fn apply_pattern_replacement(target: &str, replacement: &str) -> String {
+    if target.contains('*') {
+        target.replace('*', replacement)
+    } else {
+        target.to_string()
+    }
+}
+
 fn blocked_export_message(package: &LoaderPackageRoot, export_subpath: &str) -> String {
     format!(
-        "package `{}` does not export subpath `{}`",
-        package.name, export_subpath
+        "package `{}` does not export subpath `{}` (id `{}`)",
+        package.name, export_subpath, package.id
     )
+}
+
+fn package_label(package: &LoaderPackageRoot) -> String {
+    format!("package `{}` (id `{}`)", package.name, package.id)
 }
 
 fn ensure_within_package(package: &LoaderPackageRoot, resolved: &Path) -> Result<(), String> {
@@ -696,6 +814,76 @@ mod tests {
     }
 
     #[test]
+    fn package_graph_pattern_exports_resolve_subpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        let dep_root_path = dir.path().join("store/dep");
+        std::fs::create_dir_all(dep_root_path.join("dist/features")).unwrap();
+        std::fs::create_dir_all(&app_root).unwrap();
+        std::fs::write(
+            dep_root_path.join("dist/features/a.js"),
+            "export let x = 1;\n",
+        )
+        .unwrap();
+        let mut dep = dep_root_fixture(dep_root_path.clone());
+        dep.exports = Some(json!({
+            ".": "./dist/index.js",
+            "./features/*": "./dist/features/*.js"
+        }));
+        let graph = graph_with_app_and_dep(app_root.clone(), dep);
+
+        let resolved = resolve_from_package_graph(
+            &graph,
+            "dep/features/a",
+            &app_root,
+            ImportKind::Esm,
+            &esm_conditions(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(dep_root_path.join("dist/features/a.js")).unwrap()
+        );
+    }
+
+    #[test]
+    fn package_graph_pattern_exports_prefer_most_specific_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        let dep_root_path = dir.path().join("store/dep");
+        std::fs::create_dir_all(dep_root_path.join("dist/specific")).unwrap();
+        std::fs::create_dir_all(&app_root).unwrap();
+        std::fs::write(
+            dep_root_path.join("dist/specific/a.js"),
+            "export let x = 1;\n",
+        )
+        .unwrap();
+        let mut dep = dep_root_fixture(dep_root_path.clone());
+        dep.exports = Some(json!({
+            "./features/*": "./dist/generic/*.js",
+            "./features/specific/*": "./dist/specific/*.js"
+        }));
+        let graph = graph_with_app_and_dep(app_root.clone(), dep);
+
+        let resolved = resolve_from_package_graph(
+            &graph,
+            "dep/features/specific/a",
+            &app_root,
+            ImportKind::Esm,
+            &esm_conditions(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(dep_root_path.join("dist/specific/a.js")).unwrap()
+        );
+    }
+
+    #[test]
     fn package_graph_exports_block_unexported_subpaths() {
         let dir = tempfile::tempdir().unwrap();
         let app_root = dir.path().join("app");
@@ -787,6 +975,73 @@ mod tests {
     }
 
     #[test]
+    fn package_imports_pattern_mapping_resolves_from_containing_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        std::fs::create_dir_all(app_root.join("src/features")).unwrap();
+        std::fs::write(app_root.join("src/features/a.ts"), "export let x = 1;\n").unwrap();
+        let mut graph = LoaderPackageGraph::new();
+        graph.insert_package(LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({ "#features/*": "./src/features/*.ts" })),
+            package_type: None,
+        });
+
+        let resolved =
+            resolve_imports_from_package_graph(&graph, "#features/a", &app_root, &esm_conditions())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(app_root.join("src/features/a.ts")).unwrap()
+        );
+    }
+
+    #[test]
+    fn package_imports_pattern_condition_mapping_prefers_otter() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("app");
+        std::fs::create_dir_all(app_root.join("otter")).unwrap();
+        std::fs::create_dir_all(app_root.join("src")).unwrap();
+        std::fs::write(app_root.join("otter/a.ts"), "export let x = 1;\n").unwrap();
+        std::fs::write(app_root.join("src/a.ts"), "export let x = 2;\n").unwrap();
+        let mut graph = LoaderPackageGraph::new();
+        graph.insert_package(LoaderPackageRoot {
+            id: "app@workspace:.".into(),
+            name: "app".into(),
+            version: "0.1.0".into(),
+            root: app_root.clone(),
+            main: None,
+            module: None,
+            exports: None,
+            imports: Some(json!({
+                "#alias/*": {
+                    "otter": "./otter/*.ts",
+                    "default": "./src/*.ts"
+                }
+            })),
+            package_type: None,
+        });
+
+        let resolved =
+            resolve_imports_from_package_graph(&graph, "#alias/a", &app_root, &esm_conditions())
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(app_root.join("otter/a.ts")).unwrap()
+        );
+    }
+
+    #[test]
     fn package_imports_missing_alias_reports_stable_diagnostic() {
         let dir = tempfile::tempdir().unwrap();
         let app_root = dir.path().join("app");
@@ -808,7 +1063,10 @@ mod tests {
             resolve_imports_from_package_graph(&graph, "#missing", &app_root, &esm_conditions())
                 .expect_err("missing package import must report a resolver diagnostic");
 
-        assert_eq!(err, "package `app` imports map has no entry for `#missing`");
+        assert_eq!(
+            err,
+            "package `app` imports map has no entry for `#missing` (id `app@workspace:.`)"
+        );
     }
 
     #[test]

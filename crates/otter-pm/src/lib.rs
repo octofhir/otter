@@ -19,8 +19,8 @@
 //! - This crate has no dependency on `crates-legacy/*`, `otter-runtime`, or
 //!   `otter-vm`.
 //! - Capability gates are not part of first-party install command plumbing;
-//!   they apply when runtime execution or future lifecycle script execution
-//!   consumes the graph.
+//!   they apply when runtime execution consumes the graph. Lifecycle scripts
+//!   run only inside explicit package-manager install operations.
 //!
 //! # See also
 //! - [`otter-pm-manifest`](../../otter-pm-manifest/src/lib.rs)
@@ -32,12 +32,14 @@ mod registry;
 mod tarball;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use otter_pm_lockfile::{
     LifecycleMetadata, LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind, TrustState,
+    install_lifecycle_scripts,
 };
 use otter_pm_manifest::{
     DependencySet, PACKAGE_JSON, PackageBinManifest, PackageManifest, discover_workspaces,
@@ -110,6 +112,16 @@ pub enum PackageManagerError {
     Archive {
         /// Archive, cache, or install path involved.
         path: PathBuf,
+        /// Failure message.
+        message: String,
+    },
+    /// Lifecycle script failed.
+    #[error("lifecycle script `{stage}` failed for `{package}`: {message}")]
+    Lifecycle {
+        /// Package id or root package label.
+        package: String,
+        /// Lifecycle stage.
+        stage: String,
         /// Failure message.
         message: String,
     },
@@ -350,10 +362,27 @@ pub struct InstallReport {
     pub reused_packages: usize,
     /// Number of package binaries linked into the project-local bin directory.
     pub linked_bins: usize,
+    /// Number of lifecycle scripts executed.
+    pub lifecycle_scripts: usize,
     /// Whether the lockfile changed.
     pub lockfile_changed: bool,
     /// Source lockfile format imported during this install, if any.
     pub imported_lockfile: Option<otter_pm_lockfile::LockfileFormat>,
+}
+
+/// One executed lifecycle script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleRun {
+    /// Package id or root package label.
+    pub package: String,
+    /// Package name.
+    pub name: String,
+    /// Lifecycle stage.
+    pub stage: String,
+    /// Script command.
+    pub script: String,
+    /// Working directory.
+    pub cwd: PathBuf,
 }
 
 /// Result of pruning packages no longer present in the lockfile.
@@ -440,6 +469,8 @@ pub async fn install_local_project(
                 .to_string(),
         });
     }
+    let lifecycle_runs =
+        run_install_lifecycle_scripts(project_root, &resolution.lockfile, &final_installed).await?;
     let lockfile_changed = write_lockfile_if_changed(project_root, &resolution.lockfile).await?;
     Ok(InstallReport {
         added_packages: added_package_ids.len(),
@@ -450,6 +481,7 @@ pub async fn install_local_project(
             .values()
             .map(|package| package.linked_bins)
             .sum(),
+        lifecycle_scripts: lifecycle_runs.len(),
         lockfile_changed,
         imported_lockfile,
     })
@@ -520,10 +552,7 @@ async fn enrich_imported_lockfile_with_registry_metadata(
                 .clone()
                 .or_else(|| version.dist.shasum.as_ref().map(|s| format!("sha1-{s}")));
         }
-        package.lifecycle = LifecycleMetadata {
-            scripts: version.scripts.clone(),
-            trust: TrustState::Untrusted,
-        };
+        package.lifecycle = LifecycleMetadata::from_scripts(&version.scripts, TrustState::Trusted);
     }
     Ok(())
 }
@@ -570,15 +599,8 @@ async fn apply_tarball_manifest_metadata(
             if let Some(version) = &manifest.version {
                 locked.version = version.clone();
             }
-            let lifecycle_scripts = if manifest.scripts.is_empty() {
-                locked.lifecycle.scripts.clone()
-            } else {
-                manifest.scripts.clone()
-            };
-            locked.lifecycle = LifecycleMetadata {
-                scripts: lifecycle_scripts,
-                trust: TrustState::Untrusted,
-            };
+            locked.lifecycle =
+                lifecycle_metadata_for_manifest(&manifest, Some(&package.installed_root));
         }
         let workspace_by_name: BTreeMap<String, &otter_pm_manifest::WorkspacePackage> =
             BTreeMap::new();
@@ -594,6 +616,150 @@ async fn apply_tarball_manifest_metadata(
         changed |= before != resolution.lockfile;
     }
     Ok(changed)
+}
+
+async fn run_install_lifecycle_scripts(
+    project_root: &Path,
+    lockfile: &Lockfile,
+    installed: &BTreeMap<String, InstalledPackage>,
+) -> Result<Vec<LifecycleRun>, PackageManagerError> {
+    let mut runs = Vec::new();
+    for (package_id, installed_package) in installed {
+        let Some(locked) = lockfile.packages.get(package_id) else {
+            continue;
+        };
+        runs.extend(
+            run_lifecycle_for_package(
+                project_root,
+                package_id,
+                &locked.name,
+                &locked.lifecycle,
+                &installed_package.installed_root,
+            )
+            .await?,
+        );
+    }
+    if let Some((root_id, root_package)) = lockfile.packages.iter().find(|(_, package)| {
+        package
+            .resolved
+            .as_ref()
+            .is_some_and(|source| source.reference == ".")
+    }) {
+        runs.extend(
+            run_lifecycle_for_package(
+                project_root,
+                root_id,
+                &root_package.name,
+                &root_package.lifecycle,
+                project_root,
+            )
+            .await?,
+        );
+    }
+    Ok(runs)
+}
+
+async fn run_lifecycle_for_package(
+    project_root: &Path,
+    package_id: &str,
+    package_name: &str,
+    lifecycle: &LifecycleMetadata,
+    cwd: &Path,
+) -> Result<Vec<LifecycleRun>, PackageManagerError> {
+    if lifecycle.trust == TrustState::Disabled {
+        return Ok(Vec::new());
+    }
+    let mut runs = Vec::new();
+    let stages = if lifecycle.hooks.is_empty() {
+        lifecycle.scripts.keys().cloned().collect::<Vec<_>>()
+    } else {
+        lifecycle.hooks.clone()
+    };
+    for stage in stages {
+        let Some(script) = lifecycle.scripts.get(&stage) else {
+            continue;
+        };
+        run_lifecycle_script(project_root, package_id, &stage, script, cwd).await?;
+        runs.push(LifecycleRun {
+            package: package_id.to_string(),
+            name: package_name.to_string(),
+            stage,
+            script: script.clone(),
+            cwd: cwd.to_path_buf(),
+        });
+    }
+    Ok(runs)
+}
+
+async fn run_lifecycle_script(
+    project_root: &Path,
+    package_id: &str,
+    stage: &str,
+    script: &str,
+    cwd: &Path,
+) -> Result<(), PackageManagerError> {
+    let mut command = lifecycle_shell_command(script);
+    command.current_dir(cwd);
+    command.env("INIT_CWD", project_root);
+    command.env("OTTER_SCRIPT_SRC_DIR", cwd);
+    command.env("npm_lifecycle_event", stage);
+    command.env("npm_lifecycle_script", script);
+    command.env("PATH", lifecycle_path(project_root, cwd));
+    let status = command
+        .status()
+        .await
+        .map_err(|err| PackageManagerError::Lifecycle {
+            package: package_id.to_string(),
+            stage: stage.to_string(),
+            message: err.to_string(),
+        })?;
+    if !status.success() {
+        return Err(PackageManagerError::Lifecycle {
+            package: package_id.to_string(),
+            stage: stage.to_string(),
+            message: status.code().map_or_else(
+                || "terminated by signal".to_string(),
+                |code| format!("exit status {code}"),
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn lifecycle_shell_command(script: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("cmd");
+    command.arg("/C").arg(script);
+    command
+}
+
+#[cfg(not(windows))]
+fn lifecycle_shell_command(script: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+fn lifecycle_path(project_root: &Path, cwd: &Path) -> OsString {
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let mut paths = vec![
+        cwd.join("node_modules").join(".bin").into_os_string(),
+        project_root
+            .join("node_modules")
+            .join(".bin")
+            .into_os_string(),
+    ];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.push(existing);
+    }
+    let mut joined = OsString::new();
+    for (index, path) in paths.into_iter().enumerate() {
+        if index > 0 {
+            joined.push(separator);
+        }
+        joined.push(path);
+    }
+    joined
 }
 
 /// Resolve the current local project into a deterministic graph and
@@ -794,10 +960,7 @@ pub async fn enrich_resolution_with_registry_metadata(
             kind: ResolvedSourceKind::Registry,
             reference: tarball.clone(),
         });
-        package.lifecycle = LifecycleMetadata {
-            scripts: version.scripts.clone(),
-            trust: TrustState::Untrusted,
-        };
+        package.lifecycle = LifecycleMetadata::from_scripts(&version.scripts, TrustState::Trusted);
         for (dep_name, dep_range, dependency_kind) in registry_dependency_edges(&version) {
             let dep_id = PackageId::registry(&dep_name, &dep_range);
             package
@@ -1286,11 +1449,22 @@ fn locked_package(
             kind,
             reference: reference.to_string(),
         }),
-        lifecycle: LifecycleMetadata {
-            scripts: manifest.scripts.clone(),
-            trust: TrustState::Untrusted,
-        },
+        lifecycle: lifecycle_metadata_for_manifest(manifest, None),
     }
+}
+
+fn lifecycle_metadata_for_manifest(
+    manifest: &PackageManifest,
+    package_root: Option<&Path>,
+) -> LifecycleMetadata {
+    let mut scripts = install_lifecycle_scripts(&manifest.scripts);
+    if !scripts.contains_key("preinstall")
+        && !scripts.contains_key("install")
+        && package_root.is_some_and(|root| root.join("binding.gyp").is_file())
+    {
+        scripts.insert("install".to_string(), "node-gyp rebuild".to_string());
+    }
+    LifecycleMetadata::from_install_scripts(scripts, TrustState::Trusted)
 }
 
 fn insert_bins_for_manifest(
@@ -1423,6 +1597,11 @@ mod tests {
                 "lib": "workspace:*",
                 "file-tool": "file:tools/file-tool",
                 "left-pad": "^1.3.0"
+              },
+              "scripts": {
+                "preinstall": "node preinstall.js",
+                "build": "tsc",
+                "postinstall": "node postinstall.js"
               }
             }"#,
         )
@@ -1461,6 +1640,14 @@ mod tests {
         let lock_text = resolved.lockfile.to_toml_string().unwrap();
         assert!(lock_text.contains("[packages.\"app@workspace:.\".dependencies]"));
         assert!(lock_text.contains("left-pad = \"left-pad@npm:^1.3.0\""));
+        let app_package = resolved.lockfile.packages.get("app@workspace:.").unwrap();
+        assert_eq!(
+            app_package.lifecycle.hooks,
+            vec!["preinstall".to_string(), "postinstall".to_string()]
+        );
+        assert!(app_package.lifecycle.scripts.contains_key("preinstall"));
+        assert!(app_package.lifecycle.scripts.contains_key("postinstall"));
+        assert!(!app_package.lifecycle.scripts.contains_key("build"));
     }
 
     #[tokio::test]
@@ -1492,7 +1679,11 @@ mod tests {
                   "version": "1.3.0",
                   "dependencies": { "repeat-string": "^1.6.1" },
                   "bin": { "left-pad": "./bin.js" },
-                  "scripts": { "postinstall": "node postinstall.js" },
+                  "scripts": {
+                    "preinstall": "node preinstall.js",
+                    "build": "tsc",
+                    "postinstall": "node postinstall.js"
+                  },
                   "dist": {
                     "tarball": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
                     "integrity": "sha512-new"
@@ -1549,7 +1740,79 @@ mod tests {
             package.lifecycle.scripts["postinstall"],
             "node postinstall.js"
         );
+        assert_eq!(
+            package.lifecycle.hooks,
+            vec!["preinstall".to_string(), "postinstall".to_string()]
+        );
+        assert!(!package.lifecycle.scripts.contains_key("build"));
         assert_eq!(resolution.graph.resolve_bin("left-pad").len(), 1);
+    }
+
+    #[test]
+    fn manifest_lifecycle_metadata_records_implicit_node_gyp_install_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("binding.gyp"), "{}\n").unwrap();
+        let manifest = PackageManifest::parse_json(
+            r#"{"name":"native-addon","version":"1.0.0","scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+
+        let lifecycle = lifecycle_metadata_for_manifest(&manifest, Some(tmp.path()));
+
+        assert_eq!(lifecycle.hooks, vec!["install".to_string()]);
+        assert_eq!(
+            lifecycle.scripts.get("install").map(String::as_str),
+            Some("node-gyp rebuild")
+        );
+        assert!(!lifecycle.scripts.contains_key("build"));
+    }
+
+    #[tokio::test]
+    async fn install_local_project_runs_root_lifecycle_hooks_with_project_bin_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        write(
+            &project.join("package.json"),
+            r#"{
+              "name": "app",
+              "version": "0.1.0",
+              "scripts": {
+                "preinstall": "node_modules/.bin/write-root pre",
+                "postinstall": "node_modules/.bin/write-root post"
+              }
+            }"#,
+        )
+        .await;
+        write(
+            &project.join("node_modules/.bin/write-root"),
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> lifecycle.log\n",
+        )
+        .await;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                project.join("node_modules/.bin/write-root"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let report = install_local_project(
+            &project,
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(tmp.path().join("registry")),
+            &FsPackageStore::new(tmp.path().join("package-cache")),
+            &FileTarballClient::new(tmp.path().join("tarballs")),
+        )
+        .await
+        .unwrap();
+        let lifecycle_log = tokio::fs::read_to_string(project.join("lifecycle.log"))
+            .await
+            .unwrap();
+
+        assert_eq!(report.lifecycle_scripts, 2);
+        assert_eq!(lifecycle_log, "pre\npost\n");
     }
 
     #[tokio::test]
@@ -1857,9 +2120,13 @@ mod tests {
         let tarball = npm_tgz(&[
             (
                 "package/package.json",
-                r#"{"name":"tool","version":"1.0.0","bin":{"tool":"./bin.js"}}"#,
+                r#"{"name":"tool","version":"1.0.0","bin":{"tool":"./bin.js"},"scripts":{"postinstall":"node setup.js"}}"#,
             ),
             ("package/bin.js", "#!/usr/bin/env otter\nundefined;\n"),
+            (
+                "package/setup.js",
+                "require('fs').writeFileSync('postinstall-ran.txt', 'ok')\n",
+            ),
         ]);
         let integrity = format!(
             "sha512-{}",
@@ -1929,7 +2196,14 @@ mod tests {
         assert_eq!(second.reused_packages, 1);
         assert_eq!(second.linked_bins, 1);
         assert_eq!(lockfile_first, lockfile_second);
+        assert_eq!(first.lifecycle_scripts, 1);
+        assert_eq!(second.lifecycle_scripts, 1);
         assert!(lockfile_first.contains("postinstall = \"node setup.js\""));
+        assert!(
+            project
+                .join("node_modules/tool/postinstall-ran.txt")
+                .is_file()
+        );
         assert!(project.join("node_modules/tool/bin.js").is_file());
         assert!(project.join("node_modules/.bin/tool").is_file());
         let graph = resolve_installed_project(&project).await.unwrap().graph;
@@ -1949,6 +2223,10 @@ mod tests {
                 r#"{"name":"tool","version":"1.2.0","scripts":{"postinstall":"node setup.js"},"bin":{"tool":"./bin.js"}}"#,
             ),
             ("package/bin.js", "#!/usr/bin/env otter\nundefined;\n"),
+            (
+                "package/setup.js",
+                "require('fs').writeFileSync('setup-ok', 'ok')\n",
+            ),
         ]);
         let integrity = format!(
             "sha512-{}",
@@ -2025,6 +2303,10 @@ mod tests {
                 r#"{"name":"tool","version":"1.0.0","dependencies":{"dep":"^1.0.0"},"scripts":{"postinstall":"node setup.js"},"bin":{"tool":"./bin.js"}}"#,
             ),
             ("package/bin.js", "#!/usr/bin/env otter\nundefined;\n"),
+            (
+                "package/setup.js",
+                "require('fs').writeFileSync('setup-ok', 'ok')\n",
+            ),
         ]);
         let dep_tarball = npm_tgz(&[
             (

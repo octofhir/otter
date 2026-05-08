@@ -21,6 +21,33 @@
 //! - [`OtterError`], [`ConfigError`], [`IoErrorKind`] — error model.
 //! - [`InterruptHandle`] — cooperative cancellation.
 //!
+//! # Runtime Session
+//! [`Runtime`] is the active runtime session owner. [`RuntimeBuilder`] captures
+//! session configuration — capabilities, module-loader DTOs, hosted modules,
+//! global surfaces, console sink, heap cap, timeout, and stack limit — and
+//! materializes either a single-threaded [`Runtime`] or a sendable
+//! [`RuntimeHandle`].
+//!
+//! The session owns the VM isolate (`Interpreter`) and all runtime boundary
+//! decisions around loading, compiling, capability checks, hosted-module
+//! installation, diagnostics mapping, and microtask draining. Module execution
+//! enters through [`Runtime::run_module`] / [`Runtime::check_file`]: those
+//! methods ask the runtime-owned loader state for an entry-aware
+//! [`module_loader::ModuleLoader`], build through the runtime-owned module graph
+//! state, record source spans into the session source-map table, then run or
+//! validate the linked bytecode without exposing package-manager internals to
+//! `otter-vm`.
+//!
+//! # Invariants
+//! - `otter-vm` receives bytecode, runtime surface builders, and capability
+//!   decisions only through `otter-runtime`; it never sees package-manager
+//!   lockfiles, registries, or graph mutation APIs.
+//! - Package-manager data enters this crate only as the read-only
+//!   [`module_loader::LoaderPackageGraph`] DTO.
+//! - Loader, module-graph, source-map, diagnostics, and package-manager DTO
+//!   state are owned by the `Runtime` session; no hidden global resolver state
+//!   is used by the active runtime path.
+//!
 //! # See also
 //! - [Engine architecture](../../../docs/book/src/engine/architecture.md)
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
@@ -28,6 +55,7 @@
 pub mod error;
 pub mod event_loop;
 pub mod handle;
+pub mod hooks;
 pub mod module_graph;
 pub mod module_loader;
 mod package_graph_resolver;
@@ -35,11 +63,13 @@ pub mod structured_clone;
 pub mod surface;
 pub mod worker;
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use otter_bytecode::BytecodeModule;
+use otter_bytecode::{BytecodeModule, SpanEntry};
 use otter_compiler::{
     compile_parsed_program as compile_script_program, compile_source as compile_script_source,
 };
@@ -54,6 +84,12 @@ pub use event_loop::{
     TimerRequest, TimerToken, TokioEventLoop,
 };
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
+pub use hooks::{
+    CapabilityRequest, RuntimeCapability, RuntimeCapabilityHook, RuntimeCompileHook,
+    RuntimeCompileRequest, RuntimeDiagnosticHook, RuntimeHooks, RuntimeJobHook, RuntimeJobKind,
+    RuntimeJobRequest, RuntimeLoadHook, RuntimeLoadRequest, RuntimeResolveHook,
+    RuntimeResolveRequest, default_check_capability, default_compile_source,
+};
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use structured_clone::{
     StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
@@ -822,6 +858,119 @@ pub(crate) struct RuntimeConfig {
     hosted_modules: Vec<HostedModule>,
     global_classes: Vec<GlobalClass>,
     console_sink: ConsoleSinkHandle,
+    hooks: RuntimeHooks,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeModuleLoaderState {
+    configured: Option<module_loader::LoaderConfig>,
+}
+
+impl RuntimeModuleLoaderState {
+    fn new(configured: Option<module_loader::LoaderConfig>) -> Self {
+        Self { configured }
+    }
+
+    fn for_entry(
+        &self,
+        entry_path: &Path,
+        hosted_modules: &[HostedModule],
+        package_manager: &RuntimePackageManagerHandle,
+    ) -> module_loader::ModuleLoader {
+        let mut cfg = match &self.configured {
+            Some(cfg) => cfg.clone(),
+            None => {
+                let base_dir = entry_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                module_loader::LoaderConfig::new(base_dir)
+            }
+        };
+        cfg.hosted_specifiers
+            .extend(hosted_modules.iter().map(|m| m.specifier().to_string()));
+        package_manager.apply_to_loader_config(&mut cfg);
+        module_loader::ModuleLoader::with_config(cfg)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeModuleGraphState {
+    last_entry_url: Option<String>,
+    last_module_count: usize,
+}
+
+impl RuntimeModuleGraphState {
+    fn load_program(
+        &mut self,
+        loader: &module_loader::ModuleLoader,
+        entry_path: &Path,
+    ) -> Result<module_graph::LinkedProgram, module_graph::GraphError> {
+        let linked = module_graph::load_program(loader, entry_path)?;
+        self.last_entry_url = Some(linked.entry_url.clone());
+        self.last_module_count = linked.module.module_inits.len();
+        Ok(linked)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeSourceMapTable {
+    by_module_url: RefCell<BTreeMap<String, Vec<SpanEntry>>>,
+}
+
+impl RuntimeSourceMapTable {
+    fn record_bytecode(&self, module: &BytecodeModule) {
+        let mut by_module_url = self.by_module_url.borrow_mut();
+        for function in &module.functions {
+            let url = if function.module_url.is_empty() {
+                module.module.clone()
+            } else {
+                function.module_url.clone()
+            };
+            by_module_url
+                .entry(url)
+                .or_default()
+                .extend(function.spans.iter().copied());
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_module(&self, module_url: &str) -> bool {
+        self.by_module_url.borrow().contains_key(module_url)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeDiagnosticsSink {
+    emitted: RefCell<Vec<Diagnostic>>,
+}
+
+impl RuntimeDiagnosticsSink {
+    fn emit(&self, hooks: &RuntimeHooks, diagnostic: &Diagnostic) {
+        self.emitted.borrow_mut().push(diagnostic.clone());
+        if let Some(hook) = hooks.diagnostic_hook() {
+            hook.emit_diagnostic(diagnostic);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimePackageManagerHandle {
+    graph: Option<module_loader::LoaderPackageGraph>,
+}
+
+impl RuntimePackageManagerHandle {
+    fn from_loader_config(config: Option<&module_loader::LoaderConfig>) -> Self {
+        Self {
+            graph: config.and_then(|cfg| cfg.package_graph.clone()),
+        }
+    }
+
+    fn apply_to_loader_config(&self, config: &mut module_loader::LoaderConfig) {
+        if config.package_graph.is_none() {
+            config.package_graph = self.graph.clone();
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -835,6 +984,7 @@ impl Default for RuntimeConfig {
             hosted_modules: Vec::new(),
             global_classes: Vec::new(),
             console_sink: otter_vm::console::default_console_sink(),
+            hooks: RuntimeHooks::default(),
         }
     }
 }
@@ -933,6 +1083,55 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Replace the runtime hook set.
+    #[must_use]
+    pub fn hooks(mut self, hooks: RuntimeHooks) -> Self {
+        self.config.hooks = hooks;
+        self
+    }
+
+    /// Set the module-resolution hook.
+    #[must_use]
+    pub fn resolve_hook(mut self, hook: impl RuntimeResolveHook) -> Self {
+        self.config.hooks = self.config.hooks.with_resolve_hook(hook);
+        self
+    }
+
+    /// Set the source-loading hook.
+    #[must_use]
+    pub fn load_hook(mut self, hook: impl RuntimeLoadHook) -> Self {
+        self.config.hooks = self.config.hooks.with_load_hook(hook);
+        self
+    }
+
+    /// Set the compile hook.
+    #[must_use]
+    pub fn compile_hook(mut self, hook: impl RuntimeCompileHook) -> Self {
+        self.config.hooks = self.config.hooks.with_compile_hook(hook);
+        self
+    }
+
+    /// Set the runtime job enqueue hook.
+    #[must_use]
+    pub fn job_hook(mut self, hook: impl RuntimeJobHook) -> Self {
+        self.config.hooks = self.config.hooks.with_job_hook(hook);
+        self
+    }
+
+    /// Set the diagnostic sink hook.
+    #[must_use]
+    pub fn diagnostic_hook(mut self, hook: impl RuntimeDiagnosticHook) -> Self {
+        self.config.hooks = self.config.hooks.with_diagnostic_hook(hook);
+        self
+    }
+
+    /// Set the capability-check hook.
+    #[must_use]
+    pub fn capability_hook(mut self, hook: impl RuntimeCapabilityHook) -> Self {
+        self.config.hooks = self.config.hooks.with_capability_hook(hook);
+        self
+    }
+
     /// Construct the runtime.
     ///
     /// # Errors
@@ -966,6 +1165,9 @@ impl Runtime {
 
     pub(crate) fn from_config(config: RuntimeConfig) -> Result<Self, OtterError> {
         Self::validate_config(&config)?;
+        let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
+        let package_manager =
+            RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
         // The interpreter owns the per-isolate GC heap (since
         // task 76); both the string heap and the GC heap honour
         // the configured cap.
@@ -989,7 +1191,15 @@ impl Runtime {
                 .map_err(|e| format!("compile error: {e:?}"))
         });
         interp.set_eval_hook(Some(hook));
-        Ok(Runtime { interp, config })
+        Ok(Runtime {
+            interp,
+            config,
+            module_loader,
+            module_graph: RuntimeModuleGraphState::default(),
+            source_maps: RuntimeSourceMapTable::default(),
+            diagnostics: RuntimeDiagnosticsSink::default(),
+            package_manager,
+        })
     }
 }
 
@@ -998,6 +1208,11 @@ impl Runtime {
 pub struct Runtime {
     interp: Interpreter,
     config: RuntimeConfig,
+    module_loader: RuntimeModuleLoaderState,
+    module_graph: RuntimeModuleGraphState,
+    source_maps: RuntimeSourceMapTable,
+    diagnostics: RuntimeDiagnosticsSink,
+    package_manager: RuntimePackageManagerHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1090,6 +1305,24 @@ impl Runtime {
         &self.config.capabilities
     }
 
+    /// Check a runtime capability request through the configured hook policy.
+    #[must_use]
+    pub fn check_capability(
+        &self,
+        capability: RuntimeCapability,
+        request: &CapabilityRequest<'_>,
+    ) -> bool {
+        if let Some(hook) = self.config.hooks.capability_hook() {
+            return hook.check_capability(&self.config.capabilities, capability, request);
+        }
+        default_check_capability(&self.config.capabilities, capability, request)
+    }
+
+    /// Emit a structured diagnostic through the configured runtime hook.
+    pub fn emit_diagnostic(&self, diagnostic: &Diagnostic) {
+        self.diagnostics.emit(&self.config.hooks, diagnostic);
+    }
+
     /// Compile and execute `source` as a script.
     ///
     /// # Errors
@@ -1180,7 +1413,20 @@ impl Runtime {
         source: &SourceInput,
         specifier: &str,
     ) -> Result<BytecodeModule, OtterError> {
-        compile_script_source(&source.text, source.kind, specifier).map_err(map_compile_error)
+        let module = if let Some(hook) = self.config.hooks.compile_hook() {
+            let resolved = module_loader::ResolvedSource {
+                url: specifier.to_string(),
+                kind: source.kind,
+                jsx: None,
+                text: source.text.clone(),
+            };
+            hook.compile(RuntimeCompileRequest { source: &resolved })?
+        } else {
+            compile_script_source(&source.text, source.kind, specifier)
+                .map_err(map_compile_error)?
+        };
+        self.source_maps.record_bytecode(&module);
+        Ok(module)
     }
 
     /// Load + link + execute the module-graph rooted at `entry_path`.
@@ -1213,8 +1459,10 @@ impl Runtime {
         let start = std::time::Instant::now();
         let entry_path = entry_path.as_ref();
         let loader = self.module_loader_for_entry(entry_path);
-        let linked =
-            module_graph::load_program(&loader, entry_path).map_err(|e| OtterError::Compile {
+        let linked = self
+            .module_graph
+            .load_program(&loader, entry_path)
+            .map_err(|e| OtterError::Compile {
                 diagnostics: vec![Diagnostic::syntax(e.to_string())],
             })?;
 
@@ -1224,6 +1472,7 @@ impl Runtime {
         // env as the body runs.
         self.interp.reset_module_state();
         let mut module = linked.module;
+        self.source_maps.record_bytecode(&module);
         let entry_url = linked.entry_url.clone();
         for init in &module.module_inits {
             let env = if let Some(hosted) = self
@@ -1273,32 +1522,11 @@ impl Runtime {
     }
 
     fn module_loader_for_entry(&self, entry_path: &Path) -> module_loader::ModuleLoader {
-        match &self.config.loader {
-            Some(cfg) => {
-                let mut cfg = cfg.clone();
-                cfg.hosted_specifiers.extend(
-                    self.config
-                        .hosted_modules
-                        .iter()
-                        .map(|m| m.specifier().to_string()),
-                );
-                module_loader::ModuleLoader::with_config(cfg)
-            }
-            None => {
-                let base_dir = entry_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let mut cfg = module_loader::LoaderConfig::new(base_dir);
-                cfg.hosted_specifiers = self
-                    .config
-                    .hosted_modules
-                    .iter()
-                    .map(|m| m.specifier().to_string())
-                    .collect();
-                module_loader::ModuleLoader::with_config(cfg)
-            }
-        }
+        self.module_loader.for_entry(
+            entry_path,
+            &self.config.hosted_modules,
+            &self.package_manager,
+        )
     }
 
     /// Parse and compile a file without executing it.
@@ -1352,13 +1580,16 @@ impl Runtime {
             .map_err(map_compile_error)
     }
 
-    fn check_module(&self, entry_path: &Path) -> Result<(), OtterError> {
+    fn check_module(&mut self, entry_path: &Path) -> Result<(), OtterError> {
         let loader = self.module_loader_for_entry(entry_path);
-        module_graph::load_program(&loader, entry_path)
-            .map(|_| ())
+        let linked = self
+            .module_graph
+            .load_program(&loader, entry_path)
             .map_err(|e| OtterError::Compile {
                 diagnostics: vec![Diagnostic::syntax(e.to_string())],
-            })
+            })?;
+        self.source_maps.record_bytecode(&linked.module);
+        Ok(())
     }
 
     /// Run a file from disk, detecting script vs module shape.
@@ -1972,6 +2203,85 @@ mod tests {
     fn public_handle_types_are_send_sync() {
         assert_send_sync::<Otter>();
         assert_send_sync::<RuntimeHandle>();
+        assert_send_sync::<RuntimeHooks>();
+    }
+
+    #[test]
+    fn runtime_diagnostic_hook_receives_emit() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        let runtime = Runtime::builder()
+            .diagnostic_hook(move |diagnostic: &Diagnostic| {
+                if diagnostic.code == "SYNTAX_ERROR" {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .build()
+            .unwrap();
+
+        runtime.emit_diagnostic(&Diagnostic::syntax("resolver failed"));
+
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn runtime_capability_hook_can_override_default_policy() {
+        struct AllowExampleNet;
+
+        impl RuntimeCapabilityHook for AllowExampleNet {
+            fn check_capability(
+                &self,
+                _capabilities: &CapabilitySet,
+                capability: RuntimeCapability,
+                request: &CapabilityRequest<'_>,
+            ) -> bool {
+                capability == RuntimeCapability::Net
+                    && matches!(request, CapabilityRequest::Host("example.com"))
+            }
+        }
+
+        let runtime = Runtime::builder()
+            .capabilities(CapabilitySet::sandbox())
+            .capability_hook(AllowExampleNet)
+            .build()
+            .unwrap();
+
+        assert!(runtime.check_capability(
+            RuntimeCapability::Net,
+            &CapabilityRequest::Host("example.com")
+        ));
+        assert!(
+            !runtime.check_capability(RuntimeCapability::Env, &CapabilityRequest::EnvVar("HOME"))
+        );
+    }
+
+    #[test]
+    fn runtime_session_owns_module_graph_and_source_map_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep = dir.path().join("dep.ts");
+        let entry = dir.path().join("entry.ts");
+        std::fs::write(&dep, "export const value = 1;\n").unwrap();
+        std::fs::write(
+            &entry,
+            "import { value } from './dep.ts';\nexport const result = value + 1;\n",
+        )
+        .unwrap();
+
+        let mut runtime = Runtime::builder().build().unwrap();
+        runtime.check_file(&entry).unwrap();
+
+        let entry_url = format!(
+            "file://{}",
+            std::fs::canonicalize(&entry).unwrap().display()
+        );
+        let dep_url = format!("file://{}", std::fs::canonicalize(&dep).unwrap().display());
+        assert_eq!(
+            runtime.module_graph.last_entry_url.as_deref(),
+            Some(entry_url.as_str())
+        );
+        assert_eq!(runtime.module_graph.last_module_count, 2);
+        assert!(runtime.source_maps.contains_module(&entry_url));
+        assert!(runtime.source_maps.contains_module(&dep_url));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

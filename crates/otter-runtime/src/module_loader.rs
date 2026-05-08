@@ -10,7 +10,7 @@
 //!
 //! # Contents
 //! - [`ModuleLoader`] — resolves + reads a specifier's source.
-//! - [`ResolvedSource`] — `(url, source_kind, text)` triple.
+//! - [`ResolvedSource`] — loaded source plus resolver/compiler metadata.
 //! - [`LoaderError`] — distinct enum for resolve / load failures.
 //!
 //! # Invariants
@@ -55,6 +55,15 @@ pub enum ImportKind {
     Cjs,
 }
 
+impl ImportKind {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Esm => "esm",
+            Self::Cjs => "cjs",
+        }
+    }
+}
+
 /// Return the directory of `referrer`'s file:// URL, or `None`
 /// when no referrer is set / the URL is malformed.
 fn referrer_dir(referrer: Option<&str>) -> Option<PathBuf> {
@@ -78,6 +87,12 @@ pub struct ResolvedSource {
     pub url: String,
     /// Source-language flavour, picked from the file's extension.
     pub kind: SourceKind,
+    /// Nearest merged `tsconfig.json#compilerOptions.jsx`, when present.
+    ///
+    /// The resolver reads this through `oxc_resolver`'s tsconfig discovery,
+    /// including `extends`, so compile-time callers do not need a second
+    /// tsconfig loader.
+    pub jsx: Option<String>,
     /// Source text (UTF-8).
     pub text: String,
 }
@@ -558,11 +573,16 @@ impl ModuleLoader {
                     })?;
                     Ok(format!("file://{}", path.display()))
                 }
-                Err(e) => Err(LoaderError::Resolve {
-                    specifier: specifier.to_string(),
-                    referrer: referrer.unwrap_or("<entry>").to_string(),
-                    message: e.to_string(),
-                }),
+                Err(e) => Err(resolve_error_with_context(
+                    specifier,
+                    referrer,
+                    kind,
+                    match kind {
+                        ImportKind::Esm => &self.config.esm_conditions,
+                        ImportKind::Cjs => &self.config.cjs_conditions,
+                    },
+                    e.to_string(),
+                )),
             };
         }
         if Path::new(specifier).is_absolute() {
@@ -594,10 +614,8 @@ impl ModuleLoader {
                     conditions,
                     &self.config.extensions,
                 )
-                .map_err(|message| LoaderError::Resolve {
-                    specifier: specifier.to_string(),
-                    referrer: referrer.unwrap_or("<entry>").to_string(),
-                    message,
+                .map_err(|message| {
+                    resolve_error_with_context(specifier, referrer, kind, conditions, message)
                 })?
         {
             return Ok(format!("file://{}", path.display()));
@@ -614,10 +632,8 @@ impl ModuleLoader {
                 conditions,
                 &self.config.extensions,
             )
-            .map_err(|message| LoaderError::Resolve {
-                specifier: specifier.to_string(),
-                referrer: referrer.unwrap_or("<entry>").to_string(),
-                message,
+            .map_err(|message| {
+                resolve_error_with_context(specifier, referrer, kind, conditions, message)
             })? {
                 return Ok(format!("file://{}", path.display()));
             }
@@ -641,11 +657,13 @@ impl ModuleLoader {
                     })?;
                 Ok(format!("file://{}", path.display()))
             }
-            Err(e) => Err(LoaderError::Resolve {
-                specifier: specifier.to_string(),
-                referrer: referrer.unwrap_or("<entry>").to_string(),
-                message: e.to_string(),
-            }),
+            Err(e) => Err(resolve_error_with_context(
+                specifier,
+                referrer,
+                kind,
+                conditions,
+                e.to_string(),
+            )),
         }
     }
 
@@ -663,6 +681,7 @@ impl ModuleLoader {
             return Ok(ResolvedSource {
                 url,
                 kind: SourceKind::JavaScript,
+                jsx: None,
                 text: String::new(),
             });
         }
@@ -690,9 +709,11 @@ impl ModuleLoader {
             return Ok(ResolvedSource {
                 url,
                 kind: SourceKind::JavaScript,
+                jsx: None,
                 text: wrapped,
             });
         }
+        let jsx = self.compiler_options_jsx_for_path(Path::new(path));
         let kind = otter_syntax::detect_source_kind(Path::new(path)).ok_or_else(|| {
             LoaderError::Extension {
                 url: url.clone(),
@@ -703,8 +724,56 @@ impl ModuleLoader {
             url: url.clone(),
             message: e.to_string(),
         })?;
-        Ok(ResolvedSource { url, kind, text })
+        Ok(ResolvedSource {
+            url,
+            kind,
+            jsx,
+            text,
+        })
     }
+
+    /// Return nearest merged `tsconfig.json#compilerOptions.jsx`, if present.
+    ///
+    /// This uses `oxc_resolver`'s importer-aware tsconfig discovery, so
+    /// `extends` and the resolver cache stay aligned with module resolution.
+    #[must_use]
+    pub fn compiler_options_jsx_for_path(&self, path: &Path) -> Option<String> {
+        self.esm_resolver
+            .find_tsconfig(path)
+            .ok()
+            .flatten()
+            .and_then(|tsconfig| tsconfig.compiler_options.jsx.clone())
+    }
+}
+
+fn resolve_error_with_context(
+    specifier: &str,
+    referrer: Option<&str>,
+    kind: ImportKind,
+    conditions: &[String],
+    message: impl Into<String>,
+) -> LoaderError {
+    LoaderError::Resolve {
+        specifier: specifier.to_string(),
+        referrer: referrer.unwrap_or("<entry>").to_string(),
+        message: resolver_context_message(specifier, referrer, kind, conditions, message),
+    }
+}
+
+fn resolver_context_message(
+    specifier: &str,
+    referrer: Option<&str>,
+    kind: ImportKind,
+    conditions: &[String],
+    message: impl Into<String>,
+) -> String {
+    format!(
+        "{}; resolver context: importer `{}`, specifier `{specifier}`, import kind `{}`, conditions [{}]",
+        message.into(),
+        referrer.unwrap_or("<entry>"),
+        kind.as_label(),
+        conditions.join(", ")
+    )
 }
 
 fn resolve_with_oxc(
@@ -1000,7 +1069,10 @@ mod tests {
 
         match err {
             LoaderError::Resolve { message, .. } => {
-                assert_eq!(message, "package `app` does not declare dependency `dep`");
+                assert!(message.contains("package `app` does not declare dependency `dep`"));
+                assert!(message.contains("importer `file://"));
+                assert!(message.contains("specifier `dep`"));
+                assert!(message.contains("conditions [otter, import, node, default]"));
             }
             other => panic!("expected graph-gated resolve error, got {other:?}"),
         }
@@ -1068,10 +1140,10 @@ mod tests {
 
         match err {
             LoaderError::Resolve { message, .. } => {
-                assert_eq!(
-                    message,
-                    "package `app` imports map has no entry for `#missing`"
-                );
+                assert!(message.contains("package `app` imports map has no entry for `#missing`"));
+                assert!(message.contains("importer `file://"));
+                assert!(message.contains("specifier `#missing`"));
+                assert!(message.contains("conditions [otter, import, node, default]"));
             }
             other => panic!("expected resolve error, got {other:?}"),
         }
@@ -1300,6 +1372,34 @@ mod tests {
         let resolved = loader.resolve("#shared/shared", Some(&entry)).unwrap();
 
         assert!(resolved.ends_with("src/shared.ts"), "got {resolved}");
+    }
+
+    #[test]
+    fn tsconfig_extends_jsx_option_is_available_at_load_time() {
+        let dir = temp_dir();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.base.json"),
+            r#"{
+              "compilerOptions": {
+                "jsx": "react-jsx"
+              }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"extends":"./tsconfig.base.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("component.tsx"), "export const x = <div />;\n").unwrap();
+        let loader = ModuleLoader::new(dir.path().to_path_buf());
+
+        let loaded = loader.load("./src/component.tsx", None).unwrap();
+
+        assert_eq!(loaded.kind, SourceKind::TypeScriptJsx);
+        assert_eq!(loaded.jsx.as_deref(), Some("react-jsx"));
     }
 
     #[test]

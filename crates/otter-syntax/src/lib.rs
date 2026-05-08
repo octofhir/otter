@@ -6,7 +6,7 @@
 //! parsed AST through this surface.
 //!
 //! # Contents
-//! - [`SourceKind`] — JavaScript / TypeScript flavor selector.
+//! - [`SourceKind`] — JavaScript / TypeScript / JSX flavor selector.
 //! - [`detect_source_kind`] — decide kind from file extension.
 //! - [`Parsed`] — owns an [`oxc_allocator::Allocator`] plus the
 //!   resulting [`oxc_ast::ast::Program`] (lifetime-bound to the
@@ -36,12 +36,19 @@ use thiserror::Error;
 
 /// Source-language flavor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum SourceKind {
     /// JavaScript: `.js`, `.mjs`, `.cjs`.
+    #[serde(rename = "javascript")]
     JavaScript,
+    /// JavaScript with JSX syntax enabled: `.jsx`.
+    #[serde(rename = "jsx")]
+    JavaScriptJsx,
     /// TypeScript: `.ts`, `.mts`, `.cts`.
+    #[serde(rename = "typescript")]
     TypeScript,
+    /// TypeScript with JSX syntax enabled: `.tsx`.
+    #[serde(rename = "tsx")]
+    TypeScriptJsx,
 }
 
 impl SourceKind {
@@ -50,8 +57,16 @@ impl SourceKind {
     pub fn to_oxc(self) -> SourceType {
         match self {
             SourceKind::JavaScript => SourceType::default(),
+            SourceKind::JavaScriptJsx => SourceType::default().with_jsx(true),
             SourceKind::TypeScript => SourceType::default().with_typescript(true),
+            SourceKind::TypeScriptJsx => SourceType::default().with_typescript(true).with_jsx(true),
         }
+    }
+
+    /// `true` when this source kind enables TypeScript syntax.
+    #[must_use]
+    pub fn is_typescript(self) -> bool {
+        matches!(self, SourceKind::TypeScript | SourceKind::TypeScriptJsx)
     }
 }
 
@@ -64,7 +79,9 @@ pub fn detect_source_kind(path: &Path) -> Option<SourceKind> {
     let ext = path.extension()?.to_str()?;
     Some(match ext {
         "js" | "mjs" | "cjs" => SourceKind::JavaScript,
+        "jsx" => SourceKind::JavaScriptJsx,
         "ts" | "mts" | "cts" => SourceKind::TypeScript,
+        "tsx" => SourceKind::TypeScriptJsx,
         _ => return None,
     })
 }
@@ -189,8 +206,16 @@ mod tests {
             Some(SourceKind::TypeScript)
         );
         assert_eq!(
+            detect_source_kind(Path::new("x.tsx")),
+            Some(SourceKind::TypeScriptJsx)
+        );
+        assert_eq!(
             detect_source_kind(Path::new("x.js")),
             Some(SourceKind::JavaScript)
+        );
+        assert_eq!(
+            detect_source_kind(Path::new("x.jsx")),
+            Some(SourceKind::JavaScriptJsx)
         );
         assert_eq!(detect_source_kind(Path::new("x.foo")), None);
     }
@@ -206,6 +231,12 @@ mod tests {
     fn parses_undefined_literal_typescript() {
         let parsed = parse("undefined;", SourceKind::TypeScript).unwrap();
         assert_eq!(parsed.program().unwrap().body.len(), 1);
+    }
+
+    #[test]
+    fn parses_jsx_and_tsx_sources() {
+        assert!(parse("const x = <div />;", SourceKind::JavaScriptJsx).is_ok());
+        assert!(parse("const x: JSX.Element = <div />;", SourceKind::TypeScriptJsx).is_ok());
     }
 
     #[test]

@@ -1034,6 +1034,7 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
                 "addedPackages": report.added_packages,
                 "reusedPackages": report.reused_packages,
                 "linkedBins": report.linked_bins,
+                "lifecycleScripts": report.lifecycle_scripts,
                 "importedLockfile": report.imported_lockfile.map(|format| format.filename())
             })
         );
@@ -1056,6 +1057,15 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
             report.linked_bins,
             if report.linked_bins == 1 { "" } else { "s" }
         );
+        println!(
+            "ran {} lifecycle script{}",
+            report.lifecycle_scripts,
+            if report.lifecycle_scripts == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
     } else {
         println!(
             "{} is up to date",
@@ -1071,6 +1081,15 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
             "linked {} bin{}",
             report.linked_bins,
             if report.linked_bins == 1 { "" } else { "s" }
+        );
+        println!(
+            "ran {} lifecycle script{}",
+            report.lifecycle_scripts,
+            if report.lifecycle_scripts == 1 {
+                ""
+            } else {
+                "s"
+            }
         );
     }
 }

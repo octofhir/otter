@@ -311,17 +311,21 @@ pub enum Value {
     /// `LoadProperty` / `StoreProperty` against the class as
     /// operations on the static side (with `"prototype"` aliased
     /// to the prototype object directly).
-    ClassConstructor(std::rc::Rc<ClassConstructor>),
+    ClassConstructor(ClassConstructor),
 }
 
-/// Storage for [`Value::ClassConstructor`]. Cloned by handle so
-/// passing a class through registers stays cheap; the wrapper is
-/// `Rc`-shared and the inner objects are themselves heap-shared.
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
+/// [`ClassConstructorBody`].
+pub const CLASS_CONSTRUCTOR_BODY_TYPE_TAG: u8 = 0x1f;
+
+/// GC-allocated payload backing every [`Value::ClassConstructor`].
+/// Holds the callable, the instance prototype, and the static-side
+/// object the class exposes.
 #[derive(Debug)]
-pub struct ClassConstructor {
-    /// The actual callable (a `Value::Function` or
-    /// `Value::Closure`) the runtime invokes for `new C(...)` or
-    /// `super(...)`. Constructed by the compiler's class-lowering
+pub struct ClassConstructorBody {
+    /// The actual callable (`Value::Function` / `Value::Closure` /
+    /// `Value::NativeFunction`) the runtime invokes for `new C(...)`
+    /// or `super(...)`. Constructed by the compiler's class-lowering
     /// pass.
     pub ctor: Value,
     /// `C.prototype` — every instance built by `new C(...)`
@@ -332,6 +336,90 @@ pub struct ClassConstructor {
     /// `[[Prototype]]` chains to `C`'s static object so static
     /// inheritance just falls out of the existing prototype walker.
     pub statics: JsObject,
+}
+
+impl otter_gc::SafeTraceable for ClassConstructorBody {
+    const TYPE_TAG: u8 = CLASS_CONSTRUCTOR_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
+        self.ctor.trace_value_slots(visitor);
+        // `JsObject` is `#[repr(transparent)]` over a `u32` GC
+        // offset; expose its storage to the scavenger so a moving
+        // collector can rewrite the slot.
+        if !self.prototype.is_null() {
+            let p = &self.prototype as *const JsObject as *mut RawGc;
+            visitor(p);
+        }
+        if !self.statics.is_null() {
+            let p = &self.statics as *const JsObject as *mut RawGc;
+            visitor(p);
+        }
+    }
+}
+
+/// Cheap-to-clone class-constructor handle. Wraps a
+/// `Gc<ClassConstructorBody>` so `Value::ClassConstructor` stays a
+/// 4-byte payload and the underlying body is GC-managed (no
+/// `Rc`-shared mutable state).
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct ClassConstructor {
+    inner: otter_gc::Gc<ClassConstructorBody>,
+}
+
+impl ClassConstructor {
+    /// Allocate a fresh class constructor on the GC heap.
+    pub fn new(
+        heap: &mut otter_gc::GcHeap,
+        ctor: Value,
+        prototype: JsObject,
+        statics: JsObject,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_old(ClassConstructorBody {
+                ctor,
+                prototype,
+                statics,
+            })?,
+        })
+    }
+
+    /// Identity comparison — `===` follows the GC handle's
+    /// 32-bit-offset equality.
+    #[inline]
+    #[must_use]
+    pub fn ptr_eq(self, other: Self) -> bool {
+        self.inner == other.inner
+    }
+
+    /// Read the underlying callable (Function / Closure / native).
+    #[inline]
+    #[must_use]
+    pub fn ctor(self, heap: &otter_gc::GcHeap) -> Value {
+        heap.read_payload(self.inner, |body| body.ctor.clone())
+    }
+
+    /// Read `C.prototype`.
+    #[inline]
+    #[must_use]
+    pub fn prototype(self, heap: &otter_gc::GcHeap) -> JsObject {
+        heap.read_payload(self.inner, |body| body.prototype)
+    }
+
+    /// Read the static-side object.
+    #[inline]
+    #[must_use]
+    pub fn statics(self, heap: &otter_gc::GcHeap) -> JsObject {
+        heap.read_payload(self.inner, |body| body.statics)
+    }
+
+    /// GC root — used by VM tracing roots when a class constructor
+    /// sits in a register or environment slot.
+    #[doc(hidden)]
+    #[inline]
+    pub fn raw(self) -> RawGc {
+        self.inner.raw()
+    }
 }
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`IteratorState`].
@@ -1088,7 +1176,7 @@ impl PartialEq for Value {
             (Value::Promise(a), Value::Promise(b)) => a.ptr_eq(b as &dyn JsPromise),
             (Value::Iterator(a), Value::Iterator(b)) => a == b,
             (Value::RegExp(a), Value::RegExp(b)) => a.ptr_eq(b),
-            (Value::ClassConstructor(a), Value::ClassConstructor(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Value::ClassConstructor(a), Value::ClassConstructor(b)) => a.ptr_eq(*b),
             (Value::Map(a), Value::Map(b)) => crate::collections::map_ptr_eq(*a, *b),
             (Value::Set(a), Value::Set(b)) => crate::collections::set_ptr_eq(*a, *b),
             (Value::WeakMap(a), Value::WeakMap(b)) => a == b,
@@ -1561,6 +1649,15 @@ pub enum VmError {
         /// Human-readable diagnostic.
         message: String,
     },
+    /// User-visible `RangeError`. Distinct from
+    /// [`Self::TypeError`] so that intrinsics like
+    /// `Number.prototype.toFixed` can surface the spec-mandated
+    /// `RangeError` for out-of-range arguments instead of the
+    /// fallback `TypeError`.
+    RangeError {
+        /// Human-readable diagnostic.
+        message: String,
+    },
     /// String allocation failed because the heap cap was hit.
     OutOfMemory {
         /// Bytes the allocation requested.
@@ -1636,6 +1733,7 @@ impl std::fmt::Display for VmError {
             VmError::InvalidOperand => write!(f, "invalid operand"),
             VmError::TypeMismatch => write!(f, "operand type mismatch"),
             VmError::TypeError { message } => write!(f, "{message}"),
+            VmError::RangeError { message } => write!(f, "{message}"),
             VmError::OutOfMemory {
                 requested_bytes,
                 heap_limit_bytes,
@@ -2468,7 +2566,7 @@ impl Interpreter {
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
-                    current = cc.ctor.clone();
+                    current = cc.ctor(&self.gc_heap).clone();
                 }
                 _ => break,
             }
@@ -2748,6 +2846,13 @@ impl Interpreter {
                 dynamic_message = message.clone();
                 (
                     error_classes::ErrorKind::TypeError,
+                    dynamic_message.as_str(),
+                )
+            }
+            VmError::RangeError { message } => {
+                dynamic_message = message.clone();
+                (
+                    error_classes::ErrorKind::RangeError,
                     dynamic_message.as_str(),
                 )
             }
@@ -3399,16 +3504,16 @@ impl Interpreter {
                         }
                         Value::ClassConstructor(c) => {
                             if name == "prototype" {
-                                Value::Object(c.prototype)
+                                Value::Object(c.prototype(&self.gc_heap))
                             } else {
-                                match crate::object::get(c.statics, &self.gc_heap, &name) {
+                                match crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, &name) {
                                     Some(v) => v,
                                     None if name == "name" || name == "length" => {
                                         // Fall back to the underlying
                                         // ctor's intrinsic property
                                         // when the user hasn't shadowed
                                         // it via a static field.
-                                        match &c.ctor {
+                                        match &c.ctor(&self.gc_heap) {
                                             Value::Function { function_id }
                                             | Value::Closure { function_id, .. } => {
                                                 function_intrinsic_property(
@@ -3522,7 +3627,7 @@ impl Interpreter {
                     let value = read_register(frame, src)?.clone();
                     let target = match read_register(frame, obj_reg)? {
                         Value::Object(o) => Some(*o),
-                        Value::ClassConstructor(c) => Some(c.statics),
+                        Value::ClassConstructor(c) => Some(c.statics(&self.gc_heap)),
                         Value::RegExp(r) => {
                             regexp_prototype::store_property(r, &self.gc_heap, &name, &value);
                             None
@@ -3658,7 +3763,7 @@ impl Interpreter {
                     // through the existing prototype lookup.
                     let proto = match read_register(frame, proto_reg)? {
                         Value::Object(p) => Some(*p),
-                        Value::ClassConstructor(c) => Some(c.statics),
+                        Value::ClassConstructor(c) => Some(c.statics(&self.gc_heap)),
                         Value::Null => None,
                         _ => return Err(VmError::TypeMismatch),
                     };
@@ -3911,9 +4016,9 @@ impl Interpreter {
                             }
                         }
                         // §13.10.2 — for class values, walk the
-                        // proto chain against `class.prototype`.
+                        // proto chain against `class.prototype(&self.gc_heap)`.
                         (Value::Object(a), Value::ClassConstructor(c)) => {
-                            crate::object::has_in_proto_chain(*a, &self.gc_heap, c.prototype)
+                            crate::object::has_in_proto_chain(*a, &self.gc_heap, c.prototype(&self.gc_heap))
                         }
                         _ => false,
                     };
@@ -3985,7 +4090,7 @@ impl Interpreter {
                                 Value::String(s) if s.to_lossy_string() == "prototype" => true,
                                 Value::String(s) => !matches!(
                                     crate::object::lookup(
-                                        c.statics,
+                                        c.statics(&self.gc_heap),
                                         &self.gc_heap,
                                         &s.to_lossy_string()
                                     ),
@@ -4835,11 +4940,7 @@ impl Interpreter {
                         Value::Object(o) => *o,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let class = std::rc::Rc::new(ClassConstructor {
-                        ctor,
-                        prototype,
-                        statics,
-                    });
+                    let class = ClassConstructor::new(&mut self.gc_heap, ctor, prototype, statics)?;
                     write_register(frame, dst, Value::ClassConstructor(class))?;
                     frame.pc += 1;
                 }
@@ -5268,7 +5369,7 @@ impl Interpreter {
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
-                    current = cc.ctor.clone();
+                    current = cc.ctor(&self.gc_heap).clone();
                 }
                 _ => break,
             }
@@ -5790,7 +5891,7 @@ impl Interpreter {
         };
         let top_idx = stack.len() - 1;
         let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        if !is_callable(&callee) {
+        if !is_callable(&callee) && !object_has_construct_slot(&callee, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
@@ -5887,11 +5988,54 @@ impl Interpreter {
             crate::object::set_prototype(receiver, &mut self.gc_heap, Some(proto));
         }
         let this_value = Value::Object(receiver);
-        if matches!(callee, Value::NativeFunction(_)) {
-            return Err(VmError::NotCallable);
+        // Built-in constructor objects (`Number`, `Boolean`, …)
+        // surface as a `Value::Object` whose
+        // `crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY` property
+        // holds the native ctor. Promote to the native-function
+        // construct path so the JS-visible callee can also carry
+        // own properties (statics + `prototype`) without leaning on
+        // a separate `ClassConstructor` handle.
+        if let Value::Object(obj) = &callee
+            && let Some(Value::NativeFunction(native)) = crate::object::get(
+                *obj,
+                &self.gc_heap,
+                crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY,
+            )
+        {
+            let argv: Vec<Value> = args.into_iter().collect();
+            let call = native.call_target(&self.gc_heap);
+            let call_info = NativeCallInfo::construct(this_value.clone(), Some(callee.clone()));
+            let mut ctx = NativeCtx::new_with_call_info(self, call_info);
+            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
+            let constructed = match result {
+                Value::Object(_) => result,
+                _ => this_value,
+            };
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, constructed)?;
+            return Ok(());
+        }
+        // `Value::NativeFunction` carries `[[Construct]]` whenever
+        // the runtime needs the callable to behave as a constructor
+        // (e.g. `new Number(x)`). The native callback inspects
+        // `NativeCtx::is_construct_call()` to differentiate the
+        // call shape.
+        if let Value::NativeFunction(native) = &callee {
+            let argv: Vec<Value> = args.into_iter().collect();
+            let call = native.call_target(&self.gc_heap);
+            let call_info = NativeCallInfo::construct(this_value.clone(), Some(callee.clone()));
+            let mut ctx = NativeCtx::new_with_call_info(self, call_info);
+            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
+            let constructed = match result {
+                Value::Object(_) => result,
+                _ => this_value,
+            };
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, constructed)?;
+            return Ok(());
         }
         if let Value::ClassConstructor(class) = &callee
-            && let Value::NativeFunction(native) = &class.ctor
+            && let Value::NativeFunction(native) = &class.ctor(&self.gc_heap)
         {
             let argv: Vec<Value> = args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
@@ -6308,9 +6452,9 @@ impl Interpreter {
                 Some(crate::object::get(*obj, &self.gc_heap, &name).unwrap_or(Value::Undefined))
             }
             Value::ClassConstructor(c) => Some(if name == "prototype" {
-                Value::Object(c.prototype)
+                Value::Object(c.prototype(&self.gc_heap))
             } else {
-                crate::object::get(c.statics, &self.gc_heap, &name).unwrap_or(Value::Undefined)
+                crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, &name).unwrap_or(Value::Undefined)
             }),
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties (e.g. `assert.sameValue = function(){}`)
@@ -6720,7 +6864,7 @@ impl Interpreter {
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
-                    current = cc.ctor.clone();
+                    current = cc.ctor(&self.gc_heap).clone();
                 }
                 _ => break,
             }
@@ -8066,7 +8210,7 @@ impl Interpreter {
         }
         let obj = match &receiver {
             Value::Object(o) => *o,
-            Value::ClassConstructor(c) => c.statics,
+            Value::ClassConstructor(c) => c.statics(&self.gc_heap),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let fid = *function_id;
                 match self.function_user_props.get(&fid).copied() {
@@ -8181,10 +8325,10 @@ impl Interpreter {
                 if matches!(&key, ComputedPropertyKey::String(key) if key == "prototype") {
                     let pc = stack[top_idx].pc;
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, Value::Object(class.prototype))?;
+                    write_register(&mut stack[top_idx], dst, Value::Object(class.prototype(&self.gc_heap)))?;
                     return Ok(true);
                 }
-                class.statics
+                class.statics(&self.gc_heap)
             }
             _ => return Ok(false),
         };
@@ -8342,7 +8486,7 @@ impl Interpreter {
         }
         let obj = match &receiver {
             Value::Object(obj) => *obj,
-            Value::ClassConstructor(class) => class.statics,
+            Value::ClassConstructor(class) => class.statics(&self.gc_heap),
             _ => return Ok(false),
         };
         let outcome = match &key {
@@ -8466,7 +8610,7 @@ impl Interpreter {
         }
         let obj = match &receiver {
             Value::Object(o) => *o,
-            Value::ClassConstructor(c) => c.statics,
+            Value::ClassConstructor(c) => c.statics(&self.gc_heap),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let fid = *function_id;
                 match self.function_user_props.get(&fid).copied() {
@@ -8640,7 +8784,7 @@ impl Interpreter {
         let proto_val = read_register(&stack[top_idx], proto_reg)?.clone();
         let proto_obj = match &proto_val {
             Value::Object(_) | Value::Null => proto_val.clone(),
-            Value::ClassConstructor(c) => Value::Object(c.statics),
+            Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
             _ => return Err(VmError::TypeMismatch),
         };
         let trap_args: SmallVec<[Value; 8]> =
@@ -9212,6 +9356,9 @@ fn native_to_vm_error(err: NativeError) -> VmError {
         NativeError::TypeError { name, reason } => VmError::TypeError {
             message: format!("{name}: {reason}"),
         },
+        NativeError::RangeError { name, reason } => VmError::RangeError {
+            message: format!("{name}: {reason}"),
+        },
     }
 }
 
@@ -9287,6 +9434,9 @@ fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {
         IntrinsicError::BadReceiver { .. } | IntrinsicError::BadArgument { .. } => {
             VmError::TypeMismatch
         }
+        IntrinsicError::OutOfRange { index, reason } => VmError::RangeError {
+            message: format!("argument {index} out of range: {reason}"),
+        },
         IntrinsicError::UnknownMethod { name } => VmError::UnknownIntrinsic { name },
     }
 }
@@ -9379,10 +9529,10 @@ fn function_to_string(
             .map(|f| f.name.as_str())
             .unwrap_or("anonymous"),
         Value::NativeFunction(n) => n.name(gc_heap),
-        Value::ClassConstructor(c) => match &c.ctor {
+        Value::ClassConstructor(c) => match c.ctor(gc_heap) {
             Value::Function { function_id } | Value::Closure { function_id, .. } => module
                 .functions
-                .get(*function_id as usize)
+                .get(function_id as usize)
                 .map(|f| f.name.as_str())
                 .unwrap_or("anonymous"),
             _ => "anonymous",
@@ -10188,13 +10338,28 @@ fn step_iterator(
 /// constructor object reference (the constructor itself is held in
 /// a register, with `prototype` set via `obj.prototype = …` style
 /// dispatch only on the rare path).
+/// `true` when `value` is a `JsObject` whose
+/// [`crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY`] property carries
+/// a `Value::NativeFunction`, i.e. it is admissible as a `new`
+/// callee even though it is not a plain function value.
+fn object_has_construct_slot(value: &Value, heap: &otter_gc::GcHeap) -> bool {
+    let Value::Object(obj) = value else {
+        return false;
+    };
+    matches!(
+        crate::object::get(*obj, heap, crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY),
+        Some(Value::NativeFunction(_))
+    )
+}
+
 fn construct_prototype(callee: &Value, gc_heap: &otter_gc::GcHeap) -> Option<JsObject> {
     match callee {
-        Value::ClassConstructor(c) => Some(c.prototype),
+        Value::ClassConstructor(c) => Some(c.prototype(gc_heap)),
         Value::Object(obj) => match crate::object::get(*obj, gc_heap, "prototype") {
             Some(Value::Object(p)) => Some(p),
             _ => None,
         },
+        Value::NativeFunction(_) => None,
         Value::BoundFunction(b) => {
             let (target, _, _) = b.parts(gc_heap);
             construct_prototype(&target, gc_heap)

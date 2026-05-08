@@ -5266,29 +5266,12 @@ fn compile_expr(
                 cx.emit(Op::StringCall, operands, new_span);
                 return Ok(dst);
             }
-            // §21.1.1 `new Number(value)` — foundation aliases to
-            // primitive ToNumber (no wrapper object).
-            if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "Number"
-                && cx.lookup_binding("Number").is_none()
-                && find_module_import_binding(cx, "Number").is_none()
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let dst = cx.alloc_scratch();
-                match arg_regs.first().copied() {
-                    Some(src) => cx.emit(
-                        Op::ToNumber,
-                        vec![Operand::Register(dst), Operand::Register(src)],
-                        new_span,
-                    ),
-                    None => cx.emit(
-                        Op::LoadInt32,
-                        vec![Operand::Register(dst), Operand::Imm32(0)],
-                        new_span,
-                    ),
-                }
-                return Ok(dst);
-            }
+            // §21.1.1 `new Number(value)` no longer aliases here —
+            // the `Number` global is now a real `ClassConstructor`
+            // (see `bootstrap::install_number`) and the construct
+            // form must produce a `NumberObject` wrapper with the
+            // `[[NumberData]]` slot set, not a primitive Number.
+            // Falls through to the general `NewExpression` path.
             // §20.3.1 `new Boolean(value)` — foundation aliases to
             // primitive ToBoolean (no wrapper object).
             // <https://tc39.es/ecma262/#sec-boolean-constructor>

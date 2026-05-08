@@ -763,6 +763,17 @@ pub enum NativeError {
         /// Short reason.
         reason: String,
     },
+    /// Out-of-range argument; surfaces as a JS `RangeError`. Used
+    /// by intrinsics whose spec wording mandates `RangeError`
+    /// (e.g. `Number.prototype.toFixed`, `toExponential`,
+    /// `toPrecision` — out-of-range `fractionDigits` / `precision`).
+    #[error("native function {name}: {reason}")]
+    RangeError {
+        /// Display name of the native.
+        name: &'static str,
+        /// Short reason.
+        reason: String,
+    },
 }
 
 impl From<otter_gc::OutOfMemory> for NativeError {

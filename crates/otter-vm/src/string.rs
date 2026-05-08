@@ -191,11 +191,12 @@ pub enum StringRepr {
         /// Length (code units).
         len: u32,
     },
-    /// Reserved variant for the future Latin-1 / WTF-16 hybrid
-    /// representation. **Never constructed** at this slice; the tag
-    /// is occupied so a future amendment cannot quietly reuse the
-    /// discriminant.
-    #[doc(hidden)]
+    /// Latin-1 storage. Each byte zero-extends to a `u16` code
+    /// unit on read. Used as the inline target of ASCII-only
+    /// constructors (e.g. numeric formatters in
+    /// `crate::number::ecma`) so the result avoids the
+    /// `&str → Vec<u16> → Arc<[u16]>` widening round-trip that
+    /// `from_str` performs.
     Thin(Arc<[u8]>),
 }
 
@@ -227,6 +228,27 @@ impl JsString {
     pub fn from_str(s: &str, heap: &StringHeap) -> Result<Self, StringError> {
         let units: Vec<u16> = s.encode_utf16().collect();
         Self::from_utf16_units(&units, heap)
+    }
+
+    /// Construct a Latin-1-tagged string from an ASCII / Latin-1
+    /// byte slice. Each byte zero-extends to a `u16` code unit on
+    /// read; storage stays a single `Arc<[u8]>` to avoid the
+    /// `&str → Vec<u16>` widening allocation that
+    /// [`Self::from_str`] performs.
+    ///
+    /// Caller is responsible for ensuring `bytes` are valid Latin-1
+    /// (every byte ≤ `0xFF` is trivially Latin-1, but ASCII-only
+    /// callers preserve the spec semantics for code-unit access).
+    ///
+    /// # Errors
+    /// Returns [`StringError::OutOfMemory`] if `heap` cannot
+    /// accommodate the allocation.
+    pub fn from_latin1(bytes: &[u8], heap: &StringHeap) -> Result<Self, StringError> {
+        let alloc = FLAT_HEADER_BYTES + bytes.len() as u64;
+        heap.reserve(alloc)?;
+        Ok(Self {
+            repr: Arc::new(StringRepr::Thin(bytes.into())),
+        })
     }
 
     /// Empty string convenience constructor (no allocation
@@ -350,7 +372,18 @@ impl JsString {
                 let flat = self.flatten(heap)?;
                 flat.slice(start, length, heap)
             }
-            StringRepr::Thin(_) => unreachable!("Thin variant is reserved"),
+            StringRepr::Thin(bytes) => {
+                // Latin-1 source: collapse the slice into a fresh
+                // `Thin` rather than widening to WTF-16. Keeps the
+                // 1-byte-per-code-unit advantage on the slice path.
+                let s = start as usize;
+                let e = s + (length as usize);
+                let alloc = FLAT_HEADER_BYTES + (length as u64);
+                heap.reserve(alloc)?;
+                Ok(Self {
+                    repr: Arc::new(StringRepr::Thin(bytes[s..e].into())),
+                })
+            }
         }
     }
 
@@ -382,7 +415,9 @@ impl JsString {
                     stack.push(right);
                     stack.push(left);
                 }
-                StringRepr::Thin(_) => unreachable!("Thin variant is reserved"),
+                StringRepr::Thin(bytes) => {
+                    buf.extend(bytes.iter().map(|&b| u16::from(b)));
+                }
             }
         }
         Self::from_utf16_units(&buf, heap)
@@ -459,7 +494,9 @@ impl JsString {
                         node = (**right).clone();
                     }
                 }
-                StringRepr::Thin(_) => unreachable!("Thin variant is reserved"),
+                StringRepr::Thin(bytes) => {
+                    return Some(u16::from(bytes[idx as usize]));
+                }
             }
         }
     }
@@ -621,6 +658,7 @@ enum NodeFrame<'a> {
     Flat { slice: &'a [u16], pos: usize },
     Sliced { slice: &'a [u16] },
     Cons { right: &'a JsString },
+    Latin1 { slice: &'a [u8] },
 }
 
 impl<'a> CodeUnits<'a> {
@@ -655,7 +693,10 @@ impl<'a> CodeUnits<'a> {
                     self.stack.push(NodeFrame::Cons { right });
                     current = left;
                 }
-                StringRepr::Thin(_) => unreachable!("Thin variant is reserved"),
+                StringRepr::Thin(bytes) => {
+                    self.stack.push(NodeFrame::Latin1 { slice: bytes });
+                    return;
+                }
             }
         }
     }
@@ -689,6 +730,14 @@ impl<'a> Iterator for CodeUnits<'a> {
                     self.stack.pop();
                     self.push(r);
                 }
+                NodeFrame::Latin1 { slice } => {
+                    if !slice.is_empty() {
+                        let byte = slice[0];
+                        *slice = &slice[1..];
+                        return Some(u16::from(byte));
+                    }
+                    self.stack.pop();
+                }
             }
         }
     }
@@ -707,6 +756,47 @@ mod tests {
         let s = JsString::from_str("abc", &h()).unwrap();
         assert_eq!(s.len(), 3);
         assert_eq!(s.to_lossy_string(), "abc");
+    }
+
+    #[test]
+    fn latin1_thin_roundtrip() {
+        let heap = h();
+        let thin = JsString::from_latin1(b"abc", &heap).unwrap();
+        assert_eq!(thin.len(), 3);
+        assert_eq!(thin.to_lossy_string(), "abc");
+        assert_eq!(thin.char_code_at(0), Some(b'a' as u16));
+        assert_eq!(thin.char_code_at(1), Some(b'b' as u16));
+        assert_eq!(thin.char_code_at(2), Some(b'c' as u16));
+        assert_eq!(thin.char_code_at(3), None);
+    }
+
+    #[test]
+    fn latin1_equals_flat_for_ascii() {
+        let heap = h();
+        let thin = JsString::from_latin1(b"hello", &heap).unwrap();
+        let flat = JsString::from_str("hello", &heap).unwrap();
+        assert!(thin.equals(&flat));
+        assert!(flat.equals(&thin));
+    }
+
+    #[test]
+    fn latin1_slice_stays_thin() {
+        let heap = h();
+        let thin = JsString::from_latin1(b"abcdef", &heap).unwrap();
+        let mid = thin.slice(1, 3, &heap).unwrap();
+        assert_eq!(mid.len(), 3);
+        assert_eq!(mid.to_lossy_string(), "bcd");
+    }
+
+    #[test]
+    fn latin1_in_cons_rope_iterates() {
+        let heap = h();
+        let left = JsString::from_latin1(b"foo", &heap).unwrap();
+        let right = JsString::from_str("bar", &heap).unwrap();
+        let cons = JsString::concat(&left, &right, &heap).unwrap();
+        assert_eq!(cons.to_lossy_string(), "foobar");
+        assert_eq!(cons.char_code_at(2), Some(b'o' as u16));
+        assert_eq!(cons.char_code_at(3), Some(b'b' as u16));
     }
 
     #[test]

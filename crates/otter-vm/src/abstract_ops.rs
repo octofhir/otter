@@ -279,6 +279,11 @@ pub fn is_callable(value: &Value) -> bool {
 pub fn is_constructor(value: &Value, module: &BytecodeModule, heap: &otter_gc::GcHeap) -> bool {
     match value {
         Value::ClassConstructor(_) => true,
+        // Native functions installed as built-in constructors carry
+        // `[[Construct]]`. The dispatch site routes through the
+        // same `NativeCtx::is_construct_call()` flag the callback
+        // uses to differentiate `Number(x)` from `new Number(x)`.
+        Value::NativeFunction(_) => true,
         Value::Function { function_id } | Value::Closure { function_id, .. } => module
             .functions
             .get(*function_id as usize)

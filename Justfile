@@ -29,6 +29,12 @@ process-audit:
 build:
     cargo build --all-targets
 
+# Regenerate the Schubfach POW10 multiplier table
+# (`crates/otter-vm/src/number/pow10_table.rs`). Run after editing
+# the generator at `crates/otter-vm-codegen/src/bin/gen_pow10.rs`.
+gen-pow10:
+    cargo run -p otter-vm-codegen --bin gen-pow10 --release
+
 # Build release
 release:
     cargo build --release -p otter-cli

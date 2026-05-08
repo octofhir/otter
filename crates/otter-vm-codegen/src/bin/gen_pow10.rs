@@ -1,0 +1,186 @@
+//! Generate the Schubfach POW10 multiplier table for `f64`
+//! shortest-decimal rendering, then write it to
+//! `crates/otter-vm/src/number/pow10_table.rs`.
+//!
+//! Output is committed to source control; this binary is run only
+//! when the table needs to change (which should be never, since the
+//! `f64` Schubfach range is fixed by the IEEE 754 binary64 spec).
+//!
+//! # Algorithm
+//!
+//! For each integer `k` in `[K_MIN, K_MAX]`, compute the unique pair
+//! `(β, r)` of real `β` and integer `r` such that
+//!
+//! ```text
+//!     10^(-k) = β · 2^r,   2^125 ≤ β < 2^126.
+//! ```
+//!
+//! Then `g(k) = ⌊β⌋ + 1` (the "ceiling but always strictly above" rule
+//! from Giulietti 2018/2020). `g(k)` fits in 126 bits and is stored
+//! split into a high `u64` (top 64 bits) and a low `u64` (bottom 64).
+//!
+//! The shift exponent is `r = ⌊-k · log2(10)⌋ - 125`. The codegen
+//! uses `f64`'s `LOG2_10` constant (exact closest-f64 value); for
+//! the involved range `|k| ≤ 324` the floor is unambiguous because
+//! the rounding error in the product is `< 1e-12` while the floor
+//! function only changes on integer boundaries.
+//!
+//! # ECMA-262
+//! - <https://tc39.es/ecma262/#sec-numeric-types-number-tostring>
+
+use num_bigint::BigInt;
+use num_traits::One;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+const K_MIN: i32 = -324;
+const K_MAX: i32 = 292;
+const ENTRIES: usize = (K_MAX - K_MIN + 1) as usize;
+
+fn main() {
+    let table = build_table();
+    let rendered = render(&table);
+
+    let mut out_path = workspace_root();
+    out_path.push("crates/otter-vm/src/number/pow10_table.rs");
+    fs::write(&out_path, rendered).expect("write pow10_table.rs");
+    println!("wrote {} ({} entries)", out_path.display(), ENTRIES);
+}
+
+/// Locate the workspace root by walking up from `CARGO_MANIFEST_DIR`
+/// until a `Cargo.toml` with `[workspace]` is found.
+fn workspace_root() -> PathBuf {
+    let mut p = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    loop {
+        let candidate = p.join("Cargo.toml");
+        if candidate.is_file() {
+            let body = fs::read_to_string(&candidate).expect("read Cargo.toml");
+            if body.contains("[workspace]") {
+                return p;
+            }
+        }
+        if !p.pop() {
+            panic!("workspace root not found");
+        }
+    }
+}
+
+fn build_table() -> Vec<(u64, u64)> {
+    (K_MIN..=K_MAX).map(g_for_k).collect()
+}
+
+/// Compute `g(k)` per the paper formula and return its high/low
+/// 64-bit halves.
+fn g_for_k(k: i32) -> (u64, u64) {
+    // r = ⌊-k · log2(10)⌋ - 125. Computed in f64 because the
+    // product's rounding error is far smaller than 1, and the floor
+    // is unambiguous over the K_MIN..K_MAX window.
+    let r = (-(k as f64) * std::f64::consts::LOG2_10).floor() as i32 - 125;
+
+    // Compute ⌊β⌋ as an integer using exact bigint arithmetic.
+    //
+    //   β = 10^(-k) · 2^(-r)
+    //
+    // Three cases by sign:
+    //   k <= 0, -r >= 0  →  β = 10^|k| · 2^|r|             (integer)
+    //   k <= 0, -r <  0  →  β = 10^|k| / 2^r               (rational; floor by shift)
+    //   k >  0           →  β = 2^|r| / 10^k               (rational; floor by div)
+    let beta_floor: BigInt = if k <= 0 {
+        let ten_pow = pow_bigint(10, (-k) as u32);
+        if r <= 0 {
+            ten_pow << (-r) as u32
+        } else {
+            ten_pow >> r as u32
+        }
+    } else {
+        let ten_pow = pow_bigint(10, k as u32);
+        // For k > 0, r is large negative, so -r is large positive.
+        // Sanity: r should always be < 0 here.
+        assert!(r < 0, "k>0 implies r<0 for Schubfach, got r={r} at k={k}");
+        let two_pow = BigInt::one() << (-r) as u32;
+        two_pow / ten_pow
+    };
+
+    let g = beta_floor + BigInt::one();
+    let bytes = g.to_bytes_be().1;
+    assert!(
+        bytes.len() <= 16,
+        "g(k={k}) overflows 128 bits: {} bytes",
+        bytes.len()
+    );
+
+    // Pad to 16 bytes big-endian.
+    let mut padded = [0u8; 16];
+    let offset = 16 - bytes.len();
+    padded[offset..].copy_from_slice(&bytes);
+
+    let high = u64::from_be_bytes(padded[..8].try_into().unwrap());
+    let low = u64::from_be_bytes(padded[8..].try_into().unwrap());
+
+    // Sanity: 2^125 ≤ g - 1 < 2^126 means g - 1 has bit 125 set and
+    // no bit ≥ 126 set. So the top 6 bits of `high` are 0b00000010
+    // up to 0b00000011 inclusive (after we add 1, top bits stay in
+    // the same range modulo a single corner case where β exactly =
+    // 2^126 - 1). Verify the two-MSB sanity check.
+    debug_assert!(
+        (high >> 62) & 0b11 != 0,
+        "high should have bit 125 or 126 set (k={k}, high={high:#x})"
+    );
+
+    (high, low)
+}
+
+fn pow_bigint(base: u32, exp: u32) -> BigInt {
+    let mut result = BigInt::one();
+    let b = BigInt::from(base);
+    for _ in 0..exp {
+        result *= &b;
+    }
+    result
+}
+
+fn render(table: &[(u64, u64)]) -> String {
+    let mut out = String::with_capacity(48 * 1024);
+    out.push_str(
+        r#"//! Generated by `just gen-pow10` — DO NOT EDIT BY HAND.
+//!
+//! Schubfach POW10 multiplier table for `f64` shortest-decimal
+//! rendering. For `k ∈ [K_MIN, K_MAX]`, `G_TABLE[k - K_MIN]` is the
+//! pair `(g_high, g_low)` such that `g = (g_high as u128) << 64 |
+//! g_low as u128` equals `⌊β⌋ + 1`, with `10^(-k) = β · 2^r` and
+//! `2^125 ≤ β < 2^126`.
+//!
+//! See `crates/otter-vm-codegen/src/bin/gen_pow10.rs` for the
+//! algorithm. The table covers the full IEEE 754 binary64 exponent
+//! range.
+//!
+//! # ECMA-262
+//! - <https://tc39.es/ecma262/#sec-numeric-types-number-tostring>
+
+/// Smallest `k` for which a multiplier is tabulated.
+pub const K_MIN: i32 = "#,
+    );
+    out.push_str(&K_MIN.to_string());
+    out.push_str(
+        ";\n\n/// Largest `k` for which a multiplier is tabulated.\npub const K_MAX: i32 = ",
+    );
+    out.push_str(&K_MAX.to_string());
+    out.push_str(";\n\n");
+    out.push_str("/// Number of entries (`K_MAX - K_MIN + 1`).\n");
+    out.push_str(&format!("pub const G_TABLE_LEN: usize = {ENTRIES};\n\n"));
+    out.push_str(
+        "/// `(g_high, g_low)` pairs indexed by `k - K_MIN`.\n\
+         /// Each pair packs a 126-bit `g(k)` into two `u64` halves.\n\
+         #[rustfmt::skip]\n",
+    );
+    out.push_str("pub static G_TABLE: [(u64, u64); G_TABLE_LEN] = [\n");
+    for (i, (hi, lo)) in table.iter().enumerate() {
+        let k = K_MIN + i as i32;
+        out.push_str(&format!(
+            "    (0x{hi:016x}, 0x{lo:016x}), // k = {k:>4}\n"
+        ));
+    }
+    out.push_str("];\n");
+    out
+}

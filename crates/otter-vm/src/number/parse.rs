@@ -33,8 +33,10 @@ use crate::Value;
 /// - `"NaN"`;
 /// - decimal-integer / decimal-float text (Rust `f64::from_str`).
 ///
-/// Any other shape → `NaN`. Hex / binary / octal `StringNumeric`
-/// literals are deferred to a later slice.
+/// Per §7.1.4.1 `StringToNumber`. Recognises decimal, hex (`0x` /
+/// `0X`), binary (`0b` / `0B`), and octal (`0o` / `0O`) prefixed
+/// integer literals as well as the decimal floating-point grammar
+/// (`+/-`, integer/fraction/exponent). Unparseable strings → `NaN`.
 #[must_use]
 pub fn to_number_from_string(text: &str) -> NumberValue {
     let trimmed = text.trim();
@@ -47,10 +49,35 @@ pub fn to_number_from_string(text: &str) -> NumberValue {
         "-Infinity" => return NumberValue::Double(f64::NEG_INFINITY),
         _ => {}
     }
+    // §7.1.4.1.3 NonDecimalIntegerLiteral. Spec disallows a sign
+    // prefix on hex / binary / octal forms (so `"-0x10"` → NaN).
+    if let Some(rest) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        return parse_radix_digits(rest, 16);
+    }
+    if let Some(rest) = trimmed.strip_prefix("0b").or_else(|| trimmed.strip_prefix("0B")) {
+        return parse_radix_digits(rest, 2);
+    }
+    if let Some(rest) = trimmed.strip_prefix("0o").or_else(|| trimmed.strip_prefix("0O")) {
+        return parse_radix_digits(rest, 8);
+    }
     match trimmed.parse::<f64>() {
         Ok(d) => NumberValue::Double(d).canonicalize(),
         Err(_) => NumberValue::Double(f64::NAN),
     }
+}
+
+fn parse_radix_digits(digits: &str, radix: u32) -> NumberValue {
+    if digits.is_empty() {
+        return NumberValue::Double(f64::NAN);
+    }
+    let mut value: f64 = 0.0;
+    for ch in digits.chars() {
+        let Some(d) = ch.to_digit(radix) else {
+            return NumberValue::Double(f64::NAN);
+        };
+        value = value * f64::from(radix) + f64::from(d);
+    }
+    NumberValue::Double(value).canonicalize()
 }
 
 /// §7.1.4 ToNumber for an arbitrary `Value` — returns the raw
@@ -74,6 +101,52 @@ pub fn to_number_value(value: &Value) -> f64 {
             NumberValue::Double(d) => d,
         },
         _ => f64::NAN,
+    }
+}
+
+/// §7.1.5 `ToIntegerOrInfinity(value)`. Coerces via [`to_number_value`]
+/// then truncates toward zero; `NaN` collapses to `0`, infinities
+/// pass through unchanged. Used by `Number.prototype.{toFixed,
+/// toExponential, toPrecision}` for their fractional-digit /
+/// precision arguments.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-tointegerorinfinity>
+#[must_use]
+pub fn to_integer_or_infinity(value: &Value) -> f64 {
+    let n = to_number_value(value);
+    if n.is_nan() {
+        0.0
+    } else if !n.is_finite() {
+        n
+    } else {
+        n.trunc()
+    }
+}
+
+/// Outcome of a strict `ToIntegerOrInfinity` coercion: distinguishes
+/// the `Symbol` / `BigInt` arms (which spec-mandate a `TypeError`)
+/// from the rest.
+#[derive(Debug, Clone, Copy)]
+pub enum IntegerCoercion {
+    /// Successful coercion. Carries the truncated `f64`.
+    Ok(f64),
+    /// `Symbol` argument; `ToNumber(Symbol)` throws `TypeError`.
+    SymbolNotConvertible,
+    /// `BigInt` argument; `ToNumber(BigInt)` throws `TypeError`.
+    BigIntNotConvertible,
+}
+
+/// Strict version of [`to_integer_or_infinity`] that surfaces the
+/// `Symbol` / `BigInt` arms separately so the caller can throw a
+/// spec-correct `TypeError` (per §7.1.4 ToNumber). Other inputs go
+/// through [`to_number_value`] like the loose form.
+#[must_use]
+pub fn to_integer_or_infinity_strict(value: &Value) -> IntegerCoercion {
+    match value {
+        Value::Symbol(_) => IntegerCoercion::SymbolNotConvertible,
+        Value::BigInt(_) => IntegerCoercion::BigIntNotConvertible,
+        _ => IntegerCoercion::Ok(to_integer_or_infinity(value)),
     }
 }
 

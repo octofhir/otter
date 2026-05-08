@@ -1953,6 +1953,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "otter-vm-codegen"
+version = "0.0.0"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
 name = "otter-web"
 version = "0.1.0"
 dependencies = [

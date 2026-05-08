@@ -547,6 +547,18 @@ thread_local! {
 /// Distinct from `UPVALUE_CELL_TYPE_TAG = 0x10` (task 76).
 pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 
+/// Reserved property key that materialises a JsObject's
+/// `[[Construct]]` (and, transitively, `[[Call]]`) internal method
+/// when the object stands in for a callable+constructable built-in
+/// (e.g. the `Number` global). The dispatcher reads this slot
+/// before falling back to ordinary property lookup, so a plain
+/// `Value::Object` can serve as the `Op::New` / `Op::Call` callee
+/// without a separate `Rc`-shared variant. Stored as a
+/// `Value::NativeFunction`; the native body inspects
+/// `NativeCtx::is_construct_call()` to differentiate the call
+/// shape (per ECMA-262 §10.3).
+pub const CONSTRUCTOR_NATIVE_SLOT_KEY: &str = "__construct__";
+
 /// GC-allocated storage backing every [`JsObject`] handle.
 ///
 /// Per ECMA-262 §10.1, ordinary objects carry a hidden-class

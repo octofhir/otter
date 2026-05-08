@@ -337,7 +337,7 @@ pub fn call(
 /// instances with the same chain.
 fn construct_prototype(callee: &Value, heap: &otter_gc::GcHeap) -> Option<JsObject> {
     match callee {
-        Value::ClassConstructor(c) => Some(c.prototype),
+        Value::ClassConstructor(c) => Some(c.prototype(heap)),
         Value::Object(obj) => match crate::object::get(*obj, heap, "prototype") {
             Some(Value::Object(p)) => Some(p),
             _ => None,

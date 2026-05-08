@@ -451,11 +451,9 @@ impl<'rt> ClassBuilder<'rt> {
             }
         }
 
-        let class = Value::ClassConstructor(Rc::new(ClassConstructor {
-            ctor: constructor,
-            prototype,
-            statics,
-        }));
+        let class = Value::ClassConstructor(
+            ClassConstructor::new(self.heap, constructor, prototype, statics)?,
+        );
         define_data(
             prototype,
             self.heap,
@@ -658,14 +656,14 @@ mod tests {
             panic!("class builder should produce a class constructor value")
         };
 
-        let Value::NativeFunction(ctor) = &class.ctor else {
+        let Value::NativeFunction(ctor) = &class.ctor(&heap) else {
             panic!("class constructor should use a native function")
         };
         assert!(ctor.is_static_call(&heap));
         assert_eq!(ctor.length(&heap), 1);
 
         let Value::NativeFunction(static_method) =
-            object::get(class.statics, &heap, "from").expect("static method")
+            object::get(class.statics(&heap), &heap, "from").expect("static method")
         else {
             panic!("static method should be native")
         };
@@ -673,17 +671,17 @@ mod tests {
         assert_eq!(static_method.length(&heap), 1);
 
         let Value::NativeFunction(proto_method) =
-            object::get(class.prototype, &heap, "valueOf").expect("prototype method")
+            object::get(class.prototype(&heap), &heap, "valueOf").expect("prototype method")
         else {
             panic!("prototype method should be native")
         };
         assert!(proto_method.is_static_call(&heap));
         assert_eq!(proto_method.length(&heap), 0);
 
-        let constructor = object::get(class.prototype, &heap, "constructor")
+        let constructor = object::get(class.prototype(&heap), &heap, "constructor")
             .expect("prototype constructor backlink");
         assert!(matches!(constructor, Value::ClassConstructor(_)));
-        let accessor = object::get_own_descriptor(class.prototype, &heap, "answer")
+        let accessor = object::get_own_descriptor(class.prototype(&heap), &heap, "answer")
             .expect("prototype accessor");
         assert!(accessor.is_accessor());
         assert!(!accessor.enumerable());

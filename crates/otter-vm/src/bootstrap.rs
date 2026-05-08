@@ -266,7 +266,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         install: install_json,
     },
     placeholder("String"),
-    placeholder("Number"),
+    BootstrapEntry {
+        name: "Number",
+        feature: BootstrapFeatures::CORE,
+        install: install_number,
+    },
     placeholder("Boolean"),
     placeholder("BigInt"),
     placeholder("Symbol"),
@@ -436,6 +440,216 @@ fn install_array(
     Ok(())
 }
 
+fn install_number(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{NativeCall, NativeCtx, NativeError};
+
+    // Number.prototype with all the formatter methods + the
+    // hidden `[[NumberData]]` slot (= +0 per §21.1.3) so
+    // `Number.prototype.toString()` recovers the value.
+    let prototype = object::alloc_object(heap)?;
+    {
+        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        for method in crate::number::prototype::NUMBER_PROTOTYPE_METHODS {
+            builder.method_from_spec(method)?;
+        }
+    }
+    object::set(
+        prototype,
+        heap,
+        crate::number::prototype::NUMBER_DATA_SLOT_KEY,
+        Value::Number(crate::number::NumberValue::from_i32(0)),
+    );
+
+    // §21.1.1 Number constructor. Both `Number(value)` (call) and
+    // `new Number(value)` (construct) coerce `value` via §7.1.4
+    // ToNumber. The construct form additionally wraps the result in
+    // a `NumberObject` with `[[NumberData]] = ToNumber(value)`; the
+    // pre-allocated receiver from `dispatch_construct` already has
+    // `Number.prototype` linked as `[[Prototype]]`.
+    fn number_ctor_call(
+        ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let value = if args.is_empty() {
+            crate::number::NumberValue::from_i32(0)
+        } else {
+            crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(&args[0]))
+        };
+        if ctx.is_construct_call() {
+            let this = ctx.this_value().clone();
+            if let Value::Object(obj) = this {
+                crate::object::set(
+                    obj,
+                    ctx.heap_mut(),
+                    crate::number::prototype::NUMBER_DATA_SLOT_KEY,
+                    Value::Number(value),
+                );
+                Ok(Value::Object(obj))
+            } else {
+                Err(NativeError::TypeError {
+                    name: "Number",
+                    reason: "expected object receiver in `new Number(...)`".to_string(),
+                })
+            }
+        } else {
+            Ok(Value::Number(value))
+        }
+    }
+
+    let ctor_native = NativeFunction::new_static(heap, "Number", 1, number_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    // The `Number` global itself is a GC-managed JsObject. Both the
+    // constants/static methods and the `prototype` link sit on it
+    // as ordinary properties; the callable+constructable surface is
+    // wired through the dispatch path's hidden-slot lookup
+    // (`__construct__` / `__call__` keys, see
+    // `crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY`).
+    let statics = object::alloc_object(heap)?;
+    // Chain `Number`'s statics to `Object.prototype` so the
+    // prototype-resident methods (hasOwnProperty, toString,
+    // isPrototypeOf, etc.) resolve through ordinary property
+    // lookup. Object is installed earlier in BOOTSTRAP_ENTRIES, so
+    // `Object.prototype` is already reachable.
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(statics, heap, Some(object_proto));
+    }
+    // Same chaining for `Number.prototype`, so
+    // `Number.prototype.hasOwnProperty(...)` resolves.
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
+    // Wire the callable+constructable bridge: stash the native
+    // ctor on the Number object under a reserved key the dispatch
+    // path looks up before falling back to ordinary property load.
+    object::set(
+        statics,
+        heap,
+        crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY,
+        Value::NativeFunction(ctor_native),
+    );
+    // `Number.prototype` lives as an own property on the
+    // constructor object (per §21.1.2.5). Spec posture is
+    // `[[Writable]]: false, [[Enumerable]]: false,
+    // [[Configurable]]: false`; ordinary `set` matches the first
+    // and third but installs as enumerable — the descriptor surface
+    // is tightened separately when the rest of the spec descriptors
+    // get audited.
+    object::set(statics, heap, "prototype", Value::Object(prototype));
+
+    // §21.1.2 Number-namespace constants. Per spec, each is
+    // `[[Writable]]: false, [[Enumerable]]: false,
+    // [[Configurable]]: false` — install via `Attr::read_only()`
+    // through the property builder so descriptor checks pass.
+    let max_safe_int = ((1u64 << 53) - 1) as f64;
+    let constants: &[(&'static str, f64)] = &[
+        ("MAX_VALUE", f64::MAX),
+        ("MIN_VALUE", 5e-324),
+        ("EPSILON", f64::EPSILON),
+        ("MAX_SAFE_INTEGER", max_safe_int),
+        ("MIN_SAFE_INTEGER", -max_safe_int),
+        ("POSITIVE_INFINITY", f64::INFINITY),
+        ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+        ("NaN", f64::NAN),
+    ];
+    {
+        let mut builder = ObjectBuilder::from_object(heap, statics);
+        for (name, value) in constants {
+            builder.property(
+                name,
+                Value::Number(crate::number::NumberValue::from_f64(*value)),
+                Attr::read_only(),
+            )?;
+        }
+    }
+
+    // Static predicates / parsers. Wired through dedicated native
+    // callbacks that share the foundation `crate::number::parse`
+    // implementation (the same helpers `Op::GlobalCall` reaches via
+    // the compile-time alias for `Number.isNaN(x)` etc.).
+    fn number_is_nan_native(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let result = matches!(args.first(), Some(Value::Number(n)) if n.as_f64().is_nan());
+        Ok(Value::Boolean(result))
+    }
+    fn number_is_finite_native(
+        _ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let result = matches!(args.first(), Some(Value::Number(n)) if n.as_f64().is_finite());
+        Ok(Value::Boolean(result))
+    }
+    fn number_is_integer_native(
+        _ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let v = args.first().cloned().unwrap_or(Value::Undefined);
+        Ok(Value::Boolean(crate::number::parse::is_integer(&v)))
+    }
+    fn number_is_safe_integer_native(
+        _ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let v = args.first().cloned().unwrap_or(Value::Undefined);
+        Ok(Value::Boolean(crate::number::parse::is_safe_integer(&v)))
+    }
+    fn number_parse_int_native(
+        _ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let s = match args.first() {
+            Some(Value::String(s)) => s.to_lossy_string(),
+            Some(other) => other.display_string(),
+            None => return Ok(Value::Number(crate::number::NumberValue::from_f64(f64::NAN))),
+        };
+        let radix = match args.get(1) {
+            Some(Value::Number(n)) => n.as_f64() as i32,
+            _ => 0,
+        };
+        Ok(Value::Number(crate::number::parse::parse_int(&s, radix)))
+    }
+    fn number_parse_float_native(
+        _ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let s = match args.first() {
+            Some(Value::String(s)) => s.to_lossy_string(),
+            Some(other) => other.display_string(),
+            None => return Ok(Value::Number(crate::number::NumberValue::from_f64(f64::NAN))),
+        };
+        Ok(Value::Number(crate::number::parse::parse_float(&s)))
+    }
+
+    {
+        let mut builder = ObjectBuilder::from_object(heap, statics);
+        let methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
+            ("isNaN", 1, number_is_nan_native),
+            ("isFinite", 1, number_is_finite_native),
+            ("isInteger", 1, number_is_integer_native),
+            ("isSafeInteger", 1, number_is_safe_integer_native),
+            ("parseInt", 2, number_parse_int_native),
+            ("parseFloat", 1, number_parse_float_native),
+        ];
+        for (name, length, call) in methods {
+            builder.method(name, *length, NativeCall::Static(*call), Attr::builtin_function())?;
+        }
+    }
+
+    let number_value = Value::Object(statics);
+    // §21.1.3.1 `Number.prototype.constructor` points back at the
+    // Number constructor.
+    object::set(prototype, heap, "constructor", number_value.clone());
+    define_global(global, heap, entry.name, number_value);
+    Ok(())
+}
+
 fn install_function(
     entry: &BootstrapEntry,
     heap: &mut otter_gc::GcHeap,
@@ -570,6 +784,15 @@ fn record_installed_entry(telemetry: &mut BootstrapTelemetry, entry: &BootstrapE
                 .native_functions_installed
                 .saturating_add(function_prototype::FUNCTION_PROTOTYPE_METHODS.len());
         }
+        "Number" => {
+            telemetry.entries_installed = telemetry.entries_installed.saturating_add(1);
+            telemetry.objects_installed = telemetry.objects_installed.saturating_add(2);
+            telemetry.prototype_objects_installed =
+                telemetry.prototype_objects_installed.saturating_add(1);
+            telemetry.native_functions_installed = telemetry
+                .native_functions_installed
+                .saturating_add(crate::number::prototype::NUMBER_PROTOTYPE_METHODS.len());
+        }
         "console" => telemetry.record_namespace(&console::CONSOLE_SPEC),
         _ => telemetry.record_placeholder(),
     }
@@ -609,7 +832,7 @@ mod tests {
 
     #[test]
     fn default_bootstrap_telemetry_matches_startup_ratchet() {
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 180;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 200;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 96 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
@@ -626,7 +849,7 @@ mod tests {
         assert_eq!(telemetry.duplicate_names_found(), 0);
         assert_eq!(telemetry.strings_interned(), 0);
         assert_eq!(telemetry.namespace_objects_installed(), 5);
-        assert_eq!(telemetry.native_functions_installed(), 96);
+        assert_eq!(telemetry.native_functions_installed(), 101);
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,
             "gc_allocations={} max={}",

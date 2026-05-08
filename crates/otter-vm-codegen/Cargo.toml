@@ -1,0 +1,18 @@
+[package]
+name = "otter-vm-codegen"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+license.workspace = true
+description = "Build-time table generators for crates/otter-vm. Run via `just gen-pow10`."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "gen-pow10"
+path = "src/bin/gen_pow10.rs"
+
+[dependencies]
+num-bigint = { workspace = true }
+num-traits = { workspace = true }

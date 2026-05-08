@@ -176,6 +176,21 @@ fn native_prototype_has_own_property(
         Value::Object(obj) => has_own_property(*obj, ctx.heap(), args.first())
             .map_err(|err| object_native_error("hasOwnProperty", err))?,
         Value::NativeFunction(native) => native_function_has_own(native, ctx.heap(), args.first()),
+        Value::ClassConstructor(class) => {
+            // The own-property surface for a `ClassConstructor` is
+            // its `statics` object plus the spec-mandated
+            // `prototype` property. Mirror the property-load path
+            // (which falls through to `statics`) so spec checks
+            // like `Number.hasOwnProperty("EPSILON")` see the
+            // installed statics.
+            let key = args.first();
+            if matches!(key, Some(Value::String(s)) if s.to_lossy_string() == "prototype") {
+                true
+            } else {
+                has_own_property(class.statics(ctx.heap()), ctx.heap(), key)
+                    .map_err(|err| object_native_error("hasOwnProperty", err))?
+            }
+        }
         _ => false,
     };
     Ok(Value::Boolean(present))
@@ -324,13 +339,13 @@ pub fn call(
                 Some(Value::ClassConstructor(class)) => {
                     let ok = match &key {
                         PropertyKey::String(key) => crate::object::define_own_property(
-                            class.statics,
+                            class.statics(gc_heap),
                             gc_heap,
                             key,
                             descriptor,
                         ),
                         PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property(
-                            class.statics,
+                            class.statics(gc_heap),
                             gc_heap,
                             sym,
                             descriptor,
@@ -341,7 +356,7 @@ pub fn call(
                             message: format!("Cannot define property '{}'", key.label()),
                         });
                     }
-                    Ok(Value::ClassConstructor(class.clone()))
+                    Ok(Value::ClassConstructor(*class))
                 }
                 Some(Value::NativeFunction(native)) => {
                     let PropertyKey::String(key) = &key else {
@@ -414,13 +429,13 @@ pub fn call(
                 },
                 Some(Value::ClassConstructor(class)) => match &key {
                     PropertyKey::String(key) => {
-                        match crate::object::get_own_descriptor(class.statics, gc_heap, key) {
+                        match crate::object::get_own_descriptor(class.statics(gc_heap), gc_heap, key) {
                             Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
                             None => Ok(Value::Undefined),
                         }
                     }
                     PropertyKey::Symbol(sym) => {
-                        match crate::object::get_own_symbol_descriptor(class.statics, gc_heap, sym)
+                        match crate::object::get_own_symbol_descriptor(class.statics(gc_heap), gc_heap, sym)
                         {
                             Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
                             None => Ok(Value::Undefined),
@@ -649,7 +664,7 @@ pub fn call(
         "hasOwn" => {
             let target = match args.first() {
                 Some(Value::Object(target)) => *target,
-                Some(Value::ClassConstructor(class)) => class.statics,
+                Some(Value::ClassConstructor(class)) => class.statics(gc_heap),
                 _ => return Err(VmError::TypeMismatch),
             };
             let present = has_own_property(target, gc_heap, args.get(1))?;

@@ -252,6 +252,17 @@ pub enum IntrinsicError {
         /// Short reason.
         reason: &'static str,
     },
+    /// Argument falls outside the spec-mandated range. Distinct
+    /// from [`Self::BadArgument`] so the runtime surface throws
+    /// `RangeError` rather than `TypeError` (per ECMA-262 for
+    /// e.g. `toFixed` `fractionDigits` outside `0..=100`).
+    #[error("argument {index} out of range: {reason}")]
+    OutOfRange {
+        /// Argument index (0-based).
+        index: u16,
+        /// Short reason.
+        reason: &'static str,
+    },
     /// Method name is not registered for this receiver.
     #[error("unknown intrinsic method `{name}` for receiver")]
     UnknownMethod {

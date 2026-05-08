@@ -37,8 +37,15 @@ use serde::{Deserialize, Serialize};
 
 pub mod arith;
 pub mod bitwise;
+pub mod digit_pair;
+pub mod dragon4;
+pub mod ecma;
+pub mod ecma_fixed;
+pub mod integer_fast;
 pub mod parse;
+pub mod pow10_table;
 pub mod prototype;
+pub mod schubfach;
 
 pub use arith::{add, div, mul, neg, rem, sub};
 pub use bitwise::{
@@ -136,34 +143,18 @@ impl NumberValue {
         matches!(self, Self::Double(d) if d == 0.0 && d.is_sign_negative())
     }
 
-    /// JS `String(n)` rendering. Foundation subset: matches the
-    /// spec for finite numbers via Rust's `Display`. `NaN`,
-    /// `Infinity`, `-Infinity`, and `-0` are spelled per spec.
+    /// JS `String(n)` rendering — matches ECMA-262 §6.1.6.1.13
+    /// `Number::ToString(x)` exactly via the same formatter that
+    /// powers `Number.prototype.toString` (`crate::number::ecma`).
+    /// Special values (`NaN`, `±Infinity`, `±0`) and the
+    /// fixed/exponential boundaries (`-6 < n ≤ 0`, `1 ≤ n ≤ 21`,
+    /// scientific otherwise) all match V8 / Test262 expectations.
     #[must_use]
     pub fn to_display_string(self) -> String {
-        match self {
-            Self::Smi(n) => n.to_string(),
-            Self::Double(d) => {
-                if d.is_nan() {
-                    return "NaN".to_string();
-                }
-                if d.is_infinite() {
-                    return if d.is_sign_positive() {
-                        "Infinity".to_string()
-                    } else {
-                        "-Infinity".to_string()
-                    };
-                }
-                if d == 0.0 && d.is_sign_negative() {
-                    return "0".to_string(); // Per ToString(-0) → "0".
-                }
-                if d.fract() == 0.0 && d.abs() < 1e21 {
-                    format!("{}", d as i64)
-                } else {
-                    format!("{d}")
-                }
-            }
-        }
+        let mut buf = [0u8; super::number::ecma::ECMA_BUF_LEN];
+        let len = super::number::ecma::f64_to_ecma_string_buf(self.as_f64(), &mut buf);
+        // Output is ASCII by construction.
+        String::from_utf8(buf[..len].to_vec()).expect("ECMA wrapper emits ASCII")
     }
 }
 

@@ -257,7 +257,7 @@ fn emit_value(
         // `undefined` reaches us only inside arrays where the
         // caller already substituted `null`. As a safety net, treat
         // it as null too.
-        Value::Undefined => out.push_str("null"),
+        Value::Undefined | Value::Hole => out.push_str("null"),
         Value::Boolean(true) => out.push_str("true"),
         Value::Boolean(false) => out.push_str("false"),
         Value::Number(n) => write_number(out, *n),

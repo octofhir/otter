@@ -65,23 +65,24 @@ const fn method(
     }
 }
 
-/// Dispatch `Atomics.<name>(args...)`.
+/// Dispatch `Atomics.<method>(args...)` via the typed
+/// [`AtomicsMethod`] emitted by the compiler.
 ///
 /// # Errors
 /// - [`VmError::TypeMismatch`] for unsupported element kinds /
 ///   non-TypedArray receivers / out-of-range indices.
-/// - [`VmError::UnknownIntrinsic`] for unrecognised method names.
 pub fn call(
-    name: &str,
+    method: otter_bytecode::method_id::AtomicsMethod,
     args: &[Value],
     string_heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    match name {
+    use otter_bytecode::method_id::AtomicsMethod as M;
+    match method {
         // §25.4.13 Atomics.isLockFree(size) — true for the four
         // sizes the spec mandates (1, 2, 4, 8).
         // <https://tc39.es/ecma262/#sec-atomics.islockfree>
-        "isLockFree" => {
+        M::IsLockFree => {
             let n = match args.first() {
                 Some(Value::Number(n)) => n.as_f64(),
                 Some(Value::Boolean(true)) => 1.0,
@@ -93,28 +94,28 @@ pub fn call(
         }
         // §25.4.5 Atomics.load(typedArray, index)
         // <https://tc39.es/ecma262/#sec-atomics.load>
-        "load" => {
+        M::Load => {
             let (ta, idx) = read_indexed_args(args)?;
             ensure_int_kind(ta.kind())?;
             Ok(ta.get(idx))
         }
         // §25.4.10 Atomics.store(typedArray, index, value)
         // <https://tc39.es/ecma262/#sec-atomics.store>
-        "store" => {
+        M::Store => {
             let (ta, idx) = read_indexed_args(args)?;
             ensure_int_kind(ta.kind())?;
             let value = args.get(2).cloned().unwrap_or(Value::Undefined);
             ta.set(idx, &value);
             Ok(value)
         }
-        "add" => atomic_modify(args, |a, b| a.wrapping_add(b)),
-        "sub" => atomic_modify(args, |a, b| a.wrapping_sub(b)),
-        "and" => atomic_modify(args, |a, b| a & b),
-        "or" => atomic_modify(args, |a, b| a | b),
-        "xor" => atomic_modify(args, |a, b| a ^ b),
+        M::Add => atomic_modify(args, |a, b| a.wrapping_add(b)),
+        M::Sub => atomic_modify(args, |a, b| a.wrapping_sub(b)),
+        M::And => atomic_modify(args, |a, b| a & b),
+        M::Or => atomic_modify(args, |a, b| a | b),
+        M::Xor => atomic_modify(args, |a, b| a ^ b),
         // §25.4.7 Atomics.exchange(typedArray, index, value)
         // <https://tc39.es/ecma262/#sec-atomics.exchange>
-        "exchange" => {
+        M::Exchange => {
             let (ta, idx) = read_indexed_args(args)?;
             ensure_int_kind(ta.kind())?;
             let prev = ta.get(idx);
@@ -125,7 +126,7 @@ pub fn call(
         // §25.4.6 Atomics.compareExchange(typedArray, index,
         //                                 expectedValue, replacementValue)
         // <https://tc39.es/ecma262/#sec-atomics.compareexchange>
-        "compareExchange" => {
+        M::CompareExchange => {
             let (ta, idx) = read_indexed_args(args)?;
             ensure_int_kind(ta.kind())?;
             let expected = args.get(2).cloned().unwrap_or(Value::Undefined);
@@ -145,7 +146,7 @@ pub fn call(
         // timeout=0 and is observably correct for any positive
         // timeout in a single-threaded VM.
         // <https://tc39.es/ecma262/#sec-atomics.wait>
-        "wait" => {
+        M::Wait => {
             let (ta, idx) = read_indexed_args(args)?;
             ensure_int_kind(ta.kind())?;
             let current = ta.get(idx);
@@ -161,7 +162,7 @@ pub fn call(
         // other thread can ever be waiting on a single-thread VM,
         // so the count of woken waiters is always `0`.
         // <https://tc39.es/ecma262/#sec-atomics.notify>
-        "notify" => {
+        M::Notify => {
             let (ta, idx) = read_indexed_args(args)?;
             ensure_int_kind(ta.kind())?;
             let _ = idx;
@@ -173,7 +174,7 @@ pub fn call(
         // shape, where `<result>` is a synchronously-fulfilled
         // promise of the equivalent `wait` outcome.
         // <https://tc39.es/ecma262/#sec-atomics.waitasync>
-        "waitAsync" => {
+        M::WaitAsync => {
             let (ta, idx) = read_indexed_args(args)?;
             ensure_int_kind(ta.kind())?;
             let current = ta.get(idx);
@@ -192,46 +193,43 @@ pub fn call(
             crate::object::set(result, gc_heap, "value", Value::Promise(promise));
             Ok(Value::Object(result))
         }
-        other => Err(VmError::UnknownIntrinsic {
-            name: format!("Atomics.{other}"),
-        }),
     }
 }
 
 fn native_atomics_call(
     ctx: &mut NativeCtx<'_>,
-    name: &'static str,
+    method: otter_bytecode::method_id::AtomicsMethod,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let interp = ctx.interp_mut();
     let string_heap = interp.string_heap.clone();
-    call(name, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
-        name,
+    call(method, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
+        name: method.name(),
         reason: err.to_string(),
     })
 }
 
 macro_rules! native_atomics {
-    ($fn_name:ident, $js_name:literal) => {
+    ($fn_name:ident, $variant:ident) => {
         fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            native_atomics_call(ctx, $js_name, args)
+            native_atomics_call(ctx, otter_bytecode::method_id::AtomicsMethod::$variant, args)
         }
     };
 }
 
-native_atomics!(native_add, "add");
-native_atomics!(native_and, "and");
-native_atomics!(native_compare_exchange, "compareExchange");
-native_atomics!(native_exchange, "exchange");
-native_atomics!(native_is_lock_free, "isLockFree");
-native_atomics!(native_load, "load");
-native_atomics!(native_notify, "notify");
-native_atomics!(native_or, "or");
-native_atomics!(native_store, "store");
-native_atomics!(native_sub, "sub");
-native_atomics!(native_wait, "wait");
-native_atomics!(native_wait_async, "waitAsync");
-native_atomics!(native_xor, "xor");
+native_atomics!(native_add, Add);
+native_atomics!(native_and, And);
+native_atomics!(native_compare_exchange, CompareExchange);
+native_atomics!(native_exchange, Exchange);
+native_atomics!(native_is_lock_free, IsLockFree);
+native_atomics!(native_load, Load);
+native_atomics!(native_notify, Notify);
+native_atomics!(native_or, Or);
+native_atomics!(native_store, Store);
+native_atomics!(native_sub, Sub);
+native_atomics!(native_wait, Wait);
+native_atomics!(native_wait_async, WaitAsync);
+native_atomics!(native_xor, Xor);
 
 /// Single-thread arithmetic / bitwise modify-and-return-old.
 fn atomic_modify(args: &[Value], op: fn(i64, i64) -> i64) -> Result<Value, VmError> {

@@ -94,7 +94,11 @@ fn impl_shift(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         if elements.is_empty() {
             Value::Undefined
         } else {
-            elements.remove(0)
+            // §23.1.3.26: a leading hole shifts to `undefined`.
+            match elements.remove(0) {
+                Value::Hole => Value::Undefined,
+                other => other,
+            }
         }
     }))
 }
@@ -168,7 +172,9 @@ fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         elements
             .iter()
             .map(|v| match v {
-                Value::Undefined | Value::Null => String::new(),
+                // §23.1.3.16: holes serialize the same as `undefined`
+                // / `null` — i.e. an empty string between separators.
+                Value::Undefined | Value::Null | Value::Hole => String::new(),
                 other => other.display_string(),
             })
             .collect()
@@ -181,10 +187,18 @@ fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    // §23.1.3.13: holes compare as if the slot held `undefined`
+    // (SameValueZero), so `[,,].includes(undefined) === true`.
     let arr = receiver_array(args)?;
     let heap = args.gc_heap.borrow();
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let found = array::with_elements(arr, &heap, |elements| elements.iter().any(|v| v == &needle));
+    let needle_is_undefined = matches!(needle, Value::Undefined);
+    let found = array::with_elements(arr, &heap, |elements| {
+        elements.iter().any(|v| match v {
+            Value::Hole => needle_is_undefined,
+            other => other == &needle,
+        })
+    });
     Ok(Value::Boolean(found))
 }
 
@@ -312,6 +326,9 @@ fn impl_flat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     fn walk(out: &mut Vec<Value>, heap: &otter_gc::GcHeap, body: &[Value], depth: i64) {
         for v in body {
             match v {
+                // §23.1.3.12 step 4.b — `flat` skips array holes
+                // (`HasProperty(O, P)` is `false`).
+                Value::Hole => {}
                 Value::Array(a) if depth > 0 => {
                     array::with_elements(*a, heap, |inner| walk(out, heap, inner, depth - 1));
                 }

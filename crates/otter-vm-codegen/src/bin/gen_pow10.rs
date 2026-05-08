@@ -177,9 +177,7 @@ pub const K_MIN: i32 = "#,
     out.push_str("pub static G_TABLE: [(u64, u64); G_TABLE_LEN] = [\n");
     for (i, (hi, lo)) in table.iter().enumerate() {
         let k = K_MIN + i as i32;
-        out.push_str(&format!(
-            "    (0x{hi:016x}, 0x{lo:016x}), // k = {k:>4}\n"
-        ));
+        out.push_str(&format!("    (0x{hi:016x}, 0x{lo:016x}), // k = {k:>4}\n"));
     }
     out.push_str("];\n");
     out

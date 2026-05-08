@@ -92,12 +92,7 @@ pub fn dragon4_digits(value: f64, radix: u32) -> (Vec<u8>, i32) {
                 BigUint::one(),
             )
         } else {
-            (
-                &f * 2u32,
-                &s_pow * 2u32,
-                BigUint::one(),
-                BigUint::one(),
-            )
+            (&f * 2u32, &s_pow * 2u32, BigUint::one(), BigUint::one())
         }
     };
 
@@ -179,21 +174,13 @@ pub fn dragon4_digits(value: f64, radix: u32) -> (Vec<u8>, i32) {
 
 #[inline]
 fn low_pred(r: &BigUint, m_minus: &BigUint, is_even: bool) -> bool {
-    if is_even {
-        r <= m_minus
-    } else {
-        r < m_minus
-    }
+    if is_even { r <= m_minus } else { r < m_minus }
 }
 
 #[inline]
 fn high_pred(r: &BigUint, m_plus: &BigUint, s: &BigUint, is_even: bool) -> bool {
     let sum = r + m_plus;
-    if is_even {
-        sum >= *s
-    } else {
-        sum > *s
-    }
+    if is_even { sum >= *s } else { sum > *s }
 }
 
 #[inline]

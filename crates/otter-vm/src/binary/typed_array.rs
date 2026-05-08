@@ -32,33 +32,39 @@ use crate::number::{NumberValue, bitwise};
 use super::array_buffer::JsArrayBuffer;
 
 /// One of the eleven concrete TypedArray element kinds.
+///
+/// Discriminants are stable so the compiler can encode a kind as
+/// the leading [`Operand::ConstIndex`] payload of
+/// [`Op::TypedArrayCall`] and the runtime can decode it via
+/// [`Self::from_u32`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
 pub enum TypedArrayKind {
     /// `Int8Array` — signed 1-byte integer.
-    Int8,
+    Int8 = 0,
     /// `Uint8Array` — unsigned 1-byte integer.
-    Uint8,
+    Uint8 = 1,
     /// `Uint8ClampedArray` — unsigned 1-byte, clamped on store
     /// per §6.1.6 `ToUint8Clamp`.
-    Uint8Clamped,
+    Uint8Clamped = 2,
     /// `Int16Array` — signed 2-byte integer.
-    Int16,
+    Int16 = 3,
     /// `Uint16Array` — unsigned 2-byte integer.
-    Uint16,
+    Uint16 = 4,
     /// `Int32Array` — signed 4-byte integer.
-    Int32,
+    Int32 = 5,
     /// `Uint32Array` — unsigned 4-byte integer.
-    Uint32,
+    Uint32 = 6,
     /// `Float32Array` — IEEE-754 single.
-    Float32,
+    Float32 = 7,
     /// `Float64Array` — IEEE-754 double.
-    Float64,
+    Float64 = 8,
     /// `BigInt64Array` — signed 8-byte integer; values are JS
     /// `BigInt`.
-    BigInt64,
+    BigInt64 = 9,
     /// `BigUint64Array` — unsigned 8-byte integer; values are JS
     /// `BigInt`.
-    BigUint64,
+    BigUint64 = 10,
 }
 
 impl TypedArrayKind {
@@ -80,6 +86,32 @@ impl TypedArrayKind {
             "BigUint64Array" => Self::BigUint64,
             _ => return None,
         })
+    }
+
+    /// Decode a discriminant produced by [`as_u32`](Self::as_u32).
+    #[must_use]
+    pub fn from_u32(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::Int8,
+            1 => Self::Uint8,
+            2 => Self::Uint8Clamped,
+            3 => Self::Int16,
+            4 => Self::Uint16,
+            5 => Self::Int32,
+            6 => Self::Uint32,
+            7 => Self::Float32,
+            8 => Self::Float64,
+            9 => Self::BigInt64,
+            10 => Self::BigUint64,
+            _ => return None,
+        })
+    }
+
+    /// Encode as the `u32` carried by `Operand::ConstIndex`.
+    #[must_use]
+    #[inline]
+    pub fn as_u32(self) -> u32 {
+        self as u32
     }
 
     /// Constructor name for diagnostics and `[Symbol.toStringTag]`.

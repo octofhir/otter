@@ -36,18 +36,18 @@ enum PropertyKey {
 ///
 /// # Errors
 /// - [`VmError::TypeMismatch`] for receiver / argument shape errors.
-/// - [`VmError::UnknownIntrinsic`] for unrecognised method names.
 pub fn call(
     interp: &mut Interpreter,
     module: &BytecodeModule,
-    name: &str,
+    method: otter_bytecode::method_id::ReflectMethod,
     args: &[Value],
     string_heap: &crate::string::StringHeap,
 ) -> Result<Value, VmError> {
-    match name {
+    use otter_bytecode::method_id::ReflectMethod as M;
+    match method {
         // §28.1.2 Reflect.apply(target, thisArgument, argumentsList)
         // <https://tc39.es/ecma262/#sec-reflect.apply>
-        "apply" => {
+        M::Apply => {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
             if !is_callable(&target) {
                 return Err(VmError::NotCallable);
@@ -66,7 +66,7 @@ pub fn call(
         }
         // §28.1.3 Reflect.construct(target, argumentsList[, newTarget])
         // <https://tc39.es/ecma262/#sec-reflect.construct>
-        "construct" => {
+        M::Construct => {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
             if !is_constructor(&target, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
@@ -110,7 +110,7 @@ pub fn call(
         }
         // §28.1.4 Reflect.defineProperty(target, propertyKey, attributes)
         // <https://tc39.es/ecma262/#sec-reflect.defineproperty>
-        "defineProperty" => {
+        M::DefineProperty => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let desc_obj = expect_object(args.get(2))?;
@@ -131,7 +131,7 @@ pub fn call(
         }
         // §28.1.5 Reflect.deleteProperty(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.deleteproperty>
-        "deleteProperty" => {
+        M::DeleteProperty => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let heap = interp.gc_heap_mut();
@@ -143,7 +143,7 @@ pub fn call(
         }
         // §28.1.6 Reflect.get(target, propertyKey[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.get>
-        "get" => {
+        M::Get => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             // Foundation: `receiver` is honoured by accessor
@@ -162,7 +162,7 @@ pub fn call(
         }
         // §28.1.7 Reflect.getOwnPropertyDescriptor(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.getownpropertydescriptor>
-        "getOwnPropertyDescriptor" => {
+        M::GetOwnPropertyDescriptor => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let lookup = {
@@ -210,7 +210,7 @@ pub fn call(
         }
         // §28.1.8 Reflect.getPrototypeOf(target)
         // <https://tc39.es/ecma262/#sec-reflect.getprototypeof>
-        "getPrototypeOf" => {
+        M::GetPrototypeOf => {
             let target = expect_object(args.first())?;
             let heap = interp.gc_heap();
             Ok(crate::object::prototype(target, heap)
@@ -219,7 +219,7 @@ pub fn call(
         }
         // §28.1.9 Reflect.has(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.has>
-        "has" => {
+        M::Has => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let heap = interp.gc_heap();
@@ -237,14 +237,14 @@ pub fn call(
         }
         // §28.1.10 Reflect.isExtensible(target)
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>
-        "isExtensible" => {
+        M::IsExtensible => {
             let target = expect_object(args.first())?;
             let heap = interp.gc_heap();
             Ok(Value::Boolean(crate::object::is_extensible(target, heap)))
         }
         // §28.1.11 Reflect.ownKeys(target)
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
-        "ownKeys" => {
+        M::OwnKeys => {
             let target = expect_object(args.first())?;
             let heap = interp.gc_heap();
             let keys: Vec<Value> = crate::object::with_properties(target, heap, |p| {
@@ -266,7 +266,7 @@ pub fn call(
         }
         // §28.1.12 Reflect.preventExtensions(target)
         // <https://tc39.es/ecma262/#sec-reflect.preventextensions>
-        "preventExtensions" => {
+        M::PreventExtensions => {
             let target = expect_object(args.first())?;
             let heap = interp.gc_heap_mut();
             crate::object::prevent_extensions(target, heap);
@@ -274,7 +274,7 @@ pub fn call(
         }
         // §28.1.13 Reflect.set(target, propertyKey, V[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.set>
-        "set" => {
+        M::Set => {
             let target = expect_object(args.first())?;
             let key = expect_property_key(args.get(1))?;
             let value = args.get(2).cloned().unwrap_or(Value::Undefined);
@@ -315,7 +315,7 @@ pub fn call(
         }
         // §28.1.14 Reflect.setPrototypeOf(target, prototype)
         // <https://tc39.es/ecma262/#sec-reflect.setprototypeof>
-        "setPrototypeOf" => {
+        M::SetPrototypeOf => {
             let target = expect_object(args.first())?;
             let proto = match args.get(1) {
                 Some(Value::Object(p)) => Some(*p),
@@ -326,9 +326,6 @@ pub fn call(
             crate::object::set_prototype(target, heap, proto);
             Ok(Value::Boolean(true))
         }
-        other => Err(VmError::UnknownIntrinsic {
-            name: format!("Reflect.{other}"),
-        }),
     }
 }
 

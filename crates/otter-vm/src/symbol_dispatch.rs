@@ -95,16 +95,21 @@ pub fn load_static(interp: &Interpreter, name: &str) -> Result<Value, SymbolErro
 /// since it would be a syntax error as a property name.
 pub const CONSTRUCTOR_SENTINEL: &str = "";
 
-/// Dispatch `Symbol(...)` (when `name == ""`) or
-/// `Symbol.<method>(args...)`.
-pub fn call(interp: &Interpreter, name: &str, args: &[Value]) -> Result<Value, SymbolError> {
-    match name {
+/// Dispatch `Symbol(desc)` ([`SymbolMethod::Construct`]) or
+/// `Symbol.<method>(args...)`. Routes the typed
+/// [`SymbolMethod`] emitted by the compiler.
+pub fn call(
+    interp: &Interpreter,
+    method: otter_bytecode::method_id::SymbolMethod,
+    args: &[Value],
+) -> Result<Value, SymbolError> {
+    use otter_bytecode::method_id::SymbolMethod as M;
+    match method {
         // Bare `Symbol(desc)` — fresh primitive symbol per call.
         // Spec §20.4.1.1.
-        CONSTRUCTOR_SENTINEL => construct_symbol(interp, args),
-        "for" => symbol_for(interp, args),
-        "keyFor" => symbol_key_for(interp, args),
-        other => Err(SymbolError::UnknownMember(other.to_string())),
+        M::Construct => construct_symbol(interp, args),
+        M::For => symbol_for(interp, args),
+        M::KeyFor => symbol_key_for(interp, args),
     }
 }
 

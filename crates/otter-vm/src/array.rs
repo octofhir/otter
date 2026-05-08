@@ -113,11 +113,14 @@ pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
     len(arr, heap) == 0
 }
 
-/// Read element at `idx`. Out-of-range returns `Value::Undefined`.
+/// Read element at `idx`. Out-of-range and array-hole slots both
+/// return [`Value::Undefined`] per ECMA-262 §10.4.2 OrdinaryGet —
+/// the internal [`Value::Hole`] sentinel never escapes the array.
 #[must_use]
 pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
     heap.read_payload(arr, |body| {
-        body.elements
+        let raw = body
+            .elements
             .get(idx)
             .cloned()
             .or_else(|| {
@@ -125,12 +128,34 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
                     .as_ref()
                     .and_then(|sparse| sparse.get(&idx).cloned())
             })
-            .unwrap_or(Value::Undefined)
+            .unwrap_or(Value::Undefined);
+        match raw {
+            Value::Hole => Value::Undefined,
+            other => other,
+        }
     })
 }
 
-/// Write element at `idx`, extending with `Value::Undefined` when
-/// `idx >= len`.
+/// Spec [HasProperty](https://tc39.es/ecma262/#sec-array-exotic-objects)
+/// for array-indexed slots: a missing dense element ([`Value::Hole`])
+/// or an absent sparse entry returns `false`, even when the index
+/// is below `length`. Returns `true` only when an explicit value
+/// occupies the slot.
+#[must_use]
+pub fn has_own_element(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
+    heap.read_payload(arr, |body| {
+        if let Some(slot) = body.elements.get(idx) {
+            return !matches!(slot, Value::Hole);
+        }
+        body.sparse_elements
+            .as_ref()
+            .is_some_and(|sparse| sparse.contains_key(&idx))
+    })
+}
+
+/// Write element at `idx`, extending with the internal
+/// [`Value::Hole`] sentinel when `idx > len` so absent slots remain
+/// distinguishable from explicit `undefined` per ECMA-262 §10.4.2.
 ///
 /// # Errors
 ///
@@ -161,7 +186,7 @@ pub fn set(
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
         while body.elements.len() < idx {
-            body.elements.push(Value::Undefined);
+            body.elements.push(Value::Hole);
         }
         body.elements.push(value);
     });
@@ -193,10 +218,14 @@ pub fn push(
     Ok(new_len)
 }
 
-/// Pop from the tail. Returns `Value::Undefined` for an empty array.
+/// Pop from the tail. Returns `Value::Undefined` for an empty array
+/// and for slots that hold the internal [`Value::Hole`] sentinel.
 #[must_use]
 pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
-    heap.with_payload(arr, |body| body.elements.pop().unwrap_or(Value::Undefined))
+    heap.with_payload(arr, |body| match body.elements.pop() {
+        Some(Value::Hole) | None => Value::Undefined,
+        Some(other) => other,
+    })
 }
 
 /// Set a string-keyed own property. Numeric strings route into dense
@@ -235,11 +264,15 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
     }
     if let Ok(idx) = key.parse::<usize>() {
         return heap.read_payload(arr, |body| {
-            body.elements.get(idx).cloned().or_else(|| {
-                body.sparse_elements
-                    .as_ref()
-                    .and_then(|sparse| sparse.get(&idx).cloned())
-            })
+            body.elements
+                .get(idx)
+                .filter(|v| !matches!(v, Value::Hole))
+                .cloned()
+                .or_else(|| {
+                    body.sparse_elements
+                        .as_ref()
+                        .and_then(|sparse| sparse.get(&idx).cloned())
+                })
         });
     }
     heap.read_payload(arr, |body| {
@@ -401,14 +434,60 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_write_extends_with_undefined() {
+    fn out_of_range_write_extends_with_holes() {
         let mut heap = fresh_heap();
         let a = alloc_array(&mut heap).unwrap();
         set(a, &mut heap, 2, Value::Boolean(true)).unwrap();
         assert_eq!(len(a, &heap), 3);
+        // Public reads observe `Value::Undefined` for absent slots,
+        // even though the body stores `Value::Hole` internally.
         assert_eq!(get(a, &heap, 0), Value::Undefined);
         assert_eq!(get(a, &heap, 1), Value::Undefined);
         assert_eq!(get(a, &heap, 2), Value::Boolean(true));
+        // `has_own_element` distinguishes the two: holes report `false`,
+        // explicit values report `true`.
+        assert!(!has_own_element(a, &heap, 0));
+        assert!(!has_own_element(a, &heap, 1));
+        assert!(has_own_element(a, &heap, 2));
+        // Out-of-range index is also absent.
+        assert!(!has_own_element(a, &heap, 99));
+    }
+
+    #[test]
+    fn explicit_undefined_distinguished_from_hole() {
+        let mut heap = fresh_heap();
+        let a = from_elements(&mut heap, [Value::Undefined]).unwrap();
+        // Explicit undefined is a real own element.
+        assert!(has_own_element(a, &heap, 0));
+        assert_eq!(get(a, &heap, 0), Value::Undefined);
+    }
+
+    #[test]
+    fn hole_does_not_escape_via_pop() {
+        let mut heap = fresh_heap();
+        let a = alloc_array(&mut heap).unwrap();
+        set(a, &mut heap, 1, Value::Boolean(true)).unwrap();
+        // Tail is the explicit value.
+        assert_eq!(pop(a, &mut heap), Value::Boolean(true));
+        // Next pop pulls the leading hole — must surface as
+        // `undefined`, never as the internal sentinel.
+        assert_eq!(pop(a, &mut heap), Value::Undefined);
+        assert!(is_empty(a, &heap));
+    }
+
+    #[test]
+    fn named_property_lookup_skips_holes() {
+        let mut heap = fresh_heap();
+        let a = alloc_array(&mut heap).unwrap();
+        set(a, &mut heap, 2, Value::Boolean(true)).unwrap();
+        // Hole index — own-property lookup returns `None` so
+        // callers can fall back to the prototype chain.
+        assert_eq!(get_named_property(a, &heap, "0"), None);
+        // Filled index — own-property lookup returns the value.
+        assert_eq!(
+            get_named_property(a, &heap, "2"),
+            Some(Value::Boolean(true))
+        );
     }
 
     #[test]

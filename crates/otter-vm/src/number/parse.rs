@@ -51,13 +51,22 @@ pub fn to_number_from_string(text: &str) -> NumberValue {
     }
     // §7.1.4.1.3 NonDecimalIntegerLiteral. Spec disallows a sign
     // prefix on hex / binary / octal forms (so `"-0x10"` → NaN).
-    if let Some(rest) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         return parse_radix_digits(rest, 16);
     }
-    if let Some(rest) = trimmed.strip_prefix("0b").or_else(|| trimmed.strip_prefix("0B")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("0b")
+        .or_else(|| trimmed.strip_prefix("0B"))
+    {
         return parse_radix_digits(rest, 2);
     }
-    if let Some(rest) = trimmed.strip_prefix("0o").or_else(|| trimmed.strip_prefix("0O")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("0o")
+        .or_else(|| trimmed.strip_prefix("0O"))
+    {
         return parse_radix_digits(rest, 8);
     }
     match trimmed.parse::<f64>() {

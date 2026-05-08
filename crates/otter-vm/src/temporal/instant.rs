@@ -25,20 +25,22 @@ use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{js_string_value, make_temporal, require_instant, temporal_err};
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 
-/// Dispatch `Temporal.Instant.<method>(args...)`.
+/// Dispatch `Temporal.Instant.<method>(args...)` via the typed
+/// [`TemporalMethod`].
 pub fn dispatch_static(
     string_heap: &StringHeap,
-    method: &str,
+    method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
+    use otter_bytecode::method_id::TemporalMethod as M;
     let _ = string_heap;
     match method {
-        "from" => from(args),
-        "fromEpochMilliseconds" => from_epoch_milliseconds(args),
-        "compare" => compare(args),
+        M::From => from(args),
+        M::FromEpochMilliseconds => from_epoch_milliseconds(args),
+        M::Compare => compare(args),
         other => Err(TemporalError::UnknownMember {
             class: "Instant".to_string(),
-            method: other.to_string(),
+            method: other.name().to_string(),
         }),
     }
 }

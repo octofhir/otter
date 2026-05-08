@@ -54,11 +54,7 @@ fn decompose(abs: f64) -> (u64, i32) {
 /// - `negative == true`:  round down (`q`).
 #[inline]
 fn tie_break_round(q: BigUint, negative: bool) -> BigUint {
-    if negative {
-        q
-    } else {
-        q + 1u32
-    }
+    if negative { q } else { q + 1u32 }
 }
 
 /// Compute `round_to_larger_n(value · 10^digits)` as a `BigUint`,
@@ -600,7 +596,10 @@ mod tests {
     fn to_exponential_special() {
         assert_eq!(number_to_exponential(f64::NAN, Some(2)), "NaN");
         assert_eq!(number_to_exponential(f64::INFINITY, Some(2)), "Infinity");
-        assert_eq!(number_to_exponential(f64::NEG_INFINITY, Some(2)), "-Infinity");
+        assert_eq!(
+            number_to_exponential(f64::NEG_INFINITY, Some(2)),
+            "-Infinity"
+        );
     }
 
     #[test]

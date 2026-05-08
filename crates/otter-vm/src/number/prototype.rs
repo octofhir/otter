@@ -39,10 +39,7 @@ pub(crate) const NUMBER_DATA_SLOT_KEY: &str = "__NumberData__";
 /// `BigInt` arms as `TypeError` (which the wrapper translates to
 /// `IntrinsicError::BadArgument`); the rest go through the loose
 /// numeric coercion.
-fn coerce_digits_arg(
-    arg: Option<&Value>,
-    default_undefined: f64,
-) -> Result<f64, IntrinsicError> {
+fn coerce_digits_arg(arg: Option<&Value>, default_undefined: f64) -> Result<f64, IntrinsicError> {
     use super::parse::IntegerCoercion;
     match arg {
         None | Some(Value::Undefined) => Ok(default_undefined),

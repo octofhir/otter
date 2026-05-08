@@ -414,14 +414,15 @@ where
     otter_vm::object::with_host_data_mut::<T, R>(object, ctx.interp_mut().gc_heap_mut(), f)
 }
 
-/// Set a string-keyed property on an object.
+/// Set a string-keyed property on an object through ordinary descriptor
+/// assignment.
 pub fn runtime_set_property(
     ctx: &mut RuntimeNativeCtx<'_>,
     object: RuntimeJsObject,
     key: &str,
     value: RuntimeValue,
-) {
-    otter_vm::object::set(object, ctx.interp_mut().gc_heap_mut(), key, value);
+) -> bool {
+    otter_vm::object::ordinary_set_data_property(object, ctx.interp_mut().gc_heap_mut(), key, value)
 }
 
 /// Build an array from already-created JS values.

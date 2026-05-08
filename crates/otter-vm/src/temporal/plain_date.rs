@@ -17,19 +17,21 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{js_string_value, make_temporal, require_plain_date, temporal_err};
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 
-/// Dispatch `Temporal.PlainDate.<method>(args...)`.
+/// Dispatch `Temporal.PlainDate.<method>(args...)` via the typed
+/// [`TemporalMethod`].
 pub fn dispatch_static(
     string_heap: &StringHeap,
-    method: &str,
+    method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
+    use otter_bytecode::method_id::TemporalMethod as M;
     let _ = string_heap;
     match method {
-        "from" => from(args),
-        "compare" => compare(args),
+        M::From => from(args),
+        M::Compare => compare(args),
         other => Err(TemporalError::UnknownMember {
             class: "PlainDate".to_string(),
-            method: other.to_string(),
+            method: other.name().to_string(),
         }),
     }
 }

@@ -578,6 +578,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Proxy(_) => "proxy",
         Value::ClassConstructor(_) => "class_constructor",
         Value::Undefined
+        | Value::Hole
         | Value::Null
         | Value::Boolean(_)
         | Value::Number(_)

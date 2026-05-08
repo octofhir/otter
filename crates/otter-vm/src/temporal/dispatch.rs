@@ -24,7 +24,6 @@
 
 use crate::Value;
 use crate::temporal::now;
-use crate::temporal::payload::TemporalKind;
 use crate::temporal::{duration, instant, plain_date, plain_date_time, plain_time};
 
 /// Failure modes returned by [`call`] / [`load_static`].
@@ -87,36 +86,29 @@ impl From<crate::string::StringError> for TemporalError {
     }
 }
 
-/// Dispatch `Temporal.<class>.<method>(args...)`.
-///
-/// `class` is one of `"Instant"`, `"Duration"`, `"PlainDate"`,
-/// `"PlainTime"`, `"PlainDateTime"`, or the special `"Now"` namespace.
-/// `method` is the static method name on that class (`"from"`,
-/// `"compare"`, …).
+/// Dispatch `Temporal.<class>.<method>(args...)` via the typed
+/// [`TemporalClassId`] / [`TemporalMethod`] operands.
 ///
 /// # See also
 /// - <https://tc39.es/proposal-temporal/#sec-temporal-instant-objects>
 pub fn call(
     string_heap: &crate::string::StringHeap,
     gc_heap: &otter_gc::GcHeap,
-    class: &str,
-    method: &str,
+    class: otter_bytecode::method_id::TemporalClassId,
+    method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
-    if class == "Now" {
+    use otter_bytecode::method_id::TemporalClassId as C;
+    if matches!(class, C::Now) {
         return now::dispatch(string_heap, method, args);
     }
-    let kind =
-        TemporalKind::from_class_name(class).ok_or_else(|| TemporalError::UnknownMember {
-            class: class.to_string(),
-            method: method.to_string(),
-        })?;
-    match kind {
-        TemporalKind::Instant => instant::dispatch_static(string_heap, method, args),
-        TemporalKind::Duration => duration::dispatch_static(string_heap, gc_heap, method, args),
-        TemporalKind::PlainDate => plain_date::dispatch_static(string_heap, method, args),
-        TemporalKind::PlainTime => plain_time::dispatch_static(string_heap, method, args),
-        TemporalKind::PlainDateTime => plain_date_time::dispatch_static(string_heap, method, args),
+    match class {
+        C::Now => unreachable!("handled above"),
+        C::Instant => instant::dispatch_static(string_heap, method, args),
+        C::Duration => duration::dispatch_static(string_heap, gc_heap, method, args),
+        C::PlainDate => plain_date::dispatch_static(string_heap, method, args),
+        C::PlainTime => plain_time::dispatch_static(string_heap, method, args),
+        C::PlainDateTime => plain_date_time::dispatch_static(string_heap, method, args),
     }
 }
 

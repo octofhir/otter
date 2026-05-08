@@ -3570,13 +3570,12 @@ fn assign_object_pattern(
         // BindingPattern variant.
         let rest_obj = cx.alloc_scratch();
         cx.emit(Op::NewObject, vec![Operand::Register(rest_obj)], span);
-        let assign_const = cx.intern_string_constant("assign");
         let scratch = cx.alloc_scratch();
         cx.emit(
             Op::ObjectCall,
             vec![
                 Operand::Register(scratch),
-                Operand::ConstIndex(assign_const),
+                Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Assign.as_u32()),
                 Operand::ConstIndex(2),
                 Operand::Register(rest_obj),
                 Operand::Register(value_reg),
@@ -4088,13 +4087,12 @@ fn destructure_object_inner(
         // each previously-extracted key.
         let rest_obj = parent.alloc_scratch();
         parent.emit(Op::NewObject, vec![Operand::Register(rest_obj)], span);
-        let assign_const = parent.intern_string_constant("assign");
         let scratch = parent.alloc_scratch();
         parent.emit(
             Op::ObjectCall,
             vec![
                 Operand::Register(scratch),
-                Operand::ConstIndex(assign_const),
+                Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Assign.as_u32()),
                 Operand::ConstIndex(2),
                 Operand::Register(rest_obj),
                 Operand::Register(src_reg),
@@ -5228,39 +5226,39 @@ fn compile_expr(
                 }
                 return Ok(arg_regs[0]);
             }
-            // §23.1.1 `new Array(...)` — bare-call form yields a
-            // dense array (foundation simplification: ignores the
-            // single-numeric-length form).
+            // §23.1.1.1 `new Array(...)` — typed
+            // [`Op::ArrayConstruct`]. Single-numeric form reserves
+            // a sparse array of that length; everything else
+            // collects values like `Array.of`.
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "Array"
                 && cx.lookup_binding("Array").is_none()
                 && find_module_import_binding(cx, "Array").is_none()
             {
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let name_idx = cx.intern_string_constant("of");
                 let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::ArrayCall, operands, new_span);
+                cx.emit(Op::ArrayConstruct, operands, new_span);
                 return Ok(dst);
             }
             // §22.1.1 `new String(value)` — foundation aliases to
-            // the primitive string (no wrapper object). Lower
-            // through Op::StringCall like the bare form.
+            // the primitive string (no wrapper object). Lowers via
+            // [`StringMethod::Construct`] like the bare form.
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "String"
                 && cx.lookup_binding("String").is_none()
                 && find_module_import_binding(cx, "String").is_none()
             {
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let name_idx = cx.intern_string_constant("");
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(
+                    otter_bytecode::method_id::StringMethod::Construct.as_u32(),
+                ));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::StringCall, operands, new_span);
@@ -5297,6 +5295,7 @@ fn compile_expr(
                 return Ok(dst);
             }
             // §25.2.1 `new SharedArrayBuffer(length [, options])`.
+            // Lowers via [`SharedArrayBufferMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "SharedArrayBuffer"
@@ -5304,19 +5303,19 @@ fn compile_expr(
                 && find_module_import_binding(cx, "SharedArrayBuffer").is_none()
             {
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let name_idx = cx.intern_string_constant("");
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(
+                    otter_bytecode::method_id::SharedArrayBufferMethod::Construct.as_u32(),
+                ));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::SharedArrayBufferCall, operands, new_span);
                 return Ok(dst);
             }
-            // §25.1.4 `new ArrayBuffer(length [, options])` — lower
-            // through `Op::ArrayBufferCall` with the empty-name
-            // sentinel.
+            // §25.1.4 `new ArrayBuffer(length [, options])`.
+            // Lowers via [`ArrayBufferMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "ArrayBuffer"
@@ -5324,17 +5323,19 @@ fn compile_expr(
                 && find_module_import_binding(cx, "ArrayBuffer").is_none()
             {
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let name_idx = cx.intern_string_constant("");
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(
+                    otter_bytecode::method_id::ArrayBufferMethod::Construct.as_u32(),
+                ));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::ArrayBufferCall, operands, new_span);
                 return Ok(dst);
             }
             // §25.3.1 `new DataView(buffer, byteOffset?, byteLength?)`.
+            // Lowers via [`DataViewMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-dataview-constructor>
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "DataView"
@@ -5342,42 +5343,43 @@ fn compile_expr(
                 && find_module_import_binding(cx, "DataView").is_none()
             {
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let name_idx = cx.intern_string_constant("");
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(
+                    otter_bytecode::method_id::DataViewMethod::Construct.as_u32(),
+                ));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::DataViewCall, operands, new_span);
                 return Ok(dst);
             }
             // §23.2.5 `new <T>(...)` for one of the eleven concrete
-            // TypedArray constructors. Routed through
-            // `Op::TypedArrayCall` with the kind-name in the leading
-            // const slot.
+            // TypedArray constructors. Encodes the kind discriminant
+            // and [`TypedArrayMethod::Construct`] directly.
             // <https://tc39.es/ecma262/#sec-typedarray-constructors>
             if let Expression::Identifier(id) = callee
-                && is_typed_array_name(id.name.as_str())
+                && let Some(kind) = otter_bytecode::method_id::TypedArrayKindId::from_str(
+                    id.name.as_str(),
+                )
                 && cx.lookup_binding(id.name.as_str()).is_none()
                 && find_module_import_binding(cx, id.name.as_str()).is_none()
             {
-                let kind = id.name.as_str();
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let kind_idx = cx.intern_string_constant(kind);
-                let name_idx = cx.intern_string_constant("");
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(kind_idx));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(kind.as_u32()));
+                operands.push(Operand::ConstIndex(
+                    otter_bytecode::method_id::TypedArrayMethod::Construct.as_u32(),
+                ));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::TypedArrayCall, operands, new_span);
                 return Ok(dst);
             }
-            // §21.4.2 `new Date(...)` — variadic constructor; lower
-            // through `Op::DateCall` with the empty-name sentinel.
+            // §21.4.2 `new Date(...)` — variadic constructor.
+            // Lowers via [`DateMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-date-constructor>
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "Date"
@@ -5385,11 +5387,12 @@ fn compile_expr(
                 && find_module_import_binding(cx, "Date").is_none()
             {
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let name_idx = cx.intern_string_constant("");
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(
+                    otter_bytecode::method_id::DateMethod::Construct.as_u32(),
+                ));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::DateCall, operands, new_span);
@@ -5513,8 +5516,8 @@ fn compile_expr(
                 );
                 return Ok(dst);
             }
-            // §28.2.1 `new Proxy(target, handler)` — lower through
-            // `Op::ProxyCall` with the empty-name sentinel.
+            // §28.2.1 `new Proxy(target, handler)` — lower via
+            // [`ProxyMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-proxy-constructor>
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "Proxy"
@@ -5522,11 +5525,12 @@ fn compile_expr(
                 && find_module_import_binding(cx, "Proxy").is_none()
             {
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let name_idx = cx.intern_string_constant("");
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(
+                    otter_bytecode::method_id::ProxyMethod::Construct.as_u32(),
+                ));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::ProxyCall, operands, new_span);
@@ -5611,9 +5615,14 @@ fn compile_expr(
                             unreachable!("spread excluded above")
                         }
                         oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
-                            // Hole: foundation slice fills with `undefined`.
+                            // §10.4.2 ArrayExoticObject: emit the
+                            // internal hole sentinel so the resulting
+                            // dense slot stays distinguishable from
+                            // explicit `undefined` for `in`,
+                            // `Array.prototype` callbacks, and JSON
+                            // serialisation.
                             let r = cx.alloc_scratch();
-                            cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                            cx.emit(Op::LoadHole, vec![Operand::Register(r)], span);
                             element_regs.push(r);
                         }
                         other => {
@@ -5648,8 +5657,12 @@ fn compile_expr(
                             emit_spread_into_array(cx, dst, &s.argument, inner_span)?;
                         }
                         oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                            // Spread path's hole branch: same hole
+                            // sentinel as the dense `NewArray` form
+                            // above. `Op::ArrayPush` simply forwards
+                            // the register value into the body.
                             let r = cx.alloc_scratch();
-                            cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                            cx.emit(Op::LoadHole, vec![Operand::Register(r)], span);
                             cx.emit(
                                 Op::ArrayPush,
                                 vec![Operand::Register(dst), Operand::Register(r)],
@@ -5763,14 +5776,16 @@ fn compile_expr(
                     oxc_ast::ast::ObjectPropertyKind::SpreadProperty(s) => {
                         let s_span = (s.span.start, s.span.end);
                         let src = compile_expr(cx, &s.argument, s_span)?;
-                        // Use Object.assign(dst, src) via Op::ObjectCall.
-                        let name_idx = cx.intern_string_constant("assign");
+                        // Lower the spread to `Object.assign(dst, src)` via
+                        // the typed [`ObjectMethod::Assign`].
                         let scratch = cx.alloc_scratch();
                         cx.emit(
                             Op::ObjectCall,
                             vec![
                                 Operand::Register(scratch),
-                                Operand::ConstIndex(name_idx),
+                                Operand::ConstIndex(
+                                    otter_bytecode::method_id::ObjectMethod::Assign.as_u32(),
+                                ),
                                 Operand::ConstIndex(2),
                                 Operand::Register(dst),
                                 Operand::Register(src),
@@ -6524,12 +6539,11 @@ fn compile_for_in_statement(
     //   exit:
     let obj_reg = compile_expr(cx, &s.right, span)?;
     let keys_reg = cx.alloc_scratch();
-    let keys_name_idx = cx.intern_string_constant("keys");
     cx.emit(
         Op::ObjectCall,
         vec![
             Operand::Register(keys_reg),
-            Operand::ConstIndex(keys_name_idx),
+            Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Keys.as_u32()),
             Operand::ConstIndex(1),
             Operand::Register(obj_reg),
         ],
@@ -6905,103 +6919,135 @@ fn compile_method_call(
             cx.emit(Op::ArrayBufferCall, operands, span);
             return Ok(dst);
         }
-        // §28.2.2 `Proxy.revocable(target, handler)` — lower
-        // through `Op::ProxyCall` with the literal method name.
+        // §28.2.2 `Proxy.<method>(target, handler)` — typed dispatch
+        // via [`ProxyMethod`].
         // <https://tc39.es/ecma262/#sec-proxy.revocable>
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Proxy"
             && cx.lookup_binding("Proxy").is_none()
             && find_module_import_binding(cx, "Proxy").is_none()
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::ProxyMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Proxy.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::ProxyCall, operands, span);
             return Ok(dst);
         }
-        // §25.4 `Atomics.<method>(args)`.
+        // §25.4 `Atomics.<method>(args)` — typed dispatch via
+        // [`AtomicsMethod`].
         // <https://tc39.es/ecma262/#sec-atomics-object>
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Atomics"
             && cx.lookup_binding("Atomics").is_none()
             && find_module_import_binding(cx, "Atomics").is_none()
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::AtomicsMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Atomics.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::AtomicsCall, operands, span);
             return Ok(dst);
         }
-        // §28.1 `Reflect.<method>(args)` — full static surface.
+        // §28.1 `Reflect.<method>(args)` — typed dispatch via
+        // [`ReflectMethod`].
         // <https://tc39.es/ecma262/#sec-reflect-object>
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Reflect"
             && cx.lookup_binding("Reflect").is_none()
             && find_module_import_binding(cx, "Reflect").is_none()
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::ReflectMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Reflect.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::ReflectCall, operands, span);
             return Ok(dst);
         }
-        // Iterator-helpers proposal — `Iterator.from(iter)` /
-        // future statics. Lower through `Op::IteratorCall`. The
-        // bare-identifier `Iterator` shadow check keeps the
-        // user-facing class binding overridable.
+        // Iterator-helpers proposal — `Iterator.from(iter)` and
+        // future statics. Typed dispatch via [`IteratorMethod`].
         // <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Iterator"
             && cx.lookup_binding("Iterator").is_none()
             && find_module_import_binding(cx, "Iterator").is_none()
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::IteratorMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Iterator.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::IteratorCall, operands, span);
             return Ok(dst);
         }
         // §23.2.2 TypedArray statics — `<T>.from(...)` / `<T>.of(...)`.
+        // Encodes the kind discriminant plus the typed
+        // [`TypedArrayMethod`].
         // <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarray%25-intrinsic-object>
         if let Expression::Identifier(id) = &member.object
-            && is_typed_array_name(id.name.as_str())
+            && let Some(kind) = otter_bytecode::method_id::TypedArrayKindId::from_str(
+                id.name.as_str(),
+            )
             && cx.lookup_binding(id.name.as_str()).is_none()
             && find_module_import_binding(cx, id.name.as_str()).is_none()
         {
-            let kind = id.name.as_str();
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::TypedArrayMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("{}.{method_name}", kind.name()),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let kind_idx = cx.intern_string_constant(kind);
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(kind_idx));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(kind.as_u32()));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::TypedArrayCall, operands, span);
@@ -7018,9 +7064,9 @@ fn compile_method_call(
             return compile_object_builtin(cx, method, &arg_regs, span);
         }
         // §23.1.2 Array static surface. `Array.isArray` keeps a
-        // dedicated [`Op::IsArray`] for the §7.2.2 fast path; the
-        // remaining statics (`Array.from` / `Array.of`) route
-        // through a single variadic [`Op::ArrayCall`] dispatcher.
+        // dedicated [`Op::IsArray`] for the §7.2.2 fast path;
+        // `Array.from` / `Array.of` lower to dedicated
+        // [`Op::ArrayFrom`] / [`Op::ArrayOf`] opcodes.
         // <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Array"
@@ -7044,105 +7090,145 @@ fn compile_method_call(
             }
             if matches!(method, "from" | "of") {
                 let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let name_idx = cx.intern_string_constant(method);
                 let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.iter().copied().map(Operand::Register));
-                cx.emit(Op::ArrayCall, operands, span);
+                let opcode = if method == "from" {
+                    Op::ArrayFrom
+                } else {
+                    Op::ArrayOf
+                };
+                cx.emit(opcode, operands, span);
                 return Ok(dst);
             }
         }
-        // `Math.<name>(args)` — lower through `Op::MathCall`. The
-        // dispatcher resolves `<name>` against the namespace's
-        // function table; constant-style names like `PI` reach the
-        // method path only via a deliberate user `Math.PI()` call,
-        // which surfaces as `UnknownIntrinsic`.
+        // `Math.<name>(args)` — typed dispatch via [`MathMethod`].
+        // Constant-style names (`PI`, `E`, …) load through the
+        // separate [`Op::MathLoad`] path, so an unknown method here
+        // surfaces as a compile error.
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Math"
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::MathMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Math.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::MathCall, operands, span);
             return Ok(dst);
         }
-        // `JSON.<name>(args)` — same shape as Math.
+        // `JSON.<name>(args)` — typed dispatch via [`JsonMethod`].
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "JSON"
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::JsonMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("JSON.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::JsonCall, operands, span);
             return Ok(dst);
         }
-        // `Promise.<name>(args)` — same shape as Math / JSON.
+        // `Promise.<name>(args)` — typed dispatch via [`PromiseMethod`].
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Promise"
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) =
+                otter_bytecode::method_id::PromiseMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Promise.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::PromiseCall, operands, span);
             return Ok(dst);
         }
-        // `Temporal.<Class>.<method>(args)` — lower through
-        // `Op::TemporalCall`. The callee here is a *nested* static
-        // member expression: `member.object` is itself a member
-        // (`Temporal.<Class>`), and `member.property` is the static
-        // method name. We detect that shape directly so the runtime
-        // does not need a real `Temporal` global.
+        // `Temporal.<Class>.<method>(args)` — typed dispatch via
+        // [`TemporalClassId`] + [`TemporalMethod`]. The callee is a
+        // nested static-member expression (`Temporal.<Class>` then
+        // `.<method>`), detected directly so the runtime needs no
+        // real `Temporal` global.
         if let Expression::StaticMemberExpression(outer) = &member.object
             && let Expression::Identifier(id) = &outer.object
             && id.name.as_str() == "Temporal"
         {
-            let class = outer.property.name.as_str();
-            let method = member.property.name.as_str();
+            let class_name = outer.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(class_id) =
+                otter_bytecode::method_id::TemporalClassId::from_str(class_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Temporal.{class_name}"),
+                    span,
+                });
+            };
+            let Some(method_id) =
+                otter_bytecode::method_id::TemporalMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Temporal.{class_name}.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let class_idx = cx.intern_string_constant(class);
-            let method_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(class_idx));
-            operands.push(Operand::ConstIndex(method_idx));
+            operands.push(Operand::ConstIndex(class_id.as_u32()));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::TemporalCall, operands, span);
             return Ok(dst);
         }
-        // `Symbol.<method>(args)` — `Symbol.for` / `Symbol.keyFor`.
+        // `Symbol.<method>(args)` — typed dispatch via [`SymbolMethod`].
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Symbol"
         {
-            let method = member.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::SymbolMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Symbol.{method_name}"),
+                    span,
+                });
+            };
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::SymbolCall, operands, span);
@@ -7162,23 +7248,23 @@ fn compile_method_call(
             && cx.lookup_binding("Number").is_none()
             && find_module_import_binding(cx, "Number").is_none()
         {
+            use otter_bytecode::method_id::GlobalMethod;
             let method = member.property.name.as_str();
-            let dispatch_name = match method {
-                "parseInt" => Some("parseInt"),
-                "parseFloat" => Some("parseFloat"),
-                "isNaN" => Some("Number.isNaN"),
-                "isFinite" => Some("Number.isFinite"),
-                "isInteger" => Some("Number.isInteger"),
-                "isSafeInteger" => Some("Number.isSafeInteger"),
+            let method_id = match method {
+                "parseInt" => Some(GlobalMethod::ParseInt),
+                "parseFloat" => Some(GlobalMethod::ParseFloat),
+                "isNaN" => Some(GlobalMethod::NumberIsNaN),
+                "isFinite" => Some(GlobalMethod::NumberIsFinite),
+                "isInteger" => Some(GlobalMethod::NumberIsInteger),
+                "isSafeInteger" => Some(GlobalMethod::NumberIsSafeInteger),
                 _ => None,
             };
-            if let Some(name) = dispatch_name {
+            if let Some(method_id) = method_id {
                 let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let name_idx = cx.intern_string_constant(name);
                 let dst = cx.alloc_scratch();
                 let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
                 operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(name_idx));
+                operands.push(Operand::ConstIndex(method_id.as_u32()));
                 operands.push(Operand::ConstIndex(arg_regs.len() as u32));
                 operands.extend(arg_regs.into_iter().map(Operand::Register));
                 cx.emit(Op::GlobalCall, operands, span);
@@ -7186,19 +7272,18 @@ fn compile_method_call(
             }
         }
     }
-    // Bare `Symbol(desc)` — fresh primitive symbol per call. Lower
-    // through the same Op::SymbolCall path with the empty-string
-    // sentinel as the method name (the runtime treats that as the
-    // constructor form).
+    // Bare `Symbol(desc)` — fresh primitive symbol per call.
+    // Lowers through `Op::SymbolCall` with [`SymbolMethod::Construct`].
     if let Expression::Identifier(id) = callee
         && id.name.as_str() == "Symbol"
     {
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let name_idx = cx.intern_string_constant("");
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
         operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(
+            otter_bytecode::method_id::SymbolMethod::Construct.as_u32(),
+        ));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::SymbolCall, operands, span);
@@ -7229,9 +7314,8 @@ fn compile_method_call(
         }
         return Ok(dst);
     }
-    // §22.1.1 / §22.1.2 String constructor + statics.
-    // `String(value)` (bare) and `String.<fromCharCode|fromCodePoint>(...)`
-    // both lower to `Op::StringCall` with the appropriate name.
+    // §22.1.1 / §22.1.2 String constructor + statics. Typed
+    // dispatch via [`StringMethod`].
     // <https://tc39.es/ecma262/#sec-string-constructor>
     if let Expression::StaticMemberExpression(member) = callee
         && let Expression::Identifier(id) = &member.object
@@ -7240,13 +7324,12 @@ fn compile_method_call(
         && find_module_import_binding(cx, "String").is_none()
     {
         let method = member.property.name.as_str();
-        if matches!(method, "fromCharCode" | "fromCodePoint") {
+        if let Some(method_id) = otter_bytecode::method_id::StringMethod::from_str(method) {
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::StringCall, operands, span);
@@ -7259,11 +7342,12 @@ fn compile_method_call(
         && find_module_import_binding(cx, "String").is_none()
     {
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let name_idx = cx.intern_string_constant("");
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
         operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(
+            otter_bytecode::method_id::StringMethod::Construct.as_u32(),
+        ));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::StringCall, operands, span);
@@ -7311,25 +7395,21 @@ fn compile_method_call(
         }
         return Ok(dst);
     }
-    // §23.1.1 `Array(...)` — bare-call form. Foundation routes
-    // through `Op::ArrayCall("of", ...)` which builds a dense
-    // array from the args (matches `Array.of` semantics modulo
-    // the single-numeric-argument length form, which we don't
-    // model yet).
+    // §23.1.1.1 `Array(...)` — bare-call form has the same spec
+    // body as `new Array(...)`. Both lower to [`Op::ArrayConstruct`]
+    // so the single-numeric-length form produces a sparse array.
     if let Expression::Identifier(id) = callee
         && id.name.as_str() == "Array"
         && cx.lookup_binding("Array").is_none()
         && find_module_import_binding(cx, "Array").is_none()
     {
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let name_idx = cx.intern_string_constant("of");
         let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
         operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(name_idx));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::ArrayCall, operands, span);
+        cx.emit(Op::ArrayConstruct, operands, span);
         return Ok(dst);
     }
     // §20.1.1 `Object(value)` — bare-call form. Foundation routes
@@ -7354,8 +7434,7 @@ fn compile_method_call(
         let dst = arg_regs[0];
         return Ok(dst);
     }
-    // §21.4.3 Date statics — `Date.now` / `Date.parse` / `Date.UTC`
-    // lower through `Op::DateCall` with the literal method name.
+    // §21.4.3 Date statics — typed dispatch via [`DateMethod`].
     // <https://tc39.es/ecma262/#sec-properties-of-the-date-constructor>
     if let Expression::StaticMemberExpression(member) = callee
         && let Expression::Identifier(id) = &member.object
@@ -7363,22 +7442,25 @@ fn compile_method_call(
         && cx.lookup_binding("Date").is_none()
         && find_module_import_binding(cx, "Date").is_none()
     {
-        let method = member.property.name.as_str();
+        let method_name = member.property.name.as_str();
+        let Some(method_id) = otter_bytecode::method_id::DateMethod::from_str(method_name) else {
+            return Err(CompileError::Unsupported {
+                node: format!("Date.{method_name}"),
+                span,
+            });
+        };
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let name_idx = cx.intern_string_constant(method);
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
         operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(method_id.as_u32()));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::DateCall, operands, span);
         return Ok(dst);
     }
-    // §21.2.1 BigInt(value) / §21.2.2 BigInt.<name>(args).
-    // Bare-identifier and `BigInt.<method>` static-member shapes
-    // both lower to `Op::BigIntCall`; empty-string name signals
-    // the constructor form.
+    // §21.2.1 BigInt(value) / §21.2.2 BigInt.<name>(args). Typed
+    // dispatch via [`BigIntMethod`].
     // <https://tc39.es/ecma262/#sec-bigint-constructor>
     if let Expression::StaticMemberExpression(member) = callee
         && let Expression::Identifier(id) = &member.object
@@ -7386,13 +7468,19 @@ fn compile_method_call(
         && cx.lookup_binding("BigInt").is_none()
         && find_module_import_binding(cx, "BigInt").is_none()
     {
-        let method = member.property.name.as_str();
+        let method_name = member.property.name.as_str();
+        let Some(method_id) = otter_bytecode::method_id::BigIntMethod::from_str(method_name)
+        else {
+            return Err(CompileError::Unsupported {
+                node: format!("BigInt.{method_name}"),
+                span,
+            });
+        };
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let name_idx = cx.intern_string_constant(method);
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
         operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(method_id.as_u32()));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::BigIntCall, operands, span);
@@ -7404,11 +7492,12 @@ fn compile_method_call(
         && find_module_import_binding(cx, "BigInt").is_none()
     {
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let name_idx = cx.intern_string_constant("");
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
         operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(
+            otter_bytecode::method_id::BigIntMethod::Construct.as_u32(),
+        ));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
         cx.emit(Op::BigIntCall, operands, span);
@@ -7467,25 +7556,16 @@ fn compile_method_call(
     // <https://tc39.es/ecma262/#sec-function-properties-of-the-global-object>
     if let Expression::Identifier(id) = callee {
         let name = id.name.as_str();
-        if matches!(
-            name,
-            "parseInt"
-                | "parseFloat"
-                | "isNaN"
-                | "isFinite"
-                | "encodeURI"
-                | "encodeURIComponent"
-                | "decodeURI"
-                | "decodeURIComponent"
-        ) && cx.lookup_binding(name).is_none()
+        if let Some(method_id) = otter_bytecode::method_id::GlobalMethod::from_str(name)
+            && !matches!(method_id.name(), n if n.starts_with("Number."))
+            && cx.lookup_binding(name).is_none()
             && find_module_import_binding(cx, name).is_none()
         {
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(name);
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.into_iter().map(Operand::Register));
             cx.emit(Op::GlobalCall, operands, span);
@@ -8914,13 +8994,12 @@ fn compile_object_builtin(
         // alongside `defineProperties`.
         // <https://tc39.es/ecma262/#sec-object.create>
         ("create", 2) => {
-            let name_idx = cx.intern_string_constant("create");
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::ObjectCall,
                 vec![
                     Operand::Register(dst),
-                    Operand::ConstIndex(name_idx),
+                    Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Create.as_u32()),
                     Operand::ConstIndex(2),
                     Operand::Register(arg_regs[0]),
                     Operand::Register(arg_regs[1]),
@@ -8968,35 +9047,15 @@ fn compile_object_builtin(
             Ok(dst)
         }
         // ECMA-262 §20.1.2 / §10.1.6 — Object descriptor surface.
-        // Routed through one variadic `Op::ObjectCall` opcode.
+        // Typed dispatch via [`ObjectMethod`].
         // <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
-        (
-            "create"
-            | "defineProperty"
-            | "defineProperties"
-            | "getOwnPropertyDescriptor"
-            | "getOwnPropertyDescriptors"
-            | "freeze"
-            | "isFrozen"
-            | "seal"
-            | "isSealed"
-            | "preventExtensions"
-            | "isExtensible"
-            | "keys"
-            | "values"
-            | "entries"
-            | "assign"
-            | "fromEntries"
-            | "hasOwn"
-            | "getOwnPropertyNames"
-            | "getOwnPropertySymbols",
-            _,
-        ) => {
-            let name_idx = cx.intern_string_constant(method);
+        _ if otter_bytecode::method_id::ObjectMethod::from_str(method).is_some() => {
+            let method_id = otter_bytecode::method_id::ObjectMethod::from_str(method)
+                .expect("guard above ensures Some");
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
             operands.push(Operand::ConstIndex(arg_regs.len() as u32));
             operands.extend(arg_regs.iter().copied().map(Operand::Register));
             cx.emit(Op::ObjectCall, operands, span);

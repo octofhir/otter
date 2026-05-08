@@ -28,17 +28,22 @@ use crate::number;
 use crate::string::{JsString, StringHeap};
 use crate::{Value, VmError};
 
-/// Dispatch `<name>(args...)`. `name` is one of the §19.2 global
-/// names or a `Number.<x>` static prefixed with `Number.`.
+/// Dispatch `<method>(args...)`. Routes the typed
+/// [`GlobalMethod`] emitted by the compiler — covers both the
+/// §19.2 globals and the `Number.<predicate>` aliases.
 ///
 /// # Errors
-/// - [`VmError::UnknownIntrinsic`] when `name` isn't recognised.
 /// - [`VmError::TypeMismatch`] for malformed inputs to `decodeURI*`.
-pub fn call(name: &str, args: &[Value], heap: &StringHeap) -> Result<Value, VmError> {
-    match name {
-        // `parseInt` and `Number.parseInt` are the same callable
-        // per §21.1.2.13. Foundation routes both names here.
-        "parseInt" | "Number.parseInt" => {
+pub fn call(
+    method: otter_bytecode::method_id::GlobalMethod,
+    args: &[Value],
+    heap: &StringHeap,
+) -> Result<Value, VmError> {
+    use otter_bytecode::method_id::GlobalMethod as M;
+    match method {
+        // §19.2.5 / §21.1.2.13 — `parseInt` and `Number.parseInt`
+        // are the same callable. Compiler emits `ParseInt` for both.
+        M::ParseInt => {
             let s = coerce_to_string(args.first());
             let radix = match args.get(1) {
                 None | Some(Value::Undefined) => 0i32,
@@ -50,57 +55,56 @@ pub fn call(name: &str, args: &[Value], heap: &StringHeap) -> Result<Value, VmEr
             };
             Ok(Value::Number(number::parse_int(&s, radix)))
         }
-        // §21.1.2.12 — same callable for both names.
-        "parseFloat" | "Number.parseFloat" => Ok(Value::Number(number::parse_float(
-            &coerce_to_string(args.first()),
-        ))),
+        // §19.2.4 / §21.1.2.12 — same callable for both names.
+        M::ParseFloat => Ok(Value::Number(number::parse_float(&coerce_to_string(
+            args.first(),
+        )))),
         // §19.2.3 — coerces, then defers to the strict predicate.
-        "isNaN" => {
+        M::IsNaN => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(number::is_nan(number::to_number_value(
                 &value,
             ))))
         }
-        "isFinite" => {
+        M::IsFinite => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(number::is_finite(number::to_number_value(
                 &value,
             ))))
         }
         // §21.1.2.3 / §21.1.2.2 — strict, no coercion.
-        "Number.isNaN" => {
+        M::NumberIsNaN => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(matches!(
                 value,
                 Value::Number(ref n) if number::is_nan(n.as_f64())
             )))
         }
-        "Number.isFinite" => {
+        M::NumberIsFinite => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(matches!(
                 value,
                 Value::Number(ref n) if number::is_finite(n.as_f64())
             )))
         }
-        "Number.isInteger" => Ok(Value::Boolean(number::is_integer(
+        M::NumberIsInteger => Ok(Value::Boolean(number::is_integer(
             &args.first().cloned().unwrap_or(Value::Undefined),
         ))),
-        "Number.isSafeInteger" => Ok(Value::Boolean(number::is_safe_integer(
+        M::NumberIsSafeInteger => Ok(Value::Boolean(number::is_safe_integer(
             &args.first().cloned().unwrap_or(Value::Undefined),
         ))),
-        "encodeURI" => js_string(&uri_encode(&coerce_to_string(args.first()), false), heap),
-        "encodeURIComponent" => js_string(&uri_encode(&coerce_to_string(args.first()), true), heap),
-        "decodeURI" => {
+        M::EncodeURI => js_string(&uri_encode(&coerce_to_string(args.first()), false), heap),
+        M::EncodeURIComponent => {
+            js_string(&uri_encode(&coerce_to_string(args.first()), true), heap)
+        }
+        M::DecodeURI => {
             let out = uri_decode(&coerce_to_string(args.first()), false)?;
             js_string(&out, heap)
         }
-        "decodeURIComponent" => {
+        M::DecodeURIComponent => {
             let out = uri_decode(&coerce_to_string(args.first()), true)?;
             js_string(&out, heap)
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("global {name}"),
-        }),
     }
 }
 

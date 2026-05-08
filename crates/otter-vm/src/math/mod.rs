@@ -187,79 +187,114 @@ pub fn load_constant(name: &str) -> Option<Value> {
     Some(Value::Number(NumberValue::from_f64(v)))
 }
 
-/// Dispatch a `Math.<name>(args...)` call. Returns the result
-/// value or a [`MathError`] the caller maps to `VmError`.
-pub fn call(name: &str, args: &[Value]) -> Result<Value, MathError> {
-    let entry = FUNCTIONS
-        .iter()
-        .find(|f| f.name == name)
-        .ok_or_else(|| MathError::UnknownMember(name.to_string()))?;
-    let nums = coerce_all(entry.name, args)?;
-    Ok(Value::Number((entry.impl_fn)(&nums)))
+/// Dispatch a `Math.<method>(args...)` call. Routes via the
+/// typed method id emitted by the compiler — direct match, no
+/// table scan or string compare.
+pub fn call(
+    method: otter_bytecode::method_id::MathMethod,
+    args: &[Value],
+) -> Result<Value, MathError> {
+    use otter_bytecode::method_id::MathMethod as M;
+    let nums = coerce_all(method.name(), args)?;
+    let value = match method {
+        M::Abs => impl_abs(&nums),
+        M::Acos => impl_acos(&nums),
+        M::Acosh => impl_acosh(&nums),
+        M::Asin => impl_asin(&nums),
+        M::Asinh => impl_asinh(&nums),
+        M::Atan => impl_atan(&nums),
+        M::Atan2 => impl_atan2(&nums),
+        M::Atanh => impl_atanh(&nums),
+        M::Cbrt => impl_cbrt(&nums),
+        M::Ceil => impl_ceil(&nums),
+        M::Clz32 => impl_clz32(&nums),
+        M::Cos => impl_cos(&nums),
+        M::Cosh => impl_cosh(&nums),
+        M::Exp => impl_exp(&nums),
+        M::Expm1 => impl_expm1(&nums),
+        M::Floor => impl_floor(&nums),
+        M::Fround => impl_fround(&nums),
+        M::Hypot => impl_hypot(&nums),
+        M::Imul => impl_imul(&nums),
+        M::Log => impl_log(&nums),
+        M::Log10 => impl_log10(&nums),
+        M::Log1p => impl_log1p(&nums),
+        M::Log2 => impl_log2(&nums),
+        M::Max => impl_max(&nums),
+        M::Min => impl_min(&nums),
+        M::Pow => impl_pow(&nums),
+        M::Random => impl_random(&nums),
+        M::Round => impl_round(&nums),
+        M::Sign => impl_sign(&nums),
+        M::Sin => impl_sin(&nums),
+        M::Sinh => impl_sinh(&nums),
+        M::Sqrt => impl_sqrt(&nums),
+        M::Tan => impl_tan(&nums),
+        M::Tanh => impl_tanh(&nums),
+        M::Trunc => impl_trunc(&nums),
+    };
+    Ok(Value::Number(value))
 }
 
-fn native_call(name: &'static str, args: &[Value]) -> Result<Value, NativeError> {
-    call(name, args).map_err(|err| match err {
+fn native_call(
+    method: otter_bytecode::method_id::MathMethod,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    call(method, args).map_err(|err| match err {
         MathError::UnknownMember(member) => NativeError::TypeError {
-            name,
+            name: method.name(),
             reason: format!("unknown Math member {member}"),
         },
         MathError::BadArgument { reason, .. } => NativeError::TypeError {
-            name,
+            name: method.name(),
             reason: reason.to_string(),
         },
     })
 }
 
 macro_rules! native_math {
-    ($fn_name:ident, $js_name:literal) => {
+    ($fn_name:ident, $variant:ident) => {
         fn $fn_name(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            native_call($js_name, args)
+            native_call(otter_bytecode::method_id::MathMethod::$variant, args)
         }
     };
 }
 
-native_math!(native_abs, "abs");
-native_math!(native_floor, "floor");
-native_math!(native_ceil, "ceil");
-native_math!(native_round, "round");
-native_math!(native_trunc, "trunc");
-native_math!(native_sqrt, "sqrt");
-native_math!(native_pow, "pow");
-native_math!(native_min, "min");
-native_math!(native_max, "max");
-native_math!(native_log, "log");
-native_math!(native_log2, "log2");
-native_math!(native_log10, "log10");
-native_math!(native_log1p, "log1p");
-native_math!(native_exp, "exp");
-native_math!(native_expm1, "expm1");
-native_math!(native_sin, "sin");
-native_math!(native_cos, "cos");
-native_math!(native_tan, "tan");
-native_math!(native_asin, "asin");
-native_math!(native_acos, "acos");
-native_math!(native_atan, "atan");
-native_math!(native_atan2, "atan2");
-native_math!(native_sinh, "sinh");
-native_math!(native_cosh, "cosh");
-native_math!(native_tanh, "tanh");
-native_math!(native_asinh, "asinh");
-native_math!(native_acosh, "acosh");
-native_math!(native_atanh, "atanh");
-native_math!(native_cbrt, "cbrt");
-native_math!(native_fround, "fround");
-native_math!(native_hypot, "hypot");
-native_math!(native_sign, "sign");
-native_math!(native_clz32, "clz32");
-native_math!(native_imul, "imul");
-native_math!(native_random, "random");
-
-/// One entry in the Math function table.
-struct MathFn {
-    name: &'static str,
-    impl_fn: fn(&[NumberValue]) -> NumberValue,
-}
+native_math!(native_abs, Abs);
+native_math!(native_floor, Floor);
+native_math!(native_ceil, Ceil);
+native_math!(native_round, Round);
+native_math!(native_trunc, Trunc);
+native_math!(native_sqrt, Sqrt);
+native_math!(native_pow, Pow);
+native_math!(native_min, Min);
+native_math!(native_max, Max);
+native_math!(native_log, Log);
+native_math!(native_log2, Log2);
+native_math!(native_log10, Log10);
+native_math!(native_log1p, Log1p);
+native_math!(native_exp, Exp);
+native_math!(native_expm1, Expm1);
+native_math!(native_sin, Sin);
+native_math!(native_cos, Cos);
+native_math!(native_tan, Tan);
+native_math!(native_asin, Asin);
+native_math!(native_acos, Acos);
+native_math!(native_atan, Atan);
+native_math!(native_atan2, Atan2);
+native_math!(native_sinh, Sinh);
+native_math!(native_cosh, Cosh);
+native_math!(native_tanh, Tanh);
+native_math!(native_asinh, Asinh);
+native_math!(native_acosh, Acosh);
+native_math!(native_atanh, Atanh);
+native_math!(native_cbrt, Cbrt);
+native_math!(native_fround, Fround);
+native_math!(native_hypot, Hypot);
+native_math!(native_sign, Sign);
+native_math!(native_clz32, Clz32);
+native_math!(native_imul, Imul);
+native_math!(native_random, Random);
 
 fn coerce_all(name: &'static str, args: &[Value]) -> Result<Vec<NumberValue>, MathError> {
     let mut out = Vec::with_capacity(args.len());
@@ -552,148 +587,6 @@ fn first_or_nan(args: &[NumberValue]) -> NumberValue {
         .unwrap_or(NumberValue::Double(f64::NAN))
 }
 
-const FUNCTIONS: &[MathFn] = &[
-    MathFn {
-        name: "abs",
-        impl_fn: impl_abs,
-    },
-    MathFn {
-        name: "floor",
-        impl_fn: impl_floor,
-    },
-    MathFn {
-        name: "ceil",
-        impl_fn: impl_ceil,
-    },
-    MathFn {
-        name: "round",
-        impl_fn: impl_round,
-    },
-    MathFn {
-        name: "trunc",
-        impl_fn: impl_trunc,
-    },
-    MathFn {
-        name: "sqrt",
-        impl_fn: impl_sqrt,
-    },
-    MathFn {
-        name: "pow",
-        impl_fn: impl_pow,
-    },
-    MathFn {
-        name: "min",
-        impl_fn: impl_min,
-    },
-    MathFn {
-        name: "max",
-        impl_fn: impl_max,
-    },
-    MathFn {
-        name: "log",
-        impl_fn: impl_log,
-    },
-    MathFn {
-        name: "log2",
-        impl_fn: impl_log2,
-    },
-    MathFn {
-        name: "log10",
-        impl_fn: impl_log10,
-    },
-    MathFn {
-        name: "log1p",
-        impl_fn: impl_log1p,
-    },
-    MathFn {
-        name: "exp",
-        impl_fn: impl_exp,
-    },
-    MathFn {
-        name: "expm1",
-        impl_fn: impl_expm1,
-    },
-    MathFn {
-        name: "sin",
-        impl_fn: impl_sin,
-    },
-    MathFn {
-        name: "cos",
-        impl_fn: impl_cos,
-    },
-    MathFn {
-        name: "tan",
-        impl_fn: impl_tan,
-    },
-    MathFn {
-        name: "asin",
-        impl_fn: impl_asin,
-    },
-    MathFn {
-        name: "acos",
-        impl_fn: impl_acos,
-    },
-    MathFn {
-        name: "atan",
-        impl_fn: impl_atan,
-    },
-    MathFn {
-        name: "atan2",
-        impl_fn: impl_atan2,
-    },
-    MathFn {
-        name: "sinh",
-        impl_fn: impl_sinh,
-    },
-    MathFn {
-        name: "cosh",
-        impl_fn: impl_cosh,
-    },
-    MathFn {
-        name: "tanh",
-        impl_fn: impl_tanh,
-    },
-    MathFn {
-        name: "asinh",
-        impl_fn: impl_asinh,
-    },
-    MathFn {
-        name: "acosh",
-        impl_fn: impl_acosh,
-    },
-    MathFn {
-        name: "atanh",
-        impl_fn: impl_atanh,
-    },
-    MathFn {
-        name: "cbrt",
-        impl_fn: impl_cbrt,
-    },
-    MathFn {
-        name: "fround",
-        impl_fn: impl_fround,
-    },
-    MathFn {
-        name: "hypot",
-        impl_fn: impl_hypot,
-    },
-    MathFn {
-        name: "sign",
-        impl_fn: impl_sign,
-    },
-    MathFn {
-        name: "clz32",
-        impl_fn: impl_clz32,
-    },
-    MathFn {
-        name: "imul",
-        impl_fn: impl_imul,
-    },
-    MathFn {
-        name: "random",
-        impl_fn: impl_random,
-    },
-];
 
 #[cfg(test)]
 mod tests {
@@ -712,17 +605,23 @@ mod tests {
 
     #[test]
     fn min_and_max_handle_nan() {
-        let r = call("min", &[n(1), n(2), n(3)]).unwrap();
+        use otter_bytecode::method_id::MathMethod;
+        let r = call(MathMethod::Min, &[n(1), n(2), n(3)]).unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(1));
-        let r = call("max", &[n(1), n(2), n(3)]).unwrap();
+        let r = call(MathMethod::Max, &[n(1), n(2), n(3)]).unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(3));
-        let nan_r = call("max", &[n(1), Value::Number(NumberValue::Double(f64::NAN))]).unwrap();
+        let nan_r = call(
+            MathMethod::Max,
+            &[n(1), Value::Number(NumberValue::Double(f64::NAN))],
+        )
+        .unwrap();
         assert!(nan_r.as_number().unwrap().is_nan());
     }
 
     #[test]
     fn pow_routes_to_bitwise_pow() {
-        let r = call("pow", &[n(2), n(10)]).unwrap();
+        use otter_bytecode::method_id::MathMethod;
+        let r = call(MathMethod::Pow, &[n(2), n(10)]).unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(1024));
     }
 }

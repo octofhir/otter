@@ -158,6 +158,14 @@ pub(super) fn validate_and_apply(
     }))
 }
 
+pub(super) fn validate_descriptor_update(
+    existing: &PropertyDescriptor,
+    incoming: &PropertyDescriptor,
+) -> Option<PropertyDescriptor> {
+    let existing = PropertySlot::from_descriptor(existing.clone());
+    validate_and_apply(&existing, incoming).map(|slot| slot.to_descriptor())
+}
+
 fn optional_value_eq(a: &Option<Value>, b: &Option<Value>) -> bool {
     match (a, b) {
         (None, None) => true,

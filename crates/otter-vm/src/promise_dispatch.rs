@@ -72,25 +72,22 @@ pub fn make_capability(
     })
 }
 
-/// Dispatch a `Promise.<name>(args...)` static call. Mirrors
-/// [`crate::math::call`] / [`crate::json::call`].
+/// Dispatch a `Promise.<method>(args...)` static call. Routes
+/// the typed [`PromiseMethod`] emitted by the compiler.
 pub fn statics_call(
     interp: &mut Interpreter,
-    name: &str,
+    method: otter_bytecode::method_id::PromiseMethod,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    match name {
-        "resolve" => Ok(Value::Promise(static_resolve(interp, args)?)),
-        "reject" => Ok(Value::Promise(static_reject(interp, args)?)),
-        "all" => static_all(interp, args),
-        "race" => static_race(interp, args),
-        "allSettled" => static_all_settled(interp, args),
-        "any" => static_any(interp, args),
-        "withResolvers" => static_with_resolvers(interp),
-        other => Err(NativeError::TypeError {
-            name: "Promise",
-            reason: format!("static `{other}` is not defined"),
-        }),
+    use otter_bytecode::method_id::PromiseMethod as M;
+    match method {
+        M::Resolve => Ok(Value::Promise(static_resolve(interp, args)?)),
+        M::Reject => Ok(Value::Promise(static_reject(interp, args)?)),
+        M::All => static_all(interp, args),
+        M::Race => static_race(interp, args),
+        M::AllSettled => static_all_settled(interp, args),
+        M::Any => static_any(interp, args),
+        M::WithResolvers => static_with_resolvers(interp),
     }
 }
 

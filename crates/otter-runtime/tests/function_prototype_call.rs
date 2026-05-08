@@ -184,3 +184,40 @@ fn native_builtin_readonly_assignment_has_contextual_type_error() {
         "{message}"
     );
 }
+
+#[test]
+fn bound_function_metadata_composes_from_target_name_and_length() {
+    let completion = run(r#"
+        function target(a, b, c) {}
+        Object.defineProperty(target, "name", { value: "renamed" });
+        const once = target.bind(null, 1);
+        const twice = once.bind(null, 2);
+        const uncurried = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
+        once.name + ":" + once.length + ":" +
+            twice.name + ":" + twice.length + ":" +
+            uncurried.name + ":" + uncurried.length;
+        "#);
+    assert_eq!(
+        completion,
+        "bound renamed:2:bound bound renamed:1:bound call:1"
+    );
+}
+
+#[test]
+fn bound_function_metadata_has_configurable_descriptor_shape() {
+    let completion = run(r#"
+        function target(a) {}
+        const bound = target.bind(null);
+        const length = Object.getOwnPropertyDescriptor(bound, "length");
+        const name = Object.getOwnPropertyDescriptor(bound, "name");
+        const deleted = delete bound.name;
+        length.value + ":" + length.writable + ":" + length.enumerable + ":" +
+            length.configurable + ":" + name.value + ":" + name.configurable + ":" +
+            deleted + ":" + Object.prototype.hasOwnProperty.call(bound, "name") + ":" +
+            Object.getOwnPropertyNames(bound).join(",");
+        "#);
+    assert_eq!(
+        completion,
+        "1:false:false:true:bound target:true:true:false:length"
+    );
+}

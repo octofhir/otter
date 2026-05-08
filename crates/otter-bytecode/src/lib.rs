@@ -27,6 +27,7 @@
 
 pub mod disasm;
 pub mod dump;
+pub mod method_id;
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,15 @@ pub enum Op {
     Nop,
     /// `r<dst> = undefined`.
     LoadUndefined,
+    /// `r<dst> = <array hole sentinel>`.
+    ///
+    /// Emitted by the compiler for elision elements in array
+    /// literals (`[1, , 3]`) so the resulting `Op::NewArray` /
+    /// `Op::ArrayPush` operand carries the internal `Value::Hole`
+    /// instead of an explicit `undefined`. User code never observes
+    /// this register slot directly — every array read path maps
+    /// `Value::Hole` back to `undefined` per ECMA-262 §10.4.2.
+    LoadHole,
     /// Return from the current function with `r<src>` as the
     /// completion value.
     Return,
@@ -795,17 +805,31 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-bigint-constructor>
     BigIntCall,
 
-    /// `r<dst> = Array.<name>(args...)`. Operands:
-    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
+    /// `r<dst> = Array(args...)` / `r<dst> = new Array(args...)`.
+    /// Operands: `Register(dst), ConstIndex(argc), Register(arg0), …`.
     ///
-    /// Variadic. Routes `Array.from` / `Array.of` (the foundation
-    /// surface today) through one synchronous dispatcher.
-    /// `Array.isArray` keeps its dedicated [`Self::IsArray`] opcode.
+    /// §23.1.1.1 — single-numeric argument reserves a sparse array
+    /// of that length; everything else collects values verbatim.
     ///
     /// # See also
-    /// - <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
-    ArrayCall,
+    /// - <https://tc39.es/ecma262/#sec-array>
+    ArrayConstruct,
+    /// `r<dst> = Array.from(args...)`. Operands:
+    /// `Register(dst), ConstIndex(argc), Register(arg0), …`.
+    ///
+    /// §23.1.2.1 Array.from. Variadic.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array.from>
+    ArrayFrom,
+    /// `r<dst> = Array.of(args...)`. Operands:
+    /// `Register(dst), ConstIndex(argc), Register(arg0), …`.
+    ///
+    /// §23.1.2.3 Array.of. Variadic.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array.of>
+    ArrayOf,
     /// `r<dst> = Object.<name>(args...)`. Operands:
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -962,6 +986,7 @@ impl Op {
         match self {
             Op::Nop => "NOP",
             Op::LoadUndefined => "LOAD_UNDEFINED",
+            Op::LoadHole => "LOAD_HOLE",
             Op::Return => "RETURN",
             Op::LoadString => "LOAD_STRING",
             Op::LoadNumber => "LOAD_NUMBER",
@@ -1065,7 +1090,9 @@ impl Op {
             Op::NewBuiltinError => "NEW_BUILTIN_ERROR",
             Op::LoadBuiltinError => "LOAD_BUILTIN_ERROR",
             Op::ObjectCall => "OBJECT_CALL",
-            Op::ArrayCall => "ARRAY_CALL",
+            Op::ArrayConstruct => "ARRAY_CONSTRUCT",
+            Op::ArrayFrom => "ARRAY_FROM",
+            Op::ArrayOf => "ARRAY_OF",
             Op::BigIntCall => "BIGINT_CALL",
             Op::DateCall => "DATE_CALL",
             Op::StringCall => "STRING_CALL",
@@ -1103,6 +1130,7 @@ impl Op {
         match self {
             Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally => 0,
             Op::LoadUndefined
+            | Op::LoadHole
             | Op::LoadNull
             | Op::LoadTrue
             | Op::LoadFalse
@@ -1203,7 +1231,8 @@ impl Op {
             Op::JsonCall => 3,              // dst, name_const, argc — args follow
             Op::SymbolCall => 3,            // dst, name_const, argc — args follow
             Op::ObjectCall => 3,            // dst, name_const, argc — args follow
-            Op::ArrayCall => 3,             // dst, name_const, argc — args follow
+            // dst, argc — args follow as `Register(arg0)…`.
+            Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
             Op::BigIntCall => 3,            // dst, name_const, argc — args follow
             Op::DateCall => 3,              // dst, name_const, argc — args follow
             Op::StringCall => 3,            // dst, name_const, argc — args follow

@@ -353,13 +353,13 @@ semantics) builds on it, then P1.3 (builtin installation) consumes both.
 
 ### P1.1 Object/Descriptor Core
 
-- [ ] Make property descriptors the canonical object mutation path.
+- [x] Make property descriptors the canonical object mutation path.
 - [x] Ensure property order is deterministic and spec-observable
   (integer-indexed keys ascending, then strings in insertion order, then
   symbols in insertion order).
-- [ ] Centralize `[[DefineOwnProperty]]`, `[[GetOwnProperty]]`, `[[Set]]`,
+- [x] Centralize `[[DefineOwnProperty]]`, `[[GetOwnProperty]]`, `[[Set]]`,
   `[[Delete]]`, and prototype-walk behavior in `crates/otter-vm/src/object.rs`.
-- [ ] Add descriptor tests for data/accessor fields, configurability,
+- [x] Add descriptor tests for data/accessor fields, configurability,
   enumerability, writability, symbol keys, integer-index ordering, and
   frozen/sealed/non-extensible interactions.
 
@@ -372,10 +372,10 @@ Acceptance:
 
 Next slice notes:
 
-- Remaining special receiver divergence before closing the full
-  descriptor-core checkbox: `NativeFunction` metadata uses its own
-  define/assignment validation, and user `Function`/`Closure` values still
-  lack `Object.defineProperty` routing into their side-table bags.
+- Construction/bootstrap seeding still uses the explicit `object::set` helper
+  for fresh owned objects. User-visible assignment, runtime-host property
+  mutation, symbol writes, class statics, user function bags, and native
+  function metadata now route through descriptor validation.
 
 ### P1.2 Function And Arguments Semantics
 

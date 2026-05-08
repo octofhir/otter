@@ -14,22 +14,24 @@ use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::make_temporal;
 use crate::temporal::payload::TemporalPayload;
 
-/// Dispatch `Temporal.Now.<method>(args...)`.
+/// Dispatch `Temporal.Now.<method>(args...)` via the typed
+/// [`TemporalMethod`].
 pub fn dispatch(
     string_heap: &StringHeap,
-    method: &str,
+    method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
+    use otter_bytecode::method_id::TemporalMethod as M;
     let _ = string_heap;
     let _ = args;
     match method {
-        "instant" => instant(),
-        "plainDateTimeISO" => plain_date_time_iso(),
-        "plainDateISO" => plain_date_iso(),
-        "plainTimeISO" => plain_time_iso(),
+        M::NowInstant => instant(),
+        M::NowPlainDateTimeISO => plain_date_time_iso(),
+        M::NowPlainDateISO => plain_date_iso(),
+        M::NowPlainTimeISO => plain_time_iso(),
         other => Err(TemporalError::UnknownMember {
             class: "Now".to_string(),
-            method: other.to_string(),
+            method: other.name().to_string(),
         }),
     }
 }

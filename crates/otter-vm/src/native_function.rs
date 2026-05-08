@@ -472,9 +472,24 @@ impl NativeFunction {
     pub(crate) fn define_own_property(
         &self,
         heap: &mut otter_gc::GcHeap,
+        string_heap: &StringHeap,
         key: &str,
         descriptor: PropertyDescriptor,
     ) -> bool {
+        let existing = match self.own_property_descriptor(heap, string_heap, key) {
+            Ok(existing) => existing,
+            Err(_) => return false,
+        };
+        let descriptor = match existing {
+            Some(existing) => {
+                match crate::object::validate_descriptor_update(&existing, &descriptor) {
+                    Some(merged) => merged,
+                    None => return false,
+                }
+            }
+            None if key == "name" || key == "length" => descriptor,
+            None => return false,
+        };
         let barrier_descriptor = descriptor.clone();
         let success = heap.with_payload(self.inner, |body| {
             let slot = match key {

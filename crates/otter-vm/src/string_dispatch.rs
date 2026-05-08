@@ -13,16 +13,21 @@ use crate::number::NumberValue;
 use crate::string::{JsString, StringHeap};
 use crate::{Value, VmError};
 
-/// Dispatch `String(...)` / `String.<name>(...)`. Empty `name`
-/// (sentinel) selects the constructor.
+/// Dispatch `String(...)` ([`StringMethod::Construct`]) /
+/// `String.<method>(...)`. Routes the typed [`StringMethod`]
+/// emitted by the compiler.
 ///
 /// # Errors
 /// - [`VmError::TypeMismatch`] for malformed inputs.
-/// - [`VmError::UnknownIntrinsic`] for unknown method names.
-pub fn call(name: &str, args: &[Value], heap: &StringHeap) -> Result<Value, VmError> {
-    match name {
+pub fn call(
+    method: otter_bytecode::method_id::StringMethod,
+    args: &[Value],
+    heap: &StringHeap,
+) -> Result<Value, VmError> {
+    use otter_bytecode::method_id::StringMethod as M;
+    match method {
         // §22.1.1 String(value) — coerce via §7.1.17 ToString.
-        "" => {
+        M::Construct => {
             let s = match args.first() {
                 Some(Value::String(s)) => s.to_lossy_string(),
                 Some(Value::Symbol(_)) => {
@@ -39,7 +44,7 @@ pub fn call(name: &str, args: &[Value], heap: &StringHeap) -> Result<Value, VmEr
             ))
         }
         // §22.1.2.1 String.fromCharCode(...codeUnits).
-        "fromCharCode" => {
+        M::FromCharCode => {
             let mut units: Vec<u16> = Vec::with_capacity(args.len());
             for arg in args {
                 let n = match arg {
@@ -58,7 +63,7 @@ pub fn call(name: &str, args: &[Value], heap: &StringHeap) -> Result<Value, VmEr
             ))
         }
         // §22.1.2.2 String.fromCodePoint(...codePoints).
-        "fromCodePoint" => {
+        M::FromCodePoint => {
             let mut units: Vec<u16> = Vec::with_capacity(args.len());
             for arg in args {
                 let n = match arg {
@@ -83,9 +88,6 @@ pub fn call(name: &str, args: &[Value], heap: &StringHeap) -> Result<Value, VmEr
                 JsString::from_utf16_units(&units, heap).map_err(|_| VmError::TypeMismatch)?,
             ))
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("String.{name}"),
-        }),
     }
 }
 

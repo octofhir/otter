@@ -451,9 +451,12 @@ impl<'rt> ClassBuilder<'rt> {
             }
         }
 
-        let class = Value::ClassConstructor(
-            ClassConstructor::new(self.heap, constructor, prototype, statics)?,
-        );
+        let class = Value::ClassConstructor(ClassConstructor::new(
+            self.heap,
+            constructor,
+            prototype,
+            statics,
+        )?);
         define_data(
             prototype,
             self.heap,

@@ -205,7 +205,10 @@ mod tests {
         assert_eq!(fmt_f64(1.0).as_deref(), Some("1"));
         assert_eq!(fmt_f64(-1.0).as_deref(), Some("-1"));
         assert_eq!(fmt_f64(1234567890.0).as_deref(), Some("1234567890"));
-        assert_eq!(fmt_f64(-9007199254740991.0).as_deref(), Some("-9007199254740991"));
+        assert_eq!(
+            fmt_f64(-9007199254740991.0).as_deref(),
+            Some("-9007199254740991")
+        );
     }
 
     #[test]

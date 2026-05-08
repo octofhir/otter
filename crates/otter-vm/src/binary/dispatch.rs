@@ -24,21 +24,22 @@ use super::{to_index, typed_array_prototype};
 // ArrayBuffer
 // =========================================================================
 
-/// Dispatch `ArrayBuffer(...)` / `ArrayBuffer.<name>(...)`. Empty
-/// `name` is the constructor.
+/// Dispatch `ArrayBuffer(...)` ([`ArrayBufferMethod::Construct`]) /
+/// `ArrayBuffer.<method>(...)` via the typed [`ArrayBufferMethod`].
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
 pub fn array_buffer_call(
-    name: &str,
+    method: otter_bytecode::method_id::ArrayBufferMethod,
     args: &[Value],
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    match name {
+    use otter_bytecode::method_id::ArrayBufferMethod as M;
+    match method {
         // §25.1.4 `new ArrayBuffer(length [, options])`. The second
         // argument is an options bag with an optional `maxByteLength`
         // property; when present, the buffer is resizable.
-        "" => {
+        M::Construct => {
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
                 Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
@@ -68,16 +69,13 @@ pub fn array_buffer_call(
         }
         // §25.1.3.1 ArrayBuffer.isView(arg) — returns `true` when
         // arg is a TypedArray or DataView.
-        "isView" => {
+        M::IsView => {
             let v = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(matches!(
                 v,
                 Value::TypedArray(_) | Value::DataView(_)
             )))
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("ArrayBuffer.{name}"),
-        }),
     }
 }
 
@@ -88,12 +86,13 @@ pub fn array_buffer_call(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
 pub fn shared_array_buffer_call(
-    name: &str,
+    method: otter_bytecode::method_id::SharedArrayBufferMethod,
     args: &[Value],
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    match name {
-        "" => {
+    use otter_bytecode::method_id::SharedArrayBufferMethod as M;
+    match method {
+        M::Construct => {
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
                 Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
@@ -121,9 +120,6 @@ pub fn shared_array_buffer_call(
             };
             Ok(Value::ArrayBuffer(buf))
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("SharedArrayBuffer.{name}"),
-        }),
     }
 }
 
@@ -131,13 +127,18 @@ pub fn shared_array_buffer_call(
 // DataView
 // =========================================================================
 
-/// Dispatch `new DataView(buffer, byteOffset?, byteLength?)`.
+/// Dispatch `new DataView(buffer, byteOffset?, byteLength?)` via
+/// the typed [`DataViewMethod`].
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-dataview-buffer-byteoffset-bytelength>
-pub fn data_view_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
-    match name {
-        "" => {
+pub fn data_view_call(
+    method: otter_bytecode::method_id::DataViewMethod,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    use otter_bytecode::method_id::DataViewMethod as M;
+    match method {
+        M::Construct => {
             let buffer = match args.first() {
                 Some(Value::ArrayBuffer(b)) => b.clone(),
                 _ => return Err(VmError::TypeMismatch),
@@ -169,9 +170,6 @@ pub fn data_view_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
                 byte_length,
             )))
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("DataView.{name}"),
-        }),
     }
 }
 
@@ -180,7 +178,8 @@ pub fn data_view_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
 // =========================================================================
 
 /// Dispatch `new <T>(...)` / `<T>.from(...)` / `<T>.of(...)` for one
-/// of the eleven concrete TypedArray classes.
+/// of the eleven concrete TypedArray classes via the typed
+/// [`TypedArrayMethod`].
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-typedarray-constructors>
@@ -188,22 +187,15 @@ pub fn data_view_call(name: &str, args: &[Value]) -> Result<Value, VmError> {
 /// - <https://tc39.es/ecma262/#sec-%25typedarray%25.of>
 pub fn typed_array_call(
     kind: TypedArrayKind,
-    name: &str,
+    method: otter_bytecode::method_id::TypedArrayMethod,
     args: &[Value],
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    match name {
-        "" => construct_typed_array(kind, args, gc_heap),
-        "from" => from_static(kind, args, gc_heap),
-        "of" => of_static(kind, args),
-        // BYTES_PER_ELEMENT is read on the constructor object as a
-        // property — the compiler routes that through LoadProperty
-        // (see lib.rs additions). Here we handle the case where the
-        // user reaches for it via call form (`Uint8Array.BYTES_PER_ELEMENT()`)
-        // — that is illegal in JS, so route to UnknownIntrinsic.
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("{}.{name}", kind.name()),
-        }),
+    use otter_bytecode::method_id::TypedArrayMethod as M;
+    match method {
+        M::Construct => construct_typed_array(kind, args, gc_heap),
+        M::From => from_static(kind, args, gc_heap),
+        M::Of => of_static(kind, args),
     }
 }
 

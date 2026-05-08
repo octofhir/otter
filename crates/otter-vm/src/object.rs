@@ -1366,6 +1366,15 @@ pub fn define_own_symbol_property(
     success
 }
 
+/// Validate one descriptor update against an existing descriptor using
+/// the same `ValidateAndApplyPropertyDescriptor` core as ordinary objects.
+pub(crate) fn validate_descriptor_update(
+    existing: &PropertyDescriptor,
+    incoming: &PropertyDescriptor,
+) -> Option<PropertyDescriptor> {
+    descriptor_core::validate_descriptor_update(existing, incoming)
+}
+
 impl otter_gc::GcStore for PropertyDescriptor {
     fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
         match &self.kind {

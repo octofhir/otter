@@ -421,6 +421,9 @@ fn install_array(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{NativeCtx, NativeError};
+
     let array = object::alloc_object(heap)?;
     let prototype = object::alloc_object(heap)?;
     object::set(array, heap, "prototype", Value::Object(prototype));
@@ -436,6 +439,65 @@ fn install_array(
             builder.method_from_spec(method)?;
         }
     }
+
+    // §23.1.1.1 Array(...values) — both `Array(…)` and
+    // `new Array(…)` reach this callback. Single numeric argument
+    // means "pre-sized sparse array of length n"; anything else
+    // collects values verbatim.
+    // <https://tc39.es/ecma262/#sec-array>
+    fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let arr = crate::array::alloc_array(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+            name: "Array",
+            reason: "out of memory while allocating array".to_string(),
+        })?;
+        if args.len() == 1
+            && let Value::Number(n) = &args[0]
+        {
+            let raw = n.as_f64();
+            let len = raw as u32;
+            if !raw.is_finite() || raw < 0.0 || raw != f64::from(len) {
+                return Err(NativeError::RangeError {
+                    name: "Array",
+                    reason: "Invalid array length".to_string(),
+                });
+            }
+            if len > 0 {
+                // `array::set` gap-fills with `Value::Hole`, so
+                // writing the trailing slot also fills every index
+                // in `[0, len-1)` with a hole.
+                let last = (len - 1) as usize;
+                crate::array::set(arr, ctx.heap_mut(), last, Value::Hole).map_err(|_| {
+                    NativeError::TypeError {
+                        name: "Array",
+                        reason: "out of memory while sizing array".to_string(),
+                    }
+                })?;
+            }
+            return Ok(Value::Array(arr));
+        }
+        for v in args {
+            crate::array::push(arr, ctx.heap_mut(), v.clone()).map_err(|_| {
+                NativeError::TypeError {
+                    name: "Array",
+                    reason: "out of memory while populating array".to_string(),
+                }
+            })?;
+        }
+        Ok(Value::Array(arr))
+    }
+
+    let ctor_native = NativeFunction::new_static(heap, "Array", 1, array_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    // Wire the callable+constructable bridge: the dispatch path
+    // promotes any `Value::Object` carrying this slot to the native
+    // ctor branch (see `Interpreter::dispatch_construct`).
+    object::set(
+        array,
+        heap,
+        crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY,
+        Value::NativeFunction(ctor_native),
+    );
+
     define_global(global, heap, entry.name, Value::Object(array));
     Ok(())
 }
@@ -471,10 +533,7 @@ fn install_number(
     // a `NumberObject` with `[[NumberData]] = ToNumber(value)`; the
     // pre-allocated receiver from `dispatch_construct` already has
     // `Number.prototype` linked as `[[Prototype]]`.
-    fn number_ctor_call(
-        ctx: &mut NativeCtx<'_>,
-        args: &[Value],
-    ) -> Result<Value, NativeError> {
+    fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let value = if args.is_empty() {
             crate::number::NumberValue::from_i32(0)
         } else {
@@ -575,7 +634,10 @@ fn install_number(
     // callbacks that share the foundation `crate::number::parse`
     // implementation (the same helpers `Op::GlobalCall` reaches via
     // the compile-time alias for `Number.isNaN(x)` etc.).
-    fn number_is_nan_native(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn number_is_nan_native(
+        _ctx: &mut NativeCtx<'_>,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
         let result = matches!(args.first(), Some(Value::Number(n)) if n.as_f64().is_nan());
         Ok(Value::Boolean(result))
     }
@@ -607,7 +669,11 @@ fn install_number(
         let s = match args.first() {
             Some(Value::String(s)) => s.to_lossy_string(),
             Some(other) => other.display_string(),
-            None => return Ok(Value::Number(crate::number::NumberValue::from_f64(f64::NAN))),
+            None => {
+                return Ok(Value::Number(crate::number::NumberValue::from_f64(
+                    f64::NAN,
+                )));
+            }
         };
         let radix = match args.get(1) {
             Some(Value::Number(n)) => n.as_f64() as i32,
@@ -622,7 +688,11 @@ fn install_number(
         let s = match args.first() {
             Some(Value::String(s)) => s.to_lossy_string(),
             Some(other) => other.display_string(),
-            None => return Ok(Value::Number(crate::number::NumberValue::from_f64(f64::NAN))),
+            None => {
+                return Ok(Value::Number(crate::number::NumberValue::from_f64(
+                    f64::NAN,
+                )));
+            }
         };
         Ok(Value::Number(crate::number::parse::parse_float(&s)))
     }
@@ -638,7 +708,12 @@ fn install_number(
             ("parseFloat", 1, number_parse_float_native),
         ];
         for (name, length, call) in methods {
-            builder.method(name, *length, NativeCall::Static(*call), Attr::builtin_function())?;
+            builder.method(
+                name,
+                *length,
+                NativeCall::Static(*call),
+                Attr::builtin_function(),
+            )?;
         }
     }
 

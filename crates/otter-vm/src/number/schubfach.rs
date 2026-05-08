@@ -300,7 +300,7 @@ mod tests {
         // Mantissa boundaries — values at which Schubfach's
         // irregular-spacing branch fires.
         for &x in &[
-            f64::MIN_POSITIVE,         // smallest positive normal
+            f64::MIN_POSITIVE,                     // smallest positive normal
             f64::from_bits(0x000F_FFFF_FFFF_FFFF), // largest subnormal
             f64::from_bits(0x0010_0000_0000_0000), // smallest normal (= MIN_POSITIVE)
             2.0_f64.powi(53),
@@ -348,7 +348,7 @@ mod tests {
             5.7184e-309,
             2.5e-323,
             // Loitsch 2010 — Grisu3 boundary cases.
-            1.7976931348623157e308, // f64::MAX
+            1.7976931348623157e308,  // f64::MAX
             2.2250738585072014e-308, // f64::MIN_POSITIVE
             5e-324,                  // smallest positive subnormal
             // Adams 2018 — values at the decimal-window boundaries.

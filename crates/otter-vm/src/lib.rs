@@ -41,6 +41,7 @@ pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod bootstrap;
 pub mod error_classes;
+pub mod function_metadata;
 pub mod function_prototype;
 pub mod gc_trace;
 pub mod generator;
@@ -141,6 +142,22 @@ static_assertions::assert_not_impl_any!(crate::runtime_cx::NativeCtx<'static>: S
 pub enum Value {
     /// JS `undefined`.
     Undefined,
+    /// Internal "array hole" sentinel used by sparse arrays.
+    ///
+    /// Distinguishes a missing dense slot from an explicit
+    /// `undefined` element so `in`, `Object.keys`, and
+    /// `Array.prototype` callbacks (`forEach`, `map`, `filter`, …)
+    /// can skip absent indices per ECMA-262 §10.4.2 / §23.1.3.
+    /// User code never observes this variant: every public read
+    /// path (`array::get`, `array::get_named_property`,
+    /// JSON.stringify, etc.) maps it back to `Value::Undefined`.
+    /// Display / typeof / coercion behave like `Undefined` as a
+    /// defensive fallback in case an internal leak occurs.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array-exotic-objects>
+    /// - <https://tc39.es/ecma262/#sec-array.prototype.foreach>
+    Hole,
     /// JS `null`.
     Null,
     /// JS `true` / `false`.
@@ -336,6 +353,11 @@ pub struct ClassConstructorBody {
     /// `[[Prototype]]` chains to `C`'s static object so static
     /// inheritance just falls out of the existing prototype walker.
     pub statics: JsObject,
+}
+
+enum VmPropertyKey {
+    String(String),
+    Symbol(symbol::JsSymbol),
 }
 
 impl otter_gc::SafeTraceable for ClassConstructorBody {
@@ -588,6 +610,17 @@ pub fn alloc_iterator_state(
 /// [`BoundFunctionBody`].
 pub const BOUND_FUNCTION_BODY_TYPE_TAG: u8 = 0x1c;
 
+/// Own metadata-property state for bound function objects.
+#[derive(Debug, Clone)]
+pub(crate) enum BoundFunctionMetadataProperty {
+    /// The spec-created `name` / `length` property is still present.
+    Builtin,
+    /// The configurable own property was deleted.
+    Deleted,
+    /// The property was redefined through `Object.defineProperty`.
+    Overridden(object::PropertyDescriptor),
+}
+
 /// GC-allocated storage for `Value::BoundFunction`. Constructed by
 /// the `Op::BindFunction` opcode and consumed by every call dispatch
 /// path (`Op::Call`, `Op::CallWithThis`, `Op::CallMethodValue`).
@@ -603,7 +636,15 @@ pub struct BoundFunctionBody {
     /// Arguments prepended to the caller's argument list at every
     /// invocation. Stored inline up to four entries to keep the
     /// usual `f.bind(t, a, b)` shape off the heap.
-    pub bound_args: SmallVec<[Value; 4]>,
+    bound_args: SmallVec<[Value; 4]>,
+    /// Bound function builtin `name`, computed once by `bind`.
+    builtin_name: String,
+    /// Bound function builtin `length`, computed once by `bind`.
+    builtin_length: NumberValue,
+    /// Own `name` metadata property state.
+    name_property: BoundFunctionMetadataProperty,
+    /// Own `length` metadata property state.
+    length_property: BoundFunctionMetadataProperty,
 }
 
 impl otter_gc::SafeTraceable for BoundFunctionBody {
@@ -614,6 +655,28 @@ impl otter_gc::SafeTraceable for BoundFunctionBody {
         self.bound_this.trace_value_slots(visitor);
         for arg in &self.bound_args {
             arg.trace_value_slots(visitor);
+        }
+        trace_bound_metadata_property(&self.name_property, visitor);
+        trace_bound_metadata_property(&self.length_property, visitor);
+    }
+}
+
+fn trace_bound_metadata_property(
+    property: &BoundFunctionMetadataProperty,
+    visitor: &mut SlotVisitor<'_>,
+) {
+    let BoundFunctionMetadataProperty::Overridden(desc) = property else {
+        return;
+    };
+    match &desc.kind {
+        object::DescriptorKind::Data { value } => value.trace_value_slots(visitor),
+        object::DescriptorKind::Accessor { getter, setter } => {
+            if let Some(getter) = getter {
+                getter.trace_value_slots(visitor);
+            }
+            if let Some(setter) = setter {
+                setter.trace_value_slots(visitor);
+            }
         }
     }
 }
@@ -633,11 +696,36 @@ impl BoundFunction {
         bound_this: Value,
         bound_args: SmallVec<[Value; 4]>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
+        Self::new_with_metadata(
+            heap,
+            target,
+            bound_this,
+            bound_args,
+            function_metadata::BoundFunctionCreateMetadata {
+                name: "bound ".to_string(),
+                length: NumberValue::from_i32(0),
+            },
+        )
+    }
+
+    /// Build a bound function with spec-computed `name` / `length`
+    /// metadata captured at bind time.
+    pub(crate) fn new_with_metadata(
+        heap: &mut otter_gc::GcHeap,
+        target: Value,
+        bound_this: Value,
+        bound_args: SmallVec<[Value; 4]>,
+        metadata: function_metadata::BoundFunctionCreateMetadata,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(BoundFunctionBody {
                 target,
                 bound_this,
                 bound_args,
+                builtin_name: metadata.name,
+                builtin_length: metadata.length,
+                name_property: BoundFunctionMetadataProperty::Builtin,
+                length_property: BoundFunctionMetadataProperty::Builtin,
             })?,
         })
     }
@@ -915,7 +1003,7 @@ impl Value {
     #[must_use]
     pub fn display_string(&self) -> String {
         match self {
-            Value::Undefined => "undefined".to_string(),
+            Value::Undefined | Value::Hole => "undefined".to_string(),
             Value::Null => "null".to_string(),
             Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
             Value::Number(n) => n.to_display_string(),
@@ -965,7 +1053,7 @@ impl Value {
     #[must_use]
     pub fn to_boolean(&self) -> bool {
         match self {
-            Value::Undefined | Value::Null => false,
+            Value::Undefined | Value::Null | Value::Hole => false,
             Value::Boolean(b) => *b,
             Value::Number(n) => {
                 if n.is_nan() {
@@ -1079,7 +1167,7 @@ impl Value {
     #[must_use]
     pub fn typeof_string(&self) -> &'static str {
         match self {
-            Value::Undefined => "undefined",
+            Value::Undefined | Value::Hole => "undefined",
             Value::Null => "object",
             Value::Boolean(_) => "boolean",
             Value::Number(_) => "number",
@@ -1144,6 +1232,7 @@ impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Undefined, Value::Undefined) => true,
+            (Value::Hole, Value::Hole) => true,
             (Value::Null, Value::Null) => true,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Number(a), Value::Number(b)) => number::equals(*a, *b),
@@ -2061,6 +2150,193 @@ impl Interpreter {
         }
     }
 
+    fn coerce_vm_property_key(arg: Option<&Value>) -> Result<VmPropertyKey, VmError> {
+        match arg {
+            Some(Value::String(s)) => Ok(VmPropertyKey::String(s.to_lossy_string())),
+            Some(Value::Number(n)) => Ok(VmPropertyKey::String(n.to_display_string())),
+            Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(
+                (if *b { "true" } else { "false" }).to_string(),
+            )),
+            Some(Value::Null) => Ok(VmPropertyKey::String("null".to_string())),
+            Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined".to_string())),
+            Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(sym.clone())),
+            _ => Err(VmError::TypeMismatch),
+        }
+    }
+
+    fn function_user_bag(&mut self, function_id: u32) -> Result<JsObject, VmError> {
+        match self.function_user_props.get(&function_id).copied() {
+            Some(bag) => Ok(bag),
+            None => {
+                let bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                self.function_user_props.insert(function_id, bag);
+                Ok(bag)
+            }
+        }
+    }
+
+    pub(crate) fn try_function_object_static_call(
+        &mut self,
+        module: Option<&BytecodeModule>,
+        method: otter_bytecode::method_id::ObjectMethod,
+        args: &[Value],
+    ) -> Result<Option<Value>, VmError> {
+        use otter_bytecode::method_id::ObjectMethod as M;
+        let Some(target) = args.first().cloned() else {
+            return Ok(None);
+        };
+        let function_id = match &target {
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                Some(*function_id)
+            }
+            Value::BoundFunction(_) => None,
+            _ => return Ok(None),
+        };
+        match method {
+            M::DefineProperty => {
+                let key = Self::coerce_vm_property_key(args.get(1))?;
+                let desc_obj = match args.get(2) {
+                    Some(Value::Object(obj)) => *obj,
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                let descriptor = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
+                let ok = match (&target, function_id, key) {
+                    (_, Some(function_id), VmPropertyKey::String(key)) => {
+                        let bag = self.function_user_bag(function_id)?;
+                        crate::object::define_own_property(bag, &mut self.gc_heap, &key, descriptor)
+                    }
+                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
+                        let bag = self.function_user_bag(function_id)?;
+                        crate::object::define_own_symbol_property(
+                            bag,
+                            &mut self.gc_heap,
+                            &sym,
+                            descriptor,
+                        )
+                    }
+                    (Value::BoundFunction(bound), None, VmPropertyKey::String(key)) => {
+                        function_metadata::bound_define_own_property(
+                            bound,
+                            &mut self.gc_heap,
+                            &self.string_heap,
+                            &key,
+                            descriptor,
+                        )
+                    }
+                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
+                    _ => return Ok(None),
+                };
+                if !ok {
+                    return Err(VmError::TypeMismatch);
+                }
+                Ok(Some(target))
+            }
+            M::GetOwnPropertyDescriptor => {
+                let key = Self::coerce_vm_property_key(args.get(1))?;
+                let desc = match (&target, function_id, key) {
+                    (_, Some(function_id), VmPropertyKey::String(key)) => {
+                        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+                            && let Some(desc) =
+                                crate::object::get_own_descriptor(bag, &self.gc_heap, &key)
+                        {
+                            Some(desc)
+                        } else if let Some(module) = module
+                            && matches!(key.as_str(), "name" | "length")
+                        {
+                            let ctx = function_metadata::FunctionMetadataContext::new(
+                                module,
+                                &self.gc_heap,
+                                &self.string_heap,
+                                &self.function_user_props,
+                            );
+                            let value = function_metadata::ordinary_function_intrinsic_property(
+                                &ctx,
+                                function_id,
+                                &key,
+                            )?;
+                            Some(object::PropertyDescriptor::data(value, false, false, true))
+                        } else {
+                            None
+                        }
+                    }
+                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
+                        let Some(bag) = self.function_user_props.get(&function_id).copied() else {
+                            return Ok(Some(Value::Undefined));
+                        };
+                        crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, &sym)
+                    }
+                    (Value::BoundFunction(bound), None, VmPropertyKey::String(key)) => {
+                        function_metadata::bound_own_property_descriptor(
+                            bound,
+                            &self.gc_heap,
+                            &self.string_heap,
+                            &key,
+                        )?
+                    }
+                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => None,
+                    _ => return Ok(None),
+                };
+                match desc {
+                    Some(desc) => Ok(Some(Value::Object(object_statics::descriptor_to_object(
+                        &desc,
+                        &mut self.gc_heap,
+                    )?))),
+                    None => Ok(Some(Value::Undefined)),
+                }
+            }
+            M::HasOwn => {
+                let key = Self::coerce_vm_property_key(args.get(1))?;
+                let present = match (&target, function_id, key) {
+                    (_, Some(function_id), VmPropertyKey::String(key)) => {
+                        let user_present = self
+                            .function_user_props
+                            .get(&function_id)
+                            .copied()
+                            .map(|bag| {
+                                !matches!(
+                                    crate::object::lookup_own(bag, &self.gc_heap, &key),
+                                    object::PropertyLookup::Absent
+                                )
+                            })
+                            .unwrap_or(false);
+                        user_present || matches!(key.as_str(), "name" | "length")
+                    }
+                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => self
+                        .function_user_props
+                        .get(&function_id)
+                        .copied()
+                        .map(|bag| crate::object::has_own_symbol(bag, &self.gc_heap, &sym))
+                        .unwrap_or(false),
+                    (Value::BoundFunction(bound), None, VmPropertyKey::String(key)) => {
+                        function_metadata::bound_has_own_property(bound, &self.gc_heap, &key)
+                    }
+                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
+                    _ => return Ok(None),
+                };
+                Ok(Some(Value::Boolean(present)))
+            }
+            // §20.1.2 — only the methods above need the function-as-
+            // object fast path; everything else falls through to the
+            // ordinary object_statics dispatcher.
+            M::Assign
+            | M::Create
+            | M::DefineProperties
+            | M::Entries
+            | M::Freeze
+            | M::FromEntries
+            | M::GetOwnPropertyDescriptors
+            | M::GetOwnPropertyNames
+            | M::GetOwnPropertySymbols
+            | M::IsExtensible
+            | M::IsFrozen
+            | M::IsSealed
+            | M::Keys
+            | M::PreventExtensions
+            | M::Seal
+            | M::Values => Ok(None),
+        }
+    }
+
     /// Resolve a property read on a `Value::Function` /
     /// `Value::Closure`. Honours user-installed properties via the
     /// `function_user_props` side table, lazily allocates
@@ -2103,7 +2379,17 @@ impl Interpreter {
             return Ok(proto_value);
         }
         if name == "name" || name == "length" {
-            return function_intrinsic_property(module, function_id, name, &self.string_heap);
+            let ctx = function_metadata::FunctionMetadataContext::new(
+                module,
+                &self.gc_heap,
+                &self.string_heap,
+                &self.function_user_props,
+            );
+            return function_metadata::ordinary_function_intrinsic_property(
+                &ctx,
+                function_id,
+                name,
+            );
         }
         if let Some(value) = self
             .load_function_prototype_method(name)
@@ -3231,6 +3517,21 @@ impl Interpreter {
                     write_register(frame, dst, Value::Undefined)?;
                     frame.pc += 1;
                 }
+                Op::LoadHole => {
+                    // Compiler-emitted for elision elements in array
+                    // literals: `[1, , 3]`. The register holds the
+                    // internal `Value::Hole` sentinel just long
+                    // enough for the next `Op::NewArray` /
+                    // `Op::ArrayPush` to copy it into the array
+                    // body. Direct user reads (`r3` exposed via
+                    // anything other than the array body) never see
+                    // it because no opcode forwards a register value
+                    // to user code without going through
+                    // `array::get` or its hole-aware wrappers.
+                    let dst = register_operand(operands.first())?;
+                    write_register(frame, dst, Value::Hole)?;
+                    frame.pc += 1;
+                }
                 Op::Eval | Op::NewFunction => {
                     unreachable!("stack-modifying ops handled earlier in this loop")
                 }
@@ -3506,36 +3807,33 @@ impl Interpreter {
                             if name == "prototype" {
                                 Value::Object(c.prototype(&self.gc_heap))
                             } else {
-                                match crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, &name) {
+                                match crate::object::get(
+                                    c.statics(&self.gc_heap),
+                                    &self.gc_heap,
+                                    &name,
+                                ) {
                                     Some(v) => v,
                                     None if name == "name" || name == "length" => {
                                         // Fall back to the underlying
                                         // ctor's intrinsic property
                                         // when the user hasn't shadowed
                                         // it via a static field.
-                                        match &c.ctor(&self.gc_heap) {
-                                            Value::Function { function_id }
-                                            | Value::Closure { function_id, .. } => {
-                                                function_intrinsic_property(
-                                                    module,
-                                                    *function_id,
-                                                    &name,
-                                                    &self.string_heap,
-                                                )?
-                                            }
-                                            Value::NativeFunction(native) => {
-                                                if name == "name" {
-                                                    let s = JsString::from_str(
-                                                        native.name(&self.gc_heap),
+                                        let ctor = c.ctor(&self.gc_heap);
+                                        match &ctor {
+                                            Value::Function { .. }
+                                            | Value::Closure { .. }
+                                            | Value::NativeFunction(_)
+                                            | Value::BoundFunction(_) => {
+                                                let ctx =
+                                                    function_metadata::FunctionMetadataContext::new(
+                                                        module,
+                                                        &self.gc_heap,
                                                         &self.string_heap,
-                                                    )
-                                                    .map_err(|_| VmError::TypeMismatch)?;
-                                                    Value::String(s)
-                                                } else {
-                                                    Value::Number(NumberValue::from_i32(
-                                                        native.length(&self.gc_heap) as i32,
-                                                    ))
-                                                }
+                                                        &self.function_user_props,
+                                                    );
+                                                function_metadata::callable_intrinsic_property(
+                                                    &ctx, &ctor, &name,
+                                                )?
                                             }
                                             _ => Value::Undefined,
                                         }
@@ -3567,26 +3865,33 @@ impl Interpreter {
                             self.function_property_get(module, fid, &name)?
                         }
                         Value::NativeFunction(native) if name == "name" || name == "length" => {
-                            match native.own_property_descriptor(
+                            let ctx = function_metadata::FunctionMetadataContext::new(
+                                module,
                                 &self.gc_heap,
                                 &self.string_heap,
+                                &self.function_user_props,
+                            );
+                            function_metadata::callable_intrinsic_property(
+                                &ctx,
+                                &Value::NativeFunction(*native),
                                 &name,
-                            )? {
-                                Some(desc) => descriptor_value(&desc),
-                                None => Value::Undefined,
-                            }
+                            )?
                         }
                         Value::NativeFunction(_) => self
                             .load_function_prototype_method(&name)
                             .or_else(|| self.load_object_prototype_method(&name))
                             .unwrap_or(Value::Undefined),
                         Value::BoundFunction(bound) if name == "name" || name == "length" => {
-                            bound_function_intrinsic_property(
+                            let ctx = function_metadata::FunctionMetadataContext::new(
                                 module,
-                                bound,
-                                &name,
-                                &self.string_heap,
                                 &self.gc_heap,
+                                &self.string_heap,
+                                &self.function_user_props,
+                            );
+                            function_metadata::callable_intrinsic_property(
+                                &ctx,
+                                &Value::BoundFunction(*bound),
+                                &name,
                             )?
                         }
                         Value::BoundFunction(_) => self
@@ -3685,7 +3990,12 @@ impl Interpreter {
                                         false,
                                         true,
                                     );
-                                    if !native.define_own_property(&mut self.gc_heap, &name, desc) {
+                                    if !native.define_own_property(
+                                        &mut self.gc_heap,
+                                        &self.string_heap,
+                                        &name,
+                                        desc,
+                                    ) {
                                         return Err(VmError::TypeError {
                                             message: format!(
                                                 "Cannot define property '{name}' on function {}",
@@ -3720,6 +4030,13 @@ impl Interpreter {
                         Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, &name),
                         Value::NativeFunction(native) => {
                             native.delete_own_property(&mut self.gc_heap, &name)
+                        }
+                        Value::BoundFunction(bound) => {
+                            function_metadata::bound_delete_own_property(
+                                bound,
+                                &mut self.gc_heap,
+                                &name,
+                            )
                         }
                         other => {
                             return Err(VmError::TypeError {
@@ -3943,7 +4260,12 @@ impl Interpreter {
                                         false,
                                         true,
                                     );
-                                    if !native.define_own_property(&mut self.gc_heap, &key, desc) {
+                                    if !native.define_own_property(
+                                        &mut self.gc_heap,
+                                        &self.string_heap,
+                                        &key,
+                                        desc,
+                                    ) {
                                         return Err(VmError::TypeError {
                                             message: format!(
                                                 "Cannot define property '{key}' on function {}",
@@ -4018,7 +4340,11 @@ impl Interpreter {
                         // §13.10.2 — for class values, walk the
                         // proto chain against `class.prototype(&self.gc_heap)`.
                         (Value::Object(a), Value::ClassConstructor(c)) => {
-                            crate::object::has_in_proto_chain(*a, &self.gc_heap, c.prototype(&self.gc_heap))
+                            crate::object::has_in_proto_chain(
+                                *a,
+                                &self.gc_heap,
+                                c.prototype(&self.gc_heap),
+                            )
                         }
                         _ => false,
                     };
@@ -4062,13 +4388,15 @@ impl Interpreter {
                         },
                         Value::Array(arr) => match &lhs {
                             // §10.4.2 ArrayExoticObject: indexed
-                            // properties are present iff index is
-                            // in `[0, len)`. The string `"length"`
-                            // is also always present.
+                            // properties are present iff a value (not
+                            // a hole) occupies the slot. The string
+                            // `"length"` is always present.
                             Value::Number(n) => match n.as_smi() {
-                                Some(i) if i >= 0 => {
-                                    (i as usize) < crate::array::len(*arr, &self.gc_heap)
-                                }
+                                Some(i) if i >= 0 => crate::array::has_own_element(
+                                    *arr,
+                                    &self.gc_heap,
+                                    i as usize,
+                                ),
                                 _ => false,
                             },
                             Value::String(s) => {
@@ -4076,7 +4404,7 @@ impl Interpreter {
                                 if key == "length" {
                                     true
                                 } else if let Ok(i) = key.parse::<usize>() {
-                                    i < crate::array::len(*arr, &self.gc_heap)
+                                    crate::array::has_own_element(*arr, &self.gc_heap, i)
                                 } else {
                                     false
                                 }
@@ -4222,6 +4550,7 @@ impl Interpreter {
                         // §7.1.4 step 4.
                         Value::Symbol(_) => return Err(VmError::TypeMismatch),
                         Value::Undefined
+                        | Value::Hole
                         | Value::Function { .. }
                         | Value::Closure { .. }
                         | Value::BoundFunction(_)
@@ -4406,35 +4735,37 @@ impl Interpreter {
                 }
                 Op::MathCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::MathMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = math::call(&name, &args).map_err(math_to_vm_error)?;
+                    let result = math::call(method, &args).map_err(math_to_vm_error)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
                 Op::JsonCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::JsonMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = json::call(&name, &args, &self.string_heap, &mut self.gc_heap)
+                    let result = json::call(method, &args, &self.string_heap, &mut self.gc_heap)
                         .map_err(json_to_vm_error)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
@@ -4443,18 +4774,19 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-string-constructor>
                 Op::StringCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::StringMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = string_dispatch::call(&name, &args, &self.string_heap)?;
+                    let result = string_dispatch::call(method, &args, &self.string_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4462,18 +4794,19 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-date-objects>
                 Op::DateCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::DateMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = date::dispatch::call(&name, &args)?;
+                    let result = date::dispatch::call(method, &args)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4481,18 +4814,19 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-bigint-constructor>
                 Op::BigIntCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::BigIntMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = bigint::dispatch::call(&name, &args)?;
+                    let result = bigint::dispatch::call(method, &args)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4500,18 +4834,20 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
                 Op::ArrayBufferCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method =
+                        otter_bytecode::method_id::ArrayBufferMethod::from_u32(method_idx)
+                            .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = binary::dispatch::array_buffer_call(&name, &args, &self.gc_heap)?;
+                    let result = binary::dispatch::array_buffer_call(method, &args, &self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4519,18 +4855,19 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-dataview-constructor>
                 Op::DataViewCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::DataViewMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = binary::dispatch::data_view_call(&name, &args)?;
+                    let result = binary::dispatch::data_view_call(method, &args)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4539,22 +4876,22 @@ impl Interpreter {
                 Op::TypedArrayCall => {
                     let dst = register_operand(operands.first())?;
                     let kind_idx = const_operand(operands.get(1))?;
-                    let name_idx = const_operand(operands.get(2))?;
+                    let method_idx = const_operand(operands.get(2))?;
                     let argc = match operands.get(3) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let kind_name = lookup_string_constant(module, kind_idx)?;
-                    let kind = binary::TypedArrayKind::from_name(&kind_name)
-                        .ok_or(VmError::TypeMismatch)?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let kind = binary::TypedArrayKind::from_u32(kind_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let method = otter_bytecode::method_id::TypedArrayMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(4 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
                     let result =
-                        binary::dispatch::typed_array_call(kind, &name, &args, &self.gc_heap)?;
+                        binary::dispatch::typed_array_call(kind, method, &args, &self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4563,18 +4900,19 @@ impl Interpreter {
                 // <https://tc39.es/proposal-iterator-helpers/>
                 Op::IteratorCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::IteratorMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = iterator_static_call(&name, &args, &mut self.gc_heap)?;
+                    let result = iterator_static_call(method, &args, &mut self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4582,19 +4920,21 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
                 Op::SharedArrayBufferCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method =
+                        otter_bytecode::method_id::SharedArrayBufferMethod::from_u32(method_idx)
+                            .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
                     let result =
-                        binary::dispatch::shared_array_buffer_call(&name, &args, &self.gc_heap)?;
+                        binary::dispatch::shared_array_buffer_call(method, &args, &self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4602,12 +4942,13 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-atomics-object>
                 Op::AtomicsCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::AtomicsMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
@@ -4615,7 +4956,7 @@ impl Interpreter {
                     }
                     let result = {
                         let string_heap = self.string_heap.clone();
-                        atomics::call(&name, &args, &string_heap, &mut self.gc_heap)?
+                        atomics::call(method, &args, &string_heap, &mut self.gc_heap)?
                     };
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
@@ -4625,18 +4966,19 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-proxy-constructor>
                 Op::ProxyCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::ProxyMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = proxy_static_call(&name, &args, &mut self.gc_heap)?;
+                    let result = proxy_static_call(method, &args, &mut self.gc_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4645,12 +4987,13 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-reflect-object>
                 Op::ReflectCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::ReflectMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
@@ -4661,33 +5004,32 @@ impl Interpreter {
                     let pc = stack[top_idx].pc;
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let heap = self.string_heap.clone();
-                    let result = reflect::call(self, module, &name, &args, &heap)?;
+                    let result = reflect::call(self, module, method, &args, &heap)?;
                     write_register(&mut stack[top_idx], dst, result)?;
                     continue;
                 }
-                // §23.1.2 Array static dispatch. Routes
-                // `Array.from` / `Array.of` through one entry point.
-                // <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
-                Op::ArrayCall => {
+                // §23.1.1 / §23.1.2 — typed Array static dispatch.
+                // No string indirection: each shape has its own
+                // opcode with `dst, argc, args...` operands.
+                Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
+                    let argc = match operands.get(1) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
+                        let r = register_operand(operands.get(2 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    // Callback-driven `Array.from(iter, mapFn)` would
-                    // need the interpreter; the foundation slice
-                    // routes the no-callback shape through
-                    // `array_statics::call`. With a callback we
-                    // dispatch on the surrounding stack instead —
-                    // filed as a follow-up.
-                    let result = array_statics::call(&name, &args, &mut self.gc_heap)?;
+                    let result = match op {
+                        Op::ArrayConstruct => {
+                            array_statics::construct(&args, &mut self.gc_heap)?
+                        }
+                        Op::ArrayFrom => array_statics::from(&args, &mut self.gc_heap)?,
+                        Op::ArrayOf => array_statics::of(&args, &mut self.gc_heap)?,
+                        _ => unreachable!("outer match guarantees Array static op"),
+                    };
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4698,19 +5040,28 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
                 Op::ObjectCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::ObjectMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
                     let result =
-                        object_statics::call(&name, &args, &self.string_heap, &mut self.gc_heap)?;
+                        match self.try_function_object_static_call(Some(module), method, &args)? {
+                            Some(result) => result,
+                            None => object_statics::call(
+                                method,
+                                &args,
+                                &self.string_heap,
+                                &mut self.gc_heap,
+                            )?,
+                        };
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4770,14 +5121,15 @@ impl Interpreter {
                     )?;
                 }
                 Op::PromiseCall => {
-                    // Operands: dst, name_const, argc, args...
+                    // Operands: dst, method_id, argc, args...
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::PromiseMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
@@ -4785,7 +5137,7 @@ impl Interpreter {
                     }
                     let argv: Vec<Value> = args.into_iter().collect();
                     frame.pc += 1;
-                    let result = promise_dispatch::statics_call(self, &name, &argv)
+                    let result = promise_dispatch::statics_call(self, method, &argv)
                         .map_err(native_to_vm_error)?;
                     let top_idx = stack.len() - 1;
                     write_register(&mut stack[top_idx], dst, result)?;
@@ -4861,18 +5213,19 @@ impl Interpreter {
                     // §19.2 global functions — parseInt / parseFloat /
                     // isNaN / isFinite / encodeURI* / decodeURI*.
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::GlobalMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
-                    let result = global_functions::call(&name, &args, &self.string_heap)?;
+                    let result = global_functions::call(method, &args, &self.string_heap)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -4995,8 +5348,21 @@ impl Interpreter {
                         let r = register_operand(operands.get(4 + i))?;
                         bound_args.push(read_register(frame, r)?.clone());
                     }
-                    let bound =
-                        BoundFunction::new(&mut self.gc_heap, target, bound_this, bound_args)?;
+                    let ctx = function_metadata::FunctionMetadataContext::new(
+                        module,
+                        &self.gc_heap,
+                        &self.string_heap,
+                        &self.function_user_props,
+                    );
+                    let metadata =
+                        function_metadata::bound_create_metadata(&ctx, &target, bound_args.len())?;
+                    let bound = BoundFunction::new_with_metadata(
+                        &mut self.gc_heap,
+                        target,
+                        bound_this,
+                        bound_args,
+                        metadata,
+                    )?;
                     write_register(frame, dst, Value::BoundFunction(bound))?;
                     frame.pc += 1;
                 }
@@ -5093,19 +5459,20 @@ impl Interpreter {
                 }
                 Op::SymbolCall => {
                     let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
+                    let method_idx = const_operand(operands.get(1))?;
                     let argc = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let method = otter_bytecode::method_id::SymbolMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(3 + i))?;
                         args.push(read_register(frame, r)?.clone());
                     }
                     let result =
-                        symbol_dispatch::call(self, &name, &args).map_err(symbol_to_vm_error)?;
+                        symbol_dispatch::call(self, method, &args).map_err(symbol_to_vm_error)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -5142,6 +5509,13 @@ impl Interpreter {
                         },
                         (Value::NativeFunction(native), Value::String(s)) => {
                             native.delete_own_property(&mut self.gc_heap, &s.to_lossy_string())
+                        }
+                        (Value::BoundFunction(bound), Value::String(s)) => {
+                            function_metadata::bound_delete_own_property(
+                                bound,
+                                &mut self.gc_heap,
+                                &s.to_lossy_string(),
+                            )
                         }
                         _ => return Err(VmError::TypeMismatch),
                     };
@@ -5183,8 +5557,10 @@ impl Interpreter {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
                     };
-                    let class = lookup_string_constant(module, class_idx)?;
-                    let method = lookup_string_constant(module, method_idx)?;
+                    let class = otter_bytecode::method_id::TemporalClassId::from_u32(class_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let method = otter_bytecode::method_id::TemporalMethod::from_u32(method_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
                     for i in 0..argc {
                         let r = register_operand(operands.get(4 + i))?;
@@ -5193,8 +5569,8 @@ impl Interpreter {
                     let result = temporal::call_static(
                         &self.string_heap,
                         &self.gc_heap,
-                        &class,
-                        &method,
+                        class,
+                        method,
                         &args,
                     )
                     .map_err(temporal_to_vm_error)?;
@@ -6008,7 +6384,11 @@ impl Interpreter {
             let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let constructed = match result {
-                Value::Object(_) => result,
+                // Spec §10.1.13 step 5 — non-undefined "object-like"
+                // returns are honoured. Builtin constructors such as
+                // `Array` produce a `Value::Array` (still an object
+                // per ECMA-262), so the foundation also forwards it.
+                Value::Object(_) | Value::Array(_) => result,
                 _ => this_value,
             };
             let top_idx = stack.len() - 1;
@@ -6027,7 +6407,11 @@ impl Interpreter {
             let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let constructed = match result {
-                Value::Object(_) => result,
+                // Spec §10.1.13 step 5 — non-undefined "object-like"
+                // returns are honoured. Builtin constructors such as
+                // `Array` produce a `Value::Array` (still an object
+                // per ECMA-262), so the foundation also forwards it.
+                Value::Object(_) | Value::Array(_) => result,
                 _ => this_value,
             };
             let top_idx = stack.len() - 1;
@@ -6043,7 +6427,11 @@ impl Interpreter {
             let mut ctx = NativeCtx::new_with_call_info(self, call_info);
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let constructed = match result {
-                Value::Object(_) => result,
+                // Spec §10.1.13 step 5 — non-undefined "object-like"
+                // returns are honoured. Builtin constructors such as
+                // `Array` produce a `Value::Array` (still an object
+                // per ECMA-262), so the foundation also forwards it.
+                Value::Object(_) | Value::Array(_) => result,
                 _ => this_value,
             };
             let top_idx = stack.len() - 1;
@@ -6454,7 +6842,8 @@ impl Interpreter {
             Value::ClassConstructor(c) => Some(if name == "prototype" {
                 Value::Object(c.prototype(&self.gc_heap))
             } else {
-                crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, &name).unwrap_or(Value::Undefined)
+                crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, &name)
+                    .unwrap_or(Value::Undefined)
             }),
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties (e.g. `assert.sameValue = function(){}`)
@@ -6630,15 +7019,24 @@ impl Interpreter {
             "forEach" => {
                 let callee = require_callable(args.first())?;
                 for (i, value) in elements.into_iter().enumerate() {
+                    if matches!(value, Value::Hole) {
+                        continue;
+                    }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                 }
                 Value::Undefined
             }
             "map" => {
+                // §23.1.3.21: callback NOT invoked for holes; the
+                // result array preserves holes at the same indices.
                 let callee = require_callable(args.first())?;
                 let mut out: Vec<Value> = Vec::with_capacity(len);
                 for (i, value) in elements.into_iter().enumerate() {
+                    if matches!(value, Value::Hole) {
+                        out.push(Value::Hole);
+                        continue;
+                    }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     out.push(self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?);
                 }
@@ -6648,6 +7046,9 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut out: Vec<Value> = Vec::new();
                 for (i, value) in elements.into_iter().enumerate() {
+                    if matches!(value, Value::Hole) {
+                        continue;
+                    }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let kept =
                         self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
@@ -6658,6 +7059,9 @@ impl Interpreter {
                 Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
             }
             "reduce" | "reduceRight" => {
+                // §23.1.3.24 / §23.1.3.25: skip holes; if no
+                // initialValue and every slot is a hole, raise
+                // TypeError.
                 let callee = require_callable(args.first())?;
                 let has_init = args.len() >= 2;
                 let initial = if has_init {
@@ -6666,30 +7070,43 @@ impl Interpreter {
                     Value::Undefined
                 };
                 let reverse = name == "reduceRight";
-                if !has_init && elements.is_empty() {
-                    return Err(VmError::TypeMismatch);
-                }
-                let mut acc = if has_init {
-                    initial
-                } else if reverse {
-                    elements[len - 1].clone()
-                } else {
-                    elements[0].clone()
-                };
-                let start_idx = if has_init {
-                    if reverse {
+                let mut acc;
+                let start_idx: i64;
+                let step: i64 = if reverse { -1 } else { 1 };
+                if has_init {
+                    acc = initial;
+                    start_idx = if reverse {
                         len.saturating_sub(1) as i64
                     } else {
                         0
-                    }
-                } else if reverse {
-                    (len as i64) - 2
+                    };
                 } else {
-                    1
-                };
-                let step: i64 = if reverse { -1 } else { 1 };
+                    let mut seed_idx: Option<usize> = None;
+                    if reverse {
+                        for i in (0..len).rev() {
+                            if !matches!(elements[i], Value::Hole) {
+                                seed_idx = Some(i);
+                                break;
+                            }
+                        }
+                    } else {
+                        for (i, value) in elements.iter().enumerate() {
+                            if !matches!(value, Value::Hole) {
+                                seed_idx = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    let seed = seed_idx.ok_or(VmError::TypeMismatch)?;
+                    acc = elements[seed].clone();
+                    start_idx = seed as i64 + step;
+                }
                 let mut i = start_idx;
                 while i >= 0 && (i as usize) < len {
+                    if matches!(elements[i as usize], Value::Hole) {
+                        i += step;
+                        continue;
+                    }
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                     cb_args.push(acc.clone());
                     cb_args.push(elements[i as usize].clone());
@@ -6701,23 +7118,36 @@ impl Interpreter {
                 acc
             }
             "find" => {
+                // §23.1.3.10: holes are visited but produce
+                // `undefined` for the callback's element argument.
                 let callee = require_callable(args.first())?;
                 let mut found = Value::Undefined;
                 for (i, value) in elements.into_iter().enumerate() {
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let elem = if matches!(value, Value::Hole) {
+                        Value::Undefined
+                    } else {
+                        value
+                    };
+                    let cb_args = build_array_cb_args(&elem, i, &arr_value);
                     let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                     if hit.to_boolean() {
-                        found = crate::array::get(*arr, &self.gc_heap, i);
+                        found = elem;
                         break;
                     }
                 }
                 found
             }
             "findIndex" => {
+                // §23.1.3.11: same hole semantics as `find`.
                 let callee = require_callable(args.first())?;
                 let mut idx: i32 = -1;
                 for (i, value) in elements.into_iter().enumerate() {
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
+                    let elem = if matches!(value, Value::Hole) {
+                        Value::Undefined
+                    } else {
+                        value
+                    };
+                    let cb_args = build_array_cb_args(&elem, i, &arr_value);
                     let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                     if hit.to_boolean() {
                         idx = i as i32;
@@ -6727,9 +7157,13 @@ impl Interpreter {
                 Value::Number(NumberValue::from_i32(idx))
             }
             "every" => {
+                // §23.1.3.6: callback NOT invoked for holes.
                 let callee = require_callable(args.first())?;
                 let mut all = true;
                 for (i, value) in elements.into_iter().enumerate() {
+                    if matches!(value, Value::Hole) {
+                        continue;
+                    }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                     if !hit.to_boolean() {
@@ -6740,9 +7174,13 @@ impl Interpreter {
                 Value::Boolean(all)
             }
             "some" => {
+                // §23.1.3.27: callback NOT invoked for holes.
                 let callee = require_callable(args.first())?;
                 let mut any = false;
                 for (i, value) in elements.into_iter().enumerate() {
+                    if matches!(value, Value::Hole) {
+                        continue;
+                    }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
                     if hit.to_boolean() {
@@ -6753,9 +7191,15 @@ impl Interpreter {
                 Value::Boolean(any)
             }
             "flatMap" => {
+                // §23.1.3.12: callback NOT invoked for holes; the
+                // hole simply contributes nothing to the flattened
+                // result.
                 let callee = require_callable(args.first())?;
                 let mut out: Vec<Value> = Vec::with_capacity(len);
                 for (i, value) in elements.into_iter().enumerate() {
+                    if matches!(value, Value::Hole) {
+                        continue;
+                    }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let mapped =
                         self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
@@ -6771,15 +7215,24 @@ impl Interpreter {
                 Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
             }
             "sort" => {
+                // §23.1.3.30: SortIndexedProperties sorts only
+                // present elements; holes (and any explicit
+                // `undefined`s, but we keep those in the sort) are
+                // pushed to the end of the array.
                 let callee = require_callable(args.first())?;
-                // Snapshot, sort by user comparator, write back.
-                let mut buffer: Vec<Value> = elements;
-                // `sort_by` requires a closure that doesn't itself
-                // mutate the engine — we can't recurse the
-                // interpreter from inside `Ord::cmp`. Use a manual
-                // insertion sort over the snapshot to stay
-                // interpreter-friendly. O(n²) but matches the
-                // foundation's "correctness over speed" stance.
+                let mut buffer: Vec<Value> = Vec::with_capacity(elements.len());
+                let mut hole_count: usize = 0;
+                for v in elements {
+                    if matches!(v, Value::Hole) {
+                        hole_count += 1;
+                    } else {
+                        buffer.push(v);
+                    }
+                }
+                // Manual insertion sort over the present-elements
+                // snapshot — a closure-driven `sort_by` would have
+                // to call back into the interpreter from inside
+                // `Ord::cmp`. O(n²), correctness-first.
                 let n = buffer.len();
                 for i in 1..n {
                     let mut j = i;
@@ -6805,6 +7258,9 @@ impl Interpreter {
                     crate::array::with_elements_mut(*arr, &mut self.gc_heap, |elements| {
                         elements.clear();
                         elements.extend(buffer);
+                        for _ in 0..hole_count {
+                            elements.push(Value::Hole);
+                        }
                     });
                 }
                 arr_value.clone()
@@ -7535,15 +7991,34 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let receiver = iter.next().unwrap_or(Value::Undefined);
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let bound =
-                    BoundFunction::new(&mut self.gc_heap, this_value, receiver, bound_args)?;
+                let ctx = function_metadata::FunctionMetadataContext::new(
+                    module,
+                    &self.gc_heap,
+                    &self.string_heap,
+                    &self.function_user_props,
+                );
+                let metadata =
+                    function_metadata::bound_create_metadata(&ctx, &this_value, bound_args.len())?;
+                let bound = BoundFunction::new_with_metadata(
+                    &mut self.gc_heap,
+                    this_value,
+                    receiver,
+                    bound_args,
+                    metadata,
+                )?;
                 Ok(Value::BoundFunction(bound))
             }
             VmIntrinsicFunction::FunctionPrototypeToString => {
                 if !is_callable(&this_value) {
                     return Err(VmError::NotCallable);
                 }
-                let display = function_to_string(module, &this_value, &self.gc_heap);
+                let ctx = function_metadata::FunctionMetadataContext::new(
+                    module,
+                    &self.gc_heap,
+                    &self.string_heap,
+                    &self.function_user_props,
+                );
+                let display = function_metadata::callable_to_string(&ctx, &this_value);
                 let s = JsString::from_str(&display, &self.string_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
                 Ok(Value::String(s))
@@ -7594,8 +8069,21 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::Undefined);
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let bound =
-                    BoundFunction::new(&mut self.gc_heap, callee.clone(), this_value, bound_args)?;
+                let ctx = function_metadata::FunctionMetadataContext::new(
+                    module,
+                    &self.gc_heap,
+                    &self.string_heap,
+                    &self.function_user_props,
+                );
+                let metadata =
+                    function_metadata::bound_create_metadata(&ctx, callee, bound_args.len())?;
+                let bound = BoundFunction::new_with_metadata(
+                    &mut self.gc_heap,
+                    callee.clone(),
+                    this_value,
+                    bound_args,
+                    metadata,
+                )?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::BoundFunction(bound))?;
                 frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -7608,7 +8096,13 @@ impl Interpreter {
             // foundation defers source preservation to a follow-up.
             // <https://tc39.es/ecma262/#sec-function.prototype.tostring>
             "toString" => {
-                let display = function_to_string(module, callee, &self.gc_heap);
+                let ctx = function_metadata::FunctionMetadataContext::new(
+                    module,
+                    &self.gc_heap,
+                    &self.string_heap,
+                    &self.function_user_props,
+                );
+                let display = function_metadata::callable_to_string(&ctx, callee);
                 let s = JsString::from_str(&display, &self.string_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
                 let frame = &mut stack[top_idx];
@@ -8325,10 +8819,20 @@ impl Interpreter {
                 if matches!(&key, ComputedPropertyKey::String(key) if key == "prototype") {
                     let pc = stack[top_idx].pc;
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, Value::Object(class.prototype(&self.gc_heap)))?;
+                    write_register(
+                        &mut stack[top_idx],
+                        dst,
+                        Value::Object(class.prototype(&self.gc_heap)),
+                    )?;
                     return Ok(true);
                 }
                 class.statics(&self.gc_heap)
+            }
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let Some(bag) = self.function_user_props.get(function_id).copied() else {
+                    return Ok(false);
+                };
+                bag
             }
             _ => return Ok(false),
         };
@@ -8487,6 +8991,9 @@ impl Interpreter {
         let obj = match &receiver {
             Value::Object(obj) => *obj,
             Value::ClassConstructor(class) => class.statics(&self.gc_heap),
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                self.function_user_bag(*function_id)?
+            }
             _ => return Ok(false),
         };
         let outcome = match &key {
@@ -9514,115 +10021,6 @@ fn render_thrown_value(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
     value.display_string()
 }
 
-/// §20.2.3.5 — render a callable as a string. Foundation returns
-/// the canonical placeholder `function <name>() { [native code] }`
-/// for every callable shape; source-faithful output is filed.
-fn function_to_string(
-    module: &BytecodeModule,
-    callee: &Value,
-    gc_heap: &otter_gc::GcHeap,
-) -> String {
-    let display = match callee {
-        Value::Function { function_id } | Value::Closure { function_id, .. } => module
-            .functions
-            .get(*function_id as usize)
-            .map(|f| f.name.as_str())
-            .unwrap_or("anonymous"),
-        Value::NativeFunction(n) => n.name(gc_heap),
-        Value::ClassConstructor(c) => match c.ctor(gc_heap) {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => module
-                .functions
-                .get(function_id as usize)
-                .map(|f| f.name.as_str())
-                .unwrap_or("anonymous"),
-            _ => "anonymous",
-        },
-        Value::BoundFunction(_) => "bound",
-        _ => "anonymous",
-    };
-    format!("function {display}() {{ [native code] }}")
-}
-
-/// §20.2.4 — read `name` or `length` off a function record. `name`
-/// returns the recorded display name (`<anonymous>` for unnamed
-/// expressions); `length` returns `param_count` minus the rest
-/// parameter (excluded per spec §10.2.4).
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-function-instances-name>
-/// - <https://tc39.es/ecma262/#sec-function-instances-length>
-fn function_intrinsic_property(
-    module: &BytecodeModule,
-    function_id: u32,
-    name: &str,
-    heap: &StringHeap,
-) -> Result<Value, VmError> {
-    let function = module
-        .functions
-        .get(function_id as usize)
-        .ok_or(VmError::InvalidOperand)?;
-    Ok(match name {
-        "name" => {
-            let display = function.name.as_str();
-            // Synthetic class names like "<anonymous>" / "<class>"
-            // round-trip as their literal text — matching V8's
-            // `(function () {}).name === ""` behaviour requires
-            // empty-string canonicalisation, which is filed.
-            let s = JsString::from_str(display, heap).map_err(|_| VmError::TypeMismatch)?;
-            Value::String(s)
-        }
-        "length" => {
-            // `param_count` already excludes the rest parameter
-            // (it lives separately in `Function::has_rest`), so it
-            // matches §10.2.4 ExpectedArgumentCount directly.
-            // Default-valued parameters would also reduce the
-            // count; the foundation tracks them as ordinary params
-            // for now — filed in the param-defaults follow-up.
-            Value::Number(NumberValue::from_i32(function.param_count as i32))
-        }
-        _ => Value::Undefined,
-    })
-}
-
-/// §20.2.3.2 — derive `.name` / `.length` for a bound function.
-/// The spec prepends `"bound "` to the target's name; foundation
-/// matches that. `length` is `target.length - bound_args.len()`,
-/// clamped at zero.
-fn bound_function_intrinsic_property(
-    module: &BytecodeModule,
-    bound: &BoundFunction,
-    name: &str,
-    heap: &StringHeap,
-    gc_heap: &otter_gc::GcHeap,
-) -> Result<Value, VmError> {
-    let (target, _, bound_args) = bound.parts(gc_heap);
-    let inner = match &target {
-        Value::Function { function_id } | Value::Closure { function_id, .. } => Some(
-            module
-                .functions
-                .get(*function_id as usize)
-                .ok_or(VmError::InvalidOperand)?,
-        ),
-        _ => None,
-    };
-    Ok(match name {
-        "name" => {
-            let inner_name = inner.map(|f| f.name.as_str()).unwrap_or("");
-            let s = JsString::from_str(&format!("bound {inner_name}"), heap)
-                .map_err(|_| VmError::TypeMismatch)?;
-            Value::String(s)
-        }
-        "length" => {
-            let raw = inner.map(|f| f.param_count as i32).unwrap_or(0);
-            let bound_count = bound_args.len() as i32;
-            Value::Number(NumberValue::from_i32(
-                raw.saturating_sub(bound_count).max(0),
-            ))
-        }
-        _ => Value::Undefined,
-    })
-}
-
 /// Resolve `specifier` against `referrer`, mirroring the WHATWG URL
 /// join semantics used by `import.meta.resolve`. Foundation handles:
 ///
@@ -9798,7 +10196,7 @@ fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {
 
 fn value_kind_name(value: &Value) -> &'static str {
     match value {
-        Value::Undefined => "undefined",
+        Value::Undefined | Value::Hole => "undefined",
         Value::Null => "null",
         Value::Boolean(_) => "boolean",
         Value::Number(_) => "number",
@@ -10078,21 +10476,21 @@ fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
     }
 }
 
-/// §28.2 Proxy static dispatcher. Empty name = `new Proxy(target,
-/// handler)`; `"revocable"` = `Proxy.revocable(target, handler)`.
+/// §28.2 Proxy static dispatcher via the typed [`ProxyMethod`].
 fn proxy_static_call(
-    name: &str,
+    method: otter_bytecode::method_id::ProxyMethod,
     args: &[Value],
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    match name {
+    use otter_bytecode::method_id::ProxyMethod as M;
+    match method {
         // §28.2.1.1 — `new Proxy(target, handler)`. Target may be
         // any object — including callables — wrapped here in a
         // synthetic JsObject that carries the original value as
         // `[[ProxyTarget]]`. Foundation simplification: use a
         // dedicated `__callable` slot when the target is a
         // function so the apply trap's fallback can re-invoke it.
-        "" => {
+        M::Construct => {
             let target = coerce_proxy_target(args.first())?;
             let handler = match args.get(1) {
                 Some(Value::Object(o)) => *o,
@@ -10102,7 +10500,7 @@ fn proxy_static_call(
         }
         // §28.2.2.1 — `Proxy.revocable(target, handler)` returns
         // `{proxy, revoke}`.
-        "revocable" => {
+        M::Revocable => {
             let target = coerce_proxy_target(args.first())?;
             let handler = match args.get(1) {
                 Some(Value::Object(o)) => *o,
@@ -10120,9 +10518,6 @@ fn proxy_static_call(
             crate::object::set(obj, gc_heap, "revoke", revoke);
             Ok(Value::Object(obj))
         }
-        other => Err(VmError::UnknownIntrinsic {
-            name: format!("Proxy.{other}"),
-        }),
     }
 }
 
@@ -10137,15 +10532,16 @@ fn proxy_static_call(
 /// # See also
 /// - <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
 fn iterator_static_call(
-    name: &str,
+    method: otter_bytecode::method_id::IteratorMethod,
     args: &[Value],
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    match name {
+    use otter_bytecode::method_id::IteratorMethod as M;
+    match method {
         // Reserved spec form — the constructor itself isn't
         // user-callable.
-        "" => Err(VmError::TypeMismatch),
-        "from" => {
+        M::Construct => Err(VmError::TypeMismatch),
+        M::From => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             let state = match value {
                 Value::Iterator(rc) => return Ok(Value::Iterator(rc)),
@@ -10188,9 +10584,6 @@ fn iterator_static_call(
             };
             Ok(Value::Iterator(alloc_iterator_state(gc_heap, state)?))
         }
-        other => Err(VmError::UnknownIntrinsic {
-            name: format!("Iterator.{other}"),
-        }),
     }
 }
 

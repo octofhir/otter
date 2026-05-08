@@ -154,39 +154,42 @@ impl From<ParseError> for JsonError {
     }
 }
 
-/// Dispatch a `JSON.<name>(args...)` call. Mirrors
-/// [`crate::math::call`]; see the receiver-type guards below.
+/// Dispatch a `JSON.<method>(args...)` call. Routes via the
+/// typed method id emitted by the compiler — no string-table
+/// indirection or per-call name match.
 pub fn call(
-    name: &str,
+    method: otter_bytecode::method_id::JsonMethod,
     args: &[Value],
     string_heap: &crate::string::StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, JsonError> {
-    match name {
-        "stringify" => json_stringify(args, string_heap, gc_heap),
-        "parse" => json_parse(args, string_heap, gc_heap),
-        _ => Err(JsonError::UnknownMember(name.to_string())),
+    use otter_bytecode::method_id::JsonMethod;
+    match method {
+        JsonMethod::Stringify => json_stringify(args, string_heap, gc_heap),
+        JsonMethod::Parse => json_parse(args, string_heap, gc_heap),
     }
 }
 
 fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_json_call(ctx, "parse", args)
+    native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Parse, args)
 }
 
 fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_json_call(ctx, "stringify", args)
+    native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Stringify, args)
 }
 
 fn native_json_call(
     ctx: &mut NativeCtx<'_>,
-    name: &'static str,
+    method: otter_bytecode::method_id::JsonMethod,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let interp = ctx.interp_mut();
     let string_heap = interp.string_heap.clone();
-    call(name, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
-        name,
-        reason: err.to_string(),
+    call(method, args, &string_heap, interp.gc_heap_mut()).map_err(|err| {
+        NativeError::TypeError {
+            name: method.name(),
+            reason: err.to_string(),
+        }
     })
 }
 

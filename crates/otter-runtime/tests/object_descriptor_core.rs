@@ -264,6 +264,81 @@ fn computed_class_static_getter_and_setter_use_class_receiver() {
 }
 
 #[test]
+fn native_function_non_configurable_metadata_rejects_redefinition() {
+    let mut rt = Runtime::builder().build().expect("runtime");
+    let err = rt
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                const thrower = Object.getOwnPropertyDescriptor(
+                    (function() { "use strict"; return arguments; })(),
+                    "callee"
+                ).get;
+                Object.defineProperty(thrower, "name", { value: "changed" });
+                "#,
+            ),
+            "<test>",
+        )
+        .expect_err("non-configurable native metadata should reject");
+    let message = err.to_string();
+    assert!(
+        message.contains("Cannot define property") || message.contains("TypeMismatch"),
+        "{message}"
+    );
+}
+
+#[test]
+fn user_function_define_property_uses_descriptor_bag() {
+    let completion = run(r#"
+        function f() {}
+        Object.defineProperty(f, "x", {
+            get: function() {
+                return this === f ? 23 : 0;
+            },
+            enumerable: true,
+            configurable: true,
+        });
+        const desc = Object.getOwnPropertyDescriptor(f, "x");
+        f.x + ":" + Object.hasOwn(f, "x") + ":" + desc.enumerable;
+        "#);
+    assert_eq!(completion, "23:true:true");
+}
+
+#[test]
+fn user_function_define_symbol_property_uses_descriptor_bag() {
+    let completion = run(r#"
+        function f() {}
+        const sym = Symbol("x");
+        Object.defineProperty(f, sym, {
+            value: 29,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
+        const desc = Object.getOwnPropertyDescriptor(f, sym);
+        f[sym] + ":" + Object.hasOwn(f, sym) + ":" + desc.enumerable;
+        "#);
+    assert_eq!(completion, "29:true:false");
+}
+
+#[test]
+fn extracted_object_define_property_routes_user_function_bag() {
+    let completion = run(r#"
+        function f() {}
+        const define = Object.defineProperty;
+        const hasOwn = Object.hasOwn;
+        define(f, "x", {
+            value: 31,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+        f.x + ":" + hasOwn(f, "x");
+        "#);
+    assert_eq!(completion, "31:true");
+}
+
+#[test]
 fn non_configurable_symbol_delete_returns_false() {
     let completion = run(r#"
         const o = {};

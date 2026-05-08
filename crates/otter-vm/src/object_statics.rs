@@ -119,12 +119,21 @@ const fn method(
 }
 
 fn native_call(
-    name: &'static str,
+    method: otter_bytecode::method_id::ObjectMethod,
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    if let Some(result) = ctx
+        .cx
+        .interp
+        .try_function_object_static_call(None, method, args)
+        .map_err(|err| object_native_error(method.name(), err))?
+    {
+        return Ok(result);
+    }
     let string_heap = ctx.cx.interp.string_heap_clone();
-    call(name, args, &string_heap, ctx.heap_mut()).map_err(|err| object_native_error(name, err))
+    call(method, args, &string_heap, ctx.heap_mut())
+        .map_err(|err| object_native_error(method.name(), err))
 }
 
 fn object_native_error(name: &'static str, err: VmError) -> NativeError {
@@ -135,38 +144,35 @@ fn object_native_error(name: &'static str, err: VmError) -> NativeError {
 }
 
 macro_rules! native_object_static {
-    ($fn_name:ident, $js_name:literal) => {
+    ($fn_name:ident, $variant:ident) => {
         fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            native_call($js_name, ctx, args)
+            native_call(otter_bytecode::method_id::ObjectMethod::$variant, ctx, args)
         }
     };
 }
 
-native_object_static!(native_create, "create");
-native_object_static!(native_define_property, "defineProperty");
-native_object_static!(native_define_properties, "defineProperties");
-native_object_static!(
-    native_get_own_property_descriptor,
-    "getOwnPropertyDescriptor"
-);
+native_object_static!(native_create, Create);
+native_object_static!(native_define_property, DefineProperty);
+native_object_static!(native_define_properties, DefineProperties);
+native_object_static!(native_get_own_property_descriptor, GetOwnPropertyDescriptor);
 native_object_static!(
     native_get_own_property_descriptors,
-    "getOwnPropertyDescriptors"
+    GetOwnPropertyDescriptors
 );
-native_object_static!(native_freeze, "freeze");
-native_object_static!(native_is_frozen, "isFrozen");
-native_object_static!(native_seal, "seal");
-native_object_static!(native_is_sealed, "isSealed");
-native_object_static!(native_prevent_extensions, "preventExtensions");
-native_object_static!(native_is_extensible, "isExtensible");
-native_object_static!(native_keys, "keys");
-native_object_static!(native_values, "values");
-native_object_static!(native_entries, "entries");
-native_object_static!(native_assign, "assign");
-native_object_static!(native_from_entries, "fromEntries");
-native_object_static!(native_has_own, "hasOwn");
-native_object_static!(native_get_own_property_names, "getOwnPropertyNames");
-native_object_static!(native_get_own_property_symbols, "getOwnPropertySymbols");
+native_object_static!(native_freeze, Freeze);
+native_object_static!(native_is_frozen, IsFrozen);
+native_object_static!(native_seal, Seal);
+native_object_static!(native_is_sealed, IsSealed);
+native_object_static!(native_prevent_extensions, PreventExtensions);
+native_object_static!(native_is_extensible, IsExtensible);
+native_object_static!(native_keys, Keys);
+native_object_static!(native_values, Values);
+native_object_static!(native_entries, Entries);
+native_object_static!(native_assign, Assign);
+native_object_static!(native_from_entries, FromEntries);
+native_object_static!(native_has_own, HasOwn);
+native_object_static!(native_get_own_property_names, GetOwnPropertyNames);
+native_object_static!(native_get_own_property_symbols, GetOwnPropertySymbols);
 
 fn native_prototype_has_own_property(
     ctx: &mut NativeCtx<'_>,
@@ -176,6 +182,7 @@ fn native_prototype_has_own_property(
         Value::Object(obj) => has_own_property(*obj, ctx.heap(), args.first())
             .map_err(|err| object_native_error("hasOwnProperty", err))?,
         Value::NativeFunction(native) => native_function_has_own(native, ctx.heap(), args.first()),
+        Value::BoundFunction(bound) => bound_function_has_own(bound, ctx.heap(), args.first()),
         Value::ClassConstructor(class) => {
             // The own-property surface for a `ClassConstructor` is
             // its `statics` object plus the spec-mandated
@@ -258,27 +265,41 @@ fn native_function_has_own(
     }
 }
 
-/// Single entry point for `Object.<name>(args...)` dispatch.
+fn bound_function_has_own(
+    bound: &crate::BoundFunction,
+    gc_heap: &otter_gc::GcHeap,
+    key: Option<&Value>,
+) -> bool {
+    match expect_property_key(key) {
+        Ok(PropertyKey::String(key)) => {
+            crate::function_metadata::bound_has_own_property(bound, gc_heap, &key)
+        }
+        Ok(PropertyKey::Symbol(_)) | Err(_) => false,
+    }
+}
+
+/// Single entry point for `Object.<method>(args...)` dispatch.
 ///
-/// Returns the call's completion value or surfaces a [`VmError`].
+/// Routes the typed [`ObjectMethod`] emitted by the compiler — no
+/// per-call name match.
 ///
 /// # Errors
-/// - [`VmError::UnknownIntrinsic`] when `name` is not recognised.
 /// - [`VmError::TypeMismatch`] when an argument has the wrong shape
 ///   (e.g., the receiver of `defineProperty` is not an Object).
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
 pub fn call(
-    name: &str,
+    method: otter_bytecode::method_id::ObjectMethod,
     args: &[Value],
     string_heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
-    match name {
+    use otter_bytecode::method_id::ObjectMethod as M;
+    match method {
         // §20.1.2.2 Object.create(O, Properties)
         // <https://tc39.es/ecma262/#sec-object.create>
-        "create" => {
+        M::Create => {
             let proto = args.first().cloned().unwrap_or(Value::Undefined);
             let proto_obj = match proto {
                 Value::Object(o) => Some(o),
@@ -315,7 +336,7 @@ pub fn call(
         }
         // §20.1.2.4 Object.defineProperty(O, P, Attributes)
         // <https://tc39.es/ecma262/#sec-object.defineproperty>
-        "defineProperty" => {
+        M::DefineProperty => {
             let key = expect_property_key(args.get(1))?;
             let desc_obj = expect_object(args.get(2))?;
             let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
@@ -368,7 +389,7 @@ pub fn call(
                             ),
                         });
                     };
-                    if !native.define_own_property(gc_heap, key, descriptor) {
+                    if !native.define_own_property(gc_heap, string_heap, key, descriptor) {
                         return Err(VmError::TypeError {
                             message: format!(
                                 "Cannot define property '{key}' on function {}",
@@ -385,7 +406,7 @@ pub fn call(
         }
         // §20.1.2.5 Object.defineProperties(O, Properties)
         // <https://tc39.es/ecma262/#sec-object.defineproperties>
-        "defineProperties" => {
+        M::DefineProperties => {
             let target = expect_object(args.first())?;
             let props = expect_object(args.get(1))?;
             // Walk enumerable own keys of `props`. Each value is a
@@ -410,7 +431,7 @@ pub fn call(
         }
         // §20.1.2.10 Object.getOwnPropertyDescriptor(O, P)
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptor>
-        "getOwnPropertyDescriptor" => {
+        M::GetOwnPropertyDescriptor => {
             let key = expect_property_key(args.get(1))?;
             match args.first() {
                 Some(Value::Object(target)) => match &key {
@@ -429,14 +450,21 @@ pub fn call(
                 },
                 Some(Value::ClassConstructor(class)) => match &key {
                     PropertyKey::String(key) => {
-                        match crate::object::get_own_descriptor(class.statics(gc_heap), gc_heap, key) {
+                        match crate::object::get_own_descriptor(
+                            class.statics(gc_heap),
+                            gc_heap,
+                            key,
+                        ) {
                             Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
                             None => Ok(Value::Undefined),
                         }
                     }
                     PropertyKey::Symbol(sym) => {
-                        match crate::object::get_own_symbol_descriptor(class.statics(gc_heap), gc_heap, sym)
-                        {
+                        match crate::object::get_own_symbol_descriptor(
+                            class.statics(gc_heap),
+                            gc_heap,
+                            sym,
+                        ) {
                             Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
                             None => Ok(Value::Undefined),
                         }
@@ -458,7 +486,7 @@ pub fn call(
         }
         // §20.1.2.11 Object.getOwnPropertyDescriptors(O)
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptors>
-        "getOwnPropertyDescriptors" => {
+        M::GetOwnPropertyDescriptors => {
             let target = expect_object(args.first())?;
             let result = crate::object::alloc_object(gc_heap)?;
             let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
@@ -487,7 +515,7 @@ pub fn call(
         }
         // §20.1.2.6 Object.freeze(O)
         // <https://tc39.es/ecma262/#sec-object.freeze>
-        "freeze" => {
+        M::Freeze => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             if let Value::Object(o) = &arg {
                 crate::object::freeze(*o, gc_heap);
@@ -497,7 +525,7 @@ pub fn call(
             Ok(arg)
         }
         // §20.1.2.20 Object.seal(O)
-        "seal" => {
+        M::Seal => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             if let Value::Object(o) = &arg {
                 crate::object::seal(*o, gc_heap);
@@ -505,7 +533,7 @@ pub fn call(
             Ok(arg)
         }
         // §20.1.2.18 Object.preventExtensions(O)
-        "preventExtensions" => {
+        M::PreventExtensions => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             if let Value::Object(o) = &arg {
                 crate::object::prevent_extensions(*o, gc_heap);
@@ -513,7 +541,7 @@ pub fn call(
             Ok(arg)
         }
         // §20.1.2.15 Object.isFrozen(O)
-        "isFrozen" => {
+        M::IsFrozen => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             // Per spec, `Object.isFrozen(non_object) === true`.
             let result = match arg {
@@ -523,7 +551,7 @@ pub fn call(
             Ok(Value::Boolean(result))
         }
         // §20.1.2.16 Object.isSealed(O)
-        "isSealed" => {
+        M::IsSealed => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             let result = match arg {
                 Value::Object(o) => crate::object::is_sealed(o, gc_heap),
@@ -532,7 +560,7 @@ pub fn call(
             Ok(Value::Boolean(result))
         }
         // §20.1.2.14 Object.isExtensible(O)
-        "isExtensible" => {
+        M::IsExtensible => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
             // Spec: `Object.isExtensible(non_object) === false`.
             let result = match arg {
@@ -543,7 +571,7 @@ pub fn call(
         }
         // §20.1.2.17 Object.keys(O) — enumerable own string keys.
         // <https://tc39.es/ecma262/#sec-object.keys>
-        "keys" => {
+        M::Keys => {
             let owned: Vec<String> = match args.first() {
                 Some(Value::Object(target)) => {
                     crate::object::with_properties(*target, gc_heap, |p| {
@@ -565,7 +593,7 @@ pub fn call(
         }
         // §20.1.2.22 Object.values(O) — enumerable own data values.
         // <https://tc39.es/ecma262/#sec-object.values>
-        "values" => {
+        M::Values => {
             let target = expect_object(args.first())?;
             let values: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.enumerable_data_iter().map(|(_, v)| v).collect()
@@ -575,7 +603,7 @@ pub fn call(
         // §20.1.2.5 Object.entries(O) — `[key, value]` pairs in
         // insertion order.
         // <https://tc39.es/ecma262/#sec-object.entries>
-        "entries" => {
+        M::Entries => {
             let target = expect_object(args.first())?;
             let raw: Vec<(String, Value)> = crate::object::with_properties(target, gc_heap, |p| {
                 p.enumerable_data_iter()
@@ -599,7 +627,7 @@ pub fn call(
         // Symbol-keyed properties + non-enumerable + accessor sources
         // are left to follow-ups.
         // <https://tc39.es/ecma262/#sec-object.assign>
-        "assign" => {
+        M::Assign => {
             let target = expect_object(args.first())?;
             for src in args.iter().skip(1) {
                 match src {
@@ -627,7 +655,7 @@ pub fn call(
         // `Value::Map`; arbitrary iterables route through the user
         // iterator protocol once it lands here too — filed.
         // <https://tc39.es/ecma262/#sec-object.fromentries>
-        "fromEntries" => {
+        M::FromEntries => {
             let iter = args.first().cloned().unwrap_or(Value::Undefined);
             let result = crate::object::alloc_object(gc_heap)?;
             match iter {
@@ -661,7 +689,7 @@ pub fn call(
         // §20.1.2.13 Object.hasOwn(O, P) — Stage 4 ergonomic
         // alternative to `Object.prototype.hasOwnProperty.call`.
         // <https://tc39.es/ecma262/#sec-object.hasown>
-        "hasOwn" => {
+        M::HasOwn => {
             let target = match args.first() {
                 Some(Value::Object(target)) => *target,
                 Some(Value::ClassConstructor(class)) => class.statics(gc_heap),
@@ -673,7 +701,7 @@ pub fn call(
         // §20.1.2.12 Object.getOwnPropertyNames(O) — every own
         // string-keyed property, regardless of enumerability.
         // <https://tc39.es/ecma262/#sec-object.getownpropertynames>
-        "getOwnPropertyNames" => {
+        M::GetOwnPropertyNames => {
             let owned: Vec<String> = match args.first() {
                 Some(Value::Object(target)) => {
                     crate::object::with_properties(*target, gc_heap, |p| {
@@ -685,6 +713,12 @@ pub fn call(
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
+                Some(Value::BoundFunction(bound)) => {
+                    crate::function_metadata::bound_own_property_keys(bound, gc_heap)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                }
                 Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
                 Some(Value::String(s)) => {
                     let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
@@ -704,16 +738,13 @@ pub fn call(
         // string-keyed today; symbol keys are tracked in a parallel
         // table inside JsObject.
         // <https://tc39.es/ecma262/#sec-object.getownpropertysymbols>
-        "getOwnPropertySymbols" => {
+        M::GetOwnPropertySymbols => {
             let target = expect_object(args.first())?;
             let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.symbol_keys().map(Value::Symbol).collect()
             });
             Ok(Value::Array(crate::array::from_elements(gc_heap, syms)?))
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("Object.{name}"),
-        }),
     }
 }
 
@@ -798,7 +829,7 @@ pub fn coerce_to_descriptor(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-frompropertydescriptor>
-fn descriptor_to_object(
+pub(crate) fn descriptor_to_object(
     desc: &PropertyDescriptor,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<JsObject, VmError> {

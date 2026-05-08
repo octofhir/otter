@@ -582,7 +582,6 @@ fn is_const_pool_ref(op: Op, pos: usize) -> bool {
         | Op::PromiseCall
         | Op::SymbolCall
         | Op::ObjectCall
-        | Op::ArrayCall
         | Op::GlobalCall
         | Op::BigIntCall
         | Op::DateCall

@@ -17,21 +17,25 @@ use crate::{Value, VmError};
 use num_bigint::{BigInt, Sign};
 use num_traits::Signed;
 
-/// Dispatch `BigInt(...)` / `BigInt.<name>(...)`. Empty `name`
-/// (sentinel from the compiler) selects the constructor form.
+/// Dispatch `BigInt(...)` ([`BigIntMethod::Construct`]) /
+/// `BigInt.<method>(...)`. Routes the typed [`BigIntMethod`]
+/// emitted by the compiler.
 ///
 /// # Errors
 /// - [`VmError::TypeMismatch`] for wrong-shape arguments.
-/// - [`VmError::UnknownIntrinsic`] when `name` isn't recognised.
-pub fn call(name: &str, args: &[Value]) -> Result<Value, VmError> {
-    match name {
+pub fn call(
+    method: otter_bytecode::method_id::BigIntMethod,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    use otter_bytecode::method_id::BigIntMethod as M;
+    match method {
         // §21.2.1 BigInt(value) — coerce `value` to a BigInt.
-        "" => {
+        M::Construct => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::BigInt(to_bigint(&value)?))
         }
         // §21.2.2.1 BigInt.asIntN(bits, value).
-        "asIntN" => {
+        M::AsIntN => {
             let bits = expect_bits(args.first())?;
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
             let n = to_bigint(&value)?;
@@ -41,7 +45,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, VmError> {
             ))))
         }
         // §21.2.2.2 BigInt.asUintN(bits, value).
-        "asUintN" => {
+        M::AsUintN => {
             let bits = expect_bits(args.first())?;
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
             let n = to_bigint(&value)?;
@@ -50,9 +54,6 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, VmError> {
                 n.as_inner(),
             ))))
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("BigInt.{name}"),
-        }),
     }
 }
 

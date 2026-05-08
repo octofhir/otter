@@ -12,20 +12,24 @@ use super::{JsDate, make_date};
 use crate::number::NumberValue;
 use crate::{Value, VmError};
 
-/// Dispatch `Date(...)` / `Date.<name>(...)`. Empty `name` selects
-/// the constructor.
+/// Dispatch `Date(...)` ([`DateMethod::Construct`]) /
+/// `Date.<method>(...)`. Routes the typed [`DateMethod`] emitted
+/// by the compiler.
 ///
 /// # Errors
 /// - [`VmError::TypeMismatch`] for malformed inputs.
-/// - [`VmError::UnknownIntrinsic`] for unknown method names.
-pub fn call(name: &str, args: &[Value]) -> Result<Value, VmError> {
-    match name {
+pub fn call(
+    method: otter_bytecode::method_id::DateMethod,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    use otter_bytecode::method_id::DateMethod as M;
+    match method {
         // §21.4.2 — `new Date(...)`. Forms:
         //   - 0 args: now.
         //   - 1 arg (string): parse via Date.parse.
         //   - 1 arg (number / Date): epoch ms.
         //   - 2+ args: (year, month, day?, hr?, min?, sec?, ms?).
-        "" => match args.len() {
+        M::Construct => match args.len() {
             0 => Ok(Value::Date(JsDate::now())),
             1 => match &args[0] {
                 Value::String(s) => Ok(Value::Date(JsDate::from_ms(parse_date(
@@ -49,9 +53,9 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, VmError> {
             }
         },
         // §21.4.3.1 Date.now() — current epoch ms as a Number.
-        "now" => Ok(Value::Number(NumberValue::from_f64(JsDate::now().time()))),
+        M::Now => Ok(Value::Number(NumberValue::from_f64(JsDate::now().time()))),
         // §21.4.3.2 Date.parse(str).
-        "parse" => {
+        M::Parse => {
             let s = match args.first() {
                 Some(Value::String(s)) => s.to_lossy_string(),
                 _ => return Ok(Value::Number(NumberValue::from_f64(f64::NAN))),
@@ -59,7 +63,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, VmError> {
             Ok(Value::Number(NumberValue::from_f64(parse_date(&s))))
         }
         // §21.4.3.4 Date.UTC(year, month, day?, …).
-        "UTC" => {
+        M::UTC => {
             if args.is_empty() {
                 return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
             }
@@ -74,9 +78,6 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, VmError> {
                 year, month, day, hours, minutes, seconds, ms,
             ))))
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("Date.{name}"),
-        }),
     }
 }
 

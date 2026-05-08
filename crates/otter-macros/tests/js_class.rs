@@ -50,22 +50,25 @@ fn js_class_generates_spec_shaped_class_constructor() {
         panic!("macro class should build a class constructor value");
     };
 
-    let Value::NativeFunction(ctor) = &class.ctor else {
+    let class_ctor = class.ctor(interp.gc_heap());
+    let Value::NativeFunction(ctor) = &class_ctor else {
         panic!("constructor should be native");
     };
     assert!(ctor.is_static_call(interp.gc_heap()));
     assert_eq!(ctor.length(interp.gc_heap()), 1);
 
+    let class_statics = class.statics(interp.gc_heap());
     let Value::NativeFunction(from) =
-        object::get(class.statics, interp.gc_heap(), "from").expect("from")
+        object::get(class_statics, interp.gc_heap(), "from").expect("from")
     else {
         panic!("static method should be native");
     };
     assert!(from.is_static_call(interp.gc_heap()));
     assert_eq!(from.length(interp.gc_heap()), 1);
 
+    let class_prototype = class.prototype(interp.gc_heap());
     let Value::NativeFunction(value_of) =
-        object::get(class.prototype, interp.gc_heap(), "valueOf").expect("valueOf")
+        object::get(class_prototype, interp.gc_heap(), "valueOf").expect("valueOf")
     else {
         panic!("prototype method should be native");
     };
@@ -73,11 +76,11 @@ fn js_class_generates_spec_shaped_class_constructor() {
     assert_eq!(value_of.length(interp.gc_heap()), 0);
 
     assert!(matches!(
-        object::get(class.prototype, interp.gc_heap(), "constructor"),
+        object::get(class_prototype, interp.gc_heap(), "constructor"),
         Some(Value::ClassConstructor(_))
     ));
 
-    let answer = object::get_own_descriptor(class.prototype, interp.gc_heap(), "answer")
+    let answer = object::get_own_descriptor(class_prototype, interp.gc_heap(), "answer")
         .expect("answer accessor");
     assert!(answer.is_accessor());
     assert!(!answer.enumerable());

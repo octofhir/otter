@@ -221,3 +221,71 @@ fn bound_function_metadata_has_configurable_descriptor_shape() {
         "1:false:false:true:bound target:true:true:false:length"
     );
 }
+
+#[test]
+fn bound_function_builtin_metadata_is_not_for_in_enumerable() {
+    let completion = run(r#"
+        function target(a) {}
+        const bound = target.bind(null);
+        let seen = "";
+        for (const key in bound) {
+            seen += key;
+        }
+        seen + ":" + Object.keys(bound).join(",") + ":" +
+            bound.propertyIsEnumerable("name");
+        "#);
+    assert_eq!(completion, "::false");
+}
+
+#[test]
+fn bound_function_overridden_metadata_enumerability_is_observable() {
+    let completion = run(r#"
+        function target(a) {}
+        const bound = target.bind(null);
+        Object.defineProperty(bound, "name", {
+            value: "visible",
+            enumerable: true,
+            configurable: true,
+        });
+        Object.defineProperty(bound, "length", {
+            value: 0,
+            enumerable: true,
+            configurable: true,
+        });
+        const keys = [];
+        for (const key in bound) {
+            keys.push(key);
+        }
+        keys.join(",") + ":" + Object.keys(bound).join(",") + ":" +
+            bound.propertyIsEnumerable("name");
+        "#);
+    assert_eq!(completion, "length,name:length,name:true");
+}
+
+#[test]
+fn ordinary_function_metadata_redefinition_preserves_builtin_configurable_shape() {
+    let completion = run(r#"
+        function target(a, b) {}
+        Object.defineProperty(target, "length", { value: undefined });
+        const first = Object.getOwnPropertyDescriptor(target, "length");
+        Object.defineProperty(target, "length", { value: null });
+        const second = Object.getOwnPropertyDescriptor(target, "length");
+        first.value + ":" + first.writable + ":" + first.enumerable + ":" +
+            first.configurable + ":" + second.value + ":" + target.bind(null, 1).length;
+        "#);
+    assert_eq!(completion, "undefined:false:false:true:null:0");
+}
+
+#[test]
+fn ordinary_function_metadata_delete_removes_virtual_own_property() {
+    let completion = run(r#"
+        function target(a, b) {}
+        const before = target.hasOwnProperty("length");
+        const deleted = delete target.length;
+        const after = target.hasOwnProperty("length");
+        const desc = Object.getOwnPropertyDescriptor(target, "length");
+        const bound = Function.prototype.bind.call(target, null, 1);
+        before + ":" + deleted + ":" + after + ":" + desc + ":" + bound.length;
+        "#);
+    assert_eq!(completion, "true:true:false:undefined:0");
+}

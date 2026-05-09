@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "json_scan"
 harness = false
+
+[[bench]]
+name = "string_search"
+harness = false

@@ -9,7 +9,7 @@
 //! # Contents
 //! - [`FunctionMetadataContext`] — read-only metadata lookup inputs.
 //! - [`callable_intrinsic_property`] — `f.name` / `f.length` value reads.
-//! - Bound-function own-property helpers for descriptor APIs.
+//! - Bound-function own-property helpers for descriptor and enumeration APIs.
 //!
 //! # Invariants
 //! - Bound-function `name` / `length` are own data properties:
@@ -25,7 +25,7 @@
 //! - <https://tc39.es/ecma262/#sec-setfunctionname>
 //! - <https://tc39.es/ecma262/#sec-setfunctionlength>
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use otter_bytecode::BytecodeModule;
 
@@ -40,6 +40,7 @@ pub(crate) struct FunctionMetadataContext<'a> {
     gc_heap: &'a otter_gc::GcHeap,
     string_heap: &'a StringHeap,
     function_user_props: &'a HashMap<u32, JsObject>,
+    function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
 }
 
 /// Builtin metadata captured when `Function.prototype.bind` creates a wrapper.
@@ -58,12 +59,14 @@ impl<'a> FunctionMetadataContext<'a> {
         gc_heap: &'a otter_gc::GcHeap,
         string_heap: &'a StringHeap,
         function_user_props: &'a HashMap<u32, JsObject>,
+        function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
     ) -> Self {
         Self {
             module,
             gc_heap,
             string_heap,
             function_user_props,
+            function_deleted_metadata,
         }
     }
 }
@@ -127,6 +130,38 @@ pub(crate) fn bound_own_property_keys(
             keys.push("name");
         }
         keys
+    })
+}
+
+/// Return enumerable own string property keys in built-in creation order.
+#[must_use]
+pub(crate) fn bound_enumerable_own_property_keys(
+    bound: &BoundFunction,
+    gc_heap: &otter_gc::GcHeap,
+) -> Vec<&'static str> {
+    gc_heap.read_payload(bound.inner, |body| {
+        let mut keys = Vec::new();
+        if bound_metadata_property_is_enumerable(&body.length_property, false) {
+            keys.push("length");
+        }
+        if bound_metadata_property_is_enumerable(&body.name_property, false) {
+            keys.push("name");
+        }
+        keys
+    })
+}
+
+/// Test whether a bound function own metadata property is enumerable.
+#[must_use]
+pub(crate) fn bound_own_property_is_enumerable(
+    bound: &BoundFunction,
+    gc_heap: &otter_gc::GcHeap,
+    key: &str,
+) -> bool {
+    gc_heap.read_payload(bound.inner, |body| match key {
+        "name" => bound_metadata_property_is_enumerable(&body.name_property, false),
+        "length" => bound_metadata_property_is_enumerable(&body.length_property, false),
+        _ => false,
     })
 }
 
@@ -254,6 +289,9 @@ fn callable_name(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<St
                     _ => String::new(),
                 });
             }
+            if ordinary_function_metadata_deleted(ctx, *function_id, "name") {
+                return Ok(String::new());
+            }
             let function = ctx
                 .module
                 .functions
@@ -293,6 +331,9 @@ fn callable_length(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<
                     _ => 0.0,
                 });
             }
+            if ordinary_function_metadata_deleted(ctx, *function_id, "length") {
+                return Ok(0.0);
+            }
             let function = ctx
                 .module
                 .functions
@@ -328,8 +369,30 @@ fn ordinary_function_user_property(
     function_id: u32,
     key: &str,
 ) -> Option<Value> {
+    if ordinary_function_metadata_deleted(ctx, function_id, key) {
+        return None;
+    }
     let bag = ctx.function_user_props.get(&function_id).copied()?;
     object::get_own(bag, ctx.gc_heap, key)
+}
+
+fn ordinary_function_metadata_deleted(
+    ctx: &FunctionMetadataContext<'_>,
+    function_id: u32,
+    key: &str,
+) -> bool {
+    let Some(key) = ordinary_function_metadata_key(key) else {
+        return false;
+    };
+    ctx.function_deleted_metadata.contains(&(function_id, key))
+}
+
+pub(crate) fn ordinary_function_metadata_key(key: &str) -> Option<&'static str> {
+    match key {
+        "name" => Some("name"),
+        "length" => Some("length"),
+        _ => None,
+    }
 }
 
 fn bound_builtin_descriptor(
@@ -349,6 +412,17 @@ fn descriptor_value(desc: &PropertyDescriptor) -> Value {
     match &desc.kind {
         DescriptorKind::Data { value } => value.clone(),
         DescriptorKind::Accessor { .. } => Value::Undefined,
+    }
+}
+
+fn bound_metadata_property_is_enumerable(
+    property: &BoundFunctionMetadataProperty,
+    builtin_default: bool,
+) -> bool {
+    match property {
+        BoundFunctionMetadataProperty::Builtin => builtin_default,
+        BoundFunctionMetadataProperty::Deleted => false,
+        BoundFunctionMetadataProperty::Overridden(desc) => desc.flags.enumerable(),
     }
 }
 

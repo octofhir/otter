@@ -220,6 +220,10 @@ fn apply_substitution(template: &[u16], text_units: &[u16], m: &regress::Match) 
 /// First-occurrence search for `needle` inside `haystack` starting
 /// at code-unit offset `from`. Used by methods that materialise
 /// flat code-unit buffers (`replace`, `split`).
+///
+/// SWAR-assisted: the candidate scan for the needle's first code
+/// unit goes through [`crate::swar::find_u16`] (4 lanes per
+/// `u64`); the verify step is a single slice equality.
 fn find_substr(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from.min(haystack.len()));
@@ -228,12 +232,16 @@ fn find_substr(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
         return None;
     }
     let last_start = haystack.len() - needle.len();
-    let mut i = from;
-    while i <= last_start {
-        if haystack[i..i + needle.len()] == needle[..] {
+    let first = needle[0];
+    let n_len = needle.len();
+    let mut search_start = from;
+    while search_start <= last_start {
+        let rel = crate::swar::find_u16(&haystack[search_start..=last_start], first, 0)?;
+        let i = search_start + rel;
+        if haystack[i..i + n_len] == *needle {
             return Some(i);
         }
-        i += 1;
+        search_start = i + 1;
     }
     None
 }
@@ -1040,24 +1048,23 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
 
 /// §22.1.3.10 String.prototype.lastIndexOf(search, fromIndex?).
 fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = match args.receiver {
-        Value::String(s) => s.to_lossy_string(),
-        _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
+    let recv = receiver_string(args)?;
+    let needle = arg_string(args, 0)?;
+    // ECMA-262 §22.1.3.11: `position` defaults to +∞, then
+    // ToInteger, then min(pos, len). NaN clamps to 0. Foundation
+    // takes the simpler accessor and clamps to `recv.len()`.
+    let position = arg_u32_or(args, 1, recv.len())?.min(recv.len());
+    let pos = recv
+        .last_index_of(needle, position, None)
+        .map_err(|Interrupted| IntrinsicError::BadArgument {
+            index: 0,
+            reason: "interrupted",
+        })?;
+    let value = match pos {
+        Some(p) => NumberValue::from_i32(p as i32),
+        None => NumberValue::from_i32(-1),
     };
-    let needle = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(),
-        Some(other) => other.display_string(),
-        None => "undefined".to_string(),
-    };
-    if needle.is_empty() {
-        return Ok(Value::Number(crate::number::NumberValue::from_i32(
-            recv.chars().count() as i32,
-        )));
-    }
-    // Search from end. ECMA-262 walks code-unit positions; the
-    // foundation slice approximates with byte indices.
-    let idx = recv.rfind(&needle).map_or(-1, |b| b as i32);
-    Ok(Value::Number(crate::number::NumberValue::from_i32(idx)))
+    Ok(Value::Number(value))
 }
 
 /// §22.1.3.12 String.prototype.localeCompare. Foundation falls

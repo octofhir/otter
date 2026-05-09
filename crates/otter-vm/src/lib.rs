@@ -67,6 +67,7 @@ pub mod runtime_state;
 pub mod string;
 pub mod string_dispatch;
 pub mod string_prototype;
+pub mod swar;
 pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
@@ -2014,6 +2015,11 @@ pub struct Interpreter {
     /// underlying function so writes through any closure handle
     /// land on the same place.
     function_user_props: std::collections::HashMap<u32, JsObject>,
+    /// Deleted virtual `name` / `length` own properties for ordinary
+    /// bytecode functions. Stored separately from the user bag so
+    /// deleting built-in function metadata does not resurrect the
+    /// intrinsic fallback on later reads.
+    function_deleted_metadata: std::collections::HashSet<(u32, &'static str)>,
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].
@@ -2102,6 +2108,7 @@ impl Interpreter {
             eval_hook: None,
             pending_generator_throw: None,
             function_user_props: std::collections::HashMap::new(),
+            function_deleted_metadata: std::collections::HashSet::new(),
             console_sink: console::default_console_sink(),
         }
     }
@@ -2175,6 +2182,113 @@ impl Interpreter {
         }
     }
 
+    fn ordinary_function_own_property_descriptor(
+        &self,
+        module: Option<&BytecodeModule>,
+        function_id: u32,
+        key: &str,
+    ) -> Result<Option<object::PropertyDescriptor>, VmError> {
+        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+            && let Some(desc) = crate::object::get_own_descriptor(bag, &self.gc_heap, key)
+        {
+            return Ok(Some(desc));
+        }
+        let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
+            return Ok(None);
+        };
+        if self
+            .function_deleted_metadata
+            .contains(&(function_id, metadata_key))
+        {
+            return Ok(None);
+        }
+        let Some(module) = module else {
+            return Ok(None);
+        };
+        let ctx = function_metadata::FunctionMetadataContext::new(
+            module,
+            &self.gc_heap,
+            &self.string_heap,
+            &self.function_user_props,
+            &self.function_deleted_metadata,
+        );
+        let value =
+            function_metadata::ordinary_function_intrinsic_property(&ctx, function_id, key)?;
+        Ok(Some(object::PropertyDescriptor::data(
+            value, false, false, true,
+        )))
+    }
+
+    fn ordinary_function_define_own_property(
+        &mut self,
+        module: Option<&BytecodeModule>,
+        function_id: u32,
+        key: &str,
+        desc_obj: Option<JsObject>,
+        descriptor: object::PropertyDescriptor,
+    ) -> Result<bool, VmError> {
+        let descriptor = match self.ordinary_function_own_property_descriptor(
+            module,
+            function_id,
+            key,
+        )? {
+            Some(existing) => {
+                let descriptor = if function_metadata::ordinary_function_metadata_key(key).is_some()
+                {
+                    match desc_obj {
+                        Some(desc_obj) => complete_descriptor_defaults_from_object(
+                            desc_obj,
+                            &self.gc_heap,
+                            descriptor,
+                            &existing,
+                        ),
+                        None => descriptor,
+                    }
+                } else {
+                    descriptor
+                };
+                match object::validate_descriptor_update(&existing, &descriptor) {
+                    Some(merged) => merged,
+                    None => return Ok(false),
+                }
+            }
+            None => descriptor,
+        };
+        let bag = self.function_user_bag(function_id)?;
+        let ok = crate::object::define_own_property(bag, &mut self.gc_heap, key, descriptor);
+        if ok
+            && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key)
+        {
+            self.function_deleted_metadata
+                .remove(&(function_id, metadata_key));
+        }
+        Ok(ok)
+    }
+
+    fn ordinary_function_delete_own_property(&mut self, function_id: u32, key: &str) -> bool {
+        let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
+            return self
+                .function_user_props
+                .get(&function_id)
+                .copied()
+                .map(|bag| crate::object::delete(bag, &mut self.gc_heap, key))
+                .unwrap_or(true);
+        };
+        if let Some(bag) = self.function_user_props.get(&function_id).copied() {
+            if crate::object::get_own_descriptor(bag, &self.gc_heap, key).is_some() {
+                if !crate::object::delete(bag, &mut self.gc_heap, key) {
+                    return false;
+                }
+                self.function_deleted_metadata
+                    .insert((function_id, metadata_key));
+                return true;
+            }
+        }
+        self.function_deleted_metadata
+            .insert((function_id, metadata_key));
+        true
+    }
+
     pub(crate) fn try_function_object_static_call(
         &mut self,
         module: Option<&BytecodeModule>,
@@ -2202,8 +2316,13 @@ impl Interpreter {
                 let descriptor = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
                 let ok = match (&target, function_id, key) {
                     (_, Some(function_id), VmPropertyKey::String(key)) => {
-                        let bag = self.function_user_bag(function_id)?;
-                        crate::object::define_own_property(bag, &mut self.gc_heap, &key, descriptor)
+                        self.ordinary_function_define_own_property(
+                            module,
+                            function_id,
+                            &key,
+                            Some(desc_obj),
+                            descriptor,
+                        )?
                     }
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let bag = self.function_user_bag(function_id)?;
@@ -2235,29 +2354,7 @@ impl Interpreter {
                 let key = Self::coerce_vm_property_key(args.get(1))?;
                 let desc = match (&target, function_id, key) {
                     (_, Some(function_id), VmPropertyKey::String(key)) => {
-                        if let Some(bag) = self.function_user_props.get(&function_id).copied()
-                            && let Some(desc) =
-                                crate::object::get_own_descriptor(bag, &self.gc_heap, &key)
-                        {
-                            Some(desc)
-                        } else if let Some(module) = module
-                            && matches!(key.as_str(), "name" | "length")
-                        {
-                            let ctx = function_metadata::FunctionMetadataContext::new(
-                                module,
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &self.function_user_props,
-                            );
-                            let value = function_metadata::ordinary_function_intrinsic_property(
-                                &ctx,
-                                function_id,
-                                &key,
-                            )?;
-                            Some(object::PropertyDescriptor::data(value, false, false, true))
-                        } else {
-                            None
-                        }
+                        self.ordinary_function_own_property_descriptor(module, function_id, &key)?
                     }
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let Some(bag) = self.function_user_props.get(&function_id).copied() else {
@@ -2299,7 +2396,14 @@ impl Interpreter {
                                 )
                             })
                             .unwrap_or(false);
-                        user_present || matches!(key.as_str(), "name" | "length")
+                        user_present
+                            || function_metadata::ordinary_function_metadata_key(&key).is_some_and(
+                                |metadata_key| {
+                                    !self
+                                        .function_deleted_metadata
+                                        .contains(&(function_id, metadata_key))
+                                },
+                            )
                     }
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => self
                         .function_user_props
@@ -2384,6 +2488,7 @@ impl Interpreter {
                 &self.gc_heap,
                 &self.string_heap,
                 &self.function_user_props,
+                &self.function_deleted_metadata,
             );
             return function_metadata::ordinary_function_intrinsic_property(
                 &ctx,
@@ -3830,6 +3935,7 @@ impl Interpreter {
                                                         &self.gc_heap,
                                                         &self.string_heap,
                                                         &self.function_user_props,
+                                                        &self.function_deleted_metadata,
                                                     );
                                                 function_metadata::callable_intrinsic_property(
                                                     &ctx, &ctor, &name,
@@ -3870,6 +3976,7 @@ impl Interpreter {
                                 &self.gc_heap,
                                 &self.string_heap,
                                 &self.function_user_props,
+                                &self.function_deleted_metadata,
                             );
                             function_metadata::callable_intrinsic_property(
                                 &ctx,
@@ -3887,6 +3994,7 @@ impl Interpreter {
                                 &self.gc_heap,
                                 &self.string_heap,
                                 &self.function_user_props,
+                                &self.function_deleted_metadata,
                             );
                             function_metadata::callable_intrinsic_property(
                                 &ctx,
@@ -3959,6 +4067,22 @@ impl Interpreter {
                         // every closure observes the same bag.
                         Value::Function { function_id } | Value::Closure { function_id, .. } => {
                             let fid = *function_id;
+                            if matches!(name.as_str(), "name" | "length") {
+                                match self.ordinary_function_own_property_descriptor(
+                                    Some(module),
+                                    fid,
+                                    &name,
+                                )? {
+                                    Some(desc) if !desc.writable() => {
+                                        return Err(VmError::TypeError {
+                                            message: format!(
+                                                "Cannot assign to read-only property '{name}' of function"
+                                            ),
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
                             let bag = match self.function_user_props.get(&fid).copied() {
                                 Some(b) => b,
                                 None => {
@@ -3967,6 +4091,11 @@ impl Interpreter {
                                     new_bag
                                 }
                             };
+                            if let Some(metadata_key) =
+                                function_metadata::ordinary_function_metadata_key(&name)
+                            {
+                                self.function_deleted_metadata.remove(&(fid, metadata_key));
+                            }
                             Some(bag)
                         }
                         Value::NativeFunction(native) if name == "name" || name == "length" => {
@@ -4028,6 +4157,9 @@ impl Interpreter {
                     let name = lookup_string_constant(module, name_idx)?;
                     let removed = match read_register(frame, obj_reg)? {
                         Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, &name),
+                        Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                            self.ordinary_function_delete_own_property(*function_id, &name)
+                        }
                         Value::NativeFunction(native) => {
                             native.delete_own_property(&mut self.gc_heap, &name)
                         }
@@ -4061,6 +4193,9 @@ impl Interpreter {
                         Value::NativeFunction(_) => {
                             Value::Object(self.function_prototype_object()?)
                         }
+                        Value::Function { .. } | Value::Closure { .. } | Value::BoundFunction(_) => {
+                            Value::Object(self.function_prototype_object()?)
+                        }
                         _ => return Err(VmError::TypeMismatch),
                     };
                     write_register(frame, dst, result)?;
@@ -4069,10 +4204,6 @@ impl Interpreter {
                 Op::SetPrototype => {
                     let obj_reg = register_operand(operands.first())?;
                     let proto_reg = register_operand(operands.get(1))?;
-                    let obj = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => *o,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
                     // Class values chain through their statics
                     // object — `class D extends C` sets
                     // `D.statics.[[Prototype]] = C.statics` so
@@ -4084,7 +4215,18 @@ impl Interpreter {
                         Value::Null => None,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    crate::object::set_prototype(obj, &mut self.gc_heap, proto);
+                    match read_register(frame, obj_reg)? {
+                        Value::Object(obj) => crate::object::set_prototype(
+                            *obj,
+                            &mut self.gc_heap,
+                            proto,
+                        ),
+                        Value::Function { .. }
+                        | Value::Closure { .. }
+                        | Value::BoundFunction(_)
+                        | Value::NativeFunction(_) => {}
+                        _ => return Err(VmError::TypeMismatch),
+                    }
                     frame.pc += 1;
                 }
                 Op::NewArray => {
@@ -4136,10 +4278,34 @@ impl Interpreter {
                             crate::object::get(*obj, &self.gc_heap, &key)
                                 .unwrap_or(Value::Undefined)
                         }
+                        (Value::Function { function_id } | Value::Closure { function_id, .. }, Value::String(key)) => {
+                            match self.ordinary_function_own_property_descriptor(
+                                Some(module),
+                                *function_id,
+                                &key.to_lossy_string(),
+                            )? {
+                                Some(desc) => descriptor_value(&desc),
+                                None => Value::Undefined,
+                            }
+                        }
                         // Computed access to built-in function
                         // metadata, e.g. `Function.prototype.call["name"]`.
                         (Value::NativeFunction(native), Value::String(key)) => {
                             match native.own_property_descriptor(
+                                &self.gc_heap,
+                                &self.string_heap,
+                                &key.to_lossy_string(),
+                            )? {
+                                Some(desc) => descriptor_value(&desc),
+                                None => Value::Undefined,
+                            }
+                        }
+                        // Computed access to bound-function metadata,
+                        // e.g. `bound["name"]`, follows the same
+                        // descriptor-backed state as direct `bound.name`.
+                        (Value::BoundFunction(bound), Value::String(key)) => {
+                            match function_metadata::bound_own_property_descriptor(
+                                bound,
                                 &self.gc_heap,
                                 &self.string_heap,
                                 &key.to_lossy_string(),
@@ -4235,6 +4401,36 @@ impl Interpreter {
                             let key = n.to_display_string();
                             self.store_computed_ordinary_property(*obj, &key, value)?;
                         }
+                        (
+                            Value::Function { function_id }
+                            | Value::Closure { function_id, .. },
+                            Value::String(key),
+                        ) => {
+                            let key = key.to_lossy_string();
+                            match self.ordinary_function_own_property_descriptor(
+                                Some(module),
+                                *function_id,
+                                &key,
+                            )? {
+                                Some(desc) if !desc.writable() => {
+                                    return Err(VmError::TypeError {
+                                        message: format!(
+                                            "Cannot assign to read-only property '{key}' of function"
+                                        ),
+                                    });
+                                }
+                                _ => {
+                                    let bag = self.function_user_bag(*function_id)?;
+                                    crate::object::set(bag, &mut self.gc_heap, &key, value);
+                                    if let Some(metadata_key) =
+                                        function_metadata::ordinary_function_metadata_key(&key)
+                                    {
+                                        self.function_deleted_metadata
+                                            .remove(&(*function_id, metadata_key));
+                                    }
+                                }
+                            }
+                        }
                         // Computed write to built-in function
                         // metadata follows the same descriptor path
                         // as `f.name = ...`.
@@ -4270,6 +4466,44 @@ impl Interpreter {
                                             message: format!(
                                                 "Cannot define property '{key}' on function {}",
                                                 native.name(&self.gc_heap)
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        (Value::BoundFunction(bound), Value::String(key)) => {
+                            let key = key.to_lossy_string();
+                            match function_metadata::bound_own_property_descriptor(
+                                bound,
+                                &self.gc_heap,
+                                &self.string_heap,
+                                &key,
+                            )? {
+                                Some(desc) if !desc.writable() => {
+                                    return Err(VmError::TypeError {
+                                        message: format!(
+                                            "Cannot assign to read-only property '{key}' of bound function"
+                                        ),
+                                    });
+                                }
+                                _ => {
+                                    let desc = crate::object::PropertyDescriptor::data(
+                                        value.clone(),
+                                        true,
+                                        false,
+                                        true,
+                                    );
+                                    if !function_metadata::bound_define_own_property(
+                                        bound,
+                                        &mut self.gc_heap,
+                                        &self.string_heap,
+                                        &key,
+                                        desc,
+                                    ) {
+                                        return Err(VmError::TypeError {
+                                            message: format!(
+                                                "Cannot define property '{key}' on bound function"
                                             ),
                                         });
                                     }
@@ -5353,6 +5587,7 @@ impl Interpreter {
                         &self.gc_heap,
                         &self.string_heap,
                         &self.function_user_props,
+                        &self.function_deleted_metadata,
                     );
                     let metadata =
                         function_metadata::bound_create_metadata(&ctx, &target, bound_args.len())?;
@@ -5507,6 +5742,14 @@ impl Interpreter {
                                 &n.to_display_string(),
                             ),
                         },
+                        (
+                            Value::Function { function_id }
+                            | Value::Closure { function_id, .. },
+                            Value::String(s),
+                        ) => self.ordinary_function_delete_own_property(
+                            *function_id,
+                            &s.to_lossy_string(),
+                        ),
                         (Value::NativeFunction(native), Value::String(s)) => {
                             native.delete_own_property(&mut self.gc_heap, &s.to_lossy_string())
                         }
@@ -6769,26 +7012,24 @@ impl Interpreter {
                 "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
             )
         {
-            let bag = match self.function_user_props.get(function_id).copied() {
-                Some(b) => b,
-                None => {
-                    let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
-                    self.function_user_props.insert(*function_id, new_bag);
-                    new_bag
+            let result = match name.as_str() {
+                "hasOwnProperty" => {
+                    let key = property_key_from_arg(arg_values.first())?;
+                    self.ordinary_function_own_property_descriptor(Some(module), *function_id, &key)?
+                        .is_some()
                 }
+                "propertyIsEnumerable" => {
+                    let key = property_key_from_arg(arg_values.first())?;
+                    self.ordinary_function_own_property_descriptor(Some(module), *function_id, &key)?
+                        .is_some_and(|desc| desc.enumerable())
+                }
+                "isPrototypeOf" => false,
+                _ => unreachable!("guarded by method-name match"),
             };
-            if let Some(result) = object_prototype_intercept(
-                &bag,
-                &name,
-                &arg_values,
-                &self.string_heap,
-                &self.gc_heap,
-            )? {
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, result)?;
-                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                return Ok(());
-            }
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, Value::Boolean(result))?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
         }
         if let Value::NativeFunction(native) = &recv_value
             && let Some(result) = native_function_object_prototype_intercept(
@@ -6798,6 +7039,15 @@ impl Interpreter {
                 &self.gc_heap,
                 &self.string_heap,
             )?
+        {
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
+        }
+        if let Value::BoundFunction(bound) = &recv_value
+            && let Some(result) =
+                bound_function_object_prototype_intercept(bound, &name, &arg_values, &self.gc_heap)?
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
@@ -7996,6 +8246,7 @@ impl Interpreter {
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
+                    &self.function_deleted_metadata,
                 );
                 let metadata =
                     function_metadata::bound_create_metadata(&ctx, &this_value, bound_args.len())?;
@@ -8017,6 +8268,7 @@ impl Interpreter {
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
+                    &self.function_deleted_metadata,
                 );
                 let display = function_metadata::callable_to_string(&ctx, &this_value);
                 let s = JsString::from_str(&display, &self.string_heap)
@@ -8074,6 +8326,7 @@ impl Interpreter {
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
+                    &self.function_deleted_metadata,
                 );
                 let metadata =
                     function_metadata::bound_create_metadata(&ctx, callee, bound_args.len())?;
@@ -8101,6 +8354,7 @@ impl Interpreter {
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
+                    &self.function_deleted_metadata,
                 );
                 let display = function_metadata::callable_to_string(&ctx, callee);
                 let s = JsString::from_str(&display, &self.string_heap)
@@ -10185,6 +10439,73 @@ fn native_function_object_prototype_intercept(
         "isPrototypeOf" => Ok(Some(Value::Boolean(false))),
         _ => Ok(None),
     }
+}
+
+fn bound_function_object_prototype_intercept(
+    bound: &BoundFunction,
+    name: &str,
+    args: &SmallVec<[Value; 8]>,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Option<Value>, VmError> {
+    match name {
+        "hasOwnProperty" => {
+            let key = property_key_from_arg(args.first())?;
+            Ok(Some(Value::Boolean(
+                function_metadata::bound_has_own_property(bound, gc_heap, &key),
+            )))
+        }
+        "propertyIsEnumerable" => {
+            let key = property_key_from_arg(args.first())?;
+            Ok(Some(Value::Boolean(
+                function_metadata::bound_own_property_is_enumerable(bound, gc_heap, &key),
+            )))
+        }
+        "isPrototypeOf" => Ok(Some(Value::Boolean(false))),
+        _ => Ok(None),
+    }
+}
+
+fn complete_descriptor_defaults_from_object(
+    desc_obj: JsObject,
+    gc_heap: &otter_gc::GcHeap,
+    mut descriptor: object::PropertyDescriptor,
+    existing: &object::PropertyDescriptor,
+) -> object::PropertyDescriptor {
+    let has_value = !matches!(
+        object::lookup_own(desc_obj, gc_heap, "value"),
+        object::PropertyLookup::Absent
+    );
+    let has_writable = !matches!(
+        object::lookup_own(desc_obj, gc_heap, "writable"),
+        object::PropertyLookup::Absent
+    );
+    let has_enumerable = !matches!(
+        object::lookup_own(desc_obj, gc_heap, "enumerable"),
+        object::PropertyLookup::Absent
+    );
+    let has_configurable = !matches!(
+        object::lookup_own(desc_obj, gc_heap, "configurable"),
+        object::PropertyLookup::Absent
+    );
+
+    if !has_value
+        && let object::DescriptorKind::Data { value } = &existing.kind
+        && let object::DescriptorKind::Data {
+            value: descriptor_value,
+        } = &mut descriptor.kind
+    {
+        *descriptor_value = value.clone();
+    }
+    if !has_writable {
+        descriptor.flags = descriptor.flags.with_writable(existing.writable());
+    }
+    if !has_enumerable {
+        descriptor.flags = descriptor.flags.with_enumerable(existing.enumerable());
+    }
+    if !has_configurable {
+        descriptor.flags = descriptor.flags.with_configurable(existing.configurable());
+    }
+    descriptor
 }
 
 fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {

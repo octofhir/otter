@@ -232,6 +232,20 @@ fn native_prototype_property_is_enumerable(
             let _ = native;
             false
         }
+        Value::BoundFunction(bound) => {
+            let key = expect_property_key(args.first())
+                .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+            match key {
+                PropertyKey::String(key) => {
+                    crate::function_metadata::bound_own_property_is_enumerable(
+                        bound,
+                        ctx.heap(),
+                        &key,
+                    )
+                }
+                PropertyKey::Symbol(_) => false,
+            }
+        }
         _ => false,
     };
     Ok(Value::Boolean(enumerable))
@@ -583,6 +597,12 @@ pub fn call(
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
+                Some(Value::BoundFunction(bound)) => {
+                    crate::function_metadata::bound_enumerable_own_property_keys(bound, gc_heap)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                }
                 _ => return Err(VmError::TypeMismatch),
             };
             let mut names = Vec::with_capacity(owned.len());

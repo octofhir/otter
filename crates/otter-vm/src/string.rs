@@ -260,6 +260,21 @@ impl JsString {
         Self::from_utf16_units(&[], heap)
     }
 
+    /// Borrow the underlying Latin-1 byte storage iff this string
+    /// is the [`StringRepr::Thin`] variant. Returns `None` for
+    /// flat / sliced / cons UTF-16 strings.
+    ///
+    /// Callers exploit this for byte-level fast paths — substring
+    /// search, prefix / suffix tests — that would otherwise pay
+    /// the [`Self::to_utf16_vec`] widening allocation.
+    #[must_use]
+    pub fn as_latin1(&self) -> Option<&[u8]> {
+        match &*self.repr {
+            StringRepr::Thin(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
     /// Length in WTF-16 code units (O(1)).
     #[must_use]
     pub fn len(&self) -> u32 {
@@ -516,6 +531,14 @@ impl JsString {
     /// [`INDEX_OF_INTERRUPT_BUDGET`] iterations; a tripped flag
     /// produces an [`Interrupted`] sentinel which callers translate
     /// to `VmError::Interrupted`.
+    ///
+    /// Hot path uses [`crate::swar`] to scan 8 bytes (Latin-1) or
+    /// 4 code units (UTF-16) at a time when locating candidate
+    /// match positions, falling back to slice equality for the
+    /// per-candidate verify step.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.indexof>
+    /// §22.1.3.10
     pub fn index_of(
         &self,
         needle: &JsString,
@@ -534,34 +557,72 @@ impl JsString {
         if from > last_start {
             return Ok(None);
         }
-        // Materialize haystack and needle to flat slices for the
-        // hot loop. This is a deliberate tradeoff against
-        // re-walking the rope on every comparison; substring search
-        // benefits from random access.
+
+        // Both sides Latin-1 → byte-level scan (no `Vec<u16>`
+        // materialisation, SWAR memchr on the first byte).
+        if let (Some(h_bytes), Some(n_bytes)) = (self.as_latin1(), needle.as_latin1()) {
+            return latin1_index_of(
+                h_bytes,
+                n_bytes,
+                from as usize,
+                last_start as usize,
+                interrupt,
+            );
+        }
+
+        // UTF-16 path: still materialise to flat code-unit slices
+        // so the verify step stays a single `==` comparison, but
+        // route the candidate scan through the SWAR `find_u16`
+        // helper (4 lanes per `u64`).
         let haystack: Vec<u16> = self.to_utf16_vec();
         let needle_units: Vec<u16> = needle.to_utf16_vec();
-        let mut i = from as usize;
-        let mut steps: u32 = 0;
-        while i <= last_start as usize {
-            if haystack[i..i + n_len as usize] == needle_units[..] {
-                return Ok(Some(i as u32));
-            }
-            i += 1;
-            steps = steps.saturating_add(1);
-            if steps == INDEX_OF_INTERRUPT_BUDGET {
-                if let Some(flag) = interrupt
-                    && flag.is_set()
-                {
-                    return Err(Interrupted);
-                }
-                steps = 0;
-            }
+        utf16_index_of(
+            &haystack,
+            &needle_units,
+            from as usize,
+            last_start as usize,
+            interrupt,
+        )
+    }
+
+    /// Find the **last** occurrence of `needle` ending at or
+    /// before code-unit position `position` (exclusive upper
+    /// bound is `position + needle.len()`). Returns `None` if no
+    /// match exists.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.lastindexof>
+    /// §22.1.3.11
+    pub fn last_index_of(
+        &self,
+        needle: &JsString,
+        position: u32,
+        interrupt: Option<&crate::InterruptFlag>,
+    ) -> Result<Option<u32>, Interrupted> {
+        let n_len = needle.len();
+        let h_len = self.len();
+        if n_len == 0 {
+            return Ok(Some(position.min(h_len)));
         }
-        Ok(None)
+        if h_len < n_len {
+            return Ok(None);
+        }
+        let max_start = h_len - n_len;
+        let last_start = position.min(max_start);
+
+        if let (Some(h_bytes), Some(n_bytes)) = (self.as_latin1(), needle.as_latin1()) {
+            return latin1_last_index_of(h_bytes, n_bytes, last_start as usize, interrupt);
+        }
+
+        let haystack: Vec<u16> = self.to_utf16_vec();
+        let needle_units: Vec<u16> = needle.to_utf16_vec();
+        utf16_last_index_of(&haystack, &needle_units, last_start as usize, interrupt)
     }
 
     /// `true` when this string starts with `prefix` at offset
     /// `from`. Cheap: pulls only the relevant code units.
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.startswith>
+    /// §22.1.3.22
     #[must_use]
     pub fn starts_with(&self, prefix: &JsString, from: u32) -> bool {
         let p_len = prefix.len();
@@ -571,20 +632,20 @@ impl JsString {
         if from + p_len > self.len() {
             return false;
         }
-        // Compare via code-unit iterators; both sides are bounded.
-        let mut a = self
-            .to_utf16_vec()
-            .into_iter()
-            .skip(from as usize)
-            .take(p_len as usize);
-        let mut b = prefix.to_utf16_vec().into_iter();
-        loop {
-            match (a.next(), b.next()) {
-                (Some(x), Some(y)) if x == y => continue,
-                (None, None) => return true,
-                _ => return false,
-            }
+        // Both Latin-1 → byte-level slice equality (compiler
+        // vectorises the memcmp). Skips the `Vec<u16>` widening
+        // both sides currently pay.
+        if let (Some(h), Some(p)) = (self.as_latin1(), prefix.as_latin1()) {
+            let from = from as usize;
+            let p_len = p_len as usize;
+            return h[from..from + p_len] == *p;
         }
+        // Mixed / UTF-16: materialise once and compare slices.
+        let haystack: Vec<u16> = self.to_utf16_vec();
+        let prefix_units: Vec<u16> = prefix.to_utf16_vec();
+        let from = from as usize;
+        let p_len = p_len as usize;
+        haystack[from..from + p_len] == prefix_units[..]
     }
 
     /// `true` when this string ends with `suffix`. `end_position`
@@ -625,6 +686,159 @@ impl JsString {
 /// flag. Matches the foundation plan's "every 4096 iterations" rule
 /// for native loops.
 pub const INDEX_OF_INTERRUPT_BUDGET: u32 = 4096;
+
+/// Latin-1 index_of fast path: SWAR scan for the needle's first
+/// byte, then verify the candidate via slice equality.
+fn latin1_index_of(
+    haystack: &[u8],
+    needle: &[u8],
+    from: usize,
+    last_start: usize,
+    interrupt: Option<&crate::InterruptFlag>,
+) -> Result<Option<u32>, Interrupted> {
+    debug_assert!(!needle.is_empty());
+    debug_assert!(last_start < haystack.len());
+    debug_assert!(last_start + needle.len() <= haystack.len());
+    let first = needle[0];
+    let n_len = needle.len();
+    let mut search_start = from;
+    let mut steps: u32 = 0;
+    while search_start <= last_start {
+        let Some(rel) = crate::swar::find_byte(&haystack[search_start..=last_start], first, 0)
+        else {
+            return Ok(None);
+        };
+        let i = search_start + rel;
+        if haystack[i..i + n_len] == *needle {
+            return Ok(Some(i as u32));
+        }
+        steps = steps.saturating_add(rel as u32 + 1);
+        if steps >= INDEX_OF_INTERRUPT_BUDGET {
+            if let Some(flag) = interrupt
+                && flag.is_set()
+            {
+                return Err(Interrupted);
+            }
+            steps = 0;
+        }
+        search_start = i + 1;
+    }
+    Ok(None)
+}
+
+/// Latin-1 last_index_of fast path: SWAR rfind for the needle's
+/// first byte, then verify the candidate via slice equality.
+fn latin1_last_index_of(
+    haystack: &[u8],
+    needle: &[u8],
+    last_start: usize,
+    interrupt: Option<&crate::InterruptFlag>,
+) -> Result<Option<u32>, Interrupted> {
+    debug_assert!(!needle.is_empty());
+    debug_assert!(last_start + needle.len() <= haystack.len());
+    let first = needle[0];
+    let n_len = needle.len();
+    let mut search_end = last_start + 1;
+    let mut steps: u32 = 0;
+    while search_end > 0 {
+        let Some(i) = crate::swar::rfind_byte(&haystack[..search_end], first) else {
+            return Ok(None);
+        };
+        if haystack[i..i + n_len] == *needle {
+            return Ok(Some(i as u32));
+        }
+        steps = steps.saturating_add((search_end - i) as u32);
+        if steps >= INDEX_OF_INTERRUPT_BUDGET {
+            if let Some(flag) = interrupt
+                && flag.is_set()
+            {
+                return Err(Interrupted);
+            }
+            steps = 0;
+        }
+        if i == 0 {
+            return Ok(None);
+        }
+        search_end = i;
+    }
+    Ok(None)
+}
+
+/// UTF-16 last_index_of with SWAR-assisted reverse candidate
+/// scan.
+fn utf16_last_index_of(
+    haystack: &[u16],
+    needle: &[u16],
+    last_start: usize,
+    interrupt: Option<&crate::InterruptFlag>,
+) -> Result<Option<u32>, Interrupted> {
+    debug_assert!(!needle.is_empty());
+    debug_assert!(last_start + needle.len() <= haystack.len());
+    let first = needle[0];
+    let n_len = needle.len();
+    let mut search_end = last_start + 1;
+    let mut steps: u32 = 0;
+    while search_end > 0 {
+        let Some(i) = crate::swar::rfind_u16(&haystack[..search_end], first) else {
+            return Ok(None);
+        };
+        if haystack[i..i + n_len] == *needle {
+            return Ok(Some(i as u32));
+        }
+        steps = steps.saturating_add((search_end - i) as u32);
+        if steps >= INDEX_OF_INTERRUPT_BUDGET {
+            if let Some(flag) = interrupt
+                && flag.is_set()
+            {
+                return Err(Interrupted);
+            }
+            steps = 0;
+        }
+        if i == 0 {
+            return Ok(None);
+        }
+        search_end = i;
+    }
+    Ok(None)
+}
+
+/// UTF-16 index_of with SWAR-assisted candidate scan.
+fn utf16_index_of(
+    haystack: &[u16],
+    needle: &[u16],
+    from: usize,
+    last_start: usize,
+    interrupt: Option<&crate::InterruptFlag>,
+) -> Result<Option<u32>, Interrupted> {
+    debug_assert!(!needle.is_empty());
+    debug_assert!(last_start < haystack.len());
+    debug_assert!(last_start + needle.len() <= haystack.len());
+    let first = needle[0];
+    let n_len = needle.len();
+    let mut search_start = from;
+    let mut steps: u32 = 0;
+    while search_start <= last_start {
+        let Some(rel) = crate::swar::find_u16(&haystack[search_start..=last_start], first, 0)
+        else {
+            return Ok(None);
+        };
+        let i = search_start + rel;
+        if haystack[i..i + n_len] == *needle {
+            return Ok(Some(i as u32));
+        }
+        steps = steps.saturating_add(rel as u32 + 1);
+        if steps >= INDEX_OF_INTERRUPT_BUDGET {
+            if let Some(flag) = interrupt
+                && flag.is_set()
+            {
+                return Err(Interrupted);
+            }
+            steps = 0;
+        }
+        search_start = i + 1;
+    }
+    Ok(None)
+}
 
 /// Sentinel returned by [`JsString::index_of`] when the runtime
 /// interrupt flag was observed. Carries no payload — callers

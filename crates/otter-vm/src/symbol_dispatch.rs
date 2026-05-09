@@ -84,6 +84,14 @@ impl From<crate::string::StringError> for SymbolError {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-well-known-symbols>
 pub fn load_static(interp: &Interpreter, name: &str) -> Result<Value, SymbolError> {
+    if name == "prototype" {
+        if let Some(Value::Object(symbol_ctor)) =
+            crate::object::get(interp.global_this, &interp.gc_heap, "Symbol")
+            && let Some(prototype) = crate::object::get(symbol_ctor, &interp.gc_heap, "prototype")
+        {
+            return Ok(prototype);
+        }
+    }
     if let Some(tag) = WellKnown::from_name(name) {
         return Ok(Value::Symbol(interp.well_known_symbols().get(tag)));
     }

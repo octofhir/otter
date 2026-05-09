@@ -6,8 +6,8 @@ error[E0277]: `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>` cannot be sent b
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>`
-note: required because it appears within the type `Value`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -26,13 +26,13 @@ error[E0277]: `Rc<num_bigint::bigint::BigInt>` cannot be sent between threads sa
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<num_bigint::bigint::BigInt>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<num_bigint::bigint::BigInt>`
 note: required because it appears within the type `BigIntValue`
   --> src/bigint/mod.rs
    |
    | pub struct BigIntValue {
    |            ^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -51,13 +51,13 @@ error[E0277]: `Rc<SymbolBody>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<SymbolBody>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<SymbolBody>`
 note: required because it appears within the type `JsSymbol`
   --> src/symbol.rs
    |
    | pub struct JsSymbol {
    |            ^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -76,13 +76,13 @@ error[E0277]: `Rc<TemporalPayload>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<TemporalPayload>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<TemporalPayload>`
 note: required because it appears within the type `JsTemporal`
   --> src/temporal/payload.rs
    |
    | pub struct JsTemporal {
    |            ^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -101,13 +101,13 @@ error[E0277]: `Rc<Cell<f64>>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<Cell<f64>>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<Cell<f64>>`
 note: required because it appears within the type `JsDate`
   --> src/date/mod.rs
    |
    | pub struct JsDate {
    |            ^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -126,13 +126,13 @@ error[E0277]: `Rc<IntlPayload>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<IntlPayload>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<IntlPayload>`
 note: required because it appears within the type `JsIntl`
   --> src/intl/payload.rs
    |
    | pub struct JsIntl {
    |            ^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -151,13 +151,13 @@ error[E0277]: `Rc<ArrayBufferBody>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<ArrayBufferBody>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<ArrayBufferBody>`
 note: required because it appears within the type `JsArrayBuffer`
   --> src/binary/array_buffer.rs
    |
    | pub struct JsArrayBuffer {
    |            ^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -176,13 +176,13 @@ error[E0277]: `Rc<DataViewBody>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<DataViewBody>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<DataViewBody>`
 note: required because it appears within the type `JsDataView`
   --> src/binary/data_view.rs
    |
    | pub struct JsDataView {
    |            ^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -201,13 +201,13 @@ error[E0277]: `Rc<TypedArrayBody>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<TypedArrayBody>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<TypedArrayBody>`
 note: required because it appears within the type `JsTypedArray`
   --> src/binary/typed_array.rs
    |
    | pub struct JsTypedArray {
    |            ^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -226,13 +226,13 @@ error[E0277]: `Rc<ProxyBody>` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `Rc<ProxyBody>`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `Rc<ProxyBody>`
 note: required because it appears within the type `JsProxy`
   --> src/proxy.rs
    |
    | pub struct JsProxy {
    |            ^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -251,7 +251,7 @@ error[E0277]: `*const ObjectBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const ObjectBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const ObjectBody`
 note: required because it appears within the type `PhantomData<*const ObjectBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -262,7 +262,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Obje
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -281,7 +281,7 @@ error[E0277]: `*const ArrayBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const ArrayBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const ArrayBody`
 note: required because it appears within the type `PhantomData<*const ArrayBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -292,7 +292,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Arra
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -311,7 +311,7 @@ error[E0277]: `*const IteratorState` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const IteratorState`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const IteratorState`
 note: required because it appears within the type `PhantomData<*const IteratorState>`
   --> $RUST/core/src/marker.rs
    |
@@ -322,7 +322,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Iter
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -341,7 +341,7 @@ error[E0277]: `*const MapBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const MapBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const MapBody`
 note: required because it appears within the type `PhantomData<*const MapBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -352,7 +352,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<MapB
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -371,7 +371,7 @@ error[E0277]: `*const SetBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const SetBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const SetBody`
 note: required because it appears within the type `PhantomData<*const SetBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -382,7 +382,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<SetB
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -401,7 +401,7 @@ error[E0277]: `*const WeakMapBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const WeakMapBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const WeakMapBody`
 note: required because it appears within the type `PhantomData<*const WeakMapBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -412,7 +412,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Weak
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -431,7 +431,7 @@ error[E0277]: `*const WeakSetBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const WeakSetBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const WeakSetBody`
 note: required because it appears within the type `PhantomData<*const WeakSetBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -442,7 +442,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Weak
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -461,7 +461,7 @@ error[E0277]: `*const WeakRefBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const WeakRefBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const WeakRefBody`
 note: required because it appears within the type `PhantomData<*const WeakRefBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -472,7 +472,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Weak
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -491,7 +491,7 @@ error[E0277]: `*const FinalizationRegistryBody` cannot be sent between threads s
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const FinalizationRegistryBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const FinalizationRegistryBody`
 note: required because it appears within the type `PhantomData<*const FinalizationRegistryBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -502,7 +502,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Fina
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -521,7 +521,7 @@ error[E0277]: `*const BoundFunctionBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const BoundFunctionBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const BoundFunctionBody`
 note: required because it appears within the type `PhantomData<*const BoundFunctionBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -537,7 +537,7 @@ note: required because it appears within the type `otter_vm::BoundFunction`
    |
    | pub struct BoundFunction {
    |            ^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -556,7 +556,7 @@ error[E0277]: `*const NativeFunctionBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const NativeFunctionBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const NativeFunctionBody`
 note: required because it appears within the type `PhantomData<*const NativeFunctionBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -572,7 +572,7 @@ note: required because it appears within the type `otter_vm::NativeFunction`
    |
    | pub struct NativeFunction {
    |            ^^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -591,7 +591,7 @@ error[E0277]: `*const JsRegExpBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const JsRegExpBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const JsRegExpBody`
 note: required because it appears within the type `PhantomData<*const JsRegExpBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -607,7 +607,7 @@ note: required because it appears within the type `JsRegExp`
    |
    | pub struct JsRegExp {
    |            ^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -626,7 +626,7 @@ error[E0277]: `*const GeneratorBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const GeneratorBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const GeneratorBody`
 note: required because it appears within the type `PhantomData<*const GeneratorBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -642,7 +642,7 @@ note: required because it appears within the type `JsGenerator`
    |
    | pub struct JsGenerator {
    |            ^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -661,7 +661,7 @@ error[E0277]: `*const ClassConstructorBody` cannot be sent between threads safel
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const ClassConstructorBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const ClassConstructorBody`
 note: required because it appears within the type `PhantomData<*const ClassConstructorBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -677,7 +677,7 @@ note: required because it appears within the type `otter_vm::ClassConstructor`
    |
    | pub struct ClassConstructor {
    |            ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -696,7 +696,7 @@ error[E0277]: `*const PurePromiseBody` cannot be sent between threads safely
    |     |
    |     required by a bound introduced by this call
    |
-   = help: within `Value`, the trait `Send` is not implemented for `*const PurePromiseBody`
+   = help: within `otter_vm::Value`, the trait `Send` is not implemented for `*const PurePromiseBody`
 note: required because it appears within the type `PhantomData<*const PurePromiseBody>`
   --> $RUST/core/src/marker.rs
    |
@@ -722,7 +722,7 @@ note: required because it appears within the type `JsPromiseHandle`
    |
    | pub struct JsPromiseHandle {
    |            ^^^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {

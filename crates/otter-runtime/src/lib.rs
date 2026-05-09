@@ -79,7 +79,7 @@ use otter_compiler::{
 };
 use otter_gc::GcStats;
 use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
-use otter_vm::{Interpreter, InterruptFlag, JsObject};
+use otter_vm::{EvalCompileOptions, Interpreter, InterruptFlag, JsObject};
 use serde::{Deserialize, Serialize};
 
 pub use compiled_program::CompiledProgram;
@@ -1194,10 +1194,16 @@ impl Runtime {
         // `new Function(...)` reach a real parse + compile path.
         // The closure is reusable across calls; each invocation
         // builds a fresh `BytecodeModule`.
-        let hook: otter_vm::EvalHook = std::rc::Rc::new(|source: &str| {
-            compile_script_source(source, SourceKind::JavaScript, "<eval>")
+        let hook: otter_vm::EvalHook =
+            std::rc::Rc::new(|source: &str, options: EvalCompileOptions| {
+                otter_compiler::compile_source_with_forced_strict(
+                    source,
+                    SourceKind::JavaScript,
+                    "<eval>",
+                    options.force_strict,
+                )
                 .map_err(|e| format!("compile error: {e:?}"))
-        });
+            });
         interp.set_eval_hook(Some(hook));
         Ok(Runtime {
             interp,
@@ -2132,6 +2138,9 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
         VmError::TypeMismatch => runtime_diagnostic(DiagnosticKind::Type, "TYPE_MISMATCH", display),
         VmError::TypeError { message } => {
             runtime_diagnostic(DiagnosticKind::Type, "TYPE_ERROR", message)
+        }
+        VmError::SyntaxError { message } => {
+            runtime_diagnostic(DiagnosticKind::Syntax, "SYNTAX_ERROR", message)
         }
         VmError::UnknownIntrinsic { name } => runtime_diagnostic(
             DiagnosticKind::Type,

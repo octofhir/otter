@@ -8,8 +8,8 @@
 //!    `ignored_tests`).
 //! 2. Parse frontmatter; on parse failure → [`Outcome::Fail`].
 //! 3. Skip via `skip_features` (config-driven).
-//! 4. Skip via `skip_flags` (config-driven; root config skips
-//!    `noStrict` for the active strict-mode profile).
+//! 4. Skip via `skip_flags` (config-driven escape hatch for
+//!    unsupported host/test modes).
 //! 5. Build a fresh `Runtime` with the configured heap cap.
 //! 6. Compile + run the harness preamble (cached per-worker).
 //! 7. Compile + run the test body. `flags: [module]` routes through
@@ -317,9 +317,9 @@ pub fn run_one(
         );
     }
 
-    // 6. Configured flag policy. The root config currently skips
-    //    `noStrict` to keep legacy sloppy-mode tests out of the
-    //    active strict-mode conformance profile.
+    // 6. Configured flag policy. This remains a generic escape
+    //    hatch for unsupported host/test modes; strictness itself
+    //    is honored from Test262 frontmatter below.
     if let Some(flag) = exec.config.first_skipped_flag(&frontmatter.flags) {
         return result_with(
             rel_path,
@@ -352,14 +352,17 @@ pub fn run_one(
     // 8. Build the per-test source.
     let body = Frontmatter::body_of(&source);
     let combined = if frontmatter.is_module() {
-        // Module-flagged tests run via run_module; the harness +
-        // body need to live in a temp file. Implemented later in
-        // this slice.
+        // Module-flagged tests are strict by ECMAScript module
+        // semantics; do not inject a directive into the harness.
         let mut buf = preamble;
         buf.push_str(body);
         buf
     } else {
-        let mut buf = preamble;
+        let mut buf = String::new();
+        if frontmatter.is_only_strict() && !frontmatter.is_raw() {
+            buf.push_str("\"use strict\";\n");
+        }
+        buf.push_str(&preamble);
         buf.push_str(body);
         buf
     };

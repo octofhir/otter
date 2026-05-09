@@ -289,7 +289,7 @@ pub fn load_property(
         "unicode" => Value::Boolean(re.flags(gc_heap).unicode),
         "sticky" => Value::Boolean(re.flags(gc_heap).sticky),
         "unicodeSets" => Value::Boolean(re.flags(gc_heap).unicode_sets),
-        "lastIndex" => Value::Number(NumberValue::from_i32(re.last_index(gc_heap) as i32)),
+        "lastIndex" => re.last_index_value(gc_heap),
         _ => Value::Undefined,
     }
 }
@@ -298,19 +298,9 @@ pub fn load_property(
 /// `lastIndex` is writable; everything else is silently ignored
 /// (foundation: the spec marks accessors non-writable, so a real
 /// `TypeError` belongs in a later strict-mode slice).
-pub fn store_property(re: &JsRegExp, gc_heap: &otter_gc::GcHeap, name: &str, value: &Value) {
-    if name == "lastIndex"
-        && let Value::Number(n) = value
-    {
-        let raw = n.as_f64();
-        let clamped = if raw.is_nan() || raw < 0.0 {
-            0
-        } else if raw > u32::MAX as f64 {
-            u32::MAX
-        } else {
-            raw as u32
-        };
-        re.set_last_index(gc_heap, clamped);
+pub fn store_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str, value: Value) {
+    if name == "lastIndex" {
+        re.set_last_index_value(gc_heap, value);
     }
 }
 
@@ -442,33 +432,44 @@ mod tests {
             JsRegExp::compile(&mut gc_heap, &"a".encode_utf16().collect::<Vec<_>>(), "g").unwrap();
         store_property(
             &re,
-            &gc_heap,
+            &mut gc_heap,
             "lastIndex",
-            &Value::Number(NumberValue::from_i32(7)),
+            Value::Number(NumberValue::from_i32(7)),
         );
         assert_eq!(re.last_index(&gc_heap), 7);
-        // Negative clamps to 0.
+        // Numeric execution coercion clamps negative values to 0,
+        // while the JS-visible property preserves the written value.
         store_property(
             &re,
-            &gc_heap,
+            &mut gc_heap,
             "lastIndex",
-            &Value::Number(NumberValue::from_i32(-3)),
+            Value::Number(NumberValue::from_i32(-3)),
         );
         assert_eq!(re.last_index(&gc_heap), 0);
-        // String writes are ignored (non-spec, but defensive).
+        assert_eq!(
+            load_property(&re, &gc_heap, "lastIndex", &heap),
+            Value::Number(NumberValue::from_i32(-3))
+        );
+        // String writes are observable, and execution coerces them
+        // numerically when needed.
+        let written = JsString::from_str("9", &heap).unwrap();
         store_property(
             &re,
-            &gc_heap,
+            &mut gc_heap,
             "lastIndex",
-            &Value::String(JsString::from_str("x", &heap).unwrap()),
+            Value::String(written.clone()),
         );
-        assert_eq!(re.last_index(&gc_heap), 0);
+        assert_eq!(
+            load_property(&re, &gc_heap, "lastIndex", &heap),
+            Value::String(written)
+        );
+        assert_eq!(re.last_index(&gc_heap), 9);
         // Non-lastIndex names are silently ignored.
         store_property(
             &re,
-            &gc_heap,
+            &mut gc_heap,
             "source",
-            &Value::String(JsString::from_str("nope", &heap).unwrap()),
+            Value::String(JsString::from_str("nope", &heap).unwrap()),
         );
     }
 }

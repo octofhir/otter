@@ -7,7 +7,7 @@ error[E0308]: mismatched types
   |            arguments to this method are incorrect
   |
   = note: expected reference `&StructuredCloneValue`
-             found reference `&Value`
+             found reference `&otter_vm::Value`
 note: method defined here
  --> src/worker.rs
   |

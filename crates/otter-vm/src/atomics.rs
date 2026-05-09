@@ -212,7 +212,11 @@ fn native_atomics_call(
 macro_rules! native_atomics {
     ($fn_name:ident, $variant:ident) => {
         fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            native_atomics_call(ctx, otter_bytecode::method_id::AtomicsMethod::$variant, args)
+            native_atomics_call(
+                ctx,
+                otter_bytecode::method_id::AtomicsMethod::$variant,
+                args,
+            )
         }
     };
 }

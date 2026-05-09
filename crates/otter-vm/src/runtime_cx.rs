@@ -36,6 +36,8 @@
 
 use std::marker::PhantomData;
 
+use otter_bytecode::BytecodeModule;
+
 use crate::{Interpreter, Value};
 
 /// Internal VM context. Carried explicitly through the dispatch
@@ -149,6 +151,7 @@ impl NativeCallInfo {
 pub struct NativeCtx<'rt> {
     pub(crate) cx: RuntimeCx<'rt>,
     call_info: NativeCallInfo,
+    module: Option<&'rt BytecodeModule>,
 }
 
 impl<'rt> NativeCtx<'rt> {
@@ -165,10 +168,41 @@ impl<'rt> NativeCtx<'rt> {
         interp: &'rt mut Interpreter,
         call_info: NativeCallInfo,
     ) -> Self {
+        Self::new_with_call_info_and_module(interp, call_info, None)
+    }
+
+    /// Build a native context with explicit call-site metadata and
+    /// current bytecode module. Builtins that need to re-enter JS
+    /// observable algorithms (for example Proxy traps) use the
+    /// module to invoke callbacks with the same function table as
+    /// the caller.
+    #[must_use]
+    pub(crate) fn new_with_call_info_and_module(
+        interp: &'rt mut Interpreter,
+        call_info: NativeCallInfo,
+        module: Option<&'rt BytecodeModule>,
+    ) -> Self {
         Self {
             cx: RuntimeCx::new(interp),
             call_info,
+            module,
         }
+    }
+
+    /// Current bytecode module for native builtins that re-enter
+    /// JS callbacks.
+    #[must_use]
+    pub(crate) fn current_module(&self) -> Option<&'rt BytecodeModule> {
+        self.module
+    }
+
+    /// Borrow the owning interpreter together with the current
+    /// bytecode module. Use this when a native needs to re-enter VM
+    /// code that also needs the caller module for observable coercions.
+    pub(crate) fn interp_mut_and_current_module(
+        &mut self,
+    ) -> (&mut Interpreter, Option<&'rt BytecodeModule>) {
+        (self.cx.interp, self.module)
     }
 
     /// Return the JavaScript receiver for the active native call.

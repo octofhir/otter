@@ -26,14 +26,6 @@ use crate::js_surface::{Attr, MethodSpec};
 use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError};
 
-/// Hidden property carrying the boxed `[[NumberData]]` slot of a
-/// Number object. Mirrors V8/SpiderMonkey's invisible internal
-/// slot — without an in-engine internal-slot field on `JsObject`,
-/// we attach the value as a property whose key starts with the
-/// reserved `__` prefix. The Number-prototype methods below read it
-/// when `this` is an object rather than a primitive Number.
-pub(crate) const NUMBER_DATA_SLOT_KEY: &str = "__NumberData__";
-
 /// Coerce a digit-count argument (`fractionDigits` / `precision`)
 /// per `ToIntegerOrInfinity` (§7.1.5). Surfaces the `Symbol` and
 /// `BigInt` arms as `TypeError` (which the wrapper translates to
@@ -62,19 +54,10 @@ fn receiver_number(args: &IntrinsicArgs<'_>) -> Result<NumberValue, IntrinsicErr
         Value::Number(n) => Ok(*n),
         Value::Object(obj) => {
             // Per ECMA-262 `thisNumberValue`: if `this` has a
-            // `[[NumberData]]` internal slot, use it. We materialise
-            // that slot as the hidden `__NumberData__` property
-            // (set up by `bootstrap::install_number` for
-            // `Number.prototype` itself, and by `Number(...)` /
-            // `new Number(...)` if the engine ever wraps a primitive
-            // in an Object — current default is auto-unbox, so this
-            // path principally exists for `Number.prototype` as
-            // receiver).
+            // `[[NumberData]]` internal slot, use it.
             let gc = args.gc_heap.borrow();
-            match crate::object::get(*obj, &gc, NUMBER_DATA_SLOT_KEY) {
-                Some(Value::Number(n)) => Ok(n),
-                _ => Err(IntrinsicError::BadReceiver { expected: "number" }),
-            }
+            crate::object::number_data(*obj, &gc)
+                .ok_or(IntrinsicError::BadReceiver { expected: "number" })
         }
         _ => Err(IntrinsicError::BadReceiver { expected: "number" }),
     }

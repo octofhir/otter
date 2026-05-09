@@ -84,12 +84,10 @@ skip_features = [
     "import-defer",
 ]
 
-# Test flags to skip. Otter's active Test262 profile is strict-mode
-# first; old sloppy-only tests stay out of the conformance signal until
-# the engine intentionally grows Annex B / sloppy-mode coverage.
-skip_flags = [
-    "noStrict",
-]
+# Test flags to skip. Strictness is controlled by each test's
+# frontmatter (`onlyStrict`, `noStrict`, `module`, `raw`) rather than
+# by a global runner prelude.
+skip_flags = []
 
 # Test path patterns to ignore (tests matching these patterns will be skipped)
 ignored_tests = [
@@ -125,7 +123,7 @@ ignored_tests = [
     # Annex B \c ClassControlLetter escape in character class — regress limitation
     "literals/regexp/class-escape",
 
-    # Tests use legacy string escapes ("\d", "\x", "\ ") without noStrict flag — oxc rejects in strict mode
+    # Legacy RegExp escape coverage still ignored pending parser / regexp triage.
     "RegExp/S15.10.3.1_A2_T1",
     "RegExp/S15.10.2.13_A1_T10",
     "RegExp/S15.10.2.8_A3_T24",

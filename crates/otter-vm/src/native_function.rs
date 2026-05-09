@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
-use crate::object::{DescriptorKind, PropertyDescriptor};
+use crate::object::{DescriptorKind, JsObject, PropertyDescriptor};
 use crate::string::{JsString, StringError, StringHeap};
 use crate::{NativeCtx, Value};
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -79,17 +79,26 @@ enum NativeOwnProperty {
 struct NativeFunctionMetadata {
     name_configurable: bool,
     length_configurable: bool,
+    constructable: bool,
 }
 
 impl NativeFunctionMetadata {
     const BUILTIN: Self = Self {
         name_configurable: true,
         length_configurable: true,
+        constructable: false,
+    };
+
+    const CONSTRUCTOR: Self = Self {
+        name_configurable: true,
+        length_configurable: true,
+        constructable: true,
     };
 
     const THROW_TYPE_ERROR: Self = Self {
         name_configurable: false,
         length_configurable: false,
+        constructable: false,
     };
 }
 
@@ -189,6 +198,9 @@ pub struct NativeFunctionBody {
     length_property: NativeOwnProperty,
     /// Attribute policy for built-in metadata descriptors.
     metadata: NativeFunctionMetadata,
+    /// Ordinary own properties installed on native callables, such
+    /// as `%Proxy%.revocable`.
+    own_properties: JsObject,
 }
 
 impl otter_gc::SafeTraceable for NativeFunctionBody {
@@ -203,6 +215,8 @@ impl otter_gc::SafeTraceable for NativeFunctionBody {
         }
         trace_native_own_property(&self.name_property, visitor);
         trace_native_own_property(&self.length_property, visitor);
+        let p = &self.own_properties as *const JsObject as *mut RawGc;
+        visitor(p);
     }
 }
 
@@ -270,6 +284,7 @@ impl NativeFunction {
         length: u8,
         call: NativeFastFn,
     ) -> Result<Self, otter_gc::OutOfMemory> {
+        let own_properties = crate::object::alloc_object(heap)?;
         Ok(Self {
             inner: heap.alloc_old(NativeFunctionBody {
                 name,
@@ -280,6 +295,30 @@ impl NativeFunction {
                 name_property: default_name_property(),
                 length_property: default_length_property(),
                 metadata: NativeFunctionMetadata::BUILTIN,
+                own_properties,
+            })?,
+        })
+    }
+
+    /// Build a static native function that has `[[Construct]]`.
+    pub fn new_constructor_static(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeFastFn,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let own_properties = crate::object::alloc_object(heap)?;
+        Ok(Self {
+            inner: heap.alloc_old(NativeFunctionBody {
+                name,
+                length,
+                call: NativeCallStorage::Static(call),
+                captures: SmallVec::new(),
+                trace: None,
+                name_property: default_name_property(),
+                length_property: default_length_property(),
+                metadata: NativeFunctionMetadata::CONSTRUCTOR,
+                own_properties,
             })?,
         })
     }
@@ -292,6 +331,7 @@ impl NativeFunction {
         length: u8,
         call: NativeCall,
     ) -> Result<Self, otter_gc::OutOfMemory> {
+        let own_properties = crate::object::alloc_object(heap)?;
         Ok(Self {
             inner: heap.alloc_old(NativeFunctionBody {
                 name,
@@ -302,6 +342,7 @@ impl NativeFunction {
                 name_property: default_name_property(),
                 length_property: default_length_property(),
                 metadata: NativeFunctionMetadata::BUILTIN,
+                own_properties,
             })?,
         })
     }
@@ -314,6 +355,7 @@ impl NativeFunction {
         heap: &mut otter_gc::GcHeap,
         call: NativeFastFn,
     ) -> Result<Self, otter_gc::OutOfMemory> {
+        let own_properties = crate::object::alloc_object(heap)?;
         Ok(Self {
             inner: heap.alloc_old(NativeFunctionBody {
                 name: "",
@@ -324,6 +366,7 @@ impl NativeFunction {
                 name_property: default_name_property(),
                 length_property: default_length_property(),
                 metadata: NativeFunctionMetadata::THROW_TYPE_ERROR,
+                own_properties,
             })?,
         })
     }
@@ -359,6 +402,7 @@ impl NativeFunction {
             + Sync
             + 'static,
     {
+        let own_properties = crate::object::alloc_object(heap)?;
         Ok(Self {
             inner: heap.alloc_old(NativeFunctionBody {
                 name,
@@ -369,6 +413,7 @@ impl NativeFunction {
                 name_property: default_name_property(),
                 length_property: default_length_property(),
                 metadata: NativeFunctionMetadata::BUILTIN,
+                own_properties,
             })?,
         })
     }
@@ -403,6 +448,12 @@ impl NativeFunction {
         heap.read_payload(self.inner, |body| body.length)
     }
 
+    /// Whether this native function has `[[Construct]]`.
+    #[must_use]
+    pub(crate) fn is_constructable(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.metadata.constructable)
+    }
+
     /// Return an own property descriptor for native function object
     /// metadata. Built-in `name` / `length` are non-writable,
     /// non-enumerable, configurable data properties.
@@ -416,7 +467,13 @@ impl NativeFunction {
             let property = match key {
                 "name" => &body.name_property,
                 "length" => &body.length_property,
-                _ => return Ok(None),
+                _ => {
+                    return Ok(crate::object::get_own_descriptor(
+                        body.own_properties,
+                        heap,
+                        key,
+                    ));
+                }
             };
             match property {
                 NativeOwnProperty::Builtin => {
@@ -433,18 +490,20 @@ impl NativeFunction {
     /// enumerable; overridden descriptors participate according to
     /// their current `[[Enumerable]]` flag.
     #[must_use]
-    pub(crate) fn enumerable_own_property_keys(
-        &self,
-        heap: &otter_gc::GcHeap,
-    ) -> Vec<&'static str> {
+    pub(crate) fn enumerable_own_property_keys(&self, heap: &otter_gc::GcHeap) -> Vec<String> {
         heap.read_payload(self.inner, |body| {
             let mut keys = Vec::new();
             if native_own_property_is_enumerable(&body.name_property, false) {
-                keys.push("name");
+                keys.push("name".to_string());
             }
             if native_own_property_is_enumerable(&body.length_property, false) {
-                keys.push("length");
+                keys.push("length".to_string());
             }
+            keys.extend(crate::object::with_properties(
+                body.own_properties,
+                heap,
+                |p| p.enumerable_keys().map(str::to_string).collect::<Vec<_>>(),
+            ));
             keys
         })
     }
@@ -452,15 +511,20 @@ impl NativeFunction {
     /// Return own string property keys in built-in function
     /// creation order: `length`, then `name`.
     #[must_use]
-    pub(crate) fn own_property_keys(&self, heap: &otter_gc::GcHeap) -> Vec<&'static str> {
+    pub(crate) fn own_property_keys(&self, heap: &otter_gc::GcHeap) -> Vec<String> {
         heap.read_payload(self.inner, |body| {
             let mut keys = Vec::new();
             if !matches!(body.length_property, NativeOwnProperty::Deleted) {
-                keys.push("length");
+                keys.push("length".to_string());
             }
             if !matches!(body.name_property, NativeOwnProperty::Deleted) {
-                keys.push("name");
+                keys.push("name".to_string());
             }
+            keys.extend(crate::object::with_properties(
+                body.own_properties,
+                heap,
+                |p| p.keys().map(str::to_string).collect::<Vec<_>>(),
+            ));
             keys
         })
     }
@@ -488,7 +552,10 @@ impl NativeFunction {
                 }
             }
             None if key == "name" || key == "length" => descriptor,
-            None => return false,
+            None => {
+                let obj = heap.read_payload(self.inner, |body| body.own_properties);
+                return crate::object::define_own_property(obj, heap, key, descriptor);
+            }
         };
         let barrier_descriptor = descriptor.clone();
         let success = heap.with_payload(self.inner, |body| {
@@ -508,6 +575,10 @@ impl NativeFunction {
 
     /// Delete a configurable own metadata property.
     pub(crate) fn delete_own_property(&self, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
+        if key != "name" && key != "length" {
+            let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
+            return crate::object::delete(own_properties, heap, key);
+        }
         heap.with_payload(self.inner, |body| {
             let slot = match key {
                 "name" => &mut body.name_property,
@@ -679,6 +750,31 @@ where
     native_value_with_captures_unchecked(heap, name, SmallVec::new(), call)
 }
 
+pub(crate) fn native_constructor_value_with_captures_unchecked<F>(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    captures: SmallVec<[Value; 4]>,
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    let own_properties = crate::object::alloc_object(heap)?;
+    Ok(Value::NativeFunction(NativeFunction {
+        inner: heap.alloc_old(NativeFunctionBody {
+            name,
+            length: 0,
+            call: NativeCallStorage::LocalDynamic(Rc::new(call)),
+            captures,
+            trace: None,
+            name_property: default_name_property(),
+            length_property: default_length_property(),
+            metadata: NativeFunctionMetadata::CONSTRUCTOR,
+            own_properties,
+        })?,
+    }))
+}
+
 pub(crate) fn native_value_with_captures_unchecked<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
@@ -688,6 +784,7 @@ pub(crate) fn native_value_with_captures_unchecked<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
+    let own_properties = crate::object::alloc_object(heap)?;
     Ok(Value::NativeFunction(NativeFunction {
         inner: heap.alloc_old(NativeFunctionBody {
             name,
@@ -698,6 +795,7 @@ where
             name_property: default_name_property(),
             length_property: default_length_property(),
             metadata: NativeFunctionMetadata::BUILTIN,
+            own_properties,
         })?,
     }))
 }
@@ -712,6 +810,7 @@ pub(crate) fn native_value_with_trace_unchecked<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
+    let own_properties = crate::object::alloc_object(heap)?;
     Ok(Value::NativeFunction(NativeFunction {
         inner: heap.alloc_old(NativeFunctionBody {
             name,
@@ -722,6 +821,7 @@ where
             name_property: default_name_property(),
             length_property: default_length_property(),
             metadata: NativeFunctionMetadata::BUILTIN,
+            own_properties,
         })?,
     }))
 }
@@ -773,6 +873,15 @@ pub enum NativeError {
     /// `VmError::TypeMismatch`.
     #[error("native function {name}: {reason}")]
     TypeError {
+        /// Display name of the native.
+        name: &'static str,
+        /// Short reason.
+        reason: String,
+    },
+    /// Syntax error reported by a native that performs dynamic
+    /// source compilation, such as the `Function` constructor.
+    #[error("native function {name}: {reason}")]
+    SyntaxError {
         /// Display name of the native.
         name: &'static str,
         /// Short reason.

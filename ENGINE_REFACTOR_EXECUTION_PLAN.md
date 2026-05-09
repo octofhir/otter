@@ -384,10 +384,10 @@ Next slice notes:
   `native_function.rs`).
 - [ ] Finalize native function metadata: name, length, constructability,
   receiver handling, and error label.
-- [ ] Confirm unmapped arguments-object semantics
+- [x] Confirm unmapped arguments-object semantics
   (`crates/otter-vm/src/arguments_object.rs`).
-- [ ] Confirm mapped arguments-object semantics under sloppy + simple-params.
-- [ ] Add tests for `Function.prototype.call/apply/bind` and constructor
+- [x] Confirm mapped arguments-object semantics under sloppy + simple-params.
+- [x] Add tests for `Function.prototype.call/apply/bind` and constructor
   behavior, including `bind` length/name composition and bound-target chain.
 
 Acceptance:

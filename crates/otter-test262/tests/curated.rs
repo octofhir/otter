@@ -100,6 +100,45 @@ fn pass_outcome_when_test_returns_normally() {
 }
 
 #[test]
+fn default_script_runs_without_forced_strict_prelude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let path = write_test(
+        &corpus,
+        "strictness/default-sloppy.js",
+        "/*---\ndescription: default script source is not rewritten to strict\n---*/\nassert.sameValue((function() { return this; })(), globalThis);\n",
+    );
+    let outcome = drive(&corpus, &path);
+    assert!(matches!(outcome, Outcome::Pass), "got {outcome:?}");
+}
+
+#[test]
+fn only_strict_flag_gets_strict_prelude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let path = write_test(
+        &corpus,
+        "strictness/only-strict.js",
+        "/*---\ndescription: onlyStrict runs under strict source\nflags: [onlyStrict]\n---*/\nassert.sameValue((function() { return this; })(), undefined);\n",
+    );
+    let outcome = drive(&corpus, &path);
+    assert!(matches!(outcome, Outcome::Pass), "got {outcome:?}");
+}
+
+#[test]
+fn no_strict_flag_runs_without_strict_prelude() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let path = write_test(
+        &corpus,
+        "strictness/no-strict.js",
+        "/*---\ndescription: noStrict runs as sloppy script\nflags: [noStrict]\n---*/\nassert.sameValue((function() { return this; })(), globalThis);\n",
+    );
+    let outcome = drive(&corpus, &path);
+    assert!(matches!(outcome, Outcome::Pass), "got {outcome:?}");
+}
+
+#[test]
 fn fail_outcome_when_assert_throws() {
     let tmp = tempfile::tempdir().unwrap();
     let corpus = synth_corpus(&tmp);

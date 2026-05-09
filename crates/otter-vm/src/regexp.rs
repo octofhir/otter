@@ -31,10 +31,13 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp-regular-expression-objects>
 
-use std::cell::Cell;
+use std::cell::RefCell;
 
 use otter_gc::raw::{RawGc, SlotVisitor};
 use regress::{Flags, Regex};
+
+use crate::Value;
+use crate::number::NumberValue;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsRegExpBody`].
 pub const REGEXP_BODY_TYPE_TAG: u8 = 0x1e;
@@ -183,15 +186,18 @@ pub struct JsRegExpBody {
     pub source: String,
     /// Parsed flag bits.
     pub flags: RegExpFlags,
-    /// `RegExp.prototype.lastIndex` — interior-mutable so methods
-    /// observe successive `g` / `y` walks.
-    pub last_index: Cell<u32>,
+    /// `RegExp.prototype.lastIndex` — a writable own data property.
+    /// RegExp execution coerces it numerically, but ordinary JS
+    /// reads/writes observe the exact stored value.
+    pub last_index: RefCell<Value>,
 }
 
 impl otter_gc::SafeTraceable for JsRegExpBody {
     const TYPE_TAG: u8 = REGEXP_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
+        self.last_index.borrow().trace_value_slots(visitor);
+    }
 }
 
 /// Cheap-to-clone JS regex handle.
@@ -234,7 +240,7 @@ impl JsRegExp {
                 pattern_utf16: pattern_utf16.to_vec(),
                 source,
                 flags,
-                last_index: Cell::new(0),
+                last_index: RefCell::new(Value::Number(NumberValue::from_i32(0))),
             })?,
         })
     }
@@ -282,13 +288,32 @@ impl JsRegExp {
     /// Read `lastIndex`.
     #[must_use]
     pub fn last_index(&self, heap: &otter_gc::GcHeap) -> u32 {
-        heap.read_payload(self.inner, |body| body.last_index.get())
+        heap.read_payload(self.inner, |body| {
+            last_index_to_u32(&body.last_index.borrow())
+        })
+    }
+
+    /// Read the JS-visible `lastIndex` data-property value.
+    #[must_use]
+    pub fn last_index_value(&self, heap: &otter_gc::GcHeap) -> Value {
+        heap.read_payload(self.inner, |body| body.last_index.borrow().clone())
     }
 
     /// Update `lastIndex`. Pattern-arg methods use this to step
     /// through successive `g` / `y` matches.
     pub fn set_last_index(&self, heap: &otter_gc::GcHeap, value: u32) {
-        heap.read_payload(self.inner, |body| body.last_index.set(value));
+        heap.read_payload(self.inner, |body| {
+            *body.last_index.borrow_mut() = Value::Number(NumberValue::from_f64(value as f64));
+        });
+    }
+
+    /// Store the JS-visible `lastIndex` data-property value.
+    pub fn set_last_index_value(&self, heap: &mut otter_gc::GcHeap, value: Value) {
+        let barrier_value = value.clone();
+        heap.read_payload(self.inner, |body| {
+            *body.last_index.borrow_mut() = value;
+        });
+        heap.record_write(self.inner, &barrier_value);
     }
 
     /// Identity comparison — two handles are equal iff they share
@@ -311,6 +336,27 @@ impl JsRegExp {
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = self as *const JsRegExp as *mut RawGc;
         visitor(p);
+    }
+}
+
+fn last_index_to_u32(value: &Value) -> u32 {
+    let raw = match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s
+            .to_lossy_string()
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(f64::NAN),
+        Value::Boolean(true) => 1.0,
+        Value::Boolean(false) | Value::Null => 0.0,
+        _ => f64::NAN,
+    };
+    if raw.is_nan() || raw <= 0.0 {
+        0
+    } else if raw > u32::MAX as f64 {
+        u32::MAX
+    } else {
+        raw.trunc() as u32
     }
 }
 

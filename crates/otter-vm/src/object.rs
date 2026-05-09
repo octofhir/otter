@@ -65,9 +65,11 @@ use std::rc::Rc;
 
 use smallvec::SmallVec;
 
-use crate::Value;
+use crate::number::NumberValue;
+use crate::proxy::JsProxy;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
+use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 mod descriptor_core;
@@ -81,6 +83,17 @@ mod key_order;
 pub trait HostObjectData: Any {}
 
 impl<T: Any> HostObjectData for T {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MappedArgumentEntry {
+    pub(crate) key: String,
+    pub(crate) cell: UpvalueCell,
+}
+
+#[derive(Debug)]
+struct MappedArgumentsData {
+    entries: Box<[MappedArgumentEntry]>,
+}
 
 /// Host object access failure.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -97,6 +110,61 @@ pub enum HostObjectError {
         /// Stored Rust type.
         found: &'static str,
     },
+}
+
+/// Legal `[[Prototype]]` slot values.
+#[derive(Debug, Clone)]
+pub enum ObjectPrototype {
+    /// `null` prototype.
+    Null,
+    /// Ordinary object prototype.
+    Object(JsObject),
+    /// Non-ordinary object-like prototype represented outside
+    /// [`JsObject`], such as a function value.
+    Value(Value),
+    /// Proxy object prototype.
+    Proxy(JsProxy),
+}
+
+impl ObjectPrototype {
+    fn as_value(&self) -> Option<Value> {
+        match self {
+            Self::Null => None,
+            Self::Object(obj) => Some(Value::Object(*obj)),
+            Self::Value(value) => Some(value.clone()),
+            Self::Proxy(proxy) => Some(Value::Proxy(proxy.clone())),
+        }
+    }
+}
+
+fn is_prototype_object_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::Promise(_)
+            | Value::Iterator(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::Temporal(_)
+            | Value::Date(_)
+            | Value::Intl(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Generator(_)
+            | Value::Proxy(_)
+    )
 }
 
 // ---------- property attribute flags ---------------------------------------
@@ -547,18 +615,6 @@ thread_local! {
 /// Distinct from `UPVALUE_CELL_TYPE_TAG = 0x10` (task 76).
 pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 
-/// Reserved property key that materialises a JsObject's
-/// `[[Construct]]` (and, transitively, `[[Call]]`) internal method
-/// when the object stands in for a callable+constructable built-in
-/// (e.g. the `Number` global). The dispatcher reads this slot
-/// before falling back to ordinary property lookup, so a plain
-/// `Value::Object` can serve as the `Op::New` / `Op::Call` callee
-/// without a separate `Rc`-shared variant. Stored as a
-/// `Value::NativeFunction`; the native body inspects
-/// `NativeCtx::is_construct_call()` to differentiate the call
-/// shape (per ECMA-262 §10.3).
-pub const CONSTRUCTOR_NATIVE_SLOT_KEY: &str = "__construct__";
-
 /// GC-allocated storage backing every [`JsObject`] handle.
 ///
 /// Per ECMA-262 §10.1, ordinary objects carry a hidden-class
@@ -588,13 +644,27 @@ pub struct ObjectBody {
     /// the GC can yield to its scavenger / marker (`Option<u32>`
     /// has no niche and the discriminant offset would not give a
     /// `RawGc`-aligned slot).
-    prototype: JsObject,
+    prototype: ObjectPrototype,
     /// Symbol-keyed own properties. Stored outside the string-keyed
     /// shape because symbols are identity keys, but values still use
     /// the same descriptor slot representation.
     symbol_props: Vec<(JsSymbol, PropertySlot)>,
-    /// Rust-owned payload for host-backed objects.
+    /// Rust-owned payload for host-backed objects and VM-internal
+    /// exotic side data.
     host_data: Option<Box<dyn Any>>,
+    /// Native `[[Call]]` implementation for builtin ordinary
+    /// objects that are callable without using a `Value::NativeFunction`
+    /// as their public representation.
+    call_native: Option<Value>,
+    /// Native `[[Construct]]` implementation for constructor-shaped
+    /// builtin objects such as `Number` and `Boolean`.
+    constructor_native: Option<Value>,
+    /// `[[BooleanData]]` internal slot for Boolean wrapper objects.
+    boolean_data: Option<bool>,
+    /// `[[NumberData]]` internal slot for Number wrapper objects.
+    number_data: Option<NumberValue>,
+    /// `[[StringData]]` internal slot for String wrapper objects.
+    string_data: Option<JsString>,
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
     extensible: bool,
@@ -605,9 +675,25 @@ impl std::fmt::Debug for ObjectBody {
         f.debug_struct("ObjectBody")
             .field("shape_len", &self.shape.len())
             .field("slot_count", &self.slots.len())
-            .field("has_prototype", &!self.prototype.is_null())
+            .field(
+                "has_prototype",
+                &!matches!(self.prototype, ObjectPrototype::Null),
+            )
             .field("symbol_props", &self.symbol_props.len())
             .field("has_host_data", &self.host_data.is_some())
+            .field(
+                "mapped_arguments",
+                &self
+                    .host_data
+                    .as_ref()
+                    .and_then(|data| data.downcast_ref::<MappedArgumentsData>())
+                    .map_or(0, |data| data.entries.len()),
+            )
+            .field("has_call_native", &self.call_native.is_some())
+            .field("has_constructor_native", &self.constructor_native.is_some())
+            .field("has_boolean_data", &self.boolean_data.is_some())
+            .field("has_number_data", &self.number_data.is_some())
+            .field("has_string_data", &self.string_data.is_some())
             .field("extensible", &self.extensible)
             .finish()
     }
@@ -625,13 +711,18 @@ impl otter_gc::SafeTraceable for ObjectBody {
     /// [`Shape`] is `Rc`-shared, not GC-managed, so they are not
     /// traced — see the type doc on [`ObjectBody`].
     fn trace_slots_safe(&self, v: &mut SlotVisitor<'_>) {
-        // Prototype: `Gc<ObjectBody>` (null ≡ no prototype).
-        // `Gc<T>` is `#[repr(transparent)]` over `u32`, so the
-        // field's storage address is a `*mut RawGc` slot the
-        // scavenger may rewrite.
-        if !self.prototype.is_null() {
-            let p = &self.prototype as *const JsObject as *mut RawGc;
-            v(p);
+        match &self.prototype {
+            ObjectPrototype::Null => {}
+            ObjectPrototype::Object(proto) => {
+                let p = proto as *const JsObject as *mut RawGc;
+                v(p);
+            }
+            ObjectPrototype::Value(value) => {
+                value.trace_value_slots(v);
+            }
+            ObjectPrototype::Proxy(proxy) => {
+                proxy.trace_value_slots(v);
+            }
         }
         // Property slots.
         for slot in self.slots.iter() {
@@ -659,6 +750,22 @@ impl otter_gc::SafeTraceable for ObjectBody {
                         s.trace_value_slots(v);
                     }
                 }
+            }
+        }
+        if let Some(native) = &self.call_native {
+            native.trace_value_slots(v);
+        }
+        if let Some(native) = &self.constructor_native {
+            native.trace_value_slots(v);
+        }
+        if let Some(data) = self
+            .host_data
+            .as_ref()
+            .and_then(|data| data.downcast_ref::<MappedArgumentsData>())
+        {
+            for entry in data.entries.iter() {
+                let p = &entry.cell as *const UpvalueCell as *mut RawGc;
+                v(p);
             }
         }
     }
@@ -701,9 +808,14 @@ pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::O
     heap.alloc_old(ObjectBody {
         shape,
         slots: SmallVec::new(),
-        prototype: otter_gc::Gc::null(),
+        prototype: ObjectPrototype::Null,
         symbol_props: Vec::new(),
         host_data: None,
+        call_native: None,
+        constructor_native: None,
+        boolean_data: None,
+        number_data: None,
+        string_data: None,
         extensible: true,
     })
 }
@@ -731,9 +843,14 @@ pub fn alloc_diagnostic_object(
     heap.alloc_old_diagnostic(ObjectBody {
         shape,
         slots: SmallVec::new(),
-        prototype: otter_gc::Gc::null(),
+        prototype: ObjectPrototype::Null,
         symbol_props: Vec::new(),
         host_data: None,
+        call_native: None,
+        constructor_native: None,
+        boolean_data: None,
+        number_data: None,
+        string_data: None,
         extensible: true,
     })
 }
@@ -752,9 +869,14 @@ pub fn alloc_host_object<T: HostObjectData>(
     heap.alloc_old(ObjectBody {
         shape,
         slots: SmallVec::new(),
-        prototype: otter_gc::Gc::null(),
+        prototype: ObjectPrototype::Null,
         symbol_props: Vec::new(),
         host_data: Some(Box::new(data)),
+        call_native: None,
+        constructor_native: None,
+        boolean_data: None,
+        number_data: None,
+        string_data: None,
         extensible: true,
     })
 }
@@ -783,6 +905,54 @@ pub fn alloc_object_with_proto(
     Ok(obj)
 }
 
+pub(crate) fn install_mapped_arguments(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    entries: Vec<MappedArgumentEntry>,
+) {
+    heap.with_payload(obj, |body| {
+        if !entries.is_empty() {
+            body.host_data = Some(Box::new(MappedArgumentsData {
+                entries: entries.into_boxed_slice(),
+            }));
+        }
+    });
+}
+
+fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<UpvalueCell> {
+    body.host_data
+        .as_ref()?
+        .downcast_ref::<MappedArgumentsData>()?
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.cell)
+}
+
+fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
+    let Some(data) = body.host_data.take() else {
+        return;
+    };
+    match data.downcast::<MappedArgumentsData>() {
+        Ok(mapped) => {
+            let retained: Vec<_> = mapped
+                .entries
+                .into_vec()
+                .into_iter()
+                .filter(|entry| entry.key != key)
+                .collect();
+            if !retained.is_empty() {
+                body.host_data = Some(Box::new(MappedArgumentsData {
+                    entries: retained.into_boxed_slice(),
+                }));
+            }
+        }
+        Err(other) => {
+            body.host_data = Some(other);
+        }
+    }
+}
+
 // ---------- read accessors -----------------------------------------------
 
 /// Number of own (string-keyed) properties.
@@ -808,6 +978,9 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
     heap.read_payload(obj, |body| {
+        if let Some(cell) = mapped_argument_cell(body, key) {
+            return Some(read_upvalue(heap, cell));
+        }
         body.shape
             .offset_of(key)
             .map(|offset| match &body.slots[offset as usize].body {
@@ -844,7 +1017,15 @@ pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
 #[must_use]
 pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
     heap.read_payload(obj, |body| match body.shape.offset_of(key) {
-        Some(offset) => body.slots[offset as usize].to_lookup(),
+        Some(offset) => {
+            let mut lookup = body.slots[offset as usize].to_lookup();
+            if let Some(cell) = mapped_argument_cell(body, key)
+                && let PropertyLookup::Data { value, .. } = &mut lookup
+            {
+                *value = read_upvalue(heap, cell);
+            }
+            lookup
+        }
         None => PropertyLookup::Absent,
     })
 }
@@ -891,9 +1072,15 @@ pub fn get_own_descriptor(
     key: &str,
 ) -> Option<PropertyDescriptor> {
     heap.read_payload(obj, |body| {
-        body.shape
-            .offset_of(key)
-            .map(|offset| body.slots[offset as usize].to_descriptor())
+        body.shape.offset_of(key).map(|offset| {
+            let mut descriptor = body.slots[offset as usize].to_descriptor();
+            if let Some(cell) = mapped_argument_cell(body, key)
+                && let DescriptorKind::Data { value } = &mut descriptor.kind
+            {
+                *value = read_upvalue(heap, cell);
+            }
+            descriptor
+        })
     })
 }
 
@@ -903,13 +1090,16 @@ pub fn get_own_descriptor(
 /// (the in-payload encoding for JS `null`).
 #[must_use]
 pub fn prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
-    heap.read_payload(obj, |body| {
-        if body.prototype.is_null() {
-            None
-        } else {
-            Some(body.prototype)
-        }
+    heap.read_payload(obj, |body| match &body.prototype {
+        ObjectPrototype::Object(proto) => Some(*proto),
+        ObjectPrototype::Null | ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => None,
     })
+}
+
+/// Borrow the current prototype as a JS value, if any.
+#[must_use]
+pub fn prototype_value(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
+    heap.read_payload(obj, |body| body.prototype.as_value())
 }
 
 /// `true` when `obj` has `target` somewhere in its prototype chain.
@@ -1035,6 +1225,77 @@ pub fn get_own_symbol_descriptor(
             .find(|(k, _)| k.ptr_eq(key))
             .map(|(_, slot)| slot.to_descriptor())
     })
+}
+
+/// Store the internal native `[[Call]]` slot for callable ordinary
+/// objects.
+pub fn set_call_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
+    heap.with_payload(obj, |body| {
+        body.call_native = Some(native.clone());
+    });
+    heap.record_write(obj, &native);
+}
+
+/// Read the internal native `[[Call]]` slot.
+#[must_use]
+pub fn call_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
+    heap.read_payload(obj, |body| body.call_native.clone())
+}
+
+/// Store the internal native `[[Construct]]` slot for constructor-shaped
+/// builtin objects. Current builtin constructor objects are callable
+/// too, so this also installs the same callback as `[[Call]]`.
+pub fn set_constructor_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
+    heap.with_payload(obj, |body| {
+        body.call_native = Some(native.clone());
+        body.constructor_native = Some(native.clone());
+    });
+    heap.record_write(obj, &native);
+}
+
+/// Read the internal native `[[Construct]]` slot.
+#[must_use]
+pub fn constructor_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
+    heap.read_payload(obj, |body| body.constructor_native.clone())
+}
+
+/// Store the `[[BooleanData]]` internal slot for a Boolean wrapper.
+pub fn set_boolean_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: bool) {
+    heap.with_payload(obj, |body| {
+        body.boolean_data = Some(value);
+    });
+}
+
+/// Read the `[[BooleanData]]` internal slot for a Boolean wrapper.
+#[must_use]
+pub fn boolean_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<bool> {
+    heap.read_payload(obj, |body| body.boolean_data)
+}
+
+/// Store the `[[NumberData]]` internal slot for a Number wrapper.
+pub fn set_number_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: NumberValue) {
+    heap.with_payload(obj, |body| {
+        body.number_data = Some(value);
+    });
+}
+
+/// Read the `[[NumberData]]` internal slot for a Number wrapper.
+#[must_use]
+pub fn number_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<NumberValue> {
+    heap.read_payload(obj, |body| body.number_data)
+}
+
+/// Store the `[[StringData]]` internal slot for a String wrapper.
+pub fn set_string_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: JsString) {
+    heap.with_payload(obj, |body| {
+        body.string_data = Some(value);
+    });
+}
+
+/// Read the `[[StringData]]` internal slot for a String wrapper.
+#[must_use]
+pub fn string_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
+    heap.read_payload(obj, |body| body.string_data.clone())
 }
 
 /// Borrow typed host data attached to `obj`.
@@ -1201,21 +1462,49 @@ pub fn ordinary_set_data_property(
     key: &str,
     value: Value,
 ) -> bool {
-    descriptor_core::ordinary_set_data_property(obj, heap, key, value)
+    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
+    let success = descriptor_core::ordinary_set_data_property(obj, heap, key, value.clone());
+    if success && let Some(cell) = mapped_cell {
+        store_upvalue(heap, cell, value);
+    }
+    success
 }
 
-/// Replace the prototype. `None` detaches the chain (encoded as
-/// [`otter_gc::Gc::null()`] inside the body).
+/// Replace the prototype with a spec-legal value. `None` or
+/// `Some(Value::Null)` detaches the chain.
 ///
 /// # Spec
 ///
 /// - <https://tc39.es/ecma262/#sec-ordinarysetprototypeof>
-pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<JsObject>) {
-    let new_proto = proto.unwrap_or_else(otter_gc::Gc::null);
+pub fn set_prototype_value(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) -> bool {
+    let new_proto = match proto {
+        Some(Value::Object(proto)) => ObjectPrototype::Object(proto),
+        Some(Value::Proxy(proxy)) => ObjectPrototype::Proxy(proxy),
+        Some(Value::Null) | None => ObjectPrototype::Null,
+        Some(value) if is_prototype_object_value(&value) => ObjectPrototype::Value(value),
+        _ => return false,
+    };
+    let barrier_value = new_proto.as_value();
     heap.with_payload(obj, |body| {
         body.prototype = new_proto;
     });
-    heap.record_write(obj, &new_proto);
+    if let Some(value) = &barrier_value {
+        heap.record_write(obj, value);
+    }
+    true
+}
+
+/// Replace the prototype with an ordinary object or `null`.
+///
+/// This compatibility helper preserves existing call sites that do
+/// not need Proxy-as-prototype support.
+pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<JsObject>) {
+    let value = proto.map(Value::Object);
+    set_prototype_value(obj, heap, value);
 }
 
 /// Remove an own property. Per ECMA-262 §10.1.10 OrdinaryDelete:
@@ -1245,6 +1534,7 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
             offsets: OnceCell::new(),
             transitions: Cell::new(HashMap::new()),
         });
+        remove_mapped_argument(body, key);
         true
     })
 }
@@ -1307,6 +1597,7 @@ pub fn define_own_property(
     descriptor: PropertyDescriptor,
 ) -> bool {
     let barrier_descriptor = descriptor.clone();
+    let map_descriptor = descriptor.clone();
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = body.shape.offset_of(key) {
             let existing = body.slots[offset as usize].clone();
@@ -1328,6 +1619,20 @@ pub fn define_own_property(
         }
     });
     if success {
+        let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
+        if let Some(cell) = mapped_cell {
+            match &map_descriptor.kind {
+                DescriptorKind::Data { value } => {
+                    store_upvalue(heap, cell, value.clone());
+                    if !map_descriptor.writable() {
+                        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+                    }
+                }
+                DescriptorKind::Accessor { .. } => {
+                    heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+                }
+            }
+        }
         heap.record_write(obj, &barrier_descriptor);
     }
     success

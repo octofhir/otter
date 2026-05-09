@@ -25,6 +25,7 @@ use std::rc::Rc;
 
 use crate::Value;
 use crate::object::JsObject;
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Cheap-to-clone Proxy handle.
 #[derive(Debug, Clone)]
@@ -108,6 +109,14 @@ impl JsProxy {
     #[must_use]
     pub fn identity_addr(&self) -> *const () {
         Rc::as_ptr(&self.inner).cast()
+    }
+
+    /// Trace GC handles reachable from the proxy's target and
+    /// handler slots.
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        self.inner.target.trace_value_slots(visitor);
+        let p = &self.inner.handler as *const JsObject as *mut RawGc;
+        visitor(p);
     }
 }
 

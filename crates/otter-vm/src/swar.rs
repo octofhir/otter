@@ -263,7 +263,10 @@ mod tests {
             let needle = (state >> 24) as u8;
             for from in 0..=buf.len() {
                 let swar = find_byte(&buf, needle, from);
-                let scalar = buf[from..].iter().position(|&b| b == needle).map(|p| p + from);
+                let scalar = buf[from..]
+                    .iter()
+                    .position(|&b| b == needle)
+                    .map(|p| p + from);
                 assert_eq!(swar, scalar, "needle={needle:#x} from={from}");
             }
         }
@@ -403,7 +406,10 @@ mod tests {
             let needle = (state >> 16) as u16;
             for from in 0..=buf.len() {
                 let swar = find_u16(&buf, needle, from);
-                let scalar = buf[from..].iter().position(|&u| u == needle).map(|p| p + from);
+                let scalar = buf[from..]
+                    .iter()
+                    .position(|&u| u == needle)
+                    .map(|p| p + from);
                 assert_eq!(swar, scalar, "needle={needle:#x} from={from}");
             }
         }

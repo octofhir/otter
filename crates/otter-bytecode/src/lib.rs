@@ -270,6 +270,10 @@ pub enum Op {
     /// Module top level binds `this` to `undefined` (foundation
     /// strict default).
     LoadThis,
+    /// `r<dst> = current constructor call's `new.target`, or
+    /// `undefined` when the active frame was not entered through
+    /// `[[Construct]]`. Operand: `dst`.
+    LoadNewTarget,
     /// Throw `r<src>` as an exception. Operand: `Register(src)`.
     /// Walks the frame's handler stack; on miss, pops the frame and
     /// continues the search in the caller. An exception that
@@ -519,17 +523,17 @@ pub enum Op {
     LoadGlobalOrThrow,
 
     /// `r<dst> = arguments` — materialise the current frame's
-    /// incoming argument list as an unmapped arguments object. Operand:
+    /// incoming argument list as an arguments object. Operand:
     /// `Register(dst)`. The dispatcher populates `frame.incoming_args`
     /// at call entry only when the callee was compiled with
     /// `needs_arguments = true`, so this opcode is only emitted
-    /// inside such functions. The object exposes indexed own data
-    /// properties, a non-enumerable `length`, and a restricted
-    /// `callee` accessor.
+    /// inside such functions. The function metadata decides whether
+    /// the object is strict/unmapped or sloppy/simple mapped.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-arguments-exotic-objects>
-    /// (foundation lowers the unmapped variant for strict-mode
-    /// scripts).
+    /// (strict functions, non-simple parameter lists, and arrows use
+    /// the unmapped variant; sloppy simple-parameter functions may
+    /// expose mapped indexed properties).
     CollectArguments,
 
     /// `r<dst> = globalThis[const<name>]` returning `undefined` when
@@ -1005,6 +1009,7 @@ impl Op {
             Op::CallWithThis => "CALL_WITH_THIS",
             Op::BindFunction => "BIND_FUNCTION",
             Op::LoadThis => "LOAD_THIS",
+            Op::LoadNewTarget => "LOAD_NEW_TARGET",
             Op::Throw => "THROW",
             Op::EnterTry => "ENTER_TRY",
             Op::LeaveTry => "LEAVE_TRY",
@@ -1135,6 +1140,7 @@ impl Op {
             | Op::LoadTrue
             | Op::LoadFalse
             | Op::LoadThis
+            | Op::LoadNewTarget
             | Op::Return
             | Op::ReturnValue
             | Op::Jump
@@ -1226,34 +1232,34 @@ impl Op {
             Op::LoadElement | Op::DeleteElement => 3,
             // recv, key, src, scratch_dst for accessor setters.
             Op::StoreElement => 4,
-            Op::CallMethodValue => 4,       // dst, recv, name_const, argc
-            Op::MathCall => 3,              // dst, name_const, argc — args follow
-            Op::JsonCall => 3,              // dst, name_const, argc — args follow
-            Op::SymbolCall => 3,            // dst, name_const, argc — args follow
-            Op::ObjectCall => 3,            // dst, name_const, argc — args follow
+            Op::CallMethodValue => 4, // dst, recv, name_const, argc
+            Op::MathCall => 3,        // dst, name_const, argc — args follow
+            Op::JsonCall => 3,        // dst, name_const, argc — args follow
+            Op::SymbolCall => 3,      // dst, name_const, argc — args follow
+            Op::ObjectCall => 3,      // dst, name_const, argc — args follow
             // dst, argc — args follow as `Register(arg0)…`.
             Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
-            Op::BigIntCall => 3,            // dst, name_const, argc — args follow
-            Op::DateCall => 3,              // dst, name_const, argc — args follow
-            Op::StringCall => 3,            // dst, name_const, argc — args follow
-            Op::GlobalCall => 3,            // dst, name_const, argc — args follow
-            Op::ArrayBufferCall => 3,       // dst, name_const, argc — args follow
-            Op::DataViewCall => 3,          // dst, name_const, argc — args follow
-            Op::TypedArrayCall => 4,        // dst, kind_const, name_const, argc — args follow
-            Op::IteratorCall => 3,          // dst, name_const, argc — args follow
-            Op::Yield => 2,                 // dst, src
-            Op::ReflectCall => 3,           // dst, name_const, argc — args follow
-            Op::ProxyCall => 3,             // dst, name_const, argc — args follow
+            Op::BigIntCall => 3,      // dst, name_const, argc — args follow
+            Op::DateCall => 3,        // dst, name_const, argc — args follow
+            Op::StringCall => 3,      // dst, name_const, argc — args follow
+            Op::GlobalCall => 3,      // dst, name_const, argc — args follow
+            Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
+            Op::DataViewCall => 3,    // dst, name_const, argc — args follow
+            Op::TypedArrayCall => 4,  // dst, kind_const, name_const, argc — args follow
+            Op::IteratorCall => 3,    // dst, name_const, argc — args follow
+            Op::Yield => 2,           // dst, src
+            Op::ReflectCall => 3,     // dst, name_const, argc — args follow
+            Op::ProxyCall => 3,       // dst, name_const, argc — args follow
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
-            Op::AtomicsCall => 3,           // dst, name_const, argc — args follow
-            Op::NewFunction => 2,           // dst, argc — args follow
-            Op::TemporalCall => 4,          // dst, class_const, method_const, argc — args follow
-            Op::NewIntl => 4,               // dst, class_const, locale_reg, options_reg
-            Op::QueueMicrotask => 2,        // callee, argc — args follow
-            Op::PromiseNew => 3,            // dst, executor_reg, scratch_dst
-            Op::PromiseCall => 3,           // dst, name_const, argc — args follow
-            Op::Call | Op::New => 3,        // dst, callee, argc — args follow
-            Op::MakeClass => 4,             // dst, ctor, prototype, statics
+            Op::AtomicsCall => 3,     // dst, name_const, argc — args follow
+            Op::NewFunction => 2,     // dst, argc — args follow
+            Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
+            Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
+            Op::QueueMicrotask => 2,  // callee, argc — args follow
+            Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
+            Op::PromiseCall => 3,     // dst, name_const, argc — args follow
+            Op::Call | Op::New => 3,  // dst, callee, argc — args follow
+            Op::MakeClass => 4,       // dst, ctor, prototype, statics
             // dst, callee, this, argc — args follow.
             Op::CallWithThis | Op::BindFunction => 4,
             // catch_offset, finally_offset, exc_dst.
@@ -1345,6 +1351,13 @@ pub struct Function {
     /// and parent-passed captures follow.
     #[serde(default)]
     pub own_upvalue_count: u16,
+    /// `true` when this compiled function body executes as strict
+    /// ECMAScript code. The compiler sets this from the source type
+    /// and directive prologue; runtime call setup reads it for
+    /// observable strict/sloppy semantics such as `this` binding and
+    /// `arguments` object shape.
+    #[serde(default)]
+    pub is_strict: bool,
     /// `true` when this record is an arrow function. Arrow bodies
     /// inherit the enclosing function's `this` lexically, so
     /// `MakeClosure` snapshots the current frame's `this` into the
@@ -1422,6 +1435,19 @@ pub struct Function {
     /// [`Op::CollectArguments`] can wrap it as an Array.
     #[serde(default)]
     pub needs_arguments: bool,
+    /// Arguments object shape requested by the compiler for this
+    /// function. Strict functions, arrows, and non-simple parameter
+    /// lists stay unmapped. Sloppy functions with simple parameters
+    /// and a body reference to `arguments` may use the mapped form.
+    #[serde(default)]
+    pub arguments_object_kind: ArgumentsObjectKind,
+    /// Indexed argument-to-parameter bindings for the sloppy mapped
+    /// arguments object. Entries are in source parameter order after
+    /// duplicate-name filtering: duplicate simple parameters keep
+    /// only the last matching binding per ECMA-262
+    /// CreateMappedArgumentsObject.
+    #[serde(default)]
+    pub mapped_argument_bindings: Vec<MappedArgumentBinding>,
     /// The source-module URL this function belongs to (e.g.
     /// `"file:///path/to/other.ts"`), recorded by the linker
     /// during module-fragment merging. The runtime threads this
@@ -1436,6 +1462,44 @@ pub struct Function {
     pub code: Vec<Instruction>,
     /// `pc -> source span` table.
     pub spans: Vec<SpanEntry>,
+}
+
+/// Runtime shape for a materialised `arguments` object.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgumentsObjectKind {
+    /// Strict/unmapped arguments object.
+    #[default]
+    Unmapped,
+    /// Sloppy simple-parameter mapped arguments object.
+    Mapped,
+}
+
+/// One argument index aliased to one formal parameter binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MappedArgumentBinding {
+    /// Argument object index, stored as a decimal string property at runtime.
+    pub argument_index: u16,
+    /// Source formal name, retained for bytecode dumps and audits.
+    pub formal_name: String,
+    /// Storage backing the parameter binding.
+    pub storage: ArgumentBindingStorage,
+}
+
+/// Storage location for a mapped formal parameter binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgumentBindingStorage {
+    /// Parameter lives in a frame register.
+    Register {
+        /// Frame register index.
+        reg: u16,
+    },
+    /// Parameter lives in one of the frame's own upvalue cells.
+    Upvalue {
+        /// Frame upvalue-cell index.
+        idx: u16,
+    },
 }
 
 /// Source-language flavor.

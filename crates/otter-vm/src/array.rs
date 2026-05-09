@@ -333,6 +333,34 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
     })
 }
 
+/// Delete a string-keyed own property from an array exotic.
+#[must_use]
+pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
+    if key == "length" {
+        return false;
+    }
+    if let Ok(idx) = key.parse::<usize>() {
+        return heap.with_payload(arr, |body| {
+            if let Some(slot) = body.elements.get_mut(idx) {
+                *slot = Value::Hole;
+                body.dirty = true;
+                return true;
+            }
+            if let Some(sparse) = body.sparse_elements.as_mut() {
+                sparse.remove(&idx);
+            }
+            true
+        });
+    }
+    heap.with_payload(arr, |body| {
+        if let Some(props) = body.named_properties.as_mut() {
+            props.remove(key);
+        }
+        body.dirty = true;
+        true
+    })
+}
+
 /// Read-only access to dense elements for call sites that need to
 /// derive an aggregate result without exposing the body borrow.
 pub fn with_elements<R>(arr: JsArray, heap: &otter_gc::GcHeap, f: impl FnOnce(&[Value]) -> R) -> R {
@@ -402,10 +430,7 @@ pub fn clean_source_bytes(arr: JsArray, heap: &otter_gc::GcHeap) -> Option<Arc<[
 fn is_render_stable_primitive(v: &Value) -> bool {
     matches!(
         v,
-        Value::Null
-            | Value::Boolean(_)
-            | Value::Number(_)
-            | Value::String(_)
+        Value::Null | Value::Boolean(_) | Value::Number(_) | Value::String(_)
     )
 }
 
@@ -639,9 +664,8 @@ mod tests {
         // the captured `[…]` slice stale.
         let inner = alloc_array(&mut heap).unwrap();
         let bytes: Arc<[u8]> = Arc::from(&b"[[]]"[..]);
-        let outer =
-            from_elements_with_source(&mut heap, [Value::Array(inner)], Arc::clone(&bytes))
-                .unwrap();
+        let outer = from_elements_with_source(&mut heap, [Value::Array(inner)], Arc::clone(&bytes))
+            .unwrap();
         assert!(clean_source_bytes(outer, &heap).is_none());
     }
 

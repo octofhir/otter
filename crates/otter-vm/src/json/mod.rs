@@ -186,11 +186,9 @@ fn native_json_call(
 ) -> Result<Value, NativeError> {
     let interp = ctx.interp_mut();
     let string_heap = interp.string_heap.clone();
-    call(method, args, &string_heap, interp.gc_heap_mut()).map_err(|err| {
-        NativeError::TypeError {
-            name: method.name(),
-            reason: err.to_string(),
-        }
+    call(method, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
+        name: method.name(),
+        reason: err.to_string(),
     })
 }
 
@@ -310,7 +308,9 @@ mod tests {
         let sheap = StringHeap::default();
         let parsed = parse("[1,2,3]", &sheap, &mut heap).unwrap();
         let opts = StringifyOptions::from_space(&Value::Number(NumberValue::from_i32(2))).unwrap();
-        let s = stringify_with_options(&parsed, &opts, &heap).unwrap().unwrap();
+        let s = stringify_with_options(&parsed, &opts, &heap)
+            .unwrap()
+            .unwrap();
         // Pretty output must reflect the indent setting, proving we
         // did not short-circuit through the captured raw bytes.
         assert_eq!(s, "[\n  1,\n  2,\n  3\n]");

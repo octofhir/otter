@@ -52,7 +52,7 @@ The shape is:
 timeout_secs = 10
 max_heap_bytes_per_test = 536870912
 skip_features = ["Atomics", "SharedArrayBuffer", ...]
-skip_flags = ["noStrict"]
+skip_flags = []
 ignored_tests = ["staging/sm/Math", ...]
 known_panics = ["S15.10.2.8_A3_T15", ...]
 ```

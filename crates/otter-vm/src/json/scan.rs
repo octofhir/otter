@@ -80,9 +80,7 @@ pub(crate) fn find_first_escape(bytes: &[u8], start: usize) -> usize {
             .try_into()
             .expect("8-byte window is exactly 8 bytes");
         let chunk = u64::from_le_bytes(chunk_bytes);
-        let mask = byte_eq_mask(chunk, b'"')
-            | byte_eq_mask(chunk, b'\\')
-            | byte_lt_20_mask(chunk);
+        let mask = byte_eq_mask(chunk, b'"') | byte_eq_mask(chunk, b'\\') | byte_lt_20_mask(chunk);
         if mask != 0 {
             // Lowest-numbered byte in the LE chunk corresponds to
             // `bytes[i]`; trailing_zeros / 8 gives its offset.

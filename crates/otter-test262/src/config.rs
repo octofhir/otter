@@ -34,9 +34,10 @@ pub struct Test262Config {
     /// `Skipped(<feature>)`.
     pub skip_features: Vec<String>,
 
-    /// `flags:` tokens whose tests are reported as skipped. Used
-    /// for policy decisions such as keeping sloppy-only `noStrict`
-    /// tests out of the active strict-mode conformance profile.
+    /// `flags:` tokens whose tests are reported as skipped. This is
+    /// a generic escape hatch for unsupported host/test modes; the
+    /// runner itself honors Test262 strictness flags instead of
+    /// filtering them.
     pub skip_flags: Vec<String>,
 
     /// Test-path substrings whose matching tests skip with reason

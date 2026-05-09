@@ -103,7 +103,13 @@ pub(crate) fn bound_own_property_descriptor(
         let property = match key {
             "name" => &body.name_property,
             "length" => &body.length_property,
-            _ => return Ok(None),
+            _ => {
+                return Ok(object::get_own_descriptor(
+                    body.own_properties,
+                    gc_heap,
+                    key,
+                ));
+            }
         };
         match property {
             BoundFunctionMetadataProperty::Builtin => {
@@ -120,15 +126,21 @@ pub(crate) fn bound_own_property_descriptor(
 pub(crate) fn bound_own_property_keys(
     bound: &BoundFunction,
     gc_heap: &otter_gc::GcHeap,
-) -> Vec<&'static str> {
+) -> Vec<String> {
     gc_heap.read_payload(bound.inner, |body| {
         let mut keys = Vec::new();
         if !matches!(body.length_property, BoundFunctionMetadataProperty::Deleted) {
-            keys.push("length");
+            keys.push("length".to_string());
         }
         if !matches!(body.name_property, BoundFunctionMetadataProperty::Deleted) {
-            keys.push("name");
+            keys.push("name".to_string());
         }
+        keys.extend(object::with_properties(body.own_properties, gc_heap, |p| {
+            p.keys()
+                .filter(|key| *key != "name" && *key != "length")
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>()
+        }));
         keys
     })
 }
@@ -138,15 +150,21 @@ pub(crate) fn bound_own_property_keys(
 pub(crate) fn bound_enumerable_own_property_keys(
     bound: &BoundFunction,
     gc_heap: &otter_gc::GcHeap,
-) -> Vec<&'static str> {
+) -> Vec<String> {
     gc_heap.read_payload(bound.inner, |body| {
         let mut keys = Vec::new();
         if bound_metadata_property_is_enumerable(&body.length_property, false) {
-            keys.push("length");
+            keys.push("length".to_string());
         }
         if bound_metadata_property_is_enumerable(&body.name_property, false) {
-            keys.push("name");
+            keys.push("name".to_string());
         }
+        keys.extend(object::with_properties(body.own_properties, gc_heap, |p| {
+            p.enumerable_keys()
+                .filter(|key| *key != "name" && *key != "length")
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>()
+        }));
         keys
     })
 }
@@ -161,7 +179,11 @@ pub(crate) fn bound_own_property_is_enumerable(
     gc_heap.read_payload(bound.inner, |body| match key {
         "name" => bound_metadata_property_is_enumerable(&body.name_property, false),
         "length" => bound_metadata_property_is_enumerable(&body.length_property, false),
-        _ => false,
+        _ => match object::lookup_own(body.own_properties, gc_heap, key) {
+            object::PropertyLookup::Data { flags, .. }
+            | object::PropertyLookup::Accessor { flags, .. } => flags.enumerable(),
+            object::PropertyLookup::Absent => false,
+        },
     })
 }
 
@@ -175,7 +197,10 @@ pub(crate) fn bound_has_own_property(
     gc_heap.read_payload(bound.inner, |body| match key {
         "name" => !matches!(body.name_property, BoundFunctionMetadataProperty::Deleted),
         "length" => !matches!(body.length_property, BoundFunctionMetadataProperty::Deleted),
-        _ => false,
+        _ => !matches!(
+            object::lookup_own(body.own_properties, gc_heap, key),
+            object::PropertyLookup::Absent
+        ),
     })
 }
 
@@ -197,14 +222,18 @@ pub(crate) fn bound_define_own_property(
             None => return false,
         },
         None if key == "name" || key == "length" => descriptor,
-        None => return false,
+        None => descriptor,
     };
+    if key != "name" && key != "length" {
+        let own_properties = heap.read_payload(bound.inner, |body| body.own_properties);
+        return object::define_own_property(own_properties, heap, key, descriptor);
+    }
     let barrier_descriptor = descriptor.clone();
     let success = heap.with_payload(bound.inner, |body| {
         let slot = match key {
             "name" => &mut body.name_property,
             "length" => &mut body.length_property,
-            _ => return false,
+            _ => unreachable!("ordinary bound properties return before metadata update"),
         };
         *slot = BoundFunctionMetadataProperty::Overridden(descriptor);
         true
@@ -221,11 +250,15 @@ pub(crate) fn bound_delete_own_property(
     heap: &mut otter_gc::GcHeap,
     key: &str,
 ) -> bool {
+    if key != "name" && key != "length" {
+        let own_properties = heap.read_payload(bound.inner, |body| body.own_properties);
+        return object::delete(own_properties, heap, key);
+    }
     heap.with_payload(bound.inner, |body| {
         let slot = match key {
             "name" => &mut body.name_property,
             "length" => &mut body.length_property,
-            _ => return true,
+            _ => unreachable!("ordinary bound properties return before metadata delete"),
         };
         let configurable = match slot {
             BoundFunctionMetadataProperty::Builtin => true,
@@ -255,11 +288,34 @@ pub(crate) fn bound_create_metadata(
 ) -> Result<BoundFunctionCreateMetadata, VmError> {
     let target_name = callable_name(ctx, target)?;
     let target_len = callable_length(ctx, target)?;
+    Ok(bound_create_metadata_from_values(
+        &Value::String(JsString::from_str(&target_name, ctx.string_heap)?),
+        &Value::Number(number_from_length_value(target_len)),
+        bound_arg_count,
+    ))
+}
+
+/// Compute bound-function metadata from spec-observable
+/// `Get(target, "name")` / `Get(target, "length")` results.
+#[must_use]
+pub(crate) fn bound_create_metadata_from_values(
+    target_name: &Value,
+    target_length: &Value,
+    bound_arg_count: usize,
+) -> BoundFunctionCreateMetadata {
+    let target_name = match target_name {
+        Value::String(s) => s.to_lossy_string(),
+        _ => String::new(),
+    };
+    let target_len = match target_length {
+        Value::Number(n) => to_integer_or_infinity(n.as_f64()),
+        _ => 0.0,
+    };
     let length = (target_len - bound_arg_count as f64).max(0.0);
-    Ok(BoundFunctionCreateMetadata {
+    BoundFunctionCreateMetadata {
         name: format!("bound {target_name}"),
         length: number_from_length_value(length),
-    })
+    }
 }
 
 fn callable_metadata_value(
@@ -318,6 +374,12 @@ fn callable_name(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<St
             }
         }
         Value::ClassConstructor(class) => callable_name(ctx, &class.ctor(ctx.gc_heap)),
+        Value::Object(obj) => match object::constructor_native(*obj, ctx.gc_heap) {
+            Some(Value::NativeFunction(native)) => {
+                callable_name(ctx, &Value::NativeFunction(native))
+            }
+            _ => Ok(String::new()),
+        },
         _ => Ok(String::new()),
     }
 }
@@ -360,6 +422,12 @@ fn callable_length(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<
             }
         }
         Value::ClassConstructor(class) => callable_length(ctx, &class.ctor(ctx.gc_heap)),
+        Value::Object(obj) => match object::constructor_native(*obj, ctx.gc_heap) {
+            Some(Value::NativeFunction(native)) => {
+                callable_length(ctx, &Value::NativeFunction(native))
+            }
+            _ => Ok(0.0),
+        },
         _ => Ok(0.0),
     }
 }

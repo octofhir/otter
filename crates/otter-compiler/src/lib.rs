@@ -49,8 +49,8 @@ pub use compiled_module::{
     CompiledSourceSpan, LiveBindingSlot,
 };
 use otter_bytecode::{
-    BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind as BytecodeSourceKind,
-    SpanEntry,
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Constant, Function, Instruction,
+    MappedArgumentBinding, Op, Operand, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_syntax::{
     Parsed, SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, with_program,
@@ -158,7 +158,7 @@ pub struct ModuleHostInfo {
 /// the foundation subset (see [`CompileError::Unsupported`]).
 pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule, CompileError> {
     let program = parsed.program().map_err(CompileError::from)?;
-    compile_program(&program, parsed.kind, module_specifier)
+    compile_program(&program, parsed.kind, module_specifier, false)
 }
 
 /// Compile a parsed script into the frozen runtime boundary product.
@@ -186,8 +186,23 @@ pub fn compile_source(
     kind: SyntaxSourceKind,
     module_specifier: &str,
 ) -> Result<BytecodeModule, CompileError> {
+    compile_source_with_forced_strict(source, kind, module_specifier, false)
+}
+
+/// Compile source text with an optional inherited strict-mode
+/// override. Direct eval uses this to model ECMA-262's caller
+/// strictness inheritance without rewriting source text.
+///
+/// # Errors
+/// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
+pub fn compile_source_with_forced_strict(
+    source: &str,
+    kind: SyntaxSourceKind,
+    module_specifier: &str,
+    force_strict: bool,
+) -> Result<BytecodeModule, CompileError> {
     with_program(source, kind, |program| {
-        compile_parsed_program(program, kind, module_specifier)
+        compile_program(program, kind, module_specifier, force_strict)
     })
     .map_err(CompileError::from)?
 }
@@ -221,7 +236,7 @@ pub fn compile_parsed_program(
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_program(program, source_kind, module_specifier)
+    compile_program(program, source_kind, module_specifier, false)
 }
 
 /// Compile an already parsed OXC program into the frozen runtime boundary
@@ -242,12 +257,14 @@ fn compile_program(
     program: &Program<'_>,
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
+    force_strict: bool,
 ) -> Result<BytecodeModule, CompileError> {
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     // §16.2.1.7 — top-level `await` upgrades `<main>` to async so
     // the dispatch loop's async machinery parks / resumes the
     // entry frame on suspension points.
     let main_is_async = module_body_uses_top_level_await(&program.body);
+    let main_is_strict = force_strict || program.has_use_strict_directive();
     // Reserve slot 0 for `<main>` so nested function compilation
     // can pre-register their ids deterministically (slice 13 only
     // needs the immediate id, but the slot reservation keeps the
@@ -257,9 +274,10 @@ fn compile_program(
         name: "<main>".to_string(),
         span: (program.span.start, program.span.end),
         is_async: main_is_async,
+        is_strict: main_is_strict,
         ..Default::default()
     });
-    let mut top = FunctionContext::new(Rc::clone(&module));
+    let mut top = FunctionContext::new(Rc::clone(&module)).with_strict(main_is_strict);
     top.captured_names = capture::analyze_module(&program.body);
     let mut cx = Compiler::new(top);
     cx.enter_scope();
@@ -399,12 +417,13 @@ pub fn compile_module_fragment(
         span: (program.span.start, program.span.end),
         is_module: true,
         is_async: init_is_async,
+        is_strict: true,
         module_url: host.module_url.clone(),
         param_count: 2, // module_env, import_meta
         ..Default::default()
     });
 
-    let mut top = FunctionContext::new(Rc::clone(&module));
+    let mut top = FunctionContext::new(Rc::clone(&module)).with_strict(true);
     top.captured_names = capture::analyze_module(&program.body);
     // Also capture names that any inner function references whose
     // bindings live as `module_env` / `import_meta` / `import_record_*`
@@ -790,6 +809,7 @@ fn compile_export_inner_declaration(
                 fspan,
                 f.r#async,
                 f.generator,
+                false,
             )?;
             let storage = cx.declare_binding(&name, false, fspan)?;
             let const_idx = cx.intern_function_id(function_id);
@@ -1000,6 +1020,15 @@ enum BindingStorage {
     Upvalue { idx: u16 },
 }
 
+impl BindingStorage {
+    fn to_argument_storage(self) -> ArgumentBindingStorage {
+        match self {
+            Self::Register { reg } => ArgumentBindingStorage::Register { reg },
+            Self::Upvalue { idx } => ArgumentBindingStorage::Upvalue { idx },
+        }
+    }
+}
+
 /// One pending control-flow target so `break` / `continue` can patch
 /// their offsets at scope close.
 ///
@@ -1062,6 +1091,10 @@ struct FunctionContext {
     /// Stack of lexical scopes. Index 0 is the function-body
     /// scope.
     scopes: Vec<Scope>,
+    /// ECMAScript strictness for the function currently being
+    /// lowered. This is compile-time metadata stored on the
+    /// resulting bytecode function and also drives early errors.
+    is_strict: bool,
     /// Stack of enclosing loops; the innermost is on top.
     loops: Vec<LoopFrame>,
     /// Label deposited by the immediately-enclosing
@@ -1081,6 +1114,10 @@ struct FunctionContext {
     /// such binding is allocated as an
     /// [`UpvalueCell`](otter_vm::UpvalueCell) instead of a register.
     captured_names: HashSet<String>,
+    /// Simple formal names that must live in own-upvalue cells so a
+    /// sloppy mapped arguments object can alias them without exposing
+    /// frame registers outside the VM.
+    mapped_argument_names: HashSet<String>,
     /// Number of own-upvalue cells allocated so far. The first
     /// `own_upvalue_count` slots in `frame.upvalues` belong to this
     /// function's own captured bindings.
@@ -1242,15 +1279,22 @@ impl FunctionContext {
             next_pc: 0,
             scratch: 0,
             scopes: Vec::new(),
+            is_strict: false,
             loops: Vec::new(),
             pending_label: None,
             hoisted_function_names: HashSet::new(),
             captured_names: HashSet::new(),
+            mapped_argument_names: HashSet::new(),
             own_upvalue_count: 0,
             parent_captures: Vec::new(),
             captured_uv: HashMap::new(),
             module_state: None,
         }
+    }
+
+    fn with_strict(mut self, is_strict: bool) -> Self {
+        self.is_strict = is_strict;
+        self
     }
 
     /// Check `name` against this function's `captured_names` set
@@ -1259,7 +1303,7 @@ impl FunctionContext {
     /// or `None` if the name is not captured (use a register
     /// instead).
     fn allocate_own_upvalue(&mut self, name: &str) -> Option<u16> {
-        if !self.captured_names.contains(name) {
+        if !self.captured_names.contains(name) && !self.mapped_argument_names.contains(name) {
             return None;
         }
         let idx = self.own_upvalue_count;
@@ -1982,8 +2026,16 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             if cx.hoisted_function_names.contains(&name) {
                 return Ok(None);
             }
-            let (function_id, captures) =
-                compile_function_full(cx, &name, &f.params, &f.body, span, f.r#async, f.generator)?;
+            let (function_id, captures) = compile_function_full(
+                cx,
+                &name,
+                &f.params,
+                &f.body,
+                span,
+                f.r#async,
+                f.generator,
+                false,
+            )?;
             let storage = cx.declare_binding(&name, false, span)?;
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
@@ -2178,6 +2230,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                         span,
                         f.r#async,
                         f.generator,
+                        false,
                     )?;
                     let const_idx = cx.intern_function_id(function_id);
                     let dst = cx.alloc_scratch();
@@ -2463,6 +2516,43 @@ fn body_references_arguments(
         }
     }
     finder.found
+}
+
+fn simple_formal_names(params: &oxc_ast::ast::FormalParameters<'_>) -> Vec<String> {
+    params
+        .items
+        .iter()
+        .filter_map(|param| match &param.pattern {
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id) if param.initializer.is_none() => {
+                Some(id.name.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn mapped_formal_parameter_bindings(
+    cx: &Compiler,
+    params: &oxc_ast::ast::FormalParameters<'_>,
+) -> Vec<MappedArgumentBinding> {
+    let names = simple_formal_names(params);
+    let mut seen = HashSet::new();
+    let mut bindings = Vec::new();
+    for (index, name) in names.iter().enumerate().rev() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = cx.lookup_in_current_scope(name) else {
+            continue;
+        };
+        bindings.push(MappedArgumentBinding {
+            argument_index: index as u16,
+            formal_name: name.clone(),
+            storage: info.storage.to_argument_storage(),
+        });
+    }
+    bindings.reverse();
+    bindings
 }
 
 fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool {
@@ -2816,8 +2906,16 @@ fn hoist_function_declarations(
             continue;
         }
         let span = (f.span.start, f.span.end);
-        let (function_id, captures) =
-            compile_function_full(cx, &name, &f.params, &f.body, span, f.r#async, f.generator)?;
+        let (function_id, captures) = compile_function_full(
+            cx,
+            &name,
+            &f.params,
+            &f.body,
+            span,
+            f.r#async,
+            f.generator,
+            false,
+        )?;
         let const_idx = cx.intern_function_id(function_id);
         let tmp = cx.alloc_scratch();
         emit_make_callable(cx, tmp, const_idx, &captures, false, span);
@@ -2831,17 +2929,6 @@ fn hoist_function_declarations(
     Ok(())
 }
 
-fn compile_function(
-    parent: &mut Compiler,
-    name: &str,
-    params: &oxc_ast::ast::FormalParameters<'_>,
-    body: &Option<oxc_allocator::Box<'_, oxc_ast::ast::FunctionBody<'_>>>,
-    span: (u32, u32),
-    is_async: bool,
-) -> Result<(u32, Vec<u32>), CompileError> {
-    compile_function_full(parent, name, params, body, span, is_async, false)
-}
-
 fn compile_function_full(
     parent: &mut Compiler,
     name: &str,
@@ -2850,12 +2937,26 @@ fn compile_function_full(
     span: (u32, u32),
     is_async: bool,
     is_generator: bool,
+    force_strict: bool,
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let is_async_generator = is_async && is_generator;
     let module = Rc::clone(&parent.top_mut().module);
-    let mut child = FunctionContext::new(Rc::clone(&module));
+    let body_has_strict_directive = match body {
+        Some(b) => b.has_use_strict_directive(),
+        None => false,
+    };
+    let function_is_strict = force_strict || parent.is_strict || body_has_strict_directive;
+    let simple_params = formal_parameters_are_simple(params);
+    let allow_duplicate_formals = !function_is_strict && simple_params;
+    let needs_arguments = body_references_arguments(params, body.as_deref());
+    let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
+    validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
+    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
+    }
+    if uses_mapped_arguments {
+        child.mapped_argument_names = simple_formal_names(params).into_iter().collect();
     }
     parent.push(child);
     parent.enter_scope();
@@ -2874,6 +2975,7 @@ fn compile_function_full(
         id: function_id,
         name: name.to_string(),
         span,
+        is_strict: function_is_strict,
         ..Default::default()
     });
 
@@ -2887,11 +2989,17 @@ fn compile_function_full(
             &param.pattern,
             param.initializer.as_deref(),
             span,
+            allow_duplicate_formals,
         )?;
     }
     if let Some(rest) = &params.rest {
         compile_rest_parameter(parent, &rest.rest.argument, span)?;
     }
+    let mapped_argument_bindings = if uses_mapped_arguments {
+        mapped_formal_parameter_bindings(parent, params)
+    } else {
+        Vec::new()
+    };
 
     // Bind self-name for recursion. Emit a MakeFunction (no
     // captures yet — the function value referencing itself doesn't
@@ -2911,7 +3019,6 @@ fn compile_function_full(
     // every `var`-declared name in the body to the function scope
     // and pre-bind it to `undefined`. Reads before the source-level
     // declaration site observe the hoisted `undefined` (no TDZ).
-    let needs_arguments = body_references_arguments(params, body.as_deref());
     if needs_arguments && parent.lookup_binding("arguments").is_none() {
         // §10.2.11 FunctionDeclarationInstantiation step 22 — bind
         // `arguments` in the function scope before any var/lex
@@ -2960,6 +3067,12 @@ fn compile_function_full(
     slot.is_generator = is_generator;
     slot.is_async_generator = is_async_generator;
     slot.needs_arguments = needs_arguments;
+    slot.arguments_object_kind = if uses_mapped_arguments {
+        ArgumentsObjectKind::Mapped
+    } else {
+        ArgumentsObjectKind::Unmapped
+    };
+    slot.mapped_argument_bindings = mapped_argument_bindings;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;
@@ -3784,7 +3897,19 @@ fn compile_formal_parameter(
     pattern: &oxc_ast::ast::BindingPattern<'_>,
     initializer: Option<&Expression<'_>>,
     span: (u32, u32),
+    allow_duplicate_formals: bool,
 ) -> Result<(), CompileError> {
+    if initializer.is_none()
+        && let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = pattern
+    {
+        return bind_simple_formal_parameter(
+            parent,
+            ordinal,
+            id.name.as_str(),
+            span,
+            allow_duplicate_formals,
+        );
+    }
     if let Some(default_expr) = initializer {
         apply_default_into(parent, ordinal, default_expr, span)?;
     }
@@ -3798,6 +3923,69 @@ fn compile_formal_parameter(
         return destructure_into(parent, ordinal, &asgn.left, span);
     }
     destructure_into(parent, ordinal, pattern, span)
+}
+
+fn bind_simple_formal_parameter(
+    parent: &mut Compiler,
+    ordinal: u16,
+    name: &str,
+    span: (u32, u32),
+    allow_duplicate_formals: bool,
+) -> Result<(), CompileError> {
+    let storage = if allow_duplicate_formals {
+        match parent.lookup_in_current_scope(name) {
+            Some(info) => info.storage,
+            None => parent.declare_binding(name, false, span)?,
+        }
+    } else {
+        parent.declare_binding(name, false, span)?
+    };
+    parent.emit_store_storage(ordinal, storage, span);
+    parent.mark_initialized(name);
+    Ok(())
+}
+
+fn formal_parameters_are_simple(params: &oxc_ast::ast::FormalParameters<'_>) -> bool {
+    params.rest.is_none()
+        && params.items.iter().all(|param| {
+            param.initializer.is_none()
+                && matches!(
+                    param.pattern,
+                    oxc_ast::ast::BindingPattern::BindingIdentifier(_)
+                )
+        })
+}
+
+fn validate_formal_parameter_names(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    is_strict: bool,
+    allow_duplicates: bool,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let mut names = Vec::new();
+    for param in &params.items {
+        collect_pattern_var_names(&param.pattern, &mut names);
+    }
+    if let Some(rest) = &params.rest {
+        collect_pattern_var_names(&rest.rest.argument, &mut names);
+    }
+
+    let mut seen = HashSet::new();
+    for name in names {
+        if is_strict && (name == "eval" || name == "arguments") {
+            return Err(CompileError::Unsupported {
+                node: format!("restricted formal parameter name `{name}` in strict function"),
+                span,
+            });
+        }
+        if !allow_duplicates && !seen.insert(name.clone()) {
+            return Err(CompileError::Unsupported {
+                node: format!("redeclaration of `{name}` in same scope"),
+                span,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Lower the rest parameter (`function f(..., ...rest) { … }`).
@@ -4198,7 +4386,9 @@ fn compile_arrow_function(
     span: (u32, u32),
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
-    let mut child = FunctionContext::new(Rc::clone(&module));
+    let function_is_strict = parent.is_strict || arrow.body.has_use_strict_directive();
+    validate_formal_parameter_names(&arrow.params, function_is_strict, false, span)?;
+    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
     child.captured_names = capture::analyze_arrow(arrow);
     parent.push(child);
     parent.enter_scope();
@@ -4214,6 +4404,7 @@ fn compile_arrow_function(
         id: function_id,
         name: "<arrow>".to_string(),
         span,
+        is_strict: function_is_strict,
         ..Default::default()
     });
 
@@ -4224,6 +4415,7 @@ fn compile_arrow_function(
             &param.pattern,
             param.initializer.as_deref(),
             span,
+            false,
         )?;
     }
     if let Some(rest) = &arrow.params.rest {
@@ -4765,6 +4957,14 @@ fn compile_expr(
             // `delete obj.prop` is special: the operand isn't a
             // value-producing expression, it's a member reference.
             if matches!(u.operator, UnaryOperator::Delete) {
+                if cx.is_strict
+                    && let Expression::Identifier(id) = &u.argument
+                {
+                    return Err(CompileError::Unsupported {
+                        node: format!("strict delete of identifier `{}`", id.name.as_str()),
+                        span,
+                    });
+                }
                 if let Expression::StaticMemberExpression(member) = &u.argument {
                     let obj_reg = compile_expr(cx, &member.object, span)?;
                     let name_idx = cx.intern_string_constant(member.property.name.as_str());
@@ -5244,56 +5444,18 @@ fn compile_expr(
                 cx.emit(Op::ArrayConstruct, operands, new_span);
                 return Ok(dst);
             }
-            // §22.1.1 `new String(value)` — foundation aliases to
-            // the primitive string (no wrapper object). Lowers via
-            // [`StringMethod::Construct`] like the bare form.
-            if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "String"
-                && cx.lookup_binding("String").is_none()
-                && find_module_import_binding(cx, "String").is_none()
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(
-                    otter_bytecode::method_id::StringMethod::Construct.as_u32(),
-                ));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::StringCall, operands, new_span);
-                return Ok(dst);
-            }
+            // §22.1.1 `new String(value)` falls through to the
+            // general constructor path so runtime bootstrap can
+            // produce a String wrapper object with [[StringData]].
             // §21.1.1 `new Number(value)` no longer aliases here —
             // the `Number` global is now a real `ClassConstructor`
             // (see `bootstrap::install_number`) and the construct
             // form must produce a `NumberObject` wrapper with the
             // `[[NumberData]]` slot set, not a primitive Number.
             // Falls through to the general `NewExpression` path.
-            // §20.3.1 `new Boolean(value)` — foundation aliases to
-            // primitive ToBoolean (no wrapper object).
-            // <https://tc39.es/ecma262/#sec-boolean-constructor>
-            if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "Boolean"
-                && cx.lookup_binding("Boolean").is_none()
-                && find_module_import_binding(cx, "Boolean").is_none()
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let dst = cx.alloc_scratch();
-                match arg_regs.first().copied() {
-                    Some(src) => {
-                        cx.emit(
-                            Op::ToBoolean,
-                            vec![Operand::Register(dst), Operand::Register(src)],
-                            new_span,
-                        );
-                    }
-                    None => {
-                        cx.emit(Op::LoadFalse, vec![Operand::Register(dst)], new_span);
-                    }
-                }
-                return Ok(dst);
-            }
+            // §20.3.1 `new Boolean(value)` falls through to the
+            // general constructor path so runtime bootstrap can
+            // produce a Boolean wrapper object with [[BooleanData]].
             // §25.2.1 `new SharedArrayBuffer(length [, options])`.
             // Lowers via [`SharedArrayBufferMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
@@ -5359,9 +5521,8 @@ fn compile_expr(
             // and [`TypedArrayMethod::Construct`] directly.
             // <https://tc39.es/ecma262/#sec-typedarray-constructors>
             if let Expression::Identifier(id) = callee
-                && let Some(kind) = otter_bytecode::method_id::TypedArrayKindId::from_str(
-                    id.name.as_str(),
-                )
+                && let Some(kind) =
+                    otter_bytecode::method_id::TypedArrayKindId::from_str(id.name.as_str())
                 && cx.lookup_binding(id.name.as_str()).is_none()
                 && find_module_import_binding(cx, id.name.as_str()).is_none()
             {
@@ -5692,11 +5853,6 @@ fn compile_expr(
                 match prop {
                     oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) => {
                         let key_span = (p.span.start, p.span.end);
-                        // Foundation: getter / setter shorthand on
-                        // an object literal (`{ get foo () { … } }`)
-                        // installs as a plain data method. Real
-                        // accessor descriptors await the §13.2.5.5
-                        // installer follow-up.
                         // §13.2.5 Object Initializer — computed-key
                         // properties (`{ [expr]: value }`) lower to
                         // `Op::StoreElement` with the key value
@@ -5704,6 +5860,108 @@ fn compile_expr(
                         // keep the existing `Op::StoreProperty`
                         // fast path.
                         // <https://tc39.es/ecma262/#sec-object-initializer>
+                        let static_key_str = if p.computed {
+                            None
+                        } else {
+                            Some(match &p.key {
+                                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
+                                    id.name.as_str().to_string()
+                                }
+                                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
+                                    lit.value.to_string()
+                                }
+                                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
+                                    lit.value.to_string()
+                                }
+                                _ => {
+                                    return Err(CompileError::Unsupported {
+                                        node: "ObjectExpression: non-string property key"
+                                            .to_string(),
+                                        span: key_span,
+                                    });
+                                }
+                            })
+                        };
+                        if matches!(
+                            p.kind,
+                            oxc_ast::ast::PropertyKind::Get | oxc_ast::ast::PropertyKind::Set
+                        ) {
+                            let key_reg = match &static_key_str {
+                                Some(key) => {
+                                    let r = cx.alloc_scratch();
+                                    let const_idx = cx.intern_string_constant(key);
+                                    cx.emit(
+                                        Op::LoadString,
+                                        vec![Operand::Register(r), Operand::ConstIndex(const_idx)],
+                                        key_span,
+                                    );
+                                    r
+                                }
+                                None => {
+                                    let expr = p.key.as_expression().ok_or_else(|| {
+                                        CompileError::Unsupported {
+                                            node: "ObjectExpression: computed accessor key (non-expression)"
+                                                .to_string(),
+                                            span: key_span,
+                                        }
+                                    })?;
+                                    compile_expr(cx, expr, key_span)?
+                                }
+                            };
+                            let function_reg = compile_expr(cx, &p.value, key_span)?;
+                            let desc_reg = cx.alloc_scratch();
+                            cx.emit(Op::NewObject, vec![Operand::Register(desc_reg)], key_span);
+                            let accessor_key = match p.kind {
+                                oxc_ast::ast::PropertyKind::Get => "get",
+                                oxc_ast::ast::PropertyKind::Set => "set",
+                                oxc_ast::ast::PropertyKind::Init => unreachable!(),
+                            };
+                            let accessor_const = cx.intern_string_constant(accessor_key);
+                            let store_scratch = cx.alloc_scratch();
+                            cx.emit(
+                                Op::StoreProperty,
+                                vec![
+                                    Operand::Register(desc_reg),
+                                    Operand::ConstIndex(accessor_const),
+                                    Operand::Register(function_reg),
+                                    Operand::Register(store_scratch),
+                                ],
+                                key_span,
+                            );
+                            let true_reg = cx.alloc_scratch();
+                            cx.emit(Op::LoadTrue, vec![Operand::Register(true_reg)], key_span);
+                            for attr in ["enumerable", "configurable"] {
+                                let attr_const = cx.intern_string_constant(attr);
+                                let attr_scratch = cx.alloc_scratch();
+                                cx.emit(
+                                    Op::StoreProperty,
+                                    vec![
+                                        Operand::Register(desc_reg),
+                                        Operand::ConstIndex(attr_const),
+                                        Operand::Register(true_reg),
+                                        Operand::Register(attr_scratch),
+                                    ],
+                                    key_span,
+                                );
+                            }
+                            let define_dst = cx.alloc_scratch();
+                            cx.emit(
+                                Op::ObjectCall,
+                                vec![
+                                    Operand::Register(define_dst),
+                                    Operand::ConstIndex(
+                                        otter_bytecode::method_id::ObjectMethod::DefineProperty
+                                            .as_u32(),
+                                    ),
+                                    Operand::ConstIndex(3),
+                                    Operand::Register(dst),
+                                    Operand::Register(key_reg),
+                                    Operand::Register(desc_reg),
+                                ],
+                                key_span,
+                            );
+                            continue;
+                        }
                         if p.computed {
                             let key_reg = match &p.key {
                                 oxc_ast::ast::PropertyKey::StaticIdentifier(_)
@@ -5738,19 +5996,7 @@ fn compile_expr(
                             cx.emit_store_element(dst, key_reg, value_reg, key_span);
                             continue;
                         }
-                        let key_str = match &p.key {
-                            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
-                                id.name.as_str().to_string()
-                            }
-                            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
-                            oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
-                            _ => {
-                                return Err(CompileError::Unsupported {
-                                    node: "ObjectExpression: non-string property key".to_string(),
-                                    span: key_span,
-                                });
-                            }
-                        };
+                        let key_str = static_key_str.expect("non-computed key resolved above");
                         let value_reg = compile_expr(cx, &p.value, key_span)?;
                         let const_idx = cx.intern_string_constant(&key_str);
                         let store_scratch = cx.alloc_scratch();
@@ -5804,8 +6050,16 @@ fn compile_expr(
                 f.id.as_ref()
                     .map(|id| id.name.as_str().to_string())
                     .unwrap_or_else(|| "<anonymous>".to_string());
-            let (function_id, captures) =
-                compile_function_full(cx, &name, &f.params, &f.body, span, f.r#async, f.generator)?;
+            let (function_id, captures) = compile_function_full(
+                cx,
+                &name,
+                &f.params,
+                &f.body,
+                span,
+                f.r#async,
+                f.generator,
+                false,
+            )?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
             emit_make_callable(cx, dst, const_idx, &captures, false, span);
@@ -5827,6 +6081,12 @@ fn compile_expr(
         }
 
         Expression::MetaProperty(meta) => {
+            let span = (meta.span.start, meta.span.end);
+            if meta.meta.name.as_str() == "new" && meta.property.name.as_str() == "target" {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadNewTarget, vec![Operand::Register(dst)], span);
+                return Ok(dst);
+            }
             // The only legal MetaProperty inside a module is
             // `import.meta`. The runtime materialises it as a
             // JsObject the linker passes in as param 1; we hoist
@@ -5835,7 +6095,6 @@ fn compile_expr(
             //
             // Spec: <https://tc39.es/ecma262/#prod-ImportMeta>
             //       <https://tc39.es/ecma262/#sec-meta-properties-runtime-semantics-evaluation>
-            let span = (meta.span.start, meta.span.end);
             if meta.meta.name.as_str() != "import" || meta.property.name.as_str() != "meta" {
                 return Err(CompileError::Unsupported {
                     node: format!(
@@ -6823,9 +7082,10 @@ fn compile_finalizer(
 ///   `Function.prototype.{call, apply, bind}` for callables).
 /// - `callee.{call, apply, bind}(...)` with a syntactically obvious
 ///   call shape — lowered directly to [`Op::CallWithThis`] /
-///   [`Op::BindFunction`] so the foundation interpreter avoids the
-///   `CallMethodValue` dispatch overhead and rejects non-array
-///   `apply` arguments at compile time when they're a literal.
+///   [`Op::BindFunction`] when the argument list can be flattened at
+///   compile time. Dynamic `apply` argument lists stay on
+///   [`Op::CallMethodValue`] so the VM performs the spec
+///   `CreateListFromArrayLike` coercion.
 /// - `callee(args...)` (free call) — emits [`Op::Call`]; the callee
 ///   receives `this = undefined`.
 ///
@@ -7028,14 +7288,14 @@ fn compile_method_call(
         // [`TypedArrayMethod`].
         // <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarray%25-intrinsic-object>
         if let Expression::Identifier(id) = &member.object
-            && let Some(kind) = otter_bytecode::method_id::TypedArrayKindId::from_str(
-                id.name.as_str(),
-            )
+            && let Some(kind) =
+                otter_bytecode::method_id::TypedArrayKindId::from_str(id.name.as_str())
             && cx.lookup_binding(id.name.as_str()).is_none()
             && find_module_import_binding(cx, id.name.as_str()).is_none()
         {
             let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::TypedArrayMethod::from_str(method_name)
+            let Some(method_id) =
+                otter_bytecode::method_id::TypedArrayMethod::from_str(method_name)
             else {
                 return Err(CompileError::Unsupported {
                     node: format!("{}.{method_name}", kind.name()),
@@ -7060,8 +7320,10 @@ fn compile_method_call(
             && id.name.as_str() == "Object"
         {
             let method = member.property.name.as_str();
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            return compile_object_builtin(cx, method, &arg_regs, span);
+            if is_compiler_lowered_object_static(method) {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                return compile_object_builtin(cx, method, &arg_regs, span);
+            }
         }
         // §23.1.2 Array static surface. `Array.isArray` keeps a
         // dedicated [`Op::IsArray`] for the §7.2.2 fast path;
@@ -7134,30 +7396,24 @@ fn compile_method_call(
             && id.name.as_str() == "JSON"
         {
             let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::JsonMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("JSON.{method_name}"),
-                    span,
-                });
+            if let Some(method_id) = otter_bytecode::method_id::JsonMethod::from_str(method_name) {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(method_id.as_u32()));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::JsonCall, operands, span);
+                return Ok(dst);
             };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::JsonCall, operands, span);
-            return Ok(dst);
         }
         // `Promise.<name>(args)` — typed dispatch via [`PromiseMethod`].
         if let Expression::Identifier(id) = &member.object
             && id.name.as_str() == "Promise"
         {
             let method_name = member.property.name.as_str();
-            let Some(method_id) =
-                otter_bytecode::method_id::PromiseMethod::from_str(method_name)
+            let Some(method_id) = otter_bytecode::method_id::PromiseMethod::from_str(method_name)
             else {
                 return Err(CompileError::Unsupported {
                     node: format!("Promise.{method_name}"),
@@ -7185,16 +7441,14 @@ fn compile_method_call(
         {
             let class_name = outer.property.name.as_str();
             let method_name = member.property.name.as_str();
-            let Some(class_id) =
-                otter_bytecode::method_id::TemporalClassId::from_str(class_name)
+            let Some(class_id) = otter_bytecode::method_id::TemporalClassId::from_str(class_name)
             else {
                 return Err(CompileError::Unsupported {
                     node: format!("Temporal.{class_name}"),
                     span,
                 });
             };
-            let Some(method_id) =
-                otter_bytecode::method_id::TemporalMethod::from_str(method_name)
+            let Some(method_id) = otter_bytecode::method_id::TemporalMethod::from_str(method_name)
             else {
                 return Err(CompileError::Unsupported {
                     node: format!("Temporal.{class_name}.{method_name}"),
@@ -7443,21 +7697,17 @@ fn compile_method_call(
         && find_module_import_binding(cx, "Date").is_none()
     {
         let method_name = member.property.name.as_str();
-        let Some(method_id) = otter_bytecode::method_id::DateMethod::from_str(method_name) else {
-            return Err(CompileError::Unsupported {
-                node: format!("Date.{method_name}"),
-                span,
-            });
+        if let Some(method_id) = otter_bytecode::method_id::DateMethod::from_str(method_name) {
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::DateCall, operands, span);
+            return Ok(dst);
         };
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(method_id.as_u32()));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::DateCall, operands, span);
-        return Ok(dst);
     }
     // §21.2.1 BigInt(value) / §21.2.2 BigInt.<name>(args). Typed
     // dispatch via [`BigIntMethod`].
@@ -7469,8 +7719,7 @@ fn compile_method_call(
         && find_module_import_binding(cx, "BigInt").is_none()
     {
         let method_name = member.property.name.as_str();
-        let Some(method_id) = otter_bytecode::method_id::BigIntMethod::from_str(method_name)
-        else {
+        let Some(method_id) = otter_bytecode::method_id::BigIntMethod::from_str(method_name) else {
             return Err(CompileError::Unsupported {
                 node: format!("BigInt.{method_name}"),
                 span,
@@ -7745,11 +7994,10 @@ fn compile_spread_call(
 ///
 /// The shape detection is **syntactic**: the receiver expression is
 /// evaluated only once, so `getFn().call(t, 1)` invokes `getFn()`
-/// exactly once. `apply` requires its second argument (when
-/// present) to be an array literal so the foundation can unpack it
-/// into [`Op::CallWithThis`] without a runtime spread; dynamic
-/// argument arrays surface as a `CompileError::Unsupported`
-/// pointing the caller at the future spread / `apply` task.
+/// exactly once. `apply` uses the fixed-arity [`Op::CallWithThis`]
+/// path for array literals and falls back to [`Op::CallSpread`] for
+/// dynamic argument arrays so the runtime performs the observable
+/// argument-list check.
 fn try_compile_function_method(
     cx: &mut Compiler,
     receiver: &Expression<'_>,
@@ -7827,6 +8075,7 @@ fn try_compile_function_method(
                 }
             };
             let mut forwarded: Vec<u16> = Vec::new();
+            let mut dynamic_args: Option<u16> = None;
             match args_iter.next() {
                 None => {}
                 Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
@@ -7869,15 +8118,8 @@ fn try_compile_function_method(
                         }
                         Expression::NullLiteral(_) => {}
                         Expression::Identifier(id) if id.name.as_str() == "undefined" => {}
-                        other => {
-                            return Err(CompileError::Unsupported {
-                                node: format!(
-                                    "Function.prototype.apply: dynamic args ({}); \
-                                     foundation requires an array literal",
-                                    expr_kind_name(other)
-                                ),
-                                span,
-                            });
+                        _ => {
+                            dynamic_args = Some(compile_expr(cx, expr, span)?);
                         }
                     }
                 }
@@ -7889,6 +8131,22 @@ fn try_compile_function_method(
                 });
             }
             let dst = cx.alloc_scratch();
+            if let Some(args_reg) = dynamic_args {
+                let name_idx = cx.intern_string_constant("apply");
+                cx.emit(
+                    Op::CallMethodValue,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(callee_reg),
+                        Operand::ConstIndex(name_idx),
+                        Operand::ConstIndex(2),
+                        Operand::Register(this_reg),
+                        Operand::Register(args_reg),
+                    ],
+                    span,
+                );
+                return Ok(Some(dst));
+            }
             let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
             operands.push(Operand::Register(dst));
             operands.push(Operand::Register(callee_reg));
@@ -8193,6 +8451,7 @@ fn compile_class(
             method_span,
             m.value.r#async,
             m.value.generator,
+            true,
         )?;
         let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
@@ -8341,7 +8600,7 @@ fn compile_synthetic_constructor(
     instance_fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
 ) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
-    let child = FunctionContext::new(Rc::clone(&module));
+    let child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
     // No body to pre-pass; only the synthesised super call needs
     // outer captures.
     parent.push(child);
@@ -8354,6 +8613,7 @@ fn compile_synthetic_constructor(
         id: function_id,
         name: name.to_string(),
         span,
+        is_strict: true,
         ..Default::default()
     });
 
@@ -8424,7 +8684,7 @@ fn compile_class_constructor(
     is_derived: bool,
 ) -> Result<(u32, Vec<u32>), CompileError> {
     if instance_fields.is_empty() {
-        return compile_function(parent, name, params, body, span, is_async);
+        return compile_function_full(parent, name, params, body, span, is_async, false, true);
     }
     // Compile the function with field-init injection. We mirror
     // `compile_function` but inject the field stores after the
@@ -8432,7 +8692,8 @@ fn compile_class_constructor(
     // doesn't have a public hook for this, so we duplicate the
     // setup here.
     let module = Rc::clone(&parent.top_mut().module);
-    let mut child = FunctionContext::new(Rc::clone(&module));
+    validate_formal_parameter_names(params, true, false, span)?;
+    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
     }
@@ -8448,6 +8709,7 @@ fn compile_class_constructor(
         id: function_id,
         name: name.to_string(),
         span,
+        is_strict: true,
         ..Default::default()
     });
 
@@ -8458,6 +8720,7 @@ fn compile_class_constructor(
             &param.pattern,
             param.initializer.as_deref(),
             span,
+            false,
         )?;
     }
     if let Some(rest) = &params.rest {
@@ -8618,7 +8881,7 @@ fn compile_static_block(
     span: (u32, u32),
 ) -> Result<u32, CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
-    let child = FunctionContext::new(Rc::clone(&module));
+    let child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
     parent.push(child);
     parent.enter_scope();
 
@@ -8627,6 +8890,7 @@ fn compile_static_block(
         id: function_id,
         name: format!("{class_name}.<static-init>"),
         span,
+        is_strict: true,
         ..Default::default()
     });
 
@@ -9066,6 +9330,13 @@ fn compile_object_builtin(
             span,
         }),
     }
+}
+
+fn is_compiler_lowered_object_static(method: &str) -> bool {
+    matches!(
+        method,
+        "create" | "getPrototypeOf" | "setPrototypeOf" | "is"
+    ) || otter_bytecode::method_id::ObjectMethod::from_str(method).is_some()
 }
 
 /// §21.1.1 Number static constants. Returns the IEEE-754 value the

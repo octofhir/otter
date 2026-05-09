@@ -52,7 +52,7 @@ note: required because it appears within the type `BigIntValue`
    |
    | pub struct BigIntValue {
    |            ^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -82,7 +82,7 @@ note: required because it appears within the type `JsSymbol`
    |
    | pub struct JsSymbol {
    |            ^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -112,7 +112,7 @@ note: required because it appears within the type `JsTemporal`
    |
    | pub struct JsTemporal {
    |            ^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -142,7 +142,7 @@ note: required because it appears within the type `JsDate`
    |
    | pub struct JsDate {
    |            ^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -172,7 +172,7 @@ note: required because it appears within the type `JsIntl`
    |
    | pub struct JsIntl {
    |            ^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -202,7 +202,7 @@ note: required because it appears within the type `JsArrayBuffer`
    |
    | pub struct JsArrayBuffer {
    |            ^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -232,7 +232,7 @@ note: required because it appears within the type `JsDataView`
    |
    | pub struct JsDataView {
    |            ^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -262,7 +262,7 @@ note: required because it appears within the type `JsTypedArray`
    |
    | pub struct JsTypedArray {
    |            ^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -292,7 +292,7 @@ note: required because it appears within the type `JsProxy`
    |
    | pub struct JsProxy {
    |            ^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -327,7 +327,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Obje
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -362,7 +362,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Arra
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -397,7 +397,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Iter
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -432,7 +432,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<MapB
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -467,7 +467,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<SetB
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -502,7 +502,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Weak
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -537,7 +537,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Weak
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -572,7 +572,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Weak
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -607,7 +607,7 @@ note: required because it appears within the type `otter_gc::compressed::Gc<Fina
    |
    | pub struct Gc<T: ?Sized> {
    |            ^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -647,7 +647,7 @@ note: required because it appears within the type `otter_vm::BoundFunction`
    |
    | pub struct BoundFunction {
    |            ^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -687,7 +687,7 @@ note: required because it appears within the type `otter_vm::NativeFunction`
    |
    | pub struct NativeFunction {
    |            ^^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -727,7 +727,7 @@ note: required because it appears within the type `JsRegExp`
    |
    | pub struct JsRegExp {
    |            ^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -767,7 +767,7 @@ note: required because it appears within the type `JsGenerator`
    |
    | pub struct JsGenerator {
    |            ^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -807,7 +807,7 @@ note: required because it appears within the type `otter_vm::ClassConstructor`
    |
    | pub struct ClassConstructor {
    |            ^^^^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {
@@ -857,7 +857,7 @@ note: required because it appears within the type `JsPromiseHandle`
    |
    | pub struct JsPromiseHandle {
    |            ^^^^^^^^^^^^^^^
-note: required because it appears within the type `Value`
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
    |
    | pub enum Value {

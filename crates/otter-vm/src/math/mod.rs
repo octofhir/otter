@@ -587,7 +587,6 @@ fn first_or_nan(args: &[NumberValue]) -> NumberValue {
         .unwrap_or(NumberValue::Double(f64::NAN))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

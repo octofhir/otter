@@ -265,13 +265,21 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_json,
     },
-    placeholder("String"),
+    BootstrapEntry {
+        name: "String",
+        feature: BootstrapFeatures::CORE,
+        install: install_string,
+    },
     BootstrapEntry {
         name: "Number",
         feature: BootstrapFeatures::CORE,
         install: install_number,
     },
-    placeholder("Boolean"),
+    BootstrapEntry {
+        name: "Boolean",
+        feature: BootstrapFeatures::CORE,
+        install: install_boolean,
+    },
     placeholder("BigInt"),
     placeholder("Symbol"),
     BootstrapEntry {
@@ -279,7 +287,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_math,
     },
-    placeholder("Date"),
+    BootstrapEntry {
+        name: "Date",
+        feature: BootstrapFeatures::CORE,
+        install: install_date,
+    },
     placeholder("RegExp"),
     placeholder("Map"),
     placeholder("Set"),
@@ -287,7 +299,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     placeholder("WeakSet"),
     placeholder("WeakRef"),
     placeholder("Promise"),
-    placeholder("Proxy"),
+    BootstrapEntry {
+        name: "Proxy",
+        feature: BootstrapFeatures::CORE,
+        install: install_proxy,
+    },
     placeholder("Reflect"),
     BootstrapEntry {
         name: "Function",
@@ -416,6 +432,116 @@ fn install_placeholder(
     Ok(())
 }
 
+fn install_proxy(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{NativeCtx, NativeError};
+
+    fn proxy_target_is_object(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::Object(_)
+                | Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::Promise(_)
+                | Value::Iterator(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Temporal(_)
+                | Value::Date(_)
+                | Value::Intl(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+                | Value::Generator(_)
+                | Value::Proxy(_)
+        )
+    }
+
+    fn proxy_target_arg(args: &[Value]) -> Result<Value, NativeError> {
+        match args.first() {
+            Some(value) if proxy_target_is_object(value) => Ok(value.clone()),
+            _ => Err(NativeError::TypeError {
+                name: "Proxy",
+                reason: "target must be an object".to_string(),
+            }),
+        }
+    }
+
+    fn proxy_handler_arg(args: &[Value]) -> Result<JsObject, NativeError> {
+        match args.get(1) {
+            Some(Value::Object(handler)) => Ok(*handler),
+            _ => Err(NativeError::TypeError {
+                name: "Proxy",
+                reason: "handler must be an object".to_string(),
+            }),
+        }
+    }
+
+    fn proxy_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        if !ctx.is_construct_call() {
+            return Err(NativeError::TypeError {
+                name: "Proxy",
+                reason: "constructor requires new".to_string(),
+            });
+        }
+        let target = proxy_target_arg(args)?;
+        let handler = proxy_handler_arg(args)?;
+        Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
+    }
+
+    fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let target = proxy_target_arg(args)?;
+        let handler = proxy_handler_arg(args)?;
+        let proxy = crate::proxy::JsProxy::new(target, handler);
+        let proxy_handle = proxy.clone();
+        let revoke = crate::native_function::native_value_unchecked(
+            ctx.heap_mut(),
+            "revoke",
+            move |_, _, _| {
+                proxy_handle.revoke();
+                Ok(Value::Undefined)
+            },
+        )
+        .map_err(|_| NativeError::TypeError {
+            name: "Proxy.revocable",
+            reason: "out of memory while creating revoke function".to_string(),
+        })?;
+        let obj = object::alloc_object(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+            name: "Proxy.revocable",
+            reason: "out of memory while creating result object".to_string(),
+        })?;
+        object::set(obj, ctx.heap_mut(), "proxy", Value::Proxy(proxy));
+        object::set(obj, ctx.heap_mut(), "revoke", revoke);
+        Ok(Value::Object(obj))
+    }
+
+    let proxy_ctor = NativeFunction::new_constructor_static(heap, "Proxy", 2, proxy_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let revocable = NativeFunction::new_static(heap, "revocable", 2, proxy_revocable_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let revocable_desc =
+        PropertyDescriptor::data(Value::NativeFunction(revocable), true, false, true);
+    let string_heap = crate::string::StringHeap::default();
+    if !proxy_ctor.define_own_property(heap, &string_heap, "revocable", revocable_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("revocable"));
+    }
+    define_global(global, heap, entry.name, Value::NativeFunction(proxy_ctor));
+    Ok(())
+}
+
 fn install_array(
     entry: &BootstrapEntry,
     heap: &mut otter_gc::GcHeap,
@@ -446,10 +572,11 @@ fn install_array(
     // collects values verbatim.
     // <https://tc39.es/ecma262/#sec-array>
     fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let arr = crate::array::alloc_array(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
-            name: "Array",
-            reason: "out of memory while allocating array".to_string(),
-        })?;
+        let arr =
+            crate::array::alloc_array(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+                name: "Array",
+                reason: "out of memory while allocating array".to_string(),
+            })?;
         if args.len() == 1
             && let Value::Number(n) = &args[0]
         {
@@ -488,15 +615,9 @@ fn install_array(
 
     let ctor_native = NativeFunction::new_static(heap, "Array", 1, array_ctor_call)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    // Wire the callable+constructable bridge: the dispatch path
-    // promotes any `Value::Object` carrying this slot to the native
-    // ctor branch (see `Interpreter::dispatch_construct`).
-    object::set(
-        array,
-        heap,
-        crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY,
-        Value::NativeFunction(ctor_native),
-    );
+    // Wire the callable+constructable bridge as an internal object
+    // slot. This must not appear in JS own-property reflection.
+    object::set_constructor_native(array, heap, Value::NativeFunction(ctor_native));
 
     define_global(global, heap, entry.name, Value::Object(array));
     Ok(())
@@ -520,12 +641,7 @@ fn install_number(
             builder.method_from_spec(method)?;
         }
     }
-    object::set(
-        prototype,
-        heap,
-        crate::number::prototype::NUMBER_DATA_SLOT_KEY,
-        Value::Number(crate::number::NumberValue::from_i32(0)),
-    );
+    crate::object::set_number_data(prototype, heap, crate::number::NumberValue::from_i32(0));
 
     // §21.1.1 Number constructor. Both `Number(value)` (call) and
     // `new Number(value)` (construct) coerce `value` via §7.1.4
@@ -542,12 +658,7 @@ fn install_number(
         if ctx.is_construct_call() {
             let this = ctx.this_value().clone();
             if let Value::Object(obj) = this {
-                crate::object::set(
-                    obj,
-                    ctx.heap_mut(),
-                    crate::number::prototype::NUMBER_DATA_SLOT_KEY,
-                    Value::Number(value),
-                );
+                crate::object::set_number_data(obj, ctx.heap_mut(), value);
                 Ok(Value::Object(obj))
             } else {
                 Err(NativeError::TypeError {
@@ -565,9 +676,8 @@ fn install_number(
     // The `Number` global itself is a GC-managed JsObject. Both the
     // constants/static methods and the `prototype` link sit on it
     // as ordinary properties; the callable+constructable surface is
-    // wired through the dispatch path's hidden-slot lookup
-    // (`__construct__` / `__call__` keys, see
-    // `crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY`).
+    // wired through the dispatch path's internal native-constructor
+    // slot.
     let statics = object::alloc_object(heap)?;
     // Chain `Number`'s statics to `Object.prototype` so the
     // prototype-resident methods (hasOwnProperty, toString,
@@ -589,12 +699,7 @@ fn install_number(
     // Wire the callable+constructable bridge: stash the native
     // ctor on the Number object under a reserved key the dispatch
     // path looks up before falling back to ordinary property load.
-    object::set(
-        statics,
-        heap,
-        crate::object::CONSTRUCTOR_NATIVE_SLOT_KEY,
-        Value::NativeFunction(ctor_native),
-    );
+    object::set_constructor_native(statics, heap, Value::NativeFunction(ctor_native));
     // `Number.prototype` lives as an own property on the
     // constructor object (per §21.1.2.5). Spec posture is
     // `[[Writable]]: false, [[Enumerable]]: false,
@@ -725,14 +830,212 @@ fn install_number(
     Ok(())
 }
 
+fn install_string(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{NativeCtx, NativeError};
+
+    let constructor = object::alloc_object(heap)?;
+    let prototype = object::alloc_object(heap)?;
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(constructor, heap, Some(object_proto));
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
+    crate::object::set_string_data(
+        prototype,
+        heap,
+        crate::string::JsString::from_str("", &crate::string::StringHeap::default())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+
+    fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let string_heap = ctx.interp_mut().string_heap_clone();
+        let value = crate::string_dispatch::call(
+            otter_bytecode::method_id::StringMethod::Construct,
+            args,
+            &string_heap,
+        )
+        .map_err(|err| NativeError::TypeError {
+            name: "String",
+            reason: err.to_string(),
+        })?;
+        if ctx.is_construct_call() {
+            let Value::String(string) = value else {
+                return Err(NativeError::TypeError {
+                    name: "String",
+                    reason: "constructor did not return a string primitive".to_string(),
+                });
+            };
+            let this = ctx.this_value().clone();
+            if let Value::Object(obj) = this {
+                crate::object::set_string_data(obj, ctx.heap_mut(), string);
+                Ok(Value::Object(obj))
+            } else {
+                Err(NativeError::TypeError {
+                    name: "String",
+                    reason: "expected object receiver in `new String(...)`".to_string(),
+                })
+            }
+        } else {
+            Ok(value)
+        }
+    }
+
+    let ctor_native = NativeFunction::new_static(heap, "String", 1, string_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
+    object::set(constructor, heap, "prototype", Value::Object(prototype));
+    let string_value = Value::Object(constructor);
+    object::set(prototype, heap, "constructor", string_value.clone());
+    define_global(global, heap, entry.name, string_value);
+    Ok(())
+}
+
+fn install_boolean(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{NativeCtx, NativeError};
+
+    let prototype = object::alloc_object(heap)?;
+    {
+        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        for method in crate::boolean_prototype::BOOLEAN_PROTOTYPE_METHODS {
+            builder.method_from_spec(method)?;
+        }
+    }
+    crate::object::set_boolean_data(prototype, heap, false);
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
+
+    fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let value = args.first().is_some_and(Value::to_boolean);
+        if ctx.is_construct_call() {
+            let this = ctx.this_value().clone();
+            if let Value::Object(obj) = this {
+                crate::object::set_boolean_data(obj, ctx.heap_mut(), value);
+                Ok(Value::Object(obj))
+            } else {
+                Err(NativeError::TypeError {
+                    name: "Boolean",
+                    reason: "expected object receiver in `new Boolean(...)`".to_string(),
+                })
+            }
+        } else {
+            Ok(Value::Boolean(value))
+        }
+    }
+
+    let ctor_native = NativeFunction::new_static(heap, "Boolean", 1, boolean_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let statics = object::alloc_object(heap)?;
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(statics, heap, Some(object_proto));
+    }
+    object::set_constructor_native(statics, heap, Value::NativeFunction(ctor_native));
+    object::set(statics, heap, "prototype", Value::Object(prototype));
+    let boolean_value = Value::Object(statics);
+    object::set(prototype, heap, "constructor", boolean_value.clone());
+    define_global(global, heap, entry.name, boolean_value);
+    Ok(())
+}
+
 fn install_function(
     entry: &BootstrapEntry,
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{NativeCtx, NativeError};
+
+    fn function_prototype_call(
+        _ctx: &mut NativeCtx<'_>,
+        _args: &[Value],
+    ) -> Result<Value, NativeError> {
+        Ok(Value::Undefined)
+    }
+
+    fn function_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let (interp, module) = ctx.interp_mut_and_current_module();
+        let Some(module) = module else {
+            return Err(NativeError::TypeError {
+                name: "Function",
+                reason: "missing bytecode module for Function constructor".to_string(),
+            });
+        };
+        interp
+            .build_function_constructor(module, args)
+            .map_err(|err| {
+                let reason = format!("{err}");
+                match err {
+                    crate::VmError::SyntaxError { .. } => NativeError::SyntaxError {
+                        name: "Function",
+                        reason,
+                    },
+                    _ => NativeError::TypeError {
+                        name: "Function",
+                        reason,
+                    },
+                }
+            })
+    }
+
     let function = object::alloc_object(heap)?;
     let prototype = object::alloc_object(heap)?;
-    object::set(function, heap, "prototype", Value::Object(prototype));
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
+    object::set_prototype(function, heap, Some(prototype));
+    let ctor_native =
+        NativeFunction::new_constructor_static(heap, "Function", 1, function_ctor_call)
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::set_constructor_native(function, heap, Value::NativeFunction(ctor_native));
+    let prototype_call = NativeFunction::new_static(heap, "", 0, function_prototype_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::set_call_native(prototype, heap, Value::NativeFunction(prototype_call));
+    let length = PropertyDescriptor::data(
+        Value::Number(crate::number::NumberValue::from_i32(1)),
+        false,
+        false,
+        true,
+    );
+    let _ = object::define_own_property(function, heap, "length", length);
+    let name_value = Value::String(
+        crate::string::JsString::from_str("Function", &crate::string::StringHeap::default())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let name = PropertyDescriptor::data(name_value, false, false, true);
+    let _ = object::define_own_property(function, heap, "name", name);
+    let prototype_descriptor =
+        PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let _ = object::define_own_property(function, heap, "prototype", prototype_descriptor);
+    let prototype_length = PropertyDescriptor::data(
+        Value::Number(crate::number::NumberValue::from_i32(0)),
+        false,
+        false,
+        true,
+    );
+    let _ = object::define_own_property(prototype, heap, "length", prototype_length);
+    let prototype_name_value = Value::String(
+        crate::string::JsString::from_str("", &crate::string::StringHeap::default())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let prototype_name = PropertyDescriptor::data(prototype_name_value, false, false, true);
+    let _ = object::define_own_property(prototype, heap, "name", prototype_name);
     {
         let mut builder = ObjectBuilder::from_object(heap, prototype);
         for method in function_prototype::FUNCTION_PROTOTYPE_METHODS {
@@ -740,6 +1043,8 @@ fn install_function(
         }
     }
     function_prototype::install_restricted_accessors(heap, prototype)?;
+    let constructor = PropertyDescriptor::data(Value::Object(function), true, false, true);
+    let _ = object::define_own_property(prototype, heap, "constructor", constructor);
     define_global(global, heap, entry.name, Value::Object(function));
     Ok(())
 }
@@ -771,8 +1076,28 @@ fn install_object(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{NativeCtx, NativeError};
+
+    fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        match args.first() {
+            None | Some(Value::Undefined | Value::Null) => {
+                let obj =
+                    object::alloc_object(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+                        name: "Object",
+                        reason: "object allocation failed".to_string(),
+                    })?;
+                Ok(Value::Object(obj))
+            }
+            Some(value) => Ok(value.clone()),
+        }
+    }
+
     let object = object::alloc_object(heap)?;
     let prototype = object::alloc_object(heap)?;
+    let ctor_native = NativeFunction::new_static(heap, "Object", 1, object_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::set_constructor_native(object, heap, Value::NativeFunction(ctor_native));
     object::set(object, heap, "prototype", Value::Object(prototype));
     {
         let mut builder = ObjectBuilder::from_object(heap, object);
@@ -786,7 +1111,59 @@ fn install_object(
             builder.method_from_spec(method)?;
         }
     }
+    object::set(prototype, heap, "constructor", Value::Object(object));
     define_global(global, heap, entry.name, Value::Object(object));
+    Ok(())
+}
+
+fn install_date(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::{JsString, NativeCtx, NativeError};
+
+    fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let date =
+            crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::Construct, args)
+                .map_err(|err| NativeError::TypeError {
+                    name: "Date",
+                    reason: err.to_string(),
+                })?;
+        if ctx.is_construct_call() {
+            return Ok(date);
+        }
+        let text = match &date {
+            Value::Date(d) => {
+                crate::date::to_iso_string(d.time()).unwrap_or_else(|| "Invalid Date".to_string())
+            }
+            other => other.display_string(),
+        };
+        let string_heap = ctx.interp_mut().string_heap_clone();
+        let value =
+            JsString::from_str(&text, &string_heap).map_err(|err| NativeError::TypeError {
+                name: "Date",
+                reason: err.to_string(),
+            })?;
+        Ok(Value::String(value))
+    }
+
+    let constructor = object::alloc_object(heap)?;
+    let prototype = object::alloc_object(heap)?;
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(constructor, heap, Some(object_proto));
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
+    let ctor_native = NativeFunction::new_static(heap, "Date", 7, date_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
+    object::set(constructor, heap, "prototype", Value::Object(prototype));
+    let date_value = Value::Object(constructor);
+    object::set(prototype, heap, "constructor", date_value.clone());
+    define_global(global, heap, entry.name, date_value);
     Ok(())
 }
 
@@ -907,8 +1284,8 @@ mod tests {
 
     #[test]
     fn default_bootstrap_telemetry_matches_startup_ratchet() {
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 200;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 96 * 1024;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 340;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 144 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

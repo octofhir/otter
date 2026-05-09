@@ -96,6 +96,8 @@ const OBJECT_STATIC_METHODS: &[MethodSpec] = &[
 
 /// Static methods installed on `Object.prototype`.
 pub static OBJECT_PROTOTYPE_METHODS: &[MethodSpec] = &[
+    method("toString", 0, native_prototype_to_string),
+    method("valueOf", 0, native_prototype_value_of),
     method("hasOwnProperty", 1, native_prototype_has_own_property),
     method(
         "propertyIsEnumerable",
@@ -123,10 +125,11 @@ fn native_call(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    let module = ctx.current_module();
     if let Some(result) = ctx
         .cx
         .interp
-        .try_function_object_static_call(None, method, args)
+        .try_function_object_static_call(module, method, args)
         .map_err(|err| object_native_error(method.name(), err))?
     {
         return Ok(result);
@@ -174,10 +177,41 @@ native_object_static!(native_has_own, HasOwn);
 native_object_static!(native_get_own_property_names, GetOwnPropertyNames);
 native_object_static!(native_get_own_property_symbols, GetOwnPropertySymbols);
 
+fn native_prototype_to_string(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let tag = object_to_string_tag(ctx);
+    let display = format!("[object {tag}]");
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    Ok(Value::String(
+        JsString::from_str(&display, &string_heap).map_err(|_| NativeError::TypeError {
+            name: "toString",
+            reason: "out of memory while allocating string".to_string(),
+        })?,
+    ))
+}
+
+fn native_prototype_value_of(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    Ok(ctx.this_value().clone())
+}
+
 fn native_prototype_has_own_property(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    if let Some(module) = ctx.current_module() {
+        let desc = ctx
+            .cx
+            .interp
+            .get_own_property_descriptor_for_value(module, this_value.clone(), args.first())
+            .map_err(|err| object_native_error("hasOwnProperty", err))?;
+        return Ok(Value::Boolean(desc.is_some()));
+    }
     let present = match ctx.this_value() {
         Value::Object(obj) => has_own_property(*obj, ctx.heap(), args.first())
             .map_err(|err| object_native_error("hasOwnProperty", err))?,
@@ -207,6 +241,17 @@ fn native_prototype_property_is_enumerable(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    if let Some(module) = ctx.current_module() {
+        let desc = ctx
+            .cx
+            .interp
+            .get_own_property_descriptor_for_value(module, this_value, args.first())
+            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        return Ok(Value::Boolean(
+            desc.as_ref().is_some_and(PropertyDescriptor::enumerable),
+        ));
+    }
     let enumerable = match ctx.this_value() {
         Value::Object(obj) => {
             let key = expect_property_key(args.first())
@@ -255,13 +300,113 @@ fn native_prototype_is_prototype_of(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let result = match (ctx.this_value(), args.first()) {
-        (Value::Object(proto), Some(Value::Object(other))) => {
-            crate::object::has_in_proto_chain(*other, ctx.heap(), *proto)
+    let function_prototype = ctx.cx.interp.function_prototype_object().ok();
+    let this_value = ctx.this_value().clone();
+    let target = args.first().cloned();
+    let result = match (this_value, target) {
+        (Value::Object(proto), Some(value)) => {
+            value_has_prototype_in_chain(&value, proto, ctx.heap(), function_prototype)
         }
         _ => false,
     };
     Ok(Value::Boolean(result))
+}
+
+fn value_has_prototype_in_chain(
+    value: &Value,
+    target: JsObject,
+    heap: &otter_gc::GcHeap,
+    function_prototype: Option<JsObject>,
+) -> bool {
+    match value {
+        Value::Object(obj) if constructor_object_has_function_prototype(*obj, heap) => {
+            function_value_has_prototype_in_chain(target, heap, function_prototype)
+        }
+        Value::Object(obj) => crate::object::has_in_proto_chain(*obj, heap, target),
+        Value::Function { .. }
+        | Value::Closure { .. }
+        | Value::BoundFunction(_)
+        | Value::NativeFunction(_)
+        | Value::ClassConstructor(_) => {
+            function_value_has_prototype_in_chain(target, heap, function_prototype)
+        }
+        _ => false,
+    }
+}
+
+fn function_value_has_prototype_in_chain(
+    target: JsObject,
+    heap: &otter_gc::GcHeap,
+    function_prototype: Option<JsObject>,
+) -> bool {
+    let Some(function_prototype) = function_prototype else {
+        return false;
+    };
+    function_prototype == target
+        || crate::object::has_in_proto_chain(function_prototype, heap, target)
+}
+
+fn constructor_object_has_function_prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    matches!(
+        crate::object::constructor_native(obj, heap),
+        Some(Value::NativeFunction(_))
+    )
+}
+
+fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
+    if let Some(tag) = explicit_to_string_tag(ctx) {
+        return tag;
+    }
+    match ctx.this_value() {
+        Value::Undefined | Value::Hole => "Undefined",
+        Value::Null => "Null",
+        Value::Boolean(_) => "Boolean",
+        Value::Number(_) => "Number",
+        Value::BigInt(_) => "BigInt",
+        Value::String(_) => "String",
+        Value::Symbol(_) => "Symbol",
+        Value::Function { .. }
+        | Value::Closure { .. }
+        | Value::BoundFunction(_)
+        | Value::NativeFunction(_)
+        | Value::ClassConstructor(_) => "Function",
+        Value::Array(_) => "Array",
+        Value::RegExp(_) => "RegExp",
+        Value::Date(_) => "Date",
+        Value::Promise(_) => "Promise",
+        Value::Map(_) => "Map",
+        Value::Set(_) => "Set",
+        Value::WeakMap(_) => "WeakMap",
+        Value::WeakSet(_) => "WeakSet",
+        Value::WeakRef(_) => "WeakRef",
+        Value::FinalizationRegistry(_) => "FinalizationRegistry",
+        Value::Generator(_) => "Generator",
+        Value::Iterator(_) => "Iterator",
+        Value::Temporal(_) => "Temporal",
+        Value::Intl(_) => "Intl",
+        Value::ArrayBuffer(_) => "ArrayBuffer",
+        Value::DataView(_) => "DataView",
+        Value::TypedArray(_) => "TypedArray",
+        Value::Object(obj) if crate::object::call_native(*obj, ctx.heap()).is_some() => "Function",
+        Value::Object(_) | Value::Proxy(_) => "Object",
+    }
+    .to_string()
+}
+
+fn explicit_to_string_tag(ctx: &NativeCtx<'_>) -> Option<String> {
+    let tag_symbol = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::ToStringTag);
+    let value = match ctx.this_value() {
+        Value::Object(obj) => crate::object::get_symbol(*obj, ctx.heap(), &tag_symbol),
+        _ => None,
+    }?;
+    match value {
+        Value::String(s) => Some(s.to_lossy_string()),
+        _ => None,
+    }
 }
 
 fn native_function_has_own(
@@ -579,6 +724,11 @@ pub fn call(
             // Spec: `Object.isExtensible(non_object) === false`.
             let result = match arg {
                 Value::Object(o) => crate::object::is_extensible(o, gc_heap),
+                Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::BoundFunction(_)
+                | Value::NativeFunction(_)
+                | Value::ClassConstructor(_) => true,
                 _ => false,
             };
             Ok(Value::Boolean(result))
@@ -595,12 +745,10 @@ pub fn call(
                 Some(Value::NativeFunction(native)) => native
                     .enumerable_own_property_keys(gc_heap)
                     .into_iter()
-                    .map(str::to_string)
                     .collect(),
                 Some(Value::BoundFunction(bound)) => {
                     crate::function_metadata::bound_enumerable_own_property_keys(bound, gc_heap)
                         .into_iter()
-                        .map(str::to_string)
                         .collect()
                 }
                 _ => return Err(VmError::TypeMismatch),
@@ -728,15 +876,12 @@ pub fn call(
                         p.keys().map(|k| k.to_string()).collect()
                     })
                 }
-                Some(Value::NativeFunction(native)) => native
-                    .own_property_keys(gc_heap)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+                Some(Value::NativeFunction(native)) => {
+                    native.own_property_keys(gc_heap).into_iter().collect()
+                }
                 Some(Value::BoundFunction(bound)) => {
                     crate::function_metadata::bound_own_property_keys(bound, gc_heap)
                         .into_iter()
-                        .map(str::to_string)
                         .collect()
                 }
                 Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),

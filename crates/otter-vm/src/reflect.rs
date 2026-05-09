@@ -15,7 +15,6 @@
 use otter_bytecode::BytecodeModule;
 use smallvec::SmallVec;
 
-use crate::abstract_ops::is_callable;
 use crate::object::{JsObject, PropertyLookup};
 use crate::object_statics::coerce_to_descriptor;
 use crate::string::JsString;
@@ -49,7 +48,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.apply>
         M::Apply => {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
-            if !is_callable(&target) {
+            if !is_callable(&target, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
             let this_value = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -68,11 +67,11 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.construct>
         M::Construct => {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
-            if !is_constructor(&target, interp.gc_heap()) {
+            if !is_constructor(&target, module, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
             let new_target = args.get(2).cloned().unwrap_or_else(|| target.clone());
-            if !is_constructor(&new_target, interp.gc_heap()) {
+            if !is_constructor(&new_target, module, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
             let argv: SmallVec<[Value; 8]> = match args.get(1) {
@@ -84,29 +83,7 @@ pub fn call(
                 None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
                 _ => return Err(VmError::TypeMismatch),
             };
-            // Foundation: build a fresh receiver from the
-            // constructor's `prototype` chain and run the body via
-            // run_callable_sync.
-            let proto = {
-                let heap = interp.gc_heap();
-                construct_prototype(&new_target, heap)
-            };
-            let receiver = {
-                let heap = interp.gc_heap_mut();
-                let receiver = crate::object::alloc_object(heap).map_err(VmError::from)?;
-                if let Some(proto) = proto {
-                    crate::object::set_prototype(receiver, heap, Some(proto));
-                }
-                receiver
-            };
-            let result =
-                interp.run_callable_sync(module, &target, Value::Object(receiver), argv)?;
-            // Per §13.3.5 — non-object return is replaced with the
-            // freshly-allocated receiver.
-            match result {
-                Value::Object(_) => Ok(result),
-                _ => Ok(Value::Object(receiver)),
-            }
+            interp.run_construct_sync(module, &target, new_target, argv)
         }
         // §28.1.4 Reflect.defineProperty(target, propertyKey, attributes)
         // <https://tc39.es/ecma262/#sec-reflect.defineproperty>
@@ -301,7 +278,7 @@ pub fn call(
                     }
                 }
                 crate::object::SetOutcome::InvokeSetter { setter } => {
-                    if !is_callable(&setter) {
+                    if !is_callable(&setter, interp.gc_heap()) {
                         false
                     } else {
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
@@ -318,48 +295,38 @@ pub fn call(
         M::SetPrototypeOf => {
             let target = expect_object(args.first())?;
             let proto = match args.get(1) {
-                Some(Value::Object(p)) => Some(*p),
-                Some(Value::Null) | None => None,
+                Some(Value::Object(_)) | Some(Value::Proxy(_)) | Some(Value::Null) => {
+                    args.get(1).cloned()
+                }
+                None => Some(Value::Null),
                 _ => return Err(VmError::TypeMismatch),
             };
             let heap = interp.gc_heap_mut();
-            crate::object::set_prototype(target, heap, proto);
+            if !crate::object::set_prototype_value(target, heap, proto) {
+                return Err(VmError::TypeMismatch);
+            }
             Ok(Value::Boolean(true))
         }
     }
 }
 
-/// Pull the `prototype` own property off a callable. Mirrors the
-/// existing `Op::New` lookup so `Reflect.construct` builds
-/// instances with the same chain.
-fn construct_prototype(callee: &Value, heap: &otter_gc::GcHeap) -> Option<JsObject> {
-    match callee {
-        Value::ClassConstructor(c) => Some(c.prototype(heap)),
-        Value::Object(obj) => match crate::object::get(*obj, heap, "prototype") {
-            Some(Value::Object(p)) => Some(p),
-            _ => None,
-        },
-        Value::BoundFunction(b) => {
-            let (target, _, _) = b.parts(heap);
-            construct_prototype(&target, heap)
-        }
-        _ => None,
+fn is_callable(value: &Value, heap: &otter_gc::GcHeap) -> bool {
+    match value {
+        Value::Object(obj) => matches!(
+            crate::object::call_native(*obj, heap),
+            Some(Value::NativeFunction(_))
+        ),
+        _ => crate::abstract_ops::is_callable(value),
     }
 }
 
-fn is_constructor(value: &Value, heap: &otter_gc::GcHeap) -> bool {
+fn is_constructor(value: &Value, module: &BytecodeModule, heap: &otter_gc::GcHeap) -> bool {
     match value {
-        Value::Function { .. } | Value::Closure { .. } | Value::ClassConstructor(_) => true,
-        Value::BoundFunction(bound) => {
-            let (target, _, _) = bound.parts(heap);
-            is_constructor(&target, heap)
-        }
-        // Standard built-in function objects are callable but not
-        // constructors unless explicitly specified. Otter's current
-        // native builtin path does not expose any constructor-shaped
-        // native functions.
-        Value::NativeFunction(_) => false,
-        _ => false,
+        Value::Object(obj) => matches!(
+            crate::object::constructor_native(*obj, heap),
+            Some(Value::NativeFunction(_))
+        ),
+        _ => crate::abstract_ops::is_constructor(value, module, heap),
     }
 }
 

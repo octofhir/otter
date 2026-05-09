@@ -44,6 +44,7 @@ fn computed_assignment_rejects_new_key_on_non_extensible_object() {
         .run_script(
             SourceInput::from_javascript(
                 r#"
+                "use strict";
                 const o = {};
                 Object.preventExtensions(o);
                 const key = "x";
@@ -56,7 +57,7 @@ fn computed_assignment_rejects_new_key_on_non_extensible_object() {
         .expect_err("computed assignment should reject");
     let message = err.to_string();
     assert!(
-        message.contains("type mismatch") || message.contains("TypeMismatch"),
+        message.contains("Cannot assign to property 'x'") || message.contains("TypeError"),
         "{message}"
     );
 }
@@ -96,6 +97,7 @@ fn symbol_assignment_rejects_new_key_on_non_extensible_object() {
         .run_script(
             SourceInput::from_javascript(
                 r#"
+                "use strict";
                 const o = {};
                 const sym = Symbol("x");
                 Object.preventExtensions(o);
@@ -107,7 +109,9 @@ fn symbol_assignment_rejects_new_key_on_non_extensible_object() {
         .expect_err("symbol assignment should reject");
     let message = err.to_string();
     assert!(
-        message.contains("type mismatch") || message.contains("TypeMismatch"),
+        message.contains("Cannot assign to read-only property")
+            || message.contains("Cannot assign to symbol property")
+            || message.contains("TypeError"),
         "{message}"
     );
 }
@@ -119,6 +123,7 @@ fn symbol_define_property_descriptor_is_enforced() {
         .run_script(
             SourceInput::from_javascript(
                 r#"
+                "use strict";
                 const o = {};
                 const sym = Symbol("x");
                 Object.defineProperty(o, sym, {
@@ -135,7 +140,7 @@ fn symbol_define_property_descriptor_is_enforced() {
         .expect_err("non-writable symbol descriptor should reject");
     let message = err.to_string();
     assert!(
-        message.contains("type mismatch") || message.contains("TypeMismatch"),
+        message.contains("Cannot assign to read-only property") || message.contains("TypeError"),
         "{message}"
     );
 }
@@ -390,6 +395,7 @@ fn proxy_set_fallback_rejects_non_extensible_target() {
         .run_script(
             SourceInput::from_javascript(
                 r#"
+                "use strict";
                 const target = {};
                 Object.preventExtensions(target);
                 const proxy = new Proxy(target, {});
@@ -401,7 +407,7 @@ fn proxy_set_fallback_rejects_non_extensible_target() {
         .expect_err("proxy fallback set should reject");
     let message = err.to_string();
     assert!(
-        message.contains("type mismatch") || message.contains("TypeMismatch"),
+        message.contains("Cannot assign to property") || message.contains("TypeError"),
         "{message}"
     );
 }
@@ -423,4 +429,227 @@ fn proxy_set_fallback_invokes_setter_with_proxy_receiver() {
         receiverWasProxy;
         "#);
     assert_eq!(completion, "true");
+}
+
+#[test]
+fn proxy_prototype_get_trap_uses_original_receiver() {
+    let completion = run(r#"
+        const proto = new Proxy({}, {
+            get: function(target, key, receiver) {
+                return key === "x" && receiver.marker === "recv" ? "hit" : "miss";
+            }
+        });
+        const o = { marker: "recv" };
+        Object.setPrototypeOf(o, proto);
+        o.x;
+        "#);
+    assert_eq!(completion, "hit");
+}
+
+#[test]
+fn proxy_prototype_get_fallback_reads_target() {
+    let completion = run(r#"
+        const target = { x: 41 };
+        const proto = new Proxy(target, {});
+        const o = {};
+        Object.setPrototypeOf(o, proto);
+        o.x + 1;
+        "#);
+    assert_eq!(completion, "42");
+}
+
+#[test]
+fn proxy_prototype_has_trap_participates_in_in_operator() {
+    let completion = run(r#"
+        let seen = "";
+        const proto = new Proxy({}, {
+            has: function(target, key) {
+                seen = key;
+                return key === "x";
+            }
+        });
+        const o = {};
+        Object.setPrototypeOf(o, proto);
+        ("x" in o) + ":" + seen;
+        "#);
+    assert_eq!(completion, "true:x");
+}
+
+#[test]
+fn proxy_prototype_method_call_uses_get_trap_receiver() {
+    let completion = run(r#"
+        const proto = new Proxy({}, {
+            get: function(target, key, receiver) {
+                if (key !== "m") {
+                    return undefined;
+                }
+                return function() {
+                    return this === receiver && this.marker === 5 ? "ok" : "bad";
+                };
+            }
+        });
+        const o = { marker: 5 };
+        Object.setPrototypeOf(o, proto);
+        o.m();
+        "#);
+    assert_eq!(completion, "ok");
+}
+
+#[test]
+fn object_literal_getter_installs_accessor_descriptor() {
+    let completion = run(r#"
+        const o = {
+            marker: 9,
+            get x() {
+                return this.marker + 1;
+            }
+        };
+        const desc = Object.getOwnPropertyDescriptor(o, "x");
+        o.x + ":" + (typeof desc.get) + ":" + desc.enumerable + ":" + desc.configurable;
+        "#);
+    assert_eq!(completion, "10:function:true:true");
+}
+
+#[test]
+fn proxy_get_fallback_through_nested_function_proxy() {
+    let completion = run(r#"
+        const target = new Proxy(function(a) {}, {});
+        const proxy = new Proxy(target, { get: undefined });
+        Object.create(proxy).length;
+        "#);
+    assert_eq!(completion, "1");
+}
+
+#[test]
+fn proxy_get_fallback_through_nested_array_proxy() {
+    let completion = run(r#"
+        const target = new Proxy([3, 4, 5], {});
+        const proxy = new Proxy(target, { get: null });
+        proxy.length + ":" + proxy[1];
+        "#);
+    assert_eq!(completion, "3:4");
+}
+
+#[test]
+fn proxy_get_rejects_incompatible_frozen_data_property() {
+    let mut rt = Runtime::builder().build().expect("runtime");
+    let err = rt
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                const target = {};
+                Object.defineProperty(target, "x", {
+                    value: 1,
+                    writable: false,
+                    configurable: false,
+                });
+                const proxy = new Proxy(target, { get: function() { return 2; } });
+                proxy.x;
+                "#,
+            ),
+            "<test>",
+        )
+        .expect_err("proxy get invariant should reject");
+    let message = err.to_string();
+    assert!(
+        message.contains("Proxy get trap") || message.contains("TypeError"),
+        "{message}"
+    );
+}
+
+#[test]
+fn proxy_get_rejects_value_for_accessor_without_getter() {
+    let mut rt = Runtime::builder().build().expect("runtime");
+    let err = rt
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                const target = {};
+                Object.defineProperty(target, "x", {
+                    get: undefined,
+                    configurable: false,
+                });
+                const proxy = new Proxy(target, { get: function() { return 2; } });
+                proxy.x;
+                "#,
+            ),
+            "<test>",
+        )
+        .expect_err("proxy accessor invariant should reject");
+    let message = err.to_string();
+    assert!(
+        message.contains("Proxy get trap") || message.contains("TypeError"),
+        "{message}"
+    );
+}
+
+#[test]
+fn proxy_get_own_property_descriptor_falls_through_string_proxy() {
+    let completion = run(r#"
+        const stringTarget = new Proxy(new String("str"), {});
+        const stringProxy = new Proxy(stringTarget, {});
+        const ch = Object.getOwnPropertyDescriptor(stringProxy, "0");
+        const len = Object.getOwnPropertyDescriptor(stringProxy, "length");
+        ch.value + ":" + ch.writable + ":" + ch.enumerable + ":" + ch.configurable + ":" +
+            len.value + ":" + len.writable + ":" + len.enumerable + ":" + len.configurable;
+        "#);
+    assert_eq!(completion, "s:false:true:false:3:false:false:false");
+}
+
+#[test]
+fn proxy_get_own_property_descriptor_falls_through_function_proxy() {
+    let completion = run(r#"
+        const functionTarget = new Proxy(function() {}, {});
+        const functionProxy = new Proxy(functionTarget, {});
+        const desc = Object.getOwnPropertyDescriptor(functionProxy, "prototype");
+        (typeof desc.value) + ":" + desc.writable + ":" + desc.enumerable + ":" + desc.configurable;
+        "#);
+    assert_eq!(completion, "object:true:false:false");
+}
+
+#[test]
+fn proxy_array_descriptor_helpers_see_enumerable_index() {
+    let completion = run(r#"
+        const arrayTarget = new Proxy([42], {});
+        const arrayProxy = new Proxy(arrayTarget, { getOwnPropertyDescriptor: undefined });
+        const desc = Object.getOwnPropertyDescriptor(arrayProxy, "0");
+        const keys = Object.keys(arrayProxy);
+        const enumerable = Object.prototype.propertyIsEnumerable.call(arrayProxy, "0");
+        const oldValue = arrayProxy["0"];
+        arrayProxy["0"] = "changed";
+        const writable = arrayProxy["0"] === "changed";
+        arrayProxy["0"] = oldValue;
+        const removed = delete arrayProxy["0"];
+        desc.enumerable + ":" + keys.length + ":" + keys[0] + ":" + enumerable + ":" +
+            writable + ":" + removed + ":" + Object.prototype.hasOwnProperty.call(arrayProxy, "0");
+        "#);
+    assert_eq!(completion, "true:1:0:true:true:true:false");
+}
+
+#[test]
+fn proxy_trap_throw_preserves_original_payload() {
+    let completion = run(r#"
+        const marker = { tag: "marker" };
+        const getProxy = new Proxy({}, {
+            get: function() { throw marker; }
+        });
+        const descProxy = new Proxy({}, {
+            getOwnPropertyDescriptor: function() { throw marker; }
+        });
+        const protoProxy = new Proxy({}, {
+            getPrototypeOf: function() { throw marker; }
+        });
+        function caughtSame(fn) {
+            try {
+                fn();
+            } catch (e) {
+                return e === marker;
+            }
+            return false;
+        }
+        caughtSame(function() { getProxy.x; }) + ":" +
+            caughtSame(function() { Object.getOwnPropertyDescriptor(descProxy, "x"); }) + ":" +
+            caughtSame(function() { Object.getPrototypeOf(protoProxy); });
+        "#);
+    assert_eq!(completion, "true:true:true");
 }

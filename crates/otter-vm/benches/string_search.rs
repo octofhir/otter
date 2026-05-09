@@ -102,7 +102,11 @@ fn bench_string_search(c: &mut Criterion) {
     let mut g = c.benchmark_group("string_search/last_index_of_4KiB");
     g.throughput(Throughput::Bytes(buf_4k.len() as u64));
     g.bench_function("scalar_rfind", |b| {
-        b.iter(|| black_box(&buf_4k).iter().rposition(|&x| x == black_box(b'?')))
+        b.iter(|| {
+            black_box(&buf_4k)
+                .iter()
+                .rposition(|&x| x == black_box(b'?'))
+        })
     });
     g.bench_function("swar_rfind", |b| {
         b.iter(|| rfind_byte(black_box(&buf_4k), black_box(b'?')))

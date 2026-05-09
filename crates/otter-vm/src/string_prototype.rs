@@ -11,8 +11,9 @@
 //! - One private `impl_*` function per method.
 //!
 //! # Invariants
-//! - Every method validates the receiver as `Value::String`; a non-
-//!   string raises [`crate::intrinsics::IntrinsicError::BadReceiver`].
+//! - Every method validates the receiver as a primitive string or a
+//!   String wrapper with `[[StringData]]`; a non-string raises
+//!   [`crate::intrinsics::IntrinsicError::BadReceiver`].
 //! - Numeric arguments accept `Value::Number` and (for foundation-era
 //!   ergonomics on a few methods) string-encoded indices.
 //! - `indexOf` polls the runtime interrupt flag every
@@ -33,9 +34,31 @@ use crate::regexp::JsRegExp;
 use crate::string::Interrupted;
 use crate::string::JsString;
 
-fn receiver_string<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsString, IntrinsicError> {
+enum ReceiverString<'a> {
+    Borrowed(&'a JsString),
+    Owned(JsString),
+}
+
+impl std::ops::Deref for ReceiverString<'_> {
+    type Target = JsString;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+fn receiver_string<'a>(args: &'a IntrinsicArgs<'_>) -> Result<ReceiverString<'a>, IntrinsicError> {
     match args.receiver {
-        Value::String(s) => Ok(s),
+        Value::String(s) => Ok(ReceiverString::Borrowed(s)),
+        Value::Object(obj) => {
+            let gc = args.gc_heap.borrow();
+            crate::object::string_data(*obj, &gc)
+                .map(ReceiverString::Owned)
+                .ok_or(IntrinsicError::BadReceiver { expected: "string" })
+        }
         _ => Err(IntrinsicError::BadReceiver { expected: "string" }),
     }
 }
@@ -583,7 +606,7 @@ fn impl_replace(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let replacement = arg_string(args, 1)?;
         let heap = args.gc_heap.borrow();
         return regex_replace(
-            recv,
+            &recv,
             re,
             &heap,
             &replacement.to_utf16_vec(),
@@ -633,7 +656,7 @@ fn impl_replace_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         let replacement = arg_string(args, 1)?;
         return regex_replace(
-            recv,
+            &recv,
             re,
             &heap,
             &replacement.to_utf16_vec(),
@@ -689,7 +712,7 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if let Some(Value::RegExp(re)) = args.args.first() {
         let limit = parse_split_limit(args)?;
         let mut heap = args.gc_heap.borrow_mut();
-        return regex_split(recv, re, limit, args.string_heap, *heap);
+        return regex_split(&recv, re, limit, args.string_heap, *heap);
     }
 
     // Resolve separator: missing or `undefined` → caller-as-only-element.
@@ -1071,10 +1094,7 @@ fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// back to spec-default Unicode code-point comparison; locale-
 /// aware ordering ships through `Intl.Collator`.
 fn impl_locale_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = match args.receiver {
-        Value::String(s) => s.to_lossy_string(),
-        _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
-    };
+    let recv = receiver_string(args)?.to_lossy_string();
     let other = match args.args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(),
@@ -1096,10 +1116,7 @@ fn impl_locale_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
 /// working. Real normalisation lands alongside the ICU integration
 /// follow-up.
 fn impl_normalize(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let recv = match args.receiver {
-        Value::String(s) => s.clone(),
-        _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
-    };
+    let recv = receiver_string(args)?;
     let form = match args.args.first() {
         None | Some(Value::Undefined) => "NFC".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
@@ -1116,15 +1133,13 @@ fn impl_normalize(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             reason: "must be one of NFC / NFD / NFKC / NFKD",
         });
     }
-    Ok(Value::String(recv))
+    Ok(Value::String((*recv).clone()))
 }
 
 /// §22.1.3.27 String.prototype.toString — returns the primitive.
 fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    match args.receiver {
-        Value::String(s) => Ok(Value::String(s.clone())),
-        _ => Err(IntrinsicError::BadReceiver { expected: "string" }),
-    }
+    let recv = receiver_string(args)?;
+    Ok(Value::String((*recv).clone()))
 }
 
 /// Convenience accessor used by the dispatcher.

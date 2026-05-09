@@ -263,7 +263,7 @@ error: future cannot be sent between threads safely
 8 | |     });
   | |______^ future created by async block is not `Send`
   |
-  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `Rc<(dyn for<'a> Fn(&'a str) -> Result<otter_bytecode::BytecodeModule, std::string::String> + 'static)>`
+  = help: within `{async block@$DIR/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:5:18: 5:28}`, the trait `Send` is not implemented for `Rc<(dyn for<'a> Fn(&'a str, EvalCompileOptions) -> Result<otter_bytecode::BytecodeModule, std::string::String> + 'static)>`
 note: captured value is not `Send`
  --> tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs:7:30
   |

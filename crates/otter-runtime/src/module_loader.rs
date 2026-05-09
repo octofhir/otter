@@ -622,19 +622,18 @@ impl ModuleLoader {
         }
         if let Some(graph) = &self.config.package_graph
             && let Some(scope_cache) = &self.package_scope_cache
-            && let Some(path) =
-                package_graph_resolver::resolve_from_package_graph_with_scope_cache(
-                    graph,
-                    scope_cache,
-                    bare,
-                    &dir,
-                    kind,
-                    conditions,
-                    &self.config.extensions,
-                )
-                .map_err(|message| {
-                    resolve_error_with_context(specifier, referrer, kind, conditions, message)
-                })?
+            && let Some(path) = package_graph_resolver::resolve_from_package_graph_with_scope_cache(
+                graph,
+                scope_cache,
+                bare,
+                &dir,
+                kind,
+                conditions,
+                &self.config.extensions,
+            )
+            .map_err(|message| {
+                resolve_error_with_context(specifier, referrer, kind, conditions, message)
+            })?
         {
             return Ok(format!("file://{}", path.display()));
         }

@@ -73,7 +73,7 @@ impl<'a> RuntimeState<'a> {
     /// - symbol registry + well-known symbols;
     /// - error-class registry;
     /// - function-user-prop bag;
-    /// - pending generator throw side-channel.
+    /// - pending generator / uncaught throw side-channels.
     pub fn trace_roots(&self, visitor: &mut GcRootVisitor<'_>) {
         let interp = self.interp;
         // 1) Shared globalThis.
@@ -95,12 +95,14 @@ impl<'a> RuntimeState<'a> {
         for obj in interp.function_user_props_for_trace() {
             obj.trace_gc_roots(visitor);
         }
-        // 7) Pending generator throw side-channel — see
-        //    `Interpreter::pending_generator_throw`. Phase 1
-        //    holds it as a `Value` (Rc-shared); the trace body
-        //    in `Value::trace_gc_roots` lands with task 76
-        //    alongside the first real `Gc<…>`-bearing variant.
+        // 7) Pending throw side-channels. Phase 1 holds them as
+        //    `Value` (Rc-shared); the trace body in
+        //    `Value::trace_gc_roots` lands with task 76 alongside
+        //    the first real `Gc<…>`-bearing variant.
         if interp.pending_generator_throw_for_trace().is_some() {
+            // No-op stub.
+        }
+        if interp.pending_uncaught_throw_for_trace().is_some() {
             // No-op stub.
         }
         // 8) Active call frames are NOT enumerated here. The

@@ -125,6 +125,8 @@ pub enum VmIntrinsicFunction {
     FunctionPrototypeBind,
     /// `Function.prototype.toString`.
     FunctionPrototypeToString,
+    /// `Function.prototype[@@hasInstance]` — §20.2.3.6.
+    FunctionPrototypeSymbolHasInstance,
 }
 
 /// Native callable storage.
@@ -629,6 +631,22 @@ impl NativeFunction {
         })
     }
 
+    /// `true` when this callable resolves to the named VM intrinsic.
+    /// Used by §13.10.2 InstanceofOperator's fast path so the spec's
+    /// `Call(Function.prototype[@@hasInstance], target, « V »)`
+    /// dispatches straight to OrdinaryHasInstance instead of pushing
+    /// an extra frame.
+    #[must_use]
+    pub fn is_vm_intrinsic(
+        &self,
+        heap: &otter_gc::GcHeap,
+        intrinsic: VmIntrinsicFunction,
+    ) -> bool {
+        heap.read_payload(self.inner, |body| {
+            matches!(body.call, NativeCallStorage::VmIntrinsic(i) if i == intrinsic)
+        })
+    }
+
     /// Trace this handle as a root slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = self as *const NativeFunction as *mut RawGc;
@@ -687,6 +705,7 @@ impl VmIntrinsicFunction {
             Self::FunctionPrototypeApply => "apply",
             Self::FunctionPrototypeBind => "bind",
             Self::FunctionPrototypeToString => "toString",
+            Self::FunctionPrototypeSymbolHasInstance => "[Symbol.hasInstance]",
         }
     }
 }

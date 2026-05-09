@@ -923,3 +923,253 @@ fn ordinary_function_metadata_delete_removes_virtual_own_property() {
         "#);
     assert_eq!(completion, "true:true:false:undefined:0");
 }
+
+/// Regression: §7.1.1 ToPrimitive must walk the proto chain for any
+/// non-`null`/`undefined` non-primitive value, not just `Value::Object`.
+/// Function values inherit `Function.prototype.toString`; coercing a
+/// function through `"" + fn` previously raised a TypeError because
+/// the `Op::ToPrimitive` ladder only inspected `Value::Object` arms.
+///
+/// Spec: <https://tc39.es/ecma262/#sec-toprimitive>
+#[test]
+fn to_primitive_for_callable_walks_function_prototype_chain() {
+    let completion = run(r#"
+        function f(x, y) {}
+        "" + f;
+        "#);
+    assert!(
+        completion.starts_with("function f("),
+        "expected callable ToPrimitive to fall through Function.prototype.toString, got {completion:?}"
+    );
+}
+
+/// Regression: native, bound, and class-constructor callables must also
+/// route through `Function.prototype.toString` for ToPrimitive(default).
+#[test]
+fn to_primitive_for_native_bound_and_class_constructors() {
+    let completion = run(r#"
+        const native = Object.keys;
+        const bound = native.bind(null);
+        class C {}
+        const a = typeof ("" + native);
+        const b = typeof ("" + bound);
+        const c = typeof ("" + C);
+        a + ":" + b + ":" + c;
+        "#);
+    assert_eq!(completion, "string:string:string");
+}
+
+/// Regression: §10.2.4 `AddRestrictedFunctionProperties` poison
+/// pills (`caller`, `arguments`) on `%Function.prototype%` must
+/// invoke their getter — which throws `%ThrowTypeError%` — when
+/// accessed on any callable, not collapse to `undefined`.
+#[test]
+fn callable_caller_arguments_poison_pills_throw() {
+    let completion = run(r#"
+        "use strict";
+        function f() {}
+        let caughtCaller = false;
+        try { f.caller; } catch (e) { caughtCaller = e instanceof TypeError; }
+        let caughtArgs = false;
+        try { f.arguments; } catch (e) { caughtArgs = e instanceof TypeError; }
+        // Native, bound, and class constructor callables share the
+        // same Function.prototype, so the poison pills fire there too.
+        const native = Object.keys;
+        let caughtNative = false;
+        try { native.caller; } catch (e) { caughtNative = e instanceof TypeError; }
+        const bound = f.bind(null);
+        let caughtBound = false;
+        try { bound.caller; } catch (e) { caughtBound = e instanceof TypeError; }
+        class C {}
+        let caughtClass = false;
+        try { C.caller; } catch (e) { caughtClass = e instanceof TypeError; }
+        caughtCaller + ":" + caughtArgs + ":" + caughtNative + ":" + caughtBound + ":" + caughtClass;
+        "#);
+    assert_eq!(completion, "true:true:true:true:true");
+}
+
+/// Regression: §20.5 — native error class hierarchy must mirror the
+/// spec's `[[Prototype]]` chain. Without `finalize_after_bootstrap`
+/// linking the error constructors and prototypes after `Function`
+/// and `Object` are installed, `Object.getPrototypeOf(TypeError)`
+/// fell through the foundation `Function.prototype` fallback and
+/// `Error.prototype` had a null `[[Prototype]]`.
+#[test]
+fn native_error_classes_chain_and_globals() {
+    let completion = run(r#"
+        const linked = [
+            Object.getPrototypeOf(TypeError) === Error,
+            Object.getPrototypeOf(RangeError) === Error,
+            Object.getPrototypeOf(SyntaxError) === Error,
+            Object.getPrototypeOf(Error) === Function.prototype,
+            Object.getPrototypeOf(Error.prototype) === Object.prototype,
+            Object.getPrototypeOf(TypeError.prototype) === Error.prototype,
+            Object.getPrototypeOf(AggregateError) === Error,
+        ].join(":");
+        const desc = Object.getOwnPropertyDescriptor(globalThis, "TypeError");
+        linked + "|" + desc.writable + ":" + desc.enumerable + ":" + desc.configurable;
+        "#);
+    assert_eq!(
+        completion,
+        "true:true:true:true:true:true:true|true:false:true"
+    );
+}
+
+/// Regression: §20.5.3.4 `Error.prototype.toString` is a real
+/// function-valued data property that throws `TypeError` when the
+/// receiver is not an Object. The previous foundation routed every
+/// `Error.prototype.toString` access through the synthetic
+/// `object_prototype_intercept`, so the standalone reference was
+/// unreachable.
+#[test]
+fn error_prototype_to_string_is_callable_and_validates_receiver() {
+    let completion = run(r#"
+        const fn = Error.prototype.toString;
+        const direct = (new Error("oops")).toString();
+        const callForm = fn.call({ name: "Custom", message: "boom" });
+        let threw = false;
+        try { fn.call(undefined); } catch (e) { threw = e instanceof TypeError; }
+        const desc = Object.getOwnPropertyDescriptor(Error.prototype, "toString");
+        direct + "|" + callForm + "|" + threw + "|" +
+            desc.writable + ":" + desc.enumerable + ":" + desc.configurable;
+        "#);
+    assert_eq!(
+        completion,
+        "Error: oops|Custom: boom|true|true:false:true"
+    );
+}
+
+/// Regression: §20.5.3.6 — `Error.prototype.{name,message}` and
+/// `Error.prototype.constructor` are non-enumerable. The previous
+/// `object::set` path left them enumerable and broke every prop-desc
+/// test in `built-ins/{Error,NativeErrors}/prototype/*`.
+#[test]
+fn error_prototype_descriptor_attrs_match_spec() {
+    let completion = run(r#"
+        const protos = [Error, TypeError, RangeError, SyntaxError,
+            ReferenceError, URIError, EvalError, AggregateError]
+            .map(c => c.prototype);
+        const enumNames = protos.flatMap(p => Object.keys(p));
+        const ctorEnum = protos.map(p =>
+            Object.getOwnPropertyDescriptor(p, "constructor").enumerable);
+        const nameEnum = protos.map(p =>
+            Object.getOwnPropertyDescriptor(p, "name").enumerable);
+        enumNames.length + "|" + ctorEnum.join(",") + "|" + nameEnum.join(",");
+        "#);
+    assert_eq!(
+        completion,
+        "0|false,false,false,false,false,false,false,false|false,false,false,false,false,false,false,false"
+    );
+}
+
+/// Regression: §20.2.3.6 — `%Function.prototype%[@@hasInstance]` is
+/// installed with `length` 1, name `[Symbol.hasInstance]`, and
+/// `{ [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }`.
+#[test]
+fn function_prototype_symbol_has_instance_descriptor() {
+    let completion = run(r#"
+        const m = Function.prototype[Symbol.hasInstance];
+        const desc = Object.getOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance);
+        typeof m + ":" + m.length + ":" +
+            desc.writable + ":" + desc.enumerable + ":" + desc.configurable;
+        "#);
+    assert_eq!(completion, "function:1:false:false:false");
+}
+
+/// Regression: §13.10.2 InstanceofOperator — user-defined
+/// `[Symbol.hasInstance]` overrides the default OrdinaryHasInstance
+/// walk and the result is coerced through ToBoolean.
+#[test]
+fn instanceof_operator_consults_at_has_instance() {
+    let completion = run(r#"
+        class Even {
+            static [Symbol.hasInstance](v) { return v % 2 === 0; }
+        }
+        class Always {
+            static [Symbol.hasInstance]() { return "yes"; }
+        }
+        (4 instanceof Even) + ":" + (5 instanceof Even) + ":" +
+            (null instanceof Always) + ":" + (Symbol() instanceof Always);
+        "#);
+    assert_eq!(completion, "true:false:true:true");
+}
+
+/// Regression: §20.5.1.1 — every native error constructor is
+/// callable AND constructible, with `instance.message === ToString(arg)`
+/// and the matching prototype chain.
+#[test]
+fn native_error_constructors_are_callable_and_constructible() {
+    let completion = run(r#"
+        const a = new TypeError("boom");
+        const b = TypeError("call form");
+        const c = new RangeError(42);
+        const d = new SyntaxError();
+        a.message + "|" + b.message + "|" + c.message + "|" + d.message + "|" +
+            (a instanceof TypeError) + ":" + (a instanceof Error) + ":" +
+            (b instanceof TypeError) + ":" + (c instanceof RangeError) + ":" +
+            (d.name === "SyntaxError");
+        "#);
+    assert_eq!(
+        completion,
+        "boom|call form|42||true:true:true:true:true"
+    );
+}
+
+/// Regression: §20.5.6 — every native error constructor (`Error`,
+/// `TypeError`, `RangeError`, `SyntaxError`, `ReferenceError`,
+/// `URIError`, `EvalError`, `AggregateError`) has spec-shaped
+/// `name` and `length` own properties so test262
+/// `assert.throws(TypeError, …)` can distinguish constructor
+/// identities.
+#[test]
+fn error_constructor_metadata_descriptors() {
+    let completion = run(r#"
+        const names = [Error, TypeError, RangeError, SyntaxError,
+            ReferenceError, URIError, EvalError, AggregateError]
+            .map(c => c.name).join(",");
+        const lens = [Error, TypeError, RangeError, SyntaxError,
+            ReferenceError, URIError, EvalError, AggregateError]
+            .map(c => c.length).join(",");
+        names + "|" + lens;
+        "#);
+    assert_eq!(
+        completion,
+        "Error,TypeError,RangeError,SyntaxError,ReferenceError,URIError,EvalError,AggregateError|1,1,1,1,1,1,1,2"
+    );
+}
+
+/// Regression: §23.1 `%Array.prototype%`'s `[[Prototype]]` must be
+/// `%Object.prototype%`. `Array` had been installed before `Object`
+/// in the bootstrap order, leaving the link `null`; that broke
+/// `ToPrimitive(default)` on every array operand and any test that
+/// relied on `Array.prototype` inheriting `Object.prototype` methods.
+#[test]
+fn array_prototype_chains_to_object_prototype() {
+    let completion = run(r#"
+        const linked = Object.getPrototypeOf(Array.prototype) === Object.prototype;
+        const concat = "" + [1, 2, 3];
+        linked + ":" + concat;
+        "#);
+    assert!(
+        completion.starts_with("true:"),
+        "expected Array.prototype to chain to Object.prototype, got {completion:?}"
+    );
+}
+
+/// Regression: `Symbol.toPrimitive` installed on `Function.prototype`
+/// (or any inherited prototype) must be visible when the engine
+/// coerces a callable through `+`. Walks Function.prototype proto
+/// chain for the symbol lookup.
+#[test]
+fn to_primitive_finds_symbol_toprimitive_on_function_prototype() {
+    let completion = run(r#"
+        Function.prototype[Symbol.toPrimitive] = function(hint) {
+            return "<<symbol-toprim:" + hint + ">>";
+        };
+        function g() {}
+        const result = "" + g;
+        delete Function.prototype[Symbol.toPrimitive];
+        result;
+        "#);
+    assert_eq!(completion, "<<symbol-toprim:default>>");
+}

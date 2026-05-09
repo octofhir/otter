@@ -24,6 +24,7 @@
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
 use crate::native_function::NativeFunction;
 use crate::object::{self, JsObject, PropertyDescriptor};
+use crate::symbol;
 use crate::{NativeCall, NativeCtx, NativeError, Value, VmIntrinsicFunction};
 
 /// Static `Function.prototype` method specs.
@@ -37,6 +38,38 @@ pub static FUNCTION_PROTOTYPE_METHODS: &[MethodSpec] = &[
         VmIntrinsicFunction::FunctionPrototypeToString,
     ),
 ];
+
+/// Install `Function.prototype[@@hasInstance]` per §20.2.3.6.
+///
+/// The property's attributes are `{ [[Writable]]: false,
+/// [[Enumerable]]: false, [[Configurable]]: false }` — the only
+/// non-configurable Function.prototype data slot in the spec.
+/// The function value carries the canonical native `name` of
+/// `"[Symbol.hasInstance]"` and `length` of `1`.
+pub(crate) fn install_symbol_has_instance(
+    heap: &mut otter_gc::GcHeap,
+    prototype: JsObject,
+    well_known_has_instance: symbol::JsSymbol,
+) -> Result<(), JsSurfaceError> {
+    let value = NativeFunction::from_call(
+        heap,
+        "[Symbol.hasInstance]",
+        1,
+        NativeCall::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance),
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let descriptor =
+        PropertyDescriptor::data(Value::NativeFunction(value), false, false, false);
+    if !object::define_own_symbol_property(
+        prototype,
+        heap,
+        &well_known_has_instance,
+        descriptor,
+    ) {
+        return Err(JsSurfaceError::DefinePropertyFailed("[Symbol.hasInstance]"));
+    }
+    Ok(())
+}
 
 const fn intrinsic_method(
     name: &'static str,

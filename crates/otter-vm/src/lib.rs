@@ -2212,6 +2212,45 @@ impl Interpreter {
         let global_this = bootstrap::build_global_this(&mut gc_heap)
             .expect("global_this fits within any positive cap");
         startup_timer.mark("vm_global_this");
+        // §20.2.3.6 — install `Function.prototype[@@hasInstance]`.
+        // Bootstrap can't see `WellKnownSymbols`, so we wire the
+        // realm-local @@hasInstance after both Function.prototype
+        // and the symbol table exist.
+        let function_prototype_handle =
+            if let Some(Value::Object(function_ctor)) =
+                object::get(global_this, &gc_heap, "Function")
+                && let Some(Value::Object(function_proto)) =
+                    object::get(function_ctor, &gc_heap, "prototype")
+            {
+                let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
+                function_prototype::install_symbol_has_instance(
+                    &mut gc_heap,
+                    function_proto,
+                    has_instance,
+                )
+                .expect("Function.prototype[@@hasInstance] fits within any positive cap");
+                Some(function_proto)
+            } else {
+                None
+            };
+        // §20.5.6 — finalize the native error class hierarchy now
+        // that `%Function.prototype%` and `%Object.prototype%` are
+        // installed: link constructor and prototype `[[Prototype]]`
+        // chains and surface every error constructor on `globalThis`
+        // as a writable, non-enumerable, configurable data property.
+        if let Some(function_prototype) = function_prototype_handle
+            && let Some(Value::Object(object_ctor)) =
+                object::get(global_this, &gc_heap, "Object")
+            && let Some(Value::Object(object_prototype)) =
+                object::get(object_ctor, &gc_heap, "prototype")
+        {
+            error_classes.finalize_after_bootstrap(
+                &mut gc_heap,
+                function_prototype,
+                object_prototype,
+                global_this,
+            );
+        }
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
@@ -2263,6 +2302,72 @@ impl Interpreter {
                 ..
             }) => Ok(getter),
             _ => Err(VmError::TypeMismatch),
+        }
+    }
+
+    /// `[[GetPrototypeOf]]` for non-Proxy heap values. Centralises
+    /// the foundation rule that constructor-shaped Objects whose
+    /// stored `[[Prototype]]` is missing — or is the realm's
+    /// `%Object.prototype%` (the default link from many bootstrap
+    /// installers) — surface as `%Function.prototype%`. Explicit
+    /// proto links to anything else (e.g. `Error.[[Prototype]]` =
+    /// `%Function.prototype%`, `TypeError.[[Prototype]]` = `Error`)
+    /// are honoured verbatim.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
+    fn get_prototype_for_op(&self, value: &Value) -> Result<Value, VmError> {
+        match value {
+            Value::Object(obj) => {
+                let stored = object::prototype_value(*obj, &self.gc_heap);
+                let has_construct =
+                    object_has_construct_slot(&Value::Object(*obj), &self.gc_heap);
+                if has_construct {
+                    let function_proto = self.function_prototype_object().ok();
+                    let object_proto = self.object_prototype_object_opt();
+                    match &stored {
+                        // No stored proto on a callable Object →
+                        // foundation fallback to %Function.prototype%.
+                        None => {
+                            if let Some(fp) = function_proto {
+                                return Ok(Value::Object(fp));
+                            }
+                        }
+                        // Stored proto is %Object.prototype% — the
+                        // bootstrap installers use it as a default;
+                        // hoist to %Function.prototype% to keep the
+                        // observable spec shape on built-ins like
+                        // `Number`, `Boolean`, `Date`, `Array`, etc.
+                        Some(Value::Object(p))
+                            if object_proto.is_some_and(|op| op == *p) =>
+                        {
+                            if let Some(fp) = function_proto {
+                                return Ok(Value::Object(fp));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(stored.unwrap_or(Value::Null))
+            }
+            Value::NativeFunction(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_) => {
+                Ok(Value::Object(self.function_prototype_object()?))
+            }
+            _ => Err(VmError::TypeMismatch),
+        }
+    }
+
+    fn object_prototype_object_opt(&self) -> Option<JsObject> {
+        match object::get(self.global_this, &self.gc_heap, "Object") {
+            Some(Value::Object(ctor)) => match object::get(ctor, &self.gc_heap, "prototype") {
+                Some(Value::Object(p)) => Some(p),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -4967,24 +5072,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
                     let value = read_register(frame, src)?;
-                    let result = match value {
-                        Value::Object(_) if object_has_construct_slot(value, &self.gc_heap) => {
-                            Value::Object(self.function_prototype_object()?)
-                        }
-                        Value::Object(o) => {
-                            crate::object::prototype_value(*o, &self.gc_heap).unwrap_or(Value::Null)
-                        }
-                        Value::NativeFunction(_) => {
-                            Value::Object(self.function_prototype_object()?)
-                        }
-                        Value::Function { .. }
-                        | Value::Closure { .. }
-                        | Value::BoundFunction(_)
-                        | Value::ClassConstructor(_) => {
-                            Value::Object(self.function_prototype_object()?)
-                        }
-                        _ => return Err(VmError::TypeMismatch),
-                    };
+                    let result = self.get_prototype_for_op(value)?;
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -9452,7 +9540,163 @@ impl Interpreter {
                     .map_err(|_| VmError::TypeMismatch)?;
                 Ok(Value::String(s))
             }
+            VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance => {
+                // §20.2.3.6: Return ? OrdinaryHasInstance(F, V) where
+                // F is the `this` value and V is the first argument.
+                // <https://tc39.es/ecma262/#sec-function.prototype-@@hasinstance>
+                let v = args.into_iter().next().unwrap_or(Value::Undefined);
+                let result = self.ordinary_has_instance(module, &this_value, &v)?;
+                Ok(Value::Boolean(result))
+            }
         }
+    }
+
+    /// ECMA-262 §10.4.3 `OrdinaryHasInstance(C, O)`.
+    ///
+    /// # Algorithm
+    /// 1. If `IsCallable(C)` is false, return false.
+    /// 2. If `C` has a `[[BoundTargetFunction]]` slot, recurse with
+    ///    `InstanceofOperator(O, C.[[BoundTargetFunction]])`.
+    /// 3. If `Type(O)` is not Object, return false.
+    /// 4. Let `P` be `? Get(C, "prototype")`.
+    /// 5. If `Type(P)` is not Object, throw `TypeError`.
+    /// 6. Walk `O.[[GetPrototypeOf]]()` chain looking for `SameValue(P, _)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinaryhasinstance>
+    fn ordinary_has_instance(
+        &mut self,
+        module: &BytecodeModule,
+        c: &Value,
+        o: &Value,
+    ) -> Result<bool, VmError> {
+        // Step 1.
+        if !self.is_callable_runtime(c) {
+            return Ok(false);
+        }
+        // Step 2 — bound function delegation.
+        if let Value::BoundFunction(bound) = c {
+            let (target, _, _) = bound.parts(&self.gc_heap);
+            return self.instanceof_operator(module, o, &target);
+        }
+        // Step 3 — non-Object O collapses to false (Array / Function /
+        // exotic non-Object values still walk their proto chain via
+        // `value_has_proxy_aware_prototype`; the spec's "Type(O) is
+        // not Object" guard maps to "no proto chain to walk").
+        if !matches!(
+            o,
+            Value::Object(_)
+                | Value::Proxy(_)
+                | Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+        ) {
+            return Ok(false);
+        }
+        // Step 4 / 5 — Get(C, "prototype") via the regular property
+        // dispatch so user-shadowed `.prototype` is honoured.
+        let Some(prototype) = self.instanceof_target_prototype(module, c)? else {
+            return Ok(false);
+        };
+        if !matches!(prototype, Value::Object(_) | Value::Proxy(_)) {
+            return Err(VmError::TypeError {
+                message: "Function has non-object prototype 'undefined' in instanceof check"
+                    .to_string(),
+            });
+        }
+        // Step 6 — proto-chain walk via the Proxy-aware helper.
+        self.value_has_proxy_aware_prototype(module, o.clone(), &prototype)
+    }
+
+    /// ECMA-262 §13.10.2 `InstanceofOperator(V, target)`.
+    ///
+    /// # Algorithm
+    /// 1. If `Type(target)` is not Object, throw `TypeError`.
+    /// 2. Let `instOfHandler = ? GetMethod(target, @@hasInstance)`.
+    /// 3. If `instOfHandler` is not undefined, return
+    ///    `ToBoolean(? Call(instOfHandler, target, « V »))`.
+    /// 4. If `IsCallable(target)` is false, throw `TypeError`.
+    /// 5. Return `? OrdinaryHasInstance(target, V)`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-instanceofoperator>
+    fn instanceof_operator(
+        &mut self,
+        module: &BytecodeModule,
+        v: &Value,
+        target: &Value,
+    ) -> Result<bool, VmError> {
+        // Step 1 — non-Object target throws.
+        if !matches!(
+            target,
+            Value::Object(_)
+                | Value::Proxy(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+        ) {
+            return Err(VmError::TypeError {
+                message: "Right-hand side of instanceof is not an object".to_string(),
+            });
+        }
+        // Step 2 — GetMethod(target, @@hasInstance). Skips when the
+        // resolved value is the realm's `%Function.prototype[@@hasInstance]%`
+        // intrinsic — the spec says step 5's OrdinaryHasInstance is
+        // observably equivalent and avoids the extra call frame.
+        let has_instance_sym = self
+            .well_known_symbols
+            .get(symbol::WellKnown::HasInstance);
+        let key = VmPropertyKey::Symbol(has_instance_sym);
+        let handler = match self.ordinary_get_value(module, target.clone(), target.clone(), &key, 0)? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(module, &getter, target.clone(), SmallVec::new())?
+            }
+        };
+        if !matches!(handler, Value::Undefined | Value::Null) {
+            if !self.is_callable_runtime(&handler) {
+                return Err(VmError::TypeError {
+                    message: "@@hasInstance must be callable".to_string(),
+                });
+            }
+            // Fast path: when the resolved handler is the canonical
+            // `Function.prototype[@@hasInstance]` intrinsic, skip the
+            // call frame and dispatch OrdinaryHasInstance inline.
+            // Same observable result, no extra frame.
+            if let Value::NativeFunction(native) = &handler
+                && native.is_vm_intrinsic(
+                    &self.gc_heap,
+                    VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
+                )
+            {
+                return self.ordinary_has_instance(module, target, v);
+            }
+            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+            args.push(v.clone());
+            let result = self.run_callable_sync(module, &handler, target.clone(), args)?;
+            return Ok(result.to_boolean());
+        }
+        // Step 4 / 5.
+        if !self.is_callable_runtime(target) {
+            return Err(VmError::TypeError {
+                message: "Right-hand side of instanceof is not callable".to_string(),
+            });
+        }
+        self.ordinary_has_instance(module, target, v)
     }
 
     fn create_list_from_array_like(
@@ -9718,6 +9962,122 @@ impl Interpreter {
         )
     }
 
+    /// If `value` (the data-path result of a callable property
+    /// lookup) is `Undefined`, probe `%Function.prototype%` for an
+    /// inherited accessor descriptor under `key`. Returns
+    /// `Some(VmGetOutcome::InvokeGetter)` only when the chain hosts
+    /// a callable getter (e.g. the §10.2.4
+    /// `AddRestrictedFunctionProperties` poison pills for `caller`
+    /// and `arguments`). All other outcomes — data hit, accessor
+    /// without getter, no chain entry — return `None` so the caller
+    /// keeps the original `value`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinaryget>
+    /// - <https://tc39.es/ecma262/#sec-addrestrictedfunctionproperties>
+    fn callable_realm_prototype_accessor_outcome(
+        &self,
+        value: &Value,
+        key: &VmPropertyKey,
+    ) -> Result<Option<VmGetOutcome>, VmError> {
+        if !matches!(value, Value::Undefined) {
+            return Ok(None);
+        }
+        let Ok(proto) = self.function_prototype_object() else {
+            return Ok(None);
+        };
+        let lookup = match key {
+            VmPropertyKey::String(name) => object::lookup(proto, &self.gc_heap, name),
+            VmPropertyKey::Symbol(sym) => object::lookup_symbol(proto, &self.gc_heap, sym),
+        };
+        if let object::PropertyLookup::Accessor {
+            getter: Some(getter),
+            ..
+        } = lookup
+            && abstract_ops::is_callable(&getter)
+        {
+            return Ok(Some(VmGetOutcome::InvokeGetter { getter }));
+        }
+        Ok(None)
+    }
+
+    /// Resolve the realm prototype Object that `[[Get]]` walks for a
+    /// non-`Value::Object` heap-shape value. Mirrors §7.1.1 step 1's
+    /// requirement that any object — Function, Array, Map, etc. —
+    /// participate in `ToPrimitive` lookup through its own prototype
+    /// chain. `Value::Object` is handled directly by callers; this
+    /// helper only resolves the exotic shapes whose prototype lives
+    /// on the realm's intrinsic constructor object.
+    ///
+    /// Returns `None` when:
+    /// - the value is a primitive (callers short-circuit before
+    ///   reaching this helper),
+    /// - the value is `Value::Object` (already an ordinary object),
+    /// - the value is `Value::Proxy` (proxy lookups must invoke the
+    ///   `get` trap; §7.1.1 callers fall back to the trap dispatcher
+    ///   rather than direct proto walking), or
+    /// - the realm has no installed constructor for that shape.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    /// - <https://tc39.es/ecma262/#sec-ordinaryget>
+    fn intrinsic_prototype_object_for(&self, value: &Value) -> Option<JsObject> {
+        let constructor_name = match value {
+            Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_) => return self.function_prototype_object().ok(),
+            Value::Array(_) => "Array",
+            Value::RegExp(_) => "RegExp",
+            Value::Map(_) => "Map",
+            Value::Set(_) => "Set",
+            Value::WeakMap(_) => "WeakMap",
+            Value::WeakSet(_) => "WeakSet",
+            Value::WeakRef(_) => "WeakRef",
+            Value::Promise(_) => "Promise",
+            Value::ArrayBuffer(_) => "ArrayBuffer",
+            Value::Object(_) | Value::Proxy(_) => return None,
+            _ => return None,
+        };
+        match self.constructor_prototype_value(constructor_name).ok()? {
+            Value::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Look up a string-keyed property over a non-primitive value's
+    /// `[[Prototype]]` chain. Returns `None` when the chain has no
+    /// inherited definition. This is the §7.1.1.1 `OrdinaryToPrimitive`
+    /// fast path for `valueOf` / `toString` and intentionally does
+    /// not invoke accessor getters: callers want the raw `[[Value]]`
+    /// of an inherited data property (typically the realm's installed
+    /// `valueOf` / `toString` callables) and treat accessor hits as
+    /// "no callable found" so the next stage runs.
+    fn get_proto_string_for_to_primitive(&self, base: &Value, name: &str) -> Option<Value> {
+        let proto = match base {
+            Value::Object(o) => Some(*o),
+            _ => self.intrinsic_prototype_object_for(base),
+        };
+        proto.and_then(|o| object::get(o, &self.gc_heap, name))
+    }
+
+    /// Look up a Symbol-keyed property over a non-primitive value's
+    /// `[[Prototype]]` chain. Used by the §7.1.1 step 2 lookup of
+    /// `[Symbol.toPrimitive]`. Same accessor policy as
+    /// [`Self::get_proto_string_for_to_primitive`].
+    fn get_proto_symbol_for_to_primitive(
+        &self,
+        base: &Value,
+        sym: &symbol::JsSymbol,
+    ) -> Option<Value> {
+        let proto = match base {
+            Value::Object(o) => Some(*o),
+            _ => self.intrinsic_prototype_object_for(base),
+        };
+        proto.and_then(|o| object::get_symbol(o, &self.gc_heap, sym))
+    }
+
     /// Run a single stage of the §7.1.1 / §7.1.1.1 ladder, falling
     /// through synchronously when the chosen method is missing or
     /// non-callable until we either push a frame, throw, or write
@@ -9735,12 +10095,7 @@ impl Interpreter {
             match stage {
                 ToPrimitiveStage::SymbolToPrim => {
                     let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-                    let callee = match &obj {
-                        Value::Object(o) => {
-                            crate::object::get_symbol(*o, &self.gc_heap, &to_prim_sym)
-                        }
-                        _ => None,
-                    };
+                    let callee = self.get_proto_symbol_for_to_primitive(&obj, &to_prim_sym);
                     if let Some(callee) = callee
                         && self.is_callable_runtime(&callee)
                     {
@@ -9775,10 +10130,7 @@ impl Interpreter {
                 }
                 ToPrimitiveStage::OrdinaryFirst => {
                     let method = ordinary_method_for(hint, stage);
-                    let callee = match &obj {
-                        Value::Object(o) => crate::object::get(*o, &self.gc_heap, method),
-                        _ => None,
-                    };
+                    let callee = self.get_proto_string_for_to_primitive(&obj, method);
                     if let Some(callee) = callee
                         && self.is_callable_runtime(&callee)
                     {
@@ -9830,10 +10182,7 @@ impl Interpreter {
                 }
                 ToPrimitiveStage::OrdinarySecond => {
                     let method = ordinary_method_for(hint, stage);
-                    let callee = match &obj {
-                        Value::Object(o) => crate::object::get(*o, &self.gc_heap, method),
-                        _ => None,
-                    };
+                    let callee = self.get_proto_string_for_to_primitive(&obj, method);
                     if let Some(callee) = callee
                         && self.is_callable_runtime(&callee)
                     {
@@ -10578,12 +10927,7 @@ impl Interpreter {
                     None => self.ordinary_get_prototype_value(module, proxy.target(), hops + 1),
                 }
             }
-            Value::Object(obj) if object_has_construct_slot(&Value::Object(obj), &self.gc_heap) => {
-                Ok(Value::Object(self.function_prototype_object()?))
-            }
-            Value::Object(obj) => {
-                Ok(object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::Null))
-            }
+            Value::Object(obj) => self.get_prototype_for_op(&Value::Object(obj)),
             Value::Array(_) => self.constructor_prototype_value("Array"),
             Value::NativeFunction(_)
             | Value::Function { .. }
@@ -10731,11 +11075,20 @@ impl Interpreter {
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let value = match key {
-                    VmPropertyKey::String(key) => {
-                        self.function_property_get(module, function_id, key)?
+                    VmPropertyKey::String(name) => {
+                        self.function_property_get(module, function_id, name)?
                     }
-                    VmPropertyKey::Symbol(_) => Value::Undefined,
+                    VmPropertyKey::Symbol(sym) => self
+                        .function_prototype_object()
+                        .ok()
+                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                        .unwrap_or(Value::Undefined),
                 };
+                if let Some(outcome) =
+                    self.callable_realm_prototype_accessor_outcome(&value, key)?
+                {
+                    return Ok(outcome);
+                }
                 Ok(VmGetOutcome::Value(value))
             }
             Value::NativeFunction(native) => {
@@ -10758,8 +11111,17 @@ impl Interpreter {
                         .load_function_prototype_method(key)
                         .or_else(|| self.load_object_prototype_method(key))
                         .unwrap_or(Value::Undefined),
-                    VmPropertyKey::Symbol(_) => Value::Undefined,
+                    VmPropertyKey::Symbol(sym) => self
+                        .function_prototype_object()
+                        .ok()
+                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                        .unwrap_or(Value::Undefined),
                 };
+                if let Some(outcome) =
+                    self.callable_realm_prototype_accessor_outcome(&value, key)?
+                {
+                    return Ok(outcome);
+                }
                 Ok(VmGetOutcome::Value(value))
             }
             Value::BoundFunction(bound) => {
@@ -10778,8 +11140,17 @@ impl Interpreter {
                                 .unwrap_or(Value::Undefined),
                         }
                     }
-                    VmPropertyKey::Symbol(_) => Value::Undefined,
+                    VmPropertyKey::Symbol(sym) => self
+                        .function_prototype_object()
+                        .ok()
+                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                        .unwrap_or(Value::Undefined),
                 };
+                if let Some(outcome) =
+                    self.callable_realm_prototype_accessor_outcome(&value, key)?
+                {
+                    return Ok(outcome);
+                }
                 Ok(VmGetOutcome::Value(value))
             }
             Value::ClassConstructor(class) => {
@@ -10796,6 +11167,11 @@ impl Interpreter {
                             .unwrap_or(Value::Undefined)
                     }
                 };
+                if let Some(outcome) =
+                    self.callable_realm_prototype_accessor_outcome(&value, key)?
+                {
+                    return Ok(outcome);
+                }
                 Ok(VmGetOutcome::Value(value))
             }
             Value::RegExp(re) => {
@@ -10976,6 +11352,57 @@ impl Interpreter {
                 }
             }
         }
+        // Function / Closure / NativeFunction / ClassConstructor —
+        // probe `%Function.prototype%` for accessor descriptors so
+        // §10.2.4 `AddRestrictedFunctionProperties` poison pills
+        // (`caller`, `arguments`) and any user-installed accessor on
+        // `Function.prototype` invoke their getter rather than
+        // collapsing to `undefined` through the in-frame data path.
+        if matches!(
+            receiver,
+            Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::ClassConstructor(_)
+        ) {
+            let own_present = match &receiver {
+                Value::Function { function_id } | Value::Closure { function_id, .. } => self
+                    .function_user_props
+                    .get(function_id)
+                    .copied()
+                    .is_some_and(|bag| {
+                        !matches!(
+                            object::lookup_own(bag, &self.gc_heap, &name),
+                            object::PropertyLookup::Absent
+                        )
+                    }),
+                Value::ClassConstructor(c) => !matches!(
+                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, &name),
+                    object::PropertyLookup::Absent
+                ),
+                Value::NativeFunction(native) => native
+                    .own_property_descriptor(&self.gc_heap, &self.string_heap, &name)?
+                    .is_some(),
+                _ => false,
+            };
+            if !own_present {
+                let proto = self.function_prototype_object()?;
+                if let object::PropertyLookup::Accessor { getter, .. } =
+                    object::lookup(proto, &self.gc_heap, &name)
+                {
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    match getter {
+                        Some(callee) if abstract_ops::is_callable(&callee) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.invoke(stack, module, &callee, receiver, args, dst)?;
+                        }
+                        _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                    }
+                    return Ok(true);
+                }
+            }
+        }
         let obj = match &receiver {
             Value::Object(o) => *o,
             Value::ClassConstructor(c) => c.statics(&self.gc_heap),
@@ -11014,6 +11441,15 @@ impl Interpreter {
         }
     }
 
+    /// Drive one tick of [`Op::Instanceof`] through ECMA-262 §13.10.2
+    /// `InstanceofOperator(V, target)`. The previous foundation path
+    /// only walked `OrdinaryHasInstance`; this version honours
+    /// `target[@@hasInstance]` per spec.
+    ///
+    /// Returns `Ok(false)` only when the right-hand operand is one
+    /// of the legacy "raw prototype object as rhs" shapes the older
+    /// fixtures pass — those still fall through to the in-frame
+    /// fast path's prototype-walk fallback.
     fn drive_instanceof(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -11026,24 +11462,23 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let lhs = read_register(&stack[top_idx], lhs_reg)?.clone();
         let rhs = read_register(&stack[top_idx], rhs_reg)?.clone();
-        if !matches!(
-            lhs,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure { .. }
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::RegExp(_)
-        ) {
-            return Ok(false);
+        // Foundation back-compat: when `rhs` is a plain Object that
+        // has no own/inherited `prototype` property AND no
+        // `@@hasInstance`, older fixtures expect the in-frame path
+        // to walk lhs's chain against `rhs` directly. Those slip
+        // through `drive_instanceof` with `Ok(false)`.
+        if let Value::Object(rhs_obj) = &rhs
+            && object::get(*rhs_obj, &self.gc_heap, "prototype").is_none()
+            && !matches!(rhs, Value::Proxy(_))
+        {
+            let has_instance_sym = self
+                .well_known_symbols
+                .get(symbol::WellKnown::HasInstance);
+            if object::get_symbol(*rhs_obj, &self.gc_heap, &has_instance_sym).is_none() {
+                return Ok(false);
+            }
         }
-        let Some(target_proto) = self.instanceof_target_prototype(module, &rhs)? else {
-            return Ok(false);
-        };
-        let result = self.value_has_proxy_aware_prototype(module, lhs, &target_proto)?;
+        let result = self.instanceof_operator(module, &lhs, &rhs)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         write_register(&mut stack[top_idx], dst, Value::Boolean(result))?;

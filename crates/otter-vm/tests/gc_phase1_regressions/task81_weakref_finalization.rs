@@ -107,6 +107,13 @@ fn finalization_registry_registers_without_strong_target_retention() {
         "registry",
         Value::FinalizationRegistry(registry),
     );
+    // Stabilise the baseline before measuring: bootstrap creates
+    // transient `ObjectBody` allocations (intermediate descriptor
+    // values, intern-time scratch shapes, etc.) that are unreachable
+    // but not yet collected. Force a GC so the baseline reflects the
+    // actual reachable set, and the post-`register` GC can be
+    // compared apples-to-apples.
+    interp.force_gc();
     let baseline_object_live_bytes =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     let target = alloc_object(interp.gc_heap_mut()).expect("target");

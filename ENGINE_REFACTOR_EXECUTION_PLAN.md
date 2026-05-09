@@ -398,19 +398,27 @@ Acceptance:
 ### P1.3 Builtin Installation
 
 - [ ] Convert remaining ECMAScript builtins to static descriptor specs through
-  the existing builder/`bootstrap.rs` path.
-- [ ] Centralize bootstrap order for globals, constructors, prototypes, and
-  namespaces in one ordered list.
-- [ ] Add snapshot tests for global property descriptors (key set, attributes,
-  prototype identity).
+  the existing builder/`bootstrap.rs` path. Native error class registry now
+  finalises through `ErrorClassRegistry::finalize_after_bootstrap` rather than
+  scattered `object::set` calls; bare-Object built-ins (`Array`, `Number`,
+  `Boolean`, `String`, `JSON`, `Math`, `Function`, `Object`) still need a
+  pass to surface as function-typed callables.
+- [x] Centralize bootstrap order for globals, constructors, prototypes, and
+  namespaces in one ordered list (`bootstrap::BOOTSTRAP_ENTRIES`).
+- [x] Add snapshot tests for global property descriptors (key set, attributes,
+  prototype identity) — `crates/otter-runtime/tests/global_bootstrap_snapshot.rs`.
 - [ ] Add per-family Test262 baselines before changing semantics so deltas are
   attributable.
 
 Acceptance:
 
 - A single `bootstrap` snapshot pins the global object shape; changes to it
-  are reviewed.
-- No new `pub fn install_*` outside `bootstrap.rs` and the builder backend.
+  are reviewed (`global_bootstrap_snapshot::global_this_default_snapshot`
+  and `global_constructor_prototype_identity`).
+- No new `pub fn install_*` outside `bootstrap.rs` and the builder backend
+  (verified — `install_global_class` is the embedder API for product crates,
+  every other `install_*` is private to `bootstrap.rs` /
+  `crates/otter-vm/src/{function_prototype,error_classes,object}.rs`).
 
 ## P2: Runtime Jobs, Modules, And Diagnostics
 
@@ -418,15 +426,40 @@ Acceptance:
 
 - [ ] Define module-record states: unresolved, resolved, compiled,
   instantiated, evaluating, evaluated, errored.
+  Current `RuntimeModuleRecordState` only tracks
+  `Allocated/Evaluating/Evaluated/Errored` — needs the resolution +
+  compilation + instantiation phases as distinct states.
 - [ ] Support ESM live bindings end-to-end (export-binding slot model in
-  bytecode + runtime indirection).
+  bytecode + runtime indirection). **Audit (2026-05-10):** even
+  `export const greeting = "hello"` in a standalone `.ts` / `.mjs`
+  module raises `ReferenceError: greeting is not defined` during
+  module-init evaluation. Top-level lexical bindings declared by
+  `export const` / `export let` aren't being predeclared in the
+  module env before `<module-init>` runs. Foundation gap that needs
+  to land before live-binding indirection.
 - [ ] Support ESM cycles per HostLoadImportedModule semantics.
+  **Audit:** the resolver currently rejects any import cycle outright
+  with `MODULE_GRAPH_CYCLE`. Spec wants the loader to short-circuit
+  cyclic edges (returning the in-progress module record) and rely on
+  live-binding indirection during evaluation.
 - [ ] Route dynamic `import()` through the same loader, gated through
   `check_capability`. Privileged remote/dynamic imports require explicit
   capabilities; entry-point + statically analyzable local graph stays the
-  default-on path.
+  default-on path. **Audit:** `await import("./x.ts")` parses but the
+  awaited value never settles in the current foundation, so the
+  continuation never runs.
 - [ ] Add CJS interop policy *after* ESM graph is stable. Documented as a
   follow-up; not a P2 acceptance gate.
+
+Test262 baseline `language/module-code` (captured 2026-05-10):
+149 / 318 pass, 168 fail (46.86%). Top failure clusters:
+
+- `MODULE_RESOLUTION_ERROR` for `_FIXTURE.js`-shaped helper modules
+  the runner doesn't currently materialize (~70 tests, infrastructure).
+- "This statement should …" Test262Error from harness assertions
+  inside successfully-loaded modules (~46 tests, runtime).
+- Uninitialized-binding ReferenceErrors (~6 tests) — same root cause
+  as the standalone `export const` audit above.
 
 Acceptance:
 

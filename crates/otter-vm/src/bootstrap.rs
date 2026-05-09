@@ -249,16 +249,22 @@ struct AllocationSnapshot {
 }
 
 /// Deterministic global bootstrap registry.
+///
+/// Order is significant: every entry whose `install` callback links
+/// its prototype to `Object.prototype` (via §19.1.2 / §23.1) must
+/// come *after* `Object`. The current layout installs `Object` first
+/// so subsequent entries can resolve `globalThis.Object.prototype`
+/// without falling through to a null `[[Prototype]]`.
 pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
-    BootstrapEntry {
-        name: "Array",
-        feature: BootstrapFeatures::CORE,
-        install: install_array,
-    },
     BootstrapEntry {
         name: object_statics::OBJECT_SPEC.name,
         feature: BootstrapFeatures::CORE,
         install: install_object,
+    },
+    BootstrapEntry {
+        name: "Array",
+        feature: BootstrapFeatures::CORE,
+        install: install_array,
     },
     BootstrapEntry {
         name: json::JSON_SPEC.name,
@@ -552,6 +558,20 @@ fn install_array(
 
     let array = object::alloc_object(heap)?;
     let prototype = object::alloc_object(heap)?;
+    // §23.1 — `Array.prototype` is itself an Array exotic object whose
+    // `[[Prototype]]` is `%Object.prototype%`. Bootstrap order installs
+    // `Object` first, so the realm's Object.prototype is reachable at
+    // this point. Linking the chain here keeps the §7.1.1 / §7.1.1.1
+    // `ToPrimitive` / `OrdinaryToPrimitive` lookup path working for
+    // `Value::Array` operands — without it, `[1,2,3] + ""` walks an
+    // empty proto chain and reaches the foundation TypeError ladder.
+    // <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(array, heap, Some(object_proto));
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
     object::set(array, heap, "prototype", Value::Object(prototype));
     {
         let mut builder = ObjectBuilder::from_object(heap, array);
@@ -1273,7 +1293,12 @@ mod tests {
     #[test]
     fn registry_order_is_deterministic_and_unique() {
         let names: Vec<&str> = BOOTSTRAP_ENTRIES.iter().map(|entry| entry.name).collect();
-        assert_eq!(names.first(), Some(&"Array"));
+        assert_eq!(names.first(), Some(&"Object"));
+        assert_eq!(
+            names.iter().position(|n| *n == "Array"),
+            Some(1),
+            "Array must install after Object so its [[Prototype]] can resolve"
+        );
         assert_eq!(names.last(), Some(&"console"));
 
         let mut sorted = names.clone();

@@ -41,8 +41,11 @@
 
 use crate::Value;
 use crate::gc_trace::{GcRootVisitor, GcTrace};
-use crate::object::JsObject;
+use crate::native_function::NativeFunction;
+use crate::number::NumberValue;
+use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::string::{JsString, StringError, StringHeap};
+use crate::{NativeCtx, NativeError};
 
 /// One of the seven canonical native error classes.
 ///
@@ -266,10 +269,70 @@ impl ErrorClassRegistry {
                 requested_bytes: 0,
                 heap_limit_bytes: 0,
             })?;
+        // §20.5.3.{4,5} — `Error.prototype.name = "Error"` and
+        // `Error.prototype.message = ""` are data properties with
+        // attributes `{ writable: true, enumerable: false,
+        // configurable: true }`. The plain `set` path leaves
+        // `enumerable: true` which fails every `name`/`message`
+        // descriptor test in `built-ins/{Error,NativeErrors}/prototype/*`.
         let error_name = JsString::from_str("Error", heap)?;
         let empty = JsString::from_str("", heap)?;
-        crate::object::set(error_proto, gc_heap, "name", Value::String(error_name));
-        crate::object::set(error_proto, gc_heap, "message", Value::String(empty));
+        let _ = object::define_own_property(
+            error_proto,
+            gc_heap,
+            "name",
+            PropertyDescriptor::data(Value::String(error_name), true, false, true),
+        );
+        let _ = object::define_own_property(
+            error_proto,
+            gc_heap,
+            "message",
+            PropertyDescriptor::data(Value::String(empty), true, false, true),
+        );
+
+        // §20.5.3.4 Error.prototype.toString — install as a real
+        // function-valued data property so `Error.prototype.toString`
+        // is reachable, callable, and enforces the spec's
+        // `Type(O) is not Object → TypeError` receiver check. The
+        // single source-of-truth body lives in `error_prototype_to_string`.
+        fn error_prototype_to_string(
+            ctx: &mut NativeCtx<'_>,
+            _args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let receiver = ctx.this_value().clone();
+            // Step 2: Type(O) is not Object → TypeError.
+            let Value::Object(_) = &receiver else {
+                return Err(NativeError::TypeError {
+                    name: "Error.prototype.toString",
+                    reason: "receiver must be an Object".to_string(),
+                });
+            };
+            let string_heap = ctx.interp_mut().string_heap_clone();
+            let display = render_error_to_string(&receiver, ctx.heap_mut());
+            let s = JsString::from_str(&display, &string_heap)
+                .map_err(|err| NativeError::TypeError {
+                    name: "Error.prototype.toString",
+                    reason: err.to_string(),
+                })?;
+            Ok(Value::String(s))
+        }
+        let to_string_native =
+            NativeFunction::new_static(gc_heap, "toString", 0, error_prototype_to_string)
+                .map_err(|_| StringError::OutOfMemory {
+                    requested_bytes: 0,
+                    heap_limit_bytes: 0,
+                })?;
+        let _ = object::define_own_property(
+            error_proto,
+            gc_heap,
+            "toString",
+            PropertyDescriptor::data(
+                Value::NativeFunction(to_string_native),
+                true,
+                false,
+                true,
+            ),
+        );
         // §20.5.3.4 Error.prototype.toString is intercepted by
         // `object_prototype_intercept` in the dispatcher when the
         // receiver's prototype chain includes any error prototype.
@@ -277,6 +340,108 @@ impl ErrorClassRegistry {
         // [`render_error_to_string`] below — both `e.toString()`
         // dispatch and the unwind diagnostic call it.
         // <https://tc39.es/ecma262/#sec-error.prototype.tostring>
+
+        // §20.5.3 / §20.5.6 — every native error constructor has
+        // own `length` (the formal-parameter count, default `1` for
+        // `Error` and each subclass; `2` for `AggregateError`) and
+        // `name` (the class name) as non-enumerable, non-writable,
+        // configurable data properties. Same shape as every other
+        // built-in function object per §17 ("Built-in Function
+        // Objects" general property requirements).
+        //
+        // Without these descriptors `TypeError.name === undefined`
+        // and the test262 `assert.throws(TypeError, …)` harness
+        // can't distinguish thrown constructors, breaking ~28+
+        // strict-mode caller / arguments tests.
+        fn install_ctor_metadata(
+            ctor: JsObject,
+            name: &str,
+            length: i32,
+            heap: &StringHeap,
+            gc_heap: &mut otter_gc::GcHeap,
+        ) -> Result<(), StringError> {
+            let name_str = JsString::from_str(name, heap)?;
+            let _ = object::define_own_property(
+                ctor,
+                gc_heap,
+                "name",
+                PropertyDescriptor::data(Value::String(name_str), false, false, true),
+            );
+            let _ = object::define_own_property(
+                ctor,
+                gc_heap,
+                "length",
+                PropertyDescriptor::data(
+                    Value::Number(NumberValue::from_i32(length)),
+                    false,
+                    false,
+                    true,
+                ),
+            );
+            Ok(())
+        }
+
+        // §20.5.1.1 / §20.5.6.1.1 NativeError(message, options) —
+        // each constructor allocates an instance with its prototype
+        // and stamps `message` (when provided). The seven static
+        // dispatchers below close over their `ErrorKind` so the
+        // shared `make_instance_native` body can look up the realm
+        // registry from the live `NativeCtx`.
+        fn make_instance_native(
+            ctx: &mut NativeCtx<'_>,
+            kind: ErrorKind,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            // §20.5.1.1 step 3 — when `message` is not undefined,
+            // `msg = ? ToString(message)`. Foundation: handle the
+            // common primitive cases inline; full ToString
+            // (with `Symbol.toPrimitive`) lands in a follow-up.
+            let message = match args.first() {
+                None | Some(Value::Undefined) => None,
+                Some(Value::String(s)) => Some(s.to_lossy_string()),
+                Some(Value::Symbol(_)) => {
+                    return Err(NativeError::TypeError {
+                        name: kind.class_name(),
+                        reason: "Cannot convert a Symbol value to a string".to_string(),
+                    });
+                }
+                Some(v) => Some(v.display_string()),
+            };
+            let interp = ctx.interp_mut();
+            let registry = interp.error_classes_clone();
+            let string_heap = interp.string_heap_clone();
+            let obj = registry
+                .make_instance(kind, message.as_deref(), &string_heap, ctx.heap_mut())
+                .map_err(|err| NativeError::TypeError {
+                    name: kind.class_name(),
+                    reason: err.to_string(),
+                })?;
+            Ok(Value::Object(obj))
+        }
+        fn ctor_error(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::Error, a)
+        }
+        fn ctor_type(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::TypeError, a)
+        }
+        fn ctor_range(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::RangeError, a)
+        }
+        fn ctor_syntax(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::SyntaxError, a)
+        }
+        fn ctor_reference(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::ReferenceError, a)
+        }
+        fn ctor_uri(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::URIError, a)
+        }
+        fn ctor_eval(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::EvalError, a)
+        }
+        fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+            make_instance_native(c, ErrorKind::AggregateError, a)
+        }
 
         let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);
         // Error itself. §20.5.3 — `Error.prototype.constructor`
@@ -288,13 +453,30 @@ impl ErrorClassRegistry {
                 requested_bytes: 0,
                 heap_limit_bytes: 0,
             })?;
-        crate::object::set(error_ctor, gc_heap, "prototype", Value::Object(error_proto));
-        crate::object::set(
+        // §20.5.2 — `Error.prototype` lives on the constructor as
+        // `{ writable: false, enumerable: false, configurable: false }`.
+        // §20.5.3 — `Error.prototype.constructor` is
+        // `{ writable: true, enumerable: false, configurable: true }`.
+        let _ = object::define_own_property(
+            error_ctor,
+            gc_heap,
+            "prototype",
+            PropertyDescriptor::data(Value::Object(error_proto), false, false, false),
+        );
+        let _ = object::define_own_property(
             error_proto,
             gc_heap,
             "constructor",
-            Value::Object(error_ctor),
+            PropertyDescriptor::data(Value::Object(error_ctor), true, false, true),
         );
+        let error_call =
+            NativeFunction::new_constructor_static(gc_heap, "Error", 1, ctor_error)
+                .map_err(|_| StringError::OutOfMemory {
+                    requested_bytes: 0,
+                    heap_limit_bytes: 0,
+                })?;
+        object::set_constructor_native(error_ctor, gc_heap, Value::NativeFunction(error_call));
+        install_ctor_metadata(error_ctor, "Error", 1, heap, gc_heap)?;
         entries.push((
             ErrorKind::Error,
             ClassEntry {
@@ -320,16 +502,66 @@ impl ErrorClassRegistry {
                     requested_bytes: 0,
                     heap_limit_bytes: 0,
                 })?;
-            crate::object::set_prototype(proto, gc_heap, Some(error_proto));
+            object::set_prototype(proto, gc_heap, Some(error_proto));
+            // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
+            // share the same descriptor shape as `Error.prototype`'s.
             let class_name = JsString::from_str(kind.class_name(), heap)?;
-            crate::object::set(proto, gc_heap, "name", Value::String(class_name));
+            let _ = object::define_own_property(
+                proto,
+                gc_heap,
+                "name",
+                PropertyDescriptor::data(Value::String(class_name), true, false, true),
+            );
+            let empty = JsString::from_str("", heap)?;
+            let _ = object::define_own_property(
+                proto,
+                gc_heap,
+                "message",
+                PropertyDescriptor::data(Value::String(empty), true, false, true),
+            );
             let ctor =
                 crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
                     requested_bytes: 0,
                     heap_limit_bytes: 0,
                 })?;
-            crate::object::set(ctor, gc_heap, "prototype", Value::Object(proto));
-            crate::object::set(proto, gc_heap, "constructor", Value::Object(ctor));
+            // §20.5.6.{2,3} — same prototype/constructor shape.
+            let _ = object::define_own_property(
+                ctor,
+                gc_heap,
+                "prototype",
+                PropertyDescriptor::data(Value::Object(proto), false, false, false),
+            );
+            let _ = object::define_own_property(
+                proto,
+                gc_heap,
+                "constructor",
+                PropertyDescriptor::data(Value::Object(ctor), true, false, true),
+            );
+            // §20.5.7.2 — `AggregateError(errors, message?)` has
+            // `length` 2; every other native error has `length` 1.
+            let length = if kind == ErrorKind::AggregateError { 2 } else { 1 };
+            let dispatcher: crate::native_function::NativeFastFn = match kind {
+                ErrorKind::Error => ctor_error,
+                ErrorKind::TypeError => ctor_type,
+                ErrorKind::RangeError => ctor_range,
+                ErrorKind::SyntaxError => ctor_syntax,
+                ErrorKind::ReferenceError => ctor_reference,
+                ErrorKind::URIError => ctor_uri,
+                ErrorKind::EvalError => ctor_eval,
+                ErrorKind::AggregateError => ctor_aggregate,
+            };
+            let native = NativeFunction::new_constructor_static(
+                gc_heap,
+                kind.class_name(),
+                length as u8,
+                dispatcher,
+            )
+            .map_err(|_| StringError::OutOfMemory {
+                requested_bytes: 0,
+                heap_limit_bytes: 0,
+            })?;
+            object::set_constructor_native(ctor, gc_heap, Value::NativeFunction(native));
+            install_ctor_metadata(ctor, kind.class_name(), length, heap, gc_heap)?;
             entries.push((
                 kind,
                 ClassEntry {
@@ -368,6 +600,64 @@ impl ErrorClassRegistry {
             ErrorKind::URIError => &self.uri_error,
             ErrorKind::EvalError => &self.eval_error,
             ErrorKind::AggregateError => &self.aggregate_error,
+        }
+    }
+
+    /// Wire the realm-level prototype chain that requires
+    /// `%Function.prototype%` and `%Object.prototype%` (which only
+    /// exist after bootstrap), and register every native error
+    /// constructor as an own data property of `globalThis`.
+    ///
+    /// # Algorithm
+    /// Per ECMA-262 §20.5.6:
+    ///   - `Error.[[Prototype]]` is `%Function.prototype%`.
+    ///   - `Error.prototype.[[Prototype]]` is `%Object.prototype%`.
+    ///   - `<NativeError>.[[Prototype]]` is `%Error%` (the constructor).
+    ///   - `<NativeError>.prototype.[[Prototype]]` is `%Error.prototype%`
+    ///     (already linked at registry-construction time).
+    ///
+    /// Constructors land on `globalThis` as `{ writable: true,
+    /// enumerable: false, configurable: true }` per §17.
+    pub(crate) fn finalize_after_bootstrap(
+        &self,
+        gc_heap: &mut otter_gc::GcHeap,
+        function_prototype: JsObject,
+        object_prototype: JsObject,
+        global_this: JsObject,
+    ) {
+        // Link Error -> Function.prototype.
+        object::set_prototype(self.error.constructor, gc_heap, Some(function_prototype));
+        // Link Error.prototype -> Object.prototype.
+        object::set_prototype(self.error.prototype, gc_heap, Some(object_prototype));
+        // Link each subclass constructor -> Error.
+        for entry in [
+            &self.type_error,
+            &self.range_error,
+            &self.syntax_error,
+            &self.reference_error,
+            &self.uri_error,
+            &self.eval_error,
+            &self.aggregate_error,
+        ] {
+            object::set_prototype(entry.constructor, gc_heap, Some(self.error.constructor));
+        }
+        // Register globals.
+        for (name, entry) in [
+            ("Error", &self.error),
+            ("TypeError", &self.type_error),
+            ("RangeError", &self.range_error),
+            ("SyntaxError", &self.syntax_error),
+            ("ReferenceError", &self.reference_error),
+            ("URIError", &self.uri_error),
+            ("EvalError", &self.eval_error),
+            ("AggregateError", &self.aggregate_error),
+        ] {
+            let _ = object::define_own_property(
+                global_this,
+                gc_heap,
+                name,
+                PropertyDescriptor::data(Value::Object(entry.constructor), true, false, true),
+            );
         }
     }
 

@@ -40,6 +40,7 @@ pub mod console;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod bootstrap;
+pub mod dynamic_import;
 pub mod error_classes;
 pub mod function_metadata;
 pub mod function_prototype;
@@ -72,6 +73,7 @@ pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
+pub mod timers;
 pub mod weak_refs;
 
 use std::sync::Arc;
@@ -88,6 +90,7 @@ use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 pub use array::JsArray;
 pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
+pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use js_surface::{
@@ -110,6 +113,7 @@ pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
 pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
+pub use timers::{TimerCallbacks, TimerEntry, TimerScheduler, TimerSchedulerHandle};
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
 pub use runtime_cx::{NativeCallInfo, NativeCtx};
@@ -2134,6 +2138,31 @@ pub struct Interpreter {
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].
     console_sink: console::ConsoleSinkHandle,
+    /// Host-side timer scheduler. Wired by the runtime layer so
+    /// `setTimeout` / `clearTimeout` / `setInterval` /
+    /// `clearInterval` natives can talk to the event loop without
+    /// otter-vm depending on Tokio. `None` when the embedder did
+    /// not install a scheduler — the natives raise a TypeError on
+    /// call in that case.
+    timer_scheduler: Option<timers::TimerSchedulerHandle>,
+    /// Per-isolate map from host-issued timer token to JS callback +
+    /// extra arguments. Populated by `setTimeout` / `setInterval`,
+    /// drained by the runtime layer when a `TimerFired` inbox
+    /// message arrives.
+    timer_callbacks: timers::TimerCallbacks,
+    /// Host-side dynamic-import scheduler. Wired by the runtime
+    /// layer so `Op::ImportNamespaceDynamic` can register a
+    /// pending promise and schedule on-demand module loading
+    /// without otter-vm depending on the loader or Tokio. `None`
+    /// when the embedder did not install one — the opcode then
+    /// rejects with a `TypeError` for any unresolved specifier.
+    dynamic_import_loader: Option<dynamic_import::DynamicImportLoaderHandle>,
+    /// Per-isolate registry of pending dynamic-import promises
+    /// (`u64 → JsPromiseHandle`). Populated by
+    /// `Op::ImportNamespaceDynamic`, drained by the runtime layer
+    /// when the host loader settles a token through
+    /// [`Self::settle_dynamic_import`].
+    dynamic_import_registry: dynamic_import::DynamicImportRegistry,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -2216,31 +2245,29 @@ impl Interpreter {
         // Bootstrap can't see `WellKnownSymbols`, so we wire the
         // realm-local @@hasInstance after both Function.prototype
         // and the symbol table exist.
-        let function_prototype_handle =
-            if let Some(Value::Object(function_ctor)) =
-                object::get(global_this, &gc_heap, "Function")
-                && let Some(Value::Object(function_proto)) =
-                    object::get(function_ctor, &gc_heap, "prototype")
-            {
-                let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
-                function_prototype::install_symbol_has_instance(
-                    &mut gc_heap,
-                    function_proto,
-                    has_instance,
-                )
-                .expect("Function.prototype[@@hasInstance] fits within any positive cap");
-                Some(function_proto)
-            } else {
-                None
-            };
+        let function_prototype_handle = if let Some(Value::Object(function_ctor)) =
+            object::get(global_this, &gc_heap, "Function")
+            && let Some(Value::Object(function_proto)) =
+                object::get(function_ctor, &gc_heap, "prototype")
+        {
+            let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
+            function_prototype::install_symbol_has_instance(
+                &mut gc_heap,
+                function_proto,
+                has_instance,
+            )
+            .expect("Function.prototype[@@hasInstance] fits within any positive cap");
+            Some(function_proto)
+        } else {
+            None
+        };
         // §20.5.6 — finalize the native error class hierarchy now
         // that `%Function.prototype%` and `%Object.prototype%` are
         // installed: link constructor and prototype `[[Prototype]]`
         // chains and surface every error constructor on `globalThis`
         // as a writable, non-enumerable, configurable data property.
         if let Some(function_prototype) = function_prototype_handle
-            && let Some(Value::Object(object_ctor)) =
-                object::get(global_this, &gc_heap, "Object")
+            && let Some(Value::Object(object_ctor)) = object::get(global_this, &gc_heap, "Object")
             && let Some(Value::Object(object_prototype)) =
                 object::get(object_ctor, &gc_heap, "prototype")
         {
@@ -2269,7 +2296,81 @@ impl Interpreter {
             function_user_props: std::collections::HashMap::new(),
             function_deleted_metadata: std::collections::HashSet::new(),
             console_sink: console::default_console_sink(),
+            timer_scheduler: None,
+            timer_callbacks: timers::TimerCallbacks::new(),
+            dynamic_import_loader: None,
+            dynamic_import_registry: dynamic_import::DynamicImportRegistry::new(),
         }
+    }
+
+    /// Install the host-side timer scheduler. Called by the
+    /// runtime layer at construction time so the JS-visible
+    /// `setTimeout` / `setInterval` natives can route through the
+    /// event-loop scheduler.
+    pub fn set_timer_scheduler(&mut self, scheduler: timers::TimerSchedulerHandle) {
+        self.timer_scheduler = Some(scheduler);
+    }
+
+    /// Clone the installed timer scheduler, if any. Native-function
+    /// implementations of `setTimeout` / `clearTimeout` use this to
+    /// schedule and cancel without holding `&mut self` over the
+    /// host-side call.
+    #[must_use]
+    pub fn timer_scheduler(&self) -> Option<timers::TimerSchedulerHandle> {
+        self.timer_scheduler.clone()
+    }
+
+    /// Mutable handle to the timer-callback registry.
+    pub fn timer_callbacks_mut(&mut self) -> &mut timers::TimerCallbacks {
+        &mut self.timer_callbacks
+    }
+
+    /// Read-only view of the timer-callback registry.
+    #[must_use]
+    pub fn timer_callbacks(&self) -> &timers::TimerCallbacks {
+        &self.timer_callbacks
+    }
+
+    /// Install the host-side dynamic-import scheduler.
+    pub fn set_dynamic_import_loader(&mut self, loader: dynamic_import::DynamicImportLoaderHandle) {
+        self.dynamic_import_loader = Some(loader);
+    }
+
+    /// Clone the installed dynamic-import scheduler, if any.
+    #[must_use]
+    pub fn dynamic_import_loader(&self) -> Option<dynamic_import::DynamicImportLoaderHandle> {
+        self.dynamic_import_loader.clone()
+    }
+
+    /// Read-only view of the dynamic-import registry.
+    #[must_use]
+    pub fn dynamic_import_registry(&self) -> &dynamic_import::DynamicImportRegistry {
+        &self.dynamic_import_registry
+    }
+
+    /// Mutable handle to the dynamic-import registry.
+    pub fn dynamic_import_registry_mut(&mut self) -> &mut dynamic_import::DynamicImportRegistry {
+        &mut self.dynamic_import_registry
+    }
+
+    /// Settle a pending dynamic-import promise registered under
+    /// `token`. Routes through the standard promise dispatch path
+    /// so reactions land on the per-isolate microtask queue;
+    /// callers are expected to drain microtasks after calling
+    /// this. A missing or already-settled token is a silent no-op.
+    pub fn settle_dynamic_import(&mut self, token: u64, outcome: Result<Value, Value>) -> bool {
+        let handle = match self.dynamic_import_registry.take(token) {
+            Some(h) => h,
+            None => return false,
+        };
+        let jobs = match outcome {
+            Ok(value) => crate::JsPromise::fulfill(&handle, &mut self.gc_heap, value),
+            Err(reason) => crate::JsPromise::reject(&handle, &mut self.gc_heap, reason),
+        };
+        for j in jobs.jobs {
+            self.microtasks.enqueue(j);
+        }
+        true
     }
 
     /// Replace the sink used by `console.*` methods.
@@ -2320,8 +2421,7 @@ impl Interpreter {
         match value {
             Value::Object(obj) => {
                 let stored = object::prototype_value(*obj, &self.gc_heap);
-                let has_construct =
-                    object_has_construct_slot(&Value::Object(*obj), &self.gc_heap);
+                let has_construct = object_has_construct_slot(&Value::Object(*obj), &self.gc_heap);
                 if has_construct {
                     let function_proto = self.function_prototype_object().ok();
                     let object_proto = self.object_prototype_object_opt();
@@ -2338,9 +2438,7 @@ impl Interpreter {
                         // hoist to %Function.prototype% to keep the
                         // observable spec shape on built-ins like
                         // `Number`, `Boolean`, `Date`, `Array`, etc.
-                        Some(Value::Object(p))
-                            if object_proto.is_some_and(|op| op == *p) =>
-                        {
+                        Some(Value::Object(p)) if object_proto.is_some_and(|op| op == *p) => {
                             if let Some(fp) = function_proto {
                                 return Ok(Value::Object(fp));
                             }
@@ -2354,9 +2452,7 @@ impl Interpreter {
             | Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
-            | Value::ClassConstructor(_) => {
-                Ok(Value::Object(self.function_prototype_object()?))
-            }
+            | Value::ClassConstructor(_) => Ok(Value::Object(self.function_prototype_object()?)),
             _ => Err(VmError::TypeMismatch),
         }
     }
@@ -3296,6 +3392,22 @@ impl Interpreter {
         &self.global_this
     }
 
+    /// Install `value` as the `name` property on `globalThis` with
+    /// the standard `{ writable: true, enumerable: false,
+    /// configurable: true }` data-descriptor attributes used by
+    /// every default-global binding (§17 + §19). Public entry for
+    /// embedders that need to inject a runtime-side value into
+    /// scripts (e.g. host-bound promises, capability tokens).
+    pub fn set_global(&mut self, name: &str, value: Value) {
+        let descriptor = crate::object::PropertyDescriptor::data(value, true, false, true);
+        let _ = crate::object::define_own_property(
+            self.global_this,
+            &mut self.gc_heap,
+            name,
+            descriptor,
+        );
+    }
+
     fn primitive_wrapper_prototype(&self, constructor_name: &str) -> Result<JsObject, VmError> {
         let Some(Value::Object(constructor)) =
             object::get(self.global_this, &self.gc_heap, constructor_name)
@@ -3472,6 +3584,15 @@ impl Interpreter {
         self.pending_uncaught_throw.as_ref()
     }
 
+    /// Consume the pending uncaught-throw payload, if any. Embedder
+    /// callers that catch a `VmError::Uncaught` at a sync entry
+    /// point use this to recover the original thrown
+    /// [`Value`] (an `Error` instance, a string, etc.) instead of
+    /// the lossy `Display` rendering carried by the `VmError`.
+    pub fn take_pending_uncaught_throw(&mut self) -> Option<Value> {
+        self.pending_uncaught_throw.take()
+    }
+
     /// Borrow the per-isolate GC heap (read-only).
     #[must_use]
     pub fn gc_heap(&self) -> &otter_gc::GcHeap {
@@ -3615,6 +3736,12 @@ impl Interpreter {
         module: &BytecodeModule,
         task: Microtask,
     ) -> Result<(), RunError> {
+        // Reaction-mode rejection forwarding (§27.2.1.3.2) reads the
+        // abrupt completion's [[Value]] from `pending_uncaught_throw`
+        // after `dispatch_loop` returns. Clear any stale payload
+        // carried over from a prior microtask so we cannot read a
+        // foreign reaction's value into this one.
+        self.pending_uncaught_throw = None;
         // Async-resume tasks bypass callee resolution entirely:
         // the parked frame replaces a fresh callee invocation,
         // so route them to `run_async_resume` directly.
@@ -3809,7 +3936,19 @@ impl Interpreter {
             }
             Err(error) => {
                 if result_capability.is_some() {
-                    let reason = vm_err_to_value(&error);
+                    // Reaction-mode unwind: route the abrupt
+                    // completion's [[Value]] into the downstream
+                    // promise as a rejection per ECMA-262
+                    // §27.2.1.3.2 PromiseReactionJob step 1.f.iii.
+                    // Spec requires the *original* thrown value, not
+                    // a stringified `VmError::Uncaught` rendering;
+                    // [`Self::unwind_throw_with_uncaught`] preserves
+                    // it on `pending_uncaught_throw` for exactly this
+                    // hop.
+                    let reason = self
+                        .pending_uncaught_throw
+                        .take()
+                        .unwrap_or_else(|| vm_err_to_value(&error));
                     self.settle_microtask_capability(result_capability, Err(reason));
                     Ok(())
                 } else {
@@ -3966,6 +4105,29 @@ impl Interpreter {
     }
 
     /// Convert a `VmError` raised by a dispatch step into a thrown
+    /// Build a freshly-allocated `TypeError` instance with the
+    /// supplied message. Mirrors the shape produced by
+    /// [`Self::vm_error_to_throwable`] for `VmError::TypeError`
+    /// but skips the `VmError` wrapping — useful when the dispatch
+    /// path already knows it wants a `TypeError` rejection (e.g.
+    /// `Op::ImportNamespaceDynamic` building a rejected promise).
+    fn make_type_error(&mut self, message: &str) -> Result<Value, VmError> {
+        let proto = self
+            .error_classes
+            .prototype(error_classes::ErrorKind::TypeError);
+        let obj = crate::object::alloc_object(&mut self.gc_heap).map_err(VmError::from)?;
+        crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
+        let message_str =
+            JsString::from_str(message, &self.string_heap).map_err(|_| VmError::TypeMismatch)?;
+        crate::object::set(
+            obj,
+            &mut self.gc_heap,
+            "message",
+            Value::String(message_str),
+        );
+        Ok(Value::Object(obj))
+    }
+
     /// `Error` instance. Returns `None` for variants that should
     /// keep propagating as host errors (StackOverflow, etc.).
     fn vm_error_to_throwable(&mut self, err: &VmError) -> Option<Value> {
@@ -6394,25 +6556,59 @@ impl Interpreter {
                     frame.pc += 1;
                 }
                 Op::ImportNamespaceDynamic => {
-                    // Runtime-resolved `import(spec)` per §16.2.1.7.
-                    // The specifier is whatever string the user
-                    // expression evaluated to. Fall back to a
-                    // TypeError when the linker hasn't pre-resolved
-                    // it — re-entrant compile is filed.
+                    // §16.2.1.7 ImportCall (runtime-resolved). The
+                    // specifier is whatever string the user
+                    // expression evaluated to. The opcode always
+                    // produces a [`Value::Promise`]:
+                    //
+                    // 1. Pre-resolved (linker-merged) specifier —
+                    //    Promise fulfilled with the imported
+                    //    namespace, matching the literal
+                    //    `import("./x")` shape.
+                    // 2. Specifier the linker has not seen, host
+                    //    dynamic-import scheduler installed —
+                    //    register a fresh pending Promise + hand
+                    //    the host-issued token to
+                    //    [`crate::DynamicImportLoader::schedule`].
+                    //    The runtime layer's inbox handler then
+                    //    drives the load + compile + link +
+                    //    evaluate and settles via
+                    //    [`crate::Interpreter::settle_dynamic_import`].
+                    // 3. Specifier the linker has not seen, no
+                    //    scheduler (Layer-A direct mode) — reject
+                    //    with a `TypeError`.
+                    // 4. Non-string specifier — reject with a
+                    //    `TypeError`, matching §16.2.1.7 step 7.b.i.
                     let dst = register_operand(operands.first())?;
                     let spec_reg = register_operand(operands.get(1))?;
                     let spec_value = read_register(frame, spec_reg)?.clone();
-                    let specifier = match spec_value {
-                        Value::String(s) => s.to_lossy_string(),
-                        _ => return Err(VmError::TypeMismatch),
-                    };
                     let referrer = frame.module_url.clone();
-                    let namespace = self
-                        .resolve_module_namespace(module, referrer.as_ref(), &specifier)
-                        .ok_or(VmError::UnknownIntrinsic {
-                            name: format!("import \"{specifier}\""),
-                        })?;
-                    write_register(frame, dst, Value::Object(namespace))?;
+                    let promise = match spec_value {
+                        Value::String(s) => {
+                            let specifier = s.to_lossy_string();
+                            if let Some(ns) =
+                                self.resolve_module_namespace(module, referrer.as_ref(), &specifier)
+                            {
+                                JsPromiseHandle::fulfilled(&mut self.gc_heap, Value::Object(ns))?
+                            } else if let Some(loader) = self.dynamic_import_loader.clone() {
+                                let pending = JsPromiseHandle::pending(&mut self.gc_heap)?;
+                                let token = self.dynamic_import_registry.insert(pending);
+                                loader.schedule(token, specifier, referrer.as_ref().to_string());
+                                pending
+                            } else {
+                                let reason = self.make_type_error(&format!(
+                                    "dynamic import: module not resolvable: \"{specifier}\""
+                                ))?;
+                                JsPromiseHandle::rejected(&mut self.gc_heap, reason)?
+                            }
+                        }
+                        _ => {
+                            let reason =
+                                self.make_type_error("dynamic import: specifier must be a string")?;
+                            JsPromiseHandle::rejected(&mut self.gc_heap, reason)?
+                        }
+                    };
+                    write_register(frame, dst, Value::Promise(promise))?;
                     frame.pc += 1;
                 }
                 Op::PromiseFulfilledOf => {
@@ -9657,16 +9853,15 @@ impl Interpreter {
         // resolved value is the realm's `%Function.prototype[@@hasInstance]%`
         // intrinsic — the spec says step 5's OrdinaryHasInstance is
         // observably equivalent and avoids the extra call frame.
-        let has_instance_sym = self
-            .well_known_symbols
-            .get(symbol::WellKnown::HasInstance);
+        let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
-        let handler = match self.ordinary_get_value(module, target.clone(), target.clone(), &key, 0)? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(module, &getter, target.clone(), SmallVec::new())?
-            }
-        };
+        let handler =
+            match self.ordinary_get_value(module, target.clone(), target.clone(), &key, 0)? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(module, &getter, target.clone(), SmallVec::new())?
+                }
+            };
         if !matches!(handler, Value::Undefined | Value::Null) {
             if !self.is_callable_runtime(&handler) {
                 return Err(VmError::TypeError {
@@ -10488,6 +10683,10 @@ impl Interpreter {
         }
     }
 
+    // `to_*` mirrors the spec abstract operation `ToPrimitive` (§7.1.1).
+    // The interpreter borrow is `&mut self` because the helper invokes
+    // user-defined `toString` / `valueOf`, which can re-enter dispatch.
+    #[allow(clippy::wrong_self_convention)]
     fn to_primitive_string_hint_sync(
         &mut self,
         module: &BytecodeModule,
@@ -11471,9 +11670,7 @@ impl Interpreter {
             && object::get(*rhs_obj, &self.gc_heap, "prototype").is_none()
             && !matches!(rhs, Value::Proxy(_))
         {
-            let has_instance_sym = self
-                .well_known_symbols
-                .get(symbol::WellKnown::HasInstance);
+            let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
             if object::get_symbol(*rhs_obj, &self.gc_heap, &has_instance_sym).is_none() {
                 return Ok(false);
             }

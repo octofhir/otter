@@ -58,14 +58,8 @@ pub(crate) fn install_symbol_has_instance(
         NativeCall::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance),
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let descriptor =
-        PropertyDescriptor::data(Value::NativeFunction(value), false, false, false);
-    if !object::define_own_symbol_property(
-        prototype,
-        heap,
-        &well_known_has_instance,
-        descriptor,
-    ) {
+    let descriptor = PropertyDescriptor::data(Value::NativeFunction(value), false, false, false);
+    if !object::define_own_symbol_property(prototype, heap, &well_known_has_instance, descriptor) {
         return Err(JsSurfaceError::DefinePropertyFailed("[Symbol.hasInstance]"));
     }
     Ok(())

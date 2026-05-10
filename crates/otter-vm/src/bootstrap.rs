@@ -345,6 +345,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CONSOLE,
         install: install_console,
     },
+    BootstrapEntry {
+        name: "setTimeout",
+        feature: BootstrapFeatures::CORE,
+        install: install_timer_globals,
+    },
 ];
 
 /// Build `globalThis` with all default features.
@@ -1205,6 +1210,14 @@ fn install_console(
     console::install(global, heap)
 }
 
+fn install_timer_globals(
+    _entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    crate::timers::install_timer_globals(global, heap)
+}
+
 fn define_global(global: JsObject, heap: &mut otter_gc::GcHeap, name: &'static str, value: Value) {
     let descriptor = PropertyDescriptor::data(
         value,
@@ -1299,7 +1312,11 @@ mod tests {
             Some(1),
             "Array must install after Object so its [[Prototype]] can resolve"
         );
-        assert_eq!(names.last(), Some(&"console"));
+        assert_eq!(names.last(), Some(&"setTimeout"));
+        assert!(
+            names.contains(&"console"),
+            "console entry must remain installed"
+        );
 
         let mut sorted = names.clone();
         sorted.sort_unstable();

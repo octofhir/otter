@@ -19,8 +19,10 @@ oxc_ast = { workspace = true }
 oxc_ast_visit = { workspace = true }
 oxc_allocator = { workspace = true }
 oxc_resolver = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 

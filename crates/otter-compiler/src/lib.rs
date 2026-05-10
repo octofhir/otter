@@ -763,9 +763,16 @@ fn compile_export_inner_declaration(
                 };
                 let name = id.name.as_str().to_string();
                 // §16.2.3.7 ExportEntry: `export var x` reuses the
-                // module-scope binding pre-hoisted at module entry;
-                // `export let x` / `export const x` declare a fresh
-                // lexical binding here.
+                // module-scope binding pre-hoisted at module entry
+                // (var-hoist); `export let x` / `export const x`
+                // were pre-declared at module entry by
+                // `hoist_lexical_names` so inner functions could
+                // capture them through the standard upvalue
+                // cascade. Reuse the pre-declared binding when
+                // present; fall back to a fresh declaration only
+                // for the foundation cases the lexical hoist pass
+                // doesn't yet cover (e.g. destructuring leaves
+                // declared at their source position).
                 let storage = if is_var {
                     cx.lookup_binding(&name)
                         .ok_or(CompileError::Unsupported {
@@ -773,6 +780,8 @@ fn compile_export_inner_declaration(
                             span: dspan,
                         })?
                         .storage
+                } else if let Some(info) = cx.lookup_in_current_scope(&name) {
+                    info.storage
                 } else {
                     cx.declare_binding(&name, is_const, dspan)?
                 };
@@ -801,6 +810,15 @@ fn compile_export_inner_declaration(
                     .name
                     .as_str()
                     .to_string();
+            // §10.2.11 step 30 — top-level `function` decls were
+            // hoisted at scope entry by
+            // `hoist_function_declarations` (now also for the
+            // export-wrapped form). The hoist pass already
+            // compiled the body and bound the closure; the
+            // source-position arm becomes a pure no-op.
+            if cx.hoisted_function_names.contains(&name) {
+                return Ok(());
+            }
             let (function_id, captures) = compile_function_full(
                 cx,
                 &name,
@@ -832,7 +850,15 @@ fn compile_export_inner_declaration(
                     .as_str()
                     .to_string();
             let class_reg = compile_class(cx, c, Some(&name))?;
-            let storage = cx.declare_binding(&name, false, cspan)?;
+            // `export class C` was pre-declared by
+            // `hoist_lexical_names` (TDZ-init). The source-
+            // position arm only stores the resolved class value
+            // and flips the binding to initialized.
+            let storage = if let Some(info) = cx.lookup_in_current_scope(&name) {
+                info.storage
+            } else {
+                cx.declare_binding(&name, false, cspan)?
+            };
             cx.emit_store_storage(class_reg, storage, cspan);
             cx.mark_initialized(&name);
             cx.emit_module_export_mirror(&name, class_reg, cspan);
@@ -1672,6 +1698,28 @@ impl FunctionContext {
         self.emit_store_property(env_reg, name, value_reg, span);
     }
 
+    /// Mirror `value_reg` through to `module_env.default`. Used by
+    /// `export default function f(){}` from the hoist pass: the
+    /// default export entry was registered by the module pre-pass
+    /// so the closure must land on `module_env.default` even when
+    /// no source-position store ever runs (the source-position arm
+    /// becomes a no-op for hoisted names).
+    ///
+    /// Spec: <https://tc39.es/ecma262/#sec-exports-runtime-semantics-evaluation>
+    fn emit_module_export_default_mirror(&mut self, value_reg: u16, span: (u32, u32)) {
+        let env_uv = match &self.module_state {
+            Some(state) => state.module_env_uv,
+            None => return,
+        };
+        let env_reg = self.alloc_scratch();
+        self.emit(
+            Op::LoadUpvalue,
+            vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+            span,
+        );
+        self.emit_store_property(env_reg, "default", value_reg, span);
+    }
+
     /// Emit `Op::StoreProperty obj_reg, name_const, src_reg, scratch`.
     /// Used by the module-mode lowering to mirror writes through
     /// to `module_env` for exported bindings, and by the export
@@ -2218,6 +2266,21 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             }
             let value_reg = match &decl.declaration {
                 oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                    // §15.2 — a named `export default function f(){}`
+                    // is a HoistableDeclaration: the closure was
+                    // already compiled and bound to `f` (and
+                    // mirrored as `module_env.default`) by
+                    // [`hoist_function_declarations`]. The source-
+                    // position arm becomes a pure no-op so the
+                    // hoist's instructions stay the single source
+                    // of truth.
+                    let hoisted_name =
+                        f.id.as_ref()
+                            .map(|id| id.name.as_str().to_string())
+                            .filter(|name| cx.hoisted_function_names.contains(name));
+                    if hoisted_name.is_some() {
+                        return Ok(None);
+                    }
                     let name =
                         f.id.as_ref()
                             .map(|id| id.name.as_str().to_string())
@@ -2631,6 +2694,21 @@ fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<String>) {
                 collect_pattern_var_names(&declarator.id, out);
             }
         }
+        // §16.2.3.7 ExportEntry — `export var x` shares the
+        // module's `var`-hoisted scope: the name must be
+        // pre-declared at the module-init top, exactly as for a
+        // bare `var x`. The export side-effect (mirroring into
+        // `module_env`) runs at the source position via the
+        // export arm; here we only need to surface the name.
+        Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
+            if let Some(oxc_ast::ast::Declaration::VariableDeclaration(v)) = &decl.declaration
+                && matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            {
+                for declarator in v.declarations.iter() {
+                    collect_pattern_var_names(&declarator.id, out);
+                }
+            }
+        }
         Statement::BlockStatement(b) => hoist_var_names(&b.body, out),
         Statement::IfStatement(s) => {
             hoist_var_names_in_stmt(&s.consequent, out);
@@ -2770,27 +2848,79 @@ fn hoist_lexical_names(stmts: &[Statement<'_>], out: &mut Vec<(String, bool)>) {
                         | oxc_ast::ast::VariableDeclarationKind::Const
                 ) =>
             {
-                let is_const = matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const);
-                for declarator in d.declarations.iter() {
-                    // Only pre-hoist plain identifier bindings;
-                    // destructuring patterns declare each leaf at
-                    // their source position via `destructure_into`.
-                    // A hoisted nested function that captures a
-                    // destructured leaf name is filed as a follow-up.
-                    if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
-                        out.push((id.name.as_str().to_string(), is_const));
-                    }
-                }
+                collect_lexical_var_names(d, out);
             }
             Statement::ClassDeclaration(c) => {
                 if let Some(id) = &c.id {
                     out.push((id.name.as_str().to_string(), false));
                 }
             }
+            // §16.2.3.7 — `export let x` / `export const x` /
+            // `export class C` introduce a fresh module-scope
+            // lexical binding that must be pre-declared in TDZ
+            // before module-init runs, just like any other
+            // top-level lexical name. `export function` is
+            // handled by [`hoist_function_declarations`].
+            //
+            // `export var x` is a `var`-scoped binding picked up
+            // by [`hoist_var_names_in_stmt`]; we explicitly skip
+            // it here so the name doesn't end up double-bound.
+            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
+                match &decl.declaration {
+                    Some(oxc_ast::ast::Declaration::VariableDeclaration(v))
+                        if matches!(
+                            v.kind,
+                            oxc_ast::ast::VariableDeclarationKind::Let
+                                | oxc_ast::ast::VariableDeclarationKind::Const
+                        ) =>
+                    {
+                        collect_lexical_var_names(v, out);
+                    }
+                    Some(oxc_ast::ast::Declaration::ClassDeclaration(c)) => {
+                        if let Some(id) = &c.id {
+                            out.push((id.name.as_str().to_string(), false));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // `export default class C {}` and `export default
+            // expression` do not contribute a top-level lexical
+            // name in the foundation slice — the value lives on
+            // `module_env.default` and the source-position
+            // [`Statement::ExportDefaultDeclaration`] arm wires
+            // that store. Per §15.2.3.5 a *named* default class
+            // creates a module-scope binding `C`; that binding is
+            // a separate spec slice and is filed as a follow-up.
+            // `export default function f(){}` is a hoistable
+            // declaration; its name lands at the top of
+            // [`hoist_function_declarations`].
             // Don't recurse into blocks / control-flow constructs:
             // those declarations belong to the inner block scope,
             // not the enclosing function / module body.
             _ => {}
+        }
+    }
+}
+
+/// Push every plain-identifier name declared by a `let`/`const`
+/// declaration into `out` with its `is_const` flag. Shared
+/// between the source-statement arm and the
+/// `ExportNamedDeclaration(VariableDeclaration)` arm so both pre-
+/// hoist passes apply identical rules to the inner declaration.
+fn collect_lexical_var_names(
+    d: &oxc_ast::ast::VariableDeclaration<'_>,
+    out: &mut Vec<(String, bool)>,
+) {
+    let is_const = matches!(d.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+    for declarator in d.declarations.iter() {
+        // Only pre-hoist plain identifier bindings; destructuring
+        // patterns declare each leaf at their source position via
+        // `destructure_into`. A hoisted nested function that
+        // captures a destructured leaf name is filed as a
+        // follow-up.
+        if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+            out.push((id.name.as_str().to_string(), is_const));
         }
     }
 }
@@ -2853,12 +2983,50 @@ fn hoist_function_declarations(
     stmts: &[Statement<'_>],
 ) -> Result<(), CompileError> {
     use std::collections::HashMap;
+    // Resolve each statement to its hoistable `FunctionDeclaration`
+    // payload, including the export-wrapped forms `export function`
+    // and `export default function`. Returns `None` for other
+    // statements and for `function f.declare`-only TS shapes.
+    fn hoistable_function<'b, 'a: 'b>(
+        stmt: &'b Statement<'a>,
+    ) -> Option<&'b oxc_ast::ast::Function<'a>> {
+        match stmt {
+            Statement::FunctionDeclaration(f) if !f.declare => Some(f),
+            Statement::ExportNamedDeclaration(decl) if !decl.export_kind.is_type() => {
+                if let Some(oxc_ast::ast::Declaration::FunctionDeclaration(f)) = &decl.declaration
+                    && !f.declare
+                {
+                    Some(f)
+                } else {
+                    None
+                }
+            }
+            // §15.2 ExportDefaultDeclaration with a
+            // `FunctionDeclaration` payload hoists when the
+            // function carries a binding identifier (per HoistableDeclaration).
+            // Anonymous default functions are evaluated at the
+            // export's source position by the export arm; they
+            // don't introduce a module-scope name.
+            Statement::ExportDefaultDeclaration(decl) => {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) =
+                    &decl.declaration
+                    && !f.declare
+                    && f.id.is_some()
+                {
+                    Some(f)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     // Pass 1 — last-occurrence-wins: identify the surviving
     // declaration index per name.
     let mut last_idx: HashMap<String, usize> = HashMap::new();
     for (idx, stmt) in stmts.iter().enumerate() {
-        if let Statement::FunctionDeclaration(f) = stmt
-            && !f.declare
+        if let Some(f) = hoistable_function(stmt)
             && let Some(id) = &f.id
         {
             last_idx.insert(id.name.as_str().to_string(), idx);
@@ -2870,7 +3038,7 @@ fn hoist_function_declarations(
     // is compiled. The binding is initialised to undefined; the
     // closure value lands in pass 3.
     for (idx, stmt) in stmts.iter().enumerate() {
-        let Statement::FunctionDeclaration(f) = stmt else {
+        let Some(f) = hoistable_function(stmt) else {
             continue;
         };
         let Some(id) = &f.id else {
@@ -2895,7 +3063,7 @@ fn hoist_function_declarations(
     // already declared, mutually-recursive declarations bind
     // correctly regardless of source order.
     for (idx, stmt) in stmts.iter().enumerate() {
-        let Statement::FunctionDeclaration(f) = stmt else {
+        let Some(f) = hoistable_function(stmt) else {
             continue;
         };
         let Some(id) = &f.id else {
@@ -2924,7 +3092,20 @@ fn hoist_function_declarations(
             .expect("pass 2 pre-declared the binding")
             .storage;
         cx.emit_store_storage(tmp, storage, span);
+        // Mirror through to `module_env` for `export function f`
+        // (and `export default function f` — its export entry
+        // landed under `default` from the pre-pass; the named
+        // mirror is harmless for non-exported names because
+        // `emit_module_export_mirror` filters on
+        // `module_state.exported_names`).
         cx.emit_module_export_mirror(&name, tmp, span);
+        // §15.2 — `export default function f(){}` also requires
+        // `module_env.default = f`. Detect by walking the source
+        // statement: when the surviving declaration came from an
+        // export-default the `default` mirror must fire too.
+        if matches!(stmts.get(idx), Some(Statement::ExportDefaultDeclaration(_))) {
+            cx.emit_module_export_default_mirror(tmp, span);
+        }
     }
     Ok(())
 }
@@ -6123,11 +6304,15 @@ fn compile_expr(
         }
 
         Expression::ImportExpression(imp) => {
-            // Foundation: only literal-string `import("./x")` is
-            // accepted. Non-literal specifiers raise
-            // `MODULE_DYNAMIC_NON_LITERAL` (recorded in task 36a;
-            // task 58 lifts the restriction with runtime-lazy
-            // loading).
+            // §16.2.1.7 ImportCall: literal-string specifiers are
+            // pre-resolved by the linker (synchronous namespace lookup
+            // wrapped in a fulfilled promise). Non-literal specifiers
+            // route through `Op::ImportNamespaceDynamic` which always
+            // returns a [`crate::Value::Promise`] directly — fulfilled
+            // for a specifier that resolves against the pre-linked
+            // module graph; rejected with a TypeError when the runtime
+            // cannot satisfy the specifier (no on-demand loader for
+            // brand-new modules in this slice).
             //
             // Spec: <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>
             let span = (imp.span.start, imp.span.end);
@@ -6137,39 +6322,41 @@ fn compile_expr(
                     span,
                 });
             }
-            let ns_dst = cx.alloc_scratch();
             match unwrap_ts_expr(&imp.source) {
                 Expression::StringLiteral(lit) => {
+                    // Literal: linker resolves it during fragment merge,
+                    // opcode reads namespace + wraps in a fulfilled
+                    // promise.
                     let specifier = lit.value.as_str().to_string();
                     let spec_const = cx.intern_string_constant(&specifier);
+                    let ns_dst = cx.alloc_scratch();
                     cx.emit(
                         Op::ImportNamespace,
                         vec![Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
                         span,
                     );
-                }
-                other => {
-                    // Non-literal specifier: evaluate the expression
-                    // at runtime, then resolve through the module
-                    // graph. Specifiers that weren't pre-resolved by
-                    // the linker raise a TypeError at the dispatch
-                    // site (foundation does not yet re-enter the
-                    // compiler for runtime-discovered modules).
-                    let spec_reg = compile_expr(cx, other, span)?;
+                    let promise_dst = cx.alloc_scratch();
                     cx.emit(
-                        Op::ImportNamespaceDynamic,
-                        vec![Operand::Register(ns_dst), Operand::Register(spec_reg)],
+                        Op::PromiseFulfilledOf,
+                        vec![Operand::Register(promise_dst), Operand::Register(ns_dst)],
                         span,
                     );
+                    Ok(promise_dst)
+                }
+                other => {
+                    // Non-literal: opcode returns a Promise<namespace>
+                    // (or Promise<TypeError>) directly, so no
+                    // PromiseFulfilledOf wrap is needed.
+                    let spec_reg = compile_expr(cx, other, span)?;
+                    let promise_dst = cx.alloc_scratch();
+                    cx.emit(
+                        Op::ImportNamespaceDynamic,
+                        vec![Operand::Register(promise_dst), Operand::Register(spec_reg)],
+                        span,
+                    );
+                    Ok(promise_dst)
                 }
             }
-            let promise_dst = cx.alloc_scratch();
-            cx.emit(
-                Op::PromiseFulfilledOf,
-                vec![Operand::Register(promise_dst), Operand::Register(ns_dst)],
-                span,
-            );
-            Ok(promise_dst)
         }
 
         Expression::AwaitExpression(a) => {

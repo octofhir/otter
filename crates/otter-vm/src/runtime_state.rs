@@ -84,6 +84,10 @@ impl<'a> RuntimeState<'a> {
         }
         // 3) Microtask queue.
         interp.microtasks().trace_gc_roots(visitor);
+        // 3b) Timer callbacks waiting on host-side fire.
+        interp.timer_callbacks().trace_gc_roots(visitor);
+        // 3c) Pending dynamic-import promises waiting on host load.
+        interp.dynamic_import_registry().trace_gc_roots(visitor);
         // 4) Symbol registry + well-known table.
         interp.symbol_registry_for_trace().trace_gc_roots(visitor);
         interp

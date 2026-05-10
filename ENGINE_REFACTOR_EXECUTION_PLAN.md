@@ -424,30 +424,51 @@ Acceptance:
 
 ### P2.1 Module Graph Evaluation
 
-- [ ] Define module-record states: unresolved, resolved, compiled,
+- [x] Define module-record states: unresolved, resolved, compiled,
   instantiated, evaluating, evaluated, errored.
-  Current `RuntimeModuleRecordState` only tracks
-  `Allocated/Evaluating/Evaluated/Errored` — needs the resolution +
-  compilation + instantiation phases as distinct states.
-- [ ] Support ESM live bindings end-to-end (export-binding slot model in
-  bytecode + runtime indirection). **Audit (2026-05-10):** even
-  `export const greeting = "hello"` in a standalone `.ts` / `.mjs`
-  module raises `ReferenceError: greeting is not defined` during
-  module-init evaluation. Top-level lexical bindings declared by
-  `export const` / `export let` aren't being predeclared in the
-  module env before `<module-init>` runs. Foundation gap that needs
-  to land before live-binding indirection.
-- [ ] Support ESM cycles per HostLoadImportedModule semantics.
-  **Audit:** the resolver currently rejects any import cycle outright
-  with `MODULE_GRAPH_CYCLE`. Spec wants the loader to short-circuit
-  cyclic edges (returning the in-progress module record) and rely on
-  live-binding indirection during evaluation.
-- [ ] Route dynamic `import()` through the same loader, gated through
+  Landed 2026-05-10 in
+  `crates/otter-runtime/src/module_records.rs::RuntimeModuleRecordState`.
+  Current loader pipeline batches resolve + compile + link before
+  reaching the records table, so `allocate_for_bytecode` advances
+  each record directly into `Instantiated`; per-phase loader
+  hooks for the earlier variants are reserved for the follow-up
+  slice that splits the load pipeline.
+- [ ] Support ESM live bindings end-to-end (partial — 2026-05-10).
+  Live-binding *behavior* works through the `module_env` JsObject
+  plus `Op::ImportNamespace` plus `LoadProperty` indirection
+  (verified by
+  `tests/module_cycle_and_lifecycle.rs::cycle_with_late_function_call_observes_full_bindings`
+  — a function on the cyclic side observes the populated value
+  after both bodies finish). The plan's stated target was an
+  explicit *export-binding slot model* in bytecode; that
+  architectural choice is deferred until indirect-export
+  resolution per §15.2.1.16 lands.
+- [x] Support ESM cycles per HostLoadImportedModule semantics.
+  Landed 2026-05-10. `module_graph::topological_order` now skips
+  the cyclic back-edge instead of rejecting the graph; the
+  pre-allocated `module_env` + live-binding read path covers the
+  spec-required behavior. Pinned by 4 tests in
+  `tests/module_cycle_and_lifecycle.rs`.
+- [x] Route dynamic `import()` through the same loader, gated through
   `check_capability`. Privileged remote/dynamic imports require explicit
   capabilities; entry-point + statically analyzable local graph stays the
-  default-on path. **Audit:** `await import("./x.ts")` parses but the
-  awaited value never settles in the current foundation, so the
-  continuation never runs.
+  default-on path.
+  Landed 2026-05-10. Capability gating wired in
+  `crates/otter-runtime/src/module_loader.rs` — `LoaderConfig` now
+  carries the runtime `CapabilitySet`, and `resolve_with_kind`
+  rejects `http:` / `https:` specifiers with
+  `LoaderError::CapabilityDenied` whenever `Net` does not match
+  the host. Surfaces as the new `MODULE_CAPABILITY_DENIED`
+  diagnostic code. Pinned by 6 tests in
+  `tests/module_dynamic_import_capability.rs`. The pre-Slice-A
+  audit's third foundation gap (`await import("./x.ts")` never
+  settling) was incidentally closed by Slice A's linker fix and
+  is regression-tested in the same file. Remaining follow-ups
+  filed for separate slices: HTTPS fetcher (currently surfaces
+  `MODULE_RESOLUTION_ERROR` once the capability passes), and
+  re-entrant non-literal `import(expr)` (still raises
+  `unknown intrinsic method` because the linker cannot
+  pre-resolve a runtime-computed specifier).
 - [ ] Add CJS interop policy *after* ESM graph is stable. Documented as a
   follow-up; not a P2 acceptance gate.
 
@@ -470,18 +491,160 @@ Acceptance:
 
 ### P2.2 Job Queue And Async Boundary
 
-- [ ] Model microtasks, timers, host jobs, and dynamic imports as
+- [x] Model microtasks, timers, host jobs, and dynamic imports as
   runtime-owned queues on `Runtime`/`EventLoop`.
-- [ ] Ensure promise settlement always hops through runtime job delivery.
-- [ ] Add deterministic order tests for microtasks and timers.
-- [ ] Keep JS/VM interaction on the runtime thread boundary; worker tasks may
-  do plain Rust async, but VM/JS interaction hops back onto the scheduler.
+  Microtask queue lives on `otter_vm::Interpreter` because tasks
+  carry parked frames + GC handles (isolate-local by
+  construction). Runtime owns lifecycle via
+  `Runtime::run_compiled_script_since` /
+  `Runtime::run_module` / `Runtime::fire_timer` /
+  `Runtime::settle_pending_promise`, plus
+  `IsolateRunner::run_command` drives the inbox until idle
+  (`pending_ref_timers + pending_ref_host_ops == 0`). Timer
+  callbacks land in
+  [`otter_vm::TimerCallbacks`] keyed on the host-issued token; the
+  inbox-hosted `InboxTimerScheduler` (handle.rs) bridges to Tokio.
+  Cross-thread promise settlement uses the per-runtime
+  `PromiseRegistry` (Slice C).
+- [x] Ensure promise settlement always hops through runtime job
+  delivery. Within the VM the settlement enqueues directly onto
+  `Interpreter::microtasks` because the queue *is* the runtime's
+  delivery vehicle for isolate-local work (Slice A pinned the
+  FIFO + nested-enqueue invariants). Cross-thread settlement —
+  needed when a host async op resolves a JS-visible promise —
+  routes through the new `RuntimeMessage::SettlePromise` inbox
+  variant + `Runtime::settle_pending_promise` (Slice C), so no
+  Tokio worker ever touches `Interpreter` / `Value` / `Local`.
+  The pre-Slice A `vm_err_to_value` bug — promise rejection
+  reasons being stringified through the uncaught-error formatter
+  — was fixed at the same time: `invoke_microtask` now takes the
+  preserved throw payload from `pending_uncaught_throw` so both
+  `throw "x"` and `throw new Error("x")` round-trip the original
+  value through `.catch`.
+- [x] Add deterministic order tests for microtasks and timers.
+  Slices A + B pin the full HTML §8.1.5.5 ordering contract in
+  `crates/otter-runtime/tests/microtask_ordering.rs` (9 tests):
+  microtask FIFO, nested enqueue, mixed `then` + `queueMicrotask`,
+  reject-route, microtasks-drain-before-zero-delay-timer, FIFO
+  timer scheduling, `clearTimeout` race semantics, and the
+  scheduler-absent TypeError negative path.
+- [x] Keep JS/VM interaction on the runtime thread boundary; worker
+  tasks may do plain Rust async, but VM/JS interaction hops back
+  onto the scheduler. Three protections in place:
+  (1) the existing compile-fail test
+  `crates/otter-runtime/tests/compile_fail/tokio_spawn_native_ctx_is_not_send.rs`
+  proves `NativeCtx` is `!Send`;
+  (2) Slice D's `crates/otter-runtime/tests/tokio_spawn_audit.rs`
+  enumerates every production-source `tokio::spawn` /
+  `Handle::spawn` site under the active crate stack and pins the
+  allowlist (currently `event_loop.rs`'s host-op + timer
+  callback paths, both `Send + 'static` over owned host data);
+  (3) the new `InboxTimerScheduler` + `SettlePromise` inbox
+  shape both carry only `Send + 'static` payloads
+  (`TimerToken` / `PromiseId` + `HostSettleOutcome`) across the
+  worker → runner boundary.
 
 Acceptance:
 
 - Microtask + timer ordering test fixture passes deterministically.
-- No `tokio::spawn` of work that touches `Interpreter`/`Value`/`Local` outside
-  the runtime scheduler boundary.
+  `crates/otter-runtime/tests/microtask_ordering.rs` — 9/9 pass
+  on a multi-thread Tokio runtime. Zero-delay timer FIFO is
+  guaranteed by routing the `TimerFired` inbox message straight
+  from the VM thread for `setTimeout(0)` (Tokio's multi-thread
+  scheduler does not guarantee FIFO across `sleep(0)` spawns).
+- No `tokio::spawn` of work that touches `Interpreter`/`Value`/`Local`
+  outside the runtime scheduler boundary. Pinned by the audit +
+  compile-fail bound + the `Send`-safe inbox payload shapes.
+
+Cross-thread settlement primitive landed in Slice C:
+
+- `crates/otter-runtime/src/promise_registry.rs` —
+  `PromiseRegistry` (token → handle) + `HostSettleOutcome`
+  (`Send + 'static` payload).
+- `Runtime::register_pending_promise()` allocates a fresh pending
+  promise on the runner thread, registers it, returns the
+  `(PromiseId, Value::Promise)` pair.
+- `Runtime::settle_pending_promise(id, outcome)` and the public
+  `RuntimeHandle::settle_promise(id, outcome, liveness)`
+  cross-thread API both route through the standard promise
+  dispatch path so reactions land on the per-isolate microtask
+  queue.
+- 4 regression tests in
+  `crates/otter-runtime/tests/cross_thread_promise_settlement.rs`
+  pin programmatic resolve / reject / one-shot semantics + the
+  Tokio-worker inbox hop.
+
+Follow-up (out of P2.2 acceptance):
+
+- **Non-literal `import(expr)` — Promise-shaped dispatch landed.**
+  `Op::ImportNamespaceDynamic` now always returns a
+  [`otter_vm::Value::Promise`]; the compiler stopped emitting the
+  follow-up `Op::PromiseFulfilledOf` wrap for the dynamic arm.
+  - Pre-linked specifier (the linker's `module_resolutions` table
+    contains the `(referrer, specifier)` row, e.g. because the
+    same target was also imported statically or as a literal
+    `import("./x")` elsewhere) — settles with the namespace.
+  - Specifier the linker has not seen — rejects with a real
+    `TypeError` instance, catchable from JS with `.catch` /
+    `try { await import(...) } catch`.
+  - Non-string specifier — rejects with `TypeError` per
+    §16.2.1.7 step 7.b.i.
+  Regression coverage: 3 new tests in
+  `crates/otter-runtime/tests/module_dynamic_import_capability.rs`
+  (`dynamic_import_with_variable_specifier_resolves_through_linker_graph`,
+  `dynamic_import_with_unknown_specifier_rejects_with_typeerror`,
+  `dynamic_import_with_non_string_specifier_rejects_with_typeerror`).
+- **On-demand module loading for `import(expr)` — landed.**
+  `Op::ImportNamespaceDynamic` now registers a fresh pending
+  Promise in [`otter_vm::DynamicImportRegistry`] and hands the
+  host-issued token to the installed
+  [`otter_vm::DynamicImportLoader`]. The runtime layer's
+  `InboxDynamicImportLoader` posts a
+  `RuntimeMessage::DynamicImportLoad { token, specifier,
+  referrer }` to the isolate inbox; the runner re-enters
+  `Runtime::complete_dynamic_import` on the next tick which
+  synchronously loads + compiles + links the target through
+  `module_graph::load_program`, allocates envs for any
+  previously-unseen module URLs, dispatches each new fragment's
+  `<module-init>` via `Interpreter::run_callable_sync`, then
+  settles the promise with the target's namespace JsObject
+  (or a `TypeError` rejection on resolve / load / evaluate
+  failure). Transitively-loaded dependencies of the dynamic
+  target are evaluated in linker-topological order; a sentinel
+  `__otter_module_inited__` property on each env de-duplicates
+  inits across overlapping sub-graphs. Regression coverage in
+  `crates/otter-runtime/tests/module_dynamic_import_capability.rs`
+  — `dynamic_import_loads_new_module_on_demand` (brand-new
+  module), `dynamic_import_loads_target_dependencies_transitively`
+  (target with its own static imports),
+  `dynamic_import_returns_cached_namespace_on_repeat` (§16.2.1.7
+  fixed-point semantics).
+
+Closing follow-ups:
+
+- **Original-throw forwarding — landed.**
+  `Interpreter::take_pending_uncaught_throw` exposes the
+  preserved JS throw payload to embedders.
+  `Runtime::load_dynamic_module` now returns a
+  `DynLoadError::{Diagnostic, Thrown}` split: a dynamically-
+  loaded `<module-init>` that throws routes the original
+  abrupt-completion Value (e.g. an `Error` instance with the
+  spec-correct `.message`) into the promise's rejection per
+  §16.2.1.7 step 7.b.i + §27.2.1.7. Regression coverage:
+  `dynamic_import_forwards_original_throw_value_from_module_init`
+  asserts `caught instanceof Error && caught.message === "init-boom"`
+  after `await import("./boom.ts")` where `boom.ts` throws.
+
+Deprioritized (code present, not a P2 priority):
+
+- HTTP/HTTPS dynamic-import fetch is wired
+  (`Runtime::load_dynamic_module_https` + `InboxDynamicImportLoader`),
+  capability gating works, two regression tests pass — but the
+  feature is not on the P2 critical path. The recursive HTTPS
+  loader (modules with own static imports over HTTP), HTTPS
+  source-map propagation, redirect / TLS / cache policy, and any
+  other production-grade fetch concerns are explicitly out of
+  scope until a later priority decision.
 
 ### P2.3 Diagnostics
 

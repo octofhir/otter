@@ -1033,10 +1033,7 @@ fn error_prototype_to_string_is_callable_and_validates_receiver() {
         direct + "|" + callForm + "|" + threw + "|" +
             desc.writable + ":" + desc.enumerable + ":" + desc.configurable;
         "#);
-    assert_eq!(
-        completion,
-        "Error: oops|Custom: boom|true|true:false:true"
-    );
+    assert_eq!(completion, "Error: oops|Custom: boom|true|true:false:true");
 }
 
 /// Regression: §20.5.3.6 — `Error.prototype.{name,message}` and
@@ -1109,10 +1106,7 @@ fn native_error_constructors_are_callable_and_constructible() {
             (b instanceof TypeError) + ":" + (c instanceof RangeError) + ":" +
             (d.name === "SyntaxError");
         "#);
-    assert_eq!(
-        completion,
-        "boom|call form|42||true:true:true:true:true"
-    );
+    assert_eq!(completion, "boom|call form|42||true:true:true:true:true");
 }
 
 /// Regression: §20.5.6 — every native error constructor (`Error`,

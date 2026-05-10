@@ -38,6 +38,9 @@ use crate::event_loop::{
     TimerRequest, TimerToken, TokioEventLoop,
 };
 use crate::{ExecutionResult, OtterError, Runtime, RuntimeConfig, SourceInput};
+use otter_vm::{DynamicImportLoader, TimerScheduler};
+
+use crate::promise_registry::{HostSettleOutcome, PromiseId};
 
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
 
@@ -168,6 +171,17 @@ enum RuntimeMessage {
         token: TimerToken,
         liveness: RuntimeLiveness,
     },
+    SettlePromise {
+        id: PromiseId,
+        outcome: HostSettleOutcome,
+        liveness: RuntimeLiveness,
+    },
+    DynamicImportLoad {
+        token: u64,
+        specifier: String,
+        referrer: String,
+        liveness: RuntimeLiveness,
+    },
     DynamicModuleReady(ModuleJobId),
     Diagnostic(RuntimeDiagnostic),
     Interrupt,
@@ -265,9 +279,20 @@ impl RuntimeHandle {
             shutdown: AtomicBool::new(false),
         });
         let runner_counters = counters.clone();
+        let scheduler_tx = tx.clone();
+        let scheduler_event_loop = event_loop.clone();
         let runner = std::thread::Builder::new()
             .name("otter-isolate".to_string())
-            .spawn(move || run_isolate(config, rx, runner_counters, interrupt_tx))
+            .spawn(move || {
+                run_isolate(
+                    config,
+                    rx,
+                    runner_counters,
+                    interrupt_tx,
+                    scheduler_tx,
+                    scheduler_event_loop,
+                )
+            })
             .map_err(|e| OtterError::Internal {
                 code: "ISOLATE_SPAWN".to_string(),
                 message: e.to_string(),
@@ -423,6 +448,40 @@ impl RuntimeHandle {
             .schedule_timer_callback(request, move |token| {
                 let _ = tx.try_send(RuntimeMessage::TimerFired { token, liveness });
             })
+    }
+
+    /// Settle a JS promise registered earlier via
+    /// [`crate::Runtime::register_pending_promise`]. Posts a
+    /// `SettlePromise` inbox message; the isolate runner picks it
+    /// up on the next tick and resolves / rejects the matching
+    /// [`otter_vm::JsPromiseHandle`] through the standard promise
+    /// dispatch path so reactions land on the per-isolate
+    /// microtask queue.
+    ///
+    /// The call accounts for one referenced host operation so the
+    /// run-until-idle loop keeps the script alive until the
+    /// settlement lands. Embedders that want fire-and-forget
+    /// semantics should pass [`RuntimeLiveness::Unref`].
+    ///
+    /// A late or duplicate settlement (the host raced its own
+    /// cancellation, or the matching script run has already
+    /// returned and dropped its module) is a silent no-op.
+    pub fn settle_promise(
+        &self,
+        id: PromiseId,
+        outcome: HostSettleOutcome,
+        liveness: RuntimeLiveness,
+    ) {
+        increment_liveness(
+            liveness,
+            &self.inner.counters.pending_ref_host_ops,
+            &self.inner.counters.pending_unref_host_ops,
+        );
+        let _ = self.inner.tx.try_send(RuntimeMessage::SettlePromise {
+            id,
+            outcome,
+            liveness,
+        });
     }
 
     /// Cancel a pending timer.
@@ -739,11 +798,26 @@ fn run_isolate(
     rx: Receiver<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
     interrupt_tx: SyncSender<otter_vm::InterruptFlag>,
+    scheduler_tx: SyncSender<RuntimeMessage>,
+    event_loop: TokioEventLoop,
 ) {
-    let runtime = match Runtime::from_config(config) {
+    let mut runtime = match Runtime::from_config(config) {
         Ok(runtime) => runtime,
         Err(_) => return,
     };
+    runtime.install_tokio_handle(event_loop.tokio_handle());
+    let timer_scheduler = Arc::new(InboxTimerScheduler {
+        tx: scheduler_tx.clone(),
+        event_loop,
+        counters: counters.clone(),
+        next_immediate_token: AtomicU64::new(FIRST_IMMEDIATE_TOKEN),
+    });
+    runtime.install_timer_scheduler(timer_scheduler);
+    let dynamic_import_loader = Arc::new(InboxDynamicImportLoader {
+        tx: scheduler_tx,
+        counters: counters.clone(),
+    });
+    runtime.install_dynamic_import_loader(dynamic_import_loader);
     let _ = interrupt_tx.send(runtime.interrupt_handle().raw_flag());
     let mut runner = IsolateRunner {
         runtime,
@@ -752,6 +826,148 @@ fn run_isolate(
         shutdown: false,
     };
     runner.run_until_idle();
+}
+
+/// Timer scheduler installed on the [`crate::Runtime`] inside the
+/// isolate runner thread. Each `setTimeout` / `setInterval` native
+/// call lands here, schedules a Tokio sleep through the event
+/// loop, and posts back a [`RuntimeMessage::TimerFired`] when the
+/// delay elapses so the runner re-enters the VM and runs the JS
+/// callback.
+///
+/// The struct is `Send + Sync` because the
+/// [`otter_vm::TimerSchedulerHandle`] alias requires both. The
+/// fields satisfy that: `SyncSender` and `TokioEventLoop` are
+/// `Clone + Send + Sync`; `RuntimeCounters` is wrapped in `Arc`.
+/// No VM state crosses this boundary — the schedule callback only
+/// ships the host-issued [`TimerToken`] back to the runner, which
+/// is then resolved against the per-isolate
+/// [`otter_vm::TimerCallbacks`] table.
+struct InboxTimerScheduler {
+    tx: SyncSender<RuntimeMessage>,
+    event_loop: TokioEventLoop,
+    counters: Arc<RuntimeCounters>,
+    /// Monotonic counter for zero-delay tokens issued on the VM
+    /// thread. Tokio's multi-thread runtime does not guarantee
+    /// FIFO ordering across `sleep(Duration::ZERO)` spawns, so we
+    /// short-circuit zero-delay timers by posting `TimerFired`
+    /// straight to the inbox (which is FIFO). The counter starts
+    /// at the high half of `u64` to keep these tokens disjoint
+    /// from the Tokio-issued ones.
+    next_immediate_token: AtomicU64,
+}
+
+const FIRST_IMMEDIATE_TOKEN: u64 = 1u64 << 63;
+
+/// Dynamic-import scheduler installed on [`crate::Runtime`] from
+/// inside the isolate runner. The VM-thread opcode hands us a
+/// host-issued token + the resolved specifier; we post a
+/// [`RuntimeMessage::DynamicImportLoad`] inbox message that, on
+/// the next runner tick, drives the synchronous load + compile +
+/// link + evaluate and settles the matching promise.
+///
+/// Both fields are `Send + Sync`: `SyncSender` clones, `Arc`
+/// wraps the counters. The `String` payloads carry no VM state,
+/// matching the Slice C `HostSettleOutcome` discipline.
+struct InboxDynamicImportLoader {
+    tx: SyncSender<RuntimeMessage>,
+    counters: Arc<RuntimeCounters>,
+}
+
+impl DynamicImportLoader for InboxDynamicImportLoader {
+    fn schedule(&self, token: u64, specifier: String, referrer: String) {
+        let liveness = RuntimeLiveness::Ref;
+        increment_liveness(
+            liveness,
+            &self.counters.pending_ref_host_ops,
+            &self.counters.pending_unref_host_ops,
+        );
+        let _ = self.tx.try_send(RuntimeMessage::DynamicImportLoad {
+            token,
+            specifier,
+            referrer,
+            liveness,
+        });
+    }
+}
+
+impl TimerScheduler for InboxTimerScheduler {
+    fn schedule(&self, delay_ms: u64, repeat_ms: Option<u64>) -> u64 {
+        let liveness = RuntimeLiveness::Ref;
+        increment_liveness(
+            liveness,
+            &self.counters.pending_ref_timers,
+            &self.counters.pending_unref_timers,
+        );
+        // Zero-delay one-shot timers route through the inbox
+        // directly so multiple `setTimeout(..., 0)` calls fire in
+        // FIFO scheduling order — Tokio's multi-thread spawn
+        // scheduler does not guarantee that for `sleep(0)`.
+        if delay_ms == 0 && repeat_ms.is_none() {
+            let token = TimerToken(self.next_immediate_token.fetch_add(1, Ordering::Relaxed));
+            let _ = self
+                .tx
+                .try_send(RuntimeMessage::TimerFired { token, liveness });
+            return token.0;
+        }
+        let request = TimerRequest {
+            delay: Duration::from_millis(delay_ms),
+            repeat: repeat_ms.map(Duration::from_millis),
+            liveness,
+            origin: "setTimeout".to_string(),
+        };
+        let tx = self.tx.clone();
+        let token = self
+            .event_loop
+            .schedule_timer_callback(request, move |token| {
+                let _ = tx.try_send(RuntimeMessage::TimerFired { token, liveness });
+            });
+        token.0
+    }
+
+    fn cancel(&self, token: u64) -> bool {
+        // Immediate-token tokens have no Tokio handle to cancel;
+        // the inbox already carries the `TimerFired` message, but
+        // the per-isolate `TimerCallbacks` table was just emptied
+        // by the JS-visible `clearTimeout` so the late fire is a
+        // no-op. Decrement the liveness counter here so the
+        // run-until-idle loop accounts for the cancellation.
+        if token >= FIRST_IMMEDIATE_TOKEN {
+            self.counters
+                .pending_ref_timers
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+                .or_else(|_| {
+                    self.counters.pending_unref_timers.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |v| v.checked_sub(1),
+                    )
+                })
+                .ok();
+            self.counters
+                .cancelled_timers
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        let cancelled = self.event_loop.cancel_timer(TimerToken(token));
+        if cancelled {
+            self.counters
+                .pending_ref_timers
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+                .or_else(|_| {
+                    self.counters.pending_unref_timers.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |v| v.checked_sub(1),
+                    )
+                })
+                .ok();
+            self.counters
+                .cancelled_timers
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cancelled
+    }
 }
 
 struct IsolateRunner {
@@ -856,16 +1072,51 @@ impl IsolateRunner {
                 }
                 TickOutcome::Processed
             }
-            RuntimeMessage::TimerFired {
-                token: _token,
-                liveness,
-            } => {
+            RuntimeMessage::TimerFired { token, liveness } => {
                 decrement_liveness(
                     liveness,
                     &self.counters.pending_ref_timers,
                     &self.counters.pending_unref_timers,
                 );
                 self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
+                // Drive the JS callback associated with `token`
+                // through the runtime. A swallowed `Err` reply path
+                // is intentional: the surrounding command (if any)
+                // already returned its synchronous result, and the
+                // diagnostic runs through the structured sink.
+                let _ = self.runtime.fire_timer(token.0);
+                self.record_microtask_snapshot();
+                TickOutcome::Processed
+            }
+            RuntimeMessage::SettlePromise {
+                id,
+                outcome,
+                liveness,
+            } => {
+                decrement_liveness(
+                    liveness,
+                    &self.counters.pending_ref_host_ops,
+                    &self.counters.pending_unref_host_ops,
+                );
+                let _ = self.runtime.settle_pending_promise(id, outcome);
+                self.record_microtask_snapshot();
+                TickOutcome::Processed
+            }
+            RuntimeMessage::DynamicImportLoad {
+                token,
+                specifier,
+                referrer,
+                liveness,
+            } => {
+                decrement_liveness(
+                    liveness,
+                    &self.counters.pending_ref_host_ops,
+                    &self.counters.pending_unref_host_ops,
+                );
+                let _ = self
+                    .runtime
+                    .complete_dynamic_import(token, &specifier, &referrer);
+                self.record_microtask_snapshot();
                 TickOutcome::Processed
             }
             RuntimeMessage::DynamicModuleReady(_id) => {
@@ -899,10 +1150,13 @@ impl IsolateRunner {
         self.runtime.interrupt_handle().reset();
         match command {
             RuntimeCommand::CheckFile { path, reply, .. } => {
+                // Compile-only, no event loop driving needed.
                 send_check_reply(reply, self.runtime.check_file(path), &self.counters);
             }
             RuntimeCommand::RunFile { path, reply, .. } => {
-                send_run_reply(reply, self.runtime.run_file(path), &self.counters);
+                let result = self.runtime.run_file(path);
+                let result = self.drive_event_loop_to_idle(result);
+                send_run_reply(reply, result, &self.counters);
             }
             RuntimeCommand::RunScript {
                 source,
@@ -910,23 +1164,66 @@ impl IsolateRunner {
                 reply,
                 ..
             } => {
-                send_run_reply(
-                    reply,
-                    self.runtime.run_script(source, &specifier),
-                    &self.counters,
-                );
+                let result = self.runtime.run_script(source, &specifier);
+                let result = self.drive_event_loop_to_idle(result);
+                send_run_reply(reply, result, &self.counters);
             }
             RuntimeCommand::RunModule { path, reply, .. } => {
-                send_run_reply(reply, self.runtime.run_module(path), &self.counters);
+                let result = self.runtime.run_module(path);
+                let result = self.drive_event_loop_to_idle(result);
+                send_run_reply(reply, result, &self.counters);
             }
             RuntimeCommand::Eval { source, reply, .. } => {
-                send_run_reply(reply, self.runtime.eval(source), &self.counters);
+                let result = self.runtime.eval(source);
+                let result = self.drive_event_loop_to_idle(result);
+                send_run_reply(reply, result, &self.counters);
             }
         }
         self.counters
             .running_command
             .store(false, Ordering::Relaxed);
         self.runtime.interrupt_handle().reset();
+    }
+
+    /// Drive the inbox until pending Ref'd timers / host ops drop
+    /// to zero. Mirrors the Node / Deno run-loop semantics: a
+    /// command's reply is held until the event loop is idle so
+    /// `await otter.run_script(\"setTimeout(...)\")` observes the
+    /// timer callback before resolving.
+    ///
+    /// On script error, the loop is short-circuited; pending
+    /// timers are not run because the reply already carries the
+    /// failure. Cancellation of leftover timers happens
+    /// out-of-band when [`crate::Runtime`] drops.
+    fn drive_event_loop_to_idle<T>(
+        &mut self,
+        initial: Result<T, OtterError>,
+    ) -> Result<T, OtterError> {
+        // Clippy `question_mark` suggests `as_ref()?` but the
+        // function returns `Result<T, OtterError>` while `as_ref`
+        // gives `Result<&T, &OtterError>`; rewriting would force
+        // an extra clone path that does not pay back.
+        #[allow(clippy::question_mark)]
+        if initial.is_err() {
+            return initial;
+        }
+        loop {
+            let pending_ref_timers = self.counters.pending_ref_timers.load(Ordering::Relaxed);
+            let pending_ref_host_ops = self.counters.pending_ref_host_ops.load(Ordering::Relaxed);
+            if pending_ref_timers == 0 && pending_ref_host_ops == 0 {
+                return initial;
+            }
+            // Block on the next inbox item — TimerFired /
+            // HostOpCompleted / a follow-up Command. Bailing on
+            // Shutdown short-circuits the loop.
+            let msg = match self.rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => return initial,
+            };
+            if matches!(self.process_message(msg), TickOutcome::Shutdown) {
+                return initial;
+            }
+        }
     }
 
     fn record_microtask_snapshot(&self) {

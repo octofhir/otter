@@ -309,29 +309,26 @@ impl ErrorClassRegistry {
             };
             let string_heap = ctx.interp_mut().string_heap_clone();
             let display = render_error_to_string(&receiver, ctx.heap_mut());
-            let s = JsString::from_str(&display, &string_heap)
-                .map_err(|err| NativeError::TypeError {
+            let s = JsString::from_str(&display, &string_heap).map_err(|err| {
+                NativeError::TypeError {
                     name: "Error.prototype.toString",
                     reason: err.to_string(),
-                })?;
+                }
+            })?;
             Ok(Value::String(s))
         }
         let to_string_native =
-            NativeFunction::new_static(gc_heap, "toString", 0, error_prototype_to_string)
-                .map_err(|_| StringError::OutOfMemory {
+            NativeFunction::new_static(gc_heap, "toString", 0, error_prototype_to_string).map_err(
+                |_| StringError::OutOfMemory {
                     requested_bytes: 0,
                     heap_limit_bytes: 0,
-                })?;
+                },
+            )?;
         let _ = object::define_own_property(
             error_proto,
             gc_heap,
             "toString",
-            PropertyDescriptor::data(
-                Value::NativeFunction(to_string_native),
-                true,
-                false,
-                true,
-            ),
+            PropertyDescriptor::data(Value::NativeFunction(to_string_native), true, false, true),
         );
         // §20.5.3.4 Error.prototype.toString is intercepted by
         // `object_prototype_intercept` in the dispatcher when the
@@ -469,12 +466,11 @@ impl ErrorClassRegistry {
             "constructor",
             PropertyDescriptor::data(Value::Object(error_ctor), true, false, true),
         );
-        let error_call =
-            NativeFunction::new_constructor_static(gc_heap, "Error", 1, ctor_error)
-                .map_err(|_| StringError::OutOfMemory {
-                    requested_bytes: 0,
-                    heap_limit_bytes: 0,
-                })?;
+        let error_call = NativeFunction::new_constructor_static(gc_heap, "Error", 1, ctor_error)
+            .map_err(|_| StringError::OutOfMemory {
+                requested_bytes: 0,
+                heap_limit_bytes: 0,
+            })?;
         object::set_constructor_native(error_ctor, gc_heap, Value::NativeFunction(error_call));
         install_ctor_metadata(error_ctor, "Error", 1, heap, gc_heap)?;
         entries.push((
@@ -539,7 +535,11 @@ impl ErrorClassRegistry {
             );
             // §20.5.7.2 — `AggregateError(errors, message?)` has
             // `length` 2; every other native error has `length` 1.
-            let length = if kind == ErrorKind::AggregateError { 2 } else { 1 };
+            let length = if kind == ErrorKind::AggregateError {
+                2
+            } else {
+                1
+            };
             let dispatcher: crate::native_function::NativeFastFn = match kind {
                 ErrorKind::Error => ctor_error,
                 ErrorKind::TypeError => ctor_type,

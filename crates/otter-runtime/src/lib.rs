@@ -62,6 +62,7 @@ pub mod module_graph;
 pub mod module_loader;
 mod module_records;
 mod package_graph_resolver;
+pub mod promise_registry;
 pub mod structured_clone;
 pub mod surface;
 pub mod worker;
@@ -101,6 +102,7 @@ pub use otter_compiler::{
     CompiledSourceSpan, LiveBindingSlot,
 };
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
+pub use promise_registry::{HostSettleOutcome, PromiseId};
 pub use structured_clone::{
     StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
     StructuredCloneProperty, StructuredCloneTransfer, StructuredCloneTransferId,
@@ -886,6 +888,7 @@ impl RuntimeModuleLoaderState {
         entry_path: &Path,
         hosted_modules: &[HostedModule],
         package_manager: &RuntimePackageManagerHandle,
+        capabilities: &CapabilitySet,
     ) -> module_loader::ModuleLoader {
         let mut cfg = match &self.configured {
             Some(cfg) => cfg.clone(),
@@ -900,6 +903,10 @@ impl RuntimeModuleLoaderState {
         cfg.hosted_specifiers
             .extend(hosted_modules.iter().map(|m| m.specifier().to_string()));
         package_manager.apply_to_loader_config(&mut cfg);
+        // Propagate the runtime's capability state so the loader
+        // can reject `http:` / `https:` specifiers (and future
+        // privileged shapes) without consulting any extra hook.
+        cfg.capabilities = capabilities.clone();
         module_loader::ModuleLoader::with_config(cfg)
     }
 }
@@ -1214,6 +1221,9 @@ impl Runtime {
             source_maps: RuntimeSourceMapTable::default(),
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
+            current_module: None,
+            promise_registry: promise_registry::PromiseRegistry::new(),
+            tokio_handle: None,
         })
     }
 }
@@ -1229,6 +1239,33 @@ pub struct Runtime {
     source_maps: RuntimeSourceMapTable,
     diagnostics: RuntimeDiagnosticsSink,
     package_manager: RuntimePackageManagerHandle,
+    /// Most recently executed bytecode module, retained across the
+    /// run-to-idle event loop so timer / host-op callbacks queued
+    /// during the script can dispatch against the same function
+    /// table after the synchronous run returns.
+    ///
+    /// Cleared at the start of every `run_*` entry point so a
+    /// second `run_script` cannot leak callbacks compiled against
+    /// a stale module.
+    current_module: Option<std::rc::Rc<otter_bytecode::BytecodeModule>>,
+    /// Per-isolate map from runtime-issued `PromiseId` to the
+    /// pending [`otter_vm::JsPromiseHandle`] a host async op is
+    /// expected to settle. Embedders register a fresh promise
+    /// inside a native function (VM thread), then post the
+    /// matching settle outcome through
+    /// [`crate::RuntimeHandle::settle_promise`] (host thread).
+    /// The isolate runner pops the entry on the inbox hop and
+    /// resolves / rejects it through the standard promise
+    /// dispatch path so reactions land on the microtask queue.
+    promise_registry: promise_registry::PromiseRegistry,
+    /// Tokio handle wired by [`crate::handle::run_isolate`] so
+    /// runner-side helpers (HTTPS dynamic-import fetch, future
+    /// `fetch()` global, …) can `block_on` host async work
+    /// without spinning up a fresh runtime per call. `None` for
+    /// Layer-A direct-mode embedders; the dynamic-import fetcher
+    /// reports a clean diagnostic in that case rather than
+    /// crashing.
+    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1262,6 +1299,501 @@ impl Runtime {
         MicrotaskStats {
             pending: queue.has_any_pending(),
             generation: queue.generation(),
+        }
+    }
+
+    /// Install the host-side timer scheduler. The runtime calls
+    /// this once during isolate-runner construction. Direct-mode
+    /// embedders (Layer A `RuntimeBuilder::build`) never call this;
+    /// scripts then receive a TypeError on `setTimeout` /
+    /// `setInterval` instead of silently dropping the callback.
+    pub fn install_timer_scheduler(&mut self, scheduler: otter_vm::TimerSchedulerHandle) {
+        self.interp.set_timer_scheduler(scheduler);
+    }
+
+    /// Install the host-side dynamic-import scheduler. Wired by
+    /// the isolate runner so `Op::ImportNamespaceDynamic` can
+    /// reach the loader through the runtime inbox.
+    pub fn install_dynamic_import_loader(&mut self, loader: otter_vm::DynamicImportLoaderHandle) {
+        self.interp.set_dynamic_import_loader(loader);
+    }
+
+    /// Wire a Tokio runtime handle so runner-side helpers
+    /// (HTTPS dynamic-import fetch, future `fetch()` global, …)
+    /// can `block_on` host async work without spawning a fresh
+    /// runtime per call. The isolate runner sets this from its
+    /// [`crate::event_loop::TokioEventLoop`] at construction time.
+    pub fn install_tokio_handle(&mut self, handle: tokio::runtime::Handle) {
+        self.tokio_handle = Some(handle);
+    }
+
+    /// Synchronously load + compile + link + evaluate the module
+    /// identified by `(specifier, referrer)` and settle the
+    /// dynamic-import promise registered under `token`. Called
+    /// from `IsolateRunner` on the
+    /// [`crate::handle::RuntimeMessage::DynamicImportLoad`] hop.
+    pub fn complete_dynamic_import(
+        &mut self,
+        token: u64,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<bool, OtterError> {
+        let reaction_outcome: Result<otter_vm::Value, otter_vm::Value> =
+            match self.load_dynamic_module(specifier, referrer) {
+                Ok(namespace) => Ok(namespace),
+                Err(DynLoadError::Diagnostic(message)) => {
+                    Err(self.alloc_dynamic_import_error(message)?)
+                }
+                Err(DynLoadError::Thrown(value)) => Err(value),
+            };
+        let settled = self.interp.settle_dynamic_import(token, reaction_outcome);
+        if settled && let Some(module) = self.current_module.clone() {
+            self.interp
+                .drain_microtasks(&module)
+                .map_err(map_vm_error)?;
+        }
+        Ok(settled)
+    }
+
+    fn alloc_dynamic_import_error(
+        &mut self,
+        message: String,
+    ) -> Result<otter_vm::Value, OtterError> {
+        let heap = self.interp.string_heap_clone();
+        let proto = self
+            .interp
+            .error_classes_for_trace()
+            .prototype(otter_vm::ErrorKind::TypeError);
+        let obj = otter_vm::object::alloc_object(self.interp.gc_heap_mut())?;
+        otter_vm::object::set_prototype(obj, self.interp.gc_heap_mut(), Some(proto));
+        let message_str =
+            otter_vm::JsString::from_str(&message, &heap).map_err(|err| OtterError::Internal {
+                code: "STRING_ALLOC".to_string(),
+                message: err.to_string(),
+            })?;
+        otter_vm::object::set(
+            obj,
+            self.interp.gc_heap_mut(),
+            "message",
+            otter_vm::Value::String(message_str),
+        );
+        Ok(otter_vm::Value::Object(obj))
+    }
+
+    fn load_dynamic_module(
+        &mut self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<otter_vm::Value, DynLoadError> {
+        use std::path::PathBuf;
+        let referrer_opt = if referrer.is_empty() {
+            None
+        } else {
+            Some(referrer)
+        };
+        let entry_for_loader: PathBuf = match referrer_opt {
+            Some(url) => url_to_path(url).ok_or_else(|| {
+                DynLoadError::Diagnostic(format!(
+                    "dynamic import: referrer is not a file:// URL: \"{url}\""
+                ))
+            })?,
+            None => std::env::current_dir().map_err(|e| {
+                DynLoadError::Diagnostic(format!("dynamic import: cwd lookup failed: {e}"))
+            })?,
+        };
+        let loader = self.module_loader_for_entry(&entry_for_loader);
+        let target_url = loader.resolve(specifier, referrer_opt).map_err(|e| {
+            DynLoadError::Diagnostic(format!(
+                "dynamic import: cannot resolve \"{specifier}\": {e:?}"
+            ))
+        })?;
+        if let Some(env) = self.interp.module_env(&target_url) {
+            return Ok(otter_vm::Value::Object(env));
+        }
+        // HTTPS / HTTP targets take a separate fetch path because
+        // `module_graph::load_program` only walks file:// URLs.
+        // The capability check has already passed inside
+        // `loader.resolve` so the target host is on the allowlist.
+        if target_url.starts_with("http://") || target_url.starts_with("https://") {
+            return self.load_dynamic_module_https(&target_url);
+        }
+        let target_path: PathBuf = url_to_path(&target_url).ok_or_else(|| {
+            DynLoadError::Diagnostic(format!(
+                "dynamic import: target is not a file:// URL: \"{target_url}\""
+            ))
+        })?;
+        let linked = self
+            .module_graph
+            .load_program(&loader, &target_path)
+            .map_err(|e| {
+                DynLoadError::Diagnostic(format!(
+                    "dynamic import: load failed for \"{target_url}\": {e:?}"
+                ))
+            })?;
+        let module = std::rc::Rc::new(linked.module);
+        for metadata in &linked.metadata {
+            self.source_maps.record_compiled_metadata(metadata);
+        }
+        for init in &module.module_inits {
+            if self.interp.module_env(&init.url).is_some() {
+                continue;
+            }
+            let env = otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
+                DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
+            })?;
+            self.interp
+                .register_module_env(std::rc::Rc::from(init.url.as_str()), env);
+        }
+        let inits: Vec<(String, u32, otter_vm::JsObject)> = module
+            .module_inits
+            .iter()
+            .filter_map(|init| {
+                self.interp
+                    .module_env(&init.url)
+                    .map(|env| (init.url.clone(), init.function_id, env))
+            })
+            .collect();
+        for (url, function_id, env) in inits {
+            if otter_vm_init_marker_set(&self.interp, env) {
+                let _ = url;
+                continue;
+            }
+            otter_vm_init_marker_install(&mut self.interp, env);
+            let import_meta =
+                otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
+                    DynLoadError::Diagnostic(format!(
+                        "dynamic import: alloc import_meta failed: {e}"
+                    ))
+                })?;
+            let callee = otter_vm::Value::Function { function_id };
+            let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
+                otter_vm::Value::Object(env),
+                otter_vm::Value::Object(import_meta),
+            ];
+            if let Err(err) =
+                self.interp
+                    .run_callable_sync(&module, &callee, otter_vm::Value::Undefined, args)
+            {
+                // §16.2.1.7 step 7.b.i — an evaluation throw maps
+                // to a promise rejection. Prefer the original
+                // thrown Value (preserved on
+                // `pending_uncaught_throw` whenever the throw
+                // walked the empty stack inside the dispatch
+                // sub-loop) so `.catch` observes the spec-correct
+                // payload, not a stringified `VmError::Uncaught`
+                // rendering.
+                if matches!(err, otter_vm::VmError::Uncaught { .. })
+                    && let Some(thrown) = self.interp.take_pending_uncaught_throw()
+                {
+                    return Err(DynLoadError::Thrown(thrown));
+                }
+                return Err(DynLoadError::Diagnostic(format!(
+                    "dynamic import: evaluation failed for \"{url}\": {err}"
+                )));
+            }
+        }
+        let namespace = self.interp.module_env(&target_url).ok_or_else(|| {
+            DynLoadError::Diagnostic(format!(
+                "dynamic import: namespace missing after load: \"{target_url}\""
+            ))
+        })?;
+        Ok(otter_vm::Value::Object(namespace))
+    }
+
+    /// Fetch + compile + evaluate an HTTPS module dynamically.
+    ///
+    /// # Algorithm
+    /// 1. `block_on` a `reqwest` GET against the resolved target
+    ///    URL using the runner-installed Tokio handle. The Net
+    ///    capability check has already passed inside
+    ///    `loader.resolve_with_kind`.
+    /// 2. Parse the response body as UTF-8 source text. Compile
+    ///    it as one ES-module fragment via
+    ///    `otter_compiler::compile_module_fragment`. Any own
+    ///    static imports are rejected for this slice — the
+    ///    HTTPS fetcher does not yet recurse into dependencies.
+    ///    Local file imports from an HTTPS module are also
+    ///    rejected for the same reason.
+    /// 3. Wrap the fragment in a one-module `BytecodeModule`
+    ///    suitable for `Interpreter::run_callable_sync`, allocate
+    ///    an env, mark it inited, then dispatch `<module-init>`.
+    /// 4. Settle with the populated env as the namespace.
+    fn load_dynamic_module_https(
+        &mut self,
+        target_url: &str,
+    ) -> Result<otter_vm::Value, DynLoadError> {
+        let handle = self.tokio_handle.clone().ok_or_else(|| {
+            DynLoadError::Diagnostic(
+                "dynamic import: HTTPS fetch requires a runtime-installed Tokio handle".to_string(),
+            )
+        })?;
+        let url = target_url.to_string();
+        let response_text = handle
+            .block_on(async move {
+                let resp = reqwest::Client::new()
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("dynamic import: HTTPS request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!(
+                        "dynamic import: HTTPS status {} for \"{url}\"",
+                        resp.status()
+                    ));
+                }
+                resp.text()
+                    .await
+                    .map_err(|e| format!("dynamic import: HTTPS body read failed: {e}"))
+            })
+            .map_err(DynLoadError::Diagnostic)?;
+        let parsed = otter_syntax::parse(response_text, otter_syntax::SourceKind::JavaScript)
+            .map_err(|e| {
+                DynLoadError::Diagnostic(format!(
+                    "dynamic import: parse failed for \"{target_url}\": {e:?}"
+                ))
+            })?;
+        let host = otter_compiler::ModuleHostInfo {
+            module_url: target_url.to_string(),
+            resolved_imports: std::collections::HashMap::new(),
+        };
+        let fragment = otter_compiler::compile_module_fragment(&parsed, &host).map_err(|e| {
+            DynLoadError::Diagnostic(format!(
+                "dynamic import: compile failed for \"{target_url}\": {e:?}"
+            ))
+        })?;
+        if fragment_has_import_namespace_ops(&fragment) {
+            return Err(DynLoadError::Diagnostic(format!(
+                "dynamic import: HTTPS module \"{target_url}\" has own static imports — not yet supported"
+            )));
+        }
+        let module = std::rc::Rc::new(fragment);
+        let env = otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
+            DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
+        })?;
+        self.interp
+            .register_module_env(std::rc::Rc::from(target_url), env);
+        otter_vm_init_marker_install(&mut self.interp, env);
+        let import_meta =
+            otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
+                DynLoadError::Diagnostic(format!("dynamic import: alloc import_meta failed: {e}"))
+            })?;
+        let callee = otter_vm::Value::Function { function_id: 0 };
+        let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
+            otter_vm::Value::Object(env),
+            otter_vm::Value::Object(import_meta),
+        ];
+        if let Err(err) =
+            self.interp
+                .run_callable_sync(&module, &callee, otter_vm::Value::Undefined, args)
+        {
+            if matches!(err, otter_vm::VmError::Uncaught { .. })
+                && let Some(thrown) = self.interp.take_pending_uncaught_throw()
+            {
+                return Err(DynLoadError::Thrown(thrown));
+            }
+            return Err(DynLoadError::Diagnostic(format!(
+                "dynamic import: HTTPS evaluation failed for \"{target_url}\": {err}"
+            )));
+        }
+        Ok(otter_vm::Value::Object(env))
+    }
+
+    /// Install `value` as a `globalThis.<name>` data property.
+    /// Standard descriptor attributes (`{ writable: true,
+    /// enumerable: false, configurable: true }` per §17 + §19) are
+    /// applied so the binding behaves like every other default
+    /// global. Embedders that need to expose a host-bound JS value
+    /// (e.g. a [`otter_vm::Value::Promise`] returned by
+    /// [`Self::register_pending_promise`]) call this from the
+    /// runner thread before re-entering script execution.
+    pub fn set_global(&mut self, name: &str, value: otter_vm::Value) {
+        self.interp.set_global(name, value);
+    }
+
+    /// `true` when the per-isolate `TimerCallbacks` table has any
+    /// outstanding entries. The isolate runner uses this to decide
+    /// whether the script's run loop needs to keep ticking the
+    /// inbox after the synchronous body returns.
+    #[must_use]
+    pub fn has_pending_timer_callbacks(&self) -> bool {
+        !self.interp.timer_callbacks().is_empty()
+    }
+
+    /// Register a fresh pending JS promise and return the
+    /// `(PromiseId, Value::Promise)` pair. The caller — typically
+    /// a native function exposed to JS — returns the
+    /// [`otter_vm::Value`] to the script and ships the
+    /// [`promise_registry::PromiseId`] over to a host async op.
+    /// Settlement happens later through
+    /// [`Self::settle_pending_promise`] (runner-side) or
+    /// [`crate::RuntimeHandle::settle_promise`] (host-side, posts
+    /// the inbox message).
+    ///
+    /// # Errors
+    /// Returns [`OtterError::OutOfMemory`] when the GC heap cap
+    /// blocks the fresh pure-promise allocation.
+    pub fn register_pending_promise(
+        &mut self,
+    ) -> Result<(promise_registry::PromiseId, otter_vm::Value), OtterError> {
+        let handle =
+            otter_vm::JsPromiseHandle::pending(self.interp.gc_heap_mut()).map_err(|oom| {
+                OtterError::OutOfMemory {
+                    requested_bytes: oom.requested_bytes(),
+                    heap_limit_bytes: oom.heap_limit_bytes(),
+                }
+            })?;
+        let id = self.promise_registry.register(handle);
+        Ok((id, otter_vm::Value::Promise(handle)))
+    }
+
+    /// Settle the promise registered under `id` with `outcome` and
+    /// drain any reactions the settlement enqueued onto the
+    /// per-isolate microtask queue. A late or duplicate settle
+    /// (entry already taken) is a silent no-op so the host can
+    /// race-cancel without observable damage.
+    ///
+    /// # Errors
+    /// Returns the wrapped [`otter_vm::VmError`] when the reaction
+    /// drain reports an unhandled error.
+    pub fn settle_pending_promise(
+        &mut self,
+        id: promise_registry::PromiseId,
+        outcome: promise_registry::HostSettleOutcome,
+    ) -> Result<bool, OtterError> {
+        let handle = match self.promise_registry.take(id) {
+            Some(handle) => handle,
+            None => return Ok(false),
+        };
+        let module = match self.current_module.clone() {
+            Some(m) => m,
+            None => {
+                // No module retained — the script that asked for
+                // this promise has been replaced. Drop quietly.
+                return Ok(false);
+            }
+        };
+        // Convert the owned host payload into a `Value` on the
+        // runner thread. String allocations land against the
+        // per-runtime string heap so the result honours the heap
+        // cap.
+        use promise_registry::HostSettleOutcome;
+        let (jobs, _was_resolve) = match outcome {
+            HostSettleOutcome::ResolveUndefined => (
+                otter_vm::JsPromise::fulfill(
+                    &handle,
+                    self.interp.gc_heap_mut(),
+                    otter_vm::Value::Undefined,
+                ),
+                true,
+            ),
+            HostSettleOutcome::ResolveNull => (
+                otter_vm::JsPromise::fulfill(
+                    &handle,
+                    self.interp.gc_heap_mut(),
+                    otter_vm::Value::Null,
+                ),
+                true,
+            ),
+            HostSettleOutcome::ResolveBoolean(b) => (
+                otter_vm::JsPromise::fulfill(
+                    &handle,
+                    self.interp.gc_heap_mut(),
+                    otter_vm::Value::Boolean(b),
+                ),
+                true,
+            ),
+            HostSettleOutcome::ResolveNumber(n) => (
+                otter_vm::JsPromise::fulfill(
+                    &handle,
+                    self.interp.gc_heap_mut(),
+                    otter_vm::Value::Number(otter_vm::NumberValue::from_f64(n)),
+                ),
+                true,
+            ),
+            HostSettleOutcome::ResolveString(s) => {
+                let str_val = self.alloc_string(&s)?;
+                (
+                    otter_vm::JsPromise::fulfill(
+                        &handle,
+                        self.interp.gc_heap_mut(),
+                        otter_vm::Value::String(str_val),
+                    ),
+                    true,
+                )
+            }
+            HostSettleOutcome::RejectString(s) => {
+                let str_val = self.alloc_string(&s)?;
+                (
+                    otter_vm::JsPromise::reject(
+                        &handle,
+                        self.interp.gc_heap_mut(),
+                        otter_vm::Value::String(str_val),
+                    ),
+                    false,
+                )
+            }
+        };
+        for job in jobs.jobs {
+            self.interp.microtasks_mut().enqueue(job);
+        }
+        self.interp
+            .drain_microtasks(&module)
+            .map_err(map_vm_error)?;
+        Ok(true)
+    }
+
+    fn alloc_string(&mut self, s: &str) -> Result<otter_vm::JsString, OtterError> {
+        let heap = self.interp.string_heap_clone();
+        otter_vm::JsString::from_str(s, &heap).map_err(|err| OtterError::Internal {
+            code: "STRING_ALLOC".to_string(),
+            message: err.to_string(),
+        })
+    }
+
+    /// Fire the timer identified by `token`. Routes through
+    /// the per-isolate `TimerCallbacks` table to recover the JS
+    /// callable + extra arguments + interval flag, invokes the
+    /// callback as a top-level call against the runtime's
+    /// `current_module`, and drains any microtasks the callback
+    /// queued. Returns `Ok(true)` when the entry was known,
+    /// `Ok(false)` when it was already cancelled, and an
+    /// [`OtterError`] when the callback raises an unhandled throw.
+    ///
+    /// One-shot (`setTimeout`) entries are removed from the table
+    /// before invocation so a re-entrant `clearTimeout(token)`
+    /// from inside the callback observes the entry as gone.
+    /// Repeating (`setInterval`) entries stay in the table; the
+    /// host scheduler re-arms them on its own.
+    pub fn fire_timer(&mut self, token: u64) -> Result<bool, OtterError> {
+        let module = match self.current_module.clone() {
+            Some(m) => m,
+            None => {
+                // No module retained — the scripts that scheduled
+                // this timer have all been replaced. Drop the
+                // entry quietly.
+                self.interp.timer_callbacks_mut().remove(token);
+                return Ok(false);
+            }
+        };
+        let entry = match self.interp.timer_callbacks().get(token).cloned() {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
+        if entry.repeat_ms.is_none() {
+            self.interp.timer_callbacks_mut().remove(token);
+        }
+        let task = otter_vm::Microtask {
+            callee: entry.callback,
+            this_value: otter_vm::Value::Undefined,
+            args: entry.extra_args,
+            result_capability: None,
+            kind: otter_vm::MicrotaskKind::Call,
+        };
+        self.interp.microtasks_mut().enqueue(task);
+        let outcome = self.interp.drain_microtasks(&module);
+        match outcome {
+            Ok(()) => Ok(true),
+            Err(err) => Err(map_vm_error(err)),
         }
     }
 
@@ -1358,6 +1890,13 @@ impl Runtime {
         module: BytecodeModule,
         start: std::time::Instant,
     ) -> Result<ExecutionResult, OtterError> {
+        // Retain the module on the runtime so timer / host-op
+        // callbacks queued during execution can dispatch against
+        // its function table after this synchronous run returns.
+        // Cleared at the next `run_*` entry so a fresh script does
+        // not observe stale callbacks.
+        let module = std::rc::Rc::new(module);
+        self.current_module = Some(module.clone());
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
         // drain so any `queueMicrotask` registered during script
@@ -1515,6 +2054,12 @@ impl Runtime {
             });
 
         self.module_records.mark_evaluating();
+        // Retain the linked module on the runtime so timer /
+        // host-op callbacks scheduled during evaluation can
+        // dispatch against the same function table after the
+        // synchronous body returns.
+        let module = std::rc::Rc::new(module);
+        self.current_module = Some(module.clone());
         let script_outcome = self.interp.run(&module);
         let drain_outcome = self.interp.drain_microtasks(&module);
         let value = match (script_outcome, drain_outcome) {
@@ -1537,6 +2082,7 @@ impl Runtime {
             entry_path,
             &self.config.hosted_modules,
             &self.package_manager,
+            &self.config.capabilities,
         )
     }
 
@@ -1998,6 +2544,25 @@ fn source_path_package_type(
 
 pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
     match err {
+        // Capability gating per ENGINE_REFACTOR_EXECUTION_PLAN
+        // §P2.1: surface capability denials with their own error
+        // code so embedders / CLI users can distinguish a missing
+        // permission from a genuinely unresolvable specifier.
+        module_graph::GraphError::Loader(module_loader::LoaderError::CapabilityDenied {
+            specifier,
+            capability,
+            resource,
+        }) => OtterError::Compile {
+            diagnostics: vec![
+                Diagnostic::permission(format!(
+                    "import of `{specifier}` requires capability `{capability}` for `{resource}`"
+                ))
+                .with_code("MODULE_CAPABILITY_DENIED")
+                .with_help(format!(
+                    "grant the matching capability (e.g. --allow-{capability}={resource}) or remove the import"
+                )),
+            ],
+        },
         module_graph::GraphError::Loader(err) => OtterError::Compile {
             diagnostics: vec![
                 Diagnostic::syntax(err.to_string())
@@ -2097,6 +2662,69 @@ pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &
             message: "unknown compiler error variant".to_string(),
         },
     }
+}
+
+/// Convert a `file://` URL back into a filesystem path. Returns
+/// `None` for any other scheme (e.g. `https://`) — dynamic
+/// imports targeting non-`file://` URLs use a separate fetch
+/// path inside [`Runtime::load_dynamic_module`].
+fn url_to_path(url: &str) -> Option<std::path::PathBuf> {
+    let trimmed = url.strip_prefix("file://")?;
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Internal error type for [`Runtime::load_dynamic_module`]. Split
+/// so the surrounding settle path can distinguish:
+///
+/// - [`DynLoadError::Diagnostic`] — host-side resolve / load /
+///   compile / link / alloc failure. The settler synthesises a
+///   fresh `TypeError` from the message.
+/// - [`DynLoadError::Thrown`] — the dynamically-loaded module's
+///   `<module-init>` threw a JS value. The settler uses that
+///   value directly as the promise's rejection reason per
+///   §16.2.1.7 step 7.b.i + §27.2.1.7.
+enum DynLoadError {
+    Diagnostic(String),
+    Thrown(otter_vm::Value),
+}
+
+/// Sentinel property used to flag a `module_env` as already
+/// having had its `<module-init>` body executed. Dynamic imports
+/// load + invoke each new init exactly once; this avoids
+/// re-running an init when the same module shows up in two
+/// dynamically-loaded sub-graphs (the linker generates separate
+/// `<module-init>` instances per LinkedProgram so the runtime
+/// has to dedupe).
+const DYNAMIC_INIT_MARKER: &str = "__otter_module_inited__";
+
+fn otter_vm_init_marker_set(interp: &otter_vm::Interpreter, env: otter_vm::JsObject) -> bool {
+    otter_vm::object::get(env, interp.gc_heap(), DYNAMIC_INIT_MARKER)
+        .is_some_and(|v| matches!(v, otter_vm::Value::Boolean(true)))
+}
+
+fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, env: otter_vm::JsObject) {
+    otter_vm::object::set(
+        env,
+        interp.gc_heap_mut(),
+        DYNAMIC_INIT_MARKER,
+        otter_vm::Value::Boolean(true),
+    );
+}
+
+/// `true` when the bytecode fragment contains any
+/// `Op::ImportNamespace` / `Op::ImportNamespaceDynamic`
+/// instruction. The HTTPS fetcher only handles modules without
+/// own imports for now — modules with imports need a recursive
+/// HTTPS-aware loader pipeline (next slice).
+fn fragment_has_import_namespace_ops(module: &otter_bytecode::BytecodeModule) -> bool {
+    module.functions.iter().any(|f| {
+        f.code.iter().any(|instr| {
+            matches!(
+                instr.op,
+                otter_bytecode::Op::ImportNamespace | otter_bytecode::Op::ImportNamespaceDynamic
+            )
+        })
+    })
 }
 
 fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
@@ -2882,8 +3510,13 @@ mod tests {
             .unwrap();
     }
 
+    /// ECMA-262 §16.2.1 Cyclic Module Records — the loader must
+    /// short-circuit cyclic edges and rely on live-binding
+    /// indirection through `module_env`. Both modules must
+    /// compile and evaluate; spec correctness checks live in
+    /// `tests/module_cycle_and_lifecycle.rs`.
     #[test]
-    fn module_program_detects_cycle() {
+    fn module_program_accepts_cycle_per_spec() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("a.ts"),
@@ -2896,20 +3529,9 @@ mod tests {
         )
         .unwrap();
         let otter = Otter::new();
-        let err = otter
+        otter
             .blocking_run_file(dir.path().join("a.ts"))
-            .unwrap_err();
-        match err {
-            OtterError::Compile { diagnostics } => {
-                assert!(
-                    diagnostics
-                        .iter()
-                        .any(|d| d.message.contains("cycle") || d.message.contains("RangeError")),
-                    "expected cycle diagnostic, got {diagnostics:?}"
-                );
-            }
-            other => panic!("expected Compile (cycle), got {other:?}"),
-        }
+            .expect("two-file cycle must run per §16.2.1");
     }
 
     #[test]

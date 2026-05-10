@@ -275,12 +275,23 @@ fn hosted_module_fragment(url: &str) -> BytecodeModule {
 }
 
 /// Topological sort of `nodes`, post-order DFS rooted at `entry`.
-/// Cycles raise [`GraphError::Cycle`].
 ///
-/// Iterative two-pass DFS to avoid recursion-depth concerns in
-/// the host: each visit-frame on the work stack is `(url,
-/// children_iterator_position)`. When we finish the children we
-/// emit the URL into `order`.
+/// Cyclic edges are short-circuited per ECMA-262
+/// §16.2.1.5 [HostLoadImportedModule] +
+/// §16.2.1.6 [InnerModuleEvaluation]: when the DFS revisits a
+/// module that is still on the in-progress stack, the back-edge
+/// is skipped. Live-binding indirection through `module_env`
+/// then keeps reads of late-bound exports correct at run time —
+/// the skipped module reads observe the partially-populated env
+/// at the moment they execute, exactly as the spec requires.
+///
+/// Iterative two-pass DFS to avoid recursion-depth concerns on
+/// the host: each visit-frame on the work stack is
+/// `(url, next-child-index)`. On finishing all children we emit
+/// the URL into `order`.
+///
+/// [HostLoadImportedModule]: <https://tc39.es/ecma262/#sec-HostLoadImportedModule>
+/// [InnerModuleEvaluation]: <https://tc39.es/ecma262/#sec-InnerModuleEvaluation>
 fn topological_order(
     nodes: &BTreeMap<String, ModuleNode>,
     entry: &str,
@@ -321,12 +332,17 @@ fn topological_order(
         }
         let (_, target) = &node.deps[child_idx];
         match marks.get(target).copied() {
+            // Already emitted — the dependency's <module-init>
+            // runs before the parent's, so nothing to do here.
             Some(Mark::Done) => continue,
-            Some(Mark::InProgress) => {
-                return Err(GraphError::Cycle {
-                    url: target.clone(),
-                });
-            }
+            // Back-edge into a module that is still on the
+            // DFS in-progress stack: the cyclic edge is skipped.
+            // The dependency record is already allocated and its
+            // env is reachable through `Op::ImportNamespace`, so
+            // reads from the parent's body resolve through live-
+            // binding indirection (a not-yet-populated export
+            // simply reads as `undefined`, exactly per spec).
+            Some(Mark::InProgress) => continue,
             None => {
                 marks.insert(target.clone(), Mark::InProgress);
                 stack.push((target.clone(), 0));
@@ -507,14 +523,11 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 
 /// Rewrite per-fragment constant-pool references after the
 /// linker concatenates fragments. Adds `offset` to every
-/// `Operand::ConstIndex` operand that **actually indexes the
-/// constant pool** — `Operand::ConstIndex` is also reused to
-/// carry raw counts (`argc`, `upvalue_count`, `array_length`)
-/// for some opcodes; those slots must NOT be offset.
-///
-/// The per-opcode mapping of which operand positions carry
-/// constant-pool refs vs. counts is encoded in
-/// [`is_const_pool_ref`].
+/// [`Operand::ConstIndex`] operand whose opcode/position pair
+/// actually indexes the constant pool, per
+/// [`Op::is_const_pool_operand`]. Other [`Operand::ConstIndex`]
+/// uses (`argc`, `upvalue_count`, method-id enums, typed-array
+/// kind enums, …) are intentionally left untouched.
 fn rewrite_const_indices(code: &[Instruction], offset: u32) -> Vec<Instruction> {
     code.iter()
         .map(|instr| {
@@ -527,7 +540,7 @@ fn rewrite_const_indices(code: &[Instruction], offset: u32) -> Vec<Instruction> 
                     .iter()
                     .enumerate()
                     .map(|(pos, operand)| match operand {
-                        Operand::ConstIndex(k) if is_const_pool_ref(op, pos) => {
+                        Operand::ConstIndex(k) if op.is_const_pool_operand(pos) => {
                             Operand::ConstIndex(k + offset)
                         }
                         other => other.clone(),
@@ -536,65 +549,6 @@ fn rewrite_const_indices(code: &[Instruction], offset: u32) -> Vec<Instruction> 
             }
         })
         .collect()
-}
-
-/// `true` when operand position `pos` of `op` carries a
-/// constant-pool reference (i.e., should be offset by the linker
-/// during fragment merging). `false` for raw-count uses of
-/// `Operand::ConstIndex` (`argc`, `upvalue_count`, etc.).
-///
-/// Spec mapping: every opcode that emits a `Constant::String`,
-/// `Constant::Number`, `Constant::BigInt`, `Constant::FunctionId`,
-/// `Constant::RegExp` reference goes here. Variadic call shapes
-/// (`Op::Call`, `Op::CallWithThis`, `Op::New`, …) carry their
-/// argc as a count, not an index, so those positions stay
-/// unchanged.
-fn is_const_pool_ref(op: Op, pos: usize) -> bool {
-    match op {
-        // [reg, const] shape
-        Op::LoadString
-        | Op::LoadNumber
-        | Op::LoadBigInt
-        | Op::LoadRegExp
-        | Op::MakeFunction
-        | Op::MathLoad
-        | Op::ImportNamespace
-        | Op::SymbolLoad
-        | Op::TemporalLoad
-        | Op::LoadBuiltinError => pos == 1,
-        // [reg, reg, const] shape
-        Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
-        // [reg, kind_const, reg] shape — name at pos 1 references
-        // the constant pool; the iterable at pos 2 stays raw.
-        Op::NewCollection | Op::NewBuiltinError => pos == 1,
-        // [reg, class_const, reg, reg] shape — class name at pos 1
-        // is a pool ref; locale + options are register operands.
-        Op::NewIntl => pos == 1,
-        // [reg, const, reg] shape
-        Op::StoreProperty => pos == 1,
-        // [reg, function_const, count, parent_idxs...] —
-        // function_const at pos 1; count at pos 2 stays raw.
-        Op::MakeClosure => pos == 1,
-        // [reg, name_const, argc, args...] — name at pos 1;
-        // argc at pos 2 stays raw.
-        Op::MathCall
-        | Op::JsonCall
-        | Op::PromiseCall
-        | Op::SymbolCall
-        | Op::ObjectCall
-        | Op::GlobalCall
-        | Op::BigIntCall
-        | Op::DateCall
-        | Op::StringCall => pos == 1,
-        // `TemporalCall` is `dst, class_const, method_const, argc`
-        // — both class and method positions are pool refs.
-        Op::TemporalCall => pos == 1 || pos == 2,
-        // [reg, recv, name_const, argc, args...] — name at pos 2;
-        // argc at pos 3 stays raw.
-        Op::CallMethodValue => pos == 2,
-        // No constant-pool refs in any other operand position.
-        _ => false,
-    }
 }
 
 /// One assembled `<entry>` body.

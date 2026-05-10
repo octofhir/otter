@@ -33,6 +33,7 @@
 
 use crate::array::JsArray;
 use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet};
+use crate::dynamic_import::DynamicImportRegistry;
 use crate::error_classes::ErrorClassRegistry;
 use crate::generator::JsGenerator;
 use crate::microtask::{Microtask, MicrotaskQueue};
@@ -41,6 +42,7 @@ use crate::object::JsObject;
 use crate::promise::{JsPromiseHandle, PurePromise};
 use crate::regexp::JsRegExp;
 use crate::symbol::{JsSymbol, SymbolRegistry, WellKnownSymbols};
+use crate::timers::TimerCallbacks;
 use crate::weak_refs::{JsFinalizationRegistry, JsWeakRef};
 use crate::{AsyncFrameState, BoundFunction, Frame, IteratorState};
 use otter_gc::raw::RawGc;
@@ -238,6 +240,23 @@ impl GcTrace for Microtask {
 
 impl GcTrace for MicrotaskQueue {
     /// Trace every queued microtask payload.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_gc_slots(visitor);
+    }
+}
+
+impl GcTrace for TimerCallbacks {
+    /// Trace every registered timer-callback payload so the JS
+    /// callback + extra arguments survive any GC that occurs
+    /// between scheduling and firing.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_gc_slots(visitor);
+    }
+}
+
+impl GcTrace for DynamicImportRegistry {
+    /// Trace every pending dynamic-import promise so it survives
+    /// any GC between scheduling and settlement.
     fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
         self.trace_gc_slots(visitor);
     }

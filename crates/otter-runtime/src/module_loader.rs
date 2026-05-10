@@ -35,6 +35,7 @@ use otter_syntax::SourceKind;
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 
 use crate::package_graph_resolver;
+use crate::{CapabilitySet, Permission};
 
 /// Which resolver flavour to use when consulting
 /// [`oxc_resolver`] for a bare specifier. ESM is the default;
@@ -78,6 +79,29 @@ fn referrer_file(referrer: Option<&str>) -> Option<PathBuf> {
     referrer
         .and_then(|r| r.strip_prefix("file://"))
         .map(PathBuf::from)
+}
+
+/// Extract the `host[:port]` portion of an `http://` / `https://`
+/// specifier. Returns `None` when the specifier is not an HTTP
+/// URL or when the URL is too malformed to identify a host
+/// (capability gating fails closed in that case via
+/// `LoaderError::UnsupportedSpecifier`).
+fn http_specifier_host(specifier: &str) -> Option<String> {
+    let after_scheme = specifier
+        .strip_prefix("https://")
+        .or_else(|| specifier.strip_prefix("http://"))?;
+    // Trim the path / query / fragment so the host pattern only
+    // sees authority data, matching the `host[:port]` shape
+    // documented for `Permission<String>` net patterns.
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let host = &after_scheme[..end];
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 /// One resolved + loaded module.
@@ -317,6 +341,21 @@ pub enum LoaderError {
         /// Offending extension.
         extension: String,
     },
+    /// The runtime denied the matching capability for this
+    /// specifier. Currently surfaced for `http:` / `https:`
+    /// specifiers without [`crate::RuntimeCapability::Net`]; per
+    /// ENGINE_REFACTOR_EXECUTION_PLAN §P2.1, every privileged
+    /// remote / dynamic import requires an explicit capability.
+    #[error("capability `{capability}` denied for `{specifier}`")]
+    CapabilityDenied {
+        /// Raw specifier the importer requested.
+        specifier: String,
+        /// Capability name (matches the CLI flag, e.g. `net`).
+        capability: String,
+        /// Concrete resource the runtime checked against (e.g.
+        /// the host portion of an HTTPS URL).
+        resource: String,
+    },
 }
 
 /// Configuration for [`ModuleLoader`]. Mirrors the subset of
@@ -354,6 +393,14 @@ pub struct LoaderConfig {
     pub hosted_specifiers: Vec<String>,
     /// Optional read-only installed package graph.
     pub package_graph: Option<LoaderPackageGraph>,
+    /// Capability state used to gate privileged specifier shapes
+    /// at resolve time. `http:` / `https:` specifiers consult
+    /// `capabilities.net`; future remote-package work will
+    /// route the same hook for registry fetches. Defaults to
+    /// the sandboxed [`CapabilitySet`] (deny-by-default) so
+    /// embedders that forget to wire capabilities don't
+    /// accidentally enable network module loading.
+    pub capabilities: CapabilitySet,
 }
 
 impl LoaderConfig {
@@ -383,6 +430,7 @@ impl LoaderConfig {
             enable_node_modules: true,
             hosted_specifiers: Vec::new(),
             package_graph: None,
+            capabilities: CapabilitySet::sandbox(),
         }
     }
 }
@@ -541,6 +589,29 @@ impl ModuleLoader {
             return Err(LoaderError::UnsupportedSpecifier {
                 specifier: specifier.to_string(),
             });
+        }
+        // §16.2.1.5 HostLoadImportedModule — the host owns the
+        // gating decision for privileged specifier shapes.
+        // `http:` / `https:` modules require `Net` per
+        // ENGINE_REFACTOR_EXECUTION_PLAN §P2.1; the loader
+        // surfaces a clean capability denial before any network
+        // I/O happens.
+        if let Some(host) = http_specifier_host(specifier) {
+            if !matches!(self.config.capabilities.net, Permission::AllowAll)
+                && !self.config.capabilities.net.matches(&host)
+            {
+                return Err(LoaderError::CapabilityDenied {
+                    specifier: specifier.to_string(),
+                    capability: "net".to_string(),
+                    resource: host,
+                });
+            }
+            // Capability granted: the resolver returns the URL
+            // as-is. Static-graph callers (the linker) still cannot
+            // fetch over HTTPS, but the dynamic-import path
+            // (`Runtime::load_dynamic_module_https`) handles it on
+            // the isolate-runner thread via the wired Tokio handle.
+            return Ok(specifier.to_string());
         }
         if let Some(rest) = specifier.strip_prefix("file://") {
             let path = canonicalise(Path::new(rest)).map_err(|e| LoaderError::Resolve {

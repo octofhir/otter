@@ -184,6 +184,16 @@ impl TokioEventLoop {
         }
     }
 
+    /// Return the underlying Tokio runtime handle. Used by the
+    /// isolate runner to wire `Runtime::install_tokio_handle` so
+    /// runner-side helpers (HTTPS dynamic-import fetch, future
+    /// `fetch()` global, …) can `block_on` host async work
+    /// without spinning up a fresh runtime per call.
+    #[must_use]
+    pub fn tokio_handle(&self) -> tokio::runtime::Handle {
+        self.handle.clone()
+    }
+
     /// Block on a future using the backing Tokio runtime.
     ///
     /// This is intended for CLI and non-async embedders. Async callers

@@ -36,8 +36,7 @@ fn run(source: &str) -> String {
 /// time.
 #[test]
 fn global_this_default_snapshot() {
-    let dump = run(
-        r#"
+    let dump = run(r#"
         const ownStrings = Object.getOwnPropertyNames(globalThis).sort();
         const lines = ownStrings.map(name => {
             const d = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -50,8 +49,7 @@ fn global_this_default_snapshot() {
             return name + " " + writable + enumerable + configurable + " " + kind;
         });
         lines.join("\n");
-        "#,
-    );
+        "#);
     // Snapshot of current realm. Drift discussion:
     //
     // - Every default global is `{ writable: true, enumerable: false,
@@ -115,12 +113,13 @@ Uint8ClampedArray w.c object
 WeakMap w.c object
 WeakRef w.c object
 WeakSet w.c object
+clearInterval w.c function
+clearTimeout w.c function
 console w.c object
-globalThis wec object";
-    assert_eq!(
-        dump, expected,
-        "default globalThis own properties drifted"
-    );
+globalThis wec object
+setInterval w.c function
+setTimeout w.c function";
+    assert_eq!(dump, expected, "default globalThis own properties drifted");
 }
 
 /// Pin every realm constructor's `[[Prototype]]` identity and
@@ -128,8 +127,7 @@ globalThis wec object";
 /// installer don't silently change the inheritance chain.
 #[test]
 fn global_constructor_prototype_identity() {
-    let dump = run(
-        r#"
+    let dump = run(r#"
         function probe(name) {
             const ctor = globalThis[name];
             if (typeof ctor !== "function" && typeof ctor !== "object") return name + " missing";
@@ -147,8 +145,7 @@ fn global_constructor_prototype_identity() {
             "ReferenceError", "URIError", "EvalError", "AggregateError",
         ];
         ctors.map(probe).join("\n");
-        "#,
-    );
+        "#);
     let expected = "\
 Object ctor=>FP proto.proto=>null
 Function ctor=>FP proto.proto=>OP
@@ -164,8 +161,5 @@ ReferenceError ctor=>Error proto.proto=>EP
 URIError ctor=>Error proto.proto=>EP
 EvalError ctor=>Error proto.proto=>EP
 AggregateError ctor=>Error proto.proto=>EP";
-    assert_eq!(
-        dump, expected,
-        "constructor prototype identity drifted"
-    );
+    assert_eq!(dump, expected, "constructor prototype identity drifted");
 }

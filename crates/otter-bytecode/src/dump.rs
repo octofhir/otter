@@ -56,19 +56,7 @@ mod tests {
             functions: vec![Function {
                 id: 0,
                 name: "<main>".to_string(),
-                span: (0, 0),
-                locals: 0,
                 scratch: 1,
-                param_count: 0,
-                own_upvalue_count: 0,
-                is_arrow: false,
-                has_rest: false,
-                is_async: false,
-                is_generator: false,
-                is_async_generator: false,
-                is_module: false,
-                needs_arguments: false,
-                module_url: String::new(),
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::Return,
@@ -78,6 +66,7 @@ mod tests {
                     pc: 0,
                     span: (0, 0),
                 }],
+                ..Function::default()
             }],
             constants: vec![],
             module_resolutions: Vec::new(),

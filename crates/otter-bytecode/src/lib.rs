@@ -1271,6 +1271,91 @@ impl Op {
         }
     }
 
+    /// Whether `operands[pos]` of this opcode is a reference into
+    /// [`BytecodeModule::constants`] (vs. a raw count, immediate, or
+    /// method-id value that happens to be encoded as
+    /// [`Operand::ConstIndex`]).
+    ///
+    /// The module-graph linker uses this to decide which operand
+    /// slots to offset when concatenating per-fragment constant
+    /// pools into the unified [`BytecodeModule`]. Mis-classifying a
+    /// raw count / method-id slot here corrupts the merged program
+    /// (the `Math.abs` opcode, for example, would silently dispatch
+    /// against a different `MathMethod` after fragment merge).
+    ///
+    /// # Operand-kind summary
+    /// - **Pool ref** (this method returns `true`): the runtime
+    ///   resolves the operand via
+    ///   [`BytecodeModule::constants`]`[idx]` to a string, number,
+    ///   bigint, regexp, or function-id constant.
+    /// - **Raw count / immediate** (returns `false`): the operand
+    ///   carries `argc`, `upvalue_count`, a method-id enum
+    ///   (`MathMethod`, `JsonMethod`, `ObjectMethod`, …), or a
+    ///   typed-array kind enum. The linker must leave these
+    ///   unchanged.
+    ///
+    /// # See also
+    /// - [`crate::Operand::ConstIndex`]
+    /// - [`Op::operand_count`]
+    #[must_use]
+    pub const fn is_const_pool_operand(self, pos: usize) -> bool {
+        match self {
+            // [reg, const]
+            Op::LoadString
+            | Op::LoadNumber
+            | Op::LoadBigInt
+            | Op::LoadRegExp
+            | Op::MakeFunction
+            | Op::MathLoad
+            | Op::ImportNamespace
+            | Op::SymbolLoad
+            | Op::TemporalLoad
+            | Op::LoadBuiltinError
+            | Op::LoadGlobalOrThrow
+            | Op::LoadGlobalOrUndefined => pos == 1,
+            // [reg, reg, const]
+            Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
+            // [reg, kind_const, reg]
+            Op::NewCollection | Op::NewBuiltinError => pos == 1,
+            // [reg, class_const, reg, reg]
+            Op::NewIntl => pos == 1,
+            // [reg, name_const, src_reg, scratch_dst]
+            Op::StoreProperty => pos == 1,
+            // [reg, function_const, count, parent_idxs...]
+            Op::MakeClosure => pos == 1,
+            // [reg, recv, name_const, argc, args...]
+            Op::CallMethodValue => pos == 2,
+            // Variadic *Call shapes whose pos=1 is a method-id enum
+            // (`MathMethod::from_u32`, `JsonMethod::from_u32`, …),
+            // **not** a constant-pool reference. The linker must NOT
+            // offset these slots — doing so silently rebinds the
+            // call to a different builtin method after merge.
+            Op::MathCall
+            | Op::JsonCall
+            | Op::PromiseCall
+            | Op::SymbolCall
+            | Op::ObjectCall
+            | Op::GlobalCall
+            | Op::BigIntCall
+            | Op::DateCall
+            | Op::StringCall
+            | Op::ArrayBufferCall
+            | Op::DataViewCall
+            | Op::IteratorCall
+            | Op::SharedArrayBufferCall
+            | Op::AtomicsCall
+            | Op::ProxyCall
+            | Op::ReflectCall => false,
+            // `dst, kind_id, method_id, argc` — both kind_id and
+            // method_id are raw enum values, not pool refs.
+            Op::TypedArrayCall => false,
+            // `dst, class_id, method_id, argc` — both raw.
+            Op::TemporalCall => false,
+            // No constant-pool refs in any other operand position.
+            _ => false,
+        }
+    }
+
     /// Whether the opcode performs a control-flow transfer. The
     /// dispatcher uses this to advance `pc` by 1 only for non-jump
     /// opcodes; jumps mutate `pc` themselves (and the back-edge

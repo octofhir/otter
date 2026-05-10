@@ -77,6 +77,24 @@ impl Diagnostic {
         }
     }
 
+    /// Construct a capability-denied diagnostic. Used when a host
+    /// resource (network, filesystem, env, …) was requested
+    /// without the matching capability granted.
+    #[must_use]
+    pub fn permission(message: impl Into<String>) -> Self {
+        Self {
+            kind: DiagnosticKind::Capability,
+            code: "CAPABILITY_DENIED".to_string(),
+            message: message.into(),
+            source_url: None,
+            range: None,
+            span: None,
+            help: None,
+            frames: Vec::new(),
+            cause: None,
+        }
+    }
+
     /// Construct a generic "feature not in this slice" diagnostic.
     #[must_use]
     pub fn unsupported(message: impl Into<String>, span: (u32, u32)) -> Self {

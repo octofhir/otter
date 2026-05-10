@@ -637,14 +637,11 @@ impl NativeFunction {
     /// dispatches straight to OrdinaryHasInstance instead of pushing
     /// an extra frame.
     #[must_use]
-    pub fn is_vm_intrinsic(
-        &self,
-        heap: &otter_gc::GcHeap,
-        intrinsic: VmIntrinsicFunction,
-    ) -> bool {
-        heap.read_payload(self.inner, |body| {
-            matches!(body.call, NativeCallStorage::VmIntrinsic(i) if i == intrinsic)
-        })
+    pub fn is_vm_intrinsic(&self, heap: &otter_gc::GcHeap, intrinsic: VmIntrinsicFunction) -> bool {
+        heap.read_payload(
+            self.inner,
+            |body| matches!(body.call, NativeCallStorage::VmIntrinsic(i) if i == intrinsic),
+        )
     }
 
     /// Trace this handle as a root slot.

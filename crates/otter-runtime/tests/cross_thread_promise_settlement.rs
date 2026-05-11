@@ -81,16 +81,6 @@ fn build_runtime_with_helper() -> (Runtime, Arc<LogCapture>) {
 fn programmatic_settle_resolves_pending_promise_with_string() {
     let (mut runtime, capture) = build_runtime_with_helper();
 
-    // Need a `current_module` to drain microtasks against, so run
-    // a no-op script first. This installs the bytecode module the
-    // settle path uses.
-    runtime
-        .run_script(
-            SourceInput::from_javascript("globalThis.__seen = null;"),
-            "<seed>",
-        )
-        .expect("seed script");
-
     let (id, promise_value) = runtime
         .register_pending_promise()
         .expect("register pending promise");
@@ -127,12 +117,6 @@ fn programmatic_settle_resolves_pending_promise_with_string() {
 #[test]
 fn programmatic_settle_is_one_shot_per_id() {
     let (mut runtime, capture) = build_runtime_with_helper();
-    runtime
-        .run_script(
-            SourceInput::from_javascript("globalThis.__seen = null;"),
-            "<seed>",
-        )
-        .expect("seed");
 
     let (id, promise_value) = runtime
         .register_pending_promise()
@@ -169,12 +153,6 @@ fn programmatic_settle_is_one_shot_per_id() {
 #[test]
 fn programmatic_reject_string_routes_into_catch_handler() {
     let (mut runtime, capture) = build_runtime_with_helper();
-    runtime
-        .run_script(
-            SourceInput::from_javascript("globalThis.__seen = null;"),
-            "<seed>",
-        )
-        .expect("seed");
 
     let (id, promise_value) = runtime
         .register_pending_promise()

@@ -1868,6 +1868,7 @@ dependencies = [
  "otter-bytecode",
  "otter-compiler",
  "otter-gc",
+ "otter-pm-manifest",
  "otter-syntax",
  "otter-vm",
  "oxc_allocator",

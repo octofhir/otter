@@ -25,15 +25,17 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Future shape accepted by [`EventLoop::spawn_host_op`].
 pub type HostFuture = Pin<Box<dyn Future<Output = HostOpCompletion> + Send + 'static>>;
+
+/// Callback invoked every time a timer fires.
+pub type TimerCallback = Arc<dyn Fn(TimerToken) + Send + Sync + 'static>;
 
 /// Liveness bit for runtime work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +108,7 @@ pub trait EventLoop: Send + Sync + 'static {
     fn spawn_host_op(&self, op: HostFuture) -> HostJoinHandle;
 
     /// Schedule a timer and return its token.
-    fn schedule_timer(&self, request: TimerRequest) -> TimerToken;
+    fn schedule_timer(&self, request: TimerRequest, on_fire: TimerCallback) -> TimerToken;
 
     /// Cancel a scheduled timer.
     fn cancel_timer(&self, token: TimerToken) -> bool;
@@ -214,19 +216,46 @@ impl TokioEventLoop {
     #[must_use]
     pub fn schedule_timer_callback<F>(&self, request: TimerRequest, on_fire: F) -> TimerToken
     where
-        F: FnOnce(TimerToken) + Send + 'static,
+        F: Fn(TimerToken) + Send + Sync + 'static,
     {
+        self.schedule_timer_task(request, Arc::new(on_fire))
+    }
+
+    fn schedule_timer_task(&self, request: TimerRequest, on_fire: TimerCallback) -> TimerToken {
         let token = TimerToken(self.next_timer.fetch_add(1, Ordering::Relaxed));
         let timers = self.timers.clone();
         let delay = request.delay;
+        let repeat = request
+            .repeat
+            .map(|period| period.max(Duration::from_millis(1)));
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
         let join = self.handle.spawn(async move {
-            tokio::time::sleep(delay).await;
-            timers.lock().await.remove(&token);
-            on_fire(token);
+            if start_rx.await.is_err() {
+                return;
+            }
+            match repeat {
+                Some(period) => {
+                    tokio::time::sleep(delay).await;
+                    loop {
+                        on_fire(token);
+                        tokio::time::sleep(period).await;
+                    }
+                }
+                None => {
+                    tokio::time::sleep(delay).await;
+                    timers
+                        .lock()
+                        .expect("timer registry poisoned")
+                        .remove(&token);
+                    on_fire(token);
+                }
+            }
         });
-        if let Ok(mut timers) = self.timers.try_lock() {
-            timers.insert(token, join);
-        }
+        self.timers
+            .lock()
+            .expect("timer registry poisoned")
+            .insert(token, join);
+        let _ = start_tx.send(());
         token
     }
 }
@@ -240,16 +269,16 @@ impl EventLoop for TokioEventLoop {
         HostJoinHandle { abort }
     }
 
-    fn schedule_timer(&self, request: TimerRequest) -> TimerToken {
-        self.schedule_timer_callback(request, |_| {})
+    fn schedule_timer(&self, request: TimerRequest, on_fire: TimerCallback) -> TimerToken {
+        self.schedule_timer_task(request, on_fire)
     }
 
     fn cancel_timer(&self, token: TimerToken) -> bool {
         let removed = self
             .timers
-            .try_lock()
-            .ok()
-            .and_then(|mut timers| timers.remove(&token));
+            .lock()
+            .expect("timer registry poisoned")
+            .remove(&token);
         let Some(join) = removed else {
             return false;
         };

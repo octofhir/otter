@@ -37,7 +37,10 @@ use crate::event_loop::{
     EventLoop, HostFuture, HostJoinHandle, HostOpCompletion, RuntimeLiveness, RuntimeWake,
     TimerRequest, TimerToken, TokioEventLoop,
 };
-use crate::{ExecutionResult, OtterError, Runtime, RuntimeConfig, SourceInput};
+use crate::{
+    DiagnosticCode, ExecutionResult, OtterError, Runtime, RuntimeConfig, SourceInput,
+    TimerFireOutcome,
+};
 use otter_vm::{DynamicImportLoader, TimerScheduler};
 
 use crate::promise_registry::{HostSettleOutcome, PromiseId};
@@ -170,6 +173,7 @@ enum RuntimeMessage {
     TimerFired {
         token: TimerToken,
         liveness: RuntimeLiveness,
+        expects_js_callback: bool,
     },
     SettlePromise {
         id: PromiseId,
@@ -244,7 +248,7 @@ impl RuntimeHandle {
         Runtime::validate_config(&config)?;
         let command_timeout = config.timeout();
         let event_loop = TokioEventLoop::current_or_owned().map_err(|e| OtterError::Internal {
-            code: "TOKIO_RUNTIME_CREATE".to_string(),
+            code: DiagnosticCode::TokioRuntimeCreate.as_str().to_string(),
             message: e.to_string(),
         })?;
         let (tx, rx) = sync_channel(capacity);
@@ -294,11 +298,11 @@ impl RuntimeHandle {
                 )
             })
             .map_err(|e| OtterError::Internal {
-                code: "ISOLATE_SPAWN".to_string(),
+                code: DiagnosticCode::IsolateSpawn.as_str().to_string(),
                 message: e.to_string(),
             })?;
         let interrupt = interrupt_rx.recv().map_err(|_| OtterError::Internal {
-            code: "ISOLATE_START".to_string(),
+            code: DiagnosticCode::IsolateStart.as_str().to_string(),
             message: "runtime isolate stopped before exposing its interrupt handle".to_string(),
         })?;
         let inner = Arc::new(RuntimeHandleInner {
@@ -422,13 +426,24 @@ impl RuntimeHandle {
             &self.inner.counters.pending_unref_host_ops,
         );
         let tx = self.inner.tx.clone();
+        let counters = self.inner.counters.clone();
         self.inner.event_loop.spawn_host_op(Box::pin(async move {
             let mut completion = op.await;
             completion.id = op_id.0;
-            let _ = tx.try_send(RuntimeMessage::HostOpCompleted {
-                completion: completion.clone(),
-                liveness,
-            });
+            if tx
+                .try_send(RuntimeMessage::HostOpCompleted {
+                    completion: completion.clone(),
+                    liveness,
+                })
+                .is_err()
+            {
+                decrement_liveness(
+                    liveness,
+                    &counters.pending_ref_host_ops,
+                    &counters.pending_unref_host_ops,
+                );
+                counters.failed_host_ops.fetch_add(1, Ordering::Relaxed);
+            }
             completion
         }))
     }
@@ -442,11 +457,28 @@ impl RuntimeHandle {
             &self.inner.counters.pending_unref_timers,
         );
         let tx = self.inner.tx.clone();
+        let counters = self.inner.counters.clone();
         let liveness = request.liveness;
+        let repeat = request.repeat.is_some();
         self.inner
             .event_loop
             .schedule_timer_callback(request, move |token| {
-                let _ = tx.try_send(RuntimeMessage::TimerFired { token, liveness });
+                if tx
+                    .try_send(RuntimeMessage::TimerFired {
+                        token,
+                        liveness,
+                        expects_js_callback: false,
+                    })
+                    .is_err()
+                    && !repeat
+                {
+                    decrement_liveness(
+                        liveness,
+                        &counters.pending_ref_timers,
+                        &counters.pending_unref_timers,
+                    );
+                    counters.cancelled_timers.fetch_add(1, Ordering::Relaxed);
+                }
             })
     }
 
@@ -477,11 +509,26 @@ impl RuntimeHandle {
             &self.inner.counters.pending_ref_host_ops,
             &self.inner.counters.pending_unref_host_ops,
         );
-        let _ = self.inner.tx.try_send(RuntimeMessage::SettlePromise {
-            id,
-            outcome,
-            liveness,
-        });
+        if self
+            .inner
+            .tx
+            .try_send(RuntimeMessage::SettlePromise {
+                id,
+                outcome,
+                liveness,
+            })
+            .is_err()
+        {
+            decrement_liveness(
+                liveness,
+                &self.inner.counters.pending_ref_host_ops,
+                &self.inner.counters.pending_unref_host_ops,
+            );
+            self.inner
+                .counters
+                .failed_host_ops
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Cancel a pending timer.
@@ -518,16 +565,23 @@ impl RuntimeHandle {
             .counters
             .pending_dynamic_module_jobs
             .fetch_add(1, Ordering::Relaxed);
-        let id = ModuleJobId(
-            self.inner
-                .counters
-                .next_module_job_id
-                .fetch_add(1, Ordering::Relaxed),
-        );
-        let _ = self
+        if self
             .inner
             .tx
-            .try_send(RuntimeMessage::DynamicModuleReady(id));
+            .try_send(RuntimeMessage::DynamicModuleReady(ModuleJobId(
+                self.inner
+                    .counters
+                    .next_module_job_id
+                    .fetch_add(1, Ordering::Relaxed),
+            )))
+            .is_err()
+        {
+            self.inner
+                .counters
+                .pending_dynamic_module_jobs
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+                .ok();
+        }
     }
 
     /// Emit a diagnostic wake through the event-loop abstraction.
@@ -657,7 +711,7 @@ impl RuntimeHandle {
     fn submit(&self, msg: RuntimeMessage) -> Result<(), OtterError> {
         if self.inner.counters.shutdown.load(Ordering::Relaxed) {
             return Err(OtterError::Internal {
-                code: "RUNTIME_SHUTDOWN".to_string(),
+                code: DiagnosticCode::RuntimeShutdown.as_str().to_string(),
                 message: "runtime handle is shut down".to_string(),
             });
         }
@@ -679,12 +733,12 @@ impl RuntimeHandle {
                     .backpressure_rejections
                     .fetch_add(1, Ordering::Relaxed);
                 Err(OtterError::Internal {
-                    code: "RUNTIME_BACKPRESSURE".to_string(),
+                    code: DiagnosticCode::RuntimeBackpressure.as_str().to_string(),
                     message: "runtime command queue is full".to_string(),
                 })
             }
             Err(TrySendError::Disconnected(_)) => Err(OtterError::Internal {
-                code: "RUNTIME_CLOSED".to_string(),
+                code: DiagnosticCode::RuntimeClosed.as_str().to_string(),
                 message: "runtime isolate has stopped".to_string(),
             }),
         }
@@ -730,7 +784,7 @@ impl RuntimeHandle {
                 Err(err)
             }
             Err(_) => Err(OtterError::Internal {
-                code: "RUNTIME_REPLY_DROPPED".to_string(),
+                code: DiagnosticCode::RuntimeReplyDropped.as_str().to_string(),
                 message: "runtime isolate dropped command reply".to_string(),
             }),
         }
@@ -776,7 +830,7 @@ impl RuntimeHandle {
                 Err(err)
             }
             Err(_) => Err(OtterError::Internal {
-                code: "RUNTIME_REPLY_DROPPED".to_string(),
+                code: DiagnosticCode::RuntimeReplyDropped.as_str().to_string(),
                 message: "runtime isolate dropped command reply".to_string(),
             }),
         }
@@ -882,12 +936,25 @@ impl DynamicImportLoader for InboxDynamicImportLoader {
             &self.counters.pending_ref_host_ops,
             &self.counters.pending_unref_host_ops,
         );
-        let _ = self.tx.try_send(RuntimeMessage::DynamicImportLoad {
-            token,
-            specifier,
-            referrer,
-            liveness,
-        });
+        if self
+            .tx
+            .try_send(RuntimeMessage::DynamicImportLoad {
+                token,
+                specifier,
+                referrer,
+                liveness,
+            })
+            .is_err()
+        {
+            decrement_liveness(
+                liveness,
+                &self.counters.pending_ref_host_ops,
+                &self.counters.pending_unref_host_ops,
+            );
+            self.counters
+                .failed_host_ops
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -905,9 +972,24 @@ impl TimerScheduler for InboxTimerScheduler {
         // scheduler does not guarantee that for `sleep(0)`.
         if delay_ms == 0 && repeat_ms.is_none() {
             let token = TimerToken(self.next_immediate_token.fetch_add(1, Ordering::Relaxed));
-            let _ = self
+            if self
                 .tx
-                .try_send(RuntimeMessage::TimerFired { token, liveness });
+                .try_send(RuntimeMessage::TimerFired {
+                    token,
+                    liveness,
+                    expects_js_callback: true,
+                })
+                .is_err()
+            {
+                decrement_liveness(
+                    liveness,
+                    &self.counters.pending_ref_timers,
+                    &self.counters.pending_unref_timers,
+                );
+                self.counters
+                    .cancelled_timers
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return token.0;
         }
         let request = TimerRequest {
@@ -917,10 +999,27 @@ impl TimerScheduler for InboxTimerScheduler {
             origin: "setTimeout".to_string(),
         };
         let tx = self.tx.clone();
+        let counters = self.counters.clone();
+        let repeat = repeat_ms.is_some();
         let token = self
             .event_loop
             .schedule_timer_callback(request, move |token| {
-                let _ = tx.try_send(RuntimeMessage::TimerFired { token, liveness });
+                if tx
+                    .try_send(RuntimeMessage::TimerFired {
+                        token,
+                        liveness,
+                        expects_js_callback: true,
+                    })
+                    .is_err()
+                    && !repeat
+                {
+                    decrement_liveness(
+                        liveness,
+                        &counters.pending_ref_timers,
+                        &counters.pending_unref_timers,
+                    );
+                    counters.cancelled_timers.fetch_add(1, Ordering::Relaxed);
+                }
             });
         token.0
     }
@@ -1072,19 +1171,46 @@ impl IsolateRunner {
                 }
                 TickOutcome::Processed
             }
-            RuntimeMessage::TimerFired { token, liveness } => {
-                decrement_liveness(
-                    liveness,
-                    &self.counters.pending_ref_timers,
-                    &self.counters.pending_unref_timers,
-                );
-                self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
+            RuntimeMessage::TimerFired {
+                token,
+                liveness,
+                expects_js_callback,
+            } => {
+                if !expects_js_callback {
+                    self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
+                    decrement_liveness(
+                        liveness,
+                        &self.counters.pending_ref_timers,
+                        &self.counters.pending_unref_timers,
+                    );
+                    return TickOutcome::Processed;
+                }
                 // Drive the JS callback associated with `token`
                 // through the runtime. A swallowed `Err` reply path
                 // is intentional: the surrounding command (if any)
                 // already returned its synchronous result, and the
                 // diagnostic runs through the structured sink.
-                let _ = self.runtime.fire_timer(token.0);
+                match self.runtime.fire_timer(token.0) {
+                    Ok(TimerFireOutcome::Missing) => {}
+                    Ok(TimerFireOutcome::Fired { repeat }) => {
+                        self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
+                        if !repeat {
+                            decrement_liveness(
+                                liveness,
+                                &self.counters.pending_ref_timers,
+                                &self.counters.pending_unref_timers,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        self.counters.fired_timers.fetch_add(1, Ordering::Relaxed);
+                        decrement_liveness(
+                            liveness,
+                            &self.counters.pending_ref_timers,
+                            &self.counters.pending_unref_timers,
+                        );
+                    }
+                }
                 self.record_microtask_snapshot();
                 TickOutcome::Processed
             }

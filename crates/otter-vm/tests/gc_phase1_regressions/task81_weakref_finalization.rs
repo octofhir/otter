@@ -9,10 +9,11 @@ use otter_vm::native_value;
 use otter_vm::object::{OBJECT_BODY_TYPE_TAG, alloc_object};
 use otter_vm::weak_refs::{
     FINALIZATION_REGISTRY_BODY_TYPE_TAG, WEAK_REF_BODY_TYPE_TAG, alloc_finalization_registry,
-    alloc_weak_ref, finalization_registry_cell_count, finalization_registry_register,
-    finalization_registry_unregister, process_weak_refs_and_finalizers, weak_ref_deref,
+    alloc_finalization_registry_with_context, alloc_weak_ref, finalization_registry_cell_count,
+    finalization_registry_register, finalization_registry_unregister,
+    process_weak_refs_and_finalizers, weak_ref_deref,
 };
-use otter_vm::{Interpreter, Value};
+use otter_vm::{ExecutionContext, Interpreter, Value};
 
 fn full_gc_with_roots(
     heap: &mut otter_gc::GcHeap,
@@ -39,6 +40,10 @@ fn empty_module() -> BytecodeModule {
         module_resolutions: Vec::new(),
         module_inits: Vec::new(),
     }
+}
+
+fn empty_context() -> ExecutionContext {
+    ExecutionContext::from_module(empty_module())
 }
 
 #[test]
@@ -135,11 +140,11 @@ fn finalization_registry_registers_without_strong_target_retention() {
     );
 
     interp
-        .drain_microtasks(&empty_module())
+        .drain_microtasks(&empty_context())
         .expect("drain cleanup");
     interp.force_gc();
     interp
-        .drain_microtasks(&empty_module())
+        .drain_microtasks(&empty_context())
         .expect("second drain");
     assert_eq!(
         calls.load(Ordering::Relaxed),
@@ -221,14 +226,14 @@ fn finalization_registry_schedules_cleanup_microtask() {
     );
     assert!(interp.microtasks().has_pending_sync());
     interp
-        .drain_microtasks(&empty_module())
+        .drain_microtasks(&empty_context())
         .expect("drain finalization callback");
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert!(seen_held.load(Ordering::Relaxed));
 
     interp.force_gc();
     interp
-        .drain_microtasks(&empty_module())
+        .drain_microtasks(&empty_context())
         .expect("second drain");
     assert_eq!(
         calls.load(Ordering::Relaxed),
@@ -277,9 +282,51 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
 
     interp.force_gc();
     interp
-        .drain_microtasks(&empty_module())
+        .drain_microtasks(&empty_context())
         .expect("drain finalization callback");
     assert!(observed_undefined.load(Ordering::Relaxed));
+}
+
+#[test]
+fn finalization_cleanup_job_carries_registry_context() {
+    let mut interp = Interpreter::new();
+    let called = Arc::new(AtomicBool::new(false));
+    let callback = native_value(interp.gc_heap_mut(), "cleanup", {
+        let called = Arc::clone(&called);
+        move |_, _, _| {
+            called.store(true, Ordering::Relaxed);
+            Ok(Value::Undefined)
+        }
+    })
+    .expect("native cleanup");
+    let registry = alloc_finalization_registry_with_context(
+        interp.gc_heap_mut(),
+        callback,
+        Some(ExecutionContext::from_module(empty_module())),
+    )
+    .expect("registry");
+    let target = alloc_object(interp.gc_heap_mut()).expect("target");
+    finalization_registry_register(
+        registry,
+        interp.gc_heap_mut(),
+        &Value::Object(target),
+        Value::Undefined,
+        None,
+    )
+    .expect("register");
+    let global = *interp.global_this();
+    otter_vm::object::set(
+        global,
+        interp.gc_heap_mut(),
+        "registry",
+        Value::FinalizationRegistry(registry),
+    );
+
+    interp.force_gc();
+    interp
+        .drain_microtasks_with_default(None)
+        .expect("cleanup job should carry its own context");
+    assert!(called.load(Ordering::Relaxed));
 }
 
 #[test]
@@ -324,7 +371,7 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
     assert!(interp.microtasks().has_pending_sync());
     interp.force_gc();
     interp
-        .drain_microtasks(&empty_module())
+        .drain_microtasks(&empty_context())
         .expect("drain finalization callback");
     assert!(observed_undefined.load(Ordering::Relaxed));
 }
@@ -369,7 +416,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
         "raw GC must only enqueue cleanup and must not run user callback"
     );
     interp
-        .drain_microtasks(&empty_module())
+        .drain_microtasks(&empty_context())
         .expect("drain finalization callback");
     assert!(matches!(
         otter_vm::object::get(global, interp.gc_heap(), "allocated_after_gc"),

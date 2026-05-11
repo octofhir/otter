@@ -46,8 +46,9 @@ fn bench_dispatch(c: &mut Criterion) {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
+    let context = otter_vm::ExecutionContext::from_module(module);
     c.bench_function("dispatch_10k_nop", |b| {
-        b.iter(|| interp.run(&module).unwrap());
+        b.iter(|| interp.run(&context).unwrap());
     });
 }
 

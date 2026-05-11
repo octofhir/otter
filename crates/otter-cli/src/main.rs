@@ -30,7 +30,7 @@ use clap::{Args, Parser, Subcommand};
 use otter_bytecode::disasm::disassemble;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
-use otter_runtime::{BooleanPermission, CapabilitySet, OtterError, Permission};
+use otter_runtime::{BooleanPermission, CapabilitySet, DiagnosticCode, OtterError, Permission};
 use otter_test::{Report, RunOptions, Suite};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
@@ -966,7 +966,7 @@ async fn run_dump(
     startup_timer.mark("runtime_dump_file");
     let text = match mode {
         "json" => compiled_dump_json(&compiled).map_err(|e| OtterError::Internal {
-            code: "DUMP_JSON".to_string(),
+            code: DiagnosticCode::DumpJson.as_str().to_string(),
             message: e.to_string(),
         })?,
         _ => disassemble(&compiled.bytecode),

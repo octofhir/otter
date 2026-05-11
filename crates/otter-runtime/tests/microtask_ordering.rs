@@ -269,6 +269,38 @@ async fn cleartimeout_suppresses_pending_callback() {
     assert_eq!(log, vec!["micro-only".to_string()]);
 }
 
+/// `setInterval` is a repeating task source, not a one-shot
+/// timeout with a retained callback entry. The ref'd timer keeps
+/// `run_until_idle` alive until `clearInterval`, and each tick
+/// gets its own microtask checkpoint before the next timer task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setinterval_repeats_until_clearinterval_and_checkpoints_each_tick() {
+    let log = run_script_capturing_async(
+        r#"
+            let count = 0;
+            const id = setInterval(() => {
+                count += 1;
+                console.log("tick-" + count);
+                queueMicrotask(() => console.log("micro-" + count));
+                if (count === 3) clearInterval(id);
+            }, 1);
+        "#,
+    )
+    .await
+    .expect("script must succeed");
+    assert_eq!(
+        log,
+        vec![
+            "tick-1".to_string(),
+            "micro-1".to_string(),
+            "tick-2".to_string(),
+            "micro-2".to_string(),
+            "tick-3".to_string(),
+            "micro-3".to_string(),
+        ]
+    );
+}
+
 /// Direct/blocking embedders that never installed a host-side
 /// timer scheduler observe a `TypeError` from `setTimeout` —
 /// silent drops would let scripts deadlock waiting for callbacks

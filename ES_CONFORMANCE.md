@@ -358,9 +358,9 @@ Regression spot-checks (no movement vs. baselines):
 | suite | passed |
 |---|---:|
 | `built-ins/Function` | 364 |
-| `built-ins/NativeErrors` | 78 |
-| `built-ins/Error` | 32 |
-| `built-ins/AggregateError` | 14 |
+| `built-ins/NativeErrors` | 78 → 79 (+1 after P2.3 InstallErrorCause) |
+| `built-ins/Error` | 32 → 33 (+1 after P2.3 InstallErrorCause) |
+| `built-ins/AggregateError` | 14 → 15 (+1 after P2.3 InstallErrorCause + iterable lowering) |
 | `built-ins/Function/prototype/bind` | 97 / 100 (100% non-skip) |
 | `built-ins/Function/prototype/apply` | 45 / 48 (100% non-skip) |
 | `built-ins/Function/15.3.2.1-11` | 12 / 12 |
@@ -381,7 +381,7 @@ state model):
    `Unresolved → Resolved → Compiled → Instantiated → Evaluating
    → Evaluated|Errored`. The current loader pipeline batches
    resolve + compile + link before reaching the records table,
-   so `allocate_for_bytecode` advances each record directly to
+   so `allocate_for_module_inits` advances each record directly to
    `Instantiated`; per-phase loader hooks reserved for a follow-up
    slice will use the earlier variants.
 

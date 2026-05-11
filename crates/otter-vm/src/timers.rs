@@ -10,17 +10,18 @@
 //!
 //! Timers are an *isolate-local* construct because the callback is
 //! a JS [`Value`] (closure / native) bound to a specific
-//! `BytecodeModule`. Scheduling itself, however, is *host-side*:
-//! the runtime layer owns the Tokio worker that fires the inbox
-//! [`crate::microtask`]-equivalent message after the delay.
+//! [`ExecutionContext`]. Scheduling itself, however, is
+//! *host-side*: the runtime layer owns the Tokio worker that fires
+//! the inbox [`crate::microtask`]-equivalent message after the
+//! delay.
 //!
 //! This module only owns the bridge:
 //!
 //! - [`TimerScheduler`] — trait the runtime layer implements to
 //!   talk to its event loop without otter-vm depending on Tokio.
 //! - [`TimerCallbacks`] — per-interpreter table mapping the
-//!   runtime-issued [`u64`] token to the JS callback + extra
-//!   arguments + interval (for `setInterval`).
+//!   runtime-issued [`u64`] token to the JS callback + origin
+//!   context + extra arguments + interval (for `setInterval`).
 //!
 //! # Invariants
 //!
@@ -43,6 +44,7 @@ use std::sync::Arc;
 use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
+use crate::execution_context::ExecutionContext;
 use crate::native_function::{NativeCall, NativeError, NativeFastFn};
 use crate::number::{self, NumberValue};
 use crate::object::JsObject;
@@ -78,6 +80,12 @@ pub trait TimerScheduler: Send + Sync {
 pub type TimerSchedulerHandle = Arc<dyn TimerScheduler>;
 
 /// Stored callback for one outstanding `setTimeout` / `setInterval`.
+///
+/// The entry owns the scheduling [`ExecutionContext`] so a later
+/// timer task can dispatch through the same function table. This
+/// is intentionally isolate-local state, not VM state crossing to
+/// the host scheduler: the entry stays on the isolate side and
+/// only the opaque token leaves the VM.
 #[derive(Debug, Clone)]
 pub struct TimerEntry {
     /// JS callable to invoke when the delay elapses.
@@ -85,6 +93,10 @@ pub struct TimerEntry {
     /// Extra positional arguments forwarded to the callback per
     /// HTML §8.1.5.5.4 (`setTimeout(handler, delay, ...arguments)`).
     pub extra_args: SmallVec<[Value; 4]>,
+    /// Execution context that produced the callback. Timer
+    /// callbacks may run after another script has executed, so the
+    /// entry owns the context needed for dispatch.
+    pub context: ExecutionContext,
     /// `Some(ms)` for `setInterval`; `None` for `setTimeout`.
     /// Re-arming is the host's job — the VM only inspects this
     /// field to keep the entry alive after firing instead of
@@ -228,6 +240,13 @@ fn schedule_timer_common(
     ensure_callable(&callback, native_name)?;
     let delay_ms = coerce_delay_ms(args.get(1));
     let extra: SmallVec<[Value; 4]> = args.iter().skip(2).cloned().collect();
+    let context = ctx
+        .execution_context()
+        .ok_or(NativeError::TypeError {
+            name: native_name,
+            reason: "timer callback is missing its execution context".to_string(),
+        })?
+        .clone();
     let interp = ctx.interp_mut();
     let scheduler = interp.timer_scheduler().ok_or(NativeError::TypeError {
         name: native_name,
@@ -239,6 +258,7 @@ fn schedule_timer_common(
         TimerEntry {
             callback,
             extra_args: extra,
+            context,
             repeat_ms: repeat.then_some(delay_ms),
         },
     );

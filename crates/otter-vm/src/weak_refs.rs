@@ -38,6 +38,7 @@ use crate::collections::{
     MAP_BODY_TYPE_TAG, MapBody, SET_BODY_TYPE_TAG, SetBody, WEAK_MAP_BODY_TYPE_TAG,
     WEAK_SET_BODY_TYPE_TAG, WeakMapBody, WeakSetBody,
 };
+use crate::execution_context::ExecutionContext;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::object::{OBJECT_BODY_TYPE_TAG, ObjectBody};
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -82,6 +83,7 @@ pub struct FinalizerCell {
 #[derive(Debug, Clone)]
 pub struct FinalizationRegistryBody {
     cleanup_callback: Value,
+    cleanup_context: Option<ExecutionContext>,
     cells: Vec<FinalizerCell>,
 }
 
@@ -101,6 +103,8 @@ impl otter_gc::SafeTraceable for FinalizationRegistryBody {
 pub struct FinalizationJob {
     /// Cleanup callback supplied to the registry constructor.
     pub cleanup_callback: Value,
+    /// VM context that owns the cleanup callback.
+    pub context: Option<ExecutionContext>,
     /// Held value passed as the sole cleanup callback argument.
     pub held_value: Value,
 }
@@ -137,11 +141,22 @@ pub fn alloc_finalization_registry(
     heap: &mut otter_gc::GcHeap,
     cleanup_callback: Value,
 ) -> Result<JsFinalizationRegistry, crate::VmError> {
+    alloc_finalization_registry_with_context(heap, cleanup_callback, None)
+}
+
+/// Allocate a fresh `FinalizationRegistry` with an owning VM
+/// execution context for later cleanup jobs.
+pub fn alloc_finalization_registry_with_context(
+    heap: &mut otter_gc::GcHeap,
+    cleanup_callback: Value,
+    cleanup_context: Option<ExecutionContext>,
+) -> Result<JsFinalizationRegistry, crate::VmError> {
     if !is_callable(&cleanup_callback) {
         return Err(crate::VmError::NotCallable);
     }
     let registry = heap.alloc_old(FinalizationRegistryBody {
         cleanup_callback,
+        cleanup_context,
         cells: Vec::new(),
     })?;
     heap.register_finalization_registry(registry);
@@ -252,11 +267,13 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
         }
         heap.with_payload(registry, |body| {
             let cleanup_callback = body.cleanup_callback.clone();
+            let cleanup_context = body.cleanup_context.clone();
             let mut retained = Vec::with_capacity(body.cells.len());
             for cell in body.cells.drain(..) {
                 if dead_targets.contains(&cell.target) {
                     jobs.push(FinalizationJob {
                         cleanup_callback: cleanup_callback.clone(),
+                        context: cleanup_context.clone(),
                         held_value: cell.held_value,
                     });
                 } else {

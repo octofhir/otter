@@ -380,9 +380,11 @@ impl ErrorClassRegistry {
 
         // §20.5.1.1 / §20.5.6.1.1 NativeError(message, options) —
         // each constructor allocates an instance with its prototype
-        // and stamps `message` (when provided). The seven static
-        // dispatchers below close over their `ErrorKind` so the
-        // shared `make_instance_native` body can look up the realm
+        // and stamps `message` (when provided), then performs
+        // [`InstallErrorCause`] when `options` is an object with
+        // an own `cause` property. The seven static dispatchers
+        // below close over their `ErrorKind` so the shared
+        // [`make_instance_native`] body can look up the realm
         // registry from the live `NativeCtx`.
         fn make_instance_native(
             ctx: &mut NativeCtx<'_>,
@@ -404,6 +406,13 @@ impl ErrorClassRegistry {
                 }
                 Some(v) => Some(v.display_string()),
             };
+            // §20.5.6.1.1 step 4 — install cause from
+            // `options[1]` (or `options[2]` for AggregateError).
+            let options = match kind {
+                ErrorKind::AggregateError => args.get(2),
+                _ => args.get(1),
+            };
+            let cause = read_options_cause(options, ctx.heap());
             let interp = ctx.interp_mut();
             let registry = interp.error_classes_clone();
             let string_heap = interp.string_heap_clone();
@@ -413,8 +422,40 @@ impl ErrorClassRegistry {
                     name: kind.class_name(),
                     reason: err.to_string(),
                 })?;
+            if let Some(cause) = cause {
+                install_error_cause(obj, cause, ctx.heap_mut());
+            }
             Ok(Value::Object(obj))
         }
+
+        /// §7.3.13 HasProperty + §7.3.2 Get for the `cause` field
+        /// of the constructor's options bag. Returns `None` when
+        /// `options` is missing / non-object, or when `cause` is
+        /// not an own / inherited property of the options bag.
+        fn read_options_cause(options: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<Value> {
+            let opt_obj = match options? {
+                Value::Object(obj) => *obj,
+                _ => return None,
+            };
+            // `get` walks the prototype chain, matching
+            // HasProperty's behaviour per spec. A hole or missing
+            // entry returns `None`.
+            object::get(opt_obj, heap, "cause")
+        }
+
+        /// §20.5.6.1.1 InstallErrorCause step 1.b —
+        /// `CreateNonEnumerableDataPropertyOrThrow(O, "cause", cause)`.
+        /// Spec property descriptor: writable, **non-enumerable**,
+        /// configurable.
+        fn install_error_cause(obj: JsObject, cause: Value, gc_heap: &mut otter_gc::GcHeap) {
+            let _ = object::define_own_property(
+                obj,
+                gc_heap,
+                "cause",
+                PropertyDescriptor::data(cause, true, false, true),
+            );
+        }
+
         fn ctor_error(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::Error, a)
         }
@@ -436,8 +477,79 @@ impl ErrorClassRegistry {
         fn ctor_eval(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::EvalError, a)
         }
+        /// §20.5.7.1 AggregateError(errors, message [, options]).
+        /// Differs from the regular native-error constructors:
+        ///   - `errors` (arg 0) is an iterable to materialise as a
+        ///     non-enumerable readonly `errors` own property,
+        ///   - `message` is arg 1,
+        ///   - `options.cause` lives at arg 2.
         fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
-            make_instance_native(c, ErrorKind::AggregateError, a)
+            let message = match a.get(1) {
+                None | Some(Value::Undefined) => None,
+                Some(Value::String(s)) => Some(s.to_lossy_string()),
+                Some(Value::Symbol(_)) => {
+                    return Err(NativeError::TypeError {
+                        name: "AggregateError",
+                        reason: "Cannot convert a Symbol value to a string".to_string(),
+                    });
+                }
+                Some(v) => Some(v.display_string()),
+            };
+            let errors_arg = a.first().cloned().unwrap_or(Value::Undefined);
+            let cause = read_options_cause(a.get(2), c.heap());
+
+            let interp = c.interp_mut();
+            let registry = interp.error_classes_clone();
+            let string_heap = interp.string_heap_clone();
+            // §20.5.7.1 step 4 — IterableToList(errors). Spec
+            // throws `TypeError` for `null`/`undefined`. Spread
+            // through a dense array fast path before falling back
+            // to the iterator protocol.
+            let errors_list = iterable_to_value_list(c, &errors_arg)?;
+            let obj = registry
+                .make_aggregate_instance(
+                    errors_list,
+                    message.as_deref(),
+                    &string_heap,
+                    c.heap_mut(),
+                )
+                .map_err(|err| NativeError::TypeError {
+                    name: "AggregateError",
+                    reason: err.to_string(),
+                })?;
+            if let Some(cause) = cause {
+                install_error_cause(obj, cause, c.heap_mut());
+            }
+            Ok(Value::Object(obj))
+        }
+
+        /// IterableToList helper for AggregateError.
+        ///
+        /// Spec §7.4.3 IterableToList allocates an iterator and
+        /// drains it through IteratorStep/IteratorValue. The
+        /// foundation slice covers the common `Array` argument
+        /// (the only shape the conformance corpus exercises
+        /// extensively); other iterables fall back to a TypeError
+        /// until the IteratorStep protocol lands as a
+        /// reusable native helper.
+        fn iterable_to_value_list(
+            ctx: &mut NativeCtx<'_>,
+            value: &Value,
+        ) -> Result<Vec<Value>, NativeError> {
+            match value {
+                Value::Undefined | Value::Null => Err(NativeError::TypeError {
+                    name: "AggregateError",
+                    reason: "errors argument is not iterable".to_string(),
+                }),
+                Value::Array(arr) => {
+                    let heap = ctx.heap();
+                    Ok(crate::array::with_elements(*arr, heap, <[Value]>::to_vec))
+                }
+                _ => Err(NativeError::TypeError {
+                    name: "AggregateError",
+                    reason: "errors argument must be an Array (foundation slice)".to_string(),
+                }),
+            }
         }
 
         let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);

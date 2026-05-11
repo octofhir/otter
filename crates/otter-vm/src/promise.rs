@@ -13,7 +13,8 @@
 //! - [`PromiseState`] — pending / fulfilled / rejected.
 //! - [`PromiseReaction`] — queued reaction payloads, including
 //!   explicit parked-frame resume payloads for async functions.
-//! - [`PromiseCapability`] — `{ promise, resolve, reject }`.
+//! - [`PromiseCapability`] — `{ promise, resolve, reject }`
+//!   plus the VM context that owns later settlement work.
 //!
 //! # Invariants
 //!
@@ -31,6 +32,7 @@
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use crate::Value;
+use crate::execution_context::ExecutionContext;
 use crate::microtask::{Microtask, MicrotaskKind};
 use otter_gc::raw::{RawGc, SlotVisitor};
 
@@ -73,6 +75,8 @@ pub struct PromiseReaction {
     pub handler: PromiseReactionHandler,
     /// Which side of `then` this reaction handles.
     pub kind: ReactionKind,
+    /// Execution context that registered this reaction.
+    pub context: Option<ExecutionContext>,
 }
 
 impl PromiseReaction {
@@ -184,6 +188,8 @@ pub struct PromiseCapability {
     pub resolve: Value,
     /// Native function: `reject(reason)` settles `promise` as rejected.
     pub reject: Value,
+    /// VM context captured when the capability was created.
+    pub context: Option<ExecutionContext>,
 }
 
 impl otter_gc::GcStore for PromiseCapability {
@@ -233,6 +239,17 @@ pub trait JsPromise: std::fmt::Debug {
         on_fulfilled: Option<Value>,
         on_rejected: Option<Value>,
         capability: PromiseCapability,
+    ) -> PromiseThenOutcome;
+
+    /// `PerformPromiseThen` with explicit context ownership for the
+    /// queued reaction job.
+    fn perform_then_with_context(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        on_fulfilled: Option<Value>,
+        on_rejected: Option<Value>,
+        capability: PromiseCapability,
+        context: Option<ExecutionContext>,
     ) -> PromiseThenOutcome;
 
     /// `true` once any reaction has been attached.
@@ -338,8 +355,9 @@ impl PurePromise {
         await_dst: u16,
         capability: PromiseCapability,
         owner: Option<crate::generator::JsGenerator>,
+        context: Option<ExecutionContext>,
     ) -> PromiseThenOutcome {
-        let outcome = self.perform_then_internal(heap, capability, |kind| {
+        let outcome = self.perform_then_internal(heap, capability, context, |kind| {
             let fulfilled = kind == ReactionKind::Fulfill;
             match owner {
                 Some(owner) => PromiseReactionHandler::AsyncGenResume {
@@ -362,8 +380,10 @@ impl PurePromise {
         &self,
         heap: &mut otter_gc::GcHeap,
         capability: PromiseCapability,
+        context: Option<ExecutionContext>,
         mut handler_for: impl FnMut(ReactionKind) -> PromiseReactionHandler,
     ) -> ThenOutcomeInternal {
+        let reaction_context = context.or_else(|| capability.context.clone());
         heap.with_payload(self.inner, |body| {
             body.is_handled = true;
             match body.state.clone() {
@@ -372,11 +392,13 @@ impl PurePromise {
                         capability: capability.clone(),
                         handler: handler_for(ReactionKind::Fulfill),
                         kind: ReactionKind::Fulfill,
+                        context: reaction_context.clone(),
                     };
                     let reject = PromiseReaction {
                         capability,
                         handler: handler_for(ReactionKind::Reject),
                         kind: ReactionKind::Reject,
+                        context: reaction_context,
                     };
                     body.fulfill_reactions.push(fulfill.clone());
                     body.reject_reactions.push(reject.clone());
@@ -390,6 +412,7 @@ impl PurePromise {
                         capability,
                         handler: handler_for(ReactionKind::Fulfill),
                         kind: ReactionKind::Fulfill,
+                        context: reaction_context,
                     };
                     ThenOutcomeInternal {
                         immediate_reaction: Some((reaction, value)),
@@ -401,6 +424,7 @@ impl PurePromise {
                         capability,
                         handler: handler_for(ReactionKind::Reject),
                         kind: ReactionKind::Reject,
+                        context: reaction_context,
                     };
                     ThenOutcomeInternal {
                         immediate_reaction: Some((reaction, reason)),
@@ -479,7 +503,18 @@ impl JsPromise for PurePromise {
         on_rejected: Option<Value>,
         capability: PromiseCapability,
     ) -> PromiseThenOutcome {
-        let outcome = self.perform_then_internal(heap, capability, |kind| match kind {
+        self.perform_then_with_context(heap, on_fulfilled, on_rejected, capability, None)
+    }
+
+    fn perform_then_with_context(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        on_fulfilled: Option<Value>,
+        on_rejected: Option<Value>,
+        capability: PromiseCapability,
+        context: Option<ExecutionContext>,
+    ) -> PromiseThenOutcome {
+        let outcome = self.perform_then_internal(heap, capability, context, |kind| match kind {
             ReactionKind::Fulfill => PromiseReactionHandler::Call(on_fulfilled.clone()),
             ReactionKind::Reject => PromiseReactionHandler::Call(on_rejected.clone()),
         });
@@ -586,9 +621,25 @@ impl JsPromiseHandle {
         capability: PromiseCapability,
         owner: Option<crate::generator::JsGenerator>,
     ) -> PromiseThenOutcome {
+        self.perform_async_resume_then_with_context(
+            heap, parked, await_dst, capability, owner, None,
+        )
+    }
+
+    /// Attach parked-frame reactions for `await` with explicit
+    /// context ownership.
+    pub fn perform_async_resume_then_with_context(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        parked: crate::generator::ParkedFrame,
+        await_dst: u16,
+        capability: PromiseCapability,
+        owner: Option<crate::generator::JsGenerator>,
+        context: Option<ExecutionContext>,
+    ) -> PromiseThenOutcome {
         match self.inner {
             PromiseRepr::Pure(p) => {
-                p.perform_async_resume_then(heap, parked, await_dst, capability, owner)
+                p.perform_async_resume_then(heap, parked, await_dst, capability, owner, context)
             }
         }
     }
@@ -622,6 +673,21 @@ impl JsPromise for JsPromiseHandle {
     ) -> PromiseThenOutcome {
         match self.inner {
             PromiseRepr::Pure(p) => p.perform_then(heap, on_fulfilled, on_rejected, capability),
+        }
+    }
+
+    fn perform_then_with_context(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        on_fulfilled: Option<Value>,
+        on_rejected: Option<Value>,
+        capability: PromiseCapability,
+        context: Option<ExecutionContext>,
+    ) -> PromiseThenOutcome {
+        match self.inner {
+            PromiseRepr::Pure(p) => {
+                p.perform_then_with_context(heap, on_fulfilled, on_rejected, capability, context)
+            }
         }
     }
 
@@ -672,6 +738,7 @@ fn reaction_to_microtask(
                 callee,
                 this_value: Value::Undefined,
                 args: smallvec![value],
+                context: reaction.context,
                 result_capability,
                 kind: MicrotaskKind::Call,
             })
@@ -686,6 +753,7 @@ fn reaction_to_microtask(
                 callee: Value::Undefined,
                 this_value: Value::Undefined,
                 args: smallvec![value],
+                context: reaction.context,
                 result_capability: None,
                 kind: MicrotaskKind::AsyncResume {
                     frame,
@@ -705,6 +773,7 @@ fn reaction_to_microtask(
                 callee: Value::Undefined,
                 this_value: Value::Undefined,
                 args: smallvec![value],
+                context: reaction.context,
                 result_capability: None,
                 kind: MicrotaskKind::AsyncGenResume {
                     frame,
@@ -729,6 +798,7 @@ fn record_reaction_barriers(
 mod tests {
     use super::*;
     use crate::number::NumberValue;
+    use otter_bytecode::{BytecodeModule, SourceKind};
 
     fn n(v: i32) -> Value {
         Value::Number(NumberValue::from_i32(v))
@@ -740,7 +810,19 @@ mod tests {
             promise: Value::Promise(p),
             resolve: Value::Undefined,
             reject: Value::Undefined,
+            context: None,
         }
+    }
+
+    fn empty_context() -> ExecutionContext {
+        ExecutionContext::from_module(BytecodeModule {
+            module: "promise-test".to_string(),
+            source_kind: SourceKind::JavaScript,
+            functions: Vec::new(),
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
     }
 
     #[test]
@@ -790,6 +872,17 @@ mod tests {
         let cap = cap_for(&mut heap);
         let outcome = p.perform_then(&mut heap, None, None, cap);
         assert!(outcome.immediate_job.is_some());
+    }
+
+    #[test]
+    fn capability_context_flows_into_reaction_job() {
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let p = PurePromise::fulfilled(&mut heap, n(42)).expect("promise");
+        let mut cap = cap_for(&mut heap);
+        cap.context = Some(empty_context());
+        let outcome = p.perform_then(&mut heap, None, None, cap);
+        let job = outcome.immediate_job.expect("reaction job");
+        assert!(job.context.is_some());
     }
 
     #[test]

@@ -34,6 +34,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
         promise: Value::Object(retained),
         resolve: Value::Undefined,
         reject: Value::Undefined,
+        context: None,
     };
     promise.perform_then(interp.gc_heap_mut(), None, None, capability);
 
@@ -67,6 +68,7 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
             promise: Value::Promise(next),
             resolve: Value::Undefined,
             reject: Value::Undefined,
+            context: None,
         };
         current.perform_then(interp.gc_heap_mut(), None, None, capability);
         current = next;
@@ -95,6 +97,7 @@ fn pending_promise_microtask_payload_roots_until_drained() {
         callee: Value::Undefined,
         this_value: Value::Undefined,
         args: smallvec![Value::Object(payload)],
+        context: None,
         result_capability: None,
         kind: otter_vm::MicrotaskKind::Call,
     });

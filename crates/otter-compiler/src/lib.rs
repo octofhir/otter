@@ -5583,6 +5583,7 @@ fn compile_expr(
                 && cx.lookup_binding(id.name.as_str()).is_none()
                 && find_module_import_binding(cx, id.name.as_str()).is_none()
                 && is_builtin_error_class_name(id.name.as_str())
+                && builtin_error_construct_fast_path_applies(id.name.as_str(), &new_expr.arguments)
             {
                 return compile_builtin_error_construct(
                     cx,
@@ -7335,6 +7336,7 @@ fn compile_method_call(
         && cx.lookup_binding(id.name.as_str()).is_none()
         && find_module_import_binding(cx, id.name.as_str()).is_none()
         && is_builtin_error_class_name(id.name.as_str())
+        && builtin_error_construct_fast_path_applies(id.name.as_str(), &call.arguments)
     {
         return compile_builtin_error_construct(cx, id.name.as_str(), &call.arguments, span);
     }
@@ -9295,6 +9297,25 @@ fn is_builtin_error_class_name(name: &str) -> bool {
             | "EvalError"
             | "AggregateError"
     )
+}
+
+/// `true` when the `NewBuiltinError` fast path can lower this
+/// call without losing semantics — i.e. when the call only
+/// supplies the operand shapes the opcode encodes.
+///
+/// `new Error(message, options)` / `new TypeError(message,
+/// options)` etc. — and `new AggregateError(errors, message,
+/// options)` — need the runtime constructor path
+/// (§20.5.6.1.1 InstallErrorCause requires reading
+/// `options.cause`). Those call shapes fall through to the
+/// standard `new` dispatch so the registered native constructor
+/// handles the option bag.
+fn builtin_error_construct_fast_path_applies(
+    kind: &str,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+) -> bool {
+    let max_args = if kind == "AggregateError" { 2 } else { 1 };
+    arguments.len() <= max_args
 }
 
 /// Lower `new <Kind>(arg)` / `<Kind>(arg)` for any of the seven

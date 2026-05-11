@@ -42,10 +42,9 @@
 //! - <https://tc39.es/ecma262/#sec-iscallable>
 //! - <https://tc39.es/ecma262/#sec-isconstructor>
 
-use otter_bytecode::BytecodeModule;
-
 use crate::Value;
 use crate::bigint::{BigIntValue, ops as bigint_ops};
+use crate::execution_context::ExecutionContext;
 use crate::number::{self, NumberValue};
 
 /// Preferred primitive type passed to ECMA-262 §7.1.1 `ToPrimitive`.
@@ -265,7 +264,7 @@ pub fn is_callable(value: &Value) -> bool {
 /// 2. `Value::Function { function_id }` and `Value::Closure { ... }`
 ///    have `[[Construct]]` iff the underlying bytecode `Function`
 ///    is **not** an arrow. The check needs the loaded
-///    [`BytecodeModule`] for the function-table lookup.
+///    [`ExecutionContext`] for the function-table lookup.
 /// 3. `Value::BoundFunction` inherits its target's status.
 /// 4. `Value::NativeFunction` carries no `[[Construct]]` today —
 ///    the foundation lacks a per-callable construct flag. Native
@@ -276,17 +275,16 @@ pub fn is_callable(value: &Value) -> bool {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-isconstructor>
 #[must_use]
-pub fn is_constructor(value: &Value, module: &BytecodeModule, heap: &otter_gc::GcHeap) -> bool {
+pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc::GcHeap) -> bool {
     match value {
         Value::ClassConstructor(_) => true,
         Value::NativeFunction(native) => native.is_constructable(heap),
-        Value::Function { function_id } | Value::Closure { function_id, .. } => module
-            .functions
-            .get(*function_id as usize)
-            .is_some_and(|f| !f.is_arrow),
+        Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            !context.function_is_arrow(*function_id)
+        }
         Value::BoundFunction(b) => {
             let (target, _, _) = b.parts(heap);
-            is_constructor(&target, module, heap)
+            is_constructor(&target, context, heap)
         }
         _ => false,
     }

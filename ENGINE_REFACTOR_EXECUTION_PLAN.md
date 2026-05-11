@@ -429,7 +429,7 @@ Acceptance:
   Landed 2026-05-10 in
   `crates/otter-runtime/src/module_records.rs::RuntimeModuleRecordState`.
   Current loader pipeline batches resolve + compile + link before
-  reaching the records table, so `allocate_for_bytecode` advances
+  reaching the records table, so `allocate_for_module_inits` advances
   each record directly into `Instantiated`; per-phase loader
   hooks for the earlier variants are reserved for the follow-up
   slice that splits the load pipeline.
@@ -648,18 +648,113 @@ Deprioritized (code present, not a P2 priority):
 
 ### P2.3 Diagnostics
 
-- [ ] Stabilize diagnostic types: load, resolve, parse, compile, permission,
+- [x] Stabilize diagnostic types: load, resolve, parse, compile, permission,
   runtime, package-manager. Each has a stable error code.
-- [ ] Add code-frame output and machine-readable JSON output (`--json`).
-- [ ] Add stack-trace source mapping using the runtime-owned source-map table.
-- [ ] Add error-object formatting tests (Error.cause, AggregateError).
-- [ ] Add timeout-dump integration with module/source metadata.
+  Landed 2026-05-11. New closed
+  [`otter_runtime::DiagnosticCode`] enum in
+  `crates/otter-runtime/src/diagnostics/codes.rs` covers every
+  active-stack producer site (38 variants). All ad-hoc string
+  literals in `otter-runtime`/`otter-cli` were rewritten through
+  `DiagnosticCode::as_str()` /
+  `Diagnostic::with_code_enum(...)`. Cross-crate emitters
+  (`otter-syntax`, `otter-pm-manifest`, `otter-vm` JSON path)
+  keep canonical string literals; a snapshot test in
+  `crates/otter-runtime/tests/diagnostic_codes_stable.rs`
+  pins each of those producer codes to the matching enum
+  variant so silent drift fails the build. Plan-mandated
+  `DiagnosticCategory` (load / resolve / parse / compile /
+  permission / runtime / package-manager + `Internal`) lives in
+  the same module.
+- [x] Add code-frame output and machine-readable JSON output (`--json`).
+  Landed 2026-05-11. Code-frame human output was already wired
+  through `crates/otter-cli/src/error_render.rs`
+  (`oxc-miette`); the new
+  `crates/otter-runtime/tests/diagnostic_json_roundtrip.rs`
+  pins serde round-trip byte-identity for every plan category
+  diagnostic and for `OtterError` envelopes, and
+  `crates/otter-cli/tests/json_diagnostics_per_category.rs`
+  exercises the live `otter --json <file>` exit path against a
+  fixture per category (parse / resolve / runtime / permission).
+- [x] Add stack-trace source mapping using the runtime-owned source-map table.
+  Landed 2026-05-11. `otter_vm::snapshot_frames` was fixed in
+  two places: (1) the per-frame `module` field now reports the
+  function's linker-stamped `module_url` instead of the bytecode
+  module's name, so multi-fragment graphs surface the original
+  source URL; (2) span lookup uses `partition_point`-based
+  predecessor PC matching against `Function::spans` so the
+  reported span is the source byte range covering the failing
+  instruction rather than the enclosing function's full span.
+  Uncaught throws now snapshot the stack at the originating
+  `Op::Throw` (via the new `Interpreter::pending_uncaught_frames`
+  buffer) before `unwind_throw` pops handler-less frames, so the
+  rendered diagnostic carries the call stack, not the empty
+  post-unwind stack. New public helper
+  `otter_runtime::Runtime::resolve_frame_span(module_url,
+  function_id, pc)` lets host-side tooling map back from a
+  `(module, function, pc)` triple to the original source byte
+  range using the existing per-runtime source-map table (now
+  keyed by `(module_url, function_id)` so per-function PC
+  namespaces resolve correctly).
+- [x] Add error-object formatting tests (Error.cause, AggregateError).
+  Landed 2026-05-11. The `Op::NewBuiltinError` / `Op::NewError`
+  fast-path compiler lowering is gated on
+  `builtin_error_construct_fast_path_applies` so calls that
+  carry an options bag (or AggregateError's options) fall
+  through to the standard `new`-call dispatch. The registered
+  native constructors in `otter_vm::error_classes` now honour
+  §20.5.6.1.1 InstallErrorCause (`options.cause` becomes a
+  non-enumerable, writable, configurable `cause` own property)
+  and §20.5.7.1 AggregateError (errors array materialised
+  through `make_aggregate_instance`, `options` at arg 2). The
+  runtime diagnostic mapper walks the thrown JS value via
+  `enrich_runtime_diagnostic_with_cause`: `Diagnostic.cause`
+  recurses through `.cause` properties up to
+  `MAX_CAUSE_CHAIN_DEPTH = 32`, and the new
+  `Diagnostic.aggregated_errors: Vec<Diagnostic>` field
+  materialises each entry of an `AggregateError.errors` array.
+  Coverage:
+  `crates/otter-runtime/tests/diagnostic_error_cause.rs`
+  (5 tests) and
+  `crates/otter-runtime/tests/diagnostic_aggregate_error.rs`
+  (3 tests).
+- [x] Add timeout-dump integration with module/source metadata.
+  Audit + minimal design landed 2026-05-11. The active CLI
+  (`crates/otter-cli`) does not expose a `--dump-on-timeout`
+  flag, and no `timeout_dump_is_reproducible_for_immediate_interrupt`
+  test exists in the active stack — the plan's earlier wording
+  referred to a feature that lives only on the parked
+  `crates-legacy/otter-nodejs` surface. Host-side timeout
+  (`RuntimeHandle::run_script` in `handle.rs:713`) fires
+  `OtterError::timeout_after(timeout)` from outside the VM
+  thread, so it cannot synchronously surface frames anyway. The
+  building block any future implementation will reuse —
+  `Runtime::resolve_frame_span(module_url, function_id, pc)` —
+  shipped as a side effect of the stack-mapping slice above.
+  Productionising a real `--dump-on-timeout` CLI is deferred to
+  a P3 slice once interrupt-with-frames replyback lands on the
+  inbox protocol.
 
 Acceptance:
 
-- Sample failures across all seven categories produce both pretty and `--json`
-  outputs that round-trip through `serde`.
-- Stack frames map to the original `.ts` source positions.
+- [x] Sample failures across all seven categories produce both pretty and
+  `--json` outputs that round-trip through `serde`. Verified by
+  `diagnostic_json_roundtrip.rs` (runtime, serde-level) and
+  `json_diagnostics_per_category.rs` (CLI binary, stderr
+  parse). The eighth `Internal` bucket is also covered.
+- [x] Stack frames map to the original `.ts` source positions. Verified by
+  `diagnostic_source_mapping.rs::top_frame_span_points_at_failing_source_substring`.
+
+Test262 deltas (vs the §P2.3 starting baselines):
+
+- `built-ins/Error`: 32 → 33 (+1)
+- `built-ins/NativeErrors`: 78 → 79 (+1)
+- `built-ins/AggregateError`: 14 → 15 (+1)
+- `built-ins/Function`: 364 (unchanged, baseline minimum met)
+- `built-ins/Function/prototype/bind`: 97/100 (unchanged)
+- `built-ins/Function/prototype/apply`: 45/48 (unchanged)
+- `built-ins/Function/15.3.2.1-11`: 12/12 (unchanged)
+- `language/arguments-object`: 155 (unchanged)
+- `language/module-code`: 156 (unchanged)
 
 ## P3: Performance And Scale
 

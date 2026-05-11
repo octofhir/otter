@@ -42,6 +42,7 @@ use std::collections::VecDeque;
 
 use smallvec::SmallVec;
 
+use crate::execution_context::ExecutionContext;
 use crate::{Frame, Value};
 use otter_gc::raw::RawGc;
 
@@ -76,6 +77,11 @@ pub struct Microtask {
     /// [`MicrotaskKind::AsyncResume`] the slot at index 0 carries
     /// the resolved value (fulfilment) or rejection reason.
     pub args: SmallVec<[Value; 4]>,
+    /// Execution context that owns the queued callable / parked
+    /// frame. Host-driven settlement can happen after another
+    /// script has run, so the microtask carries its dispatch
+    /// context.
+    pub context: Option<ExecutionContext>,
     /// Optional `{resolve, reject}` capability to settle with the
     /// task's outcome. Promise reaction jobs use this so the
     /// handler's return value flows into the next promise in the
@@ -322,6 +328,7 @@ mod tests {
             callee: Value::Number(NumberValue::from_i32(n)),
             this_value: Value::Undefined,
             args: SmallVec::new(),
+            context: None,
             result_capability: None,
             kind: MicrotaskKind::Call,
         }

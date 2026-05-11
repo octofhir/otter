@@ -20,8 +20,8 @@
 //! # Contents
 //!
 //! - [`DynamicImportLoader`] — host scheduler trait.
-//! - [`DynamicImportRegistry`] — per-isolate `u64 → JsPromiseHandle`
-//!   map for pending dynamic-import promises.
+//! - [`DynamicImportRegistry`] — per-isolate `u64 → pending entry`
+//!   map for dynamic-import promises and their origin contexts.
 //!
 //! # Invariants
 //!
@@ -47,6 +47,7 @@ use std::sync::Arc;
 use otter_gc::raw::RawGc;
 
 use crate::JsPromiseHandle;
+use crate::execution_context::ExecutionContext;
 
 /// Host-side scheduler the runtime layer plugs in. Lives behind
 /// an [`Arc<dyn DynamicImportLoader>`] on [`crate::Interpreter`].
@@ -67,10 +68,21 @@ pub trait DynamicImportLoader: Send + Sync {
 /// Cloneable handle the VM uses to talk to the host scheduler.
 pub type DynamicImportLoaderHandle = Arc<dyn DynamicImportLoader>;
 
+/// Pending dynamic-import state keyed by host-issued token.
+#[derive(Debug, Clone)]
+pub struct DynamicImportEntry {
+    /// Promise handle returned by `import(expr)`.
+    pub promise: JsPromiseHandle,
+    /// Execution context that ran the import call. The runtime
+    /// drains reactions against this context when the host load
+    /// settles.
+    pub context: ExecutionContext,
+}
+
 /// Per-interpreter map keyed by host-issued token.
 #[derive(Debug, Default)]
 pub struct DynamicImportRegistry {
-    entries: HashMap<u64, JsPromiseHandle>,
+    entries: HashMap<u64, DynamicImportEntry>,
     next_token: u64,
 }
 
@@ -88,19 +100,25 @@ impl DynamicImportRegistry {
     /// Register a fresh pending promise and return its token.
     /// Token allocation is monotonic — reuse is impossible inside
     /// one interpreter's lifetime.
-    pub fn insert(&mut self, handle: JsPromiseHandle) -> u64 {
+    pub fn insert(&mut self, handle: JsPromiseHandle, context: ExecutionContext) -> u64 {
         let token = self.next_token;
         self.next_token = self
             .next_token
             .checked_add(1)
             .expect("dynamic-import token overflow within one interpreter lifetime");
-        self.entries.insert(token, handle);
+        self.entries.insert(
+            token,
+            DynamicImportEntry {
+                promise: handle,
+                context,
+            },
+        );
         token
     }
 
     /// Pop the entry matching `token` (consumes — settlement is
     /// one-shot per §27.2.1.{4,7}).
-    pub fn take(&mut self, token: u64) -> Option<JsPromiseHandle> {
+    pub fn take(&mut self, token: u64) -> Option<DynamicImportEntry> {
         self.entries.remove(&token)
     }
 
@@ -121,9 +139,9 @@ impl DynamicImportRegistry {
     /// pending promise survives any GC between scheduling and
     /// settlement.
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        for handle in self.entries.values() {
+        for entry in self.entries.values() {
             // JsPromiseHandle exposes its body slot via Value::trace.
-            let value = crate::Value::Promise(*handle);
+            let value = crate::Value::Promise(entry.promise);
             value.trace_value_slots(visitor);
         }
     }

@@ -422,6 +422,7 @@ fn microtask_payload_root_survives_force_gc() {
         callee: otter_vm::Value::Undefined,
         this_value: otter_vm::Value::Undefined,
         args: smallvec::smallvec![otter_vm::Value::Object(object)],
+        context: None,
         result_capability: None,
         kind: otter_vm::MicrotaskKind::Call,
     });
@@ -479,6 +480,7 @@ fn parked_frame_keeps_alive() {
             promise: Value::Undefined,
             resolve: Value::Undefined,
             reject: Value::Undefined,
+            context: None,
         },
         None,
     );

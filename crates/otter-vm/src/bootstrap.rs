@@ -993,15 +993,15 @@ fn install_function(
     }
 
     fn function_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let (interp, module) = ctx.interp_mut_and_current_module();
-        let Some(module) = module else {
+        let (interp, context) = ctx.interp_mut_and_context();
+        let Some(context) = context else {
             return Err(NativeError::TypeError {
                 name: "Function",
-                reason: "missing bytecode module for Function constructor".to_string(),
+                reason: "missing execution context for Function constructor".to_string(),
             });
         };
         interp
-            .build_function_constructor(module, args)
+            .build_function_constructor(&context, args)
             .map_err(|err| {
                 let reason = format!("{err}");
                 match err {

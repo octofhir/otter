@@ -42,6 +42,7 @@ pub mod date;
 pub mod bootstrap;
 pub mod dynamic_import;
 pub mod error_classes;
+pub mod execution_context;
 pub mod function_metadata;
 pub mod function_prototype;
 pub mod gc_trace;
@@ -76,11 +77,13 @@ pub mod temporal;
 pub mod timers;
 pub mod weak_refs;
 
+pub use execution_context::ExecutionContext;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use otter_bytecode::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Constant, Function, Op, Operand,
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, Op, Operand,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -2121,6 +2124,13 @@ pub struct Interpreter {
     /// original thrown value is preserved here until the outer
     /// dispatch loop re-throws it on the still-live caller stack.
     pending_uncaught_throw: Option<Value>,
+    /// Stack-frame snapshot captured at the moment of the
+    /// originating `Op::Throw` (before [`Self::unwind_throw`]
+    /// pops handler-less frames). Surfaces as [`RunError::frames`]
+    /// for [`VmError::Uncaught`] so embedders see the call site,
+    /// not the empty post-unwind stack. Cleared at every `run_*`
+    /// entry and at every successful catch.
+    pending_uncaught_frames: Option<Vec<StackFrameSnapshot>>,
     /// Per-function user-property bag (§20.2.4 Function-instance
     /// properties + ordinary [[Set]] semantics for callables).
     /// `function_id` → `JsObject` carrying anything the user wrote
@@ -2293,6 +2303,7 @@ impl Interpreter {
             eval_hook: None,
             pending_generator_throw: None,
             pending_uncaught_throw: None,
+            pending_uncaught_frames: None,
             function_user_props: std::collections::HashMap::new(),
             function_deleted_metadata: std::collections::HashSet::new(),
             console_sink: console::default_console_sink(),
@@ -2358,19 +2369,23 @@ impl Interpreter {
     /// so reactions land on the per-isolate microtask queue;
     /// callers are expected to drain microtasks after calling
     /// this. A missing or already-settled token is a silent no-op.
-    pub fn settle_dynamic_import(&mut self, token: u64, outcome: Result<Value, Value>) -> bool {
-        let handle = match self.dynamic_import_registry.take(token) {
-            Some(h) => h,
-            None => return false,
+    pub fn settle_dynamic_import(
+        &mut self,
+        token: u64,
+        outcome: Result<Value, Value>,
+    ) -> Option<ExecutionContext> {
+        let entry = match self.dynamic_import_registry.take(token) {
+            Some(entry) => entry,
+            None => return None,
         };
         let jobs = match outcome {
-            Ok(value) => crate::JsPromise::fulfill(&handle, &mut self.gc_heap, value),
-            Err(reason) => crate::JsPromise::reject(&handle, &mut self.gc_heap, reason),
+            Ok(value) => crate::JsPromise::fulfill(&entry.promise, &mut self.gc_heap, value),
+            Err(reason) => crate::JsPromise::reject(&entry.promise, &mut self.gc_heap, reason),
         };
         for j in jobs.jobs {
             self.microtasks.enqueue(j);
         }
-        true
+        Some(entry.context)
     }
 
     /// Replace the sink used by `console.*` methods.
@@ -2484,14 +2499,14 @@ impl Interpreter {
 
     fn callable_bind_metadata_get(
         &self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: &Value,
         key: &str,
     ) -> Result<BindMetadataGet, VmError> {
         match target {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 match self.ordinary_function_own_property_descriptor(
-                    Some(module),
+                    Some(context),
                     *function_id,
                     key,
                 )? {
@@ -2517,7 +2532,7 @@ impl Interpreter {
                 }
             }
             Value::ClassConstructor(class) => {
-                self.callable_bind_metadata_get(module, &class.ctor(&self.gc_heap), key)
+                self.callable_bind_metadata_get(context, &class.ctor(&self.gc_heap), key)
             }
             Value::Object(obj) => {
                 if let Some(desc) = object::get_own_descriptor(*obj, &self.gc_heap, key) {
@@ -2525,7 +2540,7 @@ impl Interpreter {
                 }
                 match object::constructor_native(*obj, &self.gc_heap) {
                     Some(native @ Value::NativeFunction(_)) => {
-                        self.callable_bind_metadata_get(module, &native, key)
+                        self.callable_bind_metadata_get(context, &native, key)
                     }
                     _ => Ok(BindMetadataGet::Value(Value::Undefined)),
                 }
@@ -2561,7 +2576,7 @@ impl Interpreter {
 
     fn ordinary_function_own_property_descriptor(
         &self,
-        module: Option<&BytecodeModule>,
+        context: Option<&ExecutionContext>,
         function_id: u32,
         key: &str,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
@@ -2579,11 +2594,11 @@ impl Interpreter {
         {
             return Ok(None);
         }
-        let Some(module) = module else {
+        let Some(context) = context else {
             return Ok(None);
         };
         let ctx = function_metadata::FunctionMetadataContext::new(
-            module,
+            context,
             &self.gc_heap,
             &self.string_heap,
             &self.function_user_props,
@@ -2598,14 +2613,14 @@ impl Interpreter {
 
     fn ordinary_function_define_own_property(
         &mut self,
-        module: Option<&BytecodeModule>,
+        context: Option<&ExecutionContext>,
         function_id: u32,
         key: &str,
         desc_obj: Option<JsObject>,
         descriptor: object::PropertyDescriptor,
     ) -> Result<bool, VmError> {
         let descriptor =
-            match self.ordinary_function_own_property_descriptor(module, function_id, key)? {
+            match self.ordinary_function_own_property_descriptor(context, function_id, key)? {
                 Some(existing) => {
                     let descriptor =
                         if function_metadata::ordinary_function_metadata_key(key).is_some() {
@@ -2663,7 +2678,7 @@ impl Interpreter {
 
     pub(crate) fn try_function_object_static_call(
         &mut self,
-        module: Option<&BytecodeModule>,
+        context: Option<&ExecutionContext>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -2682,7 +2697,7 @@ impl Interpreter {
                 | Value::NativeFunction(_)
         ) && matches!(method, M::GetOwnPropertyDescriptor | M::HasOwn | M::Keys)
         {
-            let Some(module) = module else {
+            let Some(context) = context else {
                 return if matches!(target, Value::Proxy(_)) {
                     Err(VmError::InvalidOperand)
                 } else {
@@ -2690,7 +2705,7 @@ impl Interpreter {
                 };
             };
             if matches!(method, M::Keys) {
-                let keys = self.enumerable_own_string_keys_for_value(module, target.clone(), 0)?;
+                let keys = self.enumerable_own_string_keys_for_value(context, target.clone(), 0)?;
                 let mut values = Vec::with_capacity(keys.len());
                 for key in keys {
                     values.push(Value::String(
@@ -2704,7 +2719,7 @@ impl Interpreter {
                 )?)));
             }
             let desc =
-                self.get_own_property_descriptor_for_value(module, target.clone(), args.get(1))?;
+                self.get_own_property_descriptor_for_value(context, target.clone(), args.get(1))?;
             if matches!(method, M::HasOwn) {
                 return Ok(Some(Value::Boolean(desc.is_some())));
             }
@@ -2734,7 +2749,7 @@ impl Interpreter {
                 let ok = match (&target, function_id, key) {
                     (_, Some(function_id), VmPropertyKey::String(key)) => self
                         .ordinary_function_define_own_property(
-                            module,
+                            context,
                             function_id,
                             &key,
                             Some(desc_obj),
@@ -2770,7 +2785,7 @@ impl Interpreter {
                 let key = Self::coerce_vm_property_key(args.get(1))?;
                 let desc = match (&target, function_id, key) {
                     (_, Some(function_id), VmPropertyKey::String(key)) => {
-                        self.ordinary_function_own_property_descriptor(module, function_id, &key)?
+                        self.ordinary_function_own_property_descriptor(context, function_id, &key)?
                     }
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let Some(bag) = self.function_user_props.get(&function_id).copied() else {
@@ -2859,17 +2874,17 @@ impl Interpreter {
 
     pub(crate) fn get_own_property_descriptor_for_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: Value,
         key: Option<&Value>,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
         let key = Self::coerce_vm_property_key(key)?;
-        self.ordinary_get_own_property_descriptor_value(module, target, &key, 0)
+        self.ordinary_get_own_property_descriptor_value(context, target, &key, 0)
     }
 
     fn enumerable_own_string_keys_for_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: Value,
         hops: usize,
     ) -> Result<Vec<String>, VmError> {
@@ -2879,7 +2894,7 @@ impl Interpreter {
         match target {
             Value::Proxy(proxy) => {
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
-                let keys = match self.invoke_proxy_trap(module, &proxy, "ownKeys", trap_args)? {
+                let keys = match self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)? {
                     Some(Value::Array(arr)) => {
                         crate::array::with_elements(arr, &self.gc_heap, |elements| {
                             elements.to_vec()
@@ -2887,7 +2902,7 @@ impl Interpreter {
                     }
                     Some(Value::Undefined) | Some(Value::Null) | None => {
                         return self.enumerable_own_string_keys_for_value(
-                            module,
+                            context,
                             proxy.target(),
                             hops + 1,
                         );
@@ -2905,7 +2920,7 @@ impl Interpreter {
                     };
                     let name = name.to_lossy_string();
                     let desc = self.ordinary_get_own_property_descriptor_value(
-                        module,
+                        context,
                         Value::Proxy(proxy.clone()),
                         &VmPropertyKey::String(name.clone()),
                         hops + 1,
@@ -2963,7 +2978,7 @@ impl Interpreter {
 
     fn ordinary_delete_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
@@ -2976,9 +2991,9 @@ impl Interpreter {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![proxy.target(), key_value];
-                match self.invoke_proxy_trap(module, &proxy, "deleteProperty", trap_args)? {
+                match self.invoke_proxy_trap(context, &proxy, "deleteProperty", trap_args)? {
                     Some(value) => Ok(value.to_boolean()),
-                    None => self.ordinary_delete_value(module, proxy.target(), key, hops + 1),
+                    None => self.ordinary_delete_value(context, proxy.target(), key, hops + 1),
                 }
             }
             Value::Object(obj) => {
@@ -3030,7 +3045,7 @@ impl Interpreter {
 
     fn ordinary_set_data_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: Value,
         key: &VmPropertyKey,
         value: Value,
@@ -3045,10 +3060,10 @@ impl Interpreter {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![proxy.target(), key_value, value.clone(), receiver];
-                match self.invoke_proxy_trap(module, &proxy, "set", trap_args)? {
+                match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                     Some(result) => Ok(result.to_boolean()),
                     None => self.ordinary_set_data_value(
-                        module,
+                        context,
                         proxy.target(),
                         key,
                         value,
@@ -3090,7 +3105,7 @@ impl Interpreter {
             Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
                 VmPropertyKey::String(key) => {
                     let descriptor = match self.ordinary_function_own_property_descriptor(
-                        Some(module),
+                        Some(context),
                         function_id,
                         key,
                     )? {
@@ -3104,7 +3119,7 @@ impl Interpreter {
                         None => object::PropertyDescriptor::data(value, true, true, true),
                     };
                     self.ordinary_function_define_own_property(
-                        Some(module),
+                        Some(context),
                         function_id,
                         key,
                         None,
@@ -3134,7 +3149,7 @@ impl Interpreter {
     /// OrdinaryGet step 4.
     fn function_property_get(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
@@ -3186,7 +3201,7 @@ impl Interpreter {
         }
         if name == "name" || name == "length" {
             let ctx = function_metadata::FunctionMetadataContext::new(
-                module,
+                context,
                 &self.gc_heap,
                 &self.string_heap,
                 &self.function_user_props,
@@ -3297,7 +3312,7 @@ impl Interpreter {
     ///   cleanly through the bytecode dump.
     fn resolve_module_namespace(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         referrer: &str,
         specifier: &str,
     ) -> Option<JsObject> {
@@ -3306,13 +3321,8 @@ impl Interpreter {
         let target_url = if let Some(hit) = self.module_resolution_cache.get(&key) {
             hit.clone()
         } else {
-            let target = module
-                .module_resolutions
-                .iter()
-                .find(|r| r.referrer == referrer && r.specifier == specifier)?
-                .target
-                .clone();
-            let target_rc: std::rc::Rc<str> = std::rc::Rc::from(target.as_str());
+            let target = context.module_resolution_target(referrer, specifier)?;
+            let target_rc: std::rc::Rc<str> = std::rc::Rc::from(target);
             self.module_resolution_cache.insert(key, target_rc.clone());
             target_rc
         };
@@ -3651,6 +3661,7 @@ impl Interpreter {
                 callee: job.cleanup_callback,
                 this_value: Value::Undefined,
                 args,
+                context: job.context,
                 result_capability: None,
                 kind: MicrotaskKind::FinalizationCallback,
             });
@@ -3664,9 +3675,10 @@ impl Interpreter {
     /// Returns [`RunError`] (a `VmError` plus a stack-frame
     /// snapshot) on bytecode malformation, type mismatch, OOM,
     /// interrupt, or stack overflow.
-    pub fn run(&mut self, module: &BytecodeModule) -> Result<Value, RunError> {
+    pub fn run(&mut self, context: &ExecutionContext) -> Result<Value, RunError> {
         self.pending_uncaught_throw = None;
-        match self.run_inner(module) {
+        self.pending_uncaught_frames = None;
+        match self.run_inner(context) {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError { error, frames }),
         }
@@ -3685,7 +3697,18 @@ impl Interpreter {
     /// where this drain stopped. Once the `Promise` constructor
     /// lands (task 34), this flips to spec semantics ("rejected
     /// promise, continue draining").
-    pub fn drain_microtasks(&mut self, module: &BytecodeModule) -> Result<(), RunError> {
+    pub fn drain_microtasks(&mut self, context: &ExecutionContext) -> Result<(), RunError> {
+        self.drain_microtasks_with_default(Some(context.clone()))
+    }
+
+    /// Drain queued microtasks using each task's origin context,
+    /// falling back to the caller-supplied context for jobs created
+    /// inside the same VM turn. Host-settlement paths pass `None`
+    /// so missing task origin is reported as an engine error.
+    pub fn drain_microtasks_with_default(
+        &mut self,
+        default_context: Option<ExecutionContext>,
+    ) -> Result<(), RunError> {
         let mut iters: u32 = 0;
         loop {
             let Some(batch) = self.microtasks.begin_drain() else {
@@ -3713,7 +3736,15 @@ impl Interpreter {
                     });
                 }
                 iters += 1;
-                if let Err(err) = self.invoke_microtask(module, task) {
+                let context = task.context.clone().or_else(|| default_context.clone());
+                let Some(context) = context else {
+                    self.microtasks.end_drain();
+                    return Err(RunError {
+                        error: VmError::InvalidOperand,
+                        frames: Vec::new(),
+                    });
+                };
+                if let Err(err) = self.invoke_microtask(&context, task) {
                     self.microtasks.end_drain();
                     return Err(err);
                 }
@@ -3733,7 +3764,7 @@ impl Interpreter {
     /// the task accumulated when it failed.
     fn invoke_microtask(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         task: Microtask,
     ) -> Result<(), RunError> {
         // Reaction-mode rejection forwarding (§27.2.1.3.2) reads the
@@ -3752,7 +3783,7 @@ impl Interpreter {
         } = task.kind
         {
             let value = task.args.into_iter().next().unwrap_or(Value::Undefined);
-            return self.run_async_resume(module, frame, await_dst, fulfilled, value);
+            return self.run_async_resume(context, frame, await_dst, fulfilled, value);
         }
         if let MicrotaskKind::AsyncGenResume {
             frame,
@@ -3762,7 +3793,7 @@ impl Interpreter {
         } = task.kind
         {
             let value = task.args.into_iter().next().unwrap_or(Value::Undefined);
-            return self.run_async_gen_resume(module, frame, await_dst, fulfilled, value, owner);
+            return self.run_async_gen_resume(context, frame, await_dst, fulfilled, value, owner);
         }
         // Resolve callee → function_id + upvalues. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
@@ -3806,19 +3837,23 @@ impl Interpreter {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 return match self.run_vm_intrinsic_sync(
-                    module,
+                    context,
                     intrinsic,
                     effective_this,
                     effective_args,
                 ) {
                     Ok(value) => {
-                        self.settle_microtask_capability(result_capability, Ok(value));
+                        self.settle_microtask_capability(context, result_capability, Ok(value));
                         Ok(())
                     }
                     Err(vm_err) => {
                         if result_capability.is_some() {
                             let reason = vm_err_to_value(&vm_err);
-                            self.settle_microtask_capability(result_capability, Err(reason));
+                            self.settle_microtask_capability(
+                                context,
+                                result_capability,
+                                Err(reason),
+                            );
                             Ok(())
                         } else {
                             Err(RunError {
@@ -3831,10 +3866,11 @@ impl Interpreter {
             }
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             return match call.invoke(&mut ctx, &argv) {
                 Ok(value) => {
-                    self.settle_microtask_capability(result_capability, Ok(value));
+                    self.settle_microtask_capability(context, result_capability, Ok(value));
                     Ok(())
                 }
                 Err(err) => {
@@ -3844,7 +3880,7 @@ impl Interpreter {
                         // downstream promise as a rejection rather
                         // than aborting the drain.
                         let reason = vm_err_to_value(&vm_err);
-                        self.settle_microtask_capability(result_capability, Err(reason));
+                        self.settle_microtask_capability(context, result_capability, Err(reason));
                         Ok(())
                     } else {
                         Err(RunError {
@@ -3877,7 +3913,7 @@ impl Interpreter {
                 });
             }
         };
-        let function = match module.functions.get(function_id as usize) {
+        let function = match context.function(function_id) {
             Some(f) => f,
             None => {
                 return Err(RunError {
@@ -3927,11 +3963,11 @@ impl Interpreter {
         }
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(new_frame);
-        match self.dispatch_loop(module, &mut stack) {
+        match self.dispatch_loop(context, &mut stack) {
             Ok(value) => {
                 // Reaction job: settle the downstream promise with
                 // the handler's return value (spec §27.2.5.4).
-                self.settle_microtask_capability(result_capability, Ok(value));
+                self.settle_microtask_capability(context, result_capability, Ok(value));
                 Ok(())
             }
             Err(error) => {
@@ -3949,10 +3985,10 @@ impl Interpreter {
                         .pending_uncaught_throw
                         .take()
                         .unwrap_or_else(|| vm_err_to_value(&error));
-                    self.settle_microtask_capability(result_capability, Err(reason));
+                    self.settle_microtask_capability(context, result_capability, Err(reason));
                     Ok(())
                 } else {
-                    let frames = snapshot_frames(module, &stack);
+                    let frames = snapshot_frames(context, &stack);
                     Err(RunError { error, frames })
                 }
             }
@@ -3964,6 +4000,7 @@ impl Interpreter {
     /// `queueMicrotask` callbacks).
     fn settle_microtask_capability(
         &mut self,
+        context: &ExecutionContext,
         cap: Option<microtask::MicrotaskCapability>,
         outcome: Result<Value, Value>,
     ) {
@@ -3982,6 +4019,7 @@ impl Interpreter {
             callee,
             this_value: Value::Undefined,
             args,
+            context: Some(context.clone()),
             result_capability: None,
             kind: microtask::MicrotaskKind::Call,
         });
@@ -3992,9 +4030,9 @@ impl Interpreter {
     /// snapshot is built only when a `VmError` actually escapes.
     fn run_inner(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
-        let main = module.main();
+        let main = context.main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let upvalues =
             Frame::build_upvalues(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))
@@ -4011,7 +4049,8 @@ impl Interpreter {
         // The dispatch loop's exit returns the result promise's
         // resolved value once microtasks drain.
         let entry_promise = if main.is_async {
-            let result = JsPromiseHandle::pending(&mut self.gc_heap)
+            let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending(&mut self.gc_heap)
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
             entry.async_state = Some(AsyncFrameState {
                 result_promise: result,
@@ -4022,14 +4061,14 @@ impl Interpreter {
         };
         stack.push(entry);
 
-        let dispatch_result = self.dispatch_loop(module, &mut stack);
+        let dispatch_result = self.dispatch_loop(context, &mut stack);
         match dispatch_result {
             Ok(value) => {
                 if let Some(promise) = entry_promise {
                     // Drain microtasks until the entry promise
                     // settles. The settled value (or rejection)
                     // becomes the program's completion value.
-                    if let Err(err) = self.drain_microtasks(module) {
+                    if let Err(err) = self.drain_microtasks_with_default(Some(context.clone())) {
                         return Err((err.error, err.frames));
                     }
                     match promise.state(&self.gc_heap) {
@@ -4048,7 +4087,10 @@ impl Interpreter {
                 Ok(value)
             }
             Err(err) => {
-                let frames = snapshot_frames(module, &stack);
+                let frames = self
+                    .pending_uncaught_frames
+                    .take()
+                    .unwrap_or_else(|| snapshot_frames(context, &stack));
                 Err((err, frames))
             }
         }
@@ -4069,18 +4111,23 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
     fn dispatch_loop(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         stack: &mut SmallVec<[Frame; 8]>,
     ) -> Result<Value, VmError> {
         loop {
-            match self.dispatch_loop_inner(module, stack) {
+            match self.dispatch_loop_inner(context, stack) {
                 Ok(value) => return Ok(value),
                 Err(err) => {
                     if matches!(err, VmError::Uncaught { .. })
                         && !stack.is_empty()
                         && let Some(thrown) = self.pending_uncaught_throw.take()
                     {
-                        self.unwind_throw(stack, thrown)?;
+                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                        let unwind = self.unwind_throw(stack, thrown);
+                        if unwind.is_ok() {
+                            self.pending_uncaught_frames = None;
+                        }
+                        unwind?;
                         if stack.is_empty() {
                             return Ok(Value::Undefined);
                         }
@@ -4092,7 +4139,12 @@ impl Interpreter {
                         } else {
                             None
                         };
-                        self.unwind_throw_with_uncaught(stack, thrown, uncaught)?;
+                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                        let unwind = self.unwind_throw_with_uncaught(stack, thrown, uncaught);
+                        if unwind.is_ok() {
+                            self.pending_uncaught_frames = None;
+                        }
+                        unwind?;
                         if stack.is_empty() {
                             return Ok(Value::Undefined);
                         }
@@ -4209,7 +4261,7 @@ impl Interpreter {
 
     fn dispatch_loop_inner(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         stack: &mut SmallVec<[Frame; 8]>,
     ) -> Result<Value, VmError> {
         loop {
@@ -4231,9 +4283,8 @@ impl Interpreter {
             }
             let top_idx = stack.len() - 1;
             let function_id = stack[top_idx].function_id;
-            let function = module
-                .functions
-                .get(function_id as usize)
+            let function = context
+                .function(function_id)
                 .ok_or(VmError::InvalidOperand)?;
             let pc = stack[top_idx].pc;
             let instr = function
@@ -4265,27 +4316,27 @@ impl Interpreter {
                     continue;
                 }
                 Op::Call => {
-                    self.do_call(stack, module, &operands)?;
+                    self.do_call(stack, context, &operands)?;
                     continue;
                 }
                 Op::CallWithThis => {
-                    self.do_call_with_this(stack, module, &operands)?;
+                    self.do_call_with_this(stack, context, &operands)?;
                     continue;
                 }
                 Op::CallMethodValue => {
-                    self.do_call_method_value(stack, module, &operands)?;
+                    self.do_call_method_value(stack, context, &operands)?;
                     continue;
                 }
                 Op::CallSpread => {
-                    self.do_call_spread(stack, module, &operands)?;
+                    self.do_call_spread(stack, context, &operands)?;
                     continue;
                 }
                 Op::New => {
-                    self.do_construct(stack, module, &operands)?;
+                    self.do_construct(stack, context, &operands)?;
                     continue;
                 }
                 Op::NewSpread => {
-                    self.do_construct_spread(stack, module, &operands)?;
+                    self.do_construct_spread(stack, context, &operands)?;
                     continue;
                 }
                 Op::Throw => {
@@ -4295,12 +4346,27 @@ impl Interpreter {
                         .get(src as usize)
                         .cloned()
                         .ok_or(VmError::InvalidOperand)?;
-                    self.unwind_throw(stack, value)?;
+                    // Capture frames at the originating throw site
+                    // before `unwind_throw` pops handler-less
+                    // frames. If a catch absorbs the throw the
+                    // unwind path clears `pending_uncaught_frames`
+                    // through [`Self::clear_pending_uncaught_frames`].
+                    self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    let unwind = self.unwind_throw(stack, value);
+                    if unwind.is_ok() {
+                        self.pending_uncaught_frames = None;
+                    }
+                    unwind?;
                     continue;
                 }
                 Op::EndFinally => {
                     if let Some(value) = stack[top_idx].pending_throw.take() {
-                        self.unwind_throw(stack, value)?;
+                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                        let unwind = self.unwind_throw(stack, value);
+                        if unwind.is_ok() {
+                            self.pending_uncaught_frames = None;
+                        }
+                        unwind?;
                     } else {
                         stack[top_idx].pc = stack[top_idx]
                             .pc
@@ -4313,7 +4379,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
                     let awaited = read_register(&stack[top_idx], src)?.clone();
-                    self.do_await(stack, dst, awaited)?;
+                    self.do_await(stack, context, dst, awaited)?;
                     if stack.is_empty() {
                         return Ok(Value::Undefined);
                     }
@@ -4337,10 +4403,8 @@ impl Interpreter {
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let popped = stack.pop().expect("frame present");
                     owner.park_after_yield(&mut self.gc_heap, popped, dst, yielded.clone());
-                    let pending_request_resolve = if owner.is_async(&self.gc_heap) {
-                        owner
-                            .take_pending_request(&mut self.gc_heap)
-                            .map(|cap| cap.resolve)
+                    let pending_request = if owner.is_async(&self.gc_heap) {
+                        owner.take_pending_request(&mut self.gc_heap)
                     } else {
                         None
                     };
@@ -4349,11 +4413,13 @@ impl Interpreter {
                     // `{value, done: false}`. Sync generators bubble
                     // the yielded value out so the `resume_generator`
                     // caller can shape it.
-                    if let Some(resolve) = pending_request_resolve {
+                    if let Some(cap) = pending_request {
                         let record = make_iter_result(yielded.clone(), false, &mut self.gc_heap)?;
+                        let capability_context =
+                            cap.context.clone().unwrap_or_else(|| context.clone());
                         self.run_callable_sync(
-                            module,
-                            &resolve,
+                            &capability_context,
+                            &cap.resolve,
                             Value::Undefined,
                             smallvec::smallvec![record],
                         )?;
@@ -4366,7 +4432,7 @@ impl Interpreter {
                 // pushes a frame, so the dispatch happens here —
                 // outside the in-frame mutable borrow below.
                 Op::ToNumber => {
-                    if let Some(()) = self.try_to_primitive_dispatch(stack, module, &operands)? {
+                    if let Some(()) = self.try_to_primitive_dispatch(stack, context, &operands)? {
                         continue;
                     }
                 }
@@ -4380,7 +4446,7 @@ impl Interpreter {
                 // the dispatch loop afterwards — the in-frame
                 // match below has no arm for `Op::ToPrimitive`.
                 Op::ToPrimitive => {
-                    self.drive_to_primitive(stack, module, &operands)?;
+                    self.drive_to_primitive(stack, context, &operands)?;
                     continue;
                 }
                 // §7.4.3 `GetIterator`. Built-in iterables fall
@@ -4388,7 +4454,7 @@ impl Interpreter {
                 // route through the call-frame ladder.
                 // <https://tc39.es/ecma262/#sec-getiterator>
                 Op::GetIterator => {
-                    if self.drive_get_iterator(stack, module, &operands)? {
+                    if self.drive_get_iterator(stack, context, &operands)? {
                         continue;
                     }
                 }
@@ -4398,7 +4464,7 @@ impl Interpreter {
                 // `done`.
                 // <https://tc39.es/ecma262/#sec-iteratornext>
                 Op::IteratorNext => {
-                    if self.drive_iterator_next(stack, module, &operands)? {
+                    if self.drive_iterator_next(stack, context, &operands)? {
                         continue;
                     }
                 }
@@ -4410,12 +4476,12 @@ impl Interpreter {
                 // below.
                 // <https://tc39.es/ecma262/#sec-ordinaryget>
                 Op::LoadProperty => {
-                    if self.drive_load_property(stack, module, &operands)? {
+                    if self.drive_load_property(stack, context, &operands)? {
                         continue;
                     }
                 }
                 Op::LoadElement => {
-                    if self.drive_load_element(stack, module, &operands)? {
+                    if self.drive_load_element(stack, context, &operands)? {
                         continue;
                     }
                 }
@@ -4424,17 +4490,17 @@ impl Interpreter {
                 // and non-extensible rejections surface here too.
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
-                    if self.drive_store_property(stack, module, &operands)? {
+                    if self.drive_store_property(stack, context, &operands)? {
                         continue;
                     }
                 }
                 Op::StoreElement => {
-                    if self.drive_store_element(stack, module, &operands)? {
+                    if self.drive_store_element(stack, context, &operands)? {
                         continue;
                     }
                 }
                 Op::Instanceof => {
-                    if self.drive_instanceof(stack, module, &operands)? {
+                    if self.drive_instanceof(stack, context, &operands)? {
                         continue;
                     }
                 }
@@ -4442,17 +4508,17 @@ impl Interpreter {
                 // [[Delete]] — invoke `has` / `deleteProperty`
                 // traps when the receiver is a Proxy.
                 Op::HasProperty => {
-                    if self.drive_has_property_proxy(stack, module, &operands)? {
+                    if self.drive_has_property_proxy(stack, context, &operands)? {
                         continue;
                     }
                 }
                 Op::DeleteProperty => {
-                    if self.drive_delete_property_proxy(stack, module, &operands)? {
+                    if self.drive_delete_property_proxy(stack, context, &operands)? {
                         continue;
                     }
                 }
                 Op::DeleteElement => {
-                    if self.drive_delete_element_proxy(stack, module, &operands)? {
+                    if self.drive_delete_element_proxy(stack, context, &operands)? {
                         continue;
                     }
                 }
@@ -4461,12 +4527,12 @@ impl Interpreter {
                 // `setPrototypeOf` traps when the receiver is a
                 // Proxy.
                 Op::GetPrototype => {
-                    if self.drive_get_prototype_proxy(stack, module, &operands)? {
+                    if self.drive_get_prototype_proxy(stack, context, &operands)? {
                         continue;
                     }
                 }
                 Op::SetPrototype => {
-                    if self.drive_set_prototype_proxy(stack, module, &operands)? {
+                    if self.drive_set_prototype_proxy(stack, context, &operands)? {
                         continue;
                     }
                 }
@@ -4480,10 +4546,7 @@ impl Interpreter {
                     let src_reg = register_operand(operands.get(1))?;
                     let top_idx = stack.len() - 1;
                     let value = read_register(&stack[top_idx], src_reg)?.clone();
-                    let force_strict = module
-                        .functions
-                        .get(stack[top_idx].function_id as usize)
-                        .is_some_and(|function| function.is_strict);
+                    let force_strict = context.function_is_strict(stack[top_idx].function_id);
                     let result = self.run_eval(&value, force_strict)?;
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, result)?;
@@ -4504,7 +4567,7 @@ impl Interpreter {
                         let r = register_operand(operands.get(2 + i))?;
                         args.push(read_register(&stack[top_idx], r)?.clone());
                     }
-                    let result = self.build_function_constructor(module, &args)?;
+                    let result = self.build_function_constructor(context, &args)?;
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, result)?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -4518,9 +4581,8 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let (elements, kind, mapped_entries, callee) = {
                         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                        let function = module
-                            .functions
-                            .get(frame.function_id as usize)
+                        let function = context
+                            .function(frame.function_id)
                             .ok_or(VmError::InvalidOperand)?;
                         let elements = std::mem::take(&mut frame.incoming_args);
                         let mapped_entries = if function.arguments_object_kind
@@ -4626,20 +4688,18 @@ impl Interpreter {
                 Op::MakeFunction => {
                     let dst = register_operand(operands.first())?;
                     let idx = const_operand(operands.get(1))?;
-                    let function_id = match module.constants.get(idx as usize) {
-                        Some(Constant::FunctionId { index }) => *index,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
+                    let function_id = context
+                        .function_id_constant(idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, Value::Function { function_id })?;
                     frame.pc += 1;
                 }
                 Op::MakeClosure => {
                     let dst = register_operand(operands.first())?;
                     let idx = const_operand(operands.get(1))?;
-                    let function_id = match module.constants.get(idx as usize) {
-                        Some(Constant::FunctionId { index }) => *index,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
+                    let function_id = context
+                        .function_id_constant(idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let count = match operands.get(2) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
                         _ => return Err(VmError::InvalidOperand),
@@ -4660,11 +4720,7 @@ impl Interpreter {
                     // Arrow-closure receivers are bound lexically:
                     // every later invocation ignores the call site
                     // and uses the enclosing frame's `this`.
-                    let is_arrow = module
-                        .functions
-                        .get(function_id as usize)
-                        .map(|f| f.is_arrow)
-                        .unwrap_or(false);
+                    let is_arrow = context.function_is_arrow(function_id);
                     let bound_this = if is_arrow {
                         Some(Box::new(frame.this_value.clone()))
                     } else {
@@ -4712,10 +4768,9 @@ impl Interpreter {
                 Op::LoadString => {
                     let dst = register_operand(operands.first())?;
                     let idx = const_operand(operands.get(1))?;
-                    let units = match module.constants.get(idx as usize) {
-                        Some(otter_bytecode::Constant::String { utf16 }) => utf16.as_slice(),
-                        _ => return Err(VmError::InvalidOperand),
-                    };
+                    let units = context
+                        .string_constant_units(idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let s = JsString::from_utf16_units(units, &self.string_heap)?;
                     write_register(frame, dst, Value::String(s))?;
                     frame.pc += 1;
@@ -4733,12 +4788,10 @@ impl Interpreter {
                 Op::LoadNumber => {
                     let dst = register_operand(operands.first())?;
                     let idx = const_operand(operands.get(1))?;
-                    let value = match module.constants.get(idx as usize) {
-                        Some(Constant::Number { bits }) => {
-                            NumberValue::from_f64(f64::from_bits(*bits))
-                        }
-                        _ => return Err(VmError::InvalidOperand),
-                    };
+                    let bits = context
+                        .number_constant_bits(idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = NumberValue::from_f64(f64::from_bits(bits));
                     write_register(frame, dst, Value::Number(value))?;
                     frame.pc += 1;
                 }
@@ -4754,13 +4807,11 @@ impl Interpreter {
                 Op::LoadBigInt => {
                     let dst = register_operand(operands.first())?;
                     let idx = const_operand(operands.get(1))?;
-                    let value = match module.constants.get(idx as usize) {
-                        Some(Constant::BigInt { decimal }) => {
-                            bigint::BigIntValue::from_decimal(decimal)
-                                .ok_or(VmError::InvalidOperand)?
-                        }
-                        _ => return Err(VmError::InvalidOperand),
-                    };
+                    let decimal = context
+                        .bigint_decimal_constant(idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = bigint::BigIntValue::from_decimal(decimal)
+                        .ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, Value::BigInt(value))?;
                     frame.pc += 1;
                 }
@@ -4769,16 +4820,13 @@ impl Interpreter {
                     // literal caching is task 31's explicit non-goal.
                     let dst = register_operand(operands.first())?;
                     let idx = const_operand(operands.get(1))?;
-                    let regex = match module.constants.get(idx as usize) {
-                        Some(Constant::RegExp {
-                            pattern_utf16,
-                            flags,
-                        }) => regexp::JsRegExp::compile(&mut self.gc_heap, pattern_utf16, flags)
-                            .map_err(|e| VmError::InvalidRegExp {
-                                message: e.to_string(),
-                            })?,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
+                    let (pattern_utf16, flags) = context
+                        .regexp_constant(idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let regex = regexp::JsRegExp::compile(&mut self.gc_heap, pattern_utf16, flags)
+                        .map_err(|e| VmError::InvalidRegExp {
+                            message: e.to_string(),
+                        })?;
                     write_register(frame, dst, Value::RegExp(regex))?;
                     frame.pc += 1;
                 }
@@ -4871,7 +4919,9 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let obj_reg = register_operand(operands.get(1))?;
                     let name_idx = const_operand(operands.get(2))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = match read_register(frame, obj_reg)? {
                         Value::Object(o) => {
                             crate::object::get(*o, &self.gc_heap, &name).unwrap_or(Value::Undefined)
@@ -4899,7 +4949,7 @@ impl Interpreter {
                                             | Value::BoundFunction(_) => {
                                                 let ctx =
                                                     function_metadata::FunctionMetadataContext::new(
-                                                        module,
+                                                        context,
                                                         &self.gc_heap,
                                                         &self.string_heap,
                                                         &self.function_user_props,
@@ -4932,11 +4982,11 @@ impl Interpreter {
                         // <https://tc39.es/ecma262/#sec-function-instances>
                         Value::Function { function_id } => {
                             let fid = *function_id;
-                            self.function_property_get(module, fid, &name)?
+                            self.function_property_get(context, fid, &name)?
                         }
                         Value::Closure { function_id, .. } => {
                             let fid = *function_id;
-                            self.function_property_get(module, fid, &name)?
+                            self.function_property_get(context, fid, &name)?
                         }
                         Value::NativeFunction(native) => {
                             match native.own_property_descriptor(
@@ -4995,9 +5045,11 @@ impl Interpreter {
                     let obj_reg = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let src = register_operand(operands.get(2))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = read_register(frame, src)?.clone();
-                    let strict = Self::function_is_strict(module, frame.function_id as usize);
+                    let strict = Self::function_is_strict(context, frame.function_id);
                     let receiver = read_register(frame, obj_reg)?.clone();
                     let target = match &receiver {
                         Value::Object(o) => Some(*o),
@@ -5035,7 +5087,7 @@ impl Interpreter {
                             let fid = *function_id;
                             if matches!(name.as_str(), "name" | "length") {
                                 if let Some(desc) = self.ordinary_function_own_property_descriptor(
-                                    Some(module),
+                                    Some(context),
                                     fid,
                                     &name,
                                 )? && !desc.writable()
@@ -5202,7 +5254,9 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let obj_reg = register_operand(operands.get(1))?;
                     let name_idx = const_operand(operands.get(2))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let removed = match read_register(frame, obj_reg)? {
                         Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, &name),
                         Value::Function { function_id } | Value::Closure { function_id, .. } => {
@@ -5325,7 +5379,7 @@ impl Interpreter {
                             Value::String(key),
                         ) => {
                             match self.ordinary_function_own_property_descriptor(
-                                Some(module),
+                                Some(context),
                                 *function_id,
                                 &key.to_lossy_string(),
                             )? {
@@ -5423,7 +5477,7 @@ impl Interpreter {
                     let recv = read_register(frame, recv_reg)?.clone();
                     let idx_value = read_register(frame, idx_reg)?.clone();
                     let value = read_register(frame, src_reg)?.clone();
-                    let strict = Self::function_is_strict(module, frame.function_id as usize);
+                    let strict = Self::function_is_strict(context, frame.function_id);
                     match (&recv, &idx_value) {
                         // Symbol-keyed write on an object.
                         (Value::Object(obj), Value::Symbol(sym)) => {
@@ -5456,7 +5510,7 @@ impl Interpreter {
                         ) => {
                             let key = key.to_lossy_string();
                             match self.ordinary_function_own_property_descriptor(
-                                Some(module),
+                                Some(context),
                                 *function_id,
                                 &key,
                             )? {
@@ -5757,7 +5811,7 @@ impl Interpreter {
                     frame.pc += 1;
                 }
                 Op::Add => {
-                    self.run_add(module, &operands, frame)?;
+                    self.run_add(&operands, frame)?;
                 }
                 Op::Sub => {
                     self.run_numeric(&operands, frame, number::sub, bigint_sub_op)?;
@@ -5996,7 +6050,9 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let kind_idx = const_operand(operands.get(1))?;
                     let msg_reg = register_operand(operands.get(2))?;
-                    let kind_name = lookup_string_constant(module, kind_idx)?;
+                    let kind_name = context
+                        .string_constant(kind_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let kind =
                         ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
                     let value = read_register(frame, msg_reg)?.clone();
@@ -6027,7 +6083,9 @@ impl Interpreter {
                     // <https://tc39.es/ecma262/#sec-error-objects>
                     let dst = register_operand(operands.first())?;
                     let kind_idx = const_operand(operands.get(1))?;
-                    let kind_name = lookup_string_constant(module, kind_idx)?;
+                    let kind_name = context
+                        .string_constant(kind_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let kind =
                         ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
                     let ctor = self.error_classes.constructor(kind);
@@ -6037,7 +6095,9 @@ impl Interpreter {
                 Op::MathLoad => {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let value =
                         math::load_constant(&name).ok_or_else(|| VmError::UnknownIntrinsic {
                             name: format!("Math.{name}"),
@@ -6315,7 +6375,7 @@ impl Interpreter {
                     let pc = stack[top_idx].pc;
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let heap = self.string_heap.clone();
-                    let result = reflect::call(self, module, method, &args, &heap)?;
+                    let result = reflect::call(self, context, method, &args, &heap)?;
                     write_register(&mut stack[top_idx], dst, result)?;
                     continue;
                 }
@@ -6362,7 +6422,7 @@ impl Interpreter {
                         args.push(read_register(frame, r)?.clone());
                     }
                     let result =
-                        match self.try_function_object_static_call(Some(module), method, &args)? {
+                        match self.try_function_object_static_call(Some(context), method, &args)? {
                             Some(result) => result,
                             None => object_statics::call(
                                 method,
@@ -6399,6 +6459,7 @@ impl Interpreter {
                         callee,
                         this_value: Value::Undefined,
                         args,
+                        context: Some(context.clone()),
                         result_capability: None,
                         kind: microtask::MicrotaskKind::Call,
                     });
@@ -6412,7 +6473,9 @@ impl Interpreter {
                     if !self.is_callable_runtime(&executor) {
                         return Err(VmError::NotCallable);
                     }
-                    let (handle, resolve, reject) = promise_dispatch::construct(&mut self.gc_heap)?;
+                    let (handle, resolve, reject) =
+                        promise_dispatch::PromiseBuilder::with_context(context.clone())
+                            .construct(&mut self.gc_heap)?;
                     let promise_value = Value::Promise(handle);
                     write_register(frame, dst, promise_value)?;
                     // Advance pc, then invoke executor with [resolve, reject].
@@ -6422,7 +6485,7 @@ impl Interpreter {
                     args.push(reject);
                     self.invoke(
                         stack,
-                        module,
+                        context,
                         &executor,
                         Value::Undefined,
                         args,
@@ -6446,8 +6509,9 @@ impl Interpreter {
                     }
                     let argv: Vec<Value> = args.into_iter().collect();
                     frame.pc += 1;
-                    let result = promise_dispatch::statics_call(self, method, &argv)
-                        .map_err(native_to_vm_error)?;
+                    let result =
+                        promise_dispatch::statics_call(self, Some(context.clone()), method, &argv)
+                            .map_err(native_to_vm_error)?;
                     let top_idx = stack.len() - 1;
                     write_register(&mut stack[top_idx], dst, result)?;
                 }
@@ -6471,10 +6535,12 @@ impl Interpreter {
                 Op::ImportNamespace => {
                     let dst = register_operand(operands.first())?;
                     let spec_idx = const_operand(operands.get(1))?;
-                    let specifier = lookup_string_constant(module, spec_idx)?;
+                    let specifier = context
+                        .string_constant(spec_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let referrer = frame.module_url.clone();
                     let namespace = self
-                        .resolve_module_namespace(module, referrer.as_ref(), &specifier)
+                        .resolve_module_namespace(context, referrer.as_ref(), &specifier)
                         .ok_or(VmError::UnknownIntrinsic {
                             name: format!("import \"{specifier}\""),
                         })?;
@@ -6494,7 +6560,9 @@ impl Interpreter {
                     // free-identifier reads to this opcode.
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     if let Some(value) = crate::object::get(self.global_this, &self.gc_heap, &name)
                     {
                         write_register(frame, dst, value)?;
@@ -6512,7 +6580,9 @@ impl Interpreter {
                     // resolves to `undefined` rather than throwing.
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = crate::object::get(self.global_this, &self.gc_heap, &name)
                         .unwrap_or(Value::Undefined);
                     write_register(frame, dst, value)?;
@@ -6583,29 +6653,44 @@ impl Interpreter {
                     let spec_reg = register_operand(operands.get(1))?;
                     let spec_value = read_register(frame, spec_reg)?.clone();
                     let referrer = frame.module_url.clone();
+                    let import_context = context.clone();
                     let promise = match spec_value {
                         Value::String(s) => {
                             let specifier = s.to_lossy_string();
-                            if let Some(ns) =
-                                self.resolve_module_namespace(module, referrer.as_ref(), &specifier)
-                            {
-                                JsPromiseHandle::fulfilled(&mut self.gc_heap, Value::Object(ns))?
+                            if let Some(ns) = self.resolve_module_namespace(
+                                context,
+                                referrer.as_ref(),
+                                &specifier,
+                            ) {
+                                promise_dispatch::PromiseBuilder::with_context(
+                                    import_context.clone(),
+                                )
+                                .fulfilled(&mut self.gc_heap, Value::Object(ns))?
                             } else if let Some(loader) = self.dynamic_import_loader.clone() {
-                                let pending = JsPromiseHandle::pending(&mut self.gc_heap)?;
-                                let token = self.dynamic_import_registry.insert(pending);
+                                let pending = promise_dispatch::PromiseBuilder::with_context(
+                                    import_context.clone(),
+                                )
+                                .pending(&mut self.gc_heap)?;
+                                let token = self
+                                    .dynamic_import_registry
+                                    .insert(pending, import_context.clone());
                                 loader.schedule(token, specifier, referrer.as_ref().to_string());
                                 pending
                             } else {
                                 let reason = self.make_type_error(&format!(
                                     "dynamic import: module not resolvable: \"{specifier}\""
                                 ))?;
-                                JsPromiseHandle::rejected(&mut self.gc_heap, reason)?
+                                promise_dispatch::PromiseBuilder::with_context(
+                                    import_context.clone(),
+                                )
+                                .rejected(&mut self.gc_heap, reason)?
                             }
                         }
                         _ => {
                             let reason =
                                 self.make_type_error("dynamic import: specifier must be a string")?;
-                            JsPromiseHandle::rejected(&mut self.gc_heap, reason)?
+                            promise_dispatch::PromiseBuilder::with_context(import_context)
+                                .rejected(&mut self.gc_heap, reason)?
                         }
                     };
                     write_register(frame, dst, Value::Promise(promise))?;
@@ -6615,7 +6700,8 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let src = register_operand(operands.get(1))?;
                     let value = read_register(frame, src)?.clone();
-                    let promise = JsPromiseHandle::fulfilled(&mut self.gc_heap, value)?;
+                    let promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                        .fulfilled(&mut self.gc_heap, value)?;
                     write_register(frame, dst, Value::Promise(promise))?;
                     frame.pc += 1;
                 }
@@ -6674,7 +6760,7 @@ impl Interpreter {
                     frame.pc += 1;
                 }
                 Op::BindFunction => {
-                    self.drive_bind_function(stack, module, &operands)?;
+                    self.drive_bind_function(stack, context, &operands)?;
                     continue;
                 }
                 Op::GetIterator => {
@@ -6762,7 +6848,9 @@ impl Interpreter {
                 Op::SymbolLoad => {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let value =
                         symbol_dispatch::load_static(self, &name).map_err(symbol_to_vm_error)?;
                     write_register(frame, dst, value)?;
@@ -6844,7 +6932,9 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let kind_idx = const_operand(operands.get(1))?;
                     let iter_reg = register_operand(operands.get(2))?;
-                    let kind = lookup_string_constant(module, kind_idx)?;
+                    let kind = context
+                        .string_constant(kind_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let seed = read_register(frame, iter_reg)?.clone();
                     let value = build_collection(&kind, &seed, &mut self.gc_heap)?;
                     write_register(frame, dst, value)?;
@@ -6862,8 +6952,11 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let callback_reg = register_operand(operands.get(1))?;
                     let callback = read_register(frame, callback_reg)?.clone();
-                    let registry =
-                        crate::weak_refs::alloc_finalization_registry(&mut self.gc_heap, callback)?;
+                    let registry = crate::weak_refs::alloc_finalization_registry_with_context(
+                        &mut self.gc_heap,
+                        callback,
+                        Some(context.clone()),
+                    )?;
                     write_register(frame, dst, Value::FinalizationRegistry(registry))?;
                     frame.pc += 1;
                 }
@@ -6898,7 +6991,9 @@ impl Interpreter {
                 Op::TemporalLoad => {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
-                    let name = lookup_string_constant(module, name_idx)?;
+                    let name = context
+                        .string_constant(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let value = temporal::load_static(&name).map_err(temporal_to_vm_error)?;
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
@@ -6908,7 +7003,9 @@ impl Interpreter {
                     let class_idx = const_operand(operands.get(1))?;
                     let locale_reg = register_operand(operands.get(2))?;
                     let options_reg = register_operand(operands.get(3))?;
-                    let class = lookup_string_constant(module, class_idx)?;
+                    let class = context
+                        .string_constant(class_idx)
+                        .ok_or(VmError::InvalidOperand)?;
                     let locale = read_register(frame, locale_reg)?.clone();
                     let options = read_register(frame, options_reg)?.clone();
                     let value = intl::construct(&class, &locale, &options, &self.gc_heap)
@@ -6985,7 +7082,7 @@ impl Interpreter {
     fn drive_bind_function(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -7001,7 +7098,7 @@ impl Interpreter {
             return match state.stage {
                 PendingBindStage::Name => self.continue_bind_function_after_name(
                     stack,
-                    module,
+                    context,
                     dst,
                     state.target,
                     state.bound_this,
@@ -7040,10 +7137,10 @@ impl Interpreter {
             let r = register_operand(operands.get(4 + i))?;
             bound_args.push(read_register(&stack[top_idx], r)?.clone());
         }
-        match self.callable_bind_metadata_get(module, &target, "name")? {
+        match self.callable_bind_metadata_get(context, &target, "name")? {
             BindMetadataGet::Value(target_name) => self.continue_bind_function_after_name(
                 stack,
-                module,
+                context,
                 dst,
                 target,
                 bound_this,
@@ -7060,7 +7157,7 @@ impl Interpreter {
                     stage: PendingBindStage::Name,
                     target_name: None,
                 });
-                self.invoke(stack, module, &getter, target, SmallVec::new(), dst)
+                self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
             }
         }
     }
@@ -7068,7 +7165,7 @@ impl Interpreter {
     fn continue_bind_function_after_name(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         dst: u16,
         target: Value,
         bound_this: Value,
@@ -7077,7 +7174,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
-        match self.callable_bind_metadata_get(module, &target, "length")? {
+        match self.callable_bind_metadata_get(context, &target, "length")? {
             BindMetadataGet::Value(target_length) => {
                 stack[top_idx].pending_bind_function = None;
                 self.finish_bind_function(
@@ -7100,7 +7197,7 @@ impl Interpreter {
                     stage: PendingBindStage::Length,
                     target_name: Some(target_name),
                 });
-                self.invoke(stack, module, &getter, target, SmallVec::new(), dst)
+                self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
             }
         }
     }
@@ -7143,7 +7240,7 @@ impl Interpreter {
     fn do_call(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -7164,7 +7261,7 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, module, &callee, Value::Undefined, args, dst)
+        self.invoke(stack, context, &callee, Value::Undefined, args, dst)
     }
 
     /// Invoke `callee` with the explicit receiver `this_value` and
@@ -7180,7 +7277,7 @@ impl Interpreter {
     fn invoke(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
@@ -7232,7 +7329,8 @@ impl Interpreter {
             let call = native.call_target(&self.gc_heap);
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
@@ -7242,14 +7340,15 @@ impl Interpreter {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 let result =
-                    self.run_vm_intrinsic_sync(module, intrinsic, effective_this, effective_args)?;
+                    self.run_vm_intrinsic_sync(context, intrinsic, effective_this, effective_args)?;
                 let top_idx = stack.len() - 1;
                 write_register(&mut stack[top_idx], dst, result)?;
                 return Ok(());
             }
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
@@ -7267,14 +7366,14 @@ impl Interpreter {
                 effective_this.clone(),
                 Value::Array(argv_array),
             ];
-            let result = match self.invoke_proxy_trap(module, &proxy, "apply", trap_args)? {
+            let result = match self.invoke_proxy_trap(context, &proxy, "apply", trap_args)? {
                 Some(v) => v,
                 None => {
                     // Fall through to the target's [[Call]] —
                     // `proxy.target()` returns the original Value,
                     // which may be a callable directly.
                     let underlying = proxy.target();
-                    self.run_callable_sync(module, &underlying, effective_this, effective_args)?
+                    self.run_callable_sync(context, &underlying, effective_this, effective_args)?
                 }
             };
             let top_idx = stack.len() - 1;
@@ -7304,9 +7403,8 @@ impl Interpreter {
                 limit: self.max_stack_depth,
             });
         }
-        let function = module
-            .functions
-            .get(function_id as usize)
+        let function = context
+            .function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         // Async-call entry path (spec §27.7.5.1): synthesise a
         // fresh pending result promise, write it into the caller's
@@ -7315,7 +7413,8 @@ impl Interpreter {
         // `return_register = None` so its eventual completion
         // settles the promise instead of writing back.
         let (return_register, async_state) = if function.is_async {
-            let result_promise = JsPromiseHandle::pending(&mut self.gc_heap)?;
+            let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending(&mut self.gc_heap)?;
             let promise_value = Value::Promise(result_promise);
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, promise_value)?;
@@ -7416,6 +7515,7 @@ impl Interpreter {
     fn do_await(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
         dst: u16,
         awaited: Value,
     ) -> Result<(), VmError> {
@@ -7431,7 +7531,7 @@ impl Interpreter {
             if let Some(owner) = stack[top_idx].generator_owner
                 && owner.is_async(&self.gc_heap)
             {
-                return self.do_await_async_gen(stack, dst, awaited, owner);
+                return self.do_await_async_gen(stack, context, dst, awaited, owner);
             }
             return Err(VmError::InvalidOperand);
         }
@@ -7444,12 +7544,20 @@ impl Interpreter {
         let parked = stack.pop().expect("top frame existed");
         let promise = match awaited {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(&mut self.gc_heap, other)?,
+            other => promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .fulfilled(&mut self.gc_heap, other)?,
         };
         let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
-        let capability = promise_dispatch::make_capability(&mut self.gc_heap)?;
-        let outcome =
-            promise.perform_async_resume_then(&mut self.gc_heap, parked, dst, capability, None);
+        let capability =
+            promise_dispatch::make_capability_with_context(&mut self.gc_heap, context.clone())?;
+        let outcome = promise.perform_async_resume_then_with_context(
+            &mut self.gc_heap,
+            parked,
+            dst,
+            capability,
+            None,
+            Some(context.clone()),
+        );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
         }
@@ -7464,6 +7572,7 @@ impl Interpreter {
     fn do_await_async_gen(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
         dst: u16,
         awaited: Value,
         owner: crate::generator::JsGenerator,
@@ -7476,16 +7585,19 @@ impl Interpreter {
         let parked = stack.pop().expect("top frame existed");
         let promise = match awaited {
             Value::Promise(p) => p,
-            other => JsPromiseHandle::fulfilled(&mut self.gc_heap, other)?,
+            other => promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .fulfilled(&mut self.gc_heap, other)?,
         };
         let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
-        let capability = promise_dispatch::make_capability(&mut self.gc_heap)?;
-        let outcome = promise.perform_async_resume_then(
+        let capability =
+            promise_dispatch::make_capability_with_context(&mut self.gc_heap, context.clone())?;
+        let outcome = promise.perform_async_resume_then_with_context(
             &mut self.gc_heap,
             parked,
             dst,
             capability,
             Some(owner),
+            Some(context.clone()),
         );
         if let Some(job) = outcome.immediate_job {
             self.microtasks.enqueue(job);
@@ -7499,7 +7611,7 @@ impl Interpreter {
     /// throw rather than the frame's `async_state` promise.
     fn run_async_gen_resume(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         mut frame: Box<Frame>,
         await_dst: u16,
         fulfilled: bool,
@@ -7520,31 +7632,32 @@ impl Interpreter {
         stack.push(*frame);
         if !fulfilled {
             if let Err(error) = self.unwind_throw(&mut stack, value.clone()) {
-                let frames = snapshot_frames(module, &stack);
+                let frames = snapshot_frames(context, &stack);
                 return Err(RunError { error, frames });
             }
             if stack.is_empty() {
                 // Throw drained out of the gen body; settle the
                 // pending request as rejected.
                 let req = owner.take_pending_request(&mut self.gc_heap);
-                if let Some(req) = req
-                    && let Err(error) = self.run_callable_sync(
-                        module,
+                if let Some(req) = req {
+                    let request_context = req.context.clone().unwrap_or_else(|| context.clone());
+                    if let Err(error) = self.run_callable_sync(
+                        &request_context,
                         &req.reject,
                         Value::Undefined,
                         smallvec::smallvec![value],
-                    )
-                {
-                    return Err(RunError {
-                        error,
-                        frames: Vec::new(),
-                    });
+                    ) {
+                        return Err(RunError {
+                            error,
+                            frames: Vec::new(),
+                        });
+                    }
                 }
                 owner.mark_done(&mut self.gc_heap);
                 return Ok(());
             }
         }
-        match self.dispatch_loop(module, &mut stack) {
+        match self.dispatch_loop(context, &mut stack) {
             Ok(value) => {
                 let yielded_already = owner.has_yielded(&self.gc_heap);
                 if yielded_already {
@@ -7559,8 +7672,9 @@ impl Interpreter {
                 if let Some(req) = req {
                     let record =
                         make_iter_result(value, true, &mut self.gc_heap).map_err(RunError::bare)?;
+                    let request_context = req.context.clone().unwrap_or_else(|| context.clone());
                     if let Err(error) = self.run_callable_sync(
-                        module,
+                        &request_context,
                         &req.resolve,
                         Value::Undefined,
                         smallvec::smallvec![record],
@@ -7575,7 +7689,7 @@ impl Interpreter {
                 Ok(())
             }
             Err(error) => {
-                let frames = snapshot_frames(module, &stack);
+                let frames = snapshot_frames(context, &stack);
                 Err(RunError { error, frames })
             }
         }
@@ -7602,7 +7716,7 @@ impl Interpreter {
     ///   stack overflow, interrupt).
     fn run_async_resume(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         mut frame: Box<Frame>,
         await_dst: u16,
         fulfilled: bool,
@@ -7625,7 +7739,7 @@ impl Interpreter {
             // observes it through its `try`/`catch`/`finally`
             // structure exactly as a synchronous throw would.
             if let Err(error) = self.unwind_throw(&mut stack, value) {
-                let frames = snapshot_frames(module, &stack);
+                let frames = snapshot_frames(context, &stack);
                 return Err(RunError { error, frames });
             }
             if stack.is_empty() {
@@ -7634,10 +7748,10 @@ impl Interpreter {
                 return Ok(());
             }
         }
-        match self.dispatch_loop(module, &mut stack) {
+        match self.dispatch_loop(context, &mut stack) {
             Ok(_) => Ok(()),
             Err(error) => {
-                let frames = snapshot_frames(module, &stack);
+                let frames = snapshot_frames(context, &stack);
                 Err(RunError { error, frames })
             }
         }
@@ -7744,7 +7858,7 @@ impl Interpreter {
     fn do_construct(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -7755,7 +7869,7 @@ impl Interpreter {
         };
         let top_idx = stack.len() - 1;
         let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        if !is_constructor_runtime(&callee, module, &self.gc_heap) {
+        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
@@ -7767,13 +7881,13 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        self.dispatch_construct(stack, module, callee, args, dst)
+        self.dispatch_construct(stack, context, callee, args, dst)
     }
 
     fn do_construct_spread(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -7781,7 +7895,7 @@ impl Interpreter {
         let args_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
         let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        if !is_constructor_runtime(&callee, module, &self.gc_heap) {
+        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
         let args_value = read_register(&stack[top_idx], args_reg)?.clone();
@@ -7797,13 +7911,13 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        self.dispatch_construct(stack, module, callee, args, dst)
+        self.dispatch_construct(stack, context, callee, args, dst)
     }
 
     fn dispatch_construct(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         callee: Value,
         args: SmallVec<[Value; 8]>,
         dst: u16,
@@ -7841,13 +7955,13 @@ impl Interpreter {
                 Value::Array(argv_array),
                 Value::Proxy(proxy.clone()),
             ];
-            let result = match self.invoke_proxy_trap(module, &proxy, "construct", trap_args)? {
+            let result = match self.invoke_proxy_trap(context, &proxy, "construct", trap_args)? {
                 Some(v) => v,
                 None => {
                     // Fall through to constructing the underlying
                     // target.
                     let underlying = proxy.target();
-                    let proto = self.construct_prototype_for_callee(module, &underlying)?;
+                    let proto = self.construct_prototype_for_callee(context, &underlying)?;
                     let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
                     if let Some(proto) = proto {
                         crate::object::set_prototype_value(
@@ -7856,8 +7970,12 @@ impl Interpreter {
                             Some(proto),
                         );
                     }
-                    let result =
-                        self.run_callable_sync(module, &underlying, Value::Object(receiver), args)?;
+                    let result = self.run_callable_sync(
+                        context,
+                        &underlying,
+                        Value::Object(receiver),
+                        args,
+                    )?;
                     match result {
                         Value::Object(_) => result,
                         _ => Value::Object(receiver),
@@ -7872,7 +7990,7 @@ impl Interpreter {
         // the new frame. The constructor might mutate the receiver
         // immediately, so the prototype link must already be in
         // place.
-        let proto = self.construct_prototype_for_callee(module, &new_target)?;
+        let proto = self.construct_prototype_for_callee(context, &new_target)?;
         let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
@@ -7891,7 +8009,8 @@ impl Interpreter {
             let argv: Vec<Value> = args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
             let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let constructed = if constructor_return_is_object(&result) {
                 // Spec §10.1.13 step 5 — non-undefined "object-like"
@@ -7915,7 +8034,8 @@ impl Interpreter {
             let argv: Vec<Value> = args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
             let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let constructed = if constructor_return_is_object(&result) {
                 // Spec §10.1.13 step 5 — non-undefined "object-like"
@@ -7936,7 +8056,8 @@ impl Interpreter {
             let argv: Vec<Value> = args.into_iter().collect();
             let call = native.call_target(&self.gc_heap);
             let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             let constructed = if constructor_return_is_object(&result) {
                 // Spec §10.1.13 step 5 — non-undefined "object-like"
@@ -7951,7 +8072,7 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, constructed)?;
             return Ok(());
         }
-        self.invoke(stack, module, &callee, this_value, args, dst)?;
+        self.invoke(stack, context, &callee, this_value, args, dst)?;
         // The pushed frame is now on top; mark it so `pop_frame`
         // can substitute the receiver for any non-object return.
         if let Some(top) = stack.last_mut() {
@@ -7963,12 +8084,12 @@ impl Interpreter {
 
     fn construct_prototype_for_callee(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         match callee {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                match self.function_property_get(module, *function_id, "prototype")? {
+                match self.function_property_get(context, *function_id, "prototype")? {
                     proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
                     _ => Ok(None),
                 }
@@ -7980,7 +8101,7 @@ impl Interpreter {
             }),
             Value::BoundFunction(b) => {
                 let (target, _, _) = b.parts(&self.gc_heap);
-                self.construct_prototype_for_callee(module, &target)
+                self.construct_prototype_for_callee(context, &target)
             }
             Value::NativeFunction(_) => Ok(None),
             _ => Ok(None),
@@ -7994,7 +8115,7 @@ impl Interpreter {
     fn do_call_spread(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -8016,7 +8137,7 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, module, &callee, this_value, args, dst)
+        self.invoke(stack, context, &callee, this_value, args, dst)
     }
 
     /// Handle `Op::CallWithThis`: same as `do_call` but the call
@@ -8026,7 +8147,7 @@ impl Interpreter {
     fn do_call_with_this(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -8048,7 +8169,7 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, module, &callee, this_value, args, dst)
+        self.invoke(stack, context, &callee, this_value, args, dst)
     }
 
     /// Handle `Op::CallMethodValue`: the universal method-call op.
@@ -8065,7 +8186,7 @@ impl Interpreter {
     fn do_call_method_value(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -8075,10 +8196,9 @@ impl Interpreter {
             Some(&Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
-        let name = match module.constants.get(name_idx as usize) {
-            Some(Constant::String { utf16 }) => String::from_utf16_lossy(utf16),
-            _ => return Err(VmError::InvalidOperand),
-        };
+        let name = context
+            .string_constant(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let recv_value = read_register(&stack[top_idx], recv_reg)?.clone();
         let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
@@ -8092,8 +8212,14 @@ impl Interpreter {
         if let Value::Promise(p) = &recv_value {
             let promise = *p;
             let argv: Vec<Value> = arg_values.iter().cloned().collect();
-            let result = promise_dispatch::prototype_call(self, &promise, &name, &argv)
-                .map_err(native_to_vm_error)?;
+            let result = promise_dispatch::prototype_call(
+                self,
+                Some(context.clone()),
+                &promise,
+                &name,
+                &argv,
+            )
+            .map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
@@ -8105,7 +8231,7 @@ impl Interpreter {
         // that pushes a frame; lives outside the static intrinsic
         // table so it can drive `self.invoke`.
         if name == "forEach" && matches!(&recv_value, Value::Map(_) | Value::Set(_)) {
-            return self.do_collection_for_each(stack, module, &recv_value, &arg_values, dst);
+            return self.do_collection_for_each(stack, context, &recv_value, &arg_values, dst);
         }
 
         // Iterator-helpers proposal — when receiver is an iterator
@@ -8114,7 +8240,7 @@ impl Interpreter {
         // <https://tc39.es/proposal-iterator-helpers/>
         if let Value::Iterator(rc) = &recv_value {
             let iter_rc = *rc;
-            if self.iterator_helper_dispatch(stack, module, &iter_rc, &name, &arg_values, dst)? {
+            if self.iterator_helper_dispatch(stack, context, &iter_rc, &name, &arg_values, dst)? {
                 return Ok(());
             }
         }
@@ -8147,10 +8273,13 @@ impl Interpreter {
                     // `pending_request` so `Op::Yield` /
                     // `resume_generator` / the await-resume native
                     // can settle it from inside the dispatch loop.
-                    let cap = promise_dispatch::make_capability(&mut self.gc_heap)?;
+                    let cap = promise_dispatch::make_capability_with_context(
+                        &mut self.gc_heap,
+                        context.clone(),
+                    )?;
                     let promise = cap.promise.clone();
                     g.set_pending_request(&mut self.gc_heap, cap.clone());
-                    let outcome = self.resume_generator(module, &g, kind);
+                    let outcome = self.resume_generator(context, &g, kind);
                     match outcome {
                         Ok(_) => {
                             // resume_generator drained the request
@@ -8163,8 +8292,10 @@ impl Interpreter {
                         Err(err) => {
                             if let Some(thrown) = self.pending_generator_throw.take() {
                                 if let Some(req) = g.take_pending_request(&mut self.gc_heap) {
+                                    let request_context =
+                                        req.context.clone().unwrap_or_else(|| context.clone());
                                     self.run_callable_sync(
-                                        module,
+                                        &request_context,
                                         &req.reject,
                                         Value::Undefined,
                                         smallvec::smallvec![thrown],
@@ -8181,7 +8312,7 @@ impl Interpreter {
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     return Ok(());
                 }
-                match self.resume_generator(module, &g, kind) {
+                match self.resume_generator(context, &g, kind) {
                     Ok(result) => {
                         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                         write_register(frame, dst, result)?;
@@ -8225,7 +8356,7 @@ impl Interpreter {
                     | "flatMap"
                     | "sort"
             )
-            && self.array_callback_dispatch(stack, module, arr, &name, &arg_values, dst)?
+            && self.array_callback_dispatch(stack, context, arr, &name, &arg_values, dst)?
         {
             return Ok(());
         }
@@ -8314,7 +8445,7 @@ impl Interpreter {
                 "hasOwnProperty" => {
                     let key = property_key_from_arg(arg_values.first())?;
                     self.ordinary_function_own_property_descriptor(
-                        Some(module),
+                        Some(context),
                         *function_id,
                         &key,
                     )?
@@ -8323,7 +8454,7 @@ impl Interpreter {
                 "propertyIsEnumerable" => {
                     let key = property_key_from_arg(arg_values.first())?;
                     self.ordinary_function_own_property_descriptor(
-                        Some(module),
+                        Some(context),
                         *function_id,
                         &key,
                     )?
@@ -8375,7 +8506,7 @@ impl Interpreter {
         {
             return self.dispatch_function_method(
                 stack,
-                module,
+                context,
                 &recv_value,
                 &name,
                 arg_values,
@@ -8395,7 +8526,7 @@ impl Interpreter {
             Value::Object(_) | Value::Proxy(_) => {
                 let key = VmPropertyKey::String(name.clone());
                 match self.ordinary_get_value(
-                    module,
+                    context,
                     recv_value.clone(),
                     recv_value.clone(),
                     &key,
@@ -8404,7 +8535,7 @@ impl Interpreter {
                     VmGetOutcome::Value(value) => Some(value),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        Some(self.run_callable_sync(module, &getter, recv_value.clone(), args)?)
+                        Some(self.run_callable_sync(context, &getter, recv_value.clone(), args)?)
                     }
                 }
             }
@@ -8421,7 +8552,7 @@ impl Interpreter {
             // happens below if we hand back `Undefined`.
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let fid = *function_id;
-                Some(self.function_property_get(module, fid, &name)?)
+                Some(self.function_property_get(context, fid, &name)?)
             }
             _ => None,
         };
@@ -8433,7 +8564,7 @@ impl Interpreter {
                 .pc
                 .checked_add(1)
                 .ok_or(VmError::InvalidOperand)?;
-            return self.invoke(stack, module, &method, recv_value.clone(), arg_values, dst);
+            return self.invoke(stack, context, &method, recv_value.clone(), arg_values, dst);
         }
 
         // `Function.prototype.{call, apply, bind, toString}` on a
@@ -8444,7 +8575,7 @@ impl Interpreter {
         {
             return self.dispatch_function_method(
                 stack,
-                module,
+                context,
                 &recv_value,
                 &name,
                 arg_values,
@@ -8486,7 +8617,7 @@ impl Interpreter {
     fn do_collection_for_each(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         recv: &Value,
         args: &SmallVec<[Value; 8]>,
         dst: u16,
@@ -8521,7 +8652,7 @@ impl Interpreter {
             cb_args.push(value);
             cb_args.push(key);
             cb_args.push(recv_for_callback.clone());
-            self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+            self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
         }
         Ok(())
     }
@@ -8552,7 +8683,7 @@ impl Interpreter {
     fn array_callback_dispatch(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         arr: &JsArray,
         name: &str,
         args: &SmallVec<[Value; 8]>,
@@ -8592,7 +8723,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                 }
                 Value::Undefined
             }
@@ -8607,7 +8738,12 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    out.push(self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?);
+                    out.push(self.run_callable_sync(
+                        context,
+                        &callee,
+                        Value::Undefined,
+                        cb_args,
+                    )?);
                 }
                 Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
             }
@@ -8620,7 +8756,7 @@ impl Interpreter {
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let kept =
-                        self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     if kept.to_boolean() {
                         out.push(crate::array::get(*arr, &self.gc_heap, i));
                     }
@@ -8681,7 +8817,7 @@ impl Interpreter {
                     cb_args.push(elements[i as usize].clone());
                     cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
                     cb_args.push(arr_value.clone());
-                    acc = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     i += step;
                 }
                 acc
@@ -8698,7 +8834,8 @@ impl Interpreter {
                         value
                     };
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
-                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    let hit =
+                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     if hit.to_boolean() {
                         found = elem;
                         break;
@@ -8717,7 +8854,8 @@ impl Interpreter {
                         value
                     };
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
-                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    let hit =
+                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     if hit.to_boolean() {
                         idx = i as i32;
                         break;
@@ -8734,7 +8872,8 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    let hit =
+                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     if !hit.to_boolean() {
                         all = false;
                         break;
@@ -8751,7 +8890,8 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let hit = self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                    let hit =
+                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     if hit.to_boolean() {
                         any = true;
                         break;
@@ -8771,7 +8911,7 @@ impl Interpreter {
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let mapped =
-                        self.run_callable_sync(module, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     match mapped {
                         Value::Array(inner) => {
                             crate::array::with_elements(inner, &self.gc_heap, |elements| {
@@ -8810,7 +8950,7 @@ impl Interpreter {
                         cmp_args.push(buffer[j - 1].clone());
                         cmp_args.push(buffer[j].clone());
                         let outcome =
-                            self.run_callable_sync(module, &callee, Value::Undefined, cmp_args)?;
+                            self.run_callable_sync(context, &callee, Value::Undefined, cmp_args)?;
                         let order = match outcome {
                             Value::Number(n) => n.as_f64(),
                             _ => 0.0,
@@ -8860,7 +9000,7 @@ impl Interpreter {
     /// helpers.
     pub fn run_callable_sync(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
@@ -8901,14 +9041,15 @@ impl Interpreter {
             let call = native.call_target(&self.gc_heap);
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
         }
         if let Value::NativeFunction(native) = &current {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 return self.run_vm_intrinsic_sync(
-                    module,
+                    context,
                     intrinsic,
                     effective_this,
                     effective_args,
@@ -8916,7 +9057,8 @@ impl Interpreter {
             }
             let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
         }
         let (function_id, parent_upvalues, this_for_callee) = match current {
@@ -8936,9 +9078,8 @@ impl Interpreter {
             }
             _ => return Err(VmError::NotCallable),
         };
-        let function = module
-            .functions
-            .get(function_id as usize)
+        let function = context
+            .function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         let upvalues = Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
@@ -8963,7 +9104,7 @@ impl Interpreter {
             new_frame.rest_args = arg_iter.collect();
         }
         inner.push(new_frame);
-        self.dispatch_loop(module, &mut inner)
+        self.dispatch_loop(context, &mut inner)
     }
 
     /// Synchronously perform `Construct(target, args, newTarget)`.
@@ -8976,7 +9117,7 @@ impl Interpreter {
     /// `new.target` inside the target body.
     pub(crate) fn run_construct_sync(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: &Value,
         new_target: Value,
         args: SmallVec<[Value; 8]>,
@@ -9004,7 +9145,7 @@ impl Interpreter {
             effective_args = combined;
         }
 
-        let proto = self.construct_prototype_for_callee(module, &effective_new_target)?;
+        let proto = self.construct_prototype_for_callee(context, &effective_new_target)?;
         let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
@@ -9019,7 +9160,8 @@ impl Interpreter {
             let call = native.call_target(&self.gc_heap);
             let call_info =
                 NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             return Ok(if constructor_return_is_object(&result) {
                 result
@@ -9032,7 +9174,8 @@ impl Interpreter {
             let call = native.call_target(&self.gc_heap);
             let call_info =
                 NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             return Ok(if constructor_return_is_object(&result) {
                 result
@@ -9047,7 +9190,8 @@ impl Interpreter {
             let call = native.call_target(&self.gc_heap);
             let call_info =
                 NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx = NativeCtx::new_with_call_info_and_module(self, call_info, Some(module));
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
             let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
             return Ok(if constructor_return_is_object(&result) {
                 result
@@ -9068,9 +9212,8 @@ impl Interpreter {
             } => (function_id, upvalues),
             _ => return Err(VmError::NotCallable),
         };
-        let function = module
-            .functions
-            .get(function_id as usize)
+        let function = context
+            .function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         let upvalues = Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues)?;
         let mut new_frame =
@@ -9096,7 +9239,7 @@ impl Interpreter {
         }
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         inner.push(new_frame);
-        self.dispatch_loop(module, &mut inner)
+        self.dispatch_loop(context, &mut inner)
     }
 
     /// Synchronously advance an iterator one step, with full
@@ -9112,20 +9255,20 @@ impl Interpreter {
     /// - <https://tc39.es/proposal-iterator-helpers/>
     fn iterator_next_full(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
         // First try the fast path; falls through to the
         // interpreter-aware branch on `User` / wrapper variants.
         match step_iterator(*iter, &self.string_heap, &mut self.gc_heap) {
             Ok((value, done)) => Ok((value, done)),
-            Err(_) => self.iterator_next_full_slow(module, iter),
+            Err(_) => self.iterator_next_full_slow(context, iter),
         }
     }
 
     fn iterator_next_full_slow(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
         // Snapshot the current state to avoid holding the borrow
@@ -9171,7 +9314,7 @@ impl Interpreter {
         match snapshot {
             IteratorStateSnapshot::Generator(handle) => {
                 let result = self.resume_generator(
-                    module,
+                    context,
                     &handle,
                     GeneratorResumeKind::Next(Value::Undefined),
                 )?;
@@ -9199,7 +9342,7 @@ impl Interpreter {
                     return Err(VmError::TypeMismatch);
                 }
                 let result =
-                    self.run_callable_sync(module, &next_fn, iter_value.clone(), SmallVec::new())?;
+                    self.run_callable_sync(context, &next_fn, iter_value.clone(), SmallVec::new())?;
                 let Value::Object(record) = &result else {
                     return Err(VmError::TypeMismatch);
                 };
@@ -9215,14 +9358,14 @@ impl Interpreter {
                 Ok((value, done))
             }
             IteratorStateSnapshot::Map { source, mapper } => {
-                let (v, done) = self.iterator_next_full(module, &source)?;
+                let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
                     self.gc_heap
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
                 let mapped = self.run_callable_sync(
-                    module,
+                    context,
                     &mapper,
                     Value::Undefined,
                     smallvec::smallvec![v],
@@ -9230,14 +9373,14 @@ impl Interpreter {
                 Ok((mapped, false))
             }
             IteratorStateSnapshot::Filter { source, predicate } => loop {
-                let (v, done) = self.iterator_next_full(module, &source)?;
+                let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
                     self.gc_heap
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
                 let kept = self.run_callable_sync(
-                    module,
+                    context,
                     &predicate,
                     Value::Undefined,
                     smallvec::smallvec![v.clone()],
@@ -9252,7 +9395,7 @@ impl Interpreter {
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                     return Ok((Value::Undefined, true));
                 }
-                let (v, done) = self.iterator_next_full(module, &source)?;
+                let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
                     self.gc_heap
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
@@ -9267,7 +9410,7 @@ impl Interpreter {
             }
             IteratorStateSnapshot::Drop { source, to_drop } => {
                 for _ in 0..to_drop {
-                    let (_, done) = self.iterator_next_full(module, &source)?;
+                    let (_, done) = self.iterator_next_full(context, &source)?;
                     if done {
                         self.gc_heap
                             .with_payload(*iter, |state| *state = IteratorState::Exhausted);
@@ -9279,7 +9422,7 @@ impl Interpreter {
                         *to_drop = 0;
                     }
                 });
-                let (v, done) = self.iterator_next_full(module, &source)?;
+                let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
                     self.gc_heap
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
@@ -9294,7 +9437,7 @@ impl Interpreter {
             } => {
                 loop {
                     if let Some(inner_iter) = inner.take() {
-                        let (v, done) = self.iterator_next_full(module, &inner_iter)?;
+                        let (v, done) = self.iterator_next_full(context, &inner_iter)?;
                         if !done {
                             // `inner_iter` remains the active inner
                             // iterator for the next call; the FlatMap
@@ -9307,14 +9450,14 @@ impl Interpreter {
                             }
                         });
                     }
-                    let (v, done) = self.iterator_next_full(module, &source)?;
+                    let (v, done) = self.iterator_next_full(context, &source)?;
                     if done {
                         self.gc_heap
                             .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                         return Ok((Value::Undefined, true));
                     }
                     let mapped = self.run_callable_sync(
-                        module,
+                        context,
                         &mapper,
                         Value::Undefined,
                         smallvec::smallvec![v],
@@ -9358,7 +9501,7 @@ impl Interpreter {
     fn iterator_helper_dispatch(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         iter_rc: &IteratorHandle,
         name: &str,
         args: &SmallVec<[Value; 8]>,
@@ -9419,15 +9562,15 @@ impl Interpreter {
                 )?)
             }
             "toArray" => {
-                let collected = self.drain_iterator(module, iter_rc)?;
+                let collected = self.drain_iterator(context, iter_rc)?;
                 Value::Array(crate::array::from_elements(&mut self.gc_heap, collected)?)
             }
             "forEach" => {
                 let callback = require_callable(args.first())?;
-                let collected = self.drain_iterator(module, iter_rc)?;
+                let collected = self.drain_iterator(context, iter_rc)?;
                 for v in collected {
                     self.run_callable_sync(
-                        module,
+                        context,
                         &callback,
                         Value::Undefined,
                         smallvec::smallvec![v],
@@ -9443,7 +9586,7 @@ impl Interpreter {
                 } else {
                     Value::Undefined
                 };
-                let collected = self.drain_iterator(module, iter_rc)?;
+                let collected = self.drain_iterator(context, iter_rc)?;
                 let mut iter = collected.into_iter();
                 if !has_initial {
                     acc = match iter.next() {
@@ -9456,7 +9599,7 @@ impl Interpreter {
                 }
                 for v in iter {
                     acc = self.run_callable_sync(
-                        module,
+                        context,
                         &reducer,
                         Value::Undefined,
                         smallvec::smallvec![acc, v],
@@ -9475,12 +9618,12 @@ impl Interpreter {
 
     fn drain_iterator(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         iter_rc: &IteratorHandle,
     ) -> Result<Vec<Value>, VmError> {
         let mut out = Vec::new();
         loop {
-            let (v, done) = self.iterator_next_full(module, iter_rc)?;
+            let (v, done) = self.iterator_next_full(context, iter_rc)?;
             if done {
                 return Ok(out);
             }
@@ -9511,7 +9654,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-generator.prototype.throw>
     pub fn resume_generator(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         handle: &crate::generator::JsGenerator,
         kind: GeneratorResumeKind,
     ) -> Result<Value, VmError> {
@@ -9575,7 +9718,7 @@ impl Interpreter {
             self.pending_generator_throw = None;
         }
         let is_async = handle.is_async(&self.gc_heap);
-        let outcome = self.dispatch_loop(module, &mut sub_stack);
+        let outcome = self.dispatch_loop(context, &mut sub_stack);
         match outcome {
             Ok(value) => {
                 // If a Yield fired, the gen body has the paused
@@ -9618,7 +9761,7 @@ impl Interpreter {
                     if let Some(req) = handle.take_pending_request(&mut self.gc_heap) {
                         let record = make_iter_result(value, true, &mut self.gc_heap)?;
                         self.run_callable_sync(
-                            module,
+                            context,
                             &req.resolve,
                             Value::Undefined,
                             smallvec::smallvec![record],
@@ -9648,7 +9791,7 @@ impl Interpreter {
     /// from `args`) and returns the result.
     pub fn invoke_proxy_trap(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         proxy: &crate::proxy::JsProxy,
         trap: &str,
         args: SmallVec<[Value; 8]>,
@@ -9662,13 +9805,13 @@ impl Interpreter {
             Some(Value::Undefined) | Some(Value::Null) | None => return Ok(None),
             _ => return Err(VmError::TypeMismatch),
         };
-        let result = self.run_callable_sync(module, &trap_fn, Value::Object(handler), args)?;
+        let result = self.run_callable_sync(context, &trap_fn, Value::Object(handler), args)?;
         Ok(Some(result))
     }
 
     fn run_vm_intrinsic_sync(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         intrinsic: VmIntrinsicFunction,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
@@ -9681,7 +9824,7 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let receiver = iter.next().unwrap_or(Value::Undefined);
                 let forwarded: SmallVec<[Value; 8]> = iter.collect();
-                self.run_callable_sync(module, &this_value, receiver, forwarded)
+                self.run_callable_sync(context, &this_value, receiver, forwarded)
             }
             VmIntrinsicFunction::FunctionPrototypeApply => {
                 if !self.is_callable_runtime(&this_value) {
@@ -9691,9 +9834,9 @@ impl Interpreter {
                 let receiver = iter.next().unwrap_or(Value::Undefined);
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
                     None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
-                    Some(arg_array) => self.create_list_from_array_like(module, arg_array)?,
+                    Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
                 };
-                self.run_callable_sync(module, &this_value, receiver, forwarded)
+                self.run_callable_sync(context, &this_value, receiver, forwarded)
             }
             VmIntrinsicFunction::FunctionPrototypeBind => {
                 if !self.is_callable_runtime(&this_value) {
@@ -9703,7 +9846,7 @@ impl Interpreter {
                 let receiver = iter.next().unwrap_or(Value::Undefined);
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
                 let ctx = function_metadata::FunctionMetadataContext::new(
-                    module,
+                    context,
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
@@ -9725,7 +9868,7 @@ impl Interpreter {
                     return Err(VmError::NotCallable);
                 }
                 let ctx = function_metadata::FunctionMetadataContext::new(
-                    module,
+                    context,
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
@@ -9741,7 +9884,7 @@ impl Interpreter {
                 // F is the `this` value and V is the first argument.
                 // <https://tc39.es/ecma262/#sec-function.prototype-@@hasinstance>
                 let v = args.into_iter().next().unwrap_or(Value::Undefined);
-                let result = self.ordinary_has_instance(module, &this_value, &v)?;
+                let result = self.ordinary_has_instance(context, &this_value, &v)?;
                 Ok(Value::Boolean(result))
             }
         }
@@ -9762,7 +9905,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinaryhasinstance>
     fn ordinary_has_instance(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         c: &Value,
         o: &Value,
     ) -> Result<bool, VmError> {
@@ -9773,7 +9916,7 @@ impl Interpreter {
         // Step 2 — bound function delegation.
         if let Value::BoundFunction(bound) = c {
             let (target, _, _) = bound.parts(&self.gc_heap);
-            return self.instanceof_operator(module, o, &target);
+            return self.instanceof_operator(context, o, &target);
         }
         // Step 3 — non-Object O collapses to false (Array / Function /
         // exotic non-Object values still walk their proto chain via
@@ -9803,7 +9946,7 @@ impl Interpreter {
         }
         // Step 4 / 5 — Get(C, "prototype") via the regular property
         // dispatch so user-shadowed `.prototype` is honoured.
-        let Some(prototype) = self.instanceof_target_prototype(module, c)? else {
+        let Some(prototype) = self.instanceof_target_prototype(context, c)? else {
             return Ok(false);
         };
         if !matches!(prototype, Value::Object(_) | Value::Proxy(_)) {
@@ -9813,7 +9956,7 @@ impl Interpreter {
             });
         }
         // Step 6 — proto-chain walk via the Proxy-aware helper.
-        self.value_has_proxy_aware_prototype(module, o.clone(), &prototype)
+        self.value_has_proxy_aware_prototype(context, o.clone(), &prototype)
     }
 
     /// ECMA-262 §13.10.2 `InstanceofOperator(V, target)`.
@@ -9830,7 +9973,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-instanceofoperator>
     fn instanceof_operator(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
@@ -9856,10 +9999,10 @@ impl Interpreter {
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
         let handler =
-            match self.ordinary_get_value(module, target.clone(), target.clone(), &key, 0)? {
+            match self.ordinary_get_value(context, target.clone(), target.clone(), &key, 0)? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(module, &getter, target.clone(), SmallVec::new())?
+                    self.run_callable_sync(context, &getter, target.clone(), SmallVec::new())?
                 }
             };
         if !matches!(handler, Value::Undefined | Value::Null) {
@@ -9878,11 +10021,11 @@ impl Interpreter {
                     VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
                 )
             {
-                return self.ordinary_has_instance(module, target, v);
+                return self.ordinary_has_instance(context, target, v);
             }
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(v.clone());
-            let result = self.run_callable_sync(module, &handler, target.clone(), args)?;
+            let result = self.run_callable_sync(context, &handler, target.clone(), args)?;
             return Ok(result.to_boolean());
         }
         // Step 4 / 5.
@@ -9891,12 +10034,12 @@ impl Interpreter {
                 message: "Right-hand side of instanceof is not callable".to_string(),
             });
         }
-        self.ordinary_has_instance(module, target, v)
+        self.ordinary_has_instance(context, target, v)
     }
 
     fn create_list_from_array_like(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         value: Value,
     ) -> Result<SmallVec<[Value; 8]>, VmError> {
         if !matches!(value, Value::Object(_) | Value::Array(_) | Value::Proxy(_)) {
@@ -9904,25 +10047,25 @@ impl Interpreter {
                 message: "Function.prototype.apply argument list must be object-like".to_string(),
             });
         }
-        let length = self.get_property_value_for_call(module, value.clone(), "length")?;
+        let length = self.get_property_value_for_call(context, value.clone(), "length")?;
         let len = to_length(&length)?;
         let mut values = SmallVec::new();
         for index in 0..len {
             let key = index.to_string();
-            values.push(self.get_property_value_for_call(module, value.clone(), &key)?);
+            values.push(self.get_property_value_for_call(context, value.clone(), &key)?);
         }
         Ok(values)
     }
 
     fn get_property_value_for_call(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         receiver: Value,
         key: &str,
     ) -> Result<Value, VmError> {
         let property_key = VmPropertyKey::String(key.to_string());
         match self.ordinary_get_value(
-            module,
+            context,
             receiver.clone(),
             receiver.clone(),
             &property_key,
@@ -9930,7 +10073,7 @@ impl Interpreter {
         )? {
             VmGetOutcome::Value(value) => Ok(value),
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(module, &getter, receiver, SmallVec::new())
+                self.run_callable_sync(context, &getter, receiver, SmallVec::new())
             }
         }
     }
@@ -9938,7 +10081,7 @@ impl Interpreter {
     fn dispatch_function_method(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         callee: &Value,
         name: &str,
         args: SmallVec<[Value; 8]>,
@@ -9954,27 +10097,27 @@ impl Interpreter {
                     .pc
                     .checked_add(1)
                     .ok_or(VmError::InvalidOperand)?;
-                self.invoke(stack, module, callee, this_value, forwarded, dst)
+                self.invoke(stack, context, callee, this_value, forwarded, dst)
             }
             "apply" => {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::Undefined);
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
                     None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
-                    Some(arg_array) => self.create_list_from_array_like(module, arg_array)?,
+                    Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
                 };
                 stack[top_idx].pc = stack[top_idx]
                     .pc
                     .checked_add(1)
                     .ok_or(VmError::InvalidOperand)?;
-                self.invoke(stack, module, callee, this_value, forwarded, dst)
+                self.invoke(stack, context, callee, this_value, forwarded, dst)
             }
             "bind" => {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::Undefined);
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
                 let ctx = function_metadata::FunctionMetadataContext::new(
-                    module,
+                    context,
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
@@ -10002,7 +10145,7 @@ impl Interpreter {
             // <https://tc39.es/ecma262/#sec-function.prototype.tostring>
             "toString" => {
                 let ctx = function_metadata::FunctionMetadataContext::new(
-                    module,
+                    context,
                     &self.gc_heap,
                     &self.string_heap,
                     &self.function_user_props,
@@ -10044,7 +10187,7 @@ impl Interpreter {
     fn try_to_primitive_dispatch(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<Option<()>, VmError> {
         let dst = register_operand(operands.first())?;
@@ -10068,7 +10211,7 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, module, &callee, recv.clone(), args, dst)?;
+        self.invoke(stack, context, &callee, recv.clone(), args, dst)?;
         Ok(Some(()))
     }
 
@@ -10106,13 +10249,15 @@ impl Interpreter {
     fn drive_to_primitive(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let src = register_operand(operands.get(1))?;
         let hint_idx = const_operand(operands.get(2))?;
-        let hint_token = lookup_string_constant(module, hint_idx)?;
+        let hint_token = context
+            .string_constant(hint_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let hint = abstract_ops::ToPrimitiveHint::from_token(&hint_token)
             .ok_or(VmError::InvalidOperand)?;
 
@@ -10135,7 +10280,14 @@ impl Interpreter {
                 return Ok(false);
             }
             // Non-primitive — advance to the next stage.
-            return self.drive_to_primitive_stage(stack, module, dst, state.obj, hint, state.stage);
+            return self.drive_to_primitive_stage(
+                stack,
+                context,
+                dst,
+                state.obj,
+                hint,
+                state.stage,
+            );
         }
 
         // 2. Fresh entry — primitive fast path.
@@ -10149,7 +10301,7 @@ impl Interpreter {
         // 3. Object operand — start the ladder at SymbolToPrim.
         self.drive_to_primitive_stage(
             stack,
-            module,
+            context,
             dst,
             recv,
             hint,
@@ -10280,7 +10432,7 @@ impl Interpreter {
     fn drive_to_primitive_stage(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         dst: u16,
         obj: Value,
         hint: abstract_ops::ToPrimitiveHint,
@@ -10311,7 +10463,7 @@ impl Interpreter {
                         // tighten this branch to spec.
                         return self.push_to_primitive_call(
                             stack,
-                            module,
+                            context,
                             dst,
                             obj.clone(),
                             hint,
@@ -10334,7 +10486,7 @@ impl Interpreter {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         return self.push_to_primitive_call(
                             stack,
-                            module,
+                            context,
                             dst,
                             obj.clone(),
                             hint,
@@ -10390,7 +10542,7 @@ impl Interpreter {
                         // this slot.
                         return self.push_to_primitive_call(
                             stack,
-                            module,
+                            context,
                             dst,
                             obj.clone(),
                             hint,
@@ -10448,7 +10600,7 @@ impl Interpreter {
     fn push_to_primitive_call(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         dst: u16,
         obj: Value,
         hint: abstract_ops::ToPrimitiveHint,
@@ -10469,7 +10621,7 @@ impl Interpreter {
         // pc stays on the Op::ToPrimitive instruction so the
         // dispatcher re-enters the resume path after the called
         // function returns.
-        self.invoke(stack, module, callee, this_value, args, dst)?;
+        self.invoke(stack, context, callee, this_value, args, dst)?;
         Ok(true)
     }
 
@@ -10489,7 +10641,8 @@ impl Interpreter {
             _ => return Ok(value.clone()),
         };
         let module = self.compile_eval_source(&source, EvalCompileOptions { force_strict })?;
-        let main = module.main();
+        let context = ExecutionContext::from_module(module);
+        let main = context.main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let upvalues =
             Frame::build_upvalues(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))?;
@@ -10500,7 +10653,8 @@ impl Interpreter {
         };
         let mut entry = Frame::with_return_upvalues_and_this(main, None, upvalues, entry_this);
         let entry_promise = if main.is_async {
-            let result = JsPromiseHandle::pending(&mut self.gc_heap)?;
+            let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending(&mut self.gc_heap)?;
             entry.async_state = Some(AsyncFrameState {
                 result_promise: result,
             });
@@ -10509,11 +10663,12 @@ impl Interpreter {
             None
         };
         stack.push(entry);
-        let value = self.dispatch_loop(&module, &mut stack)?;
+        let value = self.dispatch_loop(&context, &mut stack)?;
         if let Some(promise) = entry_promise {
             // Drain microtasks attached to top-level await so the
             // entry promise settles before we read its value.
-            self.drain_microtasks(&module).map_err(|e| e.error)?;
+            self.drain_microtasks_with_default(Some(context))
+                .map_err(|e| e.error)?;
             return Ok(match promise.state(&self.gc_heap) {
                 crate::promise::PromiseState::Fulfilled(v) => v,
                 crate::promise::PromiseState::Rejected(reason) => {
@@ -10536,13 +10691,13 @@ impl Interpreter {
     /// surface correct.
     pub(crate) fn build_function_constructor(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         args: &[Value],
     ) -> Result<Value, VmError> {
         // Coerce every argument to a string per §20.2.1.1 step 1.
         let mut parts: Vec<String> = Vec::with_capacity(args.len());
         for arg in args {
-            parts.push(self.function_constructor_arg_to_string(module, arg)?);
+            parts.push(self.function_constructor_arg_to_string(context, arg)?);
         }
         let (params, body): (Vec<&str>, &str) = if parts.is_empty() {
             (Vec::new(), "")
@@ -10557,32 +10712,32 @@ impl Interpreter {
         let params_joined = params.join(",");
         let source = format!("(function anonymous({params_joined}) {{\n{body}\n}})");
         let module = self.compile_eval_source(&source, EvalCompileOptions::default())?;
+        let context = ExecutionContext::from_module(module);
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
         // program's completion). We capture that value's
-        // `function_id` together with the inner module so the
+        // `function_id` together with the inner context so the
         // returned native can replay calls against the right
         // bytecode.
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(Frame::for_function_with_heap(
-            module.main(),
+            context.main(),
             &mut self.gc_heap,
         )?);
-        let value = self.dispatch_loop(&module, &mut stack)?;
-        let module_rc = std::rc::Rc::new(module);
-        self.wrap_eval_function_value(module_rc, value)
+        let value = self.dispatch_loop(&context, &mut stack)?;
+        self.wrap_eval_function_value(context, value)
     }
 
     fn wrap_eval_function_value(
         &mut self,
-        module: std::rc::Rc<BytecodeModule>,
+        function_context: ExecutionContext,
         value: Value,
     ) -> Result<Value, VmError> {
         if !matches!(value, Value::Function { .. } | Value::Closure { .. }) {
             return Ok(value);
         }
         let metadata_ctx = function_metadata::FunctionMetadataContext::new(
-            &module,
+            &function_context,
             &self.gc_heap,
             &self.string_heap,
             &self.function_user_props,
@@ -10594,12 +10749,12 @@ impl Interpreter {
             function_metadata::callable_intrinsic_property(&metadata_ctx, &value, "length")?;
         let prototype_value = match &value {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                self.function_property_get(&module, *function_id, "prototype")?
+                self.function_property_get(&function_context, *function_id, "prototype")?
             }
             _ => Value::Undefined,
         };
         let target_capture = value.clone();
-        let callback_module = std::rc::Rc::clone(&module);
+        let callback_context = function_context.clone();
         let wrapper = native_function::native_constructor_value_with_captures_unchecked(
             &mut self.gc_heap,
             "anonymous",
@@ -10616,16 +10771,16 @@ impl Interpreter {
                 let this_value = ctx.this_value().clone();
                 let interp = ctx.interp_mut();
                 let result = if is_construct_call {
-                    interp.run_construct_sync(&callback_module, &target, target.clone(), args)
+                    interp.run_construct_sync(&callback_context, &target, target.clone(), args)
                 } else {
-                    interp.run_callable_sync(&callback_module, &target, this_value, args)
+                    interp.run_callable_sync(&callback_context, &target, this_value, args)
                 }
                 .map_err(|err| crate::native_function::NativeError::TypeError {
                     name: "anonymous",
                     reason: format!("{err}"),
                 })?;
                 interp
-                    .wrap_eval_function_value(std::rc::Rc::clone(&callback_module), result)
+                    .wrap_eval_function_value(callback_context.clone(), result)
                     .map_err(|err| crate::native_function::NativeError::TypeError {
                         name: "anonymous",
                         reason: format!("{err}"),
@@ -10665,12 +10820,12 @@ impl Interpreter {
 
     fn function_constructor_arg_to_string(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         value: &Value,
     ) -> Result<String, VmError> {
         let primitive = match value {
             Value::Object(_) | Value::Proxy(_) => {
-                self.to_primitive_string_hint_sync(module, value.clone())?
+                self.to_primitive_string_hint_sync(context, value.clone())?
             }
             other => other.clone(),
         };
@@ -10689,15 +10844,16 @@ impl Interpreter {
     #[allow(clippy::wrong_self_convention)]
     fn to_primitive_string_hint_sync(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         value: Value,
     ) -> Result<Value, VmError> {
         for method in ["toString", "valueOf"] {
-            let callee = self.get_property_value_for_call(module, value.clone(), method)?;
+            let callee = self.get_property_value_for_call(context, value.clone(), method)?;
             if !self.is_callable_runtime(&callee) {
                 continue;
             }
-            let result = self.run_callable_sync(module, &callee, value.clone(), SmallVec::new())?;
+            let result =
+                self.run_callable_sync(context, &callee, value.clone(), SmallVec::new())?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);
             }
@@ -10871,7 +11027,7 @@ impl Interpreter {
 
     fn ordinary_get_own_property_descriptor_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
@@ -10885,14 +11041,14 @@ impl Interpreter {
                 let trap_args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![proxy.target(), key_value];
                 match self.invoke_proxy_trap(
-                    module,
+                    context,
                     &proxy,
                     "getOwnPropertyDescriptor",
                     trap_args,
                 )? {
                     Some(Value::Undefined) | Some(Value::Null) => {
                         let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            module,
+                            context,
                             proxy.target(),
                             key,
                             hops + 1,
@@ -10907,7 +11063,7 @@ impl Interpreter {
                     Some(Value::Object(desc_obj)) => {
                         let desc = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
                         let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            module,
+                            context,
                             proxy.target(),
                             key,
                             hops + 1,
@@ -10925,7 +11081,7 @@ impl Interpreter {
                                 .to_string(),
                     }),
                     None => self.ordinary_get_own_property_descriptor_value(
-                        module,
+                        context,
                         proxy.target(),
                         key,
                         hops + 1,
@@ -10984,14 +11140,14 @@ impl Interpreter {
             },
             Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
                 VmPropertyKey::String(key) if key == "prototype" => {
-                    let _ = self.function_property_get(module, function_id, "prototype")?;
+                    let _ = self.function_property_get(context, function_id, "prototype")?;
                     let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                         return Ok(None);
                     };
                     Ok(object::get_own_descriptor(bag, &self.gc_heap, key))
                 }
                 VmPropertyKey::String(key) => {
-                    self.ordinary_function_own_property_descriptor(Some(module), function_id, key)
+                    self.ordinary_function_own_property_descriptor(Some(context), function_id, key)
                 }
                 VmPropertyKey::Symbol(sym) => {
                     let Some(bag) = self.function_user_props.get(&function_id).copied() else {
@@ -11075,7 +11231,7 @@ impl Interpreter {
 
     fn proxy_get_prototype_invariant_target_proto(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         target: &Value,
     ) -> Result<Option<Value>, VmError> {
         let Value::Object(obj) = target else {
@@ -11085,7 +11241,7 @@ impl Interpreter {
             return Ok(None);
         }
         Ok(Some(self.ordinary_get_prototype_value(
-            module,
+            context,
             target.clone(),
             0,
         )?))
@@ -11093,7 +11249,7 @@ impl Interpreter {
 
     fn ordinary_get_prototype_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         value: Value,
         hops: usize,
     ) -> Result<Value, VmError> {
@@ -11103,7 +11259,7 @@ impl Interpreter {
         match value {
             Value::Proxy(proxy) => {
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
-                match self.invoke_proxy_trap(module, &proxy, "getPrototypeOf", trap_args)? {
+                match self.invoke_proxy_trap(context, &proxy, "getPrototypeOf", trap_args)? {
                     Some(result) => {
                         if !matches!(result, Value::Object(_) | Value::Proxy(_) | Value::Null) {
                             return Err(VmError::TypeError {
@@ -11112,7 +11268,7 @@ impl Interpreter {
                             });
                         }
                         if let Some(target_proto) = self
-                            .proxy_get_prototype_invariant_target_proto(module, &proxy.target())?
+                            .proxy_get_prototype_invariant_target_proto(context, &proxy.target())?
                             && !abstract_ops::same_value(&result, &target_proto)
                         {
                             return Err(VmError::TypeError {
@@ -11123,7 +11279,7 @@ impl Interpreter {
                         }
                         Ok(result)
                     }
-                    None => self.ordinary_get_prototype_value(module, proxy.target(), hops + 1),
+                    None => self.ordinary_get_prototype_value(context, proxy.target(), hops + 1),
                 }
             }
             Value::Object(obj) => self.get_prototype_for_op(&Value::Object(obj)),
@@ -11144,13 +11300,13 @@ impl Interpreter {
 
     fn instanceof_target_prototype(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         rhs: &Value,
     ) -> Result<Option<Value>, VmError> {
         match rhs {
             Value::Object(_) | Value::Proxy(_) => {
                 let key = VmPropertyKey::String("prototype".to_string());
-                match self.ordinary_get_value(module, rhs.clone(), rhs.clone(), &key, 0)? {
+                match self.ordinary_get_value(context, rhs.clone(), rhs.clone(), &key, 0)? {
                     VmGetOutcome::Value(Value::Undefined) => Ok(Some(rhs.clone())),
                     VmGetOutcome::Value(value @ (Value::Object(_) | Value::Proxy(_))) => {
                         Ok(Some(value))
@@ -11160,7 +11316,7 @@ impl Interpreter {
                     }),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        let value = self.run_callable_sync(module, &getter, rhs.clone(), args)?;
+                        let value = self.run_callable_sync(context, &getter, rhs.clone(), args)?;
                         if matches!(value, Value::Object(_) | Value::Proxy(_)) {
                             Ok(Some(value))
                         } else {
@@ -11172,7 +11328,7 @@ impl Interpreter {
                 }
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                let value = self.function_property_get(module, *function_id, "prototype")?;
+                let value = self.function_property_get(context, *function_id, "prototype")?;
                 if matches!(value, Value::Object(_) | Value::Proxy(_)) {
                     Ok(Some(value))
                 } else {
@@ -11190,13 +11346,13 @@ impl Interpreter {
 
     fn value_has_proxy_aware_prototype(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         lhs: Value,
         target_proto: &Value,
     ) -> Result<bool, VmError> {
         let mut current = lhs;
         for hops in 0..object::PROTO_CHAIN_HARD_CAP {
-            current = self.ordinary_get_prototype_value(module, current, hops)?;
+            current = self.ordinary_get_prototype_value(context, current, hops)?;
             if matches!(current, Value::Null) {
                 return Ok(false);
             }
@@ -11209,7 +11365,7 @@ impl Interpreter {
 
     fn ordinary_get_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         base: Value,
         receiver: Value,
         key: &VmPropertyKey,
@@ -11234,7 +11390,7 @@ impl Interpreter {
                     object::PropertyLookup::Absent => {
                         match object::prototype_value(obj, &self.gc_heap) {
                             Some(proto) => {
-                                self.ordinary_get_value(module, proto, receiver, key, hops + 1)
+                                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
                             }
                             None => Ok(VmGetOutcome::Value(Value::Undefined)),
                         }
@@ -11245,13 +11401,13 @@ impl Interpreter {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![proxy.target(), key_value, receiver.clone()];
-                match self.invoke_proxy_trap(module, &proxy, "get", trap_args)? {
+                match self.invoke_proxy_trap(context, &proxy, "get", trap_args)? {
                     Some(value) => {
                         self.validate_proxy_get_invariants(&proxy.target(), key, &value)?;
                         Ok(VmGetOutcome::Value(value))
                     }
                     None => {
-                        self.ordinary_get_value(module, proxy.target(), receiver, key, hops + 1)
+                        self.ordinary_get_value(context, proxy.target(), receiver, key, hops + 1)
                     }
                 }
             }
@@ -11275,7 +11431,7 @@ impl Interpreter {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let value = match key {
                     VmPropertyKey::String(name) => {
-                        self.function_property_get(module, function_id, name)?
+                        self.function_property_get(context, function_id, name)?
                     }
                     VmPropertyKey::Symbol(sym) => self
                         .function_prototype_object()
@@ -11294,7 +11450,7 @@ impl Interpreter {
                 let value = match key {
                     VmPropertyKey::String(key) if key == "name" || key == "length" => {
                         let ctx = function_metadata::FunctionMetadataContext::new(
-                            module,
+                            context,
                             &self.gc_heap,
                             &self.string_heap,
                             &self.function_user_props,
@@ -11388,7 +11544,7 @@ impl Interpreter {
 
     fn ordinary_has_property_value(
         &mut self,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         base: Value,
         key: &VmPropertyKey,
         hops: usize,
@@ -11405,7 +11561,7 @@ impl Interpreter {
                     return Ok(true);
                 }
                 match object::prototype_value(obj, &self.gc_heap) {
-                    Some(proto) => self.ordinary_has_property_value(module, proto, key, hops + 1),
+                    Some(proto) => self.ordinary_has_property_value(context, proto, key, hops + 1),
                     None => Ok(false),
                 }
             }
@@ -11413,9 +11569,11 @@ impl Interpreter {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
                     smallvec::smallvec![proxy.target(), key_value];
-                match self.invoke_proxy_trap(module, &proxy, "has", trap_args)? {
+                match self.invoke_proxy_trap(context, &proxy, "has", trap_args)? {
                     Some(value) => Ok(value.to_boolean()),
-                    None => self.ordinary_has_property_value(module, proxy.target(), key, hops + 1),
+                    None => {
+                        self.ordinary_has_property_value(context, proxy.target(), key, hops + 1)
+                    }
                 }
             }
             _ => Err(VmError::TypeMismatch),
@@ -11446,25 +11604,27 @@ impl Interpreter {
     fn drive_load_property(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
         let name_idx = const_operand(operands.get(2))?;
-        let name = lookup_string_constant(module, name_idx)?;
+        let name = context
+            .string_constant(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         if matches!(receiver, Value::Object(_) | Value::Proxy(_)) {
             let key = VmPropertyKey::String(name.clone());
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.ordinary_get_value(module, receiver.clone(), receiver.clone(), &key, 0)? {
+            match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, module, &getter, receiver, args, dst)?;
+                        self.invoke(stack, context, &getter, receiver, args, dst)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::Undefined)?;
                     }
@@ -11484,12 +11644,12 @@ impl Interpreter {
             let key = VmPropertyKey::String(name.clone());
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.ordinary_get_value(module, boxed, receiver.clone(), &key, 0)? {
+            match self.ordinary_get_value(context, boxed, receiver.clone(), &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, module, &getter, receiver, args, dst)?;
+                        self.invoke(stack, context, &getter, receiver, args, dst)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::Undefined)?;
                     }
@@ -11513,7 +11673,7 @@ impl Interpreter {
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.invoke(stack, module, &callee, receiver, args, dst)?;
+                            self.invoke(stack, context, &callee, receiver, args, dst)?;
                         }
                         _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
                     }
@@ -11534,7 +11694,7 @@ impl Interpreter {
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                self.invoke(stack, module, &callee, receiver, args, dst)?;
+                                self.invoke(stack, context, &callee, receiver, args, dst)?;
                             }
                             _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
                         }
@@ -11545,7 +11705,7 @@ impl Interpreter {
                         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                         let callee = self.restricted_throw_type_error()?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, module, &callee, receiver, args, dst)?;
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
                         return Ok(true);
                     }
                 }
@@ -11594,7 +11754,7 @@ impl Interpreter {
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.invoke(stack, module, &callee, receiver, args, dst)?;
+                            self.invoke(stack, context, &callee, receiver, args, dst)?;
                         }
                         _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
                     }
@@ -11625,7 +11785,7 @@ impl Interpreter {
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, module, &callee, receiver, args, dst)?;
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
                     }
                     _ => {
                         // No getter (or non-callable) — §10.1.8.1
@@ -11652,7 +11812,7 @@ impl Interpreter {
     fn drive_instanceof(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
@@ -11675,7 +11835,7 @@ impl Interpreter {
                 return Ok(false);
             }
         }
-        let result = self.instanceof_operator(module, &lhs, &rhs)?;
+        let result = self.instanceof_operator(context, &lhs, &rhs)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         write_register(&mut stack[top_idx], dst, Value::Boolean(result))?;
@@ -11687,7 +11847,7 @@ impl Interpreter {
     fn drive_load_element(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
@@ -11706,12 +11866,12 @@ impl Interpreter {
         if matches!(receiver, Value::Object(_) | Value::Proxy(_)) {
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.ordinary_get_value(module, receiver.clone(), receiver.clone(), &key, 0)? {
+            match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, module, &getter, receiver, args, dst)?;
+                        self.invoke(stack, context, &getter, receiver, args, dst)?;
                     } else {
                         write_register(&mut stack[top_idx], dst, Value::Undefined)?;
                     }
@@ -11736,7 +11896,7 @@ impl Interpreter {
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.invoke(stack, module, &callee, receiver, args, dst)?;
+                            self.invoke(stack, context, &callee, receiver, args, dst)?;
                         }
                         _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
                     }
@@ -11757,7 +11917,7 @@ impl Interpreter {
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                self.invoke(stack, module, &callee, receiver, args, dst)?;
+                                self.invoke(stack, context, &callee, receiver, args, dst)?;
                             }
                             _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
                         }
@@ -11768,7 +11928,7 @@ impl Interpreter {
                         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                         let callee = self.restricted_throw_type_error()?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, module, &callee, receiver, args, dst)?;
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
                         return Ok(true);
                     }
                 }
@@ -11815,7 +11975,7 @@ impl Interpreter {
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, module, &callee, receiver, args, dst)?;
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
                     }
                     _ => {
                         write_register(&mut stack[top_idx], dst, Value::Undefined)?;
@@ -11829,25 +11989,22 @@ impl Interpreter {
 
     /// Apply descriptor-aware data assignment for computed ordinary-object
     /// writes (`obj[key] = value`).
-    fn function_is_strict(module: &BytecodeModule, function_id: usize) -> bool {
-        module
-            .functions
-            .get(function_id)
-            .is_some_and(|function| function.is_strict)
+    fn function_is_strict(context: &ExecutionContext, function_id: u32) -> bool {
+        context.function_is_strict(function_id)
     }
 
-    fn current_frame_is_strict(stack: &SmallVec<[Frame; 8]>, module: &BytecodeModule) -> bool {
+    fn current_frame_is_strict(stack: &SmallVec<[Frame; 8]>, context: &ExecutionContext) -> bool {
         stack
             .last()
-            .is_some_and(|frame| Self::function_is_strict(module, frame.function_id as usize))
+            .is_some_and(|frame| Self::function_is_strict(context, frame.function_id))
     }
 
     fn finish_failed_set(
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         message: impl Into<String>,
     ) -> Result<bool, VmError> {
-        if Self::current_frame_is_strict(stack, module) {
+        if Self::current_frame_is_strict(stack, context) {
             return Err(VmError::TypeError {
                 message: message.into(),
             });
@@ -11871,7 +12028,7 @@ impl Interpreter {
     fn store_to_primitive_base(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         receiver: Value,
         key: VmPropertyKey,
         value: Value,
@@ -11880,7 +12037,7 @@ impl Interpreter {
         let Some(base_object) = self.object_for_primitive_property_base(&receiver)? else {
             return Ok(false);
         };
-        let strict = Self::current_frame_is_strict(stack, module);
+        let strict = Self::current_frame_is_strict(stack, context);
         let mut current = object::prototype_value(base_object, &self.gc_heap);
         let mut hops = 0;
         while let Some(proto) = current {
@@ -11939,7 +12096,7 @@ impl Interpreter {
                             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                             args.push(value);
-                            self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                            self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                             return Ok(true);
                         }
                         object::PropertyLookup::Absent => {
@@ -11963,7 +12120,7 @@ impl Interpreter {
                     let top_idx = stack.len() - 1;
                     let pc = stack[top_idx].pc;
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    match self.invoke_proxy_trap(module, &proxy, "set", trap_args)? {
+                    match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                         Some(_) => {}
                         None => {
                             let Value::Object(target) = proxy.target() else {
@@ -11978,7 +12135,7 @@ impl Interpreter {
                                             args.push(value);
                                             self.invoke(
                                                 stack,
-                                                module,
+                                                context,
                                                 &setter,
                                                 receiver,
                                                 args,
@@ -12001,7 +12158,7 @@ impl Interpreter {
                                             args.push(value);
                                             self.invoke(
                                                 stack,
-                                                module,
+                                                context,
                                                 &setter,
                                                 receiver,
                                                 args,
@@ -12075,7 +12232,7 @@ impl Interpreter {
     fn drive_store_element(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let obj_reg = register_operand(operands.first())?;
@@ -12086,7 +12243,7 @@ impl Interpreter {
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         let key_value = read_register(&stack[top_idx], key_reg)?.clone();
         let value = read_register(&stack[top_idx], src_reg)?.clone();
-        let strict = Self::current_frame_is_strict(stack, module);
+        let strict = Self::current_frame_is_strict(stack, context);
         enum ComputedPropertyKey {
             String(String),
             Symbol(crate::symbol::JsSymbol),
@@ -12113,7 +12270,7 @@ impl Interpreter {
             ];
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.invoke_proxy_trap(module, &proxy, "set", trap_args)? {
+            match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(_) => {}
                 None => {
                     let target_value = proxy.target();
@@ -12123,7 +12280,7 @@ impl Interpreter {
                             ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
                         };
                         if !self.ordinary_set_data_value(
-                            module,
+                            context,
                             target_value,
                             &vm_key,
                             value,
@@ -12175,7 +12332,7 @@ impl Interpreter {
                                 args.push(value);
                                 self.invoke(
                                     stack,
-                                    module,
+                                    context,
                                     &setter,
                                     Value::Proxy(proxy.clone()),
                                     args,
@@ -12210,7 +12367,7 @@ impl Interpreter {
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
-                    self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                    self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                     return Ok(true);
                 }
                 Some(_) => return Ok(false),
@@ -12231,7 +12388,7 @@ impl Interpreter {
                         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
-                        self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                        self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                     if is_restricted_function_property(key) {
@@ -12240,7 +12397,7 @@ impl Interpreter {
                         let callee = self.restricted_throw_type_error()?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
-                        self.invoke(stack, module, &callee, receiver, args, scratch_reg)?;
+                        self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                 }
@@ -12258,7 +12415,7 @@ impl Interpreter {
                 ComputedPropertyKey::String(key) => VmPropertyKey::String(key),
                 ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym),
             };
-            return self.store_to_primitive_base(stack, module, receiver, key, value, scratch_reg);
+            return self.store_to_primitive_base(stack, context, receiver, key, value, scratch_reg);
         }
         let obj = match &receiver {
             Value::Object(obj) => *obj,
@@ -12267,7 +12424,7 @@ impl Interpreter {
                 if let ComputedPropertyKey::String(key) = &key
                     && function_metadata::ordinary_function_metadata_key(key).is_some()
                     && let Some(desc) = self.ordinary_function_own_property_descriptor(
-                        Some(module),
+                        Some(context),
                         *function_id,
                         key,
                     )?
@@ -12275,7 +12432,7 @@ impl Interpreter {
                 {
                     return Self::finish_failed_set(
                         stack,
-                        module,
+                        context,
                         format!("Cannot assign to read-only property '{key}' of function"),
                     );
                 }
@@ -12302,7 +12459,7 @@ impl Interpreter {
                 if !ok {
                     return Self::finish_failed_set(
                         stack,
-                        module,
+                        context,
                         "Cannot assign to read-only property",
                     );
                 }
@@ -12314,7 +12471,7 @@ impl Interpreter {
                 if !abstract_ops::is_callable(&setter) {
                     return Self::finish_failed_set(
                         stack,
-                        module,
+                        context,
                         "Cannot assign to accessor property without a setter",
                     );
                 }
@@ -12322,11 +12479,11 @@ impl Interpreter {
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                 Ok(true)
             }
             object::SetOutcome::Reject { .. } => {
-                Self::finish_failed_set(stack, module, "Cannot assign to property")
+                Self::finish_failed_set(stack, context, "Cannot assign to property")
             }
         }
     }
@@ -12348,18 +12505,20 @@ impl Interpreter {
     fn drive_store_property(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let obj_reg = register_operand(operands.first())?;
         let name_idx = const_operand(operands.get(1))?;
         let src_reg = register_operand(operands.get(2))?;
         let scratch_reg = register_operand(operands.get(3))?;
-        let name = lookup_string_constant(module, name_idx)?;
+        let name = context
+            .string_constant(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         let value = read_register(&stack[top_idx], src_reg)?.clone();
-        let strict = Self::current_frame_is_strict(stack, module);
+        let strict = Self::current_frame_is_strict(stack, context);
         // §28.2.4.5 Proxy.[[Set]] — invoke the `set` trap when
         // present; otherwise delegate to the target.
         if let Value::Proxy(p) = &receiver {
@@ -12373,7 +12532,7 @@ impl Interpreter {
             ];
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.invoke_proxy_trap(module, &proxy, "set", trap_args)? {
+            match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(_) => { /* trap handled the write; spec ignores return value
                     except for boolean-rejection — foundation accepts. */
                 }
@@ -12381,7 +12540,7 @@ impl Interpreter {
                     let target_value = proxy.target();
                     let Value::Object(target) = target_value else {
                         if !self.ordinary_set_data_value(
-                            module,
+                            context,
                             target_value,
                             &VmPropertyKey::String(name.clone()),
                             value,
@@ -12422,7 +12581,7 @@ impl Interpreter {
                                 args.push(value);
                                 self.invoke(
                                     stack,
-                                    module,
+                                    context,
                                     &setter,
                                     Value::Proxy(proxy.clone()),
                                     args,
@@ -12460,7 +12619,7 @@ impl Interpreter {
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
-                    self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                    self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                     return Ok(true);
                 }
                 Some(_) => return Ok(false),
@@ -12481,7 +12640,7 @@ impl Interpreter {
                         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
-                        self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                        self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                     if is_restricted_function_property(&name) {
@@ -12490,7 +12649,7 @@ impl Interpreter {
                         let callee = self.restricted_throw_type_error()?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
-                        self.invoke(stack, module, &callee, receiver, args, scratch_reg)?;
+                        self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                 }
@@ -12506,7 +12665,7 @@ impl Interpreter {
         ) {
             return self.store_to_primitive_base(
                 stack,
-                module,
+                context,
                 receiver,
                 VmPropertyKey::String(name),
                 value,
@@ -12520,12 +12679,12 @@ impl Interpreter {
                 let fid = *function_id;
                 if function_metadata::ordinary_function_metadata_key(&name).is_some()
                     && let Some(desc) =
-                        self.ordinary_function_own_property_descriptor(Some(module), fid, &name)?
+                        self.ordinary_function_own_property_descriptor(Some(context), fid, &name)?
                     && !desc.writable()
                 {
                     return Self::finish_failed_set(
                         stack,
-                        module,
+                        context,
                         format!("Cannot assign to read-only property '{name}' of function"),
                     );
                 }
@@ -12546,7 +12705,7 @@ impl Interpreter {
                 if !object::ordinary_set_data_property(obj, &mut self.gc_heap, &name, value) {
                     return Self::finish_failed_set(
                         stack,
-                        module,
+                        context,
                         format!("Cannot assign to property '{name}'"),
                     );
                 }
@@ -12560,7 +12719,7 @@ impl Interpreter {
                     // callable setter rejects.
                     return Self::finish_failed_set(
                         stack,
-                        module,
+                        context,
                         format!("Cannot assign to accessor property '{name}' without a setter"),
                     );
                 }
@@ -12568,12 +12727,12 @@ impl Interpreter {
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.invoke(stack, module, &setter, receiver, args, scratch_reg)?;
+                self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                 Ok(true)
             }
             object::SetOutcome::Reject { .. } => Self::finish_failed_set(
                 stack,
-                module,
+                context,
                 format!("Cannot assign to property '{name}'"),
             ),
         }
@@ -12585,7 +12744,7 @@ impl Interpreter {
     fn drive_has_property_proxy(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
@@ -12604,7 +12763,7 @@ impl Interpreter {
         };
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        let present = self.ordinary_has_property_value(module, rhs, &key, 0)?;
+        let present = self.ordinary_has_property_value(context, rhs, &key, 0)?;
         write_register(&mut stack[top_idx], dst, Value::Boolean(present))?;
         Ok(true)
     }
@@ -12614,13 +12773,15 @@ impl Interpreter {
     fn drive_delete_property_proxy(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
         let name_idx = const_operand(operands.get(2))?;
-        let name = lookup_string_constant(module, name_idx)?;
+        let name = context
+            .string_constant(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         let Value::Proxy(proxy) = receiver else {
@@ -12629,7 +12790,7 @@ impl Interpreter {
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let removed = self.ordinary_delete_value(
-            module,
+            context,
             Value::Proxy(proxy),
             &VmPropertyKey::String(name),
             0,
@@ -12643,7 +12804,7 @@ impl Interpreter {
     fn drive_delete_element_proxy(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
@@ -12658,7 +12819,7 @@ impl Interpreter {
         let key = Self::coerce_vm_property_key(Some(&idx))?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        let removed = self.ordinary_delete_value(module, receiver, &key, 0)?;
+        let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
         write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
         Ok(true)
     }
@@ -12668,7 +12829,7 @@ impl Interpreter {
     fn drive_get_prototype_proxy(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
@@ -12680,7 +12841,7 @@ impl Interpreter {
         };
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        let result = self.ordinary_get_prototype_value(module, value, 0)?;
+        let result = self.ordinary_get_prototype_value(context, value, 0)?;
         write_register(&mut stack[top_idx], dst, result)?;
         Ok(true)
     }
@@ -12690,7 +12851,7 @@ impl Interpreter {
     fn drive_set_prototype_proxy(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let obj_reg = register_operand(operands.first())?;
@@ -12710,7 +12871,7 @@ impl Interpreter {
             smallvec::smallvec![proxy.target(), proto_obj.clone()];
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        match self.invoke_proxy_trap(module, &proxy, "setPrototypeOf", trap_args)? {
+        match self.invoke_proxy_trap(context, &proxy, "setPrototypeOf", trap_args)? {
             Some(_) => {}
             None => {
                 let target = proxy.target_object(&mut self.gc_heap);
@@ -12749,7 +12910,7 @@ impl Interpreter {
     fn drive_get_iterator(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
@@ -12797,7 +12958,7 @@ impl Interpreter {
         let args: SmallVec<[Value; 8]> = SmallVec::new();
         // pc stays on Op::GetIterator; the called frame's result
         // lands in `dst` and the resume guard above wraps it.
-        self.invoke(stack, module, &callee, value, args, dst)?;
+        self.invoke(stack, context, &callee, value, args, dst)?;
         Ok(true)
     }
 
@@ -12825,7 +12986,7 @@ impl Interpreter {
     fn drive_iterator_next(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
-        module: &BytecodeModule,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<bool, VmError> {
         let value_dst = register_operand(operands.first())?;
@@ -12876,7 +13037,7 @@ impl Interpreter {
         });
         if let Some(handle) = gen_handle {
             let result = self.resume_generator(
-                module,
+                context,
                 &handle,
                 GeneratorResumeKind::Next(Value::Undefined),
             )?;
@@ -12910,7 +13071,7 @@ impl Interpreter {
             )
         });
         if needs_full_step {
-            let (value, done) = self.iterator_next_full(module, iter_rc)?;
+            let (value, done) = self.iterator_next_full(context, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -12949,7 +13110,7 @@ impl Interpreter {
             iterator: iter_value,
         });
         let args: SmallVec<[Value; 8]> = SmallVec::new();
-        self.invoke(stack, module, &next_fn, user_iter_value, args, value_dst)?;
+        self.invoke(stack, context, &next_fn, user_iter_value, args, value_dst)?;
         Ok(true)
     }
 
@@ -13011,12 +13172,7 @@ impl Interpreter {
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator>
-    fn run_add(
-        &self,
-        _module: &BytecodeModule,
-        operands: &[Operand],
-        frame: &mut Frame,
-    ) -> Result<(), VmError> {
+    fn run_add(&self, operands: &[Operand], frame: &mut Frame) -> Result<(), VmError> {
         let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
         let result = if matches!(lhs, Value::String(_)) || matches!(rhs, Value::String(_)) {
             // §13.15.4 step 1.c.ii — string concat path. The
@@ -13182,22 +13338,64 @@ fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
 
 /// Walk a live frame stack top-down and build a snapshot the
 /// runtime / CLI can render. Top-of-stack first.
-fn snapshot_frames(module: &BytecodeModule, stack: &[Frame]) -> Vec<StackFrameSnapshot> {
+///
+/// # Source mapping
+///
+/// Each frame's `span` is the **original source byte range** for
+/// the bytecode instruction the frame was about to execute. The
+/// compiler populates [`otter_bytecode::Function::spans`] with
+/// `(pc, span)` pairs in PC order, where `span` is the byte range
+/// the lowered instruction came from in the source text.
+///
+/// The frame's PC may not have an exact entry in the spans table
+/// (the compiler emits sparse `SpanEntry`s — one per source
+/// statement / expression boundary, not one per instruction). We
+/// therefore look up the predecessor entry: the largest `pc <=
+/// frame.pc`. Falls back to the enclosing function's source span
+/// when the table has no eligible predecessor (defensive — every
+/// non-empty function body emits at least one span).
+///
+/// Each frame's `module` field is the per-function
+/// [`otter_bytecode::Function::module_url`] when populated. The
+/// linker stamps that field during module-fragment merging
+/// (`function.module_url = "file:///path/to/other.ts"`), so
+/// multi-module bytecode produces frames pointing at the original
+/// source URL rather than the bytecode module's synthesized name
+/// (`<entry>`).
+fn snapshot_frames(context: &ExecutionContext, stack: &[Frame]) -> Vec<StackFrameSnapshot> {
     stack
         .iter()
         .rev()
         .map(|f| {
-            let function = module.functions.get(f.function_id as usize);
+            let function = context.function(f.function_id);
             let function_name = function
                 .map(|fun| fun.name.clone())
                 .unwrap_or_else(|| "<unknown>".to_string());
+            // Per-function `spans` is in PC order (compiler emits
+            // entries in lowering order). Use `partition_point` to
+            // locate the predecessor entry — the largest `pc <=
+            // frame.pc`. `partition_point(|s| s.pc <= f.pc)`
+            // returns the first index that violates the predicate,
+            // so `idx - 1` is the predecessor.
             let span = function
-                .and_then(|fun| fun.spans.iter().find(|s| s.pc == f.pc).map(|s| s.span))
+                .and_then(|fun| {
+                    let spans = fun.spans.as_slice();
+                    let idx = spans.partition_point(|s| s.pc <= f.pc);
+                    if idx == 0 {
+                        spans.first().map(|s| s.span)
+                    } else {
+                        Some(spans[idx - 1].span)
+                    }
+                })
                 .or_else(|| function.map(|fun| fun.span))
                 .unwrap_or((0, 0));
+            let module_url = function
+                .filter(|fun| !fun.module_url.is_empty())
+                .map(|fun| fun.module_url.clone())
+                .unwrap_or_else(|| context.module_name().to_string());
             StackFrameSnapshot {
                 function_name,
-                module: module.module.clone(),
+                module: module_url,
                 span,
             }
         })
@@ -13376,16 +13574,6 @@ fn register_operand(operand: Option<&Operand>) -> Result<u16, VmError> {
 fn const_operand(operand: Option<&Operand>) -> Result<u32, VmError> {
     match operand {
         Some(Operand::ConstIndex(k)) => Ok(*k),
-        _ => Err(VmError::InvalidOperand),
-    }
-}
-
-/// Resolve a string constant referenced by index. Returned as a
-/// Rust `String` because `JsObject` keys are stored UTF-8 in this
-/// slice; task 18 (shapes) revisits the key representation.
-fn lookup_string_constant(module: &BytecodeModule, idx: u32) -> Result<String, VmError> {
-    match module.constants.get(idx as usize) {
-        Some(Constant::String { utf16 }) => Ok(String::from_utf16_lossy(utf16)),
         _ => Err(VmError::InvalidOperand),
     }
 }
@@ -14303,14 +14491,18 @@ fn object_has_call_slot(value: &Value, heap: &otter_gc::GcHeap) -> bool {
 /// `true` when `value` is a VM constructor. This is intentionally
 /// stricter than `IsCallable`: callable ordinary objects such as
 /// `Function.prototype` must reject `new`.
-fn is_constructor_runtime(value: &Value, module: &BytecodeModule, heap: &otter_gc::GcHeap) -> bool {
+fn is_constructor_runtime(
+    value: &Value,
+    context: &ExecutionContext,
+    heap: &otter_gc::GcHeap,
+) -> bool {
     match value {
         Value::BoundFunction(bound) => {
             let (target, _, _) = bound.parts(heap);
-            is_constructor_runtime(&target, module, heap)
+            is_constructor_runtime(&target, context, heap)
         }
         _ => {
-            abstract_ops::is_constructor(value, module, heap)
+            abstract_ops::is_constructor(value, context, heap)
                 || object_has_construct_slot(value, heap)
         }
     }
@@ -14446,7 +14638,8 @@ mod tests {
             1,
         );
         let mut interp = Interpreter::new();
-        assert_eq!(interp.run(&module).unwrap(), Value::Undefined);
+        let context = ExecutionContext::from_module(module);
+        assert_eq!(interp.run(&context).unwrap(), Value::Undefined);
     }
 
     #[test]
@@ -14460,8 +14653,9 @@ mod tests {
             0,
         );
         let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
         assert_eq!(
-            interp.run(&module).unwrap_err().error,
+            interp.run(&context).unwrap_err().error,
             VmError::MissingReturn
         );
     }
@@ -14599,11 +14793,12 @@ mod tests {
         let receiver = Value::Object(crate::object::alloc_object(interp.gc_heap_mut()).unwrap());
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(Frame::for_function(&module.functions[0]));
+        let context = ExecutionContext::from_module(module.clone());
 
         interp
             .invoke(
                 &mut stack,
-                &module,
+                &context,
                 &callee,
                 receiver.clone(),
                 SmallVec::new(),
@@ -14710,13 +14905,14 @@ mod tests {
         };
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(Frame::for_function(&module.functions[0]));
+        let context = ExecutionContext::from_module(module.clone());
         // Reserve a scratch slot in <main> to receive the result.
         stack[0].registers.push(Value::Undefined);
         // Caller-supplied this is `Null` — the closure must override.
         interp
             .invoke(
                 &mut stack,
-                &module,
+                &context,
                 &closure,
                 Value::Null,
                 SmallVec::new(),
@@ -14775,6 +14971,10 @@ mod tests {
         let mut interp = Interpreter::new();
         let handle = interp.interrupt_handle();
         handle.interrupt();
-        assert_eq!(interp.run(&module).unwrap_err().error, VmError::Interrupted);
+        let context = ExecutionContext::from_module(module);
+        assert_eq!(
+            interp.run(&context).unwrap_err().error,
+            VmError::Interrupted
+        );
     }
 }

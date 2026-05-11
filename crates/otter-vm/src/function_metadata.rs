@@ -27,16 +27,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use otter_bytecode::BytecodeModule;
-
 use crate::number::NumberValue;
 use crate::object::{self, DescriptorKind, JsObject, PropertyDescriptor};
 use crate::string::{JsString, StringHeap};
-use crate::{BoundFunction, BoundFunctionMetadataProperty, Value, VmError};
+use crate::{BoundFunction, BoundFunctionMetadataProperty, ExecutionContext, Value, VmError};
 
 /// Read-only inputs needed to resolve callable metadata.
 pub(crate) struct FunctionMetadataContext<'a> {
-    module: &'a BytecodeModule,
+    context: &'a ExecutionContext,
     gc_heap: &'a otter_gc::GcHeap,
     string_heap: &'a StringHeap,
     function_user_props: &'a HashMap<u32, JsObject>,
@@ -55,14 +53,14 @@ impl<'a> FunctionMetadataContext<'a> {
     /// Build a metadata lookup context.
     #[must_use]
     pub(crate) fn new(
-        module: &'a BytecodeModule,
+        context: &'a ExecutionContext,
         gc_heap: &'a otter_gc::GcHeap,
         string_heap: &'a StringHeap,
         function_user_props: &'a HashMap<u32, JsObject>,
         function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
     ) -> Self {
         Self {
-            module,
+            context,
             gc_heap,
             string_heap,
             function_user_props,
@@ -349,9 +347,8 @@ fn callable_name(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<St
                 return Ok(String::new());
             }
             let function = ctx
-                .module
-                .functions
-                .get(*function_id as usize)
+                .context
+                .function(*function_id)
                 .ok_or(VmError::InvalidOperand)?;
             Ok(function.name.clone())
         }
@@ -397,9 +394,8 @@ fn callable_length(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<
                 return Ok(0.0);
             }
             let function = ctx
-                .module
-                .functions
-                .get(*function_id as usize)
+                .context
+                .function(*function_id)
                 .ok_or(VmError::InvalidOperand)?;
             Ok(f64::from(function.param_count))
         }

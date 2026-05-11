@@ -80,15 +80,15 @@ use otter_compiler::{
 };
 use otter_gc::GcStats;
 use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
-use otter_vm::{EvalCompileOptions, Interpreter, InterruptFlag, JsObject};
+use otter_vm::{EvalCompileOptions, ExecutionContext, Interpreter, InterruptFlag, JsObject};
 use serde::{Deserialize, Serialize};
 
 pub use compiled_program::CompiledProgram;
-pub use diagnostics::{Diagnostic, DiagnosticKind, StackFrame};
+pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, StackFrame};
 pub use error::{ConfigError, IoErrorKind, OtterError, error_schema_version};
 pub use event_loop::{
     EventLoop, HostFuture, HostJoinHandle, HostOpCompletion, RuntimeLiveness, RuntimeWake,
-    TimerRequest, TimerToken, TokioEventLoop,
+    TimerCallback, TimerRequest, TimerToken, TokioEventLoop,
 };
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
 pub use hooks::{
@@ -930,9 +930,26 @@ impl RuntimeModuleGraphState {
     }
 }
 
+/// Per-runtime source-map table.
+///
+/// Built incrementally by [`Self::record_compiled_metadata`] every
+/// time the runtime compiles a module / script — each
+/// [`CompiledSourceSpan`] is keyed by `(module_url, function_id)`
+/// because PC namespaces are per-function (two functions in the
+/// same source file both start at `pc = 0`).
+///
+/// The PC vectors are kept sorted by ascending `pc` so
+/// [`Self::resolve_frame_span`] can binary-search for the
+/// predecessor entry matching a live frame's PC. The compiler
+/// already emits spans in PC order, so the push path keeps the
+/// invariant for free.
+///
+/// # See also
+/// - [`otter_vm::snapshot_frames`] — the in-VM counterpart that
+///   reads [`otter_bytecode::Function::spans`] directly.
 #[derive(Debug, Default)]
 struct RuntimeSourceMapTable {
-    by_module_url: RefCell<BTreeMap<String, Vec<SpanEntry>>>,
+    by_module_url: RefCell<BTreeMap<String, BTreeMap<u32, Vec<SpanEntry>>>>,
 }
 
 impl RuntimeSourceMapTable {
@@ -942,10 +959,41 @@ impl RuntimeSourceMapTable {
             by_module_url
                 .entry(span.module_url.clone())
                 .or_default()
+                .entry(span.function_id)
+                .or_default()
                 .push(SpanEntry {
                     pc: span.pc,
                     span: span.span,
                 });
+        }
+    }
+
+    /// Map a `(module_url, function_id, pc)` triple back to the
+    /// original source byte range.
+    ///
+    /// Returns the span for the **predecessor entry** — the
+    /// largest `entry.pc <= pc` — to mirror
+    /// [`otter_vm::snapshot_frames`]'s lookup when the table has
+    /// no exact PC match. Returns `None` when the module URL
+    /// has no compiled metadata, when the function id is not in
+    /// the module, or when the function's span table is empty.
+    fn resolve_frame_span(
+        &self,
+        module_url: &str,
+        function_id: u32,
+        pc: u32,
+    ) -> Option<(u32, u32)> {
+        let by_module_url = self.by_module_url.borrow();
+        let by_function = by_module_url.get(module_url)?;
+        let spans = by_function.get(&function_id)?;
+        if spans.is_empty() {
+            return None;
+        }
+        let idx = spans.partition_point(|s| s.pc <= pc);
+        if idx == 0 {
+            spans.first().map(|s| s.span)
+        } else {
+            Some(spans[idx - 1].span)
         }
     }
 
@@ -1193,7 +1241,7 @@ impl Runtime {
             interp
                 .install_global_class(spec.raw())
                 .map_err(|err| OtterError::Internal {
-                    code: "GLOBAL_CLASS_BOOTSTRAP".to_string(),
+                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
                     message: err.to_string(),
                 })?;
         }
@@ -1221,7 +1269,6 @@ impl Runtime {
             source_maps: RuntimeSourceMapTable::default(),
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
-            current_module: None,
             promise_registry: promise_registry::PromiseRegistry::new(),
             tokio_handle: None,
         })
@@ -1239,15 +1286,6 @@ pub struct Runtime {
     source_maps: RuntimeSourceMapTable,
     diagnostics: RuntimeDiagnosticsSink,
     package_manager: RuntimePackageManagerHandle,
-    /// Most recently executed bytecode module, retained across the
-    /// run-to-idle event loop so timer / host-op callbacks queued
-    /// during the script can dispatch against the same function
-    /// table after the synchronous run returns.
-    ///
-    /// Cleared at the start of every `run_*` entry point so a
-    /// second `run_script` cannot leak callbacks compiled against
-    /// a stale module.
-    current_module: Option<std::rc::Rc<otter_bytecode::BytecodeModule>>,
     /// Per-isolate map from runtime-issued `PromiseId` to the
     /// pending [`otter_vm::JsPromiseHandle`] a host async op is
     /// expected to settle. Embedders register a fresh promise
@@ -1272,6 +1310,12 @@ pub struct Runtime {
 pub(crate) struct MicrotaskStats {
     pub(crate) pending: bool,
     pub(crate) generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimerFireOutcome {
+    Missing,
+    Fired { repeat: bool },
 }
 
 impl Runtime {
@@ -1346,13 +1390,17 @@ impl Runtime {
                 }
                 Err(DynLoadError::Thrown(value)) => Err(value),
             };
-        let settled = self.interp.settle_dynamic_import(token, reaction_outcome);
-        if settled && let Some(module) = self.current_module.clone() {
-            self.interp
-                .drain_microtasks(&module)
-                .map_err(map_vm_error)?;
+        let settled_context = self.interp.settle_dynamic_import(token, reaction_outcome);
+        if let Some(context) = settled_context {
+            if let Err(err) = self.interp.drain_microtasks_with_default(Some(context)) {
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(err),
+                ));
+            }
+            return Ok(true);
         }
-        Ok(settled)
+        Ok(false)
     }
 
     fn alloc_dynamic_import_error(
@@ -1368,7 +1416,7 @@ impl Runtime {
         otter_vm::object::set_prototype(obj, self.interp.gc_heap_mut(), Some(proto));
         let message_str =
             otter_vm::JsString::from_str(&message, &heap).map_err(|err| OtterError::Internal {
-                code: "STRING_ALLOC".to_string(),
+                code: DiagnosticCode::StringAlloc.as_str().to_string(),
                 message: err.to_string(),
             })?;
         otter_vm::object::set(
@@ -1430,11 +1478,11 @@ impl Runtime {
                     "dynamic import: load failed for \"{target_url}\": {e:?}"
                 ))
             })?;
-        let module = std::rc::Rc::new(linked.module);
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }
-        for init in &module.module_inits {
+        let context = ExecutionContext::from_module(linked.module);
+        for init in context.module_inits() {
             if self.interp.module_env(&init.url).is_some() {
                 continue;
             }
@@ -1444,8 +1492,8 @@ impl Runtime {
             self.interp
                 .register_module_env(std::rc::Rc::from(init.url.as_str()), env);
         }
-        let inits: Vec<(String, u32, otter_vm::JsObject)> = module
-            .module_inits
+        let inits: Vec<(String, u32, otter_vm::JsObject)> = context
+            .module_inits()
             .iter()
             .filter_map(|init| {
                 self.interp
@@ -1472,7 +1520,7 @@ impl Runtime {
             ];
             if let Err(err) =
                 self.interp
-                    .run_callable_sync(&module, &callee, otter_vm::Value::Undefined, args)
+                    .run_callable_sync(&context, &callee, otter_vm::Value::Undefined, args)
             {
                 // §16.2.1.7 step 7.b.i — an evaluation throw maps
                 // to a promise rejection. Prefer the original
@@ -1566,7 +1614,7 @@ impl Runtime {
                 "dynamic import: HTTPS module \"{target_url}\" has own static imports — not yet supported"
             )));
         }
-        let module = std::rc::Rc::new(fragment);
+        let context = ExecutionContext::from_module(fragment);
         let env = otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
             DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
         })?;
@@ -1584,7 +1632,7 @@ impl Runtime {
         ];
         if let Err(err) =
             self.interp
-                .run_callable_sync(&module, &callee, otter_vm::Value::Undefined, args)
+                .run_callable_sync(&context, &callee, otter_vm::Value::Undefined, args)
         {
             if matches!(err, otter_vm::VmError::Uncaught { .. })
                 && let Some(thrown) = self.interp.take_pending_uncaught_throw()
@@ -1635,12 +1683,11 @@ impl Runtime {
     pub fn register_pending_promise(
         &mut self,
     ) -> Result<(promise_registry::PromiseId, otter_vm::Value), OtterError> {
-        let handle =
-            otter_vm::JsPromiseHandle::pending(self.interp.gc_heap_mut()).map_err(|oom| {
-                OtterError::OutOfMemory {
-                    requested_bytes: oom.requested_bytes(),
-                    heap_limit_bytes: oom.heap_limit_bytes(),
-                }
+        let handle = otter_vm::promise_dispatch::PromiseBuilder::new()
+            .pending(self.interp.gc_heap_mut())
+            .map_err(|oom| OtterError::OutOfMemory {
+                requested_bytes: oom.requested_bytes(),
+                heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
         let id = self.promise_registry.register(handle);
         Ok((id, otter_vm::Value::Promise(handle)))
@@ -1663,14 +1710,6 @@ impl Runtime {
         let handle = match self.promise_registry.take(id) {
             Some(handle) => handle,
             None => return Ok(false),
-        };
-        let module = match self.current_module.clone() {
-            Some(m) => m,
-            None => {
-                // No module retained — the script that asked for
-                // this promise has been replaced. Drop quietly.
-                return Ok(false);
-            }
         };
         // Convert the owned host payload into a `Value` on the
         // runner thread. String allocations land against the
@@ -1736,27 +1775,30 @@ impl Runtime {
         for job in jobs.jobs {
             self.interp.microtasks_mut().enqueue(job);
         }
-        self.interp
-            .drain_microtasks(&module)
-            .map_err(map_vm_error)?;
+        if let Err(err) = self.interp.drain_microtasks_with_default(None) {
+            return Err(enrich_runtime_diagnostic_with_cause(
+                &mut self.interp,
+                map_vm_error(err),
+            ));
+        }
         Ok(true)
     }
 
     fn alloc_string(&mut self, s: &str) -> Result<otter_vm::JsString, OtterError> {
         let heap = self.interp.string_heap_clone();
         otter_vm::JsString::from_str(s, &heap).map_err(|err| OtterError::Internal {
-            code: "STRING_ALLOC".to_string(),
+            code: DiagnosticCode::StringAlloc.as_str().to_string(),
             message: err.to_string(),
         })
     }
 
     /// Fire the timer identified by `token`. Routes through
     /// the per-isolate `TimerCallbacks` table to recover the JS
-    /// callable + extra arguments + interval flag, invokes the
-    /// callback as a top-level call against the runtime's
-    /// `current_module`, and drains any microtasks the callback
-    /// queued. Returns `Ok(true)` when the entry was known,
-    /// `Ok(false)` when it was already cancelled, and an
+    /// callable + extra arguments + callback module, invokes the
+    /// callback as a top-level call against that module, and drains
+    /// any microtasks the callback queued. Returns [`TimerFireOutcome`]
+    /// so the isolate runner can update timer liveness without
+    /// treating a cancelled timer as a fired task. Returns an
     /// [`OtterError`] when the callback raises an unhandled throw.
     ///
     /// One-shot (`setTimeout`) entries are removed from the table
@@ -1764,36 +1806,34 @@ impl Runtime {
     /// from inside the callback observes the entry as gone.
     /// Repeating (`setInterval`) entries stay in the table; the
     /// host scheduler re-arms them on its own.
-    pub fn fire_timer(&mut self, token: u64) -> Result<bool, OtterError> {
-        let module = match self.current_module.clone() {
-            Some(m) => m,
-            None => {
-                // No module retained — the scripts that scheduled
-                // this timer have all been replaced. Drop the
-                // entry quietly.
-                self.interp.timer_callbacks_mut().remove(token);
-                return Ok(false);
-            }
-        };
+    pub(crate) fn fire_timer(&mut self, token: u64) -> Result<TimerFireOutcome, OtterError> {
         let entry = match self.interp.timer_callbacks().get(token).cloned() {
             Some(entry) => entry,
-            None => return Ok(false),
+            None => return Ok(TimerFireOutcome::Missing),
         };
-        if entry.repeat_ms.is_none() {
+        let repeat = entry.repeat_ms.is_some();
+        if !repeat {
             self.interp.timer_callbacks_mut().remove(token);
         }
-        let task = otter_vm::Microtask {
-            callee: entry.callback,
-            this_value: otter_vm::Value::Undefined,
-            args: entry.extra_args,
-            result_capability: None,
-            kind: otter_vm::MicrotaskKind::Call,
-        };
-        self.interp.microtasks_mut().enqueue(task);
-        let outcome = self.interp.drain_microtasks(&module);
+        let context = entry.context.clone();
+        let mut args: smallvec::SmallVec<[otter_vm::Value; 8]> =
+            smallvec::SmallVec::with_capacity(entry.extra_args.len());
+        args.extend(entry.extra_args);
+        self.interp
+            .run_callable_sync(&context, &entry.callback, otter_vm::Value::Undefined, args)
+            .map_err(|error| {
+                map_vm_error(otter_vm::RunError {
+                    error,
+                    frames: Vec::new(),
+                })
+            })?;
+        let outcome = self.interp.drain_microtasks(&context);
         match outcome {
-            Ok(()) => Ok(true),
-            Err(err) => Err(map_vm_error(err)),
+            Ok(()) => Ok(TimerFireOutcome::Fired { repeat }),
+            Err(err) => Err(enrich_runtime_diagnostic_with_cause(
+                &mut self.interp,
+                map_vm_error(err),
+            )),
         }
     }
 
@@ -1871,6 +1911,30 @@ impl Runtime {
         self.diagnostics.emit(&self.config.hooks, diagnostic);
     }
 
+    /// Map a `(module_url, function_id, pc)` triple back to the
+    /// original source byte range using the runtime-owned source
+    /// map table.
+    ///
+    /// Populated incrementally as the runtime compiles modules /
+    /// scripts. Returns the predecessor entry's span when the
+    /// table has no exact PC match — matches the VM's frame
+    /// snapshot policy in
+    /// [`otter_vm::snapshot_frames`].
+    ///
+    /// Returns `None` when the module URL has no compiled
+    /// metadata yet, when the function id is unknown for that
+    /// module, or when the function's span table is empty.
+    #[must_use]
+    pub fn resolve_frame_span(
+        &self,
+        module_url: &str,
+        function_id: u32,
+        pc: u32,
+    ) -> Option<(u32, u32)> {
+        self.source_maps
+            .resolve_frame_span(module_url, function_id, pc)
+    }
+
     /// Compile and execute `source` as a script.
     ///
     /// # Errors
@@ -1890,22 +1954,26 @@ impl Runtime {
         module: BytecodeModule,
         start: std::time::Instant,
     ) -> Result<ExecutionResult, OtterError> {
-        // Retain the module on the runtime so timer / host-op
-        // callbacks queued during execution can dispatch against
-        // its function table after this synchronous run returns.
-        // Cleared at the next `run_*` entry so a fresh script does
-        // not observe stale callbacks.
-        let module = std::rc::Rc::new(module);
-        self.current_module = Some(module.clone());
+        let context = ExecutionContext::from_module(module);
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
         // drain so any `queueMicrotask` registered during script
         // execution gets a chance to run before we report success.
-        let script_outcome = self.interp.run(&module);
-        let drain_outcome = self.interp.drain_microtasks(&module);
+        let script_outcome = self.interp.run(&context);
+        let drain_outcome = self.interp.drain_microtasks(&context);
         let value = match (script_outcome, drain_outcome) {
-            (Err(script_err), _) => return Err(map_vm_error(script_err)),
-            (Ok(_), Err(drain_err)) => return Err(map_vm_error(drain_err)),
+            (Err(script_err), _) => {
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(script_err),
+                ));
+            }
+            (Ok(_), Err(drain_err)) => {
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(drain_err),
+                ));
+            }
             (Ok(v), Ok(())) => v,
         };
         Ok(ExecutionResult::from_vm_value(value, start.elapsed()))
@@ -1921,22 +1989,12 @@ impl Runtime {
     /// Any `VmError` raised by a microtask propagates as
     /// `OtterError::Runtime`.
     pub fn run_microtasks(&mut self) -> Result<(), OtterError> {
-        // Empty module so the drain has a `BytecodeModule` to look
-        // up function bodies in. Microtasks always reference
-        // functions defined in the original module they were
-        // queued from — this entry point is for embedders who
-        // already have that module on hand; for now we surface
-        // it as a no-op when the queue is empty.
         if !self.interp.microtasks().has_any_pending() {
             return Ok(());
         }
-        // Without a module we cannot resolve function ids; the
-        // foundation contract is that callers use the auto-drain
-        // path. Document this loudly.
-        Err(OtterError::Internal {
-            code: "MICROTASK_DRAIN_NEEDS_MODULE".to_string(),
-            message: "manual microtask draining requires the originating module; use run_script which auto-drains".to_string(),
-        })
+        self.interp
+            .drain_microtasks_with_default(None)
+            .map_err(map_vm_error)
     }
 
     /// Convenience: run an expression for tooling.
@@ -2025,9 +2083,9 @@ impl Runtime {
             self.source_maps.record_compiled_metadata(metadata);
         }
         let entry_url = linked.entry_url.clone();
-        self.module_records.allocate_for_bytecode(
+        self.module_records.allocate_for_module_inits(
             &mut self.interp,
-            &module,
+            &module.module_inits,
             &self.config.hosted_modules,
             &self.config.capabilities,
         )?;
@@ -2054,22 +2112,23 @@ impl Runtime {
             });
 
         self.module_records.mark_evaluating();
-        // Retain the linked module on the runtime so timer /
-        // host-op callbacks scheduled during evaluation can
-        // dispatch against the same function table after the
-        // synchronous body returns.
-        let module = std::rc::Rc::new(module);
-        self.current_module = Some(module.clone());
-        let script_outcome = self.interp.run(&module);
-        let drain_outcome = self.interp.drain_microtasks(&module);
+        let context = ExecutionContext::from_module(module);
+        let script_outcome = self.interp.run(&context);
+        let drain_outcome = self.interp.drain_microtasks(&context);
         let value = match (script_outcome, drain_outcome) {
             (Err(script_err), _) => {
                 self.module_records.mark_errored();
-                return Err(map_vm_error(script_err));
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(script_err),
+                ));
             }
             (Ok(_), Err(drain_err)) => {
                 self.module_records.mark_errored();
-                return Err(map_vm_error(drain_err));
+                return Err(enrich_runtime_diagnostic_with_cause(
+                    &mut self.interp,
+                    map_vm_error(drain_err),
+                ));
             }
             (Ok(v), Ok(())) => v,
         };
@@ -2557,7 +2616,7 @@ pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
                 Diagnostic::permission(format!(
                     "import of `{specifier}` requires capability `{capability}` for `{resource}`"
                 ))
-                .with_code("MODULE_CAPABILITY_DENIED")
+                .with_code_enum(DiagnosticCode::ModuleCapabilityDenied)
                 .with_help(format!(
                     "grant the matching capability (e.g. --allow-{capability}={resource}) or remove the import"
                 )),
@@ -2566,7 +2625,7 @@ pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
         module_graph::GraphError::Loader(err) => OtterError::Compile {
             diagnostics: vec![
                 Diagnostic::syntax(err.to_string())
-                    .with_code("MODULE_RESOLUTION_ERROR")
+                    .with_code_enum(DiagnosticCode::ModuleResolutionError)
                     .with_help(
                         "check the import specifier and package/module loader configuration",
                     ),
@@ -2579,7 +2638,7 @@ pub(crate) fn map_graph_error(err: module_graph::GraphError) -> OtterError {
                 Diagnostic::syntax(format!(
                     "module graph cycle or depth limit reached at `{url}`"
                 ))
-                .with_code("MODULE_GRAPH_CYCLE")
+                .with_code_enum(DiagnosticCode::ModuleGraphCycle)
                 .with_source_url(url)
                 .with_help("break the import cycle or reduce module graph depth"),
             ],
@@ -2658,7 +2717,7 @@ pub(crate) fn map_compile_error(err: otter_compiler::CompileError, source_url: &
             ],
         },
         _ => OtterError::Internal {
-            code: "COMPILE_UNKNOWN".to_string(),
+            code: DiagnosticCode::CompileUnknown.as_str().to_string(),
             message: "unknown compiler error variant".to_string(),
         },
     }
@@ -2727,6 +2786,112 @@ fn fragment_has_import_namespace_ops(module: &otter_bytecode::BytecodeModule) ->
     })
 }
 
+/// Maximum depth the diagnostic cause-chain walker descends into
+/// nested `Error.cause` properties before bailing out. Protects
+/// against pathological self-referential chains.
+const MAX_CAUSE_CHAIN_DEPTH: usize = 32;
+
+/// Walk a thrown JS value into a [`Diagnostic`] tree.
+///
+/// Reads `name` / `message` / `cause` / `errors` from any Error
+/// instance (§20.5 / §20.5.7). Recurses on `cause` up to
+/// [`MAX_CAUSE_CHAIN_DEPTH`]. Non-Error throws (strings, numbers,
+/// …) become plain `TypeError`-categorised diagnostics with the
+/// stringified value as `message`.
+fn diagnostic_from_thrown_value(
+    interp: &otter_vm::Interpreter,
+    value: &otter_vm::Value,
+    depth: usize,
+) -> Diagnostic {
+    if depth > MAX_CAUSE_CHAIN_DEPTH {
+        return Diagnostic::new(
+            DiagnosticKind::Internal,
+            DiagnosticCode::VmBytecodeInvariant,
+            "diagnostic cause chain exceeded depth limit".to_string(),
+        );
+    }
+    let heap = interp.gc_heap();
+    let obj = match value {
+        otter_vm::Value::Object(obj) => *obj,
+        primitive => {
+            return Diagnostic::new(
+                DiagnosticKind::Type,
+                DiagnosticCode::Uncaught,
+                primitive.display_string(),
+            );
+        }
+    };
+
+    let name = otter_vm::object::get(obj, heap, "name")
+        .map(|v| v.display_string())
+        .unwrap_or_else(|| "Error".to_string());
+    let message = otter_vm::object::get(obj, heap, "message")
+        .map(|v| v.display_string())
+        .unwrap_or_default();
+    let full = if message.is_empty() {
+        name.clone()
+    } else {
+        format!("{name}: {message}")
+    };
+    let (kind, code) = vm_error_kind_and_code_from_name(&name);
+    let mut diag = Diagnostic::new(kind, code, full);
+
+    // `cause`: recurse.
+    if let Some(cause) = otter_vm::object::get(obj, heap, "cause") {
+        diag = diag.with_cause(diagnostic_from_thrown_value(interp, &cause, depth + 1));
+    }
+
+    // `errors`: AggregateError. Each entry becomes an aggregated
+    // diagnostic; recurse one level so nested causes inside each
+    // error survive.
+    if let Some(otter_vm::Value::Array(errors)) = otter_vm::object::get(obj, heap, "errors") {
+        let entries: Vec<Diagnostic> = otter_vm::array::with_elements(errors, heap, |slice| {
+            slice
+                .iter()
+                .map(|v| diagnostic_from_thrown_value(interp, v, depth + 1))
+                .collect()
+        });
+        if !entries.is_empty() {
+            diag = diag.with_aggregated_errors(entries);
+        }
+    }
+
+    diag
+}
+
+/// Map a thrown Error's `.name` to the matching
+/// [`DiagnosticKind`] / [`DiagnosticCode`] pair.
+fn vm_error_kind_and_code_from_name(name: &str) -> (DiagnosticKind, DiagnosticCode) {
+    match name {
+        "TypeError" => (DiagnosticKind::Type, DiagnosticCode::TypeError),
+        "RangeError" => (DiagnosticKind::Range, DiagnosticCode::StackOverflow),
+        "SyntaxError" => (DiagnosticKind::Syntax, DiagnosticCode::SyntaxError),
+        "ReferenceError" => (DiagnosticKind::Reference, DiagnosticCode::Tdz),
+        _ => (DiagnosticKind::Type, DiagnosticCode::Uncaught),
+    }
+}
+
+/// Enrich a runtime diagnostic with the `cause` chain and
+/// `errors` aggregated entries from the original thrown JS value,
+/// when available.
+fn enrich_runtime_diagnostic_with_cause(
+    interp: &mut otter_vm::Interpreter,
+    err: OtterError,
+) -> OtterError {
+    let OtterError::Runtime { mut diagnostic } = err else {
+        return err;
+    };
+    let Some(thrown) = interp.take_pending_uncaught_throw() else {
+        return OtterError::Runtime { diagnostic };
+    };
+    // Walk the throw value once and attach both `cause` and
+    // `aggregated_errors` directly onto the outer diagnostic.
+    let chain = diagnostic_from_thrown_value(interp, &thrown, 0);
+    diagnostic.cause = chain.cause;
+    diagnostic.aggregated_errors = chain.aggregated_errors;
+    OtterError::Runtime { diagnostic }
+}
+
 fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
     use otter_vm::VmError;
     let otter_vm::RunError { error, frames } = run_err;
@@ -2741,10 +2906,10 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
     let top_span = stack_frames.first().and_then(|f| f.span);
     let display = error.to_string();
     let runtime_diagnostic =
-        |kind: DiagnosticKind, code: &str, message: String| OtterError::Runtime {
+        |kind: DiagnosticKind, code: DiagnosticCode, message: String| OtterError::Runtime {
             diagnostic: Diagnostic {
                 kind,
-                code: code.to_string(),
+                code: code.as_str().to_string(),
                 message,
                 source_url: stack_frames.first().map(|frame| frame.module.clone()),
                 range: top_span,
@@ -2752,6 +2917,7 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
                 help: None,
                 frames: stack_frames.clone(),
                 cause: None,
+                aggregated_errors: Vec::new(),
             },
         };
     match error {
@@ -2763,52 +2929,60 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             requested_bytes,
             heap_limit_bytes,
         },
-        VmError::TypeMismatch => runtime_diagnostic(DiagnosticKind::Type, "TYPE_MISMATCH", display),
+        VmError::TypeMismatch => {
+            runtime_diagnostic(DiagnosticKind::Type, DiagnosticCode::TypeMismatch, display)
+        }
         VmError::TypeError { message } => {
-            runtime_diagnostic(DiagnosticKind::Type, "TYPE_ERROR", message)
+            runtime_diagnostic(DiagnosticKind::Type, DiagnosticCode::TypeError, message)
         }
         VmError::SyntaxError { message } => {
-            runtime_diagnostic(DiagnosticKind::Syntax, "SYNTAX_ERROR", message)
+            runtime_diagnostic(DiagnosticKind::Syntax, DiagnosticCode::SyntaxError, message)
         }
         VmError::UnknownIntrinsic { name } => runtime_diagnostic(
             DiagnosticKind::Type,
-            "UNKNOWN_METHOD",
+            DiagnosticCode::UnknownMethod,
             format!("unknown method `{name}`"),
         ),
         VmError::TemporalDeadZone { local_index } => runtime_diagnostic(
             DiagnosticKind::Reference,
-            "TDZ",
+            DiagnosticCode::Tdz,
             format!("cannot access local {local_index} before initialization"),
         ),
         VmError::StackOverflow { limit } => runtime_diagnostic(
             DiagnosticKind::Range,
-            "STACK_OVERFLOW",
+            DiagnosticCode::StackOverflow,
             format!("maximum call stack size exceeded (limit {limit})"),
         ),
         VmError::NotCallable => runtime_diagnostic(
             DiagnosticKind::Type,
-            "NOT_CALLABLE",
+            DiagnosticCode::NotCallable,
             "value is not a function".to_string(),
         ),
         VmError::Uncaught { value } => runtime_diagnostic(
             DiagnosticKind::Type,
-            "UNCAUGHT",
+            DiagnosticCode::Uncaught,
             format!("uncaught exception: {value}"),
         ),
         VmError::JsonError { code, message } => {
-            // `code` is `&'static str` so we can pass it straight
-            // through; it stays stable for telemetry/log filters.
-            runtime_diagnostic(DiagnosticKind::Type, code, message)
+            // `code` is `&'static str` from the VM JSON path (every
+            // value is one of the `JSON_*` codes in the closed
+            // [`DiagnosticCode`] set). Parse it back through
+            // `DiagnosticCode::parse` so the diagnostic still
+            // carries a typed code in the closed set.
+            let typed = DiagnosticCode::parse(code).unwrap_or(DiagnosticCode::JsonBadArg);
+            runtime_diagnostic(DiagnosticKind::Type, typed, message)
         }
-        VmError::InvalidRegExp { message } => {
-            runtime_diagnostic(DiagnosticKind::Syntax, "INVALID_REGEXP", message)
-        }
+        VmError::InvalidRegExp { message } => runtime_diagnostic(
+            DiagnosticKind::Syntax,
+            DiagnosticCode::InvalidRegexp,
+            message,
+        ),
         VmError::MissingReturn | VmError::InvalidOperand => OtterError::Internal {
-            code: "VM_BYTECODE_INVARIANT".to_string(),
+            code: DiagnosticCode::VmBytecodeInvariant.as_str().to_string(),
             message: display,
         },
         _ => OtterError::Internal {
-            code: "VM_UNKNOWN".to_string(),
+            code: DiagnosticCode::VmUnknown.as_str().to_string(),
             message: display,
         },
     }

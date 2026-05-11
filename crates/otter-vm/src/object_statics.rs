@@ -125,11 +125,11 @@ fn native_call(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let module = ctx.current_module();
+    let context = ctx.execution_context().cloned();
     if let Some(result) = ctx
         .cx
         .interp
-        .try_function_object_static_call(module, method, args)
+        .try_function_object_static_call(context.as_ref(), method, args)
         .map_err(|err| object_native_error(method.name(), err))?
     {
         return Ok(result);
@@ -204,11 +204,11 @@ fn native_prototype_has_own_property(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
-    if let Some(module) = ctx.current_module() {
+    if let Some(context) = ctx.execution_context().cloned() {
         let desc = ctx
             .cx
             .interp
-            .get_own_property_descriptor_for_value(module, this_value.clone(), args.first())
+            .get_own_property_descriptor_for_value(&context, this_value.clone(), args.first())
             .map_err(|err| object_native_error("hasOwnProperty", err))?;
         return Ok(Value::Boolean(desc.is_some()));
     }
@@ -242,11 +242,11 @@ fn native_prototype_property_is_enumerable(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
-    if let Some(module) = ctx.current_module() {
+    if let Some(context) = ctx.execution_context().cloned() {
         let desc = ctx
             .cx
             .interp
-            .get_own_property_descriptor_for_value(module, this_value, args.first())
+            .get_own_property_descriptor_for_value(&context, this_value, args.first())
             .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
         return Ok(Value::Boolean(
             desc.as_ref().is_some_and(PropertyDescriptor::enumerable),

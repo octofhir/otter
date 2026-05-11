@@ -36,9 +36,7 @@
 
 use std::marker::PhantomData;
 
-use otter_bytecode::BytecodeModule;
-
-use crate::{Interpreter, Value};
+use crate::{ExecutionContext, Interpreter, Value};
 
 /// Internal VM context. Carried explicitly through the dispatch
 /// loop and built-in helper signatures so every algorithm sees the
@@ -151,7 +149,7 @@ impl NativeCallInfo {
 pub struct NativeCtx<'rt> {
     pub(crate) cx: RuntimeCx<'rt>,
     call_info: NativeCallInfo,
-    module: Option<&'rt BytecodeModule>,
+    context: Option<ExecutionContext>,
 }
 
 impl<'rt> NativeCtx<'rt> {
@@ -168,41 +166,40 @@ impl<'rt> NativeCtx<'rt> {
         interp: &'rt mut Interpreter,
         call_info: NativeCallInfo,
     ) -> Self {
-        Self::new_with_call_info_and_module(interp, call_info, None)
+        Self::new_with_call_info_and_context(interp, call_info, None)
     }
 
     /// Build a native context with explicit call-site metadata and
-    /// current bytecode module. Builtins that need to re-enter JS
+    /// execution context. Builtins that need to re-enter JS
     /// observable algorithms (for example Proxy traps) use the
-    /// module to invoke callbacks with the same function table as
+    /// context to invoke callbacks with the same function table as
     /// the caller.
     #[must_use]
-    pub(crate) fn new_with_call_info_and_module(
+    pub(crate) fn new_with_call_info_and_context(
         interp: &'rt mut Interpreter,
         call_info: NativeCallInfo,
-        module: Option<&'rt BytecodeModule>,
+        context: Option<ExecutionContext>,
     ) -> Self {
         Self {
             cx: RuntimeCx::new(interp),
             call_info,
-            module,
+            context,
         }
     }
 
-    /// Current bytecode module for native builtins that re-enter
-    /// JS callbacks.
+    /// Execution context for the active native call.
     #[must_use]
-    pub(crate) fn current_module(&self) -> Option<&'rt BytecodeModule> {
-        self.module
+    pub(crate) fn execution_context(&self) -> Option<&ExecutionContext> {
+        self.context.as_ref()
     }
 
     /// Borrow the owning interpreter together with the current
-    /// bytecode module. Use this when a native needs to re-enter VM
-    /// code that also needs the caller module for observable coercions.
-    pub(crate) fn interp_mut_and_current_module(
+    /// execution context. Use this when a native needs to re-enter VM
+    /// code that also needs the caller context for observable coercions.
+    pub(crate) fn interp_mut_and_context(
         &mut self,
-    ) -> (&mut Interpreter, Option<&'rt BytecodeModule>) {
-        (self.cx.interp, self.module)
+    ) -> (&mut Interpreter, Option<ExecutionContext>) {
+        (self.cx.interp, self.context.clone())
     }
 
     /// Return the JavaScript receiver for the active native call.

@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use otter_bytecode::BytecodeModule;
+use otter_bytecode::ModuleInit;
 use otter_vm::{Interpreter, JsObject};
 
 use crate::{CapabilitySet, ConfigError, HostedModule, OtterError};
@@ -49,7 +49,7 @@ use crate::{CapabilitySet, ConfigError, HostedModule, OtterError};
 //
 // `Unresolved`, `Resolved`, and `Compiled` are part of the spec
 // lifecycle but currently the load pipeline batches them under a
-// single hand-off to `allocate_for_bytecode` (the linker has
+// single hand-off to `allocate_for_module_inits` (the linker has
 // already done resolve + compile + link by then). The variants
 // are kept on the enum so the per-phase loader hooks, when they
 // land, route through the same authoritative state machine.
@@ -94,7 +94,7 @@ pub(crate) struct RuntimeModuleRecords {
 }
 
 impl RuntimeModuleRecords {
-    /// Allocate records and module-env objects for a linked module program.
+    /// Allocate records and module-env objects for linked module init records.
     ///
     /// Walks each linked `<module-init>` URL and emits the
     /// `Unresolved → Resolved → Compiled → Instantiated`
@@ -107,16 +107,16 @@ impl RuntimeModuleRecords {
     /// This also resets and repopulates the VM registry used by
     /// `Op::ImportNamespace`, so the VM reads the environment
     /// objects owned by these records during evaluation.
-    pub(crate) fn allocate_for_bytecode(
+    pub(crate) fn allocate_for_module_inits(
         &mut self,
         interp: &mut Interpreter,
-        module: &BytecodeModule,
+        module_inits: &[ModuleInit],
         hosted_modules: &[HostedModule],
         capabilities: &CapabilitySet,
     ) -> Result<(), OtterError> {
         self.records.clear();
         interp.reset_module_state();
-        for init in &module.module_inits {
+        for init in module_inits {
             let env = if let Some(hosted) = hosted_modules
                 .iter()
                 .find(|hosted| hosted.specifier() == init.url)

@@ -12,9 +12,9 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-reflect-object>
 
-use otter_bytecode::BytecodeModule;
 use smallvec::SmallVec;
 
+use crate::ExecutionContext;
 use crate::object::{JsObject, PropertyLookup};
 use crate::object_statics::coerce_to_descriptor;
 use crate::string::JsString;
@@ -37,7 +37,7 @@ enum PropertyKey {
 /// - [`VmError::TypeMismatch`] for receiver / argument shape errors.
 pub fn call(
     interp: &mut Interpreter,
-    module: &BytecodeModule,
+    context: &ExecutionContext,
     method: otter_bytecode::method_id::ReflectMethod,
     args: &[Value],
     string_heap: &crate::string::StringHeap,
@@ -61,17 +61,17 @@ pub fn call(
                 None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
                 _ => return Err(VmError::TypeMismatch),
             };
-            interp.run_callable_sync(module, &target, this_value, argv)
+            interp.run_callable_sync(context, &target, this_value, argv)
         }
         // §28.1.3 Reflect.construct(target, argumentsList[, newTarget])
         // <https://tc39.es/ecma262/#sec-reflect.construct>
         M::Construct => {
             let target = args.first().cloned().unwrap_or(Value::Undefined);
-            if !is_constructor(&target, module, interp.gc_heap()) {
+            if !is_constructor(&target, context, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
             let new_target = args.get(2).cloned().unwrap_or_else(|| target.clone());
-            if !is_constructor(&new_target, module, interp.gc_heap()) {
+            if !is_constructor(&new_target, context, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
             let argv: SmallVec<[Value; 8]> = match args.get(1) {
@@ -83,7 +83,7 @@ pub fn call(
                 None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
                 _ => return Err(VmError::TypeMismatch),
             };
-            interp.run_construct_sync(module, &target, new_target, argv)
+            interp.run_construct_sync(context, &target, new_target, argv)
         }
         // §28.1.4 Reflect.defineProperty(target, propertyKey, attributes)
         // <https://tc39.es/ecma262/#sec-reflect.defineproperty>
@@ -282,7 +282,7 @@ pub fn call(
                         false
                     } else {
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        interp.run_callable_sync(module, &setter, receiver, argv)?;
+                        interp.run_callable_sync(context, &setter, receiver, argv)?;
                         true
                     }
                 }
@@ -320,13 +320,13 @@ fn is_callable(value: &Value, heap: &otter_gc::GcHeap) -> bool {
     }
 }
 
-fn is_constructor(value: &Value, module: &BytecodeModule, heap: &otter_gc::GcHeap) -> bool {
+fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc::GcHeap) -> bool {
     match value {
         Value::Object(obj) => matches!(
             crate::object::constructor_native(*obj, heap),
             Some(Value::NativeFunction(_))
         ),
-        _ => crate::abstract_ops::is_constructor(value, module, heap),
+        _ => crate::abstract_ops::is_constructor(value, context, heap),
     }
 }
 

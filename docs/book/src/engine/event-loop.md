@@ -48,9 +48,10 @@ Microtask checkpointing is VM work. Promise reactions, `queueMicrotask`,
 and async-function resumes run only after the current JS execution context
 unwinds and before the runtime turn is considered complete.
 
-Tokio-specific state belongs in `TokioEventLoop`. Runtime handles carry
-owned command payloads, timer tokens, and completion records; they do not
-hold VM values, GC handles, or executor locks.
+Tokio-specific state belongs in the runtime's internal event-loop and
+host-service layer. Runtime handles carry owned command payloads and
+settlement messages; timer callbacks re-enter the isolate by opaque timer
+token. Handles do not hold VM values, GC handles, or executor locks.
 
 ## Drive Modes
 
@@ -78,26 +79,13 @@ Native async APIs must split at the runtime boundary:
 Never move `RuntimeCx`, `NativeCtx`, `Value`, `Frame`, `Gc<T>`,
 `Local<'gc, T>`, or handle scopes into a Rust future.
 
-Host operations follow this concrete pattern:
-
-```rust,ignore
-let handle = otter.handle().clone();
-handle.spawn_host_op(RuntimeLiveness::Ref, Box::pin(async move {
-    // Owned host data only. No VM/GC handles here.
-    HostOpCompletion {
-        id: 0, // RuntimeHandle assigns the final id before posting.
-        kind: "example".to_string(),
-        result: Ok("done".to_string()),
-    }
-}));
-```
-
-The isolate runner receives the completion as a runtime inbox message on a
-later turn, then performs the JS-side resolution/checkpoint work on the
-mutator thread.
+Host operations should be exposed through narrow runtime-owned services or
+typed inbox messages. The isolate runner receives only owned completion
+data on a later turn, then performs the JS-side resolution/checkpoint work
+on the mutator thread.
 
 Cancellation and backpressure are runtime-handle concerns. Dropping or
-aborting a host future must not leave a JS promise in an untracked state:
+aborting host work must not leave a JS promise in an untracked state:
 record the operation id, decrement liveness counters, and settle or report
 the pending JS work on the isolate turn that observes cancellation.
 

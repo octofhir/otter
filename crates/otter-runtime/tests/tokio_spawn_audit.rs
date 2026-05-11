@@ -61,9 +61,9 @@ fn allowlist() -> BTreeMap<&'static str, &'static str> {
     let mut map = BTreeMap::new();
     map.insert(
         "crates/otter-runtime/src/event_loop.rs",
-        "TokioEventLoop is the runtime's explicit Tokio boundary. Both spawn sites take \
-         `'static + Send` futures of owned host data only — `HostFuture` (host op) and a \
-         delay future (timer). Neither touches Interpreter / Value / Local.",
+        "TokioEventLoop is the runtime's explicit Tokio boundary. Spawned work is limited \
+         to timer sleeps and narrow host-service futures over owned data. Neither touches \
+         Interpreter / Value / Local.",
     );
     map
 }

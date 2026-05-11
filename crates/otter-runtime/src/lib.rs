@@ -55,13 +55,15 @@
 pub mod compiled_program;
 pub mod diagnostics;
 pub mod error;
-pub mod event_loop;
+mod event_loop;
 pub mod handle;
 pub mod hooks;
+mod host_services;
 pub mod module_graph;
 pub mod module_loader;
 mod module_records;
 mod package_graph_resolver;
+mod process;
 pub mod promise_registry;
 pub mod structured_clone;
 pub mod surface;
@@ -86,10 +88,7 @@ use serde::{Deserialize, Serialize};
 pub use compiled_program::CompiledProgram;
 pub use diagnostics::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticKind, StackFrame};
 pub use error::{ConfigError, IoErrorKind, OtterError, error_schema_version};
-pub use event_loop::{
-    EventLoop, HostFuture, HostJoinHandle, HostOpCompletion, RuntimeLiveness, RuntimeWake,
-    TimerCallback, TimerRequest, TimerToken, TokioEventLoop,
-};
+pub use event_loop::RuntimeLiveness;
 pub use handle::{RuntimeActivityStats, RuntimeHandle};
 pub use hooks::{
     CapabilityRequest, RuntimeCapability, RuntimeCapabilityHook, RuntimeCompileHook,
@@ -871,6 +870,7 @@ pub(crate) struct RuntimeConfig {
     global_classes: Vec<GlobalClass>,
     console_sink: ConsoleSinkHandle,
     hooks: RuntimeHooks,
+    process_argv: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1048,6 +1048,7 @@ impl Default for RuntimeConfig {
             global_classes: Vec::new(),
             console_sink: otter_vm::console::default_console_sink(),
             hooks: RuntimeHooks::default(),
+            process_argv: process::default_argv(),
         }
     }
 }
@@ -1055,6 +1056,29 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
+    }
+}
+
+fn gc_oom_to_error(oom: otter_gc::OutOfMemory) -> OtterError {
+    OtterError::OutOfMemory {
+        requested_bytes: oom.requested_bytes(),
+        heap_limit_bytes: oom.heap_limit_bytes(),
+    }
+}
+
+fn string_oom_to_error(err: otter_vm::StringError) -> OtterError {
+    match err {
+        otter_vm::StringError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => OtterError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+        _ => OtterError::Internal {
+            code: DiagnosticCode::StringAlloc.as_str().to_string(),
+            message: err.to_string(),
+        },
     }
 }
 
@@ -1195,6 +1219,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Set the `process.argv` snapshot installed into the runtime.
+    #[must_use]
+    pub fn process_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.config.process_argv = argv.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Construct the runtime.
     ///
     /// # Errors
@@ -1245,6 +1276,7 @@ impl Runtime {
                     message: err.to_string(),
                 })?;
         }
+        process::install_global(&mut interp, &config.process_argv, &config.capabilities)?;
         // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
         // `new Function(...)` reach a real parse + compile path.
         // The closure is reusable across calls; each invocation
@@ -1270,7 +1302,6 @@ impl Runtime {
             diagnostics: RuntimeDiagnosticsSink::default(),
             package_manager,
             promise_registry: promise_registry::PromiseRegistry::new(),
-            tokio_handle: None,
         })
     }
 }
@@ -1296,14 +1327,6 @@ pub struct Runtime {
     /// resolves / rejects it through the standard promise
     /// dispatch path so reactions land on the microtask queue.
     promise_registry: promise_registry::PromiseRegistry,
-    /// Tokio handle wired by [`crate::handle::run_isolate`] so
-    /// runner-side helpers (HTTPS dynamic-import fetch, future
-    /// `fetch()` global, …) can `block_on` host async work
-    /// without spinning up a fresh runtime per call. `None` for
-    /// Layer-A direct-mode embedders; the dynamic-import fetcher
-    /// reports a clean diagnostic in that case rather than
-    /// crashing.
-    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1316,6 +1339,16 @@ pub(crate) struct MicrotaskStats {
 pub(crate) enum TimerFireOutcome {
     Missing,
     Fired { repeat: bool },
+}
+
+pub(crate) enum DynamicImportBegin {
+    Settled,
+    FetchHttps { target_url: String },
+}
+
+enum DynamicModuleLoad {
+    Loaded(otter_vm::Value),
+    FetchHttps { target_url: String },
 }
 
 impl Runtime {
@@ -1362,34 +1395,61 @@ impl Runtime {
         self.interp.set_dynamic_import_loader(loader);
     }
 
-    /// Wire a Tokio runtime handle so runner-side helpers
-    /// (HTTPS dynamic-import fetch, future `fetch()` global, …)
-    /// can `block_on` host async work without spawning a fresh
-    /// runtime per call. The isolate runner sets this from its
-    /// [`crate::event_loop::TokioEventLoop`] at construction time.
-    pub fn install_tokio_handle(&mut self, handle: tokio::runtime::Handle) {
-        self.tokio_handle = Some(handle);
-    }
-
-    /// Synchronously load + compile + link + evaluate the module
-    /// identified by `(specifier, referrer)` and settle the
-    /// dynamic-import promise registered under `token`. Called
-    /// from `IsolateRunner` on the
-    /// [`crate::handle::RuntimeMessage::DynamicImportLoad`] hop.
-    pub fn complete_dynamic_import(
+    /// Begin loading a dynamic import on the isolate thread.
+    ///
+    /// File-backed modules are loaded, compiled, evaluated, and
+    /// settled before this returns. HTTPS modules are only resolved
+    /// and capability-checked here; network I/O is deferred to the
+    /// host service and returns later as owned source text.
+    pub(crate) fn begin_dynamic_import(
         &mut self,
         token: u64,
         specifier: &str,
         referrer: &str,
+    ) -> Result<DynamicImportBegin, OtterError> {
+        match self.load_dynamic_module(specifier, referrer) {
+            Ok(DynamicModuleLoad::Loaded(namespace)) => self
+                .settle_dynamic_import_result(token, Ok(namespace))
+                .map(|_| DynamicImportBegin::Settled),
+            Ok(DynamicModuleLoad::FetchHttps { target_url }) => {
+                Ok(DynamicImportBegin::FetchHttps { target_url })
+            }
+            Err(DynLoadError::Diagnostic(message)) => self
+                .alloc_dynamic_import_error(message)
+                .and_then(|value| self.settle_dynamic_import_result(token, Err(value)))
+                .map(|_| DynamicImportBegin::Settled),
+            Err(DynLoadError::Thrown(value)) => self
+                .settle_dynamic_import_result(token, Err(value))
+                .map(|_| DynamicImportBegin::Settled),
+        }
+    }
+
+    /// Finish an HTTPS dynamic import after the host fetcher has
+    /// returned owned UTF-8 source text.
+    pub(crate) fn complete_dynamic_import_https(
+        &mut self,
+        token: u64,
+        target_url: &str,
+        source: Result<String, String>,
     ) -> Result<bool, OtterError> {
-        let reaction_outcome: Result<otter_vm::Value, otter_vm::Value> =
-            match self.load_dynamic_module(specifier, referrer) {
-                Ok(namespace) => Ok(namespace),
-                Err(DynLoadError::Diagnostic(message)) => {
-                    Err(self.alloc_dynamic_import_error(message)?)
-                }
-                Err(DynLoadError::Thrown(value)) => Err(value),
-            };
+        let reaction_outcome: Result<otter_vm::Value, otter_vm::Value> = match source
+            .map_err(DynLoadError::Diagnostic)
+            .and_then(|source| self.evaluate_dynamic_module_https_source(target_url, source))
+        {
+            Ok(namespace) => Ok(namespace),
+            Err(DynLoadError::Diagnostic(message)) => {
+                Err(self.alloc_dynamic_import_error(message)?)
+            }
+            Err(DynLoadError::Thrown(value)) => Err(value),
+        };
+        self.settle_dynamic_import_result(token, reaction_outcome)
+    }
+
+    fn settle_dynamic_import_result(
+        &mut self,
+        token: u64,
+        reaction_outcome: Result<otter_vm::Value, otter_vm::Value>,
+    ) -> Result<bool, OtterError> {
         let settled_context = self.interp.settle_dynamic_import(token, reaction_outcome);
         if let Some(context) = settled_context {
             if let Err(err) = self.interp.drain_microtasks_with_default(Some(context)) {
@@ -1432,7 +1492,7 @@ impl Runtime {
         &mut self,
         specifier: &str,
         referrer: &str,
-    ) -> Result<otter_vm::Value, DynLoadError> {
+    ) -> Result<DynamicModuleLoad, DynLoadError> {
         use std::path::PathBuf;
         let referrer_opt = if referrer.is_empty() {
             None
@@ -1456,14 +1516,14 @@ impl Runtime {
             ))
         })?;
         if let Some(env) = self.interp.module_env(&target_url) {
-            return Ok(otter_vm::Value::Object(env));
+            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::Object(env)));
         }
         // HTTPS / HTTP targets take a separate fetch path because
         // `module_graph::load_program` only walks file:// URLs.
         // The capability check has already passed inside
         // `loader.resolve` so the target host is on the allowlist.
         if target_url.starts_with("http://") || target_url.starts_with("https://") {
-            return self.load_dynamic_module_https(&target_url);
+            return Ok(DynamicModuleLoad::FetchHttps { target_url });
         }
         let target_path: PathBuf = url_to_path(&target_url).ok_or_else(|| {
             DynLoadError::Diagnostic(format!(
@@ -1545,55 +1605,31 @@ impl Runtime {
                 "dynamic import: namespace missing after load: \"{target_url}\""
             ))
         })?;
-        Ok(otter_vm::Value::Object(namespace))
+        Ok(DynamicModuleLoad::Loaded(otter_vm::Value::Object(
+            namespace,
+        )))
     }
 
-    /// Fetch + compile + evaluate an HTTPS module dynamically.
+    /// Compile + evaluate an already-fetched HTTPS module
+    /// dynamically.
     ///
     /// # Algorithm
-    /// 1. `block_on` a `reqwest` GET against the resolved target
-    ///    URL using the runner-installed Tokio handle. The Net
-    ///    capability check has already passed inside
-    ///    `loader.resolve_with_kind`.
-    /// 2. Parse the response body as UTF-8 source text. Compile
+    /// 1. Parse the response body as UTF-8 source text. Compile
     ///    it as one ES-module fragment via
     ///    `otter_compiler::compile_module_fragment`. Any own
     ///    static imports are rejected for this slice — the
     ///    HTTPS fetcher does not yet recurse into dependencies.
     ///    Local file imports from an HTTPS module are also
     ///    rejected for the same reason.
-    /// 3. Wrap the fragment in a one-module `BytecodeModule`
+    /// 2. Wrap the fragment in a one-module `BytecodeModule`
     ///    suitable for `Interpreter::run_callable_sync`, allocate
     ///    an env, mark it inited, then dispatch `<module-init>`.
-    /// 4. Settle with the populated env as the namespace.
-    fn load_dynamic_module_https(
+    /// 3. Settle with the populated env as the namespace.
+    fn evaluate_dynamic_module_https_source(
         &mut self,
         target_url: &str,
+        response_text: String,
     ) -> Result<otter_vm::Value, DynLoadError> {
-        let handle = self.tokio_handle.clone().ok_or_else(|| {
-            DynLoadError::Diagnostic(
-                "dynamic import: HTTPS fetch requires a runtime-installed Tokio handle".to_string(),
-            )
-        })?;
-        let url = target_url.to_string();
-        let response_text = handle
-            .block_on(async move {
-                let resp = reqwest::Client::new()
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("dynamic import: HTTPS request failed: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!(
-                        "dynamic import: HTTPS status {} for \"{url}\"",
-                        resp.status()
-                    ));
-                }
-                resp.text()
-                    .await
-                    .map_err(|e| format!("dynamic import: HTTPS body read failed: {e}"))
-            })
-            .map_err(DynLoadError::Diagnostic)?;
         let parsed = otter_syntax::parse(response_text, otter_syntax::SourceKind::JavaScript)
             .map_err(|e| {
                 DynLoadError::Diagnostic(format!(
@@ -1794,8 +1830,8 @@ impl Runtime {
 
     /// Fire the timer identified by `token`. Routes through
     /// the per-isolate `TimerCallbacks` table to recover the JS
-    /// callable + extra arguments + callback module, invokes the
-    /// callback as a top-level call against that module, and drains
+    /// callable + extra arguments + execution context, invokes the
+    /// callback as a top-level call against that context, and drains
     /// any microtasks the callback queued. Returns [`TimerFireOutcome`]
     /// so the isolate runner can update timer liveness without
     /// treating a cancelled timer as a fired task. Returns an
@@ -2482,6 +2518,13 @@ impl OtterBuilder {
         self
     }
 
+    /// Set the `process.argv` snapshot installed into the runtime.
+    #[must_use]
+    pub fn process_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.runtime = self.runtime.process_argv(argv);
+        self
+    }
+
     /// Construct the public async facade.
     ///
     /// # Errors
@@ -2991,6 +3034,7 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_loop::{TimerRequest, TimerToken};
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -3332,25 +3376,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_handle_host_ops_timers_and_diagnostics_update_stats() {
+    async fn runtime_handle_timers_and_diagnostics_update_stats() {
         let otter = Otter::new();
         let handle = otter.handle().clone();
 
-        handle.spawn_host_op(
-            RuntimeLiveness::Ref,
-            Box::pin(async {
-                HostOpCompletion {
-                    id: 0,
-                    kind: "test-op".to_string(),
-                    result: Ok("done".to_string()),
-                }
-            }),
-        );
         let token = handle.schedule_timer(TimerRequest {
             delay: Duration::from_millis(10),
             repeat: None,
-            liveness: RuntimeLiveness::Ref,
-            origin: "runtime-test".to_string(),
         });
         assert!(!handle.cancel_timer(TimerToken(token.0 + 1)));
         handle.complete_dynamic_module_job_for_tests();
@@ -3359,8 +3391,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let stats = handle.activity_stats();
 
-        assert_eq!(stats.pending_ref_host_ops, 0);
-        assert_eq!(stats.completed_host_ops, 1);
         assert_eq!(stats.pending_ref_timers, 0);
         assert_eq!(stats.fired_timers, 1);
         assert_eq!(stats.pending_dynamic_module_jobs, 0);
@@ -3378,8 +3408,6 @@ mod tests {
         let token = handle.schedule_timer(TimerRequest {
             delay: Duration::from_secs(60),
             repeat: None,
-            liveness: RuntimeLiveness::Ref,
-            origin: "runtime-test-cancel".to_string(),
         });
         assert!(handle.cancel_timer(token));
 

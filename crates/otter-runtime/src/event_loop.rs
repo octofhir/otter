@@ -8,14 +8,13 @@
 //!
 //! - [`EventLoop`] — host scheduling trait.
 //! - [`TokioEventLoop`] — default Tokio-backed implementation.
-//! - Host-op, timer, wake, and liveness support types.
+//! - Timer sink and HTTPS host-service wiring support types.
 //!
 //! # Invariants
 //!
-//! - Host futures are `Send + 'static` and carry only owned host data.
 //! - The VM crate does not import Tokio types.
-//! - Timer and host-op liveness metadata is explicit even before the
-//!   corresponding JS APIs are exposed.
+//! - Tokio workers only emit timer tokens or owned host-service
+//!   results; JS callback dispatch stays on the isolate runner.
 //!
 //! # See also
 //!
@@ -24,18 +23,23 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-/// Future shape accepted by [`EventLoop::spawn_host_op`].
-pub type HostFuture = Pin<Box<dyn Future<Output = HostOpCompletion> + Send + 'static>>;
+use crate::host_services::{HttpsModuleFetchSink, HttpsModuleFetcher, HttpsModuleFetcherHandle};
 
-/// Callback invoked every time a timer fires.
-pub type TimerCallback = Arc<dyn Fn(TimerToken) + Send + Sync + 'static>;
+/// Runtime-side sink notified when a host timer fires.
+///
+/// Implementations should only ship the opaque [`TimerToken`] back
+/// to the isolate/runtime boundary. They must not retain VM or GC
+/// state.
+pub(crate) trait TimerWake: Send + Sync + 'static {
+    /// Notify the runtime that `token` fired.
+    fn timer_fired(&self, token: TimerToken);
+}
 
 /// Liveness bit for runtime work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,84 +51,34 @@ pub enum RuntimeLiveness {
     Unref,
 }
 
-/// Completion payload for a host operation.
-#[derive(Debug, Clone)]
-pub struct HostOpCompletion {
-    /// Runtime-assigned operation id.
-    pub id: u64,
-    /// Human-readable operation kind.
-    pub kind: String,
-    /// Result payload. Foundation bridge keeps this owned and textual;
-    /// future host APIs can widen it without exposing VM handles.
-    pub result: Result<String, String>,
-}
-
-/// Abort handle returned for a spawned host operation.
-#[derive(Clone)]
-pub struct HostJoinHandle {
-    abort: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl std::fmt::Debug for HostJoinHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostJoinHandle").finish_non_exhaustive()
-    }
-}
-
-impl HostJoinHandle {
-    /// Request best-effort cancellation of the host operation.
-    pub fn abort(&self) {
-        (self.abort)();
-    }
-}
-
 /// Timer identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TimerToken(pub u64);
+pub(crate) struct TimerToken(pub u64);
 
 /// Timer scheduling request.
 #[derive(Debug, Clone)]
-pub struct TimerRequest {
+pub(crate) struct TimerRequest {
     /// Delay from now.
     pub delay: Duration,
     /// Optional interval repeat period.
     pub repeat: Option<Duration>,
-    /// Ref/unref liveness.
-    pub liveness: RuntimeLiveness,
-    /// Diagnostic origin string.
-    pub origin: String,
-}
-
-/// Wake request for the isolate runner.
-#[derive(Debug, Clone)]
-pub struct RuntimeWake {
-    /// Wake origin.
-    pub origin: String,
 }
 
 /// Scheduling boundary owned by `otter-runtime`.
-pub trait EventLoop: Send + Sync + 'static {
-    /// Spawn owned host work outside the isolate.
-    fn spawn_host_op(&self, op: HostFuture) -> HostJoinHandle;
-
+pub(crate) trait EventLoop: Send + Sync + 'static {
     /// Schedule a timer and return its token.
-    fn schedule_timer(&self, request: TimerRequest, on_fire: TimerCallback) -> TimerToken;
+    fn schedule_timer(&self, request: TimerRequest, wake: Arc<dyn TimerWake>) -> TimerToken;
 
     /// Cancel a scheduled timer.
     fn cancel_timer(&self, token: TimerToken) -> bool;
-
-    /// Return the event-loop time source.
-    fn now(&self) -> Instant;
-
-    /// Wake the isolate runner.
-    fn wake_runtime(&self, wake: RuntimeWake);
 }
 
 /// Tokio-backed default event loop.
 #[derive(Clone)]
-pub struct TokioEventLoop {
+pub(crate) struct TokioEventLoop {
     handle: tokio::runtime::Handle,
     owned: Option<Arc<tokio::runtime::Runtime>>,
+    http_client: reqwest::Client,
     next_timer: Arc<AtomicU64>,
     timers: Arc<Mutex<HashMap<TimerToken, JoinHandle<()>>>>,
 }
@@ -138,21 +92,13 @@ impl std::fmt::Debug for TokioEventLoop {
 }
 
 impl TokioEventLoop {
-    /// Use the current Tokio runtime.
-    ///
-    /// # Panics
-    /// Panics when called outside a Tokio runtime.
-    #[must_use]
-    pub fn current() -> Self {
-        Self::from_handle(tokio::runtime::Handle::current())
-    }
-
     /// Wrap an embedder-provided Tokio handle.
     #[must_use]
-    pub fn from_handle(handle: tokio::runtime::Handle) -> Self {
+    pub(crate) fn from_handle(handle: tokio::runtime::Handle) -> Self {
         Self {
             handle,
             owned: None,
+            http_client: reqwest::Client::new(),
             next_timer: Arc::new(AtomicU64::new(1)),
             timers: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -163,11 +109,12 @@ impl TokioEventLoop {
     /// # Errors
     /// Returns [`std::io::Error`] if Tokio cannot create worker
     /// threads.
-    pub fn owned() -> Result<Self, std::io::Error> {
+    pub(crate) fn owned() -> Result<Self, std::io::Error> {
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
         Ok(Self {
             handle: runtime.handle().clone(),
             owned: Some(runtime),
+            http_client: reqwest::Client::new(),
             next_timer: Arc::new(AtomicU64::new(1)),
             timers: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -179,49 +126,41 @@ impl TokioEventLoop {
     /// # Errors
     /// Returns [`std::io::Error`] if no current runtime exists and an
     /// owned runtime cannot be created.
-    pub fn current_or_owned() -> Result<Self, std::io::Error> {
+    pub(crate) fn current_or_owned() -> Result<Self, std::io::Error> {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => Ok(Self::from_handle(handle)),
             Err(_) => Self::owned(),
         }
     }
 
-    /// Return the underlying Tokio runtime handle. Used by the
-    /// isolate runner to wire `Runtime::install_tokio_handle` so
-    /// runner-side helpers (HTTPS dynamic-import fetch, future
-    /// `fetch()` global, …) can `block_on` host async work
-    /// without spinning up a fresh runtime per call.
+    /// Build a narrow HTTPS module fetch service backed by this
+    /// event loop's Tokio handle.
     #[must_use]
-    pub fn tokio_handle(&self) -> tokio::runtime::Handle {
-        self.handle.clone()
+    pub(crate) fn https_module_fetcher(&self) -> HttpsModuleFetcherHandle {
+        Arc::new(TokioHttpsModuleFetcher {
+            handle: self.handle.clone(),
+            client: self.http_client.clone(),
+        })
     }
 
     /// Block on a future using the backing Tokio runtime.
     ///
     /// This is intended for CLI and non-async embedders. Async callers
     /// should use the `async` methods on [`crate::Otter`] directly.
-    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+    pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
         if let Some(runtime) = &self.owned {
             return runtime.block_on(future);
         }
         tokio::task::block_in_place(|| self.handle.block_on(future))
     }
 
-    /// Schedule a Tokio timer and invoke `on_fire` on the Tokio
+    /// Schedule a Tokio timer and notify `wake` from the Tokio
     /// worker after the delay elapses.
     ///
     /// The timer task registry is intentionally Tokio-local. The
     /// generic [`crate::RuntimeHandle`] only sees owned timer tokens
     /// and inbox messages; it does not hold executor locks.
-    #[must_use]
-    pub fn schedule_timer_callback<F>(&self, request: TimerRequest, on_fire: F) -> TimerToken
-    where
-        F: Fn(TimerToken) + Send + Sync + 'static,
-    {
-        self.schedule_timer_task(request, Arc::new(on_fire))
-    }
-
-    fn schedule_timer_task(&self, request: TimerRequest, on_fire: TimerCallback) -> TimerToken {
+    fn schedule_timer_task(&self, request: TimerRequest, wake: Arc<dyn TimerWake>) -> TimerToken {
         let token = TimerToken(self.next_timer.fetch_add(1, Ordering::Relaxed));
         let timers = self.timers.clone();
         let delay = request.delay;
@@ -237,7 +176,7 @@ impl TokioEventLoop {
                 Some(period) => {
                     tokio::time::sleep(delay).await;
                     loop {
-                        on_fire(token);
+                        wake.timer_fired(token);
                         tokio::time::sleep(period).await;
                     }
                 }
@@ -247,7 +186,7 @@ impl TokioEventLoop {
                         .lock()
                         .expect("timer registry poisoned")
                         .remove(&token);
-                    on_fire(token);
+                    wake.timer_fired(token);
                 }
             }
         });
@@ -260,17 +199,41 @@ impl TokioEventLoop {
     }
 }
 
-impl EventLoop for TokioEventLoop {
-    fn spawn_host_op(&self, op: HostFuture) -> HostJoinHandle {
-        let join = self.handle.spawn(async move {
-            let _ = op.await;
-        });
-        let abort = Arc::new(move || join.abort());
-        HostJoinHandle { abort }
-    }
+#[derive(Debug)]
+struct TokioHttpsModuleFetcher {
+    handle: tokio::runtime::Handle,
+    client: reqwest::Client,
+}
 
-    fn schedule_timer(&self, request: TimerRequest, on_fire: TimerCallback) -> TimerToken {
-        self.schedule_timer_task(request, on_fire)
+impl HttpsModuleFetcher for TokioHttpsModuleFetcher {
+    fn fetch_utf8(&self, url: String, sink: Arc<dyn HttpsModuleFetchSink>) {
+        let client = self.client.clone();
+        self.handle.spawn(async move {
+            let result = async {
+                let resp = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("dynamic import: HTTPS request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!(
+                        "dynamic import: HTTPS status {} for \"{url}\"",
+                        resp.status()
+                    ));
+                }
+                resp.text()
+                    .await
+                    .map_err(|e| format!("dynamic import: HTTPS body read failed: {e}"))
+            }
+            .await;
+            sink.fetched(result);
+        });
+    }
+}
+
+impl EventLoop for TokioEventLoop {
+    fn schedule_timer(&self, request: TimerRequest, wake: Arc<dyn TimerWake>) -> TimerToken {
+        self.schedule_timer_task(request, wake)
     }
 
     fn cancel_timer(&self, token: TimerToken) -> bool {
@@ -285,10 +248,4 @@ impl EventLoop for TokioEventLoop {
         join.abort();
         true
     }
-
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn wake_runtime(&self, _wake: RuntimeWake) {}
 }

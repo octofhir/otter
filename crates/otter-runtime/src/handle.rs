@@ -34,12 +34,12 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::event_loop::{
-    EventLoop, HostFuture, HostJoinHandle, HostOpCompletion, RuntimeLiveness, RuntimeWake,
-    TimerRequest, TimerToken, TokioEventLoop,
+    EventLoop, RuntimeLiveness, TimerRequest, TimerToken, TimerWake, TokioEventLoop,
 };
+use crate::host_services::{HttpsModuleFetchSink, HttpsModuleFetcherHandle};
 use crate::{
-    DiagnosticCode, ExecutionResult, OtterError, Runtime, RuntimeConfig, SourceInput,
-    TimerFireOutcome,
+    DiagnosticCode, DynamicImportBegin, ExecutionResult, OtterError, Runtime, RuntimeConfig,
+    SourceInput, TimerFireOutcome,
 };
 use otter_vm::{DynamicImportLoader, TimerScheduler};
 
@@ -52,9 +52,7 @@ type CheckReply = oneshot::Sender<Result<(), OtterError>>;
 
 type CommandId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct HostOpId(u64);
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ModuleJobId(u64);
 
@@ -159,17 +157,13 @@ struct RuntimeCounters {
     pending_microtasks: AtomicBool,
     microtask_generation: AtomicU64,
     next_command_id: AtomicU64,
-    next_host_op_id: AtomicU64,
+    #[cfg(test)]
     next_module_job_id: AtomicU64,
     shutdown: AtomicBool,
 }
 
 enum RuntimeMessage {
     Command(RuntimeCommand),
-    HostOpCompleted {
-        completion: HostOpCompletion,
-        liveness: RuntimeLiveness,
-    },
     TimerFired {
         token: TimerToken,
         liveness: RuntimeLiveness,
@@ -186,7 +180,15 @@ enum RuntimeMessage {
         referrer: String,
         liveness: RuntimeLiveness,
     },
+    DynamicImportHttpsFetched {
+        token: u64,
+        target_url: String,
+        result: Result<String, String>,
+        liveness: RuntimeLiveness,
+    },
+    #[cfg(test)]
     DynamicModuleReady(ModuleJobId),
+    #[cfg(test)]
     Diagnostic(RuntimeDiagnostic),
     Interrupt,
     Shutdown,
@@ -221,6 +223,7 @@ enum RuntimeCommand {
     },
 }
 
+#[cfg(test)]
 struct RuntimeDiagnostic {
     _origin: String,
     _message: String,
@@ -278,7 +281,7 @@ impl RuntimeHandle {
             pending_microtasks: AtomicBool::new(false),
             microtask_generation: AtomicU64::new(0),
             next_command_id: AtomicU64::new(1),
-            next_host_op_id: AtomicU64::new(1),
+            #[cfg(test)]
             next_module_job_id: AtomicU64::new(1),
             shutdown: AtomicBool::new(false),
         });
@@ -411,75 +414,23 @@ impl RuntimeHandle {
         let _ = self.inner.tx.try_send(RuntimeMessage::Interrupt);
     }
 
-    /// Spawn an owned host operation and post its completion back to
-    /// the isolate inbox.
-    pub fn spawn_host_op(&self, liveness: RuntimeLiveness, op: HostFuture) -> HostJoinHandle {
-        let op_id = HostOpId(
-            self.inner
-                .counters
-                .next_host_op_id
-                .fetch_add(1, Ordering::Relaxed),
-        );
-        increment_liveness(
-            liveness,
-            &self.inner.counters.pending_ref_host_ops,
-            &self.inner.counters.pending_unref_host_ops,
-        );
-        let tx = self.inner.tx.clone();
-        let counters = self.inner.counters.clone();
-        self.inner.event_loop.spawn_host_op(Box::pin(async move {
-            let mut completion = op.await;
-            completion.id = op_id.0;
-            if tx
-                .try_send(RuntimeMessage::HostOpCompleted {
-                    completion: completion.clone(),
-                    liveness,
-                })
-                .is_err()
-            {
-                decrement_liveness(
-                    liveness,
-                    &counters.pending_ref_host_ops,
-                    &counters.pending_unref_host_ops,
-                );
-                counters.failed_host_ops.fetch_add(1, Ordering::Relaxed);
-            }
-            completion
-        }))
-    }
-
     /// Schedule a timer wake through the runtime inbox.
     #[must_use]
-    pub fn schedule_timer(&self, request: TimerRequest) -> TimerToken {
+    #[cfg(test)]
+    pub(crate) fn schedule_timer(&self, request: TimerRequest) -> TimerToken {
         increment_liveness(
-            request.liveness,
+            RuntimeLiveness::Ref,
             &self.inner.counters.pending_ref_timers,
             &self.inner.counters.pending_unref_timers,
         );
-        let tx = self.inner.tx.clone();
-        let counters = self.inner.counters.clone();
-        let liveness = request.liveness;
-        let repeat = request.repeat.is_some();
-        self.inner
-            .event_loop
-            .schedule_timer_callback(request, move |token| {
-                if tx
-                    .try_send(RuntimeMessage::TimerFired {
-                        token,
-                        liveness,
-                        expects_js_callback: false,
-                    })
-                    .is_err()
-                    && !repeat
-                {
-                    decrement_liveness(
-                        liveness,
-                        &counters.pending_ref_timers,
-                        &counters.pending_unref_timers,
-                    );
-                    counters.cancelled_timers.fetch_add(1, Ordering::Relaxed);
-                }
-            })
+        let wake = Arc::new(RuntimeTimerWake {
+            tx: self.inner.tx.clone(),
+            counters: self.inner.counters.clone(),
+            liveness: RuntimeLiveness::Ref,
+            repeat: request.repeat.is_some(),
+            expects_js_callback: false,
+        });
+        self.inner.event_loop.schedule_timer(request, wake)
     }
 
     /// Settle a JS promise registered earlier via
@@ -532,7 +483,8 @@ impl RuntimeHandle {
     }
 
     /// Cancel a pending timer.
-    pub fn cancel_timer(&self, token: TimerToken) -> bool {
+    #[cfg(test)]
+    pub(crate) fn cancel_timer(&self, token: TimerToken) -> bool {
         if !self.inner.event_loop.cancel_timer(token) {
             return false;
         }
@@ -560,7 +512,8 @@ impl RuntimeHandle {
     /// This keeps the task-85 inbox shape exercised until module
     /// graph loading itself grows asynchronous host work.
     #[doc(hidden)]
-    pub fn complete_dynamic_module_job_for_tests(&self) {
+    #[cfg(test)]
+    pub(crate) fn complete_dynamic_module_job_for_tests(&self) {
         self.inner
             .counters
             .pending_dynamic_module_jobs
@@ -586,11 +539,9 @@ impl RuntimeHandle {
 
     /// Emit a diagnostic wake through the event-loop abstraction.
     /// Wake the runtime and emit a diagnostic inbox item.
-    pub fn wake_runtime(&self, origin: impl Into<String>) {
+    #[cfg(test)]
+    pub(crate) fn wake_runtime(&self, origin: impl Into<String>) {
         let origin = origin.into();
-        self.inner.event_loop.wake_runtime(RuntimeWake {
-            origin: origin.clone(),
-        });
         let _ = self
             .inner
             .tx
@@ -859,7 +810,7 @@ fn run_isolate(
         Ok(runtime) => runtime,
         Err(_) => return,
     };
-    runtime.install_tokio_handle(event_loop.tokio_handle());
+    let https_module_fetcher = event_loop.https_module_fetcher();
     let timer_scheduler = Arc::new(InboxTimerScheduler {
         tx: scheduler_tx.clone(),
         event_loop,
@@ -868,7 +819,7 @@ fn run_isolate(
     });
     runtime.install_timer_scheduler(timer_scheduler);
     let dynamic_import_loader = Arc::new(InboxDynamicImportLoader {
-        tx: scheduler_tx,
+        tx: scheduler_tx.clone(),
         counters: counters.clone(),
     });
     runtime.install_dynamic_import_loader(dynamic_import_loader);
@@ -876,7 +827,9 @@ fn run_isolate(
     let mut runner = IsolateRunner {
         runtime,
         rx,
+        tx: scheduler_tx,
         counters,
+        https_module_fetcher,
         shutdown: false,
     };
     runner.run_until_idle();
@@ -912,6 +865,70 @@ struct InboxTimerScheduler {
 }
 
 const FIRST_IMMEDIATE_TOKEN: u64 = 1u64 << 63;
+
+struct RuntimeTimerWake {
+    tx: SyncSender<RuntimeMessage>,
+    counters: Arc<RuntimeCounters>,
+    liveness: RuntimeLiveness,
+    repeat: bool,
+    expects_js_callback: bool,
+}
+
+impl TimerWake for RuntimeTimerWake {
+    fn timer_fired(&self, token: TimerToken) {
+        if self
+            .tx
+            .try_send(RuntimeMessage::TimerFired {
+                token,
+                liveness: self.liveness,
+                expects_js_callback: self.expects_js_callback,
+            })
+            .is_err()
+            && !self.repeat
+        {
+            decrement_liveness(
+                self.liveness,
+                &self.counters.pending_ref_timers,
+                &self.counters.pending_unref_timers,
+            );
+            self.counters
+                .cancelled_timers
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct DynamicImportFetchWake {
+    tx: SyncSender<RuntimeMessage>,
+    counters: Arc<RuntimeCounters>,
+    token: u64,
+    target_url: String,
+    liveness: RuntimeLiveness,
+}
+
+impl HttpsModuleFetchSink for DynamicImportFetchWake {
+    fn fetched(&self, result: Result<String, String>) {
+        if self
+            .tx
+            .try_send(RuntimeMessage::DynamicImportHttpsFetched {
+                token: self.token,
+                target_url: self.target_url.clone(),
+                result,
+                liveness: self.liveness,
+            })
+            .is_err()
+        {
+            decrement_liveness(
+                self.liveness,
+                &self.counters.pending_ref_host_ops,
+                &self.counters.pending_unref_host_ops,
+            );
+            self.counters
+                .failed_host_ops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Dynamic-import scheduler installed on [`crate::Runtime`] from
 /// inside the isolate runner. The VM-thread opcode hands us a
@@ -995,32 +1012,15 @@ impl TimerScheduler for InboxTimerScheduler {
         let request = TimerRequest {
             delay: Duration::from_millis(delay_ms),
             repeat: repeat_ms.map(Duration::from_millis),
-            liveness,
-            origin: "setTimeout".to_string(),
         };
-        let tx = self.tx.clone();
-        let counters = self.counters.clone();
-        let repeat = repeat_ms.is_some();
-        let token = self
-            .event_loop
-            .schedule_timer_callback(request, move |token| {
-                if tx
-                    .try_send(RuntimeMessage::TimerFired {
-                        token,
-                        liveness,
-                        expects_js_callback: true,
-                    })
-                    .is_err()
-                    && !repeat
-                {
-                    decrement_liveness(
-                        liveness,
-                        &counters.pending_ref_timers,
-                        &counters.pending_unref_timers,
-                    );
-                    counters.cancelled_timers.fetch_add(1, Ordering::Relaxed);
-                }
-            });
+        let wake = Arc::new(RuntimeTimerWake {
+            tx: self.tx.clone(),
+            counters: self.counters.clone(),
+            liveness,
+            repeat: repeat_ms.is_some(),
+            expects_js_callback: true,
+        });
+        let token = self.event_loop.schedule_timer(request, wake);
         token.0
     }
 
@@ -1072,7 +1072,9 @@ impl TimerScheduler for InboxTimerScheduler {
 struct IsolateRunner {
     runtime: Runtime,
     rx: Receiver<RuntimeMessage>,
+    tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
+    https_module_fetcher: HttpsModuleFetcherHandle,
     shutdown: bool,
 }
 
@@ -1148,29 +1150,6 @@ impl IsolateRunner {
                 }
                 TickOutcome::Processed
             }
-            RuntimeMessage::HostOpCompleted {
-                completion,
-                liveness,
-            } => {
-                decrement_liveness(
-                    liveness,
-                    &self.counters.pending_ref_host_ops,
-                    &self.counters.pending_unref_host_ops,
-                );
-                match completion.result {
-                    Ok(_) => {
-                        self.counters
-                            .completed_host_ops
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        self.counters
-                            .failed_host_ops
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                TickOutcome::Processed
-            }
             RuntimeMessage::TimerFired {
                 token,
                 liveness,
@@ -1234,6 +1213,37 @@ impl IsolateRunner {
                 referrer,
                 liveness,
             } => {
+                match self
+                    .runtime
+                    .begin_dynamic_import(token, &specifier, &referrer)
+                {
+                    Ok(DynamicImportBegin::Settled) | Err(_) => {
+                        decrement_liveness(
+                            liveness,
+                            &self.counters.pending_ref_host_ops,
+                            &self.counters.pending_unref_host_ops,
+                        );
+                        self.record_microtask_snapshot();
+                    }
+                    Ok(DynamicImportBegin::FetchHttps { target_url }) => {
+                        let sink = Arc::new(DynamicImportFetchWake {
+                            tx: self.tx.clone(),
+                            counters: self.counters.clone(),
+                            token,
+                            target_url: target_url.clone(),
+                            liveness,
+                        });
+                        self.https_module_fetcher.fetch_utf8(target_url, sink);
+                    }
+                }
+                TickOutcome::Processed
+            }
+            RuntimeMessage::DynamicImportHttpsFetched {
+                token,
+                target_url,
+                result,
+                liveness,
+            } => {
                 decrement_liveness(
                     liveness,
                     &self.counters.pending_ref_host_ops,
@@ -1241,10 +1251,11 @@ impl IsolateRunner {
                 );
                 let _ = self
                     .runtime
-                    .complete_dynamic_import(token, &specifier, &referrer);
+                    .complete_dynamic_import_https(token, &target_url, result);
                 self.record_microtask_snapshot();
                 TickOutcome::Processed
             }
+            #[cfg(test)]
             RuntimeMessage::DynamicModuleReady(_id) => {
                 self.counters
                     .pending_dynamic_module_jobs
@@ -1255,6 +1266,7 @@ impl IsolateRunner {
                     .fetch_add(1, Ordering::Relaxed);
                 TickOutcome::Processed
             }
+            #[cfg(test)]
             RuntimeMessage::Diagnostic(diagnostic) => {
                 let _ = diagnostic;
                 self.counters.diagnostics.fetch_add(1, Ordering::Relaxed);

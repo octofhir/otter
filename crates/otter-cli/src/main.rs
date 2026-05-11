@@ -489,10 +489,12 @@ async fn main() -> ExitCode {
         (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps).await,
         (Some(Command::Test(args)), _) => run_test(args, json).await,
         (Some(Command::Info), _) => run_info(json),
-        // Shorthand: `otter <file>`.
+        // Shorthand: `otter <file> [args...]`.
         (None, Some(positional)) => {
+            let forwarded_args = cli.args.iter().skip(1).cloned().collect::<Vec<_>>();
             run_file(
                 &PathBuf::from(positional),
+                &forwarded_args,
                 json,
                 dump_mode.as_deref(),
                 &caps,
@@ -549,6 +551,7 @@ fn exit_from_result(result: Result<ExitCode, OtterError>, json: bool) -> ExitCod
 
 async fn run_file(
     path: &std::path::Path,
+    args: &[String],
     json: bool,
     dump_mode: Option<&str>,
     caps: &CapabilitySet,
@@ -563,6 +566,7 @@ async fn run_file(
     // shared helper used in the embedder Layer-A path).
     //
     let otter = cli_otter_builder(caps)
+        .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await)
         .build()?;
     startup_timer.mark("runtime_build");
@@ -598,7 +602,9 @@ async fn run_target(
     let project_root = std::env::current_dir().map_err(|err| pm_config_error(err.to_string()))?;
     let target_args = args.args.clone();
     match resolve_run_target(&project_root, &args).await? {
-        RunTarget::File(path) => run_file(&path, json, dump_mode, caps, startup_timer).await,
+        RunTarget::File(path) => {
+            run_file(&path, &target_args, json, dump_mode, caps, startup_timer).await
+        }
         RunTarget::Script {
             project_root,
             name: _,
@@ -611,8 +617,31 @@ async fn run_target(
             }
             run_package_script(&project_root, &command, &target_args, json).await
         }
-        RunTarget::Bin(bin) => run_file(&bin.path, json, dump_mode, caps, startup_timer).await,
+        RunTarget::Bin(bin) => {
+            run_file(
+                &bin.path,
+                &target_args,
+                json,
+                dump_mode,
+                caps,
+                startup_timer,
+            )
+            .await
+        }
     }
+}
+
+fn process_argv_for_file(path: &Path, args: &[String]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(args.len() + 2);
+    argv.push(
+        std::env::current_exe()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "otter".to_string()),
+    );
+    argv.push(path.to_string_lossy().to_string());
+    argv.extend(args.iter().cloned());
+    argv
 }
 
 async fn resolve_run_target(project_root: &Path, args: &RunArgs) -> Result<RunTarget, OtterError> {
@@ -746,8 +775,10 @@ async fn run_package_script(
     json: bool,
 ) -> Result<ExitCode, OtterError> {
     let command = command_with_args(command, args);
-    let status = shell_command(&command)
-        .current_dir(project_root)
+    let mut process = shell_command(&command);
+    process.current_dir(project_root);
+    install_package_script_path(&mut process, project_root);
+    let status = process
         .status()
         .await
         .map_err(|err| pm_config_error(format!("package script failed to start: {err}")))?;
@@ -762,6 +793,22 @@ async fn run_package_script(
         );
     }
     Ok(ExitCode::from(code))
+}
+
+fn install_package_script_path(process: &mut tokio::process::Command, project_root: &Path) {
+    if let Some(path) = package_script_path(project_root) {
+        process.env("PATH", path);
+    }
+}
+
+fn package_script_path(project_root: &Path) -> Option<std::ffi::OsString> {
+    let local_bin = project_root.join("node_modules").join(".bin");
+    let paths = std::iter::once(local_bin).chain(
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>()),
+    );
+    std::env::join_paths(paths).ok()
 }
 
 fn shell_command(command: &str) -> tokio::process::Command {
@@ -2249,6 +2296,7 @@ if (value !== 53) fail();
         let startup_timer = CliStartupTimer::from_env();
         let code = run_file(
             &bin.path,
+            &[],
             false,
             None,
             &CapabilitySet::default(),
@@ -2258,6 +2306,46 @@ if (value !== 53) fail();
         .unwrap();
 
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn run_file_forwards_process_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = tmp.path().join("argv.ts");
+        tokio::fs::write(
+            &entry,
+            r#"
+if (process.argv[1].indexOf("argv.ts") === -1) throw new Error("missing entry");
+if (process.argv[2] !== "alpha") throw new Error("missing first arg");
+if (process.argv[3] !== "two words") throw new Error("missing second arg");
+"#,
+        )
+        .await
+        .unwrap();
+        let startup_timer = CliStartupTimer::from_env();
+        let code = run_file(
+            &entry,
+            &["alpha".to_string(), "two words".to_string()],
+            false,
+            None,
+            &CapabilitySet::default(),
+            &startup_timer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn package_script_path_prepends_local_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = package_script_path(tmp.path()).unwrap();
+        let mut paths = std::env::split_paths(&path);
+        assert_eq!(
+            paths.next().unwrap(),
+            tmp.path().join("node_modules").join(".bin")
+        );
     }
 
     #[tokio::test]
@@ -2943,6 +3031,7 @@ trust = "untrusted"
         write_fixture(&tmp.path().join("runtime.ts"), "throw 'boom';\n");
         let runtime = run_file(
             &tmp.path().join("runtime.ts"),
+            &[],
             false,
             None,
             &CapabilitySet::default(),

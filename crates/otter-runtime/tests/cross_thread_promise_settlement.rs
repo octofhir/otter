@@ -192,10 +192,9 @@ async fn cross_thread_settlement_drives_reaction() -> Result<(), OtterError> {
 
     // The Otter facade goes through `RuntimeHandle`, so we cannot
     // synchronously call `register_pending_promise` (that lives on
-    // the runner-side `Runtime`). Instead, we expose a sub-handle
-    // pattern: spawn a host op that, when it completes, posts
-    // `SettlePromise`. The script registers the promise through
-    // a side channel.
+    // the runner-side `Runtime`). Instead, host work posts an owned
+    // `SettlePromise` message through the handle after the script
+    // registers the promise through a side channel.
     //
     // For the foundation slice, we exercise the cross-thread
     // posting path by issuing the settlement from a Tokio task

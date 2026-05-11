@@ -113,23 +113,16 @@ use otter_runtime::RuntimeNativeCtx as NativeCtx;
 fn start_async_read(ctx: &mut NativeCtx<'_>, path: PathBuf) -> Result<OpId, Error> {
     check_read_permission(ctx, &path)?;
     let op_id = create_pending_promise(ctx)?;
-    let handle = ctx.interp_mut().runtime_handle().clone();
-
-    handle.spawn_host_op(RuntimeLiveness::Ref, Box::pin(async move {
-        let result = std::fs::read_to_string(path).map_err(|err| err.to_string());
-        HostOpCompletion {
-            id: 0,
-            kind: "fs.readText".to_string(),
-            result,
-        }
-    }));
+    queue_owned_host_request("fs.readText", op_id, path);
 
     Ok(op_id)
 }
 ```
 
-The future owns `PathBuf` and strings only. It does not capture
-`NativeCtx`, VM values, handles, or heap references.
+The host request owns `PathBuf`, ids, and strings only. It does not capture
+`NativeCtx`, VM values, handles, or heap references. Completion must return
+through a typed runtime inbox message or service result, and promise
+settlement happens back on the isolate thread.
 
 Macros may eventually reduce boilerplate, but they are syntax sugar over
 static specs and builders. Manual code is preferred when capability

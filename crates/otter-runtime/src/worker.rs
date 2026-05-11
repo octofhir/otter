@@ -501,14 +501,12 @@ mod tests {
 
     #[test]
     fn shutdown_report_marks_pending_timer_as_leak() {
-        use crate::{RuntimeLiveness, TimerRequest};
+        use crate::event_loop::TimerRequest;
 
         let worker = Worker::new().unwrap();
         let token = worker.handle().schedule_timer(TimerRequest {
             delay: Duration::from_secs(60),
             repeat: None,
-            liveness: RuntimeLiveness::Ref,
-            origin: "worker-shutdown-test".to_string(),
         });
 
         let report = worker.shutdown_report();

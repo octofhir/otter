@@ -5638,89 +5638,25 @@ fn compile_expr(
             // §20.3.1 `new Boolean(value)` falls through to the
             // general constructor path so runtime bootstrap can
             // produce a Boolean wrapper object with [[BooleanData]].
-            // §25.2.1 `new SharedArrayBuffer(length [, options])`.
-            // Lowers via [`SharedArrayBufferMethod::Construct`].
-            // <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
-            if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "SharedArrayBuffer"
-                && cx.lookup_binding("SharedArrayBuffer").is_none()
-                && find_module_import_binding(cx, "SharedArrayBuffer").is_none()
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(
-                    otter_bytecode::method_id::SharedArrayBufferMethod::Construct.as_u32(),
-                ));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::SharedArrayBufferCall, operands, new_span);
-                return Ok(dst);
-            }
-            // §25.1.4 `new ArrayBuffer(length [, options])`.
-            // Lowers via [`ArrayBufferMethod::Construct`].
-            // <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
-            if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "ArrayBuffer"
-                && cx.lookup_binding("ArrayBuffer").is_none()
-                && find_module_import_binding(cx, "ArrayBuffer").is_none()
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(
-                    otter_bytecode::method_id::ArrayBufferMethod::Construct.as_u32(),
-                ));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::ArrayBufferCall, operands, new_span);
-                return Ok(dst);
-            }
-            // §25.3.1 `new DataView(buffer, byteOffset?, byteLength?)`.
-            // Lowers via [`DataViewMethod::Construct`].
-            // <https://tc39.es/ecma262/#sec-dataview-constructor>
-            if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "DataView"
-                && cx.lookup_binding("DataView").is_none()
-                && find_module_import_binding(cx, "DataView").is_none()
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(
-                    otter_bytecode::method_id::DataViewMethod::Construct.as_u32(),
-                ));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::DataViewCall, operands, new_span);
-                return Ok(dst);
-            }
-            // §23.2.5 `new <T>(...)` for one of the eleven concrete
-            // TypedArray constructors. Encodes the kind discriminant
-            // and [`TypedArrayMethod::Construct`] directly.
-            // <https://tc39.es/ecma262/#sec-typedarray-constructors>
-            if let Expression::Identifier(id) = callee
-                && let Some(kind) =
-                    otter_bytecode::method_id::TypedArrayKindId::from_str(id.name.as_str())
-                && cx.lookup_binding(id.name.as_str()).is_none()
-                && find_module_import_binding(cx, id.name.as_str()).is_none()
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(kind.as_u32()));
-                operands.push(Operand::ConstIndex(
-                    otter_bytecode::method_id::TypedArrayMethod::Construct.as_u32(),
-                ));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::TypedArrayCall, operands, new_span);
-                return Ok(dst);
-            }
+            // `new SharedArrayBuffer(length, options?)` routes
+            // through the real `NativeFunction` installed by
+            // `bootstrap_array_buffer` — `Op::SharedArrayBufferCall`
+            // is no longer emitted from the compiler.
+            // `new ArrayBuffer(length, options?)` routes through the
+            // real `NativeFunction` installed by
+            // `bootstrap_array_buffer` — `Op::ArrayBufferCall` is no
+            // longer emitted from the compiler.
+            // `new DataView(buffer, ...)` routes through the real
+            // `NativeFunction` ctor installed by
+            // `bootstrap_data_view` — `Op::DataViewCall` is no
+            // longer emitted from the compiler.
+            // `new <T>(...)` for each of the 11 concrete TypedArray
+            // ctors routes through the real `NativeFunction`
+            // installed by `bootstrap_typed_array` — the typed
+            // `Op::TypedArrayCall` shortcut for the construct path
+            // is no longer emitted. (Static-side `<T>.from(...)` /
+            // `<T>.of(...)` shortcuts elsewhere stay in place until
+            // the static methods are wired through the real ctor.)
             // §21.4.2 `new Date(...)` — variadic constructor.
             // Lowers via [`DateMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-date-constructor>
@@ -5807,58 +5743,18 @@ fn compile_expr(
                 return Ok(dst);
             }
             // `new Map(iter?)` / `new Set(iter?)` /
-            // `new WeakMap(iter?)` / `new WeakSet(iter?)` —
-            // dedicated `Op::NewCollection` lowering. Iterable
-            // argument is optional; when omitted the collection is
-            // empty.
-            if let Expression::Identifier(id) = callee
-                && matches!(id.name.as_str(), "Map" | "Set" | "WeakMap" | "WeakSet")
-            {
-                let kind = id.name.as_str();
-                let iter_reg = if new_expr.arguments.is_empty() {
-                    let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
-                    r
-                } else {
-                    let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                    arg_regs[0]
-                };
-                let dst = cx.alloc_scratch();
-                let kind_idx = cx.intern_string_constant(kind);
-                cx.emit(
-                    Op::NewCollection,
-                    vec![
-                        Operand::Register(dst),
-                        Operand::ConstIndex(kind_idx),
-                        Operand::Register(iter_reg),
-                    ],
-                    new_span,
-                );
-                return Ok(dst);
-            }
-            // `new WeakRef(target)` / `new FinalizationRegistry(cb)`.
-            if let Expression::Identifier(id) = callee
-                && matches!(id.name.as_str(), "WeakRef" | "FinalizationRegistry")
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                let first_arg = arg_regs.first().copied().unwrap_or_else(|| {
-                    let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
-                    r
-                });
-                let dst = cx.alloc_scratch();
-                let op = if id.name.as_str() == "WeakRef" {
-                    Op::NewWeakRef
-                } else {
-                    Op::NewFinalizationRegistry
-                };
-                cx.emit(
-                    op,
-                    vec![Operand::Register(dst), Operand::Register(first_arg)],
-                    new_span,
-                );
-                return Ok(dst);
-            }
+            // `new WeakMap(iter?)` / `new WeakSet(iter?)` go through
+            // the ordinary `Op::New` dispatch path now that the
+            // bootstrap installs real `[[Construct]]` slots for each
+            // global. The legacy dedicated `Op::NewCollection`
+            // lowering bypassed `Map.prototype.set` / `Set.prototype.add`
+            // and skipped the §7.4 iterator-protocol path, which is
+            // observable through test262 `iterable-calls-set.js`.
+            // `new WeakRef(target)` / `new FinalizationRegistry(cb)`
+            // route through real `NativeFunction` ctors installed by
+            // `bootstrap_weak_refs` — the dedicated `Op::NewWeakRef` /
+            // `Op::NewFinalizationRegistry` lowering is no longer
+            // needed.
             // §28.2.1 `new Proxy(target, handler)` — lower via
             // [`ProxyMethod::Construct`].
             // <https://tc39.es/ecma262/#sec-proxy-constructor>
@@ -5879,34 +5775,13 @@ fn compile_expr(
                 cx.emit(Op::ProxyCall, operands, new_span);
                 return Ok(dst);
             }
-            // `new Promise(executor)` lowers to a dedicated
-            // opcode that builds a pending promise + native
-            // resolve/reject + invokes the executor.
-            if let Expression::Identifier(id) = callee
-                && id.name.as_str() == "Promise"
-            {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                if arg_regs.len() != 1 {
-                    return Err(CompileError::Unsupported {
-                        node: "Promise constructor requires exactly one executor argument"
-                            .to_string(),
-                        span: new_span,
-                    });
-                }
-                let executor_reg = arg_regs[0];
-                let dst = cx.alloc_scratch();
-                let scratch = cx.alloc_scratch();
-                cx.emit(
-                    Op::PromiseNew,
-                    vec![
-                        Operand::Register(dst),
-                        Operand::Register(executor_reg),
-                        Operand::Register(scratch),
-                    ],
-                    new_span,
-                );
-                return Ok(dst);
-            }
+            // `new Promise(executor)` previously lowered to a
+            // dedicated `Op::PromiseNew` that bypassed the real
+            // `Promise` constructor. With the bootstrap installer
+            // building a real callable + constructible
+            // `NativeFunction`, the constructor flows through the
+            // ordinary `Op::New` dispatch like every other
+            // builtin (§27.2.3.1).
             // §13.3.5 NewExpression — `new C(...args)` may include
             // SpreadElement arguments. Route those through
             // `Op::NewSpread` (mirrors `Op::CallSpread` for calls).
@@ -7348,26 +7223,10 @@ fn compile_method_call(
         return compile_spread_call(cx, callee, &call.arguments, span);
     }
     if let Expression::StaticMemberExpression(member) = callee {
-        // §25.1.4.3 `ArrayBuffer.isView(arg)` — lower through
-        // `Op::ArrayBufferCall`.
-        // <https://tc39.es/ecma262/#sec-arraybuffer.isview>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "ArrayBuffer"
-            && cx.lookup_binding("ArrayBuffer").is_none()
-            && find_module_import_binding(cx, "ArrayBuffer").is_none()
-        {
-            let method = member.property.name.as_str();
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let name_idx = cx.intern_string_constant(method);
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(name_idx));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::ArrayBufferCall, operands, span);
-            return Ok(dst);
-        }
+        // `ArrayBuffer.isView(arg)` routes through the real
+        // `NativeFunction` installed by `bootstrap_array_buffer` —
+        // `Op::ArrayBufferCall` for the static-method shape is no
+        // longer emitted from the compiler.
         // §28.2.2 `Proxy.<method>(target, handler)` — typed dispatch
         // via [`ProxyMethod`].
         // <https://tc39.es/ecma262/#sec-proxy.revocable>
@@ -7597,28 +7456,12 @@ fn compile_method_call(
                 return Ok(dst);
             };
         }
-        // `Promise.<name>(args)` — typed dispatch via [`PromiseMethod`].
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Promise"
-        {
-            let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::PromiseMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Promise.{method_name}"),
-                    span,
-                });
-            };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::PromiseCall, operands, span);
-            return Ok(dst);
-        }
+        // `Promise.<name>(args)` previously routed through
+        // `Op::PromiseCall` for the typed dispatcher. With the
+        // bootstrap installer placing real statics on the
+        // `NativeFunction` constructor, the call flows through
+        // ordinary method dispatch so user-installed shadows on
+        // `Promise.<name>` are observable.
         // `Temporal.<Class>.<method>(args)` — typed dispatch via
         // [`TemporalClassId`] + [`TemporalMethod`]. The callee is a
         // nested static-member expression (`Temporal.<Class>` then
@@ -7898,49 +7741,10 @@ fn compile_method_call(
             return Ok(dst);
         };
     }
-    // §21.2.1 BigInt(value) / §21.2.2 BigInt.<name>(args). Typed
-    // dispatch via [`BigIntMethod`].
-    // <https://tc39.es/ecma262/#sec-bigint-constructor>
-    if let Expression::StaticMemberExpression(member) = callee
-        && let Expression::Identifier(id) = &member.object
-        && id.name.as_str() == "BigInt"
-        && cx.lookup_binding("BigInt").is_none()
-        && find_module_import_binding(cx, "BigInt").is_none()
-    {
-        let method_name = member.property.name.as_str();
-        let Some(method_id) = otter_bytecode::method_id::BigIntMethod::from_str(method_name) else {
-            return Err(CompileError::Unsupported {
-                node: format!("BigInt.{method_name}"),
-                span,
-            });
-        };
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(method_id.as_u32()));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::BigIntCall, operands, span);
-        return Ok(dst);
-    }
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "BigInt"
-        && cx.lookup_binding("BigInt").is_none()
-        && find_module_import_binding(cx, "BigInt").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(
-            otter_bytecode::method_id::BigIntMethod::Construct.as_u32(),
-        ));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::BigIntCall, operands, span);
-        return Ok(dst);
-    }
+    // `BigInt(value)` and `BigInt.asIntN/asUintN(args)` route
+    // through the real `NativeFunction` installed by
+    // `bootstrap_bigint` — the dedicated `Op::BigIntCall` shortcut
+    // is no longer emitted.
     // §20.2.1.1 — bare `Function(arg0, …, body)` is the same as
     // `new Function(...)` per spec; lower both shapes through one
     // path.

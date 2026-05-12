@@ -286,7 +286,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_boolean,
     },
-    placeholder("BigInt"),
+    BootstrapEntry {
+        name: "BigInt",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_bigint::install_bigint,
+    },
     BootstrapEntry {
         name: "Symbol",
         feature: BootstrapFeatures::CORE,
@@ -302,13 +306,41 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_date,
     },
-    placeholder("RegExp"),
-    placeholder("Map"),
-    placeholder("Set"),
-    placeholder("WeakMap"),
-    placeholder("WeakSet"),
-    placeholder("WeakRef"),
-    placeholder("Promise"),
+    BootstrapEntry {
+        name: "RegExp",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_regexp::install_regexp,
+    },
+    BootstrapEntry {
+        name: "Map",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_collections::install_map,
+    },
+    BootstrapEntry {
+        name: "Set",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_collections::install_set,
+    },
+    BootstrapEntry {
+        name: "WeakMap",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_collections::install_weak_map,
+    },
+    BootstrapEntry {
+        name: "WeakSet",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_collections::install_weak_set,
+    },
+    BootstrapEntry {
+        name: "WeakRef",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_weak_refs::install_weak_ref,
+    },
+    BootstrapEntry {
+        name: "Promise",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_promise::install_promise,
+    },
     BootstrapEntry {
         name: "Proxy",
         feature: BootstrapFeatures::CORE,
@@ -324,20 +356,32 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_function,
     },
-    placeholder("ArrayBuffer"),
-    placeholder("SharedArrayBuffer"),
-    placeholder("DataView"),
-    placeholder("Int8Array"),
-    placeholder("Uint8Array"),
-    placeholder("Uint8ClampedArray"),
-    placeholder("Int16Array"),
-    placeholder("Uint16Array"),
-    placeholder("Int32Array"),
-    placeholder("Uint32Array"),
-    placeholder("Float32Array"),
-    placeholder("Float64Array"),
-    placeholder("BigInt64Array"),
-    placeholder("BigUint64Array"),
+    BootstrapEntry {
+        name: "ArrayBuffer",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_array_buffer::install_array_buffer,
+    },
+    BootstrapEntry {
+        name: "SharedArrayBuffer",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_array_buffer::install_shared_array_buffer,
+    },
+    BootstrapEntry {
+        name: "DataView",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_data_view::install_data_view,
+    },
+    typed_array_entry("Int8Array"),
+    typed_array_entry("Uint8Array"),
+    typed_array_entry("Uint8ClampedArray"),
+    typed_array_entry("Int16Array"),
+    typed_array_entry("Uint16Array"),
+    typed_array_entry("Int32Array"),
+    typed_array_entry("Uint32Array"),
+    typed_array_entry("Float32Array"),
+    typed_array_entry("Float64Array"),
+    typed_array_entry("BigInt64Array"),
+    typed_array_entry("BigUint64Array"),
     BootstrapEntry {
         name: atomics::ATOMICS_SPEC.name,
         feature: BootstrapFeatures::CORE,
@@ -346,7 +390,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     placeholder("Intl"),
     placeholder("Temporal"),
     placeholder("AggregateError"),
-    placeholder("FinalizationRegistry"),
+    BootstrapEntry {
+        name: "FinalizationRegistry",
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_weak_refs::install_finalization_registry,
+    },
     placeholder("Iterator"),
     BootstrapEntry {
         name: console::CONSOLE_SPEC.name,
@@ -436,6 +484,17 @@ const fn placeholder(name: &'static str) -> BootstrapEntry {
         name,
         feature: BootstrapFeatures::CORE,
         install: install_placeholder,
+    }
+}
+
+/// Build a bootstrap entry for one of the 11 concrete TypedArray
+/// constructors. Routes to
+/// [`crate::bootstrap_typed_array::install_typed_array_entry`].
+const fn typed_array_entry(name: &'static str) -> BootstrapEntry {
+    BootstrapEntry {
+        name,
+        feature: BootstrapFeatures::CORE,
+        install: crate::bootstrap_typed_array::install_typed_array_entry,
     }
 }
 
@@ -934,6 +993,64 @@ pub fn install_symbol_well_knowns_post_bootstrap(
             ..Default::default()
         },
     );
+    // §24.* — install collection `@@iterator` / `@@toStringTag`.
+    crate::bootstrap_collections::install_collection_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
+    // §27.2.5.5 — install `Promise.prototype[@@toStringTag]`.
+    crate::bootstrap_promise::install_promise_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
+    // §26.1.4.4 / §26.2.4.5 — `WeakRef.prototype[@@toStringTag]`
+    // + `FinalizationRegistry.prototype[@@toStringTag]`.
+    crate::bootstrap_weak_refs::install_weak_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
+    // §21.2.5 — `BigInt.prototype[@@toStringTag]`.
+    crate::bootstrap_bigint::install_bigint_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
+    // §25.3.5 — `DataView.prototype[@@toStringTag]`.
+    crate::bootstrap_data_view::install_data_view_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
+    // §23.2.4 — `%TypedArray%.prototype[@@iterator]` plus per-kind
+    // `<T>.prototype[@@toStringTag]`.
+    crate::bootstrap_typed_array::install_typed_array_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
+    // §25.1.5 — `ArrayBuffer.prototype[@@toStringTag]`.
+    crate::bootstrap_array_buffer::install_array_buffer_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
+    // §25.2.5 — `SharedArrayBuffer.prototype[@@toStringTag]`.
+    crate::bootstrap_array_buffer::install_shared_array_buffer_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
     Ok(())
 }
 
@@ -1622,6 +1739,15 @@ fn install_timer_globals(
     crate::timers::install_timer_globals(global, heap)
 }
 
+pub(crate) fn define_global_value(
+    global: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    value: Value,
+) {
+    define_global(global, heap, name, value);
+}
+
 fn define_global(global: JsObject, heap: &mut otter_gc::GcHeap, name: &'static str, value: Value) {
     let descriptor = PropertyDescriptor::data(
         value,
@@ -1731,8 +1857,14 @@ mod tests {
 
     #[test]
     fn default_bootstrap_telemetry_matches_startup_ratchet() {
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 380;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 160 * 1024;
+        // Bumped over time as the bootstrap installer family
+        // grows: Map/Set/WeakMap/WeakSet (slice 9), Promise
+        // (slice 10), RegExp (slice 11), WeakRef +
+        // FinalizationRegistry (slice 12). Each ctor installs a
+        // `[[Construct]]` slot plus a prototype with several
+        // native methods and (for some) accessors.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 640;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 280 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

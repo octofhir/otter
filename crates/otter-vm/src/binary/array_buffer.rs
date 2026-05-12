@@ -55,16 +55,41 @@ impl JsArrayBuffer {
     /// Allocate a fresh fixed-length buffer of `len` zero bytes.
     /// `len` must already be a valid `usize` (the dispatcher honours
     /// §25.1.2.1 ToIndex on the user-facing argument).
+    ///
+    /// Returns the empty buffer when `len` exceeds practical limits
+    /// — the [`JsArrayBuffer::try_new`] entry point preserves the
+    /// fallible shape for ctors that need to surface a RangeError.
+    /// This infallible constructor is kept for callers that know
+    /// the length is bounded.
     #[must_use]
     pub fn new(len: usize) -> Self {
-        Self {
+        Self::try_new(len).unwrap_or_else(|| Self {
             inner: Rc::new(ArrayBufferBody {
-                bytes: RefCell::new(vec![0u8; len]),
+                bytes: RefCell::new(Vec::new()),
+                detached: Cell::new(true),
+                max_byte_length: None,
+                shared: false,
+            }),
+        })
+    }
+
+    /// Fallible variant of [`Self::new`]. Uses `Vec::try_reserve`
+    /// so the dispatcher can surface a `RangeError` for the spec
+    /// §25.1.2.1 step 5 too-big case (and, in practice, for any
+    /// allocation that exceeds the process memory budget).
+    #[must_use]
+    pub fn try_new(len: usize) -> Option<Self> {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.try_reserve_exact(len).ok()?;
+        bytes.resize(len, 0u8);
+        Some(Self {
+            inner: Rc::new(ArrayBufferBody {
+                bytes: RefCell::new(bytes),
                 detached: Cell::new(false),
                 max_byte_length: None,
                 shared: false,
             }),
-        }
+        })
     }
 
     /// Allocate a resizable buffer with initial length `len` and the
@@ -102,16 +127,38 @@ impl JsArrayBuffer {
     /// detached; differs from an ordinary `ArrayBuffer` only by
     /// the [`Self::is_shared`] flag in the single-threaded
     /// foundation surface.
+    ///
+    /// Returns a synthetic detached buffer when the allocation
+    /// fails; [`Self::try_new_shared`] preserves the fallible
+    /// shape for callers that need to surface a `RangeError`.
     #[must_use]
     pub fn new_shared(len: usize) -> Self {
-        Self {
+        Self::try_new_shared(len).unwrap_or_else(|| Self {
             inner: Rc::new(ArrayBufferBody {
-                bytes: RefCell::new(vec![0u8; len]),
+                bytes: RefCell::new(Vec::new()),
+                detached: Cell::new(true),
+                max_byte_length: None,
+                shared: true,
+            }),
+        })
+    }
+
+    /// Fallible variant of [`Self::new_shared`]. Uses
+    /// `Vec::try_reserve_exact` so the dispatcher can surface a
+    /// `RangeError` when `len` exceeds the process memory budget.
+    #[must_use]
+    pub fn try_new_shared(len: usize) -> Option<Self> {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.try_reserve_exact(len).ok()?;
+        bytes.resize(len, 0u8);
+        Some(Self {
+            inner: Rc::new(ArrayBufferBody {
+                bytes: RefCell::new(bytes),
                 detached: Cell::new(false),
                 max_byte_length: None,
                 shared: true,
             }),
-        }
+        })
     }
 
     /// Allocate a growable shared buffer per §25.2.5 — `length`

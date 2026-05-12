@@ -40,6 +40,14 @@ pub mod console;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod bootstrap;
+pub mod bootstrap_array_buffer;
+pub mod bootstrap_bigint;
+pub mod bootstrap_collections;
+pub mod bootstrap_data_view;
+pub mod bootstrap_promise;
+pub mod bootstrap_regexp;
+pub mod bootstrap_typed_array;
+pub mod bootstrap_weak_refs;
 pub mod dynamic_import;
 pub mod error_classes;
 pub mod execution_context;
@@ -5290,26 +5298,304 @@ impl Interpreter {
                                     .unwrap_or(Value::Undefined),
                             }
                         }
-                        Value::RegExp(r) => regexp_prototype::load_property(
-                            r,
-                            &self.gc_heap,
-                            &name,
-                            &self.string_heap,
-                        ),
+                        v @ Value::RegExp(_) => {
+                            let direct = if let Value::RegExp(r) = v {
+                                regexp_prototype::load_property(
+                                    r,
+                                    &self.gc_heap,
+                                    &name,
+                                    &self.string_heap,
+                                )
+                            } else {
+                                Value::Undefined
+                            };
+                            match direct {
+                                Value::Undefined => {
+                                    // Walk `RegExp.prototype` for
+                                    // methods + accessors per §22.2.6.
+                                    let proto =
+                                        self.constructor_prototype_value("RegExp")?;
+                                    if let Value::Object(proto_obj) = proto {
+                                        let key = VmPropertyKey::String(name.clone());
+                                        match self.ordinary_get_value(
+                                            context,
+                                            Value::Object(proto_obj),
+                                            v.clone(),
+                                            &key,
+                                            0,
+                                        )? {
+                                            VmGetOutcome::Value(value) => value,
+                                            VmGetOutcome::InvokeGetter { getter } => self
+                                                .run_callable_sync(
+                                                    context,
+                                                    &getter,
+                                                    v.clone(),
+                                                    smallvec::SmallVec::new(),
+                                                )?,
+                                        }
+                                    } else {
+                                        Value::Undefined
+                                    }
+                                }
+                                value => value,
+                            }
+                        }
                         Value::Symbol(s) => symbol_prototype::load_property(s, &name),
+                        v @ (Value::WeakRef(_) | Value::FinalizationRegistry(_)) => {
+                            // §26.1.4 / §26.2.4 — instances have no
+                            // own string keys; walk the realm
+                            // prototype.
+                            let proto_name = match v {
+                                Value::WeakRef(_) => "WeakRef",
+                                Value::FinalizationRegistry(_) => "FinalizationRegistry",
+                                _ => unreachable!(),
+                            };
+                            let proto = self.constructor_prototype_value(proto_name)?;
+                            if let Value::Object(proto_obj) = proto {
+                                let key = VmPropertyKey::String(name.clone());
+                                match self.ordinary_get_value(
+                                    context,
+                                    Value::Object(proto_obj),
+                                    v.clone(),
+                                    &key,
+                                    0,
+                                )? {
+                                    VmGetOutcome::Value(value) => value,
+                                    VmGetOutcome::InvokeGetter { getter } => self
+                                        .run_callable_sync(
+                                            context,
+                                            &getter,
+                                            v.clone(),
+                                            smallvec::SmallVec::new(),
+                                        )?,
+                                }
+                            } else {
+                                Value::Undefined
+                            }
+                        }
+                        v @ Value::Promise(_) => {
+                            // §27.2.5 — Promise instances have no
+                            // own properties; walk
+                            // `Promise.prototype` for `then` /
+                            // `catch` / `finally` / `constructor`
+                            // so user-installed overrides surface
+                            // through ordinary `[[Get]]`.
+                            let proto = self.constructor_prototype_value("Promise")?;
+                            if let Value::Object(proto_obj) = proto {
+                                let key = VmPropertyKey::String(name.clone());
+                                match self.ordinary_get_value(
+                                    context,
+                                    Value::Object(proto_obj),
+                                    v.clone(),
+                                    &key,
+                                    0,
+                                )? {
+                                    VmGetOutcome::Value(value) => value,
+                                    VmGetOutcome::InvokeGetter { getter } => self
+                                        .run_callable_sync(
+                                            context,
+                                            &getter,
+                                            v.clone(),
+                                            smallvec::SmallVec::new(),
+                                        )?,
+                                }
+                            } else {
+                                Value::Undefined
+                            }
+                        }
                         v @ (Value::Map(_)
                         | Value::Set(_)
                         | Value::WeakMap(_)
                         | Value::WeakSet(_)) => {
-                            collections_prototype::load_property_with_heap(v, &name, &self.gc_heap)
+                            // `size` is an own accessor on Map/Set
+                            // instances per the legacy intrinsic
+                            // fast-path; for every other name walk
+                            // the realm `<Collection>.prototype`
+                            // chain so user-installed methods and
+                            // overrides are observable per §24.*.3.
+                            match collections_prototype::load_property_with_heap(
+                                v,
+                                &name,
+                                &self.gc_heap,
+                            ) {
+                                Value::Undefined => {
+                                    let proto_name = match v {
+                                        Value::Map(_) => "Map",
+                                        Value::Set(_) => "Set",
+                                        Value::WeakMap(_) => "WeakMap",
+                                        Value::WeakSet(_) => "WeakSet",
+                                        _ => unreachable!(),
+                                    };
+                                    let proto = self.constructor_prototype_value(proto_name)?;
+                                    if let Value::Object(proto_obj) = proto {
+                                        let key = VmPropertyKey::String(name.clone());
+                                        match self.ordinary_get_value(
+                                            context,
+                                            Value::Object(proto_obj),
+                                            v.clone(),
+                                            &key,
+                                            0,
+                                        )? {
+                                            VmGetOutcome::Value(value) => value,
+                                            VmGetOutcome::InvokeGetter { getter } => {
+                                                self.run_callable_sync(
+                                                    context,
+                                                    &getter,
+                                                    v.clone(),
+                                                    smallvec::SmallVec::new(),
+                                                )?
+                                            }
+                                        }
+                                    } else {
+                                        Value::Undefined
+                                    }
+                                }
+                                value => value,
+                            }
                         }
                         Value::Temporal(t) => temporal::load_property(t, &name),
-                        Value::ArrayBuffer(b) => {
-                            binary::array_buffer_prototype::load_property(b, &name)
+                        v @ Value::ArrayBuffer(_) => {
+                            let (direct, is_shared) = if let Value::ArrayBuffer(b) = v {
+                                (
+                                    binary::array_buffer_prototype::load_property(b, &name),
+                                    b.is_shared(),
+                                )
+                            } else {
+                                (Value::Undefined, false)
+                            };
+                            match direct {
+                                Value::Undefined => {
+                                    let proto_name = if is_shared {
+                                        "SharedArrayBuffer"
+                                    } else {
+                                        "ArrayBuffer"
+                                    };
+                                    let proto = self.constructor_prototype_value(proto_name)?;
+                                    if let Value::Object(proto_obj) = proto {
+                                        let key = VmPropertyKey::String(name.clone());
+                                        match self.ordinary_get_value(
+                                            context,
+                                            Value::Object(proto_obj),
+                                            v.clone(),
+                                            &key,
+                                            0,
+                                        )? {
+                                            VmGetOutcome::Value(value) => value,
+                                            VmGetOutcome::InvokeGetter { getter } => self
+                                                .run_callable_sync(
+                                                    context,
+                                                    &getter,
+                                                    v.clone(),
+                                                    smallvec::SmallVec::new(),
+                                                )?,
+                                        }
+                                    } else {
+                                        Value::Undefined
+                                    }
+                                }
+                                value => value,
+                            }
                         }
-                        Value::DataView(v) => binary::data_view_prototype::load_property(v, &name),
-                        Value::TypedArray(t) => {
-                            binary::typed_array_prototype::load_property(t, &name)
+                        v @ Value::DataView(_) => {
+                            let direct = if let Value::DataView(dv) = v {
+                                binary::data_view_prototype::load_property(dv, &name)
+                            } else {
+                                Value::Undefined
+                            };
+                            match direct {
+                                Value::Undefined => {
+                                    let proto = self.constructor_prototype_value("DataView")?;
+                                    if let Value::Object(proto_obj) = proto {
+                                        let key = VmPropertyKey::String(name.clone());
+                                        match self.ordinary_get_value(
+                                            context,
+                                            Value::Object(proto_obj),
+                                            v.clone(),
+                                            &key,
+                                            0,
+                                        )? {
+                                            VmGetOutcome::Value(value) => value,
+                                            VmGetOutcome::InvokeGetter { getter } => self
+                                                .run_callable_sync(
+                                                    context,
+                                                    &getter,
+                                                    v.clone(),
+                                                    smallvec::SmallVec::new(),
+                                                )?,
+                                        }
+                                    } else {
+                                        Value::Undefined
+                                    }
+                                }
+                                value => value,
+                            }
+                        }
+                        v @ Value::TypedArray(_) => {
+                            let direct = if let Value::TypedArray(t) = v {
+                                binary::typed_array_prototype::load_property(t, &name)
+                            } else {
+                                Value::Undefined
+                            };
+                            match direct {
+                                Value::Undefined => {
+                                    let kind_name = if let Value::TypedArray(t) = v {
+                                        t.kind().name()
+                                    } else {
+                                        unreachable!()
+                                    };
+                                    let proto = self.constructor_prototype_value(kind_name)?;
+                                    if let Value::Object(proto_obj) = proto {
+                                        let key = VmPropertyKey::String(name.clone());
+                                        match self.ordinary_get_value(
+                                            context,
+                                            Value::Object(proto_obj),
+                                            v.clone(),
+                                            &key,
+                                            0,
+                                        )? {
+                                            VmGetOutcome::Value(value) => value,
+                                            VmGetOutcome::InvokeGetter { getter } => self
+                                                .run_callable_sync(
+                                                    context,
+                                                    &getter,
+                                                    v.clone(),
+                                                    smallvec::SmallVec::new(),
+                                                )?,
+                                        }
+                                    } else {
+                                        Value::Undefined
+                                    }
+                                }
+                                value => value,
+                            }
+                        }
+                        v @ Value::BigInt(_) => {
+                            // §21.2.5 — BigInt values are primitives.
+                            // Walk `BigInt.prototype` for installed
+                            // methods (`toString`, `valueOf`) and
+                            // `constructor`.
+                            let proto = self.constructor_prototype_value("BigInt")?;
+                            if let Value::Object(proto_obj) = proto {
+                                let key = VmPropertyKey::String(name.clone());
+                                match self.ordinary_get_value(
+                                    context,
+                                    Value::Object(proto_obj),
+                                    v.clone(),
+                                    &key,
+                                    0,
+                                )? {
+                                    VmGetOutcome::Value(value) => value,
+                                    VmGetOutcome::InvokeGetter { getter } => self
+                                        .run_callable_sync(
+                                            context,
+                                            &getter,
+                                            v.clone(),
+                                            smallvec::SmallVec::new(),
+                                        )?,
+                                }
+                            } else {
+                                Value::Undefined
+                            }
                         }
                         _ => return Err(VmError::TypeMismatch),
                     };
@@ -8836,6 +9122,21 @@ impl Interpreter {
                 let fid = *function_id;
                 Some(self.function_property_get(context, fid, &name)?)
             }
+            // Native callable receiver (e.g. global `Promise` /
+            // `Map` constructors). Look up `name` on the function
+            // object's own-property table so `Promise.all(...)`,
+            // `Map.groupBy(...)`, etc. dispatch through ordinary
+            // method invocation.
+            Value::NativeFunction(native) => {
+                match native.own_property_descriptor(
+                    &self.gc_heap,
+                    &self.string_heap,
+                    &name,
+                )? {
+                    Some(desc) => Some(descriptor_value(&desc)),
+                    None => None,
+                }
+            }
             _ => None,
         };
         if let Some(method) = lookup_via_property {
@@ -11603,12 +11904,25 @@ impl Interpreter {
     }
 
     fn constructor_prototype_value(&self, constructor_name: &str) -> Result<Value, VmError> {
-        let Some(Value::Object(constructor)) =
-            object::get(self.global_this, &self.gc_heap, constructor_name)
-        else {
-            return Err(VmError::InvalidOperand);
-        };
-        Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::Null))
+        match object::get(self.global_this, &self.gc_heap, constructor_name) {
+            Some(Value::Object(constructor)) => {
+                Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::Null))
+            }
+            Some(Value::NativeFunction(ctor)) => {
+                match ctor.own_property_descriptor(
+                    &self.gc_heap,
+                    &self.string_heap,
+                    "prototype",
+                ) {
+                    Ok(Some(descriptor)) => Ok(descriptor_value(&descriptor)),
+                    _ => Ok(Value::Null),
+                }
+            }
+            Some(Value::ClassConstructor(class)) => {
+                Ok(Value::Object(class.prototype(&self.gc_heap)))
+            }
+            _ => Err(VmError::InvalidOperand),
+        }
     }
 
     fn proxy_get_prototype_invariant_target_proto(
@@ -13177,13 +13491,79 @@ impl Interpreter {
                 Ok(VmGetOutcome::Value(value))
             }
             Value::RegExp(re) => {
-                let value = match key {
+                let direct = match key {
                     VmPropertyKey::String(key) => {
                         regexp_prototype::load_property(&re, &self.gc_heap, key, &self.string_heap)
                     }
                     VmPropertyKey::Symbol(_) => Value::Undefined,
                 };
-                Ok(VmGetOutcome::Value(value))
+                match direct {
+                    Value::Undefined => {
+                        // §22.2.6 — walk `RegExp.prototype` so
+                        // installed methods and accessors resolve.
+                        let proto = self.constructor_prototype_value("RegExp")?;
+                        if matches!(proto, Value::Null | Value::Undefined) {
+                            return Ok(VmGetOutcome::Value(Value::Undefined));
+                        }
+                        self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+                    }
+                    value => Ok(VmGetOutcome::Value(value)),
+                }
+            }
+            // §24.* — collection instances have no own string keys
+            // outside `size`-style accessors that live on the
+            // prototype. Walk the realm prototype so user-installed
+            // overrides on `Map.prototype` / `Set.prototype` / etc.
+            // resolve through the same internal-method substrate that
+            // Reflect/Proxy use.
+            Value::Map(_) | Value::Set(_) | Value::WeakMap(_) | Value::WeakSet(_) => {
+                let proto_name = match base {
+                    Value::Map(_) => "Map",
+                    Value::Set(_) => "Set",
+                    Value::WeakMap(_) => "WeakMap",
+                    Value::WeakSet(_) => "WeakSet",
+                    _ => unreachable!(),
+                };
+                let proto = self.constructor_prototype_value(proto_name)?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
+            // §27.2.5 — Promise instances expose no own string keys.
+            // Walk `Promise.prototype` so `then` / `catch` /
+            // `finally` / `constructor` resolve through the same
+            // internal-method substrate as other builtins.
+            Value::Promise(_) => {
+                let proto = self.constructor_prototype_value("Promise")?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
+            // §21.2.5 — BigInt primitive values walk
+            // `BigInt.prototype` for `toString` / `valueOf` /
+            // `constructor`.
+            Value::BigInt(_) => {
+                let proto = self.constructor_prototype_value("BigInt")?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
+            // §26.1.4 / §26.2.4 — walk the realm prototype for
+            // `WeakRef` / `FinalizationRegistry` instances.
+            Value::WeakRef(_) | Value::FinalizationRegistry(_) => {
+                let proto_name = match base {
+                    Value::WeakRef(_) => "WeakRef",
+                    Value::FinalizationRegistry(_) => "FinalizationRegistry",
+                    _ => unreachable!(),
+                };
+                let proto = self.constructor_prototype_value(proto_name)?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
             _ => Err(VmError::TypeMismatch),
         }

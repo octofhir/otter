@@ -60,7 +60,7 @@ fn arg_string<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Result<&'a JsStrin
 /// own properties — and, when the receiver has the `d` flag, an
 /// `indices` companion array (§22.2.7.7
 /// [`MakeMatchIndicesIndexPairArray`](https://tc39.es/ecma262/#sec-makematchindicesindexpairarray)).
-fn exec_once(
+pub(crate) fn exec_once(
     re: &JsRegExp,
     text: &JsString,
     string_heap: &crate::string::StringHeap,

@@ -63,7 +63,11 @@ pub fn array_buffer_call(
                     }
                     JsArrayBuffer::new_resizable(len, max)
                 }
-                None => JsArrayBuffer::new(len),
+                None => JsArrayBuffer::try_new(len).ok_or_else(|| VmError::RangeError {
+                    message: format!(
+                        "ArrayBuffer allocation of {len} bytes exceeds the available heap"
+                    ),
+                })?,
             };
             Ok(Value::ArrayBuffer(buf))
         }
@@ -116,7 +120,13 @@ pub fn shared_array_buffer_call(
                     }
                     JsArrayBuffer::new_shared_growable(len, max)
                 }
-                None => JsArrayBuffer::new_shared(len),
+                None => JsArrayBuffer::try_new_shared(len).ok_or_else(|| {
+                    VmError::RangeError {
+                        message: format!(
+                            "SharedArrayBuffer allocation of {len} bytes exceeds the available heap"
+                        ),
+                    }
+                })?,
             };
             Ok(Value::ArrayBuffer(buf))
         }

@@ -383,6 +383,23 @@ pub fn run_one(
         }
     };
 
+    // 9a. Install `__otter_agent_*` host bindings on the fresh
+    // runtime so the `$262.agent.*` preamble shim resolves. Reset
+    // the cross-test agent registry first so leftover senders /
+    // reports from the previous test do not bleed in.
+    crate::agent::reset_for_next_test();
+    if let Err(err) = crate::agent::install_natives(&mut runtime) {
+        return result_with(
+            rel_path,
+            esid,
+            features,
+            Outcome::Crash {
+                panic: format!("agent native install failed: {err}"),
+            },
+            start,
+        );
+    }
+
     let outcome = if frontmatter.is_module() {
         run_module_test(&mut runtime, &combined, exec.timeout)
     } else {

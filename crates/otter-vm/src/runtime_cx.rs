@@ -196,7 +196,12 @@ impl<'rt> NativeCtx<'rt> {
     /// Borrow the owning interpreter together with the current
     /// execution context. Use this when a native needs to re-enter VM
     /// code that also needs the caller context for observable coercions.
-    pub(crate) fn interp_mut_and_context(
+    ///
+    /// `pub` so out-of-crate host bindings (the test262 agent
+    /// harness in `crates/otter-test262/src/agent.rs`, future
+    /// runtime extensions) can re-enter the interpreter without
+    /// reimplementing the borrow split.
+    pub fn interp_mut_and_context(
         &mut self,
     ) -> (&mut Interpreter, Option<ExecutionContext>) {
         (self.cx.interp, self.context.clone())

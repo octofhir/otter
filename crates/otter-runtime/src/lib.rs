@@ -1708,6 +1708,39 @@ impl Runtime {
         self.interp.set_global(name, value);
     }
 
+    /// Install a host-defined native function as a global binding.
+    ///
+    /// The function is allocated on the runtime's GC heap as a
+    /// `Value::NativeFunction` with the given `name` and arity, then
+    /// stored on `globalThis` via [`Self::set_global`]. Standard
+    /// descriptor attributes (`{ writable: true, enumerable: false,
+    /// configurable: true }`) are applied.
+    ///
+    /// Used by `crates/otter-test262/src/agent.rs` to plug the
+    /// `__otter_agent_*` family of `$262.agent` host bindings into
+    /// every fresh per-test runtime without modifying the otter-vm
+    /// bootstrap.
+    ///
+    /// # Errors
+    /// Returns [`OtterError::OutOfMemory`] when the heap cap blocks
+    /// the native function allocation.
+    pub fn install_native_global(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: RuntimeNativeFastFn,
+    ) -> Result<(), OtterError> {
+        let value =
+            otter_vm::native_value_static(self.interp.gc_heap_mut(), name, length, call).map_err(
+                |oom| OtterError::OutOfMemory {
+                    requested_bytes: oom.requested_bytes(),
+                    heap_limit_bytes: oom.heap_limit_bytes(),
+                },
+            )?;
+        self.interp.set_global(name, value);
+        Ok(())
+    }
+
     /// `true` when the per-isolate `TimerCallbacks` table has any
     /// outstanding entries. The isolate runner uses this to decide
     /// whether the script's run loop needs to keep ticking the

@@ -22,11 +22,6 @@ max_heap_bytes_per_test = 536870912
 # Features to skip (tests requiring these features will be skipped).
 # Only skip features we truly cannot support (infra gaps or active proposals).
 skip_features = [
-    # Atomics still need cross-thread infra; SharedArrayBuffer itself
-    # was unblocked in slice 17 (real ctor + prototype + accessors).
-    "Atomics",
-    "Atomics.pause",
-
     # Module system (requires module loader in test262 harness)
     "import-assertions",
     "import-attributes",

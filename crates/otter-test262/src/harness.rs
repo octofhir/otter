@@ -38,6 +38,88 @@ function $DONE(reason) {
 }
 "#;
 
+/// `$262` host harness — single-thread surface (slice 19a).
+///
+/// The test262 INTERPRETING.md describes a host-defined object
+/// available as `$262`. Otter's runner implements the non-agent
+/// surface entirely in JavaScript, delegating to existing language
+/// features:
+///
+/// - `$262.global` — `globalThis`.
+/// - `$262.gc()` — no-op. The engine GC is automatic; tests that
+///   need observable host-GC semantics are skipped via the
+///   `host-gc-required` feature gate.
+/// - `$262.detachArrayBuffer(buf)` — calls `buf.transfer()` which
+///   detaches the source per §25.1.5.5.
+/// - `$262.IsHTMLDDA` — placeholder callable function. Tests that
+///   probe `[[IsHTMLDDA]]` semantics will fail; most uses just need
+///   the function identity / a no-op call.
+/// - `$262.evalScript(s)` — uses `new Function(s)()`; differs from
+///   real indirect-`eval` in that top-level `var` declarations
+///   stay function-scoped. Tests sensitive to global scope leakage
+///   fail with that limitation.
+/// - `$262.agent` — every method throws so tests get a
+///   deterministic, recognisable error instead of
+///   `TypeError: undefined is not an object`. Real cross-thread
+///   agent support lands in slice 19c (see
+///   `docs/workers-262-plan.md`).
+///
+/// # Spec / reference
+/// - <https://github.com/tc39/test262/blob/main/INTERPRETING.md#host-defined-functions>
+pub const D262_HOST_PREAMBLE: &str = r#"
+var $262 = (function () {
+    var IsHTMLDDA = function IsHTMLDDA() { return null; };
+    return {
+        global: globalThis,
+        gc: function () { /* engine gc is automatic */ },
+        detachArrayBuffer: function (buf) {
+            if (buf && typeof buf.transfer === 'function') {
+                buf.transfer();
+            }
+        },
+        evalScript: function (source) {
+            // Foundation: function-scoped fallback. Slice 19+ will
+            // route through a real indirect-eval native once `eval`
+            // is installed on the global.
+            return (new Function(source))();
+        },
+        IsHTMLDDA: IsHTMLDDA,
+        agent: {
+            // §262.agent — slice 19c wires these through native
+            // host bindings installed by
+            // `crates/otter-test262/src/agent.rs`. The natives
+            // own the cross-thread agent registry, the broadcast
+            // channels, and the report queue.
+            start: function (source) {
+                return __otter_agent_start(String(source));
+            },
+            broadcast: function (sab, num) {
+                return __otter_agent_broadcast(sab, num);
+            },
+            getReport: function () {
+                return __otter_agent_get_report();
+            },
+            sleep: function (ms) {
+                return __otter_agent_sleep(Number(ms));
+            },
+            monotonicNow: function () {
+                return __otter_agent_monotonic_now();
+            },
+            receiveBroadcast: function (handler) {
+                return __otter_agent_receive_broadcast(handler);
+            },
+            report: function (msg) {
+                return __otter_agent_report(String(msg));
+            },
+            leaving: function () {
+                return __otter_agent_leaving();
+            },
+            timeouts: { short: 200, medium: 1000, long: 4000, huge: 10000 }
+        }
+    };
+})();
+"#;
+
 /// Errors raised by the harness loader.
 #[derive(Debug, Error)]
 pub enum HarnessError {
@@ -123,6 +205,12 @@ impl HarnessCache {
             return Ok(String::new());
         }
         let mut out = String::with_capacity(8 * 1024);
+        // §262 host harness (`$262.gc`, `$262.detachArrayBuffer`,
+        // `$262.agent.*`, …). Injected before `assert.js` /
+        // `sta.js` so any harness fragment that references `$262`
+        // observes a defined global.
+        out.push_str(D262_HOST_PREAMBLE);
+        out.push('\n');
         for required in ["assert.js", "sta.js"] {
             out.push_str(self.load(required)?);
             out.push('\n');

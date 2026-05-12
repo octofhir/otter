@@ -20,6 +20,8 @@ path = "src/main.rs"
 [dependencies]
 # Active runtime / VM surface.
 otter-runtime = { workspace = true }
+otter-vm      = { workspace = true }
+smallvec     = { workspace = true }
 
 # Parsing helpers (frontmatter + reports).
 serde       = { workspace = true }

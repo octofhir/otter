@@ -1,30 +1,50 @@
 //! ECMA-262 §25.4 `Atomics` namespace.
 //!
-//! Foundation slice ships the single-threaded subset:
-//! `load` / `store` / `add` / `sub` / `and` / `or` / `xor` /
-//! `exchange` / `compareExchange` / `isLockFree`. The
-//! cross-thread `wait` / `notify` / `waitAsync` family is
-//! deferred until the worker / SharedArrayBuffer cross-isolate
-//! plumbing lands.
+//! Single-threaded foundation: ships every spec method on the
+//! integer-typed subset of TypedArrays. Wait / notify variants are
+//! implemented to be observably correct on a single-threaded VM —
+//! `wait` returns `"not-equal"` or `"timed-out"` per spec, `notify`
+//! always returns `0` (no waiters exist).
 //!
-//! Each operation reads or writes a single TypedArray element
-//! through the kind-specific element-type rules in
-//! [`super::binary::TypedArrayKind`]. On single-thread the ops
-//! are equivalent to the corresponding non-atomic indexed
-//! accesses; the API surface still validates the element-kind
-//! restriction (atomics only operate on integer kinds: Int8 /
-//! Uint8 / Int16 / Uint16 / Int32 / Uint32 / BigInt64 /
-//! BigUint64).
+//! # Contents
+//! - `ATOMICS_SPEC` / `ATOMICS_METHODS` — namespace registration.
+//! - `validate_integer_typed_array` — §25.4.3.1
+//!   ValidateIntegerTypedArray.
+//! - `validate_atomic_access` — §25.4.3.2 ValidateAtomicAccess.
+//! - `validate_atomic_access_on_int_or_bigint_typed_array` —
+//!   §25.4.3.3 ValidateAtomicAccessOnIntegerTypedArray (waitable
+//!   subset).
+//! - per-method native handlers using [`NativeCtx`] for spec-faithful
+//!   coercion of `index` and `value` arguments.
+//! - legacy `call()` opcode entry kept for the AtomicsCall fast
+//!   path that older bytecode files may still carry.
+//!
+//! # Invariants
+//! - `Uint8ClampedArray`, `Float32Array`, `Float64Array` are never
+//!   accepted as a `typedArray` argument to any atomic op.
+//! - `wait` / `waitAsync` require a `SharedArrayBuffer`-backed view
+//!   of `Int32Array` or `BigInt64Array`.
+//! - Out-of-range indices surface as `RangeError`, **not**
+//!   `TypeError`.
+//! - View kind is validated before any other argument is coerced
+//!   (validate-arraytype-before-value-coercion).
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-atomics-object>
+//! - <https://tc39.es/ecma262/#sec-validateintegertypedarray>
+//! - <https://tc39.es/ecma262/#sec-validateatomicaccess>
 
+use crate::abstract_ops::{self, ToPrimitiveHint};
+use crate::atomics_wait::{self, WaitOutcome};
 use crate::binary::{JsTypedArray, TypedArrayKind};
+use crate::bigint::BigIntValue;
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
 use crate::number::NumberValue;
+use crate::number::parse::to_integer_or_infinity;
 use crate::promise::JsPromiseHandle;
 use crate::string::{JsString, StringHeap};
 use crate::{NativeCall, NativeCtx, NativeError, Value, VmError};
+use std::time::Duration;
 
 /// Static namespace spec installed by the centralized bootstrap
 /// registry.
@@ -45,6 +65,7 @@ const ATOMICS_METHODS: &[MethodSpec] = &[
     method("load", 2, native_load),
     method("notify", 3, native_notify),
     method("or", 3, native_or),
+    method("pause", 0, native_pause),
     method("store", 3, native_store),
     method("sub", 3, native_sub),
     method("wait", 4, native_wait),
@@ -65,6 +86,603 @@ const fn method(
     }
 }
 
+/// Whether `Atomics.add` / `sub` / `and` / `or` / `xor` / `exchange`
+/// / `compareExchange` accept this kind. §25.4.3.1 step 2-3.
+fn accepts_atomic_kind(kind: TypedArrayKind) -> bool {
+    !matches!(
+        kind,
+        TypedArrayKind::Float32 | TypedArrayKind::Float64 | TypedArrayKind::Uint8Clamped
+    )
+}
+
+/// §25.4.3.1 ValidateIntegerTypedArray ( typedArray, waitable ).
+/// `waitable=true` restricts the kind to Int32Array / BigInt64Array.
+fn validate_integer_typed_array(
+    value: &Value,
+    waitable: bool,
+    method_name: &'static str,
+) -> Result<JsTypedArray, NativeError> {
+    let ta = match value {
+        Value::TypedArray(t) => t.clone(),
+        _ => {
+            return Err(type_err(
+                method_name,
+                "argument is not a TypedArray".to_string(),
+            ));
+        }
+    };
+    let kind = ta.kind();
+    if !accepts_atomic_kind(kind) {
+        return Err(type_err(
+            method_name,
+            format!("{} is not an integer-element TypedArray", kind.name()),
+        ));
+    }
+    if waitable && !matches!(kind, TypedArrayKind::Int32 | TypedArrayKind::BigInt64) {
+        return Err(type_err(
+            method_name,
+            format!(
+                "{} is not a waitable TypedArray (Int32Array or BigInt64Array)",
+                kind.name()
+            ),
+        ));
+    }
+    Ok(ta)
+}
+
+/// §25.4.3.4 ValidateAtomicAccess ( typedArray, requestIndex ).
+/// Coerces `request_index` through ToIndex, then bounds-checks it
+/// against `typedArray.length`. Out-of-range → `RangeError`.
+fn validate_atomic_access(
+    ctx: &mut NativeCtx<'_>,
+    ta: &JsTypedArray,
+    request_index: &Value,
+    method_name: &'static str,
+) -> Result<usize, NativeError> {
+    let idx = coerce_to_index(ctx, request_index, method_name)?;
+    if idx >= ta.length() {
+        return Err(range_err(
+            method_name,
+            format!(
+                "index {idx} is out of range for {} of length {}",
+                ta.kind().name(),
+                ta.length()
+            ),
+        ));
+    }
+    Ok(idx)
+}
+
+/// §7.1.22 ToIndex with full coercion (Object → primitive →
+/// integer). Returns `RangeError` for negative / non-integer /
+/// non-finite values, `TypeError` for `Symbol` or `BigInt` input
+/// (since `ToNumber` on those throws).
+fn coerce_to_index(
+    ctx: &mut NativeCtx<'_>,
+    value: &Value,
+    method_name: &'static str,
+) -> Result<usize, NativeError> {
+    let primitive = to_primitive_number(ctx, value, method_name)?;
+    match &primitive {
+        Value::Symbol(_) => {
+            return Err(type_err(
+                method_name,
+                "cannot convert Symbol to a number".to_string(),
+            ));
+        }
+        Value::BigInt(_) => {
+            return Err(type_err(
+                method_name,
+                "cannot convert BigInt to a number".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    let n = to_integer_or_infinity(&primitive);
+    if !n.is_finite() {
+        return Err(range_err(method_name, "index is not finite".to_string()));
+    }
+    if n < 0.0 {
+        return Err(range_err(method_name, "index is negative".to_string()));
+    }
+    if n > 9_007_199_254_740_991.0 {
+        return Err(range_err(method_name, "index exceeds 2^53 - 1".to_string()));
+    }
+    Ok(n as usize)
+}
+
+/// §7.1.1 ToPrimitive(value, "number"). Plain primitive values
+/// pass through unchanged; Objects route through
+/// `Interpreter::evaluate_to_primitive` so `Symbol.toPrimitive` /
+/// `valueOf` / `toString` are observable. User-thrown exceptions
+/// during coercion propagate as `NativeError::Thrown` so the
+/// runtime mapper hands the original payload back to JS (this is
+/// required by tests like
+/// `Atomics/notify/symbol-for-index-throws.js` that assert on a
+/// `Test262Error` thrown from a poisoned `valueOf`).
+fn to_primitive_number(
+    ctx: &mut NativeCtx<'_>,
+    value: &Value,
+    method_name: &'static str,
+) -> Result<Value, NativeError> {
+    if abstract_ops::is_primitive(value) {
+        return Ok(value.clone());
+    }
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| {
+        type_err(
+            method_name,
+            "missing execution context for ToPrimitive".to_string(),
+        )
+    })?;
+    interp
+        .evaluate_to_primitive(&exec, value, ToPrimitiveHint::Number)
+        .map_err(|e| vm_error_to_native(method_name, e))
+}
+
+/// Convert a [`VmError`] surfaced from re-entering the interpreter
+/// into the matching [`NativeError`]. Crucially, `VmError::Uncaught`
+/// maps to `NativeError::Thrown` so the original user-thrown value
+/// rides through (the runtime mapper at `lib.rs:15616` reconstructs
+/// the JS exception from the `message` field).
+fn vm_error_to_native(method_name: &'static str, err: VmError) -> NativeError {
+    match err {
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name: spec_name(method_name),
+            message: value,
+        },
+        other => type_err(method_name, other.to_string()),
+    }
+}
+
+/// Coerce the third / fourth argument of a read-modify-write op to
+/// the element representation. Numeric kinds use `ToIntegerOrInfinity`;
+/// BigInt kinds use `ToBigInt`.
+fn coerce_element_value(
+    ctx: &mut NativeCtx<'_>,
+    kind: TypedArrayKind,
+    value: &Value,
+    method_name: &'static str,
+) -> Result<Value, NativeError> {
+    let primitive = to_primitive_number(ctx, value, method_name)?;
+    if kind.is_bigint() {
+        match primitive {
+            Value::BigInt(b) => Ok(Value::BigInt(b)),
+            Value::Boolean(b) => Ok(Value::BigInt(BigIntValue::from_inner(
+                num_bigint::BigInt::from(i64::from(b)),
+            ))),
+            Value::String(s) => {
+                let txt = s.to_lossy_string();
+                let trimmed = txt.trim();
+                let parsed = trimmed.parse::<num_bigint::BigInt>();
+                parsed
+                    .map(|b| Value::BigInt(BigIntValue::from_inner(b)))
+                    .map_err(|_| type_err(method_name, format!("cannot convert {trimmed:?} to BigInt")))
+            }
+            Value::Number(_) => Err(type_err(
+                method_name,
+                "cannot mix BigInt and Number".to_string(),
+            )),
+            _ => Err(type_err(
+                method_name,
+                "cannot convert value to BigInt".to_string(),
+            )),
+        }
+    } else {
+        match primitive {
+            Value::BigInt(_) => Err(type_err(
+                method_name,
+                "cannot mix BigInt and Number".to_string(),
+            )),
+            Value::Symbol(_) => Err(type_err(
+                method_name,
+                "cannot convert Symbol to a number".to_string(),
+            )),
+            other => {
+                let mut n = to_integer_or_infinity(&other);
+                // §7.1.5 step 2 — `ToIntegerOrInfinity` collapses
+                // `+0` / `-0` / `NaN` to `0` (positive zero). Force
+                // the sign here so `Atomics.store(view, 0, -0)`
+                // returns `+0` per the test262
+                // `expected-return-value-negative-zero` case.
+                if n == 0.0 {
+                    n = 0.0;
+                }
+                Ok(Value::Number(NumberValue::from_f64(n)))
+            }
+        }
+    }
+}
+
+fn type_err(name: &'static str, reason: String) -> NativeError {
+    NativeError::TypeError {
+        name: spec_name(name),
+        reason,
+    }
+}
+
+fn range_err(name: &'static str, reason: String) -> NativeError {
+    NativeError::RangeError {
+        name: spec_name(name),
+        reason,
+    }
+}
+
+/// Map "add" → "Atomics.add" etc. for diagnostic strings.
+const fn spec_name(method: &'static str) -> &'static str {
+    // Static strings; the runtime mapper only reads `.name` for
+    // diagnostics so a plain method name is acceptable.
+    method
+}
+
+// =====================================================================
+// Native method handlers — primary entry points after the property
+// lookup path resolves `Atomics.<method>` to a `Value::NativeFunction`.
+// =====================================================================
+
+fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, "Atomics.load")?;
+    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), "Atomics.load")?;
+    Ok(ta.get(idx))
+}
+
+fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, "Atomics.store")?;
+    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), "Atomics.store")?;
+    let value = coerce_element_value(
+        ctx,
+        ta.kind(),
+        args.get(2).unwrap_or(&Value::Undefined),
+        "Atomics.store",
+    )?;
+    ta.set(idx, &value);
+    Ok(value)
+}
+
+fn modify_op(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    method_name: &'static str,
+    op: fn(i64, i64) -> i64,
+    op_big: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
+) -> Result<Value, NativeError> {
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, method_name)?;
+    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), method_name)?;
+    let coerced = coerce_element_value(
+        ctx,
+        ta.kind(),
+        args.get(2).unwrap_or(&Value::Undefined),
+        method_name,
+    )?;
+    let prev = ta.get(idx);
+    if ta.kind().is_bigint() {
+        let prev_b = match &prev {
+            Value::BigInt(b) => b.as_inner().clone(),
+            _ => num_bigint::BigInt::from(0),
+        };
+        let v_b = match &coerced {
+            Value::BigInt(b) => b.as_inner().clone(),
+            _ => num_bigint::BigInt::from(0),
+        };
+        let new_b = op_big(&prev_b, &v_b);
+        ta.set(idx, &Value::BigInt(BigIntValue::from_inner(new_b)));
+    } else {
+        let prev_n = match &prev {
+            Value::Number(n) => n.as_f64() as i64,
+            _ => 0,
+        };
+        let v_n = match &coerced {
+            Value::Number(n) => n.as_f64() as i64,
+            _ => 0,
+        };
+        let new_n = op(prev_n, v_n);
+        ta.set(idx, &Value::Number(NumberValue::from_f64(new_n as f64)));
+    }
+    Ok(prev)
+}
+
+fn native_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    modify_op(
+        ctx,
+        args,
+        "Atomics.add",
+        |a, b| a.wrapping_add(b),
+        |a, b| a + b,
+    )
+}
+
+fn native_sub(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    modify_op(
+        ctx,
+        args,
+        "Atomics.sub",
+        |a, b| a.wrapping_sub(b),
+        |a, b| a - b,
+    )
+}
+
+fn native_and(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    modify_op(ctx, args, "Atomics.and", |a, b| a & b, |a, b| a & b)
+}
+
+fn native_or(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    modify_op(ctx, args, "Atomics.or", |a, b| a | b, |a, b| a | b)
+}
+
+fn native_xor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    modify_op(ctx, args, "Atomics.xor", |a, b| a ^ b, |a, b| a ^ b)
+}
+
+fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, "Atomics.exchange")?;
+    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), "Atomics.exchange")?;
+    let value = coerce_element_value(
+        ctx,
+        ta.kind(),
+        args.get(2).unwrap_or(&Value::Undefined),
+        "Atomics.exchange",
+    )?;
+    let prev = ta.get(idx);
+    ta.set(idx, &value);
+    Ok(prev)
+}
+
+fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::Undefined),
+        false,
+        "Atomics.compareExchange",
+    )?;
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::Undefined),
+        "Atomics.compareExchange",
+    )?;
+    let expected = coerce_element_value(
+        ctx,
+        ta.kind(),
+        args.get(2).unwrap_or(&Value::Undefined),
+        "Atomics.compareExchange",
+    )?;
+    let replacement = coerce_element_value(
+        ctx,
+        ta.kind(),
+        args.get(3).unwrap_or(&Value::Undefined),
+        "Atomics.compareExchange",
+    )?;
+    // §25.4.3.5 step 8 — expected must be narrowed through the
+    // element-type's RawBytes round-trip before the comparison
+    // against the raw current value (e.g. an Int16 view stores
+    // `123456789` as `-13035`, so expected `123456789` must compare
+    // against `-13035`, not the original Number).
+    let expected_narrow = narrow_through_kind(ta.kind(), &expected);
+    let current = ta.get(idx);
+    if values_equal_strict(&current, &expected_narrow) {
+        ta.set(idx, &replacement);
+    }
+    Ok(current)
+}
+
+/// Round-trip `value` through the element type so the result matches
+/// what the buffer would read back after a store. Used by
+/// `compareExchange` to spec-equate `expected` with `current` per
+/// §25.4.3.5.
+fn narrow_through_kind(kind: TypedArrayKind, value: &Value) -> Value {
+    let mut scratch = [0u8; 8];
+    kind.write(&mut scratch, 0, value);
+    kind.read(&scratch, 0)
+}
+
+fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // Spec §25.4.13 — argument is coerced via ToIntegerOrInfinity
+    // (no ToIndex), so negative / non-integer / NaN map to `false`
+    // by failing the `matches!(.., 1|2|4|8)` filter.
+    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let primitive = to_primitive_number(ctx, &arg, "Atomics.isLockFree")?;
+    if matches!(primitive, Value::Symbol(_)) {
+        return Err(type_err(
+            "Atomics.isLockFree",
+            "cannot convert Symbol to a number".to_string(),
+        ));
+    }
+    let n = to_integer_or_infinity(&primitive);
+    let supported = n.is_finite() && matches!(n as i64, 1 | 2 | 4 | 8) && (n as i64 as f64) == n;
+    Ok(Value::Boolean(supported))
+}
+
+fn native_pause(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // §25.4.14 Atomics.pause ( iterationNumber )
+    // <https://tc39.es/ecma262/#sec-atomics.pause>
+    //
+    // The argument, if present, must be an integral Number (not a
+    // string or object coerced to one). The spec calls this
+    // "integral Number" — Number whose ToIntegerOrInfinity equals
+    // itself. Anything else throws TypeError. A single-threaded VM
+    // can simply yield; we choose the trivial no-op.
+    if let Some(v) = args.first()
+        && !matches!(v, Value::Undefined)
+    {
+        let Value::Number(n) = v else {
+            return Err(type_err(
+                "Atomics.pause",
+                "iterationNumber must be an integral Number".to_string(),
+            ));
+        };
+        let f = n.as_f64();
+        if !f.is_finite() || f.trunc() != f {
+            return Err(type_err(
+                "Atomics.pause",
+                "iterationNumber must be an integral Number".to_string(),
+            ));
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn native_wait(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    do_wait(ctx, args, /* is_async */ false)
+}
+
+fn native_wait_async(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    do_wait(ctx, args, /* is_async */ true)
+}
+
+fn do_wait(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    is_async: bool,
+) -> Result<Value, NativeError> {
+    let method_name = if is_async {
+        "Atomics.waitAsync"
+    } else {
+        "Atomics.wait"
+    };
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::Undefined),
+        true,
+        method_name,
+    )?;
+    // §25.4.3.13 Atomics.wait — buffer must be a SharedArrayBuffer.
+    if !ta.buffer().is_shared() {
+        return Err(type_err(
+            method_name,
+            "expected a SharedArrayBuffer-backed TypedArray".to_string(),
+        ));
+    }
+    let buf_id = ta
+        .buffer()
+        .shared_id()
+        .expect("is_shared() guards shared_id");
+    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), method_name)?;
+    // Coerce expected `value` before timeout for spec-faithful order.
+    let expected = coerce_element_value(
+        ctx,
+        ta.kind(),
+        args.get(2).unwrap_or(&Value::Undefined),
+        method_name,
+    )?;
+    // §25.4.3.13 step 11 — timeout is `ToNumber(q)`; NaN → +∞;
+    // observable side-effects fire even on a single-threaded VM.
+    let timeout = match args.get(3) {
+        None | Some(Value::Undefined) => f64::INFINITY,
+        Some(v) => {
+            let primitive = to_primitive_number(ctx, v, method_name)?;
+            if matches!(primitive, Value::Symbol(_)) {
+                return Err(type_err(
+                    method_name,
+                    "cannot convert Symbol to a number".to_string(),
+                ));
+            }
+            let n = crate::number::parse::to_number_value(&primitive);
+            if n.is_nan() { f64::INFINITY } else { n.max(0.0) }
+        }
+    };
+    let current = ta.get(idx);
+    let label = if !values_equal_strict(&current, &expected) {
+        "not-equal"
+    } else if is_async {
+        // §25.4.3.14 — `waitAsync` does not block the calling
+        // thread; the single-thread foundation returns a
+        // synchronously-fulfilled `"timed-out"` promise.
+        "timed-out"
+    } else {
+        // §25.4.3.13 — block the calling thread on the shared-buffer
+        // wait registry until either a notify or the timeout fires.
+        let dur = if timeout.is_infinite() {
+            None
+        } else {
+            // Clamp to u64::MAX milliseconds (~584 million years) to
+            // stay inside `Duration::from_millis` range.
+            let ms = timeout.min(u64::MAX as f64) as u64;
+            Some(Duration::from_millis(ms))
+        };
+        match atomics_wait::park_until_notified(buf_id, idx, dur) {
+            WaitOutcome::Ok => "ok",
+            WaitOutcome::TimedOut => "timed-out",
+        }
+    };
+    let string_heap = ctx.cx.interp.string_heap.clone();
+    let label_str = JsString::from_str(label, &string_heap).map_err(|e| {
+        type_err(method_name, format!("string allocation failed: {e}"))
+    })?;
+    if is_async {
+        let heap = ctx.heap_mut();
+        let promise = JsPromiseHandle::fulfilled(heap, Value::String(label_str))
+            .map_err(|e| type_err(method_name, format!("promise allocation failed: {e}")))?;
+        let result = crate::object::alloc_object(heap)
+            .map_err(|e| type_err(method_name, format!("object allocation failed: {e}")))?;
+        crate::object::set(result, heap, "async", Value::Boolean(false));
+        crate::object::set(result, heap, "value", Value::Promise(promise));
+        Ok(Value::Object(result))
+    } else {
+        Ok(Value::String(label_str))
+    }
+}
+
+fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    // §25.4.3.12 Atomics.notify ( typedArray, index, count ).
+    // Allows Int32Array / BigInt64Array; no SharedArrayBuffer
+    // requirement — the spec returns 0 for a non-shared buffer
+    // because no thread can be waiting on a non-shared backing.
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::Undefined),
+        true,
+        "Atomics.notify",
+    )?;
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::Undefined),
+        "Atomics.notify",
+    )?;
+    // count: ToIntegerOrInfinity with negative clamped to 0 per
+    // §25.4.3.12 step 5; +Infinity means "wake every waiter".
+    let count = match args.get(2) {
+        None | Some(Value::Undefined) => usize::MAX,
+        Some(v) => {
+            let primitive = to_primitive_number(ctx, v, "Atomics.notify")?;
+            if matches!(primitive, Value::Symbol(_)) {
+                return Err(type_err(
+                    "Atomics.notify",
+                    "cannot convert Symbol to a number".to_string(),
+                ));
+            }
+            let n = to_integer_or_infinity(&primitive);
+            if n.is_infinite() && n.is_sign_positive() {
+                usize::MAX
+            } else if n.is_nan() || n.is_sign_negative() {
+                0
+            } else if n >= usize::MAX as f64 {
+                usize::MAX
+            } else {
+                n as usize
+            }
+        }
+    };
+    let woken = match ta.buffer().shared_id() {
+        Some(buf_id) => atomics_wait::notify_waiters(buf_id, idx, count),
+        None => 0,
+    };
+    Ok(Value::Number(NumberValue::from_f64(woken as f64)))
+}
+
+fn values_equal_strict(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => crate::number::equals(*x, *y),
+        (Value::BigInt(x), Value::BigInt(y)) => x == y,
+        _ => false,
+    }
+}
+
+// =====================================================================
+// Legacy `call()` entry — invoked by the `Op::AtomicsCall` opcode
+// when older bytecode files (or the remaining compiler shortcut)
+// emit a direct method dispatch. New behaviour goes through the
+// native-function handlers above; this path keeps the simple
+// pre-coercion semantics so older code paths do not regress.
+// =====================================================================
+
 /// Dispatch `Atomics.<method>(args...)` via the typed
 /// [`AtomicsMethod`] emitted by the compiler.
 ///
@@ -79,56 +697,44 @@ pub fn call(
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::AtomicsMethod as M;
     match method {
-        // §25.4.13 Atomics.isLockFree(size) — true for the four
-        // sizes the spec mandates (1, 2, 4, 8).
-        // <https://tc39.es/ecma262/#sec-atomics.islockfree>
         M::IsLockFree => {
             let n = match args.first() {
                 Some(Value::Number(n)) => n.as_f64(),
                 Some(Value::Boolean(true)) => 1.0,
-                Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
+                Some(Value::Boolean(false)) | Some(Value::Null) | None => 0.0,
                 _ => return Ok(Value::Boolean(false)),
             };
             let supported = matches!(n as i32, 1 | 2 | 4 | 8) && n.fract() == 0.0;
             Ok(Value::Boolean(supported))
         }
-        // §25.4.5 Atomics.load(typedArray, index)
-        // <https://tc39.es/ecma262/#sec-atomics.load>
         M::Load => {
-            let (ta, idx) = read_indexed_args(args)?;
-            ensure_int_kind(ta.kind())?;
+            let (ta, idx) = read_indexed_args_legacy(args)?;
+            ensure_atomic_kind_legacy(ta.kind())?;
             Ok(ta.get(idx))
         }
-        // §25.4.10 Atomics.store(typedArray, index, value)
-        // <https://tc39.es/ecma262/#sec-atomics.store>
         M::Store => {
-            let (ta, idx) = read_indexed_args(args)?;
-            ensure_int_kind(ta.kind())?;
+            let (ta, idx) = read_indexed_args_legacy(args)?;
+            ensure_atomic_kind_legacy(ta.kind())?;
             let value = args.get(2).cloned().unwrap_or(Value::Undefined);
             ta.set(idx, &value);
             Ok(value)
         }
-        M::Add => atomic_modify(args, |a, b| a.wrapping_add(b)),
-        M::Sub => atomic_modify(args, |a, b| a.wrapping_sub(b)),
-        M::And => atomic_modify(args, |a, b| a & b),
-        M::Or => atomic_modify(args, |a, b| a | b),
-        M::Xor => atomic_modify(args, |a, b| a ^ b),
-        // §25.4.7 Atomics.exchange(typedArray, index, value)
-        // <https://tc39.es/ecma262/#sec-atomics.exchange>
+        M::Add => legacy_modify(args, |a, b| a.wrapping_add(b)),
+        M::Sub => legacy_modify(args, |a, b| a.wrapping_sub(b)),
+        M::And => legacy_modify(args, |a, b| a & b),
+        M::Or => legacy_modify(args, |a, b| a | b),
+        M::Xor => legacy_modify(args, |a, b| a ^ b),
         M::Exchange => {
-            let (ta, idx) = read_indexed_args(args)?;
-            ensure_int_kind(ta.kind())?;
+            let (ta, idx) = read_indexed_args_legacy(args)?;
+            ensure_atomic_kind_legacy(ta.kind())?;
             let prev = ta.get(idx);
             let value = args.get(2).cloned().unwrap_or(Value::Undefined);
             ta.set(idx, &value);
             Ok(prev)
         }
-        // §25.4.6 Atomics.compareExchange(typedArray, index,
-        //                                 expectedValue, replacementValue)
-        // <https://tc39.es/ecma262/#sec-atomics.compareexchange>
         M::CompareExchange => {
-            let (ta, idx) = read_indexed_args(args)?;
-            ensure_int_kind(ta.kind())?;
+            let (ta, idx) = read_indexed_args_legacy(args)?;
+            ensure_atomic_kind_legacy(ta.kind())?;
             let expected = args.get(2).cloned().unwrap_or(Value::Undefined);
             let replacement = args.get(3).cloned().unwrap_or(Value::Undefined);
             let current = ta.get(idx);
@@ -137,18 +743,9 @@ pub fn call(
             }
             Ok(current)
         }
-        // §25.4.11 Atomics.wait(typedArray, index, value, timeout?).
-        // Single-thread foundation: the current value is read; if
-        // it does not match the expected `value`, we return
-        // "not-equal" immediately. Otherwise we cannot ever
-        // observe a notify (no other thread to fire it), so
-        // returning "timed-out" matches spec semantics for
-        // timeout=0 and is observably correct for any positive
-        // timeout in a single-threaded VM.
-        // <https://tc39.es/ecma262/#sec-atomics.wait>
         M::Wait => {
-            let (ta, idx) = read_indexed_args(args)?;
-            ensure_int_kind(ta.kind())?;
+            let (ta, idx) = read_indexed_args_legacy(args)?;
+            ensure_atomic_kind_legacy(ta.kind())?;
             let current = ta.get(idx);
             let expected = args.get(2).cloned().unwrap_or(Value::Undefined);
             let label = if values_equal_strict(&current, &expected) {
@@ -158,25 +755,15 @@ pub fn call(
             };
             Ok(Value::String(JsString::from_str(label, string_heap)?))
         }
-        // §25.4.12 Atomics.notify(typedArray, index, count?). No
-        // other thread can ever be waiting on a single-thread VM,
-        // so the count of woken waiters is always `0`.
-        // <https://tc39.es/ecma262/#sec-atomics.notify>
         M::Notify => {
-            let (ta, idx) = read_indexed_args(args)?;
-            ensure_int_kind(ta.kind())?;
+            let (ta, idx) = read_indexed_args_legacy(args)?;
+            ensure_atomic_kind_legacy(ta.kind())?;
             let _ = idx;
             Ok(Value::Number(NumberValue::from_i32(0)))
         }
-        // ECMA-402 / Atomics.waitAsync(typedArray, index, value, timeout?).
-        // Single-thread foundation: returns
-        // `{ async: false, value: <result> }` per the spec result
-        // shape, where `<result>` is a synchronously-fulfilled
-        // promise of the equivalent `wait` outcome.
-        // <https://tc39.es/ecma262/#sec-atomics.waitasync>
         M::WaitAsync => {
-            let (ta, idx) = read_indexed_args(args)?;
-            ensure_int_kind(ta.kind())?;
+            let (ta, idx) = read_indexed_args_legacy(args)?;
+            ensure_atomic_kind_legacy(ta.kind())?;
             let current = ta.get(idx);
             let expected = args.get(2).cloned().unwrap_or(Value::Undefined);
             let label = if values_equal_strict(&current, &expected) {
@@ -196,49 +783,9 @@ pub fn call(
     }
 }
 
-fn native_atomics_call(
-    ctx: &mut NativeCtx<'_>,
-    method: otter_bytecode::method_id::AtomicsMethod,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let interp = ctx.interp_mut();
-    let string_heap = interp.string_heap.clone();
-    call(method, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
-        name: method.name(),
-        reason: err.to_string(),
-    })
-}
-
-macro_rules! native_atomics {
-    ($fn_name:ident, $variant:ident) => {
-        fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            native_atomics_call(
-                ctx,
-                otter_bytecode::method_id::AtomicsMethod::$variant,
-                args,
-            )
-        }
-    };
-}
-
-native_atomics!(native_add, Add);
-native_atomics!(native_and, And);
-native_atomics!(native_compare_exchange, CompareExchange);
-native_atomics!(native_exchange, Exchange);
-native_atomics!(native_is_lock_free, IsLockFree);
-native_atomics!(native_load, Load);
-native_atomics!(native_notify, Notify);
-native_atomics!(native_or, Or);
-native_atomics!(native_store, Store);
-native_atomics!(native_sub, Sub);
-native_atomics!(native_wait, Wait);
-native_atomics!(native_wait_async, WaitAsync);
-native_atomics!(native_xor, Xor);
-
-/// Single-thread arithmetic / bitwise modify-and-return-old.
-fn atomic_modify(args: &[Value], op: fn(i64, i64) -> i64) -> Result<Value, VmError> {
-    let (ta, idx) = read_indexed_args(args)?;
-    ensure_int_kind(ta.kind())?;
+fn legacy_modify(args: &[Value], op: fn(i64, i64) -> i64) -> Result<Value, VmError> {
+    let (ta, idx) = read_indexed_args_legacy(args)?;
+    ensure_atomic_kind_legacy(ta.kind())?;
     let value = args.get(2).cloned().unwrap_or(Value::Undefined);
     let prev = ta.get(idx);
     if ta.kind().is_bigint() {
@@ -250,17 +797,12 @@ fn atomic_modify(args: &[Value], op: fn(i64, i64) -> i64) -> Result<Value, VmErr
             Value::BigInt(b) => b.as_inner().clone(),
             _ => return Err(VmError::TypeMismatch),
         };
-        // Foundation: do the arithmetic in i128 + wrap on store.
-        // The kind's write helper handles the modular reduction.
         use num_traits::ToPrimitive;
         let prev_i = prev_b.to_i64().unwrap_or(0);
         let v_i = v_b.to_i64().unwrap_or(0);
         let new_i = op(prev_i, v_i);
         let new_b = num_bigint::BigInt::from(new_i);
-        ta.set(
-            idx,
-            &Value::BigInt(crate::bigint::BigIntValue::from_inner(new_b)),
-        );
+        ta.set(idx, &Value::BigInt(BigIntValue::from_inner(new_b)));
         return Ok(prev);
     }
     let prev_n = match &prev {
@@ -276,7 +818,7 @@ fn atomic_modify(args: &[Value], op: fn(i64, i64) -> i64) -> Result<Value, VmErr
     Ok(prev)
 }
 
-fn read_indexed_args(args: &[Value]) -> Result<(JsTypedArray, usize), VmError> {
+fn read_indexed_args_legacy(args: &[Value]) -> Result<(JsTypedArray, usize), VmError> {
     let ta = match args.first() {
         Some(Value::TypedArray(t)) => t.clone(),
         _ => return Err(VmError::TypeMismatch),
@@ -297,19 +839,10 @@ fn read_indexed_args(args: &[Value]) -> Result<(JsTypedArray, usize), VmError> {
     Ok((ta, idx))
 }
 
-/// §25.4.3.1 ValidateIntegerTypedArray — atomics only operate on
-/// integer kinds. Float32 / Float64 raise TypeError.
-fn ensure_int_kind(kind: TypedArrayKind) -> Result<(), VmError> {
-    match kind {
-        TypedArrayKind::Float32 | TypedArrayKind::Float64 => Err(VmError::TypeMismatch),
-        _ => Ok(()),
-    }
-}
-
-fn values_equal_strict(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => crate::number::equals(*x, *y),
-        (Value::BigInt(x), Value::BigInt(y)) => x == y,
-        _ => false,
+fn ensure_atomic_kind_legacy(kind: TypedArrayKind) -> Result<(), VmError> {
+    if accepts_atomic_kind(kind) {
+        Ok(())
+    } else {
+        Err(VmError::TypeMismatch)
     }
 }

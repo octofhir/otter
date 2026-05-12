@@ -7253,32 +7253,16 @@ fn compile_method_call(
             cx.emit(Op::ProxyCall, operands, span);
             return Ok(dst);
         }
-        // §25.4 `Atomics.<method>(args)` — typed dispatch via
-        // [`AtomicsMethod`].
+        // §25.4 `Atomics.<method>(args)` — routed through the
+        // namespace native function table installed by
+        // `bootstrap::install_atomics`. The dedicated
+        // `Op::AtomicsCall` shortcut was retired because it
+        // bypassed the spec-required ToIndex coercion and
+        // arraytype-before-value-coercion ordering. The opcode
+        // handler in `crates/otter-vm/src/lib.rs` remains for
+        // backwards-compatibility with older bytecode.
         // <https://tc39.es/ecma262/#sec-atomics-object>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Atomics"
-            && cx.lookup_binding("Atomics").is_none()
-            && find_module_import_binding(cx, "Atomics").is_none()
-        {
-            let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::AtomicsMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Atomics.{method_name}"),
-                    span,
-                });
-            };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::AtomicsCall, operands, span);
-            return Ok(dst);
-        }
+        //
         // §28.1 `Reflect.<method>(args)` — typed dispatch via
         // [`ReflectMethod`].
         // <https://tc39.es/ecma262/#sec-reflect-object>

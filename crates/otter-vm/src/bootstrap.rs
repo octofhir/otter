@@ -1699,6 +1699,14 @@ fn install_atomics(
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
     let namespace = NamespaceBuilder::from_spec(heap, &atomics::ATOMICS_SPEC)?.build()?;
+    // §25.4 — the `Atomics` object's [[Prototype]] is
+    // %Object.prototype%, mirroring the other namespace builtins.
+    // <https://tc39.es/ecma262/#sec-atomics-object>
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(namespace, heap, Some(object_proto));
+    }
     define_global(global, heap, entry.name, Value::Object(namespace));
     Ok(())
 }
@@ -1883,7 +1891,7 @@ mod tests {
         assert_eq!(telemetry.namespace_objects_installed(), 6);
         assert_eq!(
             telemetry.native_functions_installed(),
-            101 + reflect::REFLECT_SPEC.methods.len(),
+            102 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

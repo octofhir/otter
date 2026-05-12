@@ -31,6 +31,7 @@ pub mod array;
 pub mod array_prototype;
 pub mod array_statics;
 pub mod atomics;
+pub mod atomics_wait;
 pub mod bigint;
 pub mod binary;
 pub mod boolean_prototype;
@@ -1846,6 +1847,21 @@ pub enum VmError {
     /// `STRING_CONCAT` on a non-string register). Indicates a
     /// compiler bug at this slice.
     TypeMismatch,
+    /// User-facing version of [`Self::TypeMismatch`] that carries
+    /// the operation name and the offending value's type. Surfaced
+    /// to JS as a `TypeError` with the spec-shaped message
+    /// `<op>: cannot operate on <kind>` so the user can read which
+    /// site rejected which kind without learning the engine
+    /// internals.
+    TypeMismatchAt {
+        /// Operation that rejected the value (e.g.
+        /// `"Object.getPrototypeOf"`, `"Op::LoadProperty"`).
+        op: &'static str,
+        /// Value-kind name from
+        /// [`value_kind_name`] (e.g. `"Symbol"`, `"BigInt"`,
+        /// `"TypedArray"`).
+        kind: &'static str,
+    },
     /// User-visible `TypeError` with operation context.
     TypeError {
         /// Human-readable diagnostic.
@@ -1945,7 +1961,13 @@ impl std::fmt::Display for VmError {
         match self {
             VmError::MissingReturn => write!(f, "function did not RETURN"),
             VmError::InvalidOperand => write!(f, "invalid operand"),
-            VmError::TypeMismatch => write!(f, "operand type mismatch"),
+            VmError::TypeMismatch => write!(
+                f,
+                "type mismatch: this operation does not accept a value of this type"
+            ),
+            VmError::TypeMismatchAt { op, kind } => {
+                write!(f, "{op}: cannot operate on a value of type {kind}")
+            }
             VmError::TypeError { message } => write!(f, "{message}"),
             VmError::RangeError { message } => write!(f, "{message}"),
             VmError::SyntaxError { message } => write!(f, "{message}"),
@@ -2496,7 +2518,36 @@ impl Interpreter {
             | Value::Closure { .. }
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_) => Ok(Value::Object(self.function_prototype_object()?)),
-            _ => Err(VmError::TypeMismatch),
+            // §10.4 exotic objects (Array, Map, Set, WeakMap,
+            // WeakSet, WeakRef, FinalizationRegistry, Promise,
+            // ArrayBuffer, SharedArrayBuffer, DataView, TypedArray,
+            // RegExp) carry their own per-class realm prototype.
+            // Route through `intrinsic_prototype_object_for` so
+            // `Object.getPrototypeOf(buf)` / `__proto__` walks
+            // hit `%<Kind>.prototype%` instead of `TypeError:
+            // operand type mismatch`. Spec: §10.1.1 [[GetPrototypeOf]]
+            // is "OrdinaryGetPrototypeOf", which reads the slot the
+            // class set at allocation time.
+            // <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
+            Value::Array(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::Promise(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_) => match self.intrinsic_prototype_object_for(value) {
+                Some(o) => Ok(Value::Object(o)),
+                None => Ok(Value::Null),
+            },
+            other => Err(VmError::TypeMismatchAt {
+                op: "Object.getPrototypeOf",
+                kind: value_kind_name(other),
+            }),
         }
     }
 
@@ -4459,7 +4510,18 @@ impl Interpreter {
         let dynamic_message: String;
         let is_oom = matches!(err, VmError::OutOfMemory { .. });
         let (kind, message) = match err {
-            VmError::TypeMismatch => (error_classes::ErrorKind::TypeError, "operand type mismatch"),
+            VmError::TypeMismatch => (
+                error_classes::ErrorKind::TypeError,
+                "type mismatch: this operation does not accept a value of this type",
+            ),
+            VmError::TypeMismatchAt { op, kind } => {
+                dynamic_message =
+                    format!("{op}: cannot operate on a value of type {kind}");
+                (
+                    error_classes::ErrorKind::TypeError,
+                    dynamic_message.as_str(),
+                )
+            }
             VmError::TypeError { message } => {
                 dynamic_message = message.clone();
                 (
@@ -5341,6 +5403,28 @@ impl Interpreter {
                             }
                         }
                         Value::Symbol(s) => symbol_prototype::load_property(s, &name),
+                        Value::Iterator(_) => {
+                            // §27.1.2 %IteratorPrototype% surface —
+                            // raw `it.next` / `.return` / `.throw`
+                            // property reads. The actual dispatch
+                            // for `it.next()` rides through
+                            // [`Self::iterator_helper_dispatch`] on
+                            // the `Op::CallMethod` fast path; this
+                            // branch keeps `typeof it.next === "
+                            // function"` honest by synthesizing a
+                            // bound native that re-enters the
+                            // dispatcher when invoked directly.
+                            // Unknown keys return `undefined` so
+                            // `it.someProp` is a non-error read per
+                            // ordinary Iterator semantics.
+                            match name.as_str() {
+                                "next" | "return" | "throw" => {
+                                    let receiver_value = read_register(frame, obj_reg)?.clone();
+                                    self.synthesize_iterator_method(&name, receiver_value)?
+                                }
+                                _ => Value::Undefined,
+                            }
+                        }
                         v @ (Value::WeakRef(_) | Value::FinalizationRegistry(_)) => {
                             // §26.1.4 / §26.2.4 — instances have no
                             // own string keys; walk the realm
@@ -5597,7 +5681,12 @@ impl Interpreter {
                                 Value::Undefined
                             }
                         }
-                        _ => return Err(VmError::TypeMismatch),
+                        other => {
+                            return Err(VmError::TypeMismatchAt {
+                                op: "property read",
+                                kind: value_kind_name(other),
+                            });
+                        }
                     };
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
@@ -10179,6 +10268,86 @@ impl Interpreter {
     ///
     /// # See also
     /// - <https://tc39.es/proposal-iterator-helpers/>
+    /// Build a `Value::NativeFunction` that, when called,
+    /// re-dispatches the corresponding iterator method on the
+    /// captured receiver. Used by `Op::LoadProperty` so
+    /// `typeof it.next === "function"` and detached invocation
+    /// (`const f = it.next; f();`) both work.
+    fn synthesize_iterator_method(
+        &mut self,
+        name: &str,
+        receiver: Value,
+    ) -> Result<Value, VmError> {
+        let method_name: &'static str = match name {
+            "next" => "next",
+            "return" => "return",
+            "throw" => "throw",
+            _ => return Ok(Value::Undefined),
+        };
+        let captures: smallvec::SmallVec<[Value; 4]> =
+            smallvec::smallvec![receiver];
+        let value = crate::native_value_with_captures(
+            &mut self.gc_heap,
+            method_name,
+            captures,
+            move |ctx, args, captures| {
+                let receiver = captures
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Undefined);
+                let Value::Iterator(iter_rc) = receiver else {
+                    return Err(NativeError::TypeError {
+                        name: method_name,
+                        reason: "receiver is not an Iterator".to_string(),
+                    });
+                };
+                let (interp, exec) = ctx.interp_mut_and_context();
+                let exec = exec.ok_or_else(|| NativeError::TypeError {
+                    name: method_name,
+                    reason: "missing execution context".to_string(),
+                })?;
+                let small_args: smallvec::SmallVec<[Value; 8]> = args.iter().cloned().collect();
+                match method_name {
+                    "next" => {
+                        let (v, done) = interp
+                            .iterator_next_full(&exec, &iter_rc)
+                            .map_err(|e| NativeError::TypeError {
+                                name: method_name,
+                                reason: e.to_string(),
+                            })?;
+                        let obj = crate::object::alloc_object(&mut interp.gc_heap)?;
+                        crate::object::set(obj, &mut interp.gc_heap, "value", v);
+                        crate::object::set(obj, &mut interp.gc_heap, "done", Value::Boolean(done));
+                        Ok(Value::Object(obj))
+                    }
+                    "return" => {
+                        let arg = small_args
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Undefined);
+                        let obj = crate::object::alloc_object(&mut interp.gc_heap)?;
+                        crate::object::set(obj, &mut interp.gc_heap, "value", arg);
+                        crate::object::set(
+                            obj,
+                            &mut interp.gc_heap,
+                            "done",
+                            Value::Boolean(true),
+                        );
+                        Ok(Value::Object(obj))
+                    }
+                    _ => Err(NativeError::Thrown {
+                        name: method_name,
+                        message: value_kind_name(
+                            &small_args.first().cloned().unwrap_or(Value::Undefined),
+                        )
+                        .to_string(),
+                    }),
+                }
+            },
+        )?;
+        Ok(value)
+    }
+
     fn iterator_helper_dispatch(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -10287,6 +10456,35 @@ impl Interpreter {
                     )?;
                 }
                 acc
+            }
+            // §27.1.2 %IteratorPrototype%.next — pull one step from
+            // the wrapped state and surface the spec-shaped result
+            // object `{ value, done }`.
+            // <https://tc39.es/ecma262/#sec-iteratorprototype>
+            "next" => {
+                let (v, done) = self.iterator_next_full(context, iter_rc)?;
+                let obj = crate::object::alloc_object(&mut self.gc_heap)?;
+                crate::object::set(obj, &mut self.gc_heap, "value", v);
+                crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(done));
+                Value::Object(obj)
+            }
+            // §27.1.3 / §27.1.4 — `return` / `throw` on plain
+            // array-backed iterators are no-ops that fold the
+            // iterator to its completion state. Generator-style
+            // iterators are handled by the dedicated
+            // `Value::Generator` dispatch above.
+            "return" => {
+                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                let obj = crate::object::alloc_object(&mut self.gc_heap)?;
+                crate::object::set(obj, &mut self.gc_heap, "value", arg);
+                crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(true));
+                Value::Object(obj)
+            }
+            "throw" => {
+                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                return Err(VmError::Uncaught {
+                    value: value_kind_name(&arg).to_string(),
+                });
             }
             _ => return Ok(false),
         };
@@ -11063,8 +11261,17 @@ impl Interpreter {
             Value::WeakMap(_) => "WeakMap",
             Value::WeakSet(_) => "WeakSet",
             Value::WeakRef(_) => "WeakRef",
+            Value::FinalizationRegistry(_) => "FinalizationRegistry",
             Value::Promise(_) => "Promise",
-            Value::ArrayBuffer(_) => "ArrayBuffer",
+            Value::ArrayBuffer(b) => {
+                if b.is_shared() {
+                    "SharedArrayBuffer"
+                } else {
+                    "ArrayBuffer"
+                }
+            }
+            Value::DataView(_) => "DataView",
+            Value::TypedArray(t) => t.kind().name(),
             Value::Object(_) | Value::Proxy(_) => return None,
             _ => return None,
         };

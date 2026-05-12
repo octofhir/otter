@@ -444,23 +444,38 @@ fn impl_with(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(build_new_typed_array(t.kind(), &snapshot))
 }
 
+/// Wrap a snapshot of values in a `Value::Iterator`. Mirrors the
+/// pattern Map / Set iterators use so callers see a real `next()`
+/// surface instead of a plain Array.
+///
+/// Spec: §22.2.5.6 `CreateArrayIterator(O, kind)` — the abstract
+/// op produces an Iterator over the typed array's index range.
+/// <https://tc39.es/ecma262/#sec-createarrayiterator>
+fn wrap_iterator(
+    heap: &mut otter_gc::GcHeap,
+    snapshot: impl IntoIterator<Item = Value>,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    let arr = crate::array::from_elements(heap, snapshot)?;
+    let state = crate::IteratorState::Array {
+        array: arr,
+        index: 0,
+    };
+    Ok(Value::Iterator(crate::alloc_iterator_state(heap, state)?))
+}
+
 fn impl_keys(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
     let mut heap = args.gc_heap.borrow_mut();
-    let arr = crate::array::from_elements(&mut heap, (0..len).map(|i| smi(i as i32)))?;
-    Ok(Value::Array(arr))
+    Ok(wrap_iterator(&mut heap, (0..len).map(|i| smi(i as i32)))?)
 }
 
 fn impl_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let mut heap = args.gc_heap.borrow_mut();
-    Ok(Value::Array(crate::array::from_elements(
-        &mut heap,
-        copy_view(&t),
-    )?))
+    Ok(wrap_iterator(&mut heap, copy_view(&t))?)
 }
 
 fn impl_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -468,14 +483,12 @@ fn impl_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     check_not_detached(&t)?;
     let len = t.length();
     let mut heap = args.gc_heap.borrow_mut();
-    let mut entries: Vec<Value> = Vec::with_capacity(len);
+    let mut pairs: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
         let pair = crate::array::from_elements(&mut heap, [smi(i as i32), t.get(i)])?;
-        entries.push(Value::Array(pair));
+        pairs.push(Value::Array(pair));
     }
-    Ok(Value::Array(crate::array::from_elements(
-        &mut heap, entries,
-    )?))
+    Ok(wrap_iterator(&mut heap, pairs)?)
 }
 
 // ---- comparison helpers -------------------------------------------------

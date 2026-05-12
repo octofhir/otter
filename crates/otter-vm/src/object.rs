@@ -72,8 +72,15 @@ use crate::symbol::JsSymbol;
 use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
 use otter_gc::raw::{RawGc, SlotVisitor};
 
+mod descriptor;
 mod descriptor_core;
 mod key_order;
+mod lookup;
+
+pub use descriptor::{
+    DescriptorKind, PartialPropertyDescriptor, PropertyDescriptor, PropertyFlags,
+};
+pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
 
 /// Rust-owned data attached to a JavaScript object.
 ///
@@ -165,258 +172,6 @@ fn is_prototype_object_value(value: &Value) -> bool {
             | Value::Generator(_)
             | Value::Proxy(_)
     )
-}
-
-// ---------- property attribute flags ---------------------------------------
-
-/// Packed `(writable, enumerable, configurable)` bitfield. Stored as
-/// a single byte alongside each slot.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#table-default-attributes>
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct PropertyFlags(u8);
-
-impl PropertyFlags {
-    /// `[[Writable]]` bit.
-    pub const WRITABLE: u8 = 0b0001;
-    /// `[[Enumerable]]` bit.
-    pub const ENUMERABLE: u8 = 0b0010;
-    /// `[[Configurable]]` bit.
-    pub const CONFIGURABLE: u8 = 0b0100;
-
-    /// All three attributes set — the default for an object-literal
-    /// data property created by source like `{ x: 1 }`.
-    #[must_use]
-    pub const fn data_default() -> Self {
-        Self(Self::WRITABLE | Self::ENUMERABLE | Self::CONFIGURABLE)
-    }
-
-    /// Every attribute clear — the default `Object.defineProperty`
-    /// shape per §10.1.6.3 (`writable / enumerable / configurable`
-    /// each default to `false` when absent from the supplied
-    /// descriptor).
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    /// Build flags from individual bits.
-    #[must_use]
-    pub const fn new(writable: bool, enumerable: bool, configurable: bool) -> Self {
-        let mut bits = 0u8;
-        if writable {
-            bits |= Self::WRITABLE;
-        }
-        if enumerable {
-            bits |= Self::ENUMERABLE;
-        }
-        if configurable {
-            bits |= Self::CONFIGURABLE;
-        }
-        Self(bits)
-    }
-
-    /// `true` when the `[[Writable]]` bit is set.
-    #[must_use]
-    pub const fn writable(self) -> bool {
-        self.0 & Self::WRITABLE != 0
-    }
-
-    /// `true` when the `[[Enumerable]]` bit is set.
-    #[must_use]
-    pub const fn enumerable(self) -> bool {
-        self.0 & Self::ENUMERABLE != 0
-    }
-
-    /// `true` when the `[[Configurable]]` bit is set.
-    #[must_use]
-    pub const fn configurable(self) -> bool {
-        self.0 & Self::CONFIGURABLE != 0
-    }
-
-    /// Build a fresh value with `[[Writable]]` overridden.
-    #[must_use]
-    pub fn with_writable(mut self, value: bool) -> Self {
-        if value {
-            self.0 |= Self::WRITABLE;
-        } else {
-            self.0 &= !Self::WRITABLE;
-        }
-        self
-    }
-
-    /// Build a fresh value with `[[Enumerable]]` overridden.
-    #[must_use]
-    pub fn with_enumerable(mut self, value: bool) -> Self {
-        if value {
-            self.0 |= Self::ENUMERABLE;
-        } else {
-            self.0 &= !Self::ENUMERABLE;
-        }
-        self
-    }
-
-    /// Build a fresh value with `[[Configurable]]` overridden.
-    #[must_use]
-    pub fn with_configurable(mut self, value: bool) -> Self {
-        if value {
-            self.0 |= Self::CONFIGURABLE;
-        } else {
-            self.0 &= !Self::CONFIGURABLE;
-        }
-        self
-    }
-}
-
-// ---------- public descriptor type ----------------------------------------
-
-/// One property descriptor — either a data property with a stored
-/// value or an accessor pair.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-property-descriptor-specification-type>
-#[derive(Debug, Clone)]
-pub struct PropertyDescriptor {
-    /// Body — data slot or accessor pair.
-    pub kind: DescriptorKind,
-    /// Attribute flags. The `[[Writable]]` bit is meaningful only
-    /// when [`kind`](Self::kind) is [`DescriptorKind::Data`]; for
-    /// accessors it is ignored.
-    pub flags: PropertyFlags,
-}
-
-/// Body of a [`PropertyDescriptor`].
-#[derive(Debug, Clone)]
-pub enum DescriptorKind {
-    /// Data property — stores the value directly.
-    Data {
-        /// Stored value.
-        value: Value,
-    },
-    /// Accessor property — the runtime invokes the relevant function
-    /// on read (`getter`) and write (`setter`).
-    Accessor {
-        /// `Some(callable)` for a `[[Get]]` slot, `None` when absent.
-        getter: Option<Value>,
-        /// `Some(callable)` for a `[[Set]]` slot, `None` when absent.
-        setter: Option<Value>,
-    },
-}
-
-impl PropertyDescriptor {
-    /// Build a data descriptor.
-    #[must_use]
-    pub fn data(value: Value, writable: bool, enumerable: bool, configurable: bool) -> Self {
-        Self {
-            kind: DescriptorKind::Data { value },
-            flags: PropertyFlags::new(writable, enumerable, configurable),
-        }
-    }
-
-    /// Build an accessor descriptor.
-    #[must_use]
-    pub fn accessor(
-        getter: Option<Value>,
-        setter: Option<Value>,
-        enumerable: bool,
-        configurable: bool,
-    ) -> Self {
-        Self {
-            kind: DescriptorKind::Accessor { getter, setter },
-            // accessor flags never carry the writable bit
-            flags: PropertyFlags::new(false, enumerable, configurable),
-        }
-    }
-
-    /// `true` when this is a data descriptor.
-    #[must_use]
-    pub fn is_data(&self) -> bool {
-        matches!(self.kind, DescriptorKind::Data { .. })
-    }
-
-    /// `true` when this is an accessor descriptor.
-    #[must_use]
-    pub fn is_accessor(&self) -> bool {
-        matches!(self.kind, DescriptorKind::Accessor { .. })
-    }
-
-    /// Convenience: `[[Configurable]]` bit.
-    #[must_use]
-    pub fn configurable(&self) -> bool {
-        self.flags.configurable()
-    }
-
-    /// Convenience: `[[Enumerable]]` bit.
-    #[must_use]
-    pub fn enumerable(&self) -> bool {
-        self.flags.enumerable()
-    }
-
-    /// Convenience: `[[Writable]]` bit (meaningful only on data
-    /// descriptors).
-    #[must_use]
-    pub fn writable(&self) -> bool {
-        self.flags.writable()
-    }
-}
-
-/// Result of an own-property probe.
-#[derive(Debug, Clone)]
-pub enum PropertyLookup {
-    /// No own property of that key exists.
-    Absent,
-    /// Data property — the stored value plus its attribute flags.
-    Data {
-        /// Stored value.
-        value: Value,
-        /// Attribute flags.
-        flags: PropertyFlags,
-    },
-    /// Accessor property.
-    Accessor {
-        /// `[[Get]]` slot, if any.
-        getter: Option<Value>,
-        /// `[[Set]]` slot, if any.
-        setter: Option<Value>,
-        /// Attribute flags. The writable bit is meaningless here.
-        flags: PropertyFlags,
-    },
-}
-
-/// What the runtime should do after `[[Set]]` resolves through the
-/// prototype chain (§10.1.9 OrdinarySet).
-#[derive(Debug, Clone)]
-pub enum SetOutcome {
-    /// The own / inherited slot is a writable data slot. The runtime
-    /// should write `value` into the receiver as a data property.
-    AssignData,
-    /// An accessor with a setter was found. The runtime should call
-    /// `setter(value)` with `this = receiver`.
-    InvokeSetter {
-        /// The setter callable.
-        setter: Value,
-    },
-    /// The set must be rejected — non-writable data, accessor with no
-    /// setter, or the receiver is non-extensible and the property is
-    /// missing. In sloppy mode this is silently dropped; in strict
-    /// mode it would surface as a `TypeError`.
-    Reject {
-        /// Stable rejection reason (used by future strict-mode wiring).
-        reason: SetRejectReason,
-    },
-}
-
-/// Why a `[[Set]]` was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SetRejectReason {
-    /// Existing data property is non-writable.
-    NonWritable,
-    /// Accessor descriptor has no `[[Set]]`.
-    AccessorWithoutSetter,
-    /// Receiver is non-extensible and the property is absent.
-    NonExtensible,
 }
 
 // ---------- internal slot type --------------------------------------------
@@ -1590,6 +1345,98 @@ pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &JsSymbol)
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
 /// - <https://tc39.es/ecma262/#sec-validateandapplypropertydescriptor>
+/// Field-presence-aware §10.1.6.3 OrdinaryDefineOwnProperty for
+/// string-keyed properties. Mirrors V8 / JSC's
+/// `PropertyDescriptor`-based `[[DefineOwnProperty]]`: missing fields
+/// preserve the existing value, missing-and-new defaults to spec
+/// defaults (§10.1.6.3 step 5).
+pub fn define_own_property_partial(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    descriptor: PartialPropertyDescriptor,
+) -> bool {
+    let completed = descriptor.complete_for_new_property();
+    let barrier_descriptor = completed.clone();
+    let map_descriptor = completed.clone();
+    let success = heap.with_payload(obj, |body| {
+        if let Some(offset) = body.shape.offset_of(key) {
+            let existing = body.slots[offset as usize].clone();
+            match descriptor_core::validate_and_apply_partial(&existing, &descriptor) {
+                Some(merged) => {
+                    body.slots[offset as usize] = merged;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            if !body.extensible {
+                return false;
+            }
+            let new_shape = Shape::add_property(&body.shape, key);
+            body.shape = new_shape;
+            body.slots.push(PropertySlot::from_descriptor(completed.clone()));
+            true
+        }
+    });
+    if success {
+        let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
+        if let Some(cell) = mapped_cell {
+            match &map_descriptor.kind {
+                DescriptorKind::Data { value } => {
+                    store_upvalue(heap, cell, value.clone());
+                    if !map_descriptor.writable() {
+                        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+                    }
+                }
+                DescriptorKind::Accessor { .. } => {
+                    heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+                }
+            }
+        }
+        heap.record_write(obj, &barrier_descriptor);
+    }
+    success
+}
+
+/// Field-presence-aware §10.1.6.3 for symbol-keyed properties.
+pub fn define_own_symbol_property_partial(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &JsSymbol,
+    descriptor: PartialPropertyDescriptor,
+) -> bool {
+    let completed = descriptor.complete_for_new_property();
+    let barrier_descriptor = completed.clone();
+    let success = heap.with_payload(obj, |body| {
+        if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
+            let existing = body.symbol_props[pos].1.clone();
+            match descriptor_core::validate_and_apply_partial(&existing, &descriptor) {
+                Some(merged) => {
+                    body.symbol_props[pos].1 = merged;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            if !body.extensible {
+                return false;
+            }
+            body.symbol_props
+                .push((key.clone(), PropertySlot::from_descriptor(completed.clone())));
+            true
+        }
+    });
+    if success {
+        heap.record_write(obj, &barrier_descriptor);
+    }
+    success
+}
+
+/// §10.1.6.3 OrdinaryDefineOwnProperty for a fully-specified
+/// descriptor. Legacy entry point — prefer
+/// [`define_own_property_partial`] for new callers so field-presence
+/// is preserved.
 pub fn define_own_property(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,

@@ -30,7 +30,9 @@
 
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
 use crate::native_function::NativeCall;
-use crate::object::{DescriptorKind, JsObject, PropertyDescriptor, PropertyLookup};
+use crate::object::{
+    DescriptorKind, JsObject, PartialPropertyDescriptor, PropertyDescriptor, PropertyLookup,
+};
 use crate::string::{JsString, StringHeap};
 use crate::symbol::JsSymbol;
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -131,6 +133,15 @@ fn native_call(
         .interp
         .try_function_object_static_call(context.as_ref(), method, args)
         .map_err(|err| object_native_error(method.name(), err))?
+    {
+        return Ok(result);
+    }
+    if let Some(context) = context.as_ref()
+        && let Some(result) = ctx
+            .cx
+            .interp
+            .try_proxy_object_static_call(context, method, args)
+            .map_err(|err| object_native_error(method.name(), err))?
     {
         return Ok(result);
     }
@@ -486,7 +497,7 @@ pub fn call(
                         _ => return Err(VmError::TypeMismatch),
                     };
                     let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
-                    if !crate::object::define_own_property(obj, gc_heap, &key, descriptor) {
+                    if !crate::object::define_own_property_partial(obj, gc_heap, &key, descriptor) {
                         return Err(VmError::TypeMismatch);
                     }
                 }
@@ -502,12 +513,14 @@ pub fn call(
             match args.first() {
                 Some(Value::Object(target)) => {
                     let ok = match &key {
-                        PropertyKey::String(key) => {
-                            crate::object::define_own_property(*target, gc_heap, key, descriptor)
-                        }
-                        PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property(
-                            *target, gc_heap, sym, descriptor,
+                        PropertyKey::String(key) => crate::object::define_own_property_partial(
+                            *target, gc_heap, key, descriptor,
                         ),
+                        PropertyKey::Symbol(sym) => {
+                            crate::object::define_own_symbol_property_partial(
+                                *target, gc_heap, sym, descriptor,
+                            )
+                        }
                     };
                     if !ok {
                         return Err(VmError::TypeError {
@@ -518,18 +531,20 @@ pub fn call(
                 }
                 Some(Value::ClassConstructor(class)) => {
                     let ok = match &key {
-                        PropertyKey::String(key) => crate::object::define_own_property(
+                        PropertyKey::String(key) => crate::object::define_own_property_partial(
                             class.statics(gc_heap),
                             gc_heap,
                             key,
                             descriptor,
                         ),
-                        PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property(
-                            class.statics(gc_heap),
-                            gc_heap,
-                            sym,
-                            descriptor,
-                        ),
+                        PropertyKey::Symbol(sym) => {
+                            crate::object::define_own_symbol_property_partial(
+                                class.statics(gc_heap),
+                                gc_heap,
+                                sym,
+                                descriptor,
+                            )
+                        }
                     };
                     if !ok {
                         return Err(VmError::TypeError {
@@ -548,7 +563,8 @@ pub fn call(
                             ),
                         });
                     };
-                    if !native.define_own_property(gc_heap, string_heap, key, descriptor) {
+                    let completed = descriptor.complete_for_new_property();
+                    if !native.define_own_property(gc_heap, string_heap, key, completed) {
                         return Err(VmError::TypeError {
                             message: format!(
                                 "Cannot define property '{key}' on function {}",
@@ -582,7 +598,7 @@ pub fn call(
                     _ => return Err(VmError::TypeMismatch),
                 };
                 let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
-                if !crate::object::define_own_property(target, gc_heap, &key, descriptor) {
+                if !crate::object::define_own_property_partial(target, gc_heap, &key, descriptor) {
                     return Err(VmError::TypeMismatch);
                 }
             }
@@ -921,22 +937,24 @@ fn string_value(s: &str, heap: &StringHeap) -> Result<Value, VmError> {
 
 /// Implement §6.2.5.5 ToPropertyDescriptor against `desc_obj`.
 ///
+/// Returns a [`PartialPropertyDescriptor`] that tracks which fields
+/// were present on the source object, matching the V8 / JSC /
+/// SpiderMonkey descriptor-coercion shape so
+/// `ValidateAndApplyPropertyDescriptor` can distinguish "absent" from
+/// "present with `false`".
+///
 /// # Algorithm
 /// - Read `value`, `writable`, `enumerable`, `configurable`, `get`,
 ///   `set` from the descriptor object as own data properties.
-/// - If `get` or `set` is present, build an [`DescriptorKind::Accessor`].
-///   Mixing accessor + data fields rejects with `TypeMismatch` per
-///   step 17 of the spec.
-/// - If neither accessor field is present, build a
-///   [`DescriptorKind::Data`] using `value` (defaulting to
-///   `undefined`) and the writable bit (defaulting to `false`).
+/// - Mixing accessor + data fields rejects with `TypeMismatch` per
+///   step 17.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
 pub fn coerce_to_descriptor(
     desc_obj: &JsObject,
     gc_heap: &otter_gc::GcHeap,
-) -> Result<PropertyDescriptor, VmError> {
+) -> Result<PartialPropertyDescriptor, VmError> {
     // Direct own-data probes — accessors on the descriptor object
     // itself are ignored for the slice.
     let value = crate::object::lookup_own(*desc_obj, gc_heap, "value");
@@ -956,36 +974,25 @@ pub fn coerce_to_descriptor(
         return Err(VmError::TypeMismatch);
     }
 
-    let enumerable_bit = lookup_to_optional_bool(&enumerable);
-    let configurable_bit = lookup_to_optional_bool(&configurable);
-
-    if has_get || has_set {
-        let getter_value = lookup_to_optional_value(&getter)?;
-        let setter_value = lookup_to_optional_value(&setter)?;
-        // Spec: `get` and `set` must be undefined or callable. The
-        // callable check happens at install time inside
-        // `define_own_property` (a non-callable getter is preserved
-        // and would be invoked later, which the dispatcher rejects).
-        return Ok(PropertyDescriptor::accessor(
-            getter_value,
-            setter_value,
-            enumerable_bit.unwrap_or(false),
-            configurable_bit.unwrap_or(false),
-        ));
+    let mut descriptor = PartialPropertyDescriptor::default();
+    if has_value {
+        descriptor.value = Some(match value {
+            PropertyLookup::Data { value, .. } => value,
+            _ => Value::Undefined,
+        });
     }
-
-    let data_value = match value {
-        PropertyLookup::Absent => Value::Undefined,
-        PropertyLookup::Data { value, .. } => value,
-        PropertyLookup::Accessor { .. } => Value::Undefined,
-    };
-    let writable_bit = lookup_to_optional_bool(&writable).unwrap_or(false);
-    Ok(PropertyDescriptor::data(
-        data_value,
-        writable_bit,
-        enumerable_bit.unwrap_or(false),
-        configurable_bit.unwrap_or(false),
-    ))
+    if has_writable {
+        descriptor.writable = lookup_to_optional_bool(&writable);
+    }
+    descriptor.enumerable = lookup_to_optional_bool(&enumerable);
+    descriptor.configurable = lookup_to_optional_bool(&configurable);
+    if has_get {
+        descriptor.get = Some(lookup_to_optional_value(&getter)?.unwrap_or(Value::Undefined));
+    }
+    if has_set {
+        descriptor.set = Some(lookup_to_optional_value(&setter)?.unwrap_or(Value::Undefined));
+    }
+    Ok(descriptor)
 }
 
 /// Inverse of [`coerce_to_descriptor`] — returns a fresh

@@ -31,7 +31,7 @@ use crate::js_surface::{Attr, JsSurfaceError, NamespaceBuilder, NamespaceSpec, O
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
     Value, array_prototype, array_statics, atomics, console, function_prototype, json, math,
-    object_statics,
+    object_statics, reflect,
 };
 
 /// Bootstrap feature/capability bitset.
@@ -287,7 +287,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         install: install_boolean,
     },
     placeholder("BigInt"),
-    placeholder("Symbol"),
+    BootstrapEntry {
+        name: "Symbol",
+        feature: BootstrapFeatures::CORE,
+        install: install_symbol,
+    },
     BootstrapEntry {
         name: math::MATH_SPEC.name,
         feature: BootstrapFeatures::CORE,
@@ -310,7 +314,11 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_proxy,
     },
-    placeholder("Reflect"),
+    BootstrapEntry {
+        name: reflect::REFLECT_SPEC.name,
+        feature: BootstrapFeatures::CORE,
+        install: install_reflect,
+    },
     BootstrapEntry {
         name: "Function",
         feature: BootstrapFeatures::CORE,
@@ -550,6 +558,382 @@ fn install_proxy(
         return Err(JsSurfaceError::DefinePropertyFailed("revocable"));
     }
     define_global(global, heap, entry.name, Value::NativeFunction(proxy_ctor));
+    Ok(())
+}
+
+// §20.4.1 The Symbol Constructor — ordinary function callable as
+// `Symbol(desc)`. Calling with `new` rejects per §20.4.1.1.
+// Exposes every well-known symbol as an own data property
+// (configurable=false, writable=false, enumerable=false per
+// §20.4.2.*), plus `for` / `keyFor` methods and a `prototype` link.
+// <https://tc39.es/ecma262/#sec-symbol-constructor>
+fn install_symbol(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::symbol::WellKnown;
+    use crate::{NativeCtx, NativeError};
+
+    fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        if ctx.is_construct_call() {
+            return Err(NativeError::TypeError {
+                name: "Symbol",
+                reason: "Symbol is not a constructor".to_string(),
+            });
+        }
+        let description = match args.first() {
+            None | Some(Value::Undefined) => None,
+            Some(Value::Symbol(_)) => {
+                return Err(NativeError::TypeError {
+                    name: "Symbol",
+                    reason: "Cannot convert a Symbol value to a string".to_string(),
+                });
+            }
+            Some(other) => {
+                let string_heap = ctx.interp_mut().string_heap_clone();
+                let rendered = crate::string::JsString::from_str(
+                    &other.display_string(),
+                    &string_heap,
+                )
+                .map_err(|_| NativeError::TypeError {
+                    name: "Symbol",
+                    reason: "out of memory".to_string(),
+                })?;
+                Some(rendered)
+            }
+        };
+        Ok(Value::Symbol(crate::symbol::JsSymbol::new(description)))
+    }
+
+    fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let key = match args.first() {
+            None | Some(Value::Undefined) => "undefined".to_string(),
+            Some(Value::Null) => "null".to_string(),
+            Some(Value::String(s)) => s.to_lossy_string(),
+            Some(Value::Symbol(_)) => {
+                return Err(NativeError::TypeError {
+                    name: "Symbol.for",
+                    reason: "Cannot convert a Symbol value to a string".to_string(),
+                });
+            }
+            Some(other) => other.display_string(),
+        };
+        let string_heap = ctx.interp_mut().string_heap_clone();
+        let sym = ctx
+            .interp_mut()
+            .symbol_registry()
+            .for_key(&key, &string_heap)
+            .map_err(|_| NativeError::TypeError {
+                name: "Symbol.for",
+                reason: "out of memory".to_string(),
+            })?;
+        Ok(Value::Symbol(sym))
+    }
+
+    fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let Some(Value::Symbol(sym)) = args.first() else {
+            return Err(NativeError::TypeError {
+                name: "Symbol.keyFor",
+                reason: "argument must be a symbol".to_string(),
+            });
+        };
+        let key = ctx.interp_mut().symbol_registry().key_for(sym);
+        match key {
+            Some(key) => {
+                let string_heap = ctx.interp_mut().string_heap_clone();
+                let value = crate::string::JsString::from_str(&key, &string_heap).map_err(
+                    |_| NativeError::TypeError {
+                        name: "Symbol.keyFor",
+                        reason: "out of memory".to_string(),
+                    },
+                )?;
+                Ok(Value::String(value))
+            }
+            None => Ok(Value::Undefined),
+        }
+    }
+
+    fn symbol_proto_to_string(
+        ctx: &mut NativeCtx<'_>,
+        _args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let this = ctx.this_value().clone();
+        let sym = match &this {
+            Value::Symbol(sym) => sym.clone(),
+            _ => {
+                return Err(NativeError::TypeError {
+                    name: "Symbol.prototype.toString",
+                    reason: "this is not a Symbol".to_string(),
+                });
+            }
+        };
+        let string_heap = ctx.interp_mut().string_heap_clone();
+        let s = crate::string::JsString::from_str(&sym.descriptive_string(), &string_heap)
+            .map_err(|_| NativeError::TypeError {
+                name: "Symbol.prototype.toString",
+                reason: "out of memory".to_string(),
+            })?;
+        Ok(Value::String(s))
+    }
+
+    fn symbol_proto_value_of(
+        ctx: &mut NativeCtx<'_>,
+        _args: &[Value],
+    ) -> Result<Value, NativeError> {
+        match ctx.this_value() {
+            Value::Symbol(sym) => Ok(Value::Symbol(sym.clone())),
+            _ => Err(NativeError::TypeError {
+                name: "Symbol.prototype.valueOf",
+                reason: "this is not a Symbol".to_string(),
+            }),
+        }
+    }
+
+    fn symbol_proto_to_primitive(
+        ctx: &mut NativeCtx<'_>,
+        _args: &[Value],
+    ) -> Result<Value, NativeError> {
+        match ctx.this_value() {
+            Value::Symbol(sym) => Ok(Value::Symbol(sym.clone())),
+            _ => Err(NativeError::TypeError {
+                name: "Symbol.prototype[@@toPrimitive]",
+                reason: "this is not a Symbol".to_string(),
+            }),
+        }
+    }
+
+    // The Symbol constructor itself is a callable NativeFunction.
+    let symbol_ctor = NativeFunction::new_static(heap, "Symbol", 0, symbol_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+
+    // §20.4.3 Symbol.prototype — ordinary object linked to %Object.prototype%.
+    let prototype = object::alloc_object(heap)?;
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
+    fn symbol_proto_description_get(
+        ctx: &mut NativeCtx<'_>,
+        _args: &[Value],
+    ) -> Result<Value, NativeError> {
+        match ctx.this_value() {
+            Value::Symbol(sym) => match sym.description() {
+                Some(s) => Ok(Value::String(s.clone())),
+                None => Ok(Value::Undefined),
+            },
+            _ => Err(NativeError::TypeError {
+                name: "get Symbol.prototype.description",
+                reason: "this is not a Symbol".to_string(),
+            }),
+        }
+    }
+
+    {
+        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        builder.method(
+            "toString",
+            0,
+            crate::native_function::NativeCall::Static(symbol_proto_to_string),
+            Attr::builtin_function(),
+        )?;
+        builder.method(
+            "valueOf",
+            0,
+            crate::native_function::NativeCall::Static(symbol_proto_value_of),
+            Attr::builtin_function(),
+        )?;
+        // §20.4.3.2 Symbol.prototype.description — accessor.
+        let getter = NativeFunction::new_static(
+            heap,
+            "get description",
+            0,
+            symbol_proto_description_get,
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let desc_desc = PropertyDescriptor::accessor(
+            Some(Value::NativeFunction(getter)),
+            None,
+            false,
+            true,
+        );
+        if !object::define_own_property(prototype, heap, "description", desc_desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed("description"));
+        }
+    }
+    // Install Symbol.prototype as an own property on the constructor.
+    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let string_heap = crate::string::StringHeap::default();
+    if !symbol_ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+    }
+    // Well-known symbol own properties (`Symbol.iterator`,
+    // `Symbol.toPrimitive`, …) are installed by
+    // [`install_symbol_well_knowns_post_bootstrap`] once the
+    // per-interpreter `WellKnownSymbols` singleton table exists.
+    // `for` / `keyFor` methods.
+    let symbol_for_fn = NativeFunction::new_static(heap, "for", 1, symbol_for_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let symbol_key_for_fn = NativeFunction::new_static(heap, "keyFor", 1, symbol_key_for_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let for_desc =
+        PropertyDescriptor::data(Value::NativeFunction(symbol_for_fn), true, false, true);
+    let key_for_desc = PropertyDescriptor::data(
+        Value::NativeFunction(symbol_key_for_fn),
+        true,
+        false,
+        true,
+    );
+    if !symbol_ctor.define_own_property(heap, &string_heap, "for", for_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("for"));
+    }
+    if !symbol_ctor.define_own_property(heap, &string_heap, "keyFor", key_for_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("keyFor"));
+    }
+    // Install Symbol.prototype.constructor → Symbol.
+    object::set(
+        prototype,
+        heap,
+        "constructor",
+        Value::NativeFunction(symbol_ctor),
+    );
+    // Symbol.prototype[@@toPrimitive] is installed by
+    // `install_symbol_well_knowns_post_bootstrap` so it points at
+    // the per-realm well-known JsSymbol singleton.
+    let _ = WellKnown::Iterator; // silence the unused-import lint
+    let _ = symbol_proto_to_primitive;
+    define_global(global, heap, entry.name, Value::NativeFunction(symbol_ctor));
+    Ok(())
+}
+
+/// Post-bootstrap fixup: install every well-known symbol as an own
+/// property on the realm's `Symbol` constructor plus
+/// `Symbol.prototype[@@toPrimitive]`. Bootstrap runs before the
+/// per-interpreter [`crate::WellKnownSymbols`] table exists, so the
+/// runtime calls this hook from `Interpreter::with_string_heap_cap`
+/// once the table is materialised.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-symbol.iterator>
+/// - <https://tc39.es/ecma262/#sec-symbol.prototype-@@toprimitive>
+pub fn install_symbol_well_knowns_post_bootstrap(
+    heap: &mut otter_gc::GcHeap,
+    string_heap: &crate::string::StringHeap,
+    global: JsObject,
+    well_known: &crate::symbol::WellKnownSymbols,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    use crate::symbol::WellKnown;
+
+    fn symbol_proto_to_primitive(
+        ctx: &mut crate::NativeCtx<'_>,
+        _args: &[Value],
+    ) -> Result<Value, crate::NativeError> {
+        match ctx.this_value() {
+            Value::Symbol(sym) => Ok(Value::Symbol(sym.clone())),
+            _ => Err(crate::NativeError::TypeError {
+                name: "Symbol.prototype[@@toPrimitive]",
+                reason: "this is not a Symbol".to_string(),
+            }),
+        }
+    }
+
+    let Some(symbol_ctor_value) = object::get(global, heap, "Symbol") else {
+        return Ok(());
+    };
+    let symbol_ctor = match symbol_ctor_value {
+        Value::NativeFunction(f) => f,
+        _ => return Ok(()),
+    };
+
+    let well_known_pairs: &[(&'static str, WellKnown)] = &[
+        ("asyncIterator", WellKnown::AsyncIterator),
+        ("hasInstance", WellKnown::HasInstance),
+        ("isConcatSpreadable", WellKnown::IsConcatSpreadable),
+        ("iterator", WellKnown::Iterator),
+        ("match", WellKnown::Match),
+        ("matchAll", WellKnown::MatchAll),
+        ("replace", WellKnown::Replace),
+        ("search", WellKnown::Search),
+        ("species", WellKnown::Species),
+        ("split", WellKnown::Split),
+        ("toPrimitive", WellKnown::ToPrimitive),
+        ("toStringTag", WellKnown::ToStringTag),
+        ("unscopables", WellKnown::Unscopables),
+    ];
+    for (name, tag) in well_known_pairs {
+        let sym = well_known.get(*tag);
+        let desc = PropertyDescriptor::data(Value::Symbol(sym), false, false, false);
+        if !symbol_ctor.define_own_property(heap, string_heap, name, desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed("well-known symbol"));
+        }
+    }
+
+    // Symbol.prototype[@@toPrimitive] — ECMA-262 §20.4.3.5.
+    let proto_desc = symbol_ctor
+        .own_property_descriptor(heap, string_heap, "prototype")
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype = match proto_desc.and_then(|d| match d.kind {
+        crate::object::DescriptorKind::Data { value: Value::Object(p) } => Some(p),
+        _ => None,
+    }) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let to_prim_fn = NativeFunction::new_static(
+        heap,
+        "[Symbol.toPrimitive]",
+        1,
+        symbol_proto_to_primitive,
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
+    object::set_symbol(
+        prototype,
+        heap,
+        to_primitive_sym,
+        Value::NativeFunction(to_prim_fn),
+    );
+
+    // §22.2 / §25.1 / §25.4 — install `@@toStringTag` on standard
+    // namespace objects so `Object.prototype.toString.call(NS)`
+    // returns the spec-required `"[object <NS>]"` form.
+    let to_string_tag_sym = well_known.get(WellKnown::ToStringTag);
+    for ns_name in ["Math", "JSON", "Reflect", "Atomics"] {
+        if let Some(Value::Object(ns)) = object::get(global, heap, ns_name) {
+            let tag = crate::string::JsString::from_str(ns_name, string_heap)
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+            object::define_own_symbol_property_partial(
+                ns,
+                heap,
+                &to_string_tag_sym,
+                crate::object::PartialPropertyDescriptor {
+                    value: Some(Value::String(tag)),
+                    writable: Some(false),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    // §20.4.3.5 — install `Symbol.prototype[@@toStringTag] = "Symbol"`.
+    let symbol_tag = crate::string::JsString::from_str("Symbol", string_heap)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &to_string_tag_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::String(symbol_tag)),
+            writable: Some(false),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
     Ok(())
 }
 
@@ -1202,6 +1586,26 @@ fn install_atomics(
     Ok(())
 }
 
+// §28.1 Reflect — ordinary namespace object with own data properties
+// for every spec method. Links the namespace prototype to
+// `%Object.prototype%` so reflective inspection (`Object.getPrototypeOf
+// (Reflect) === Object.prototype`) returns the spec-required value.
+// <https://tc39.es/ecma262/#sec-reflect-object>
+fn install_reflect(
+    entry: &BootstrapEntry,
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<(), JsSurfaceError> {
+    let namespace = NamespaceBuilder::from_spec(heap, &reflect::REFLECT_SPEC)?.build()?;
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(namespace, heap, Some(object_proto));
+    }
+    define_global(global, heap, entry.name, Value::Object(namespace));
+    Ok(())
+}
+
 fn install_console(
     _entry: &BootstrapEntry,
     heap: &mut otter_gc::GcHeap,
@@ -1260,6 +1664,7 @@ fn record_installed_entry(telemetry: &mut BootstrapTelemetry, entry: &BootstrapE
         "Object" => telemetry.record_namespace(&object_statics::OBJECT_SPEC),
         "Math" => telemetry.record_namespace(&math::MATH_SPEC),
         "Atomics" => telemetry.record_namespace(&atomics::ATOMICS_SPEC),
+        "Reflect" => telemetry.record_namespace(&reflect::REFLECT_SPEC),
         "Function" => {
             telemetry.entries_installed = telemetry.entries_installed.saturating_add(1);
             telemetry.objects_installed = telemetry.objects_installed.saturating_add(2);
@@ -1326,8 +1731,8 @@ mod tests {
 
     #[test]
     fn default_bootstrap_telemetry_matches_startup_ratchet() {
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 340;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 144 * 1024;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 380;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 160 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();
@@ -1336,14 +1741,18 @@ mod tests {
                 .expect("global");
 
         assert!(object::get(global, &heap, "Math").is_some());
+        assert!(object::get(global, &heap, "Reflect").is_some());
         assert_eq!(telemetry.entries_considered(), BOOTSTRAP_ENTRIES.len());
         assert_eq!(telemetry.entries_installed(), BOOTSTRAP_ENTRIES.len());
         assert_eq!(telemetry.entries_skipped(), 0);
         assert_eq!(telemetry.duplicate_name_checks(), BOOTSTRAP_ENTRIES.len());
         assert_eq!(telemetry.duplicate_names_found(), 0);
         assert_eq!(telemetry.strings_interned(), 0);
-        assert_eq!(telemetry.namespace_objects_installed(), 5);
-        assert_eq!(telemetry.native_functions_installed(), 101);
+        assert_eq!(telemetry.namespace_objects_installed(), 6);
+        assert_eq!(
+            telemetry.native_functions_installed(),
+            101 + reflect::REFLECT_SPEC.methods.len(),
+        );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,
             "gc_allocations={} max={}",

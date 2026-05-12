@@ -286,6 +286,13 @@ pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc
             let (target, _, _) = b.parts(heap);
             is_constructor(&target, context, heap)
         }
+        // §28.2.4.3 — a non-revoked Proxy reports `[[Construct]]`
+        // iff its target does. Revoked proxies surface as
+        // non-constructor here; the per-trap revocation guard
+        // produces the spec-required TypeError on actual call.
+        Value::Proxy(proxy) => {
+            !proxy.is_revoked() && is_constructor(&proxy.target(), context, heap)
+        }
         _ => false,
     }
 }

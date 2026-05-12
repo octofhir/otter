@@ -26,7 +26,8 @@
 use crate::Value;
 
 use super::{
-    DescriptorKind, JsObject, JsSymbol, PropertyDescriptor, PropertySlot, Shape, SlotBody,
+    DescriptorKind, JsObject, JsSymbol, PartialPropertyDescriptor, PropertyDescriptor,
+    PropertyFlags, PropertySlot, Shape, SlotBody,
 };
 
 pub(super) fn ordinary_set_data_property(
@@ -97,7 +98,120 @@ pub(super) fn ordinary_set_symbol_data_property(
 }
 
 /// Implements §10.1.6.3 ValidateAndApplyPropertyDescriptor for an existing
-/// slot. Returns `Some(updated)` on success, `None` to reject.
+/// slot. Field-presence aware: a missing field in `incoming` means
+/// "preserve existing", not "default to false".
+pub(super) fn validate_and_apply_partial(
+    existing: &PropertySlot,
+    incoming: &PartialPropertyDescriptor,
+) -> Option<PropertySlot> {
+    let existing_is_data = matches!(existing.body, SlotBody::Data { .. });
+    let incoming_is_accessor = incoming.is_accessor();
+    let incoming_is_data = incoming.is_data();
+
+    if !existing.flags.configurable() {
+        // Step 4.a: configurable cannot transition to true.
+        if matches!(incoming.configurable, Some(true)) {
+            return None;
+        }
+        // Step 4.b: enumerable cannot change.
+        if let Some(en) = incoming.enumerable
+            && en != existing.flags.enumerable()
+        {
+            return None;
+        }
+        // Step 4.c: kind cannot flip when present.
+        if incoming_is_accessor && existing_is_data {
+            return None;
+        }
+        if incoming_is_data && !existing_is_data {
+            return None;
+        }
+        // Step 4.d/e: data, non-writable — restrict writable→true and
+        // value changes.
+        if existing_is_data && incoming_is_data && !existing.flags.writable() {
+            if matches!(incoming.writable, Some(true)) {
+                return None;
+            }
+            if let (Some(in_v), SlotBody::Data { value: ex_v }) = (&incoming.value, &existing.body)
+                && !same_value(ex_v, in_v)
+            {
+                return None;
+            }
+        }
+        // Step 4.f: accessor — get/set cannot change.
+        if !existing_is_data
+            && incoming_is_accessor
+            && let SlotBody::Accessor {
+                getter: ex_get,
+                setter: ex_set,
+            } = &existing.body
+        {
+            if incoming.get.is_some() && !optional_value_eq(ex_get, &incoming.get) {
+                return None;
+            }
+            if incoming.set.is_some() && !optional_value_eq(ex_set, &incoming.set) {
+                return None;
+            }
+        }
+    }
+
+    // Build merged slot — start from existing, apply present fields.
+    let mut configurable = existing.flags.configurable();
+    let mut enumerable = existing.flags.enumerable();
+    let mut writable = existing.flags.writable();
+    if let Some(c) = incoming.configurable {
+        configurable = c;
+    }
+    if let Some(e) = incoming.enumerable {
+        enumerable = e;
+    }
+    let kind = if incoming_is_accessor || (!incoming_is_data && !existing_is_data) {
+        // Result is an accessor descriptor.
+        let (mut getter, mut setter) = match &existing.body {
+            SlotBody::Accessor { getter, setter } => (getter.clone(), setter.clone()),
+            SlotBody::Data { .. } => (None, None),
+        };
+        if let Some(g) = &incoming.get {
+            getter = if matches!(g, Value::Undefined) {
+                None
+            } else {
+                Some(g.clone())
+            };
+        }
+        if let Some(s) = &incoming.set {
+            setter = if matches!(s, Value::Undefined) {
+                None
+            } else {
+                Some(s.clone())
+            };
+        }
+        DescriptorKind::Accessor { getter, setter }
+    } else {
+        // Data descriptor.
+        let mut value = match &existing.body {
+            SlotBody::Data { value } => value.clone(),
+            SlotBody::Accessor { .. } => Value::Undefined,
+        };
+        if let Some(v) = &incoming.value {
+            value = v.clone();
+        }
+        if let Some(w) = incoming.writable {
+            writable = w;
+        } else if !existing_is_data {
+            // Transitioning accessor → data: writable defaults to false
+            // per §10.1.6.3 step 5.b.
+            writable = false;
+        }
+        DescriptorKind::Data { value }
+    };
+    Some(PropertySlot::from_descriptor(PropertyDescriptor {
+        kind,
+        flags: PropertyFlags::new(writable, enumerable, configurable),
+    }))
+}
+
+/// Backwards-compatible wrapper that takes a full
+/// [`PropertyDescriptor`]. Treats every field as present.
 pub(super) fn validate_and_apply(
     existing: &PropertySlot,
     incoming: &PropertyDescriptor,

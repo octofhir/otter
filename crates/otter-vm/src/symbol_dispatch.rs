@@ -84,13 +84,31 @@ impl From<crate::string::StringError> for SymbolError {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-well-known-symbols>
 pub fn load_static(interp: &Interpreter, name: &str) -> Result<Value, SymbolError> {
-    if name == "prototype"
-        && let Some(Value::Object(symbol_ctor)) =
-            crate::object::get(interp.global_this, &interp.gc_heap, "Symbol")
-        && let Some(prototype) = crate::object::get(symbol_ctor, &interp.gc_heap, "prototype")
-    {
-        return Ok(prototype);
+    // Try to fetch the named own property from the realm-installed
+    // Symbol constructor first. `Symbol.prototype`, `Symbol.for`,
+    // `Symbol.keyFor`, plus every well-known own-data symbol slot
+    // (`Symbol.iterator`, `Symbol.toPrimitive`, …) resolves here.
+    let symbol_ctor = crate::object::get(interp.global_this, &interp.gc_heap, "Symbol");
+    match &symbol_ctor {
+        Some(Value::Object(ctor)) => {
+            if let Some(value) = crate::object::get(*ctor, &interp.gc_heap, name) {
+                return Ok(value);
+            }
+        }
+        Some(Value::NativeFunction(native)) => {
+            if let Ok(Some(desc)) =
+                native.own_property_descriptor(&interp.gc_heap, &interp.string_heap, name)
+                && let crate::object::DescriptorKind::Data { value } = desc.kind
+            {
+                return Ok(value);
+            }
+        }
+        _ => {}
     }
+    // Compiler-fast-path well-known symbols even when bootstrap has
+    // not yet wired the constructor (eg. during early
+    // initialisation) — keeps the typed `Op::SymbolLoad` opcode
+    // working before `install_symbol_well_knowns_post_bootstrap` runs.
     if let Some(tag) = WellKnown::from_name(name) {
         return Ok(Value::Symbol(interp.well_known_symbols().get(tag)));
     }

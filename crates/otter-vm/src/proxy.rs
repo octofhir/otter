@@ -11,9 +11,12 @@
 //! - [`ProxyBody`] — internal storage.
 //!
 //! # Invariants
-//! - `target` is always a JS object (foundation accepts only
-//!   `Value::Object`; broader receiver types follow when the wider
-//!   value model gains the same uniform interface).
+//! - `target` is any Object-like [`Value`] accepted by §7.2.4
+//!   `IsConstructor` / §7.2.3 `IsCallable` (`Value::Object`,
+//!   `Value::Array`, the callable variants, and nested
+//!   `Value::Proxy`). The constructor coerces callables so the
+//!   `apply` / `construct` trap fallback can invoke the underlying
+//!   function directly.
 //! - `revoked` flips from `false` to `true` once and never back; a
 //!   revoked proxy raises `TypeError` from every trap dispatch.
 //!

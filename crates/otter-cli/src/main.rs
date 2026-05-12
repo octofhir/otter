@@ -28,9 +28,10 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use otter_bytecode::disasm::disassemble;
+use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
-use otter_runtime::{BooleanPermission, CapabilitySet, DiagnosticCode, OtterError, Permission};
+use otter_runtime::{CapabilitySet, DiagnosticCode, OtterError, Permission};
 use otter_test::{Report, RunOptions, Suite};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
@@ -175,10 +176,6 @@ struct PermissionFlags {
     #[arg(long = "deny-ffi", value_name = "libs", global = true)]
     deny_ffi: Option<String>,
 
-    /// `--allow-hrtime` — high-resolution time.
-    #[arg(long, global = true)]
-    allow_hrtime: bool,
-
     /// `--allow-all` — grant every capability unconditionally
     /// (development only).
     #[arg(long = "allow-all", global = true)]
@@ -230,9 +227,6 @@ impl PermissionFlags {
             self.allow_ffi.as_deref(),
             self.deny_ffi.as_deref(),
         );
-        if self.allow_hrtime {
-            caps.hrtime = BooleanPermission::Allow;
-        }
         caps
     }
 }
@@ -489,12 +483,17 @@ async fn main() -> ExitCode {
         (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps).await,
         (Some(Command::Test(args)), _) => run_test(args, json).await,
         (Some(Command::Info), _) => run_info(json),
-        // Shorthand: `otter <file> [args...]`.
+        // Shorthand: `otter <file> [args...]`, routed through
+        // the same resolver/session path as `otter run`.
         (None, Some(positional)) => {
             let forwarded_args = cli.args.iter().skip(1).cloned().collect::<Vec<_>>();
-            run_file(
-                &PathBuf::from(positional),
-                &forwarded_args,
+            run_target(
+                RunArgs {
+                    target: positional,
+                    script: false,
+                    bin: false,
+                    args: forwarded_args,
+                },
                 json,
                 dump_mode.as_deref(),
                 &caps,
@@ -557,6 +556,18 @@ async fn run_file(
     caps: &CapabilitySet,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
+    run_file_with_cwd(path, args, None, json, dump_mode, caps, startup_timer).await
+}
+
+async fn run_file_with_cwd(
+    path: &std::path::Path,
+    args: &[String],
+    process_cwd: Option<&Path>,
+    json: bool,
+    dump_mode: Option<&str>,
+    caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
+) -> Result<ExitCode, OtterError> {
     if let Some(mode) = dump_mode {
         return run_dump(path, mode, caps, startup_timer).await;
     }
@@ -565,20 +576,45 @@ async fn run_file(
     // detection is AST-based (see `Otter::run_file` for the
     // shared helper used in the embedder Layer-A path).
     //
-    let otter = cli_otter_builder(caps)
+    let mut builder = cli_otter_builder(caps)
         .process_argv(process_argv_for_file(path, args))
-        .module_loader(cli_loader_config_for_entry(path).await)
-        .build()?;
+        .module_loader(cli_loader_config_for_entry(path).await);
+    if let Some(cwd) = process_cwd {
+        builder = builder.process_cwd(cwd.to_path_buf());
+    }
+    let otter = builder.build()?;
     startup_timer.mark("runtime_build");
     let result = otter.run_file(path).await?;
     startup_timer.mark("runtime_run_file");
     if json {
         println!(
-            "{{\"completion\":{}}}",
-            serde_json::to_string(&result.completion_string()).unwrap()
+            "{}",
+            serde_json::json!({
+                "completion": result.completion_string(),
+                "exitCode": result.exit_code()
+            })
         );
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(ExitCode::from(result.exit_code()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunScriptInvocation {
+    path: PathBuf,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptCommandMode {
+    Auto,
+    Bin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptCommandTarget {
+    mode: ScriptCommandMode,
+    target: String,
+    args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,7 +651,15 @@ async fn run_target(
                     "--dump-bytecode only supports file targets in this slice",
                 ));
             }
-            run_package_script(&project_root, &command, &target_args, json).await
+            run_package_script(
+                &project_root,
+                &command,
+                &target_args,
+                json,
+                caps,
+                startup_timer,
+            )
+            .await
         }
         RunTarget::Bin(bin) => {
             run_file(
@@ -657,7 +701,7 @@ async fn resolve_run_target(project_root: &Path, args: &RunArgs) -> Result<RunTa
         ));
     }
 
-    if let Some(path) = explicit_file_target(&args.target).await? {
+    if let Some(path) = explicit_file_target(project_root, &args.target).await? {
         return Ok(RunTarget::File(path));
     }
 
@@ -677,11 +721,14 @@ async fn resolve_run_target(project_root: &Path, args: &RunArgs) -> Result<RunTa
         ))),
         (Some(script), None) => Ok(script),
         (None, Some(bin)) => Ok(bin),
-        (None, None) => Ok(RunTarget::File(PathBuf::from(&args.target))),
+        (None, None) => Ok(RunTarget::File(project_root.join(&args.target))),
     }
 }
 
-async fn explicit_file_target(target: &str) -> Result<Option<PathBuf>, OtterError> {
+async fn explicit_file_target(
+    base_dir: &Path,
+    target: &str,
+) -> Result<Option<PathBuf>, OtterError> {
     if let Some(path) = target.strip_prefix("file://") {
         return Ok(Some(PathBuf::from(path)));
     }
@@ -689,17 +736,22 @@ async fn explicit_file_target(target: &str) -> Result<Option<PathBuf>, OtterErro
         return Ok(None);
     }
     let path = PathBuf::from(target);
+    let lookup_path = if path.is_absolute() {
+        path.clone()
+    } else {
+        base_dir.join(&path)
+    };
     let looks_like_path = path.is_absolute()
         || target.starts_with("./")
         || target.starts_with("../")
         || target.contains('/')
         || target.contains('\\');
     if looks_like_path
-        || tokio::fs::try_exists(&path)
+        || tokio::fs::try_exists(&lookup_path)
             .await
-            .map_err(|err| pm_io_error(&path, err))?
+            .map_err(|err| pm_io_error(&lookup_path, err))?
     {
-        Ok(Some(path))
+        Ok(Some(lookup_path))
     } else {
         Ok(None)
     }
@@ -773,80 +825,148 @@ async fn run_package_script(
     command: &str,
     args: &[String],
     json: bool,
+    caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
-    let command = command_with_args(command, args);
-    let mut process = shell_command(&command);
-    process.current_dir(project_root);
-    install_package_script_path(&mut process, project_root);
-    let status = process
-        .status()
-        .await
-        .map_err(|err| pm_config_error(format!("package script failed to start: {err}")))?;
-    let code = status.code().unwrap_or(1).clamp(0, 255) as u8;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ok": status.success(),
-                "exitCode": code
-            })
-        );
-    }
-    Ok(ExitCode::from(code))
+    let invocation = resolve_package_script_invocation(project_root, command, args).await?;
+    run_file_with_cwd(
+        &invocation.path,
+        &invocation.args,
+        Some(project_root),
+        json,
+        None,
+        caps,
+        startup_timer,
+    )
+    .await
 }
 
-fn install_package_script_path(process: &mut tokio::process::Command, project_root: &Path) {
-    if let Some(path) = package_script_path(project_root) {
-        process.env("PATH", path);
+async fn resolve_package_script_invocation(
+    project_root: &Path,
+    command: &str,
+    forwarded_args: &[String],
+) -> Result<RunScriptInvocation, OtterError> {
+    let tokens = split_package_script_command(command)?;
+    let mut target = package_script_command_target(command, &tokens)?;
+    target.args.extend(forwarded_args.iter().cloned());
+
+    if target.mode != ScriptCommandMode::Bin {
+        if let Some(path) = explicit_file_target(project_root, &target.target).await? {
+            return Ok(RunScriptInvocation {
+                path,
+                args: target.args,
+            });
+        }
     }
+
+    let RunTarget::Bin(bin) = resolve_run_bin(project_root, &target.target).await? else {
+        unreachable!("resolve_run_bin only returns RunTarget::Bin on success");
+    };
+    Ok(RunScriptInvocation {
+        path: bin.path,
+        args: target.args,
+    })
 }
 
-fn package_script_path(project_root: &Path) -> Option<std::ffi::OsString> {
-    let local_bin = project_root.join("node_modules").join(".bin");
-    let paths = std::iter::once(local_bin).chain(
-        std::env::var_os("PATH")
-            .into_iter()
-            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>()),
-    );
-    std::env::join_paths(paths).ok()
+fn package_script_command_target(
+    command: &str,
+    tokens: &[String],
+) -> Result<ScriptCommandTarget, OtterError> {
+    let Some(first) = tokens.first() else {
+        return Err(pm_config_error("package script command is empty"));
+    };
+    let mut mode = ScriptCommandMode::Auto;
+    let mut index = 0usize;
+    if is_runtime_runner(first) {
+        index += 1;
+        if tokens.get(index).is_some_and(|token| token == "run") {
+            index += 1;
+        }
+        match tokens.get(index).map(String::as_str) {
+            Some("--bin") => {
+                mode = ScriptCommandMode::Bin;
+                index += 1;
+            }
+            Some("--script") => {
+                return Err(pm_config_error(format!(
+                    "package script `{command}` cannot dispatch another package script"
+                )));
+            }
+            Some("--") => {
+                index += 1;
+            }
+            Some(flag) if flag.starts_with('-') => {
+                return Err(pm_config_error(format!(
+                    "package script `{command}` uses unsupported runtime flag `{flag}`"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let target = tokens.get(index).cloned().ok_or_else(|| {
+        pm_config_error(format!(
+            "package script `{command}` does not name a JS/TS file or local package bin"
+        ))
+    })?;
+    let args = tokens.iter().skip(index + 1).cloned().collect();
+    Ok(ScriptCommandTarget { mode, target, args })
 }
 
-fn shell_command(command: &str) -> tokio::process::Command {
-    #[cfg(windows)]
-    {
-        let mut process = tokio::process::Command::new("cmd");
-        process.arg("/C").arg(command);
-        process
+fn is_runtime_runner(command: &str) -> bool {
+    if matches!(command, "otter" | "otterjs" | "node") {
+        return true;
     }
-    #[cfg(not(windows))]
-    {
-        let mut process = tokio::process::Command::new("sh");
-        process.arg("-c").arg(command);
-        process
-    }
+    Path::new(command)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| matches!(stem, "otter" | "otterjs" | "node"))
 }
 
-fn command_with_args(command: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        return command.to_string();
-    }
-    let mut out = command.to_string();
-    for arg in args {
-        out.push(' ');
-        out.push_str(&shell_quote(arg));
-    }
-    out
-}
+fn split_package_script_command(command: &str) -> Result<Vec<String>, OtterError> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
 
-fn shell_quote(value: &str) -> String {
-    #[cfg(windows)]
-    {
-        format!("\"{}\"", value.replace('"', "\\\""))
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), c) => current.push(c),
+            (Some(_), '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                } else {
+                    current.push('\\');
+                }
+            }
+            (Some(_), c) => current.push(c),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                } else {
+                    current.push('\\');
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
     }
-    #[cfg(not(windows))]
-    {
-        format!("'{}'", value.replace('\'', "'\\''"))
+
+    if let Some(q) = quote {
+        return Err(pm_config_error(format!(
+            "package script has unterminated {q} quote: `{command}`"
+        )));
     }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
 }
 
 fn candidate_list<'a>(items: impl Iterator<Item = &'a String>) -> String {
@@ -873,16 +993,20 @@ async fn run_eval(
         println!("{}", result.completion_string());
     } else if json {
         println!(
-            "{{\"completion\":{}}}",
-            serde_json::to_string(&result.completion_string()).unwrap()
+            "{}",
+            serde_json::json!({
+                "completion": result.completion_string(),
+                "exitCode": result.exit_code()
+            })
         );
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(ExitCode::from(result.exit_code()))
 }
 
 fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
     otter_runtime::Otter::builder()
         .capabilities(caps.clone())
+        .with_node_apis()
         .with_web_apis()
 }
 
@@ -1005,6 +1129,7 @@ async fn run_dump(
 ) -> Result<ExitCode, OtterError> {
     let mut runtime = otter_runtime::Runtime::builder()
         .capabilities(caps.clone())
+        .with_node_apis()
         .with_web_apis()
         .module_loader(cli_loader_config_for_entry(path).await)
         .build()?;
@@ -2337,14 +2462,138 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
-    #[test]
-    fn package_script_path_prepends_local_bin() {
+    #[tokio::test]
+    async fn run_file_returns_process_exit_code() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = package_script_path(tmp.path()).unwrap();
-        let mut paths = std::env::split_paths(&path);
+        let entry = tmp.path().join("exit.ts");
+        tokio::fs::write(&entry, "process.exit(12); throw new Error('unreachable');")
+            .await
+            .unwrap();
+        let startup_timer = CliStartupTimer::from_env();
+        let code = run_file(
+            &entry,
+            &[],
+            false,
+            None,
+            &CapabilitySet::default(),
+            &startup_timer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::from(12));
+    }
+
+    #[test]
+    fn package_script_command_split_preserves_quoted_args() {
         assert_eq!(
-            paths.next().unwrap(),
-            tmp.path().join("node_modules").join(".bin")
+            split_package_script_command("otter run ./task.ts 'two words' \"and three\"").unwrap(),
+            ["otter", "run", "./task.ts", "two words", "and three"]
+        );
+    }
+
+    #[tokio::test]
+    async fn package_script_runs_file_through_runtime_with_args_and_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scripts_dir = tmp.path().join("scripts");
+        tokio::fs::create_dir_all(&scripts_dir).await.unwrap();
+        let entry = scripts_dir.join("build.ts");
+        let cwd_literal = serde_json::to_string(&tmp.path().to_string_lossy()).unwrap();
+        tokio::fs::write(
+            &entry,
+            format!(
+                r#"
+function fail() {{ process.exit(31); }}
+if (process.cwd() !== {cwd_literal}) fail();
+if (process.argv[1].indexOf("build.ts") === -1) fail();
+if (process.argv[2] !== "from-script") fail();
+if (process.argv[3] !== "from-cli") fail();
+"#
+            ),
+        )
+        .await
+        .unwrap();
+        let startup_timer = CliStartupTimer::from_env();
+        let code = run_package_script(
+            tmp.path(),
+            "scripts/build.ts from-script",
+            &["from-cli".to_string()],
+            false,
+            &CapabilitySet::default(),
+            &startup_timer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn package_script_runs_local_bin_through_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(PACKAGE_JSON),
+            r#"{"name":"app","workspaces":["packages/*"],"scripts":{"tool":"otter run --bin tool from-script"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("packages/tool"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("packages/tool/package.json"),
+            r#"{"name":"tool","version":"1.0.0","type":"module","bin":"./tool.ts"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("packages/tool/tool.ts"),
+            r#"
+function fail() { process.exit(32); }
+if (process.argv[1].indexOf("tool.ts") === -1) fail();
+if (process.argv[2] !== "from-script") fail();
+if (process.argv[3] !== "from-cli") fail();
+"#,
+        )
+        .await
+        .unwrap();
+        let manifest = PackageManifest::read_from_dir(tmp.path()).await.unwrap();
+        let command = manifest.scripts.get("tool").unwrap().clone();
+        let startup_timer = CliStartupTimer::from_env();
+        let code = run_package_script(
+            tmp.path(),
+            &command,
+            &["from-cli".to_string()],
+            false,
+            &CapabilitySet::default(),
+            &startup_timer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn package_script_rejects_unknown_shell_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join(PACKAGE_JSON), r#"{"name":"app"}"#)
+            .await
+            .unwrap();
+        let err = run_package_script(
+            tmp.path(),
+            "echo hello",
+            &[],
+            false,
+            &CapabilitySet::default(),
+            &CliStartupTimer::from_env(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("unknown local package binary `echo`")
         );
     }
 

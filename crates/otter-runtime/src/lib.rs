@@ -417,6 +417,8 @@ pub struct ExecutionResult {
     /// handles. The local [`Runtime`] therefore renders the completion
     /// before sending it through [`RuntimeHandle`].
     completion: String,
+    /// Process-style exit status requested by JS-visible runtime APIs.
+    exit_code: u8,
     /// Wall-clock duration.
     pub duration: Duration,
 }
@@ -427,14 +429,37 @@ impl ExecutionResult {
     fn from_vm_value(completion: otter_vm::Value, duration: Duration) -> Self {
         Self {
             completion: completion.display_string(),
+            exit_code: 0,
             duration,
         }
+    }
+
+    /// Build from a host-visible runtime exit request.
+    #[must_use]
+    fn from_exit_code(code: u8, duration: Duration) -> Self {
+        Self {
+            completion: "undefined".to_string(),
+            exit_code: code,
+            duration,
+        }
+    }
+
+    #[must_use]
+    fn with_exit_code(mut self, code: u8) -> Self {
+        self.exit_code = code;
+        self
     }
 
     /// Render the completion value for CLI preview output.
     #[must_use]
     pub fn completion_string(&self) -> &str {
         &self.completion
+    }
+
+    /// Process-style exit status requested by runtime APIs.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        self.exit_code
     }
 }
 
@@ -460,7 +485,6 @@ impl ExecutionResult {
 /// | `env` | `Deny` | Environment variables may contain secrets. |
 /// | `run` | `Deny` | Subprocess execution is opt-in. |
 /// | `ffi` | `Deny` | Native library loading is opt-in. |
-/// | `hrtime` | `Deny` | High-resolution time can be a side-channel and should be explicit. |
 ///
 /// Two convenience presets:
 ///
@@ -490,8 +514,6 @@ pub struct CapabilitySet {
     pub run: Permission<String>,
     /// FFI loading permission. Patterns are library names / paths.
     pub ffi: Permission<PathBuf>,
-    /// High-resolution time permission (boolean toggle).
-    pub hrtime: BooleanPermission,
 }
 
 impl Default for CapabilitySet {
@@ -545,7 +567,6 @@ impl CapabilitySet {
             env: Permission::Deny,
             run: Permission::Deny,
             ffi: Permission::Deny,
-            hrtime: BooleanPermission::Deny,
         }
     }
 
@@ -560,7 +581,6 @@ impl CapabilitySet {
             env: Permission::AllowAll,
             run: Permission::AllowAll,
             ffi: Permission::AllowAll,
-            hrtime: BooleanPermission::Allow,
         }
     }
 }
@@ -786,7 +806,6 @@ mod permission_tests {
         assert!(caps.env.is_deny());
         assert!(caps.run.is_deny());
         assert!(caps.ffi.is_deny());
-        assert!(!caps.hrtime.is_allowed());
     }
 
     #[test]
@@ -810,25 +829,6 @@ mod permission_tests {
         assert!(!caps.env_allows("HOME"));
         // Built-in secret-deny still wins:
         assert!(!caps.env_allows("VITE_APP_API_KEY"));
-    }
-}
-
-/// Boolean permission (no patterns; on / off).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BooleanPermission {
-    /// Operation is denied.
-    #[default]
-    Deny,
-    /// Operation is allowed.
-    Allow,
-}
-
-impl BooleanPermission {
-    /// Convert to [`bool`].
-    #[must_use]
-    pub const fn is_allowed(self) -> bool {
-        matches!(self, Self::Allow)
     }
 }
 
@@ -871,6 +871,7 @@ pub(crate) struct RuntimeConfig {
     console_sink: ConsoleSinkHandle,
     hooks: RuntimeHooks,
     process_argv: Vec<String>,
+    process_cwd: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -1049,6 +1050,7 @@ impl Default for RuntimeConfig {
             console_sink: otter_vm::console::default_console_sink(),
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
+            process_cwd: process::default_cwd(),
         }
     }
 }
@@ -1226,6 +1228,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Set the `process.cwd()` snapshot installed into the runtime.
+    #[must_use]
+    pub fn process_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.config.process_cwd = cwd.into();
+        self
+    }
+
     /// Construct the runtime.
     ///
     /// # Errors
@@ -1276,7 +1285,12 @@ impl Runtime {
                     message: err.to_string(),
                 })?;
         }
-        process::install_global(&mut interp, &config.process_argv, &config.capabilities)?;
+        process::install_global(
+            &mut interp,
+            &config.process_argv,
+            &config.process_cwd,
+            &config.capabilities,
+        )?;
         // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
         // `new Function(...)` reach a real parse + compile path.
         // The closure is reusable across calls; each invocation
@@ -1998,6 +2012,22 @@ impl Runtime {
         let script_outcome = self.interp.run(&context);
         let drain_outcome = self.interp.drain_microtasks(&context);
         let value = match (script_outcome, drain_outcome) {
+            (
+                Err(otter_vm::RunError {
+                    error: otter_vm::VmError::Exit { code },
+                    ..
+                }),
+                _,
+            )
+            | (
+                Ok(_),
+                Err(otter_vm::RunError {
+                    error: otter_vm::VmError::Exit { code },
+                    ..
+                }),
+            ) => {
+                return Ok(ExecutionResult::from_exit_code(code, start.elapsed()));
+            }
             (Err(script_err), _) => {
                 return Err(enrich_runtime_diagnostic_with_cause(
                     &mut self.interp,
@@ -2012,7 +2042,8 @@ impl Runtime {
             }
             (Ok(v), Ok(())) => v,
         };
-        Ok(ExecutionResult::from_vm_value(value, start.elapsed()))
+        Ok(ExecutionResult::from_vm_value(value, start.elapsed())
+            .with_exit_code(process::exit_code(&self.interp)))
     }
 
     /// Drain the microtask queue manually. Embedders that want to
@@ -2152,6 +2183,23 @@ impl Runtime {
         let script_outcome = self.interp.run(&context);
         let drain_outcome = self.interp.drain_microtasks(&context);
         let value = match (script_outcome, drain_outcome) {
+            (
+                Err(otter_vm::RunError {
+                    error: otter_vm::VmError::Exit { code },
+                    ..
+                }),
+                _,
+            )
+            | (
+                Ok(_),
+                Err(otter_vm::RunError {
+                    error: otter_vm::VmError::Exit { code },
+                    ..
+                }),
+            ) => {
+                self.module_records.mark_evaluated();
+                return Ok(ExecutionResult::from_exit_code(code, start.elapsed()));
+            }
             (Err(script_err), _) => {
                 self.module_records.mark_errored();
                 return Err(enrich_runtime_diagnostic_with_cause(
@@ -2169,7 +2217,8 @@ impl Runtime {
             (Ok(v), Ok(())) => v,
         };
         self.module_records.mark_evaluated();
-        Ok(ExecutionResult::from_vm_value(value, start.elapsed()))
+        Ok(ExecutionResult::from_vm_value(value, start.elapsed())
+            .with_exit_code(process::exit_code(&self.interp)))
     }
 
     fn module_loader_for_entry(&self, entry_path: &Path) -> module_loader::ModuleLoader {
@@ -2511,6 +2560,20 @@ impl OtterBuilder {
         self
     }
 
+    /// Register one runtime-hosted module such as `node:fs` or `otter:kv`.
+    #[must_use]
+    pub fn hosted_module(mut self, module: HostedModule) -> Self {
+        self.runtime = self.runtime.hosted_module(module);
+        self
+    }
+
+    /// Register multiple runtime-hosted modules.
+    #[must_use]
+    pub fn hosted_modules(mut self, modules: impl IntoIterator<Item = HostedModule>) -> Self {
+        self.runtime = self.runtime.hosted_modules(modules);
+        self
+    }
+
     /// Override the implementation behind `console.*`.
     #[must_use]
     pub fn console_sink(mut self, sink: ConsoleSinkHandle) -> Self {
@@ -2522,6 +2585,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn process_argv(mut self, argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.runtime = self.runtime.process_argv(argv);
+        self
+    }
+
+    /// Set the `process.cwd()` snapshot installed into the runtime.
+    #[must_use]
+    pub fn process_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.runtime = self.runtime.process_cwd(cwd);
         self
     }
 

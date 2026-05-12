@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 otter-bytecode = { workspace = true }
 otter-compiler = { workspace = true }
+otter-node = { workspace = true }
 otter-pm = { workspace = true }
 otter-pm-lockfile = { workspace = true }
 otter-pm-manifest = { workspace = true }

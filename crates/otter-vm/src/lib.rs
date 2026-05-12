@@ -1923,6 +1923,13 @@ pub enum VmError {
         /// for `JSON_PARSE`.
         message: String,
     },
+    /// Host-visible termination requested by a native such as
+    /// `process.exit(code)`. This is not a JS exception and is not
+    /// routed through catch/finally handlers.
+    Exit {
+        /// Process-style exit status.
+        code: u8,
+    },
 }
 
 impl std::fmt::Display for VmError {
@@ -1954,6 +1961,7 @@ impl std::fmt::Display for VmError {
             VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
             VmError::InvalidRegExp { message } => write!(f, "{message}"),
             VmError::JsonError { message, .. } => write!(f, "{message}"),
+            VmError::Exit { code } => write!(f, "process exited with code {code}"),
         }
     }
 }
@@ -13476,6 +13484,7 @@ fn native_to_vm_error(err: NativeError) -> VmError {
         NativeError::RangeError { name, reason } => VmError::RangeError {
             message: format!("{name}: {reason}"),
         },
+        NativeError::Exit { code } => VmError::Exit { code },
     }
 }
 

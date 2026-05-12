@@ -291,6 +291,39 @@ impl<'rt> NativeCtx<'rt> {
     pub fn interp_mut(&mut self) -> &mut Interpreter {
         self.cx.interp
     }
+
+    /// Queue an isolate-local microtask for the current execution
+    /// context.
+    ///
+    /// Native bindings use this for JS-visible scheduling surfaces
+    /// such as `process.nextTick`. The task stays on the owning
+    /// interpreter and is drained by the runtime checkpoint; no VM
+    /// values cross into host/Tokio work.
+    pub fn queue_microtask(
+        &mut self,
+        callee: Value,
+        args: impl IntoIterator<Item = Value>,
+    ) -> Result<(), crate::NativeError> {
+        if !self.cx.interp.is_callable_runtime(&callee) {
+            return Err(crate::NativeError::TypeError {
+                name: "NativeCtx::queue_microtask",
+                reason: "callback is not a function".to_string(),
+            });
+        }
+        let context = self.context.clone().ok_or(crate::NativeError::TypeError {
+            name: "NativeCtx::queue_microtask",
+            reason: "missing execution context".to_string(),
+        })?;
+        self.cx.interp.microtasks_mut().enqueue(crate::Microtask {
+            callee,
+            this_value: Value::Undefined,
+            args: args.into_iter().collect(),
+            context: Some(context),
+            result_capability: None,
+            kind: crate::microtask::MicrotaskKind::Call,
+        });
+        Ok(())
+    }
 }
 
 // `RuntimeCx` and `NativeCtx` are `!Send + !Sync` because they

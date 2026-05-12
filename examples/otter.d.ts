@@ -100,7 +100,6 @@ declare namespace Otter {
     env: boolean;
     run: boolean;
     ffi: boolean;
-    hrtime: boolean;
   };
 }
 

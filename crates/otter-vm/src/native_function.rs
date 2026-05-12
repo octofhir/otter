@@ -914,6 +914,14 @@ pub enum NativeError {
         /// Short reason.
         reason: String,
     },
+    /// Host-visible runtime termination requested by a native such
+    /// as `process.exit(code)`. This is not a JS throw and must not
+    /// be catchable by user code.
+    #[error("native function requested process exit with code {code}")]
+    Exit {
+        /// Process-style exit status, already normalized to one byte.
+        code: u8,
+    },
 }
 
 impl From<otter_gc::OutOfMemory> for NativeError {

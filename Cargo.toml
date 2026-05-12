@@ -16,6 +16,7 @@ members = [
     "crates/otter-test262",
     "crates/otter-cli",
     "crates/otter-modules",
+    "crates/otter-node",
     "crates/otter-web",
 ]
 exclude = [
@@ -62,6 +63,7 @@ tokio               = { version = "1", features = ["rt-multi-thread", "sync", "t
 smallvec    = "1"
 indexmap    = "2"
 globset     = "0.4"
+sysinfo     = "0.39"
 proc-macro2 = "1"
 quote       = "1"
 syn         = { version = "2", features = ["full", "parsing", "printing"] }
@@ -94,6 +96,8 @@ otter-gc        = { path = "crates/otter-gc" }
 otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }
 otter-runtime   = { path = "crates/otter-runtime" }
+otter-modules   = { path = "crates/otter-modules" }
+otter-node      = { path = "crates/otter-node" }
 otter-pm-manifest = { path = "crates/otter-pm-manifest" }
 otter-pm-lockfile = { path = "crates/otter-pm-lockfile" }
 otter-pm       = { path = "crates/otter-pm" }

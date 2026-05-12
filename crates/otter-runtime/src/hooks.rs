@@ -94,8 +94,6 @@ pub enum RuntimeCapability {
     Run,
     /// FFI/native library loading.
     Ffi,
-    /// High-resolution time.
-    Hrtime,
 }
 
 /// Concrete resource requested by a capability check.
@@ -110,8 +108,6 @@ pub enum CapabilityRequest<'a> {
     EnvVar(&'a str),
     /// Subprocess command name or path.
     Command(&'a str),
-    /// Boolean capability without a resource value.
-    Boolean,
 }
 
 /// Runtime module-resolution hook.
@@ -349,7 +345,6 @@ pub fn default_check_capability(
         (RuntimeCapability::Ffi, CapabilityRequest::Path(path)) => {
             capabilities.ffi.matches_path(path)
         }
-        (RuntimeCapability::Hrtime, CapabilityRequest::Boolean) => capabilities.hrtime.is_allowed(),
         _ => false,
     }
 }

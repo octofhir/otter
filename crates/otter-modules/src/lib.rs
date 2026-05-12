@@ -1,9 +1,9 @@
 //! Active Otter-hosted modules.
 //!
-//! This crate ports the host-owned parts of `otter:kv`, `otter:sql`, and
-//! `otter:ffi` onto the active runtime dependency graph. The JavaScript-visible
-//! shape is installed through static hosted-module registration and builder
-//! APIs, without a dynamic hot-path registry.
+//! This crate ports the host-owned parts of selected `otter:*` modules onto
+//! the active runtime dependency graph. The JavaScript-visible shape is
+//! installed through static hosted-module registration and builder APIs,
+//! without a dynamic hot-path registry.
 //!
 //! # Contents
 //! - [`kv`] - permission-gated key/value storage.

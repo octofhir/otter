@@ -44,6 +44,10 @@ A runtime turn runs JS work on the mutator, performs a microtask
 checkpoint, then folds host completions into the runtime inbox according
 to the selected drive mode.
 
+Runtime turns are budgetable. A CPU-heavy script, promise reaction storm,
+or long host callback chain must be able to yield or fail according to the
+resource policy described in [Runtime Principles](runtime-principles.md).
+
 Microtask checkpointing is VM work. Promise reactions, `queueMicrotask`,
 and async-function resumes run only after the current JS execution context
 unwinds and before the runtime turn is considered complete.
@@ -63,6 +67,10 @@ The runner should support deterministic drive modes:
   becomes idle with that promise still pending;
 - `run_until_command`: drive until a command completion is delivered;
 - `shutdown`: cancel or drain, then report leaks.
+
+Budgeted execution adds a resumable yielded state. A yielded turn remains
+owned by the isolate runner and can be requeued without losing timers,
+host completions, interrupts, diagnostics, or pending microtasks.
 
 ## Async Host Ops
 

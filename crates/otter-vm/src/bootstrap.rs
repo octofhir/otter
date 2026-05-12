@@ -1380,10 +1380,49 @@ fn install_string(
     );
 
     fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        // §22.1.1.1 — bare `String(value)` returns `ToString(value)`.
+        // ToString routes through `[Symbol.toPrimitive]` → `toString` →
+        // `valueOf` for objects, so a class with an overridden
+        // `toString` (or a custom `Symbol.toPrimitive`) is observable.
+        // The fast path keeps primitives cheap; only non-primitive
+        // values re-enter the interpreter for ToPrimitive coercion.
+        let raw = args.first().cloned().unwrap_or(Value::Undefined);
         let string_heap = ctx.interp_mut().string_heap_clone();
+        let primitive = match &raw {
+            Value::Undefined
+            | Value::Null
+            | Value::Boolean(_)
+            | Value::Number(_)
+            | Value::BigInt(_)
+            | Value::String(_)
+            | Value::Symbol(_) => raw.clone(),
+            _ => {
+                let (interp, exec) = ctx.interp_mut_and_context();
+                let exec = exec.ok_or_else(|| NativeError::TypeError {
+                    name: "String",
+                    reason: "missing execution context".to_string(),
+                })?;
+                interp
+                    .evaluate_to_primitive(
+                        &exec,
+                        &raw,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )
+                    .map_err(|e| match e {
+                        crate::VmError::Uncaught { value } => NativeError::Thrown {
+                            name: "String",
+                            message: value,
+                        },
+                        other => NativeError::TypeError {
+                            name: "String",
+                            reason: other.to_string(),
+                        },
+                    })?
+            }
+        };
         let value = crate::string_dispatch::call(
             otter_bytecode::method_id::StringMethod::Construct,
-            args,
+            std::slice::from_ref(&primitive),
             &string_heap,
         )
         .map_err(|err| NativeError::TypeError {
@@ -1891,7 +1930,7 @@ mod tests {
         assert_eq!(telemetry.namespace_objects_installed(), 6);
         assert_eq!(
             telemetry.native_functions_installed(),
-            102 + reflect::REFLECT_SPEC.methods.len(),
+            103 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

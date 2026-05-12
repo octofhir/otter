@@ -160,6 +160,17 @@ fn impl_concat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Array(array::from_elements(&mut heap, combined)?))
 }
 
+/// §23.1.3.36 `Array.prototype.toString` — delegate to `join()` with
+/// the default `","` separator. Spec step 1 is "Let array be ?
+/// ToObject(this value)"; step 4 reads `func = array.join`, falling
+/// back to `%Object.prototype.toString%` when `join` is not
+/// callable. Foundation: always call our concrete join helper.
+///
+/// <https://tc39.es/ecma262/#sec-array.prototype.tostring>
+fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    impl_join(args)
+}
+
 fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
     let heap = args.gc_heap.borrow();
@@ -444,6 +455,7 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "flat"        / 1 => impl_flat,
             "splice"      / 2 => impl_splice,
             "sort"        / 1 => impl_sort_default,
+            "toString"    / 0 => impl_to_string,
         )
     });
 
@@ -472,6 +484,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("flat", 1, native_flat),
     method("splice", 2, native_splice),
     method("sort", 1, native_sort),
+    method("toString", 0, native_to_string),
 ];
 
 const fn method(
@@ -534,6 +547,7 @@ native_array!(native_fill, "fill");
 native_array!(native_flat, "flat");
 native_array!(native_splice, "splice");
 native_array!(native_sort, "sort");
+native_array!(native_to_string, "toString");
 
 #[cfg(test)]
 mod tests {

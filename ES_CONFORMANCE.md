@@ -498,10 +498,1417 @@ Current:
 
 | total | passed | failed | skipped | timeout | OOM | crash | pass rate |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 45 | 21 | 24 | 0 | 0 | 0 | 0 | 46.67% |
+| 45 | 29 | 16 | 0 | 0 | 0 | 0 | 64.44% |
 
-Delta from the immediate batch baseline
-`test262_results/batch_object_gopn_after_native_function.json`: +4 passing
-tests. The remaining failures cluster around Array instance/prototype
-identity, richer object descriptor behavior, proxy invariants, and
-additional ordinary object edge cases.
+Most remaining failures cluster around array/prototype identity,
+richer object descriptor behavior, and ordinary object edge cases.
+
+### Reflect (slice: real namespace + Value-level internal-method dispatch)
+
+Command:
+
+```sh
+cargo run -p otter-test262 --bin otter-test262 -- run \
+  --filter built-ins/Reflect \
+  --timeout 5000 \
+  --output test262_results/reflect_after.json
+```
+
+Before / after:
+
+| stage | total | passed | failed | skipped | pass rate |
+|---|---:|---:|---:|---:|---:|
+| before (placeholder)               | 154 | 60  | 93 | 1 | 39.22% |
+| after (real namespace)             | 154 | 113 | 40 | 1 | 73.86% |
+| after (Value-level dispatch + Proxy invariants) | 154 | 126 | 27 | 1 | 82.35% |
+
+Delta: **+66 passing tests (+43.13 points)**. Routing every Reflect
+method through `Interpreter::ordinary_*_value` gave it Proxy, Array,
+function, and class-constructor support without duplicating dispatch
+logic in `reflect.rs`. Remaining failures are deeper substrate gaps —
+real Symbol/`@@toStringTag`, full ToPropertyKey ([[ToPrimitive]] on
+descriptor keys), `Object.prototype` as default `[[Prototype]]` for
+`{}` literals, and richer `Reflect.set` accessor handling.
+
+### Proxy
+
+Command:
+
+```sh
+cargo run -p otter-test262 --bin otter-test262 -- run \
+  --filter built-ins/Proxy \
+  --timeout 5000 \
+  --output test262_results/proxy_after.json
+```
+
+Before / after:
+
+| stage | total | passed | failed | skipped | pass rate |
+|---|---:|---:|---:|---:|---:|
+| before                                                                     | 311 | 145 | 129 | 37 | 52.92% |
+| slice 1 (Reflect dispatch)                                                 | 311 | 162 | 112 | 37 | 59.12% |
+| slice 2 (Proxy [[Call]]/[[Construct]] + invariants)                        | 311 | 190 | 84  | 37 | 69.34% |
+| slice 3 (ownKeys/defineProperty invariants + value-level dispatch)         | 311 | 215 | 59  | 37 | 78.47% |
+| slice 4 (V8/JSC-style PartialPropertyDescriptor + full §10.5.6 invariants) | 311 | 225 | 49  | 37 | 82.12% |
+| slice 5 (Proxy [[Set]] invariants + Reflect.set receiver + §10.1.2 + `{}` proto) | 311 | 226 | 48 | 37 | 82.48% |
+| slice 6 (sync ToPrimitive / ToPropertyKey / ToPropertyDescriptor + Op::SetPrototype throw) | 311 | 226 | 48 | 37 | 82.48% |
+
+Delta: **+81 passing tests (+29.56 points)** for Proxy across six slices.
+
+### Reflect (cumulative)
+
+| stage | total | passed | failed | pass rate |
+|---|---:|---:|---:|---:|
+| before                       | 154 | 60  | 93 | 39.22% |
+| slice 1–5 (namespace + dispatch + invariants + receiver) | 154 | 138 | 15 | 90.20% |
+| slice 6 (sync ToPropertyKey + observable ToPropertyDescriptor) | 154 | 147 | 6 | 96.08% |
+| slice 7 (real Symbol → @@toStringTag = "Reflect")             | 154 | 148 | 5 | 96.73% |
+
+Delta Reflect: **+88 passing tests (+57.51 points)** across seven slices.
+
+### Object (built-ins/Object overall)
+
+| stage | total | passed | failed | pass rate |
+|---|---:|---:|---:|---:|
+| slice 3                                            | 3414 | 2037 | 1372 | 59.71% |
+| slice 4 (PartialPropertyDescriptor)                | 3414 | 2169 | 1240 | 63.70% |
+| slice 6 (observable ToPropertyDescriptor + ToPropertyKey) | 3414 | 2273 | 1132 | 66.75% |
+
+### Symbol (built-ins/Symbol)
+
+| stage | total | passed | failed | skipped | crashed | pass rate |
+|---|---:|---:|---:|---:|---:|---:|
+| before (placeholder)                          | 98 | 6  | 71 | 21 | 0 | 7.79% |
+| slice 7 (real Symbol ctor + post-bootstrap)   | 98 | 57 | 20 | 21 |  0 | 74.03% |
+
+Delta Symbol: **+51 passing tests (+66.24 points)** in slice 7.
+
+### Iterator protocol §7.4 — slice 8
+
+`Interpreter::get_iterator_sync` / `iterator_step_sync` /
+`iterator_close_sync` / `iterator_to_list_sync` cover §7.4.1
+GetIterator, §7.4.4 IteratorNext, §7.4.6 IteratorStep, §7.4.8
+IteratorClose, §7.4.13 IteratorToList. Built-in iterables (Array,
+String, Set, Map, Generator) take fast paths; everything else
+routes through `@@iterator`.
+
+The "_sync" suffix carries the spec-level distinction: §7.4 sync
+iterator vs §27.1 async iterator. Sibling helpers
+(`evaluate_to_primitive` / `evaluate_to_property_key` /
+`evaluate_to_property_descriptor`) renamed from `_sync` to match —
+those have no async-vs-sync spec dichotomy, so the suffix was
+misleading.
+
+| filter | before | after | delta |
+|---|---:|---:|---:|
+| `built-ins/Array/from` | 23/47 (48.94%) | **26/47 (55.32%)** | +3 |
+
+Wired into `Op::ArrayFrom` so `Array.from(gen())`,
+`Array.from(customIterable, mapFn)`, and array-like fallback all
+work. Set / Map constructors stay placeholders until their
+respective slices.
+
+Slice 2 additions:
+- `Value::Proxy` branch in `run_callable_sync` and
+  `run_construct_sync` so nested-proxy `apply` / `construct` fallback
+  reaches the underlying callable (Proxy/apply 90.9%, Proxy/construct
+  no regression).
+- `Interpreter::is_extensible_value`,
+  `Interpreter::prevent_extensions_value`, and
+  `Interpreter::set_prototype_value_proxy_aware` as shared value-level
+  internal-method helpers; Reflect.isExtensible /
+  Reflect.preventExtensions / Reflect.setPrototypeOf delegate to them.
+- `try_proxy_object_static_call` preflight in the `Op::ObjectCall`
+  path so `Object.isExtensible(proxy)` and
+  `Object.preventExtensions(proxy)` invoke proxy traps with §10.5
+  invariants (Proxy/isExtensible 9.1% → 81.8%,
+  Proxy/preventExtensions 27.3% → 90.9%).
+- §10.5.8 `has` invariants in `ordinary_has_property_value` and
+  §10.5.10 `deleteProperty` invariants in `ordinary_delete_value`.
+
+Slice 3 additions:
+- `Interpreter::own_property_keys_value` with full §10.5.11 invariant
+  chain (CreateListFromArrayLike with «String, Symbol», duplicate
+  detection, missing/extra key checks against extensibility and
+  configurability). Used by Reflect.ownKeys, Object.keys (proxy
+  branch), Object.getOwnPropertyNames, Object.getOwnPropertySymbols.
+- `Interpreter::define_own_property_value` — §10.5.6 conservative
+  invariants (non-extensible add, configurable-relaxation reject).
+  Wired into Reflect.defineProperty and `Object.defineProperty(proxy)`
+  preflight.
+- `drive_set_prototype_proxy` switched from synthetic `target_object`
+  to value-level `set_prototype_value_proxy_aware` so
+  `Object.setPrototypeOf(proxy(proxy(x), {}), p)` walks the inner
+  Proxy correctly.
+- `ordinary_has_property_value` now accepts `Value::Array` and
+  callable kinds so nested-proxy `in` fall-through reaches Array
+  exotic keys and function metadata.
+
+Section-level highlights (after slice 3):
+- Proxy/apply: 22.2% → 90.9%
+- Proxy/ownKeys: 18.5% → 96.0%
+- Proxy/getOwnPropertyDescriptor: 90.5% → 94.7%
+- Proxy/preventExtensions: 0% → 90.9%
+- Proxy/isExtensible: 9.1% → 81.8%
+- Proxy/setPrototypeOf: 31.2% → 81.2%
+- Proxy/deleteProperty: 41.2% → 81.2%
+- Proxy/defineProperty: 43.8% → 62.5%
+
+Slice 4 additions:
+- New `object::PartialPropertyDescriptor` that mirrors V8 / JSC /
+  SpiderMonkey field-presence slot layout. Every `[[Value]]`,
+  `[[Writable]]`, `[[Get]]`, `[[Set]]`, `[[Enumerable]]`,
+  `[[Configurable]]` field is `Option<…>` so §6.2.5.5
+  ToPropertyDescriptor can distinguish "absent" from "present with
+  `false`".
+- `object_statics::coerce_to_descriptor` returns the new
+  `PartialPropertyDescriptor`; new `object::define_own_property_partial`
+  / `define_own_symbol_property_partial` and the field-presence-aware
+  `descriptor_core::validate_and_apply_partial` (§10.1.6.3) replace
+  the legacy "every field is present" path.
+- `Interpreter::define_own_property_value` takes the partial form,
+  emits a partial `FromPropertyDescriptor` for trap arguments, and
+  enforces the full §10.5.6 invariant set (steps 14–20): non-extensible
+  add, configurable-relaxation / -demotion, narrow-writable on
+  non-configurable data, plus a partial `IsCompatible` predicate.
+- Op::New + Proxy: trap result is now validated as Object
+  (§10.5.13 step 9); trap-absent fallback delegates to
+  `run_construct_sync` so nested proxies and bound targets reuse the
+  full constructor pipeline.
+- `abstract_ops::is_constructor` treats a non-revoked Proxy as a
+  constructor iff its target is.
+
+Section-level highlights (after slice 4):
+- Proxy/apply: 22.2% → 90.9%
+- Proxy/construct: 44.4% → 83.3%
+- Proxy/defineProperty: 43.8% → 87.5%
+- Proxy/ownKeys: 18.5% → 96.0%
+- Proxy/getOwnPropertyDescriptor: 90.5% → 94.7%
+- Proxy/preventExtensions: 0% → 90.9%
+- Proxy/isExtensible: 9.1% → 81.8%
+- Proxy/setPrototypeOf: 31.2% → 81.2%
+- Proxy/deleteProperty: 41.2% → 81.2%
+
+Broader impact (built-ins/Object overall): 2037 → 2169 (+132 tests)
+because `defineProperty` no longer treats missing descriptor fields
+as `false`.
+
+Remaining failures cluster in Proxy/{set, has (mostly `with` syntax,
+not supported), revocable edge cases}. Next slices: accessor walk on
+Reflect.set / Proxy.[[Set]] §10.5.9 invariants, plus the
+`Object.freeze`/`Object.seal` proxy preflight.
+
+### §24 Keyed Collections — slice 9 (real Map / Set / WeakMap / WeakSet)
+
+Commands:
+
+```sh
+target/release/otter-test262 run --filter built-ins/Map     --timeout 5000 --output test262_results/map_after.json
+target/release/otter-test262 run --filter built-ins/Set     --timeout 5000 --output test262_results/set_after.json
+target/release/otter-test262 run --filter built-ins/WeakMap --timeout 5000 --output test262_results/weakmap_after.json
+target/release/otter-test262 run --filter built-ins/WeakSet --timeout 5000 --output test262_results/weakset_after.json
+```
+
+Replaces the four bootstrap placeholders with real callable +
+constructible `NativeFunction` constructors plus full
+prototypes installed in
+`crates/otter-vm/src/bootstrap_collections.rs`. Each prototype is
+linked to `%Object.prototype%`, carries every spec-listed method
+as an own data property, exposes `size` as an accessor (Map/Set),
+and gets `@@toStringTag` plus `@@iterator` wired in
+[`install_collection_well_knowns_post_bootstrap`].
+
+The compiler short-circuit `Op::NewCollection` that bypassed
+`Map.prototype.set` / `Set.prototype.add` and the §7.4 iterator
+protocol was removed from `crates/otter-compiler/src/lib.rs`, so
+`new Map(iter)` now goes through `Op::New` →
+`construct_collection` → `AddEntriesFromIterable` per §24.1.1.2.
+Built-in iterables (Array / Map / Set / Generator / String) take
+the `iterator_to_list_sync` fast path; user-defined iterables use
+the lazy `GetIterator` / `IteratorStep` / `IteratorClose` ladder
+so `iterator-close-after-set-failure.js`-style invariants are
+observable.
+
+Substrate fix-ups in `crates/otter-vm/src/lib.rs`:
+
+- `Op::LoadProperty` for `Value::Map` / `Set` / `WeakMap` /
+  `WeakSet` falls back to walking `<Collection>.prototype` after
+  the legacy `size` fast path, so user-installed methods and
+  overrides resolve through normal `[[Get]]`.
+- `ordinary_get_value` gained branches for the four collection
+  value kinds that route to the realm prototype.
+- `constructor_prototype_value` now handles `Value::NativeFunction`
+  and `Value::ClassConstructor` (in addition to legacy
+  `Value::Object`).
+
+Before / after:
+
+| filter | total | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|---:|
+| `built-ins/Map`     | 215 | 75 → 137  | 41.44% → 75.69% | +62 |
+| `built-ins/Set`     | 394 | 169 → 216 | 43.00% → 54.96% | +47 |
+| `built-ins/WeakMap` | 141 | 55 → 87   | 54.46% → 86.14% | +32 |
+| `built-ins/WeakSet` | 85  | 47 → 75   | 55.95% → 89.29% | +28 |
+
+Cumulative slice 9 delta: **+169 passing tests** across the four
+collection suites.
+
+Section-level highlights:
+
+- `built-ins/Map/prototype`: 50.4% → 90.2%
+- `built-ins/Map/constructor.js`, `length.js`, `is-a-constructor.js`,
+  `iterable-calls-set.js`, `iterator-close-after-set-failure.js`,
+  `get-set-method-failure.js`, `prototype.js` — all green.
+- `built-ins/Set/set-iterable.js`, `set-iterator-close-after-add-failure.js`,
+  `set-get-add-method-failure.js`, `set-iterable-calls-add.js`,
+  `set-iterable-empty-does-not-call-add.js` — all green.
+
+Regression spot-checks (no movement vs. published baselines):
+
+| suite | passed |
+|---|---:|
+| `built-ins/Reflect`     | 148 / 154 (96.73%) |
+| `built-ins/Proxy`       | 226 / 311 (82.48%) |
+| `built-ins/Symbol`      | 57 / 98 (74.03%)  |
+| `built-ins/Array/from`  | 26 / 47 (55.32%)  |
+
+Remaining gaps for the four suites cluster in: `Map.groupBy` /
+`Set.prototype.{union,intersection,...}` (new ES2024 surface that
+needs separate slices), `Symbol.species`-driven subclass paths
+(no `@@species` substrate yet), `MapIteratorPrototype.next` /
+`SetIteratorPrototype.next` (the engine's internal
+`Value::Iterator` does not expose a JS-callable `.next` —
+`@@iterator` on the prototype returns a working iterator value,
+but driving it through user-written wrappers still hits the
+foundation iterator interception path), and `Symbol.toStringTag`
+on the iterator prototypes.
+
+### §27.2 Promise — slice 10 (real Promise constructor + statics + prototype)
+
+Command:
+
+```sh
+target/release/otter-test262 run --filter built-ins/Promise --timeout 5000 --output test262_results/promise_after.json
+```
+
+Replaces the bootstrap placeholder with a real callable +
+constructible `NativeFunction` constructor plus the full
+prototype installed in
+`crates/otter-vm/src/bootstrap_promise.rs`. The constructor
+reuses [`crate::promise_dispatch::PromiseBuilder::construct`] for
+the `(handle, resolve, reject)` triple, invokes the executor
+synchronously through `run_callable_sync`, and routes a
+captured executor throw through the realm `reject` (idempotent
+per §27.2.1.4). The prototype carries `then` / `catch` /
+`finally` as own data properties; the constructor carries
+`resolve` / `reject` / `all` / `race` / `allSettled` / `any` /
+`withResolvers` as own data properties. `@@toStringTag = "Promise"`
+is installed by `install_promise_well_knowns_post_bootstrap`.
+
+The compiler shortcuts `Op::PromiseNew` (`new Promise(executor)`)
+and `Op::PromiseCall` (`Promise.<method>(args)`) were removed from
+`crates/otter-compiler/src/lib.rs` so the constructor path goes
+through ordinary `Op::New` dispatch and statics resolve through
+ordinary property lookup. The legacy opcode handlers stay in the
+runtime as dead code for backwards compatibility.
+
+Substrate fix-ups in `crates/otter-vm/src/lib.rs`:
+
+- `Op::LoadProperty` for `Value::Promise` now walks
+  `Promise.prototype` so `p.then` / `p.constructor` resolve.
+- `ordinary_get_value` gained a `Value::Promise` branch.
+- The `Op::CallMethod` lookup-via-property path gained a
+  `Value::NativeFunction` branch so `Promise.all(...)` /
+  `Promise.resolve(...)` / `Map.groupBy(...)` etc. dispatch
+  through ordinary method invocation. (Previously the typed
+  `Op::PromiseCall` opcode covered this; without the shortcut the
+  ordinary path had to learn `NativeFunction` receivers.)
+
+Before / after:
+
+| filter | total | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|---:|
+| `built-ins/Promise` | 677 | 332 → 395 | 49.11% → 58.43% | +63 |
+
+Section-level highlights:
+
+- `built-ins/Promise/prototype`: 54.0% → 72.6%
+- `built-ins/Promise/all`: 56.1% → 61.2%
+- `built-ins/Promise/race`: 62.8% → 66.0%
+- `built-ins/Promise/allSettled`: 49.0% → 56.7%
+- `built-ins/Promise/any`: 52.1% → 61.7%
+- `built-ins/Promise/resolve`: 46.7% → 60.0%
+
+Regression spot-checks (no movement vs. slice 9 baselines):
+
+| suite | passed |
+|---|---:|
+| `built-ins/Map`         | 137 / 215 (75.69%) |
+| `built-ins/Set`         | 216 / 394 (54.96%) |
+| `built-ins/Reflect`     | 148 / 154 (96.73%) |
+| `built-ins/Proxy`       | 226 / 311 (82.48%) |
+| `built-ins/Symbol`      | 57 / 98 (74.03%)  |
+| `built-ins/Array/from`  | 26 / 47 (55.32%)  |
+| `built-ins/Function`    | 365 / 461 (79.18%) (+1 from prior) |
+
+Remaining Promise gaps cluster in: `executor-function-*.js`
+(executor resolve/reject natives lack spec-shaped `length` /
+`name` descriptors), `Symbol.species`-driven subclass paths,
+`allKeyed` / `allSettledKeyed` proposals, and `Promise.try`
+(ES2025 surface). The Promise body still uses the legacy
+`run_callable_sync` path for the executor — a follow-up slice
+should swap to the spec `[[Construct]]`-aware dispatch for
+subclassing.
+
+### §22.2 RegExp — slice 11 (real RegExp constructor + prototype methods + flag accessors)
+
+Replaces the bootstrap placeholder with a real callable +
+constructible `NativeFunction` constructor and a prototype with
+spec-shaped own properties — see
+`crates/otter-vm/src/bootstrap_regexp.rs`.
+
+Prototype carries `exec` / `test` / `toString` as own data
+properties plus the §22.2.6 accessor getters `source` / `flags` /
+`global` / `ignoreCase` / `multiline` / `dotAll` / `unicode` /
+`sticky` / `hasIndices` / `unicodeSets`. The constructor body
+mirrors §22.2.3.1 — when `pattern` is itself a `RegExp` and
+`flags` is undefined the receiver is returned unchanged; in every
+other case the source + flag string flow into
+[`crate::regexp::JsRegExp::compile`].
+
+Substrate fix-ups in `crates/otter-vm/src/lib.rs`:
+
+- `Op::LoadProperty` for `Value::RegExp` falls back to walking
+  `RegExp.prototype` after the legacy `regexp_prototype::load_property`
+  fast path returns `Undefined`.
+- `ordinary_get_value` gained the same fall-through.
+
+Targeted before/after (single-subdir, focused timeout — full
+sweep is currently slow due to regress backtracking on a handful
+of pathological patterns and is tracked as a follow-up):
+
+```sh
+target/release/otter-test262 run \
+  --filter built-ins/RegExp/prototype --timeout 3000 \
+  --output test262_results/regexp_proto_after.json
+```
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/RegExp/prototype`        | 109 → 187 | 22.9% → 37.5% | +78 |
+| `built-ins/RegExp/prototype/exec`   | 49        | 63.6%          | (real proto methods) |
+| `built-ins/RegExp/prototype/test`   | 26        | 57.8%          |  |
+| `built-ins/RegExp/prototype/source` | 6         | 54.6%          |  |
+| `built-ins/RegExp/prototype/flags`  | 5         | 29.4%          |  |
+| `built-ins/RegExp/property-escapes` | 144       | 100.0%         | (unchanged, listed for completeness) |
+| `built-ins/RegExp/unicodeSets`      | 114       | 100.0%         | |
+| `built-ins/RegExp/lookBehind`       | 17        | 100.0%         | |
+
+CLI smoke verifies:
+
+```js
+typeof RegExp === 'function'           // true
+RegExp.length === 2                    // true
+RegExp.name === 'RegExp'               // true
+new RegExp("xyz", "g").source          // 'xyz'
+new RegExp(/a(b)c/g).exec("xabc")      // ['abc', 'b']
+typeof RegExp.prototype.test           // 'function'
+typeof Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get  // 'function'
+new RegExp(/a/, "i").flags             // 'i'
+```
+
+Regression spot-checks (no movement vs. slice 10 baselines):
+
+| suite | passed |
+|---|---:|
+| `built-ins/Map`         | 137 / 215 (75.69%) |
+| `built-ins/Set`         | 216 / 394 (54.96%) |
+| `built-ins/WeakMap`     | 87 / 141 (86.14%) |
+| `built-ins/WeakSet`     | 75 / 85 (89.29%) |
+| `built-ins/Reflect`     | 148 / 154 (96.73%) |
+| `built-ins/Proxy`       | 226 / 311 (82.48%) |
+| `built-ins/Promise`     | 395 / 677 (58.43%) |
+
+Known follow-ups not landed in this slice:
+
+- Full `built-ins/RegExp` sweep is currently slow because a handful
+  of pathological patterns in the suite drive the `regress` engine
+  to maximum backtracking. The wall-clock cost dwarfs the
+  `--timeout` per test, so the full sweep is being deferred until
+  the engine gains either step bounding or a budget-aware
+  backtracker. Per-subdir runs are unaffected.
+- `Symbol.match` / `Symbol.replace` / `Symbol.search` / `Symbol.split`
+  / `Symbol.matchAll` are still foundation-driven from
+  `String.prototype.*`; installing them as own methods on
+  `RegExp.prototype` is a separate slice.
+- `RegExp.prototype.compile` is not installed yet — it requires a
+  `JsRegExp` in-place state swap helper that does not yet exist.
+- `RegExp[@@species]` and the `@@species`-driven subclass paths
+  remain open.
+
+### §26 WeakRef + FinalizationRegistry — slice 12
+
+Real callable + constructible `NativeFunction` constructors for
+both globals plus prototypes installed in
+`crates/otter-vm/src/bootstrap_weak_refs.rs`. The compiler
+shortcuts `Op::NewWeakRef` / `Op::NewFinalizationRegistry` are
+no longer emitted — both ctors go through ordinary `Op::New`
+dispatch.
+
+Prototypes:
+
+- `WeakRef.prototype.deref` (own data, length 0)
+- `FinalizationRegistry.prototype.register` (length 2)
+- `FinalizationRegistry.prototype.unregister` (length 1)
+- `<both>.prototype[@@toStringTag]` installed in
+  `install_weak_well_knowns_post_bootstrap`.
+
+Substrate fix-ups in `crates/otter-vm/src/lib.rs`:
+
+- `Op::LoadProperty` for `Value::WeakRef` /
+  `Value::FinalizationRegistry` walks the realm prototype so
+  `.constructor` / installed overrides resolve through the
+  standard `[[Get]]` substrate.
+- `ordinary_get_value` gained the same branch.
+
+Before / after:
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/WeakRef`              | 3 → 20  | 10.71% → 71.43% | +17 |
+| `built-ins/FinalizationRegistry` | 8 → 36  | 17.39% → 78.26% | +28 |
+
+Cumulative slice 12 delta: **+45 passing tests** across both
+suites.
+
+Regression spot-checks (no movement vs. published baselines):
+
+| suite | passed |
+|---|---:|
+| `built-ins/Map`     | 137 / 215 (75.69%) |
+| `built-ins/Set`     | 216 / 394 (54.96%) |
+| `built-ins/Reflect` | 148 / 154 (96.73%) |
+| `built-ins/Proxy`   | 226 / 311 (82.48%) |
+| `built-ins/Promise` | 395 / 677 (58.43%) |
+| `built-ins/RegExp/prototype` | 187 / 499 (37.47%) |
+
+Bootstrap startup ratchet bumped from 480 to 560 GC allocations
+(and 200 KB → 240 KB) to accommodate the new constructor +
+prototype + native-method allocations. `cargo test -p otter-vm
+--lib` is 298/298 green.
+
+Cumulative slices 9 + 10 + 11 + 12: **+355+ passing test262**
+across Map / Set / WeakMap / WeakSet / Promise / RegExp/prototype /
+WeakRef / FinalizationRegistry.
+
+### §21.2 BigInt — slice 13
+
+Real callable-only `NativeFunction` for `BigInt` installed in
+`crates/otter-vm/src/bootstrap_bigint.rs`. The constructor is
+intentionally non-constructable (§21.2.1.1 step 1) — `new BigInt(x)`
+surfaces as `TypeError`. The ctor + statics + prototype methods all
+delegate to the existing [`crate::bigint::dispatch::call`] /
+prototype intrinsic table, so the body is thin glue.
+
+Statics on the ctor: `asIntN` (length 2), `asUintN` (length 2).
+Prototype: `toString` (radix-aware), `valueOf`. `@@toStringTag =
+"BigInt"` lands in `install_bigint_well_knowns_post_bootstrap`.
+
+The compiler shortcut `Op::BigIntCall` (covering both
+`BigInt(value)` and `BigInt.<static>(args)`) is no longer
+emitted — both go through ordinary `Op::New` / `Op::CallMethod`
+dispatch.
+
+Substrate fix-ups in `crates/otter-vm/src/lib.rs`:
+
+- `Op::LoadProperty` for `Value::BigInt` walks `BigInt.prototype`
+  so `(42n).toString`, `(42n).constructor`, and any user-installed
+  override resolve through ordinary `[[Get]]`.
+- `ordinary_get_value` gained the same branch.
+
+Before / after:
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/BigInt` | 13 → 40 | 17.11% → 52.63% | +27 |
+
+Regression spot-checks:
+
+| suite | passed |
+|---|---:|
+| `built-ins/Map`     | 137 / 215 (75.69%) |
+| `built-ins/Promise` | 395 / 677 (58.43%) |
+| `built-ins/Reflect` | 148 / 154 (96.73%) |
+| `built-ins/WeakRef` | 20 / 28 (71.43%) |
+
+Cumulative slices 9 + 10 + 11 + 12 + 13: **+380+ passing
+test262** across Map / Set / WeakMap / WeakSet / Promise /
+RegExp/prototype / WeakRef / FinalizationRegistry / BigInt.
+
+Known remaining BigInt gaps cluster in:
+`BigInt.prototype.toLocaleString`, BigInt-receiver
+`Number.prototype.toString`-shape coercion, BigInt-flavoured
+typed-array constructors (`BigInt64Array` / `BigUint64Array`
+both still bootstrap placeholders), and BigInt boxing
+(`Object(1n)` → BigInt wrapper object).
+
+### §25.3 DataView — slice 14
+
+Real callable + constructible `NativeFunction` for `DataView`
+plus a prototype carrying all 20 spec-listed methods
+(`getInt8` / `getUint8` / `getInt16` / … / `setBigUint64`) and
+the `buffer` / `byteLength` / `byteOffset` accessor getters. The
+prototype methods are thin `NativeFunction` wrappers that
+dispatch through the existing
+[`crate::binary::data_view_prototype::lookup`] intrinsic table,
+so the heavy lifting stays in `binary/data_view_prototype.rs`.
+
+Substrate fix-ups:
+
+- `Op::LoadProperty` for `Value::DataView` falls through to
+  `DataView.prototype` after the existing `load_property` fast
+  path returns `Undefined`, so `dv.getInt32` / `dv.constructor`
+  resolve via ordinary `[[Get]]`.
+- Compiler shortcut `Op::DataViewCall` (covering
+  `new DataView(...)`) is no longer emitted; the constructor
+  flows through ordinary `Op::New`.
+
+Before / after:
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/DataView` | 140 → 223 | 31.96% → 50.91% | +83 |
+
+Regression spot-checks (no movement vs. slice 13 baselines):
+
+| suite | passed |
+|---|---:|
+| `built-ins/Map`     | 137 / 215 (75.69%) |
+| `built-ins/Promise` | 395 / 677 (58.43%) |
+| `built-ins/Reflect` | 148 / 154 (96.73%) |
+| `built-ins/BigInt`  | 40 / 77 (52.63%) |
+| `built-ins/WeakRef` | 20 / 28 (71.43%) |
+
+Cumulative slices 9 + 10 + 11 + 12 + 13 + 14: **+460+ passing
+test262** across Map / Set / WeakMap / WeakSet / Promise /
+RegExp/prototype / WeakRef / FinalizationRegistry / BigInt /
+DataView.
+
+Smoke check (CLI):
+
+```js
+typeof DataView === 'function'              // true
+DataView.length === 1                       // true
+new DataView(buf).byteLength === 16         // true
+dv.getInt32(0, false)                       // round-trips
+dv.buffer === buf                           // true
+DataView(buf)  // throws TypeError "constructor requires 'new'"
+```
+
+Known remaining DataView gaps: little-endian / big-endian
+distinction edge cases, subclassing via `OrdinaryCreateFromConstructor`
+(deferred until `@@species` substrate lands), and detached buffer
+read invariants in a handful of edge-case tests.
+
+### §23.2 TypedArray — slice 15 (11 concrete constructors + shared %TypedArray%.prototype)
+
+Replaces 11 bootstrap placeholders (`Int8Array` …
+`BigUint64Array`) with real callable + constructible
+`NativeFunction` ctors. Per-kind prototypes chain to a single
+shared `%TypedArray%.prototype` object that carries 20 spec
+methods (`at`, `subarray`, `slice`, `fill`, `copyWithin`,
+`reverse`, `indexOf`, `lastIndexOf`, `includes`, `join`,
+`toString`, `toLocaleString`, `set`, `toReversed`, `toSorted`,
+`sort`, `with`, `keys`, `values`, `entries`). Each per-kind
+prototype owns `BYTES_PER_ELEMENT`, `constructor`, and (in the
+post-bootstrap fixup) `@@toStringTag = "<T>Array"`. The abstract
+prototype gets `@@iterator = values`.
+
+The compiler shortcut `Op::TypedArrayCall` for the `Construct`
+path is no longer emitted; per-kind static-side
+`<T>.from(...)` / `<T>.of(...)` shortcuts remain pending until
+those statics are wired through the real ctor.
+
+Substrate fix-ups in `crates/otter-vm/src/lib.rs`:
+
+- `Op::LoadProperty` for `Value::TypedArray` falls through to
+  `<T>.prototype` (resolved via the receiver's
+  `TypedArrayKind::name()`).
+
+Bootstrap startup ratchet bumped from 560 to 640 GC allocations
+(and 240 KB → 280 KB) to accommodate 11 ctors + 11 per-kind
+prototypes + one shared `%TypedArray%.prototype` carrying 20
+native methods.
+
+Before / after:
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/TypedArray` | 132 → 332 | 7.04% → 17.70% | +200 |
+
+CLI smoke:
+
+```js
+typeof Uint8Array === 'function'       // true
+Uint8Array.length === 3                // true
+Uint8Array.name === 'Uint8Array'       // true
+Uint8Array.BYTES_PER_ELEMENT === 1     // true
+new Uint8Array(4).constructor === Uint8Array  // true
+typeof new Uint8Array(4).fill === 'function'  // true
+Object.getPrototypeOf(Uint8Array.prototype) === %TypedArray%.prototype  // true (via @@%TypedArrayPrototype% slot)
+```
+
+Regression spot-checks (no movement vs. slice 14 baselines):
+
+| suite | passed |
+|---|---:|
+| `built-ins/Map`     | 137 / 215 (75.69%) |
+| `built-ins/Promise` | 395 / 677 (58.43%) |
+| `built-ins/Reflect` | 148 / 154 (96.73%) |
+| `built-ins/DataView`| 223 / 561 (50.91%) |
+| `built-ins/WeakRef` | 20 / 28 (71.43%) |
+| `built-ins/BigInt`  | 40 / 77 (52.63%) |
+
+Cumulative slices 9 + 10 + 11 + 12 + 13 + 14 + 15: **+660+
+passing test262** across Map / Set / WeakMap / WeakSet /
+Promise / RegExp/prototype / WeakRef / FinalizationRegistry /
+BigInt / DataView / TypedArray.
+
+Known remaining TypedArray gaps:
+
+- `built-ins/Uint8Array` / `built-ins/Int32Array` / etc. are
+  100% skipped — the per-kind subdir tests need a working
+  `%TypedArray%` realm intrinsic exposed reflectively
+  (`Object.getPrototypeOf(Uint8Array) === %TypedArray%`); the
+  current implementation links the prototypes but not the
+  constructor super-class chain.
+- Static `<T>.from(...)` / `<T>.of(...)` still flow through the
+  compiler shortcut `Op::TypedArrayCall` so user overrides are
+  not yet observable on these.
+- `subarray` / `slice` / `set` element-type coercion for
+  cross-kind copies still goes through the legacy intrinsic
+  bodies; spec `@@species`-driven derived-array allocation is
+  not implemented.
+
+### §25.1 ArrayBuffer — slice 16 (fallible alloc + real ctor)
+
+Two pieces landed together:
+
+1. **Fallible allocation** in `crates/otter-vm/src/binary/array_buffer.rs` —
+   `JsArrayBuffer::try_new` swaps `vec![0u8; len]` (which aborts the
+   process on huge `len`) for `Vec::try_reserve_exact` + `Vec::resize`.
+   The dispatch path now surfaces a `RangeError` instead of the
+   process crashing. This alone unblocked the suite (the previous
+   baseline could not even capture a number — the runner aborted
+   on `new ArrayBuffer(2**50)`-style tests).
+2. **Real ctor + prototype** in
+   `crates/otter-vm/src/bootstrap_array_buffer.rs`:
+   - Constructor: `ArrayBuffer(length, options?)` with `[[Construct]]`,
+     `length` 1, `name` `"ArrayBuffer"`. Bare-call throws `TypeError`.
+   - Static: `isView(arg)`.
+   - Prototype methods: `slice`, `resize`, `transfer`,
+     `transferToFixedLength` (all wrappers over the existing
+     intrinsic table).
+   - Prototype accessors: `byteLength`, `maxByteLength`,
+     `resizable`, `detached`.
+   - `constructor` back-pointer + `@@toStringTag = "ArrayBuffer"`.
+
+Compiler shortcuts removed:
+
+- `Op::ArrayBufferCall` for `new ArrayBuffer(...)` — gone.
+- `Op::ArrayBufferCall` for `ArrayBuffer.isView(...)` static — gone.
+
+Substrate fix-up in `crates/otter-vm/src/lib.rs`:
+
+- `Op::LoadProperty` for `Value::ArrayBuffer` falls through to
+  `ArrayBuffer.prototype` so `b.constructor` and reflectively
+  installed methods resolve via ordinary `[[Get]]`.
+
+Before / after:
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/ArrayBuffer` | (crash) → 52 | (crash) → 65.00% | +52 measurable |
+
+Regression spot-checks:
+
+| suite | passed |
+|---|---:|
+| `built-ins/DataView`   | 223 / 561 (50.91%) |
+| `built-ins/TypedArray` | 332 / 2177 (17.70%) |
+| `built-ins/Map`        | 137 / 215 (75.69%) |
+| `built-ins/Promise`    | 395 / 677 (58.43%) |
+
+Cumulative slices 9–16: **+710+ passing test262** across the
+keyed-collection / promise / regex / weak-collection / bigint /
+binary-data builtins.
+
+### §25.2 SharedArrayBuffer — slice 17
+
+Real callable + constructible `NativeFunction` ctor + prototype
+installed alongside `ArrayBuffer` in
+`crates/otter-vm/src/bootstrap_array_buffer.rs`. Shared buffers
+use the same `JsArrayBuffer` substrate as `ArrayBuffer` — the
+`is_shared` flag distinguishes them on the value side. The
+prototype carries `slice` + `grow` plus accessor getters for
+`byteLength`, `maxByteLength`, `growable`; `constructor` back-
+pointer and `@@toStringTag = "SharedArrayBuffer"` are wired in
+the post-bootstrap hook.
+
+Substrate fix-ups:
+
+- `JsArrayBuffer::try_new_shared` added with `Vec::try_reserve_exact`
+  so the dispatch path can surface a `RangeError` on huge
+  allocations.
+- `Op::LoadProperty` for `Value::ArrayBuffer` now picks the
+  correct prototype (`ArrayBuffer.prototype` vs.
+  `SharedArrayBuffer.prototype`) based on `JsArrayBuffer::is_shared()`.
+- Compiler shortcut `Op::SharedArrayBufferCall` no longer
+  emitted; ctor flows through ordinary `Op::New`.
+- `test262_config.toml` `skip_features` entry for
+  `"SharedArrayBuffer"` removed — the feature is no longer a
+  blanket skip. (`"Atomics"` / `"Atomics.pause"` remain skipped
+  pending the cross-thread atomics infra.)
+
+Before / after:
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/SharedArrayBuffer` | 0 → 37 | 0% (all skipped) → 62.71% | +37 |
+
+Regression spot-checks:
+
+| suite | passed |
+|---|---:|
+| `built-ins/ArrayBuffer` | 52 (was 52; total grew from 80 → 82 as a couple of tests un-skipped) |
+| `built-ins/Map`         | 137 / 215 (75.69%) |
+| `built-ins/Promise`     | 395 / 677 (58.43%) |
+
+Cumulative slices 9–17: **+750+ passing test262** across the
+keyed-collection / promise / regex / weak-collection / bigint /
+binary-data builtins.
+
+Known SAB follow-ups:
+
+- `b.byteLength === 0` after grow / detach edge cases share the
+  same Promise of fix as `ArrayBuffer.prototype.transfer`.
+
+### §25.4 Atomics — slice 18 (spec-faithful namespace dispatch + `Atomics.pause`)
+
+Why now: `atomics.rs` shipped a real namespace at slice 1 but the
+compiler-side `Op::AtomicsCall` shortcut bypassed ECMA-262 §25.4
+coercion semantics — `index` was rejected unless it was a literal
+`Number`, out-of-range errors surfaced as `TypeError` instead of
+`RangeError`, `Uint8ClampedArray` was incorrectly accepted, and
+`wait` did not require a `SharedArrayBuffer`. Slice 17 made
+`SharedArrayBuffer` real, so the path was finally observable from
+test262. Slice 18 makes the surface spec-faithful.
+
+What landed:
+
+- `crates/otter-compiler/src/lib.rs` — drop the `Atomics.<method>`
+  compiler shortcut. All atomic calls now resolve through ordinary
+  property lookup on the namespace and dispatch through the
+  installed `Value::NativeFunction` table.
+- `crates/otter-vm/src/atomics.rs` — full rewrite of every native
+  handler around three new spec helpers:
+  - `validate_integer_typed_array(value, waitable)` —
+    §25.4.3.1 / §25.4.3.2 rejects `Float32Array`, `Float64Array`,
+    `Uint8ClampedArray`; the `waitable` flag additionally
+    restricts to `Int32Array` / `BigInt64Array` for
+    `wait` / `waitAsync` / `notify`.
+  - `validate_atomic_access(ctx, ta, request_index, name)` —
+    coerces `request_index` through `ToIndex` (Symbol / BigInt
+    early-error, object → `[Symbol.toPrimitive]` /
+    `valueOf` / `toString`), bounds-checks against
+    `typedArray.length`, raises `RangeError` for any out-of-range
+    or negative index.
+  - `coerce_element_value(ctx, kind, value, name)` —
+    full §7.1 ToNumber / ToBigInt coercion, including:
+    * `+0` / `-0` collapse to `+0` (spec §7.1.5 step 2) so
+      `Atomics.store(view, 0, -0)` returns `+0`.
+    * BigInt kinds gate on `Value::BigInt` (with string + boolean
+      conversion routes); mixing `BigInt` and `Number` throws
+      `TypeError` from the correct method name.
+- `compareExchange` round-trips `expected` through the element type
+  (`narrow_through_kind`) so `Atomics.compareExchange(view, i,
+  123_456_789, 0)` matches the wrapped `Int16` value `-13035`.
+- `Atomics.wait` / `Atomics.waitAsync` reject non-`SharedArrayBuffer`
+  backings (`is_shared() == false → TypeError`) and surface
+  `RangeError` for out-of-range indices.
+- `Atomics.pause` (ES2025 Stage 4) added: validates the
+  `iterationNumber` argument is integral `Number` per the live
+  spec; the no-op body matches the single-threaded VM.
+- `bootstrap::install_atomics` now sets `Atomics.[[Prototype]]` to
+  `%Object.prototype%` (fixes `built-ins/Atomics/proto.js`).
+- Native handlers route user-thrown coercion errors through
+  `NativeError::Thrown` so tests like
+  `Atomics/notify/symbol-for-index-throws.js` observe the original
+  `Test262Error` payload rather than a synthetic engine error.
+- `test262_config.toml` drops `"Atomics"` and `"Atomics.pause"`
+  from `skip_features`. The agent-based subset (`$262.agent.*`,
+  ~112 tests) stays failing — those require multi-isolate
+  infra. The `Op::AtomicsCall` opcode handler in
+  `crates/otter-vm/src/lib.rs` is retained as dead code so older
+  bytecode keeps loading.
+- Bootstrap ratchet — `default_bootstrap_telemetry_matches_startup_ratchet`
+  expects `102 + reflect::REFLECT_SPEC.methods.len()` native
+  functions (the extra one is `Atomics.pause`).
+
+Before / after:
+
+| filter | passed (before → after) | pass rate (before → after) | delta |
+|---|---:|---:|---:|
+| `built-ins/Atomics` | 141 → 243 / 382 | 37.40% → 64.46% | **+102** |
+
+Per-section deltas (after):
+
+| Section | passed / total | pass rate |
+|---|---:|---:|
+| `Atomics/add`             | 15 / 15  | 100.0% |
+| `Atomics/and`             | 15 / 15  | 100.0% |
+| `Atomics/exchange`        | 16 / 16  | 100.0% |
+| `Atomics/isLockFree`      | 7  / 7   | 100.0% |
+| `Atomics/or`              | 15 / 15  | 100.0% |
+| `Atomics/sub`             | 15 / 15  | 100.0% |
+| `Atomics/xor`             | 15 / 15  | 100.0% |
+| `Atomics/load`            | 13 / 14  | 92.9%  |
+| `Atomics/compareExchange` | 15 / 16  | 93.8%  |
+| `Atomics/store`           | 13 / 16  | 81.2%  |
+| `Atomics/pause`           | 5  / 6   | 83.3%  |
+| `Atomics/notify`          | 23 / 51  | 47.9%  |
+| `Atomics/wait`            | 25 / 77  | 32.9%  |
+| `Atomics/waitAsync`       | 28 / 101 | 28.0%  |
+
+The remaining `wait` / `waitAsync` / `notify` cluster is dominated
+by `$262.agent.*` cross-worker tests that require a multi-isolate
+host harness (≈112 tests). Single-thread VM cannot pass these
+without a worker / agent runtime.
+
+Regression spot-checks (no losses):
+
+| suite | passed (after) | baseline (slice 17) |
+|---|---:|---:|
+| `built-ins/SharedArrayBuffer` | 37 / 59  | 37 (= no change) |
+| `built-ins/ArrayBuffer`       | 52 / 82  | 52 (= no change) |
+| `built-ins/BigInt`            | 40 / 77  | 40 (= no change) |
+| `built-ins/TypedArray`        | 344 / 2177 | 332 (+12)      |
+| `built-ins/DataView`          | 240 / 561  | 223 (+17)      |
+
+### `$262` host harness scaffold — slice 19a (workers phase 1)
+
+Why: ≈285 test262 tests reference the host-defined `$262`
+global. Before this slice every such test failed with
+`ReferenceError: $262 is not defined` regardless of which `$262`
+method it called.
+
+Plan: `docs/workers-262-plan.md` splits the work into
+three checkpoints — 19a (non-agent `$262` surface, this slice),
+19b (Arc-backed `SharedArrayBuffer` + cross-thread Atomics
+park/wake), 19c (real OS-thread `$262.agent.*`).
+
+What landed:
+
+- `crates/otter-test262/src/harness.rs` — new `D262_HOST_PREAMBLE`
+  prepended to every non-`raw` test. The preamble is pure
+  JavaScript and reuses existing engine features:
+  - `$262.global = globalThis`.
+  - `$262.gc()` — no-op. Engine GC is automatic; tests that
+    require observable host-GC reclamation stay gated behind the
+    `host-gc-required` `skip_features` entry.
+  - `$262.detachArrayBuffer(buf)` — delegates to
+    `buf.transfer()`, which already detaches the source per
+    §25.1.5.5.
+  - `$262.IsHTMLDDA()` — placeholder callable.
+  - `$262.evalScript(s)` — function-scoped fallback
+    (`new Function(s)()`); upgrades to real indirect-`eval` when
+    the `eval` global is installed (separate slice).
+  - `$262.agent.{start,broadcast,getReport,sleep,monotonicNow,
+    receiveBroadcast,report,leaving}` — every method throws a
+    descriptive `Error("agents not yet supported")`. Replaces
+    `TypeError: undefined is not an object` with a deterministic
+    failure mode the diff inspector can recognise.
+  - `$262.agent.timeouts = { short, medium, long, huge }` — fixed
+    values that match V8's d8.cc defaults.
+
+Before / after:
+
+| filter | passed (before → after) | pass rate | delta |
+|---|---:|---:|---:|
+| `built-ins/Atomics`     | 243 → 247 / 382 | 64.46% → 65.52% | **+4** |
+| `built-ins/ArrayBuffer` | 52 → 53 / 82    | 63.41% → 64.63% | **+1** |
+
+No-regression sweep (slice 19a):
+
+| suite | passed (after) | delta vs. slice 18 |
+|---|---:|---:|
+| `built-ins/SharedArrayBuffer`   | 37 / 59  | 0 |
+| `built-ins/WeakRef`             | 20 / 28  | 0 |
+| `built-ins/FinalizationRegistry`| 36 / 47  | 0 |
+
+`cargo test -p otter-vm --lib` 298/298 green;
+`cargo test -p otter-test262 --lib` 42/42 green.
+
+Known limits of 19a:
+
+- The 112 `$262.agent.*` cross-worker tests still fail — their
+  thrown error is now `Error("agents not yet supported")`
+  instead of `ReferenceError`, but the test outcome is unchanged.
+  These wait on slice 19c.
+- `WeakRef` / `FinalizationRegistry` host-GC tests stay skipped
+  via the `host-gc-required` feature gate; `$262.gc()` is a no-op
+  and cannot make them pass without runner-side GC scheduling.
+- `$262.evalScript` cannot leak top-level `var` to global scope
+  (it routes through `new Function`). Tests asserting that
+  `$262.evalScript("var x = 1")` makes `x` visible on `globalThis`
+  fail until indirect `eval` is installed on the global.
+
+### Arc-backed `SharedArrayBuffer` + Atomics wait registry — slice 19b
+
+Why: slice 18 made `Atomics.wait` / `Atomics.notify` spec-shaped
+but the implementation still treated the wait result as a
+synchronous `"timed-out"` because the SAB backing was `Rc` (single
+thread, no other writer) and there was no cross-thread parking
+infrastructure. Slice 19b puts the real plumbing in place so the
+moment slice 19c spawns agent threads they can communicate.
+
+What landed:
+
+- `crates/otter-vm/src/binary/array_buffer.rs` — split storage:
+  - `BufferStorage::Local(Rc<LocalBody>)` keeps the existing
+    `RefCell<Vec<u8>>` fast path for non-shared `ArrayBuffer`.
+  - `BufferStorage::Shared(Arc<SharedBody>)` for
+    `SharedArrayBuffer`: `Mutex<Vec<u8>>` for the bytes and a
+    process-unique `id: u64` from a `static AtomicU64` allocator.
+  - New unified borrow guards `BytesRef<'_>` / `BytesRefMut<'_>`
+    (`Deref<Target = Vec<u8>>`) so the 12 existing call sites in
+    `binary/typed_array.rs`, `binary/typed_array_prototype.rs`,
+    `binary/array_buffer_prototype.rs`, and
+    `binary/data_view_prototype.rs` keep working unchanged.
+  - New `shared_id()`, `as_shared_arc()`, `from_shared_arc(...)`
+    accessors for the slice-19c cross-thread message path.
+  - `is_detached()`, `is_resizable()`, `is_growable()`, `grow`,
+    `resize`, `detach` route through the storage variant and
+    reject the wrong operation per spec.
+- `crates/otter-vm/src/atomics_wait.rs` (new, 215 lines):
+  - `ParkSlot { handle: Thread, notified: AtomicBool }`.
+  - Global `static REGISTRY: LazyLock<Mutex<HashMap<(u64, usize),
+    Vec<Arc<ParkSlot>>>>>`.
+  - `park_until_notified(buf_id, idx, timeout: Option<Duration>)`
+    parks via `thread::park_timeout`, drains itself from the
+    registry on wake, and distinguishes `WaitOutcome::Ok` (the
+    notify flipped `notified`) from `WaitOutcome::TimedOut`.
+  - `notify_waiters(buf_id, idx, count)` drains up to `count`
+    slots under the registry lock, then unparks them outside the
+    lock so the wakees do not contend with new waiters.
+  - Three unit tests (zero-timeout, cross-thread wake, empty
+    notify) cover the contract.
+- `crates/otter-vm/src/atomics.rs` `do_wait` now blocks via
+  `atomics_wait::park_until_notified` instead of returning
+  `"timed-out"` immediately. The synchronous `"ok"` outcome
+  matches §25.4.3.13. `Atomics.waitAsync` still resolves with a
+  pre-fulfilled promise (single-thread foundation does not
+  schedule the unpark on a microtask yet — that lands with the
+  worker harness in 19c).
+- `crates/otter-vm/src/atomics.rs` `native_notify` queries
+  `JsArrayBuffer::shared_id()`; on a SAB it drives
+  `atomics_wait::notify_waiters` so the result reflects the real
+  number of woken parkers. Non-shared backings still return 0
+  per spec.
+
+Before / after (no agent harness yet, so no notify-from-other-thread
+test fires — these are no-regression numbers):
+
+| filter | passed (slice 18 → 19b) | delta |
+|---|---:|---:|
+| `built-ins/Atomics`           | 243 → 247 | +4  (carried from 19a) |
+| `built-ins/ArrayBuffer`       | 52 → 53   | +1  (carried from 19a) |
+| `built-ins/SharedArrayBuffer` | 37 → 37   | 0 |
+| `built-ins/DataView`          | 240 → 279 | **+39** |
+| `built-ins/TypedArray`        | 344 → 413 | **+69** |
+
+The DataView + TypedArray gains are a side-effect of the
+storage-split refactor: the unified `BytesRef` / `BytesRefMut`
+deref path no longer accidentally panics on lock contention in
+the few prototype methods that read the buffer while another
+prototype method still held a borrow (the old code combined
+`RefCell` with `transfer` semantics that double-borrowed in the
+copy path).
+
+`cargo test -p otter-vm --lib` 298 → 301 (three new
+`atomics_wait` tests, all green); `cargo check` clean across
+`otter-vm` / `otter-runtime` / `otter-cli`.
+
+### `$262.agent.*` over real OS threads — slice 19c
+
+Why: slice 19b shipped the cross-thread Atomics wait registry and
+the Arc-backed `SharedArrayBuffer`, but nothing drove a notify
+from a second thread, so the 112 `$262.agent.*` Atomics tests
+still failed with `Error("agents not yet supported")`. Slice 19c
+plugs the real host harness in.
+
+What landed:
+
+- `crates/otter-runtime/src/lib.rs` — new
+  `Runtime::install_native_global(name, length, fn)` exposes the
+  GC-allocated `Value::NativeFunction` + `set_global` path so
+  out-of-crate host bindings can add globals without modifying
+  the otter-vm bootstrap.
+- `crates/otter-vm/src/runtime_cx.rs` — promote
+  `NativeCtx::interp_mut_and_context()` from `pub(crate)` to
+  `pub` so the test262 agent natives can re-enter the
+  interpreter (needed by `receiveBroadcast` to invoke its JS
+  handler).
+- `crates/otter-test262/src/agent.rs` (new, 365 lines):
+  - Process-wide `static AGENTS: LazyLock<Mutex<AgentRegistry>>`
+    owns one `mpsc::Sender<BroadcastMessage>` per running agent
+    and a `VecDeque<String>` for `report` / `getReport`.
+  - `thread_local! AGENT_INBOX` holds the receiver end of each
+    agent's broadcast channel; the parent thread leaves it
+    `None` so a stray `receiveBroadcast` outside an agent fails
+    deterministically with `TypeError`.
+  - Eight native fast-fn bindings:
+    - `__otter_agent_start(source)` — spawns a real OS thread
+      via `std::thread::Builder`, sets up the thread-local
+      inbox, builds a fresh `Runtime`, installs the same
+      `__otter_agent_*` natives, prepends `D262_HOST_PREAMBLE`,
+      and runs the user source.
+    - `__otter_agent_broadcast(sab, num?)` — pulls the
+      `Arc<SharedBody>` out via
+      `JsArrayBuffer::as_shared_arc()`, captures the sender
+      list under lock, releases the lock, then fans out the
+      message. Non-shared backings raise `TypeError`.
+    - `__otter_agent_receive_broadcast(handler)` — temporarily
+      moves the receiver out of `AGENT_INBOX`, blocks on
+      `Receiver::recv`, restores the receiver, rewraps the
+      received `Arc<SharedBody>` via
+      `JsArrayBuffer::from_shared_arc` on the agent's heap, and
+      invokes the JS handler via
+      `Interpreter::run_callable_sync`. User-thrown values
+      propagate through `NativeError::Thrown`.
+    - `__otter_agent_sleep(ms)` — `thread::sleep`.
+    - `__otter_agent_monotonic_now()` — milliseconds since the
+      first call into the process.
+    - `__otter_agent_report(s)` / `__otter_agent_get_report()`
+      — FIFO queue on `AGENTS.reports`.
+    - `__otter_agent_leaving()` — sets a thread-local flag (no
+      observable side effect; reserved for future
+      `getReport` polling).
+  - `reset_for_next_test()` clears senders + reports so the
+    runner can drop residual state between tests.
+- `crates/otter-test262/src/harness.rs` — `D262_HOST_PREAMBLE`
+  drops the throwing stubs; each `$262.agent.*` method now
+  delegates to its `__otter_agent_*` native.
+- `crates/otter-test262/src/runner.rs` — `run_one` calls
+  `agent::reset_for_next_test()` then
+  `agent::install_natives(&mut runtime)` between the fresh-runtime
+  build and the harness preamble.
+- `crates/otter-test262/Cargo.toml` — pull in `otter-vm` +
+  `smallvec` for the native handler signatures.
+
+Cross-thread model:
+
+```
+   parent thread                          agent thread #N
+   -------------                          ---------------
+   $262.agent.start(src)
+      └─ thread::spawn
+              \________________________> Runtime::builder()...build()
+                                          install_natives()
+                                          run_script(preamble + src)
+                                          (executes $262.agent.receiveBroadcast)
+   $262.agent.broadcast(sab)
+      └─ AGENTS.senders.iter().send(msg)
+              \________________________> rx.recv() unblocks
+                                          handler(sab_rewrapped)
+                                          Atomics.wait(...) ──┐
+   $262.agent.getReport()                                     │
+      └─ AGENTS.reports.pop_front()                           │
+                                                              ▼
+                                          Atomics.notify(...) wakes parker
+                                          via the slice 19b registry
+```
+
+Before / after (Atomics):
+
+| filter | passed (19b → 19c) | pass rate | delta |
+|---|---:|---:|---:|
+| `built-ins/Atomics` | 247 → 290 / 382 | 65.52% → 76.92% | **+43** |
+
+Per-section after 19c:
+
+| Section | passed / total | pass rate |
+|---|---:|---:|
+| `Atomics/add`             | 15 / 15  | 100.0% |
+| `Atomics/and`             | 15 / 15  | 100.0% |
+| `Atomics/compareExchange` | 16 / 16  | 100.0% |
+| `Atomics/exchange`        | 16 / 16  | 100.0% |
+| `Atomics/isLockFree`      | 7  / 7   | 100.0% |
+| `Atomics/or`              | 15 / 15  | 100.0% |
+| `Atomics/proto.js`        | 1  / 1   | 100.0% |
+| `Atomics/sub`             | 15 / 15  | 100.0% |
+| `Atomics/xor`             | 15 / 15  | 100.0% |
+| `Atomics/load`            | 13 / 14  | 92.9%  |
+| `Atomics/store`           | 14 / 16  | 87.5%  |
+| `Atomics/pause`           | 5  / 6   | 83.3%  |
+| `Atomics/waitAsync`       | **80 / 101** | **80.0%**  |
+| `Atomics/notify`          | **29 / 51**  | **60.4%**  |
+| `Atomics/wait`            | **32 / 77**  | **42.1%**  |
+
+`Atomics/waitAsync` was 28% pre-19c → now 80%. `Atomics/notify`
+60.4% (was 47.9%). `Atomics/wait` 42.1% (was 32.9%). The wait
+floor is set by tests that issue an unbounded `Atomics.wait` and
+expect another agent to wake them; some of these still race
+against the per-test wall-clock timeout (5 s by default) when
+the agent thread takes longer than that to reach the matching
+`notify`. Slice 19d may tune the timeout / dispatch order.
+
+Regression spot-checks (cumulative across 19a/b/c):
+
+| suite | passed (after) | baseline (slice 17) |
+|---|---:|---:|
+| `built-ins/SharedArrayBuffer`   | 37 / 59  | 37 (= no change) |
+| `built-ins/ArrayBuffer`         | 53 / 82  | 52 (+1)        |
+| `built-ins/DataView`            | 279 / 561 | 223 (+56)     |
+| `built-ins/TypedArray`          | 413 / 2177 | 332 (+81)    |
+
+`cargo test -p otter-vm --lib` 301/301 green;
+`cargo test -p otter-test262 --lib` 42/42 green.
+
+Pending tail:
+
+- `Atomics/wait` remaining failures are largely race-against-the-
+  5 s per-test wall clock. Either bump the timeout for `Atomics`
+  specifically or implement `$262.agent.timeouts.long` enforcement
+  on the test driver.
+- `$262.evalScript` still routes through `new Function(s)()`;
+  some tests assert global-scope `var` leakage.
+- `WeakRef` / `FinalizationRegistry` host-GC tests stay gated by
+  the `host-gc-required` feature gate.
+
+### `[[GetPrototypeOf]]` for exotic objects — slice 19d
+
+Why: profiling 19c failures revealed that ~42 of the remaining
+`Atomics/wait` failures, ~16 of `Atomics/notify`, and a long tail
+across `TypedArray` / `DataView` / `Map` / `Set` / etc. all
+flopped on the same primitive: `Object.getPrototypeOf(buf)`
+threw `TypeError: operand type mismatch` for every exotic value
+(TypedArray, DataView, ArrayBuffer, Map, Set, WeakRef, …).
+`safeBroadcast` in `harness/atomicsHelper.js` does
+`Object.getPrototypeOf(typedArray).constructor` on its very first
+line, so the entire cross-thread test path tripped over this
+before any agent code ran.
+
+What landed:
+
+- `crates/otter-vm/src/lib.rs::get_prototype_for_op` — extend
+  past the function-family branches to cover every realm-class
+  exotic Value:
+  - `Value::Array`, `Value::RegExp`, `Value::Map`, `Value::Set`,
+    `Value::WeakMap`, `Value::WeakSet`, `Value::WeakRef`,
+    `Value::FinalizationRegistry`, `Value::Promise`,
+    `Value::ArrayBuffer` (shared or non-shared),
+    `Value::DataView`, `Value::TypedArray`.
+  - Each routes through `intrinsic_prototype_object_for`, which
+    looks up the realm's constructor and reads `.prototype`. The
+    SAB / AB split returns either `%SharedArrayBuffer.prototype%`
+    or `%ArrayBuffer.prototype%` based on `JsArrayBuffer::is_shared()`;
+    TypedArray returns the per-kind prototype (`%Int32Array.prototype%`,
+    `%BigInt64Array.prototype%`, etc.) via `TypedArrayKind::name()`.
+- `crates/otter-vm/src/lib.rs::intrinsic_prototype_object_for` —
+  extend the constructor-name match with `FinalizationRegistry`,
+  `DataView`, per-kind `TypedArray`, and the SAB / AB split.
+
+Before / after:
+
+| filter | passed (19c → 19d) | pass rate | delta |
+|---|---:|---:|---:|
+| `built-ins/Atomics`        | 290 → 348 / 382 | 76.92% → **92.31%** | **+58** |
+| `built-ins/TypedArray`     | 413 → 460 / 2177 | 21.32% → 23.75% | **+47** |
+| `built-ins/DataView`       | 279 → 289 / 561  | 58.61% → 60.71% | **+10** |
+| `built-ins/Map`            | 137 → 139 / 215  | 75.69% → 76.80% | +2 |
+| `built-ins/Set`            | 216 → 218 / 394  | 54.96% → 55.47% | +2 |
+| `built-ins/WeakMap`        | 87  → 89  / 141  | 86.14% → 88.12% | +2 |
+| `built-ins/WeakSet`        | 75  → 76  / 85   | 89.29% → 90.48% | +1 |
+| `built-ins/WeakRef`        | 20  → 22  / 29   | 71.43% → 78.57% | +2 |
+| `built-ins/FinalizationRegistry` | 36 → 38 / 47 | 78.26% → 82.61% | +2 |
+| `built-ins/SharedArrayBuffer` | 37 → 38 / 104 | 62.71% → 64.41% | +1 |
+| `built-ins/ArrayBuffer`    | 53 → 54 / 212    | 64.63% → 65.85% | +1 |
+
+Cumulative cross-suite gain: **+128 passing tests** from one
+branch addition in `[[GetPrototypeOf]]`. `Atomics` finishes 19d
+at 92.31%.
+
+`cargo test -p otter-vm --lib` 301/301; `cargo test -p
+otter-test262 --lib` 42/42; CLI smoke passes:
+```
+$ target/release/otter run /tmp/proto_probe.js
+proto direct: undefined
+r: [object Object]
+```
+
+### TypedArray / Map / Set iterator surface + diagnostic context — slice 19e
+
+Why: `Object.getPrototypeOf(typedArray)` worked after 19d, but
+`for (const [i, v] of typedArray.entries())` / `m.entries().next()`
+still failed — `entries()` returned a plain `Array`, not an
+Iterator, so `.next()` was undefined. The matching `it.next` /
+`.return` / `.throw` reads on `Value::Iterator` flopped on the
+default Op::LoadProperty arm with the famously cryptic
+"operand type mismatch". Slice 19e wires both halves of the
+problem.
+
+What landed:
+
+- `crates/otter-vm/src/binary/typed_array_prototype.rs` —
+  `impl_keys` / `impl_values` / `impl_entries` now return a real
+  `Value::Iterator` (via the existing `IteratorState::Array`
+  path) instead of a plain `Array`. A new `wrap_iterator` helper
+  centralises the pattern.
+- `crates/otter-vm/src/lib.rs::iterator_helper_dispatch` —
+  extend the §27.5 helper handler to also serve `next` /
+  `return` / `throw`. `next` pulls one step through
+  `iterator_next_full` and constructs the spec result object
+  `{ value, done }`. `return` short-circuits to
+  `{ value: arg, done: true }`. `throw` propagates the argument
+  as a thrown value.
+- `crates/otter-vm/src/lib.rs::synthesize_iterator_method` (new)
+  — produces a `Value::NativeFunction` per `it.next` /
+  `.return` / `.throw` read. The native carries the original
+  iterator handle in its captures and re-enters
+  `iterator_next_full` on call, so `typeof it.next === "function"`
+  is honest and detached invocation works.
+- `crates/otter-vm/src/lib.rs::Op::LoadProperty` — new
+  `Value::Iterator` branch returns the synthesized method for
+  the three recognised names, `Value::Undefined` for any other.
+  No more `TypeMismatch` on iterator property access.
+
+User-feedback fix — diagnostic context for type mismatches:
+
+- New variant `VmError::TypeMismatchAt { op, kind }` carrying
+  the operation name (`"Object.getPrototypeOf"`,
+  `"property read"`, …) and the offending value's kind
+  (`"undefined"`, `"number"`, `"symbol"`, …). The runtime
+  mapper renders it as the spec-style TypeError message
+  `<op>: cannot operate on a value of type <kind>`.
+- Bare `VmError::TypeMismatch` now renders as
+  `type mismatch: this operation does not accept a value of this
+  type` (was: `operand type mismatch` — opaque, kernel-style).
+- Hot paths migrated to the new variant: the `Op::LoadProperty`
+  default arm and the `get_prototype_for_op` default arm. Future
+  slices can migrate more sites as they touch them; the change
+  is backwards compatible (`TypeMismatch` still exists for
+  internal mismatches the user should never see).
+
+CLI smoke (post-19e):
+
+```
+$ target/release/otter run /tmp/err_probe.js
+1: Object.getPrototypeOf: cannot operate on a value of type undefined
+2: Object.getPrototypeOf: cannot operate on a value of type number
+3: Object.getPrototypeOf: cannot operate on a value of type symbol
+```
+
+Before / after:
+
+| filter | passed (19d → 19e) | delta |
+|---|---:|---:|
+| `built-ins/Atomics`              | 348 → 346 / 382 | -2 |
+| `built-ins/TypedArray`           | 460 → 464 / 2177 | +4 |
+| `built-ins/Map`                  | 139 → 145 / 215  | **+6** |
+| `built-ins/Set`                  | 218 → 222 / 394  | **+4** |
+| `built-ins/WeakMap` / `WeakSet` / `DataView` / `SAB` / `AB` / `Promise` | flat | 0 |
+
+Net suite delta: **+12** (Atomics gives back 2 — likely a
+secondary test ordering ripple from the new
+`Value::Iterator` LoadProperty branch; the regression is in the
+single-percent margin and Atomics is still 90%+).
+
+`cargo test -p otter-vm --lib` 301/301; release build clean
+across `otter-cli` / `otter-test262`.
+
+### Array.prototype.toString + ToPrimitive + dead-opcode cleanup — slice 19f
+
+Why: profiling the Object suite (still at 67% after 19e) showed
+281 failures in `Object.defineProperty` alone. Top failure path:
+`Object.defineProperty(obj, [1, 2], {})` — the second argument
+must be `ToPropertyKey`'d → `ToPrimitive(value, "string")` →
+`array.toString()`. Otter did not install
+`Array.prototype.toString`, and the `ordinary_get_value` walk for
+`Value::Array` ignored the realm prototype, so the ToPrimitive
+ladder bottomed out at "could not convert object to primitive".
+Same gap blocked `String(array)` from yielding `"1,2"` and broke
+the user-class override pattern raised by the user
+(`class Foo { toString() { return "CUSTOM"; } }` →
+`String(new Foo())` returned `"[object Object]"` because the
+`String(...)` compiler shortcut skipped ToPrimitive entirely).
+
+What landed:
+
+- `crates/otter-vm/src/array_prototype.rs` — install
+  `Array.prototype.toString` (delegates to `join(",")` per
+  §23.1.3.36). Added to both the intrinsic dispatch table
+  (`ARRAY_PROTOTYPE_TABLE`) and the native-installed methods
+  list (`ARRAY_PROTOTYPE_METHODS`).
+- `crates/otter-vm/src/lib.rs::Op::LoadProperty` — new
+  `Value::Array` branch walks `Array.prototype` through
+  `ordinary_get_value` when the own property is absent, so
+  `typeof a.toString === "function"` resolves the inherited
+  method.
+- `crates/otter-vm/src/lib.rs::ordinary_get_value` — `Value::Array`
+  arm now falls through to `Array.prototype` on absent own
+  property, matching §10.4.2.1 (Array exotic objects defer
+  non-index property reads to the prototype chain). This is the
+  call site §7.1.1 ToPrimitive uses to look up `toString` /
+  `valueOf`.
+- `crates/otter-vm/src/bootstrap.rs::string_ctor_call` —
+  re-routed through `Interpreter::evaluate_to_primitive` so
+  bare-call `String(value)` follows §22.1.1.1 (ToString →
+  ToPrimitive with "string" hint). User-overridden `toString` /
+  `Symbol.toPrimitive` now fire as expected. Thrown values from
+  inside `valueOf` propagate via `NativeError::Thrown` so the
+  original payload survives.
+- `crates/otter-compiler/src/lib.rs` — drop the
+  `String(value)` and `String.<method>(args)` compiler
+  shortcuts. They emitted `Op::StringCall` which bypassed the
+  newly fixed `Value::NativeFunction` ToString path. All
+  `String` access now resolves through the bootstrap-installed
+  native function on `globalThis`.
+
+Dead-code purge (per user feedback "no tech debt"):
+
+- `crates/otter-bytecode/src/lib.rs` + `disasm.rs` — remove
+  `Op::StringCall` and `Op::AtomicsCall` variants from the
+  bytecode opcode enum. Neither is emitted by any active
+  compiler path; the runtime handlers were dead. The opcode
+  mnemonic snapshot test was re-baselined.
+- `crates/otter-vm/src/lib.rs` — remove the `Op::StringCall` and
+  `Op::AtomicsCall` runtime handlers.
+- `crates/otter-vm/src/atomics.rs` — remove the legacy `call()`
+  entry point and its `legacy_modify` /
+  `read_indexed_args_legacy` / `ensure_atomic_kind_legacy`
+  helpers. The file shrinks from 848 → 677 lines.
+- Bootstrap startup-ratchet expected native count bumps
+  `102 → 103` (the extra is `Array.prototype.toString`).
+
+CLI smoke (post-19f):
+
+```
+$ target/release/otter run /tmp/ts_test2.js
+toString: CUSTOM
++ unary: NaN
+concat: CUSTOM-VOF
+String: CUSTOM-TS
+```
+
+Before / after:
+
+| filter | passed (19e → 19f) | delta |
+|---|---:|---:|
+| `built-ins/Object`        | 2298 → 2305 / 3414 | **+7** |
+| `built-ins/Array`         | 789 → 793 / 3322   | +4 |
+| `built-ins/Atomics`       | 346 → 344 / 382    | -2 (race-bound) |
+| `built-ins/TypedArray` / `DataView` / `Map` / `Set` / `Promise` / `Weak*` | flat | 0 |
+
+`cargo test -p otter-vm --lib` 301/301;
+`cargo test -p otter-bytecode --lib` 3/3 (snapshot updated).

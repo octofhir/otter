@@ -119,6 +119,13 @@ drop(backing); // releases the reservation
 This covers typed-array backing stores, host buffers, large module source
 caches, and native resources.
 
+External memory is part of the runtime resource budget, not just a GC
+implementation detail. Large `ArrayBuffer` stores, string backing storage,
+retained source text, bytecode cache blobs, JSON source slices, and native
+buffers must be visible to runtime pressure so the engine can collect,
+yield, or reject work before resident memory grows without bound. See
+[Runtime Principles](runtime-principles.md).
+
 The runnable copy of this pattern is covered by
 `crates/otter-gc/tests/book_gc_api_examples.rs` and the
 `ExternalMemory` rustdoc example.

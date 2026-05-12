@@ -5314,9 +5314,45 @@ impl Interpreter {
                         Value::String(s) if name == "length" => {
                             Value::Number(NumberValue::from_i32(s.len() as i32))
                         }
-                        Value::Array(a) => {
-                            crate::array::get_named_property(*a, &self.gc_heap, &name)
-                                .unwrap_or(Value::Undefined)
+                        v @ Value::Array(_) => {
+                            let direct = if let Value::Array(a) = v {
+                                crate::array::get_named_property(*a, &self.gc_heap, &name)
+                            } else {
+                                None
+                            };
+                            match direct {
+                                Some(value) => value,
+                                None => {
+                                    // §22.1 — fall back to `Array.prototype`
+                                    // for inherited methods (`toString`,
+                                    // `join`, `map`, …). The prototype walk
+                                    // covers user-installed overrides through
+                                    // ordinary `[[Get]]` semantics.
+                                    // <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
+                                    let proto = self.constructor_prototype_value("Array")?;
+                                    if let Value::Object(proto_obj) = proto {
+                                        let key = VmPropertyKey::String(name.clone());
+                                        match self.ordinary_get_value(
+                                            context,
+                                            Value::Object(proto_obj),
+                                            v.clone(),
+                                            &key,
+                                            0,
+                                        )? {
+                                            VmGetOutcome::Value(value) => value,
+                                            VmGetOutcome::InvokeGetter { getter } => self
+                                                .run_callable_sync(
+                                                    context,
+                                                    &getter,
+                                                    v.clone(),
+                                                    smallvec::SmallVec::new(),
+                                                )?,
+                                        }
+                                    } else {
+                                        Value::Undefined
+                                    }
+                                }
+                            }
                         }
                         // §20.2.4 Function-instance properties — every
                         // callable carries `.name` / `.length` /
@@ -6799,24 +6835,6 @@ impl Interpreter {
                 }
                 // §22.1.1 / §22.1.2 String constructor + statics.
                 // <https://tc39.es/ecma262/#sec-string-constructor>
-                Op::StringCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::StringMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = string_dispatch::call(method, &args, &self.string_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
                 // §21.4 Date constructor + statics.
                 // <https://tc39.es/ecma262/#sec-date-objects>
                 Op::DateCall => {
@@ -6961,29 +6979,6 @@ impl Interpreter {
                     }
                     let result =
                         binary::dispatch::shared_array_buffer_call(method, &args, &self.gc_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §25.4 Atomics namespace dispatcher.
-                // <https://tc39.es/ecma262/#sec-atomics-object>
-                Op::AtomicsCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::AtomicsMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = {
-                        let string_heap = self.string_heap.clone();
-                        atomics::call(method, &args, &string_heap, &mut self.gc_heap)?
-                    };
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
@@ -13581,9 +13576,33 @@ impl Interpreter {
             }
             Value::Array(arr) => {
                 let value = match key {
-                    VmPropertyKey::String(key) => {
-                        crate::array::get_named_property(arr, &self.gc_heap, key)
-                            .unwrap_or(Value::Undefined)
+                    VmPropertyKey::String(key_str) => {
+                        match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
+                            Some(v) => v,
+                            None => {
+                                // §22.1.3 — fall through to
+                                // `Array.prototype` so inherited
+                                // methods (`toString`, `join`,
+                                // `map`, …) and user-installed
+                                // overrides resolve through ordinary
+                                // [[Get]]. Returning `Undefined`
+                                // here previously broke the
+                                // §7.1.1 ToPrimitive ladder for
+                                // plain arrays.
+                                // <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
+                                let proto = self.constructor_prototype_value("Array")?;
+                                if let Value::Object(proto_obj) = proto {
+                                    return self.ordinary_get_value(
+                                        context,
+                                        Value::Object(proto_obj),
+                                        receiver,
+                                        key,
+                                        hops + 1,
+                                    );
+                                }
+                                Value::Undefined
+                            }
+                        }
                     }
                     VmPropertyKey::Symbol(sym)
                         if sym

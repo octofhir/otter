@@ -11,6 +11,7 @@
 # Engine Internals
 
 - [Architecture](engine/architecture.md)
+- [Runtime Principles](engine/runtime-principles.md)
 - [Event Loop](engine/event-loop.md)
 - [Frontend And Compilation](engine/frontend.md)
 - [GC API](engine/gc-api.md)

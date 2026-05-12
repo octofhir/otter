@@ -779,12 +779,6 @@ pub enum Op {
     /// Variadic. Empty `name` (sentinel) selects the constructor
     /// form (coerces argument via §7.1.17 ToString); otherwise the
     /// runtime dispatches `fromCharCode` / `fromCodePoint` via
-    /// [`crate::string_dispatch::call`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-string-constructor>
-    StringCall,
-
     /// `r<dst> = new Date(args...)` / `Date.<name>(args...)`.
     /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -917,17 +911,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
     SharedArrayBufferCall,
-    /// `r<dst> = Atomics.<name>(args...)`. Operands:
-    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
-    ///
-    /// Routes the §25.4 Atomics surface (load / store / add / sub /
-    /// and / or / xor / exchange / compareExchange / isLockFree)
-    /// through one variadic dispatcher.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-atomics-object>
-    AtomicsCall,
     /// `r<dst> = Proxy(args...)` / `Proxy.<name>(args...)`. Operands:
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -1100,7 +1083,6 @@ impl Op {
             Op::ArrayOf => "ARRAY_OF",
             Op::BigIntCall => "BIGINT_CALL",
             Op::DateCall => "DATE_CALL",
-            Op::StringCall => "STRING_CALL",
             Op::HasProperty => "HAS_PROPERTY",
             Op::ImportNamespaceDynamic => "IMPORT_NAMESPACE_DYNAMIC",
             Op::ImportMetaResolve => "IMPORT_META_RESOLVE",
@@ -1119,7 +1101,6 @@ impl Op {
             Op::ReflectCall => "REFLECT_CALL",
             Op::ProxyCall => "PROXY_CALL",
             Op::SharedArrayBufferCall => "SHARED_ARRAY_BUFFER_CALL",
-            Op::AtomicsCall => "ATOMICS_CALL",
         }
     }
 
@@ -1241,7 +1222,6 @@ impl Op {
             Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
             Op::BigIntCall => 3,      // dst, name_const, argc — args follow
             Op::DateCall => 3,        // dst, name_const, argc — args follow
-            Op::StringCall => 3,      // dst, name_const, argc — args follow
             Op::GlobalCall => 3,      // dst, name_const, argc — args follow
             Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::DataViewCall => 3,    // dst, name_const, argc — args follow
@@ -1251,7 +1231,6 @@ impl Op {
             Op::ReflectCall => 3,     // dst, name_const, argc — args follow
             Op::ProxyCall => 3,       // dst, name_const, argc — args follow
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
-            Op::AtomicsCall => 3,     // dst, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
             Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
             Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
@@ -1338,12 +1317,10 @@ impl Op {
             | Op::GlobalCall
             | Op::BigIntCall
             | Op::DateCall
-            | Op::StringCall
             | Op::ArrayBufferCall
             | Op::DataViewCall
             | Op::IteratorCall
             | Op::SharedArrayBufferCall
-            | Op::AtomicsCall
             | Op::ProxyCall
             | Op::ReflectCall => false,
             // `dst, kind_id, method_id, argc` — both kind_id and

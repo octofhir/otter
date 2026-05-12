@@ -268,7 +268,6 @@ mod tests {
             Op::LooseNotEqual,
             Op::NewBuiltinError,
             Op::LoadBuiltinError,
-            Op::StringCall,
             Op::DateCall,
             Op::BigIntCall,
             Op::ArrayConstruct,
@@ -280,7 +279,6 @@ mod tests {
             Op::TypedArrayCall,
             Op::Yield,
             Op::SharedArrayBufferCall,
-            Op::AtomicsCall,
             Op::ProxyCall,
             Op::ReflectCall,
             Op::IteratorCall,
@@ -328,7 +326,6 @@ mod tests {
             | Op::Await
             | Op::IsArray
             | Op::LoadBuiltinError
-            | Op::StringCall
             | Op::DateCall
             | Op::BigIntCall
             | Op::ArrayConstruct
@@ -338,7 +335,6 @@ mod tests {
             | Op::ArrayBufferCall
             | Op::DataViewCall
             | Op::SharedArrayBufferCall
-            | Op::AtomicsCall
             | Op::ProxyCall
             | Op::ReflectCall
             | Op::IteratorCall
@@ -559,22 +555,20 @@ mod tests {
 000112 LOOSE_NEQ
 000113 NEW_BUILTIN_ERROR
 000114 LOAD_BUILTIN_ERROR
-000115 STRING_CALL
-000116 DATE_CALL
-000117 BIGINT_CALL
-000118 ARRAY_CONSTRUCT
-000119 ARRAY_FROM
-000120 ARRAY_OF
-000121 OBJECT_CALL
-000122 ARRAY_BUFFER_CALL
-000123 DATA_VIEW_CALL
-000124 TYPED_ARRAY_CALL
-000125 YIELD
-000126 SHARED_ARRAY_BUFFER_CALL
-000127 ATOMICS_CALL
-000128 PROXY_CALL
-000129 REFLECT_CALL
-000130 ITERATOR_CALL
-000131 TO_PRIMITIVE
+000115 DATE_CALL
+000116 BIGINT_CALL
+000117 ARRAY_CONSTRUCT
+000118 ARRAY_FROM
+000119 ARRAY_OF
+000120 OBJECT_CALL
+000121 ARRAY_BUFFER_CALL
+000122 DATA_VIEW_CALL
+000123 TYPED_ARRAY_CALL
+000124 YIELD
+000125 SHARED_ARRAY_BUFFER_CALL
+000126 PROXY_CALL
+000127 REFLECT_CALL
+000128 ITERATOR_CALL
+000129 TO_PRIMITIVE
 ";
 }

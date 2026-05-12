@@ -7584,45 +7584,17 @@ fn compile_method_call(
         }
         return Ok(dst);
     }
-    // §22.1.1 / §22.1.2 String constructor + statics. Typed
-    // dispatch via [`StringMethod`].
+    // §22.1.1 / §22.1.2 — bare-call `String(value)` and the
+    // `String.<method>(args)` statics route through the
+    // `Value::NativeFunction` table installed at bootstrap. The
+    // dedicated `Op::StringCall` shortcut was retired because it
+    // bypassed §7.1.17 ToString's ToPrimitive step (user classes
+    // with an overridden `toString` / `Symbol.toPrimitive` did
+    // not fire), and because spec-shaped dispatch through
+    // ordinary property lookup is the simpler invariant to keep.
+    // The opcode handler in `crates/otter-vm/src/lib.rs` remains
+    // for backwards-compatibility with older bytecode.
     // <https://tc39.es/ecma262/#sec-string-constructor>
-    if let Expression::StaticMemberExpression(member) = callee
-        && let Expression::Identifier(id) = &member.object
-        && id.name.as_str() == "String"
-        && cx.lookup_binding("String").is_none()
-        && find_module_import_binding(cx, "String").is_none()
-    {
-        let method = member.property.name.as_str();
-        if let Some(method_id) = otter_bytecode::method_id::StringMethod::from_str(method) {
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::StringCall, operands, span);
-            return Ok(dst);
-        }
-    }
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "String"
-        && cx.lookup_binding("String").is_none()
-        && find_module_import_binding(cx, "String").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(
-            otter_bytecode::method_id::StringMethod::Construct.as_u32(),
-        ));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::StringCall, operands, span);
-        return Ok(dst);
-    }
     // §21.1.1 `Number(value)` — coerce to a primitive number per
     // ToNumber. Bare-call form (no `new`) yields the primitive
     // result; foundation hands it back via `Op::ToNumber`.

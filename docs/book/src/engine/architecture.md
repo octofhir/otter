@@ -13,6 +13,11 @@ One JavaScript isolate owns one VM, one runtime state, and one GC heap.
 Async and worker APIs must preserve that boundary. Values move between
 workers through structured clone or transferables, not raw GC handles.
 
+Runtime design also follows the resource contract in
+[Runtime Principles](runtime-principles.md): VM turns must be measurable,
+budgetable, and yieldable so embedded scripts cannot monopolize CPU,
+heap, off-heap memory, host operations, or the event loop.
+
 ## Pipeline
 
 Source flows through the active frontend and VM stack:

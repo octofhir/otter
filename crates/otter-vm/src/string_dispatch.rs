@@ -28,20 +28,8 @@ pub fn call(
     match method {
         // §22.1.1 String(value) — coerce via §7.1.17 ToString.
         M::Construct => {
-            let s = match args.first() {
-                Some(Value::String(s)) => s.to_lossy_string(),
-                Some(Value::Symbol(_)) => {
-                    // Spec: ToString(symbol) is a TypeError, but
-                    // bare-call `String(symbol)` is allowed and
-                    // returns the descriptive form.
-                    args[0].display_string()
-                }
-                Some(other) => other.display_string(),
-                None => String::new(),
-            };
-            Ok(Value::String(
-                JsString::from_str(&s, heap).map_err(|_| VmError::TypeMismatch)?,
-            ))
+            let s = crate::conversion::string_constructor_js_string(args.first(), heap)?;
+            Ok(Value::String(s))
         }
         // §22.1.2.1 String.fromCharCode(...codeUnits).
         M::FromCharCode => {

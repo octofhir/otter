@@ -8,8 +8,8 @@
 //! # Contents
 //! - [`Value`] — opaque runtime value (foundation: only `Undefined`).
 //! - [`Frame`] — compact call frame.
-//! - [`Interpreter`] — match-based dispatch loop over
-//!   [`otter_bytecode::BytecodeModule`].
+//! - [`Interpreter`] — match-based dispatch loop over the frozen
+//!   executable view inside [`ExecutionContext`].
 //! - [`InterruptFlag`] — atomic flag observed at back-edges; cheap.
 //! - [`VmError`] — the small enum of runtime errors the interpreter
 //!   can raise.
@@ -26,7 +26,9 @@
 //! - [Frontend and bytecode dumps](../../../docs/book/src/engine/frontend.md)
 
 pub mod abstract_ops;
+mod allocation_ops;
 pub mod arguments_object;
+mod arithmetic_dispatch;
 pub mod array;
 pub mod array_prototype;
 pub mod array_statics;
@@ -38,6 +40,8 @@ pub mod boolean_prototype;
 pub mod collections;
 pub mod collections_prototype;
 pub mod console;
+mod constant_ops;
+mod conversion;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
 pub mod bootstrap;
@@ -51,7 +55,9 @@ pub mod bootstrap_typed_array;
 pub mod bootstrap_weak_refs;
 pub mod dynamic_import;
 pub mod error_classes;
+mod executable;
 pub mod execution_context;
+mod frame_ops;
 pub mod function_metadata;
 pub mod function_prototype;
 pub mod gc_trace;
@@ -67,8 +73,10 @@ pub mod native_function;
 pub mod number;
 pub mod object;
 pub mod object_statics;
+mod operand_decode;
 pub mod promise;
 pub mod promise_dispatch;
+mod property_dispatch;
 pub mod proxy;
 pub mod reflect;
 pub mod regexp;
@@ -77,6 +85,7 @@ pub mod runtime_cx;
 pub mod runtime_state;
 pub mod string;
 pub mod string_dispatch;
+mod string_ops;
 pub mod string_prototype;
 pub mod swar;
 pub mod symbol;
@@ -98,6 +107,11 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
+use arithmetic_dispatch::{
+    bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
+};
+use executable::ExecutableFunction;
+use operand_decode::{apply_branch, const_operand, imm32_operand, register_operand};
 
 pub use array::JsArray;
 pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
@@ -1723,7 +1737,23 @@ impl Frame {
         function: &Function,
         parent_upvalues: std::rc::Rc<[UpvalueCell]>,
     ) -> Result<std::rc::Rc<[UpvalueCell]>, otter_gc::OutOfMemory> {
-        let own = function.own_upvalue_count as usize;
+        Self::build_upvalues_for_count(heap, function.own_upvalue_count, parent_upvalues)
+    }
+
+    pub(crate) fn build_upvalues_for_exec(
+        heap: &mut otter_gc::GcHeap,
+        function: &ExecutableFunction,
+        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+    ) -> Result<std::rc::Rc<[UpvalueCell]>, otter_gc::OutOfMemory> {
+        Self::build_upvalues_for_count(heap, function.own_upvalue_count, parent_upvalues)
+    }
+
+    fn build_upvalues_for_count(
+        heap: &mut otter_gc::GcHeap,
+        own_upvalue_count: u16,
+        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+    ) -> Result<std::rc::Rc<[UpvalueCell]>, otter_gc::OutOfMemory> {
+        let own = own_upvalue_count as usize;
         if own == 0 {
             return Ok(parent_upvalues);
         }
@@ -1773,6 +1803,43 @@ impl Frame {
             incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_str()),
+            pending_to_primitive: None,
+            pending_bind_function: None,
+            pending_get_iterator: None,
+            pending_iterator_next: None,
+            generator_owner: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_exec_return_upvalues_and_this(
+        function: &ExecutableFunction,
+        return_register: Option<u16>,
+        upvalues: std::rc::Rc<[UpvalueCell]>,
+        this_value: Value,
+    ) -> Self {
+        let mut registers: SmallVec<[Value; 8]> =
+            SmallVec::with_capacity(function.register_count as usize);
+        registers.resize(function.register_count as usize, Value::Undefined);
+        debug_assert!(
+            upvalues.len() >= function.own_upvalue_count as usize,
+            "frame upvalues must include the function's own cells"
+        );
+        Self {
+            function_id: function.id,
+            pc: 0,
+            registers,
+            return_register,
+            upvalues,
+            this_value,
+            handlers: SmallVec::new(),
+            pending_throw: None,
+            construct_target: None,
+            rest_args: SmallVec::new(),
+            new_target: None,
+            incoming_args: SmallVec::new(),
+            async_state: None,
+            module_url: std::rc::Rc::from(function.module_url.as_ref()),
             pending_to_primitive: None,
             pending_bind_function: None,
             pending_get_iterator: None,
@@ -2482,7 +2549,7 @@ impl Interpreter {
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
-    fn get_prototype_for_op(&self, value: &Value) -> Result<Value, VmError> {
+    pub(crate) fn get_prototype_for_op(&self, value: &Value) -> Result<Value, VmError> {
         match value {
             Value::Object(obj) => {
                 let stored = object::prototype_value(*obj, &self.gc_heap);
@@ -2731,7 +2798,11 @@ impl Interpreter {
         Ok(ok)
     }
 
-    fn ordinary_function_delete_own_property(&mut self, function_id: u32, key: &str) -> bool {
+    pub(crate) fn ordinary_function_delete_own_property(
+        &mut self,
+        function_id: u32,
+        key: &str,
+    ) -> bool {
         let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) else {
             return self
                 .function_user_props
@@ -3822,7 +3893,7 @@ impl Interpreter {
 
     fn this_for_bytecode_call(
         &mut self,
-        function: &Function,
+        function: &ExecutableFunction,
         this_value: Value,
     ) -> Result<Value, VmError> {
         if function.is_strict || function.is_arrow {
@@ -4232,7 +4303,7 @@ impl Interpreter {
                 });
             }
         };
-        let function = match context.function(function_id) {
+        let function = match context.exec_function(function_id) {
             Some(f) => f,
             None => {
                 return Err(RunError {
@@ -4241,15 +4312,16 @@ impl Interpreter {
                 });
             }
         };
-        let upvalues = match Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues) {
-            Ok(u) => u,
-            Err(oom) => {
-                return Err(RunError {
-                    error: VmError::from(oom),
-                    frames: Vec::new(),
-                });
-            }
-        };
+        let upvalues =
+            match Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues) {
+                Ok(u) => u,
+                Err(oom) => {
+                    return Err(RunError {
+                        error: VmError::from(oom),
+                        frames: Vec::new(),
+                    });
+                }
+            };
         let this_for_callee = match self.this_for_bytecode_call(function, this_for_callee) {
             Ok(value) => value,
             Err(error) => {
@@ -4259,7 +4331,7 @@ impl Interpreter {
                 });
             }
         };
-        let mut new_frame = Frame::with_return_upvalues_and_this(
+        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
             function,
             None, // top-level — no return register
             upvalues,
@@ -4351,17 +4423,17 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
-        let main = context.main();
+        let main = context.exec_main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let upvalues =
-            Frame::build_upvalues(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
         let entry_this = if main.is_module || main.is_strict {
             Value::Undefined
         } else {
             Value::Object(self.global_this)
         };
-        let mut entry = Frame::with_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let mut entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
         // §16.2.1.7 ModuleDeclarationInstantiation step 5 — when the
         // entry function carries top-level await, wire up an async
         // result promise so `Op::Await` can park / resume normally.
@@ -4613,21 +4685,20 @@ impl Interpreter {
             let top_idx = stack.len() - 1;
             let function_id = stack[top_idx].function_id;
             let function = context
-                .function(function_id)
+                .exec_function(function_id)
                 .ok_or(VmError::InvalidOperand)?;
             let pc = stack[top_idx].pc;
             let instr = function
                 .code
                 .get(pc as usize)
                 .ok_or(VmError::MissingReturn)?;
-            let op = instr.op;
-            let operands = instr.operands.as_slice();
+            let op = instr.op();
 
             // Stack-modifying opcodes go first so we don't hold a
             // `&mut Frame` borrow while pushing / popping.
             match op {
                 Op::ReturnValue | Op::Return => {
-                    let src = register_operand(operands.first())?;
+                    let src = register_operand(context.exec_operand(instr, 0))?;
                     let value = stack[top_idx]
                         .registers
                         .get(src as usize)
@@ -4645,31 +4716,37 @@ impl Interpreter {
                     continue;
                 }
                 Op::Call => {
+                    let operands = context.exec_operands(instr);
                     self.do_call(stack, context, operands)?;
                     continue;
                 }
                 Op::CallWithThis => {
+                    let operands = context.exec_operands(instr);
                     self.do_call_with_this(stack, context, operands)?;
                     continue;
                 }
                 Op::CallMethodValue => {
+                    let operands = context.exec_operands(instr);
                     self.do_call_method_value(stack, context, operands)?;
                     continue;
                 }
                 Op::CallSpread => {
+                    let operands = context.exec_operands(instr);
                     self.do_call_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::New => {
+                    let operands = context.exec_operands(instr);
                     self.do_construct(stack, context, operands)?;
                     continue;
                 }
                 Op::NewSpread => {
+                    let operands = context.exec_operands(instr);
                     self.do_construct_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::Throw => {
-                    let src = register_operand(operands.first())?;
+                    let src = register_operand(context.exec_operand(instr, 0))?;
                     let value = stack[top_idx]
                         .registers
                         .get(src as usize)
@@ -4705,8 +4782,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::Await => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
+                    let dst = register_operand(context.exec_operand(instr, 0))?;
+                    let src = register_operand(context.exec_operand(instr, 1))?;
                     let awaited = read_register(&stack[top_idx], src)?.clone();
                     self.do_await(stack, context, dst, awaited)?;
                     if stack.is_empty() {
@@ -4724,8 +4801,8 @@ impl Interpreter {
                 // [`Self::resume_generator`] call).
                 // <https://tc39.es/ecma262/#sec-yield>
                 Op::Yield => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
+                    let dst = register_operand(context.exec_operand(instr, 0))?;
+                    let src = register_operand(context.exec_operand(instr, 1))?;
                     let yielded = read_register(&stack[top_idx], src)?.clone();
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
@@ -4761,6 +4838,7 @@ impl Interpreter {
                 // pushes a frame, so the dispatch happens here —
                 // outside the in-frame mutable borrow below.
                 Op::ToNumber => {
+                    let operands = context.exec_operands(instr);
                     if let Some(()) = self.try_to_primitive_dispatch(stack, context, operands)? {
                         continue;
                     }
@@ -4775,6 +4853,7 @@ impl Interpreter {
                 // the dispatch loop afterwards — the in-frame
                 // match below has no arm for `Op::ToPrimitive`.
                 Op::ToPrimitive => {
+                    let operands = context.exec_operands(instr);
                     self.drive_to_primitive(stack, context, operands)?;
                     continue;
                 }
@@ -4783,6 +4862,7 @@ impl Interpreter {
                 // route through the call-frame ladder.
                 // <https://tc39.es/ecma262/#sec-getiterator>
                 Op::GetIterator => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_get_iterator(stack, context, operands)? {
                         continue;
                     }
@@ -4793,6 +4873,7 @@ impl Interpreter {
                 // `done`.
                 // <https://tc39.es/ecma262/#sec-iteratornext>
                 Op::IteratorNext => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_iterator_next(stack, context, operands)? {
                         continue;
                     }
@@ -4805,11 +4886,13 @@ impl Interpreter {
                 // below.
                 // <https://tc39.es/ecma262/#sec-ordinaryget>
                 Op::LoadProperty => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_load_property(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::LoadElement => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
                     }
@@ -4819,16 +4902,19 @@ impl Interpreter {
                 // and non-extensible rejections surface here too.
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_store_property(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::StoreElement => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_store_element(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::Instanceof => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_instanceof(stack, context, operands)? {
                         continue;
                     }
@@ -4837,16 +4923,19 @@ impl Interpreter {
                 // [[Delete]] — invoke `has` / `deleteProperty`
                 // traps when the receiver is a Proxy.
                 Op::HasProperty => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_has_property_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::DeleteProperty => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_delete_property_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::DeleteElement => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_delete_element_proxy(stack, context, operands)? {
                         continue;
                     }
@@ -4856,11 +4945,13 @@ impl Interpreter {
                 // `setPrototypeOf` traps when the receiver is a
                 // Proxy.
                 Op::GetPrototype => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_get_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::SetPrototype => {
+                    let operands = context.exec_operands(instr);
                     if self.drive_set_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
@@ -4871,8 +4962,8 @@ impl Interpreter {
                 // modifying so it has to run before the in-frame
                 // borrow below.
                 Op::Eval => {
-                    let dst = register_operand(operands.first())?;
-                    let src_reg = register_operand(operands.get(1))?;
+                    let dst = register_operand(context.exec_operand(instr, 0))?;
+                    let src_reg = register_operand(context.exec_operand(instr, 1))?;
                     let top_idx = stack.len() - 1;
                     let value = read_register(&stack[top_idx], src_reg)?.clone();
                     let force_strict = context.function_is_strict(stack[top_idx].function_id);
@@ -4885,6 +4976,7 @@ impl Interpreter {
                 // §20.2.1.1 — `new Function(args, body)` recurses
                 // into the eval hook with a synthesised wrapper.
                 Op::NewFunction => {
+                    let operands = context.exec_operands(instr);
                     let dst = register_operand(operands.first())?;
                     let argc = match operands.get(1) {
                         Some(&Operand::ConstIndex(n)) => n as usize,
@@ -4907,11 +4999,11 @@ impl Interpreter {
                     // runs before the in-frame borrow so we can look
                     // up realm intrinsics and allocate the
                     // descriptor-backed arguments object.
-                    let dst = register_operand(operands.first())?;
+                    let dst = register_operand(context.exec_operand(instr, 0))?;
                     let (elements, kind, mapped_entries, callee) = {
                         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                         let function = context
-                            .function(frame.function_id)
+                            .exec_function(frame.function_id)
                             .ok_or(VmError::InvalidOperand)?;
                         let elements = std::mem::take(&mut frame.incoming_args);
                         let mapped_entries = if function.arguments_object_kind
@@ -4971,31 +5063,638 @@ impl Interpreter {
                 _ => {}
             }
 
-            let frame = &mut stack[top_idx];
             match op {
                 Op::Nop => {
-                    frame.pc += 1;
+                    stack[top_idx].pc += 1;
+                    continue;
                 }
                 Op::LoadUndefined => {
-                    let dst = register_operand(operands.first())?;
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::Undefined)?;
                     frame.pc += 1;
+                    continue;
                 }
                 Op::LoadHole => {
-                    // Compiler-emitted for elision elements in array
-                    // literals: `[1, , 3]`. The register holds the
-                    // internal `Value::Hole` sentinel just long
-                    // enough for the next `Op::NewArray` /
-                    // `Op::ArrayPush` to copy it into the array
-                    // body. Direct user reads (`r3` exposed via
-                    // anything other than the array body) never see
-                    // it because no opcode forwards a register value
-                    // to user code without going through
-                    // `array::get` or its hole-aware wrappers.
-                    let dst = register_operand(operands.first())?;
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::Hole)?;
                     frame.pc += 1;
+                    continue;
                 }
+                Op::LoadTrue => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::Boolean(true))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::LoadFalse => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::Boolean(false))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::LoadNull => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::Null)?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::LoadInt32 => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let imm = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::Number(NumberValue::Smi(imm)))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::LoadNumber => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let bits = context
+                        .number_constant_bits(idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value = NumberValue::from_f64(f64::from_bits(bits));
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::Number(value))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::LoadString => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let units = context
+                        .string_constant_units(idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let s = JsString::from_utf16_units(units, &self.string_heap)?;
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::String(s))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::LoadLength => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let s = read_register(frame, src)?
+                        .as_string()
+                        .ok_or(VmError::TypeMismatch)?;
+                    let len = NumberValue::from_i32(s.len() as i32);
+                    write_register(frame, dst, Value::Number(len))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::LogicalNot => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let truthy = read_register(frame, src)?.to_boolean();
+                    write_register(frame, dst, Value::Boolean(!truthy))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::ToBoolean => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let truthy = read_register(frame, src)?.to_boolean();
+                    write_register(frame, dst, Value::Boolean(truthy))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::ToNumber => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_to_number_regs(frame, dst, src)?;
+                    continue;
+                }
+                Op::GetStringIndex => {
+                    let (dst, recv, idx) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_get_string_index_regs(frame, dst, recv, idx)?;
+                    continue;
+                }
+                Op::TypeOf => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_typeof_regs(frame, dst, src)?;
+                    continue;
+                }
+                Op::LoadThis => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_this_reg(frame, dst)?;
+                    continue;
+                }
+                Op::LoadNewTarget => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_new_target_reg(frame, dst)?;
+                    continue;
+                }
+                Op::DeleteProperty => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let obj_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name = context
+                        .string_constant_str(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_delete_property_reg(frame, dst, obj_reg, name)?;
+                    continue;
+                }
+                Op::DeleteElement => {
+                    let (dst, obj_reg, idx_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_delete_element_regs(frame, dst, obj_reg, idx_reg)?;
+                    continue;
+                }
+                Op::GetPrototype => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_get_prototype_regs(frame, dst, src)?;
+                    continue;
+                }
+                Op::SetPrototype => {
+                    let obj_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let proto_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_set_prototype_regs(context, frame, obj_reg, proto_reg)?;
+                    continue;
+                }
+                Op::NewObject => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_new_object_reg(frame, dst)?;
+                    continue;
+                }
+                Op::NewArray => {
+                    let operands = context.exec_operands(instr);
+                    let frame = &mut stack[top_idx];
+                    self.run_new_array_operands(frame, operands)?;
+                    continue;
+                }
+                Op::LoadRegExp => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_regexp_reg(context, frame, dst, idx)?;
+                    continue;
+                }
+                Op::LoadBigInt => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_bigint_reg(context, frame, dst, idx)?;
+                    continue;
+                }
+                Op::LoadUpvalue => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_upvalue_reg(frame, dst, idx)?;
+                    continue;
+                }
+                Op::StoreUpvalue => {
+                    let src = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_upvalue_reg(frame, src, idx)?;
+                    continue;
+                }
+                Op::LoadProperty => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let obj_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name = context
+                        .string_constant_str(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_property_reg(context, frame, dst, obj_reg, name)?;
+                    continue;
+                }
+                Op::StoreProperty => {
+                    let obj_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name = context
+                        .string_constant_str(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_property_reg(context, frame, obj_reg, name, src)?;
+                    continue;
+                }
+                Op::LoadElement => {
+                    let (dst, recv_reg, idx_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg)?;
+                    continue;
+                }
+                Op::Jump => {
+                    let offset = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    apply_branch(frame, offset, &self.interrupt)?;
+                    continue;
+                }
+                Op::JumpIfTrue => {
+                    let offset = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let cond = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    if read_register(frame, cond)?.to_boolean() {
+                        apply_branch(frame, offset, &self.interrupt)?;
+                    } else {
+                        frame.pc += 1;
+                    }
+                    continue;
+                }
+                Op::JumpIfFalse => {
+                    let offset = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let cond = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    if !read_register(frame, cond)?.to_boolean() {
+                        apply_branch(frame, offset, &self.interrupt)?;
+                    } else {
+                        frame.pc += 1;
+                    }
+                    continue;
+                }
+                Op::JumpIfNullish => {
+                    let offset = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let cond = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    if read_register(frame, cond)?.is_nullish() {
+                        apply_branch(frame, offset, &self.interrupt)?;
+                    } else {
+                        frame.pc += 1;
+                    }
+                    continue;
+                }
+                Op::LoadLocal => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let value = read_register(frame, idx as u16)?.clone();
+                    write_register(frame, dst, value)?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::StoreLocal => {
+                    let src = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let value = read_register(frame, src)?.clone();
+                    write_register(frame, idx as u16, value)?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::TdzError => {
+                    let local_index = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?
+                        as u32;
+                    return Err(VmError::TemporalDeadZone { local_index });
+                }
+                Op::Add => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_add_regs(frame, dst, lhs, rhs)?;
+                    continue;
+                }
+                Op::Sub => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(frame, dst, lhs, rhs, number::sub, bigint_sub_op)?;
+                    continue;
+                }
+                Op::Mul => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(frame, dst, lhs, rhs, number::mul, bigint_mul_op)?;
+                    continue;
+                }
+                Op::Div => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(frame, dst, lhs, rhs, number::div, bigint::ops::div)?;
+                    continue;
+                }
+                Op::Rem => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(frame, dst, lhs, rhs, number::rem, bigint::ops::rem)?;
+                    continue;
+                }
+                Op::Pow => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(frame, dst, lhs, rhs, number::pow, bigint::ops::pow)?;
+                    continue;
+                }
+                Op::BitwiseAnd => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::bitwise_and,
+                        bigint_and_op,
+                    )?;
+                    continue;
+                }
+                Op::BitwiseOr => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(frame, dst, lhs, rhs, number::bitwise_or, bigint_or_op)?;
+                    continue;
+                }
+                Op::BitwiseXor => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::bitwise_xor,
+                        bigint_xor_op,
+                    )?;
+                    continue;
+                }
+                Op::Shl => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(frame, dst, lhs, rhs, number::shl, bigint::ops::shl)?;
+                    continue;
+                }
+                Op::Shr => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::shr_arith,
+                        bigint::ops::shr,
+                    )?;
+                    continue;
+                }
+                Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_compare_regs(frame, dst, lhs, rhs, op)?;
+                    continue;
+                }
+                Op::Ushr => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_ushr_regs(frame, dst, lhs, rhs)?;
+                    continue;
+                }
+                Op::Neg => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_neg_regs(frame, dst, src)?;
+                    continue;
+                }
+                Op::BitwiseNot => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_bitwise_not_regs(frame, dst, src)?;
+                    continue;
+                }
+                Op::Equal | Op::NotEqual | Op::LooseEqual | Op::LooseNotEqual | Op::SameValue => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    match op {
+                        Op::Equal => self.run_equal_regs(frame, dst, lhs, rhs, false)?,
+                        Op::NotEqual => self.run_equal_regs(frame, dst, lhs, rhs, true)?,
+                        Op::LooseEqual => self.run_loose_equal_regs(frame, dst, lhs, rhs, false)?,
+                        Op::LooseNotEqual => {
+                            self.run_loose_equal_regs(frame, dst, lhs, rhs, true)?;
+                        }
+                        Op::SameValue => self.run_same_value_regs(frame, dst, lhs, rhs)?,
+                        _ => unreachable!("equality opcode group"),
+                    }
+                    continue;
+                }
+                Op::ArrayLength => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let arr = match read_register(frame, src)? {
+                        Value::Array(a) => *a,
+                        _ => return Err(VmError::TypeMismatch),
+                    };
+                    let n = NumberValue::from_i32(crate::array::len(arr, &self.gc_heap) as i32);
+                    write_register(frame, dst, Value::Number(n))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::IsArray => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    let value = read_register(frame, src)?.clone();
+                    let result = abstract_ops::is_array(&value);
+                    write_register(frame, dst, Value::Boolean(result))?;
+                    frame.pc += 1;
+                    continue;
+                }
+                Op::Instanceof => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_instanceof_legacy_regs(frame, dst, lhs, rhs)?;
+                    continue;
+                }
+                Op::HasProperty => {
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_has_property_regs(frame, dst, lhs, rhs)?;
+                    continue;
+                }
+                _ => {}
+            }
+
+            let operands = context.exec_operands(instr);
+            let frame = &mut stack[top_idx];
+            match op {
                 Op::Eval | Op::NewFunction => {
                     unreachable!("stack-modifying ops handled earlier in this loop")
                 }
@@ -5013,6 +5712,45 @@ impl Interpreter {
                 | Op::Await
                 | Op::Yield => {
                     unreachable!("stack-modifying ops handled earlier in this loop")
+                }
+                Op::Nop
+                | Op::LoadUndefined
+                | Op::LoadHole
+                | Op::LoadString
+                | Op::LoadLength
+                | Op::LoadNumber
+                | Op::LoadInt32
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::LoadNull
+                | Op::LogicalNot
+                | Op::ToBoolean
+                | Op::ToNumber
+                | Op::GetStringIndex
+                | Op::TypeOf
+                | Op::LoadThis
+                | Op::LoadNewTarget
+                | Op::DeleteProperty
+                | Op::DeleteElement
+                | Op::GetPrototype
+                | Op::SetPrototype
+                | Op::NewObject
+                | Op::NewArray
+                | Op::LoadRegExp
+                | Op::LoadBigInt
+                | Op::LoadUpvalue
+                | Op::StoreUpvalue
+                | Op::LoadProperty
+                | Op::StoreProperty
+                | Op::LoadElement
+                | Op::Jump
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::JumpIfNullish
+                | Op::LoadLocal
+                | Op::StoreLocal
+                | Op::TdzError => {
+                    unreachable!("fixed-width ops handled earlier in this loop")
                 }
                 Op::MakeFunction => {
                     let dst = register_operand(operands.first())?;
@@ -5064,1091 +5802,6 @@ impl Interpreter {
                             bound_this,
                         },
                     )?;
-                    frame.pc += 1;
-                }
-                Op::LoadUpvalue => {
-                    let dst = register_operand(operands.first())?;
-                    let idx = imm32_operand(operands.get(1))?;
-                    if idx < 0 {
-                        return Err(VmError::InvalidOperand);
-                    }
-                    let cell = *frame
-                        .upvalues
-                        .get(idx as usize)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value = read_upvalue(&self.gc_heap, cell);
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::StoreUpvalue => {
-                    let src = register_operand(operands.first())?;
-                    let idx = imm32_operand(operands.get(1))?;
-                    if idx < 0 {
-                        return Err(VmError::InvalidOperand);
-                    }
-                    let value = read_register(frame, src)?.clone();
-                    let cell = *frame
-                        .upvalues
-                        .get(idx as usize)
-                        .ok_or(VmError::InvalidOperand)?;
-                    store_upvalue(&mut self.gc_heap, cell, value);
-                    frame.pc += 1;
-                }
-                Op::LoadString => {
-                    let dst = register_operand(operands.first())?;
-                    let idx = const_operand(operands.get(1))?;
-                    let units = context
-                        .string_constant_units(idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let s = JsString::from_utf16_units(units, &self.string_heap)?;
-                    write_register(frame, dst, Value::String(s))?;
-                    frame.pc += 1;
-                }
-                Op::LoadLength => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let s = read_register(frame, src)?
-                        .as_string()
-                        .ok_or(VmError::TypeMismatch)?;
-                    let len = NumberValue::from_i32(s.len() as i32);
-                    write_register(frame, dst, Value::Number(len))?;
-                    frame.pc += 1;
-                }
-                Op::LoadNumber => {
-                    let dst = register_operand(operands.first())?;
-                    let idx = const_operand(operands.get(1))?;
-                    let bits = context
-                        .number_constant_bits(idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value = NumberValue::from_f64(f64::from_bits(bits));
-                    write_register(frame, dst, Value::Number(value))?;
-                    frame.pc += 1;
-                }
-                Op::LoadInt32 => {
-                    let dst = register_operand(operands.first())?;
-                    let imm = match operands.get(1) {
-                        Some(&Operand::Imm32(v)) => v,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    write_register(frame, dst, Value::Number(NumberValue::Smi(imm)))?;
-                    frame.pc += 1;
-                }
-                Op::LoadBigInt => {
-                    let dst = register_operand(operands.first())?;
-                    let idx = const_operand(operands.get(1))?;
-                    let decimal = context
-                        .bigint_decimal_constant(idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value = bigint::BigIntValue::from_decimal(decimal)
-                        .ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, Value::BigInt(value))?;
-                    frame.pc += 1;
-                }
-                Op::LoadRegExp => {
-                    // Foundation path: compile once per load. Per-
-                    // literal caching is task 31's explicit non-goal.
-                    let dst = register_operand(operands.first())?;
-                    let idx = const_operand(operands.get(1))?;
-                    let (pattern_utf16, flags) = context
-                        .regexp_constant(idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let regex = regexp::JsRegExp::compile(&mut self.gc_heap, pattern_utf16, flags)
-                        .map_err(|e| VmError::InvalidRegExp {
-                            message: e.to_string(),
-                        })?;
-                    write_register(frame, dst, Value::RegExp(regex))?;
-                    frame.pc += 1;
-                }
-                Op::LoadTrue => {
-                    let dst = register_operand(operands.first())?;
-                    write_register(frame, dst, Value::Boolean(true))?;
-                    frame.pc += 1;
-                }
-                Op::LoadFalse => {
-                    let dst = register_operand(operands.first())?;
-                    write_register(frame, dst, Value::Boolean(false))?;
-                    frame.pc += 1;
-                }
-                Op::LoadNull => {
-                    let dst = register_operand(operands.first())?;
-                    write_register(frame, dst, Value::Null)?;
-                    frame.pc += 1;
-                }
-                Op::LogicalNot => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let truthy = read_register(frame, src)?.to_boolean();
-                    write_register(frame, dst, Value::Boolean(!truthy))?;
-                    frame.pc += 1;
-                }
-                Op::ToBoolean => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let truthy = read_register(frame, src)?.to_boolean();
-                    write_register(frame, dst, Value::Boolean(truthy))?;
-                    frame.pc += 1;
-                }
-                Op::Jump => {
-                    let offset = imm32_operand(operands.first())?;
-                    apply_branch(frame, offset, &self.interrupt)?;
-                }
-                Op::JumpIfTrue => {
-                    let offset = imm32_operand(operands.first())?;
-                    let cond = register_operand(operands.get(1))?;
-                    if read_register(frame, cond)?.to_boolean() {
-                        apply_branch(frame, offset, &self.interrupt)?;
-                    } else {
-                        frame.pc += 1;
-                    }
-                }
-                Op::JumpIfFalse => {
-                    let offset = imm32_operand(operands.first())?;
-                    let cond = register_operand(operands.get(1))?;
-                    if !read_register(frame, cond)?.to_boolean() {
-                        apply_branch(frame, offset, &self.interrupt)?;
-                    } else {
-                        frame.pc += 1;
-                    }
-                }
-                Op::JumpIfNullish => {
-                    let offset = imm32_operand(operands.first())?;
-                    let cond = register_operand(operands.get(1))?;
-                    if read_register(frame, cond)?.is_nullish() {
-                        apply_branch(frame, offset, &self.interrupt)?;
-                    } else {
-                        frame.pc += 1;
-                    }
-                }
-                Op::LoadLocal => {
-                    let dst = register_operand(operands.first())?;
-                    let idx = imm32_operand(operands.get(1))?;
-                    let value = read_register(frame, idx as u16)?.clone();
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::StoreLocal => {
-                    let src = register_operand(operands.first())?;
-                    let idx = imm32_operand(operands.get(1))?;
-                    let value = read_register(frame, src)?.clone();
-                    write_register(frame, idx as u16, value)?;
-                    frame.pc += 1;
-                }
-                Op::TdzError => {
-                    return Err(VmError::TemporalDeadZone {
-                        local_index: imm32_operand(operands.first())? as u32,
-                    });
-                }
-                Op::NewObject => {
-                    let dst = register_operand(operands.first())?;
-                    // §13.2.5.5 ObjectLiteral → OrdinaryObjectCreate(
-                    // %Object.prototype%). The realm's Object.prototype
-                    // is reachable through the bootstrap-installed
-                    // global; only fall back to a null prototype when
-                    // the global has not been linked yet (early
-                    // bootstrap or post-cleanup paths).
-                    let proto = self.object_prototype_object_opt();
-                    let obj = crate::object::alloc_object(&mut self.gc_heap)?;
-                    if let Some(proto) = proto {
-                        crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-                    }
-                    write_register(frame, dst, Value::Object(obj))?;
-                    frame.pc += 1;
-                }
-                Op::LoadProperty => {
-                    let dst = register_operand(operands.first())?;
-                    let obj_reg = register_operand(operands.get(1))?;
-                    let name_idx = const_operand(operands.get(2))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => {
-                            crate::object::get(*o, &self.gc_heap, &name).unwrap_or(Value::Undefined)
-                        }
-                        Value::ClassConstructor(c) => {
-                            if name == "prototype" {
-                                Value::Object(c.prototype(&self.gc_heap))
-                            } else {
-                                match crate::object::get(
-                                    c.statics(&self.gc_heap),
-                                    &self.gc_heap,
-                                    &name,
-                                ) {
-                                    Some(v) => v,
-                                    None if name == "name" || name == "length" => {
-                                        // Fall back to the underlying
-                                        // ctor's intrinsic property
-                                        // when the user hasn't shadowed
-                                        // it via a static field.
-                                        let ctor = c.ctor(&self.gc_heap);
-                                        match &ctor {
-                                            Value::Function { .. }
-                                            | Value::Closure { .. }
-                                            | Value::NativeFunction(_)
-                                            | Value::BoundFunction(_) => {
-                                                let ctx =
-                                                    function_metadata::FunctionMetadataContext::new(
-                                                        context,
-                                                        &self.gc_heap,
-                                                        &self.string_heap,
-                                                        &self.function_user_props,
-                                                        &self.function_deleted_metadata,
-                                                    );
-                                                function_metadata::callable_intrinsic_property(
-                                                    &ctx, &ctor, &name,
-                                                )?
-                                            }
-                                            _ => Value::Undefined,
-                                        }
-                                    }
-                                    None => Value::Undefined,
-                                }
-                            }
-                        }
-                        Value::String(s) if name == "length" => {
-                            Value::Number(NumberValue::from_i32(s.len() as i32))
-                        }
-                        v @ Value::Array(_) => {
-                            let direct = if let Value::Array(a) = v {
-                                crate::array::get_named_property(*a, &self.gc_heap, &name)
-                            } else {
-                                None
-                            };
-                            match direct {
-                                Some(value) => value,
-                                None => {
-                                    // §22.1 — fall back to `Array.prototype`
-                                    // for inherited methods (`toString`,
-                                    // `join`, `map`, …). The prototype walk
-                                    // covers user-installed overrides through
-                                    // ordinary `[[Get]]` semantics.
-                                    // <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
-                                    let proto = self.constructor_prototype_value("Array")?;
-                                    if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.to_string());
-                                        match self.ordinary_get_value(
-                                            context,
-                                            Value::Object(proto_obj),
-                                            v.clone(),
-                                            &key,
-                                            0,
-                                        )? {
-                                            VmGetOutcome::Value(value) => value,
-                                            VmGetOutcome::InvokeGetter { getter } => self
-                                                .run_callable_sync(
-                                                    context,
-                                                    &getter,
-                                                    v.clone(),
-                                                    smallvec::SmallVec::new(),
-                                                )?,
-                                        }
-                                    } else {
-                                        Value::Undefined
-                                    }
-                                }
-                            }
-                        }
-                        // §20.2.4 Function-instance properties — every
-                        // callable carries `.name` / `.length` /
-                        // `.prototype`; user writes through the side
-                        // table take precedence per ordinary [[Get]]
-                        // semantics, and `.prototype` auto-allocates
-                        // on first access (§9.2.10 MakeConstructor).
-                        // <https://tc39.es/ecma262/#sec-function-instances>
-                        Value::Function { function_id } => {
-                            let fid = *function_id;
-                            self.function_property_get(context, fid, &name)?
-                        }
-                        Value::Closure { function_id, .. } => {
-                            let fid = *function_id;
-                            self.function_property_get(context, fid, &name)?
-                        }
-                        Value::NativeFunction(native) => {
-                            match native.own_property_descriptor(
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &name,
-                            )? {
-                                Some(desc) => descriptor_value(&desc),
-                                None => self
-                                    .load_function_prototype_method(&name)
-                                    .or_else(|| self.load_object_prototype_method(&name))
-                                    .unwrap_or(Value::Undefined),
-                            }
-                        }
-                        Value::BoundFunction(bound) => {
-                            match function_metadata::bound_own_property_descriptor(
-                                bound,
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &name,
-                            )? {
-                                Some(desc) => descriptor_value(&desc),
-                                None => self
-                                    .load_function_prototype_method(&name)
-                                    .or_else(|| self.load_object_prototype_method(&name))
-                                    .unwrap_or(Value::Undefined),
-                            }
-                        }
-                        v @ Value::RegExp(_) => {
-                            let direct = if let Value::RegExp(r) = v {
-                                regexp_prototype::load_property(
-                                    r,
-                                    &self.gc_heap,
-                                    &name,
-                                    &self.string_heap,
-                                )
-                            } else {
-                                Value::Undefined
-                            };
-                            match direct {
-                                Value::Undefined => {
-                                    // Walk `RegExp.prototype` for
-                                    // methods + accessors per §22.2.6.
-                                    let proto = self.constructor_prototype_value("RegExp")?;
-                                    if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.to_string());
-                                        match self.ordinary_get_value(
-                                            context,
-                                            Value::Object(proto_obj),
-                                            v.clone(),
-                                            &key,
-                                            0,
-                                        )? {
-                                            VmGetOutcome::Value(value) => value,
-                                            VmGetOutcome::InvokeGetter { getter } => self
-                                                .run_callable_sync(
-                                                    context,
-                                                    &getter,
-                                                    v.clone(),
-                                                    smallvec::SmallVec::new(),
-                                                )?,
-                                        }
-                                    } else {
-                                        Value::Undefined
-                                    }
-                                }
-                                value => value,
-                            }
-                        }
-                        Value::Symbol(s) => symbol_prototype::load_property(s, &name),
-                        Value::Iterator(_) => {
-                            // §27.1.2 %IteratorPrototype% surface —
-                            // raw `it.next` / `.return` / `.throw`
-                            // property reads. The actual dispatch
-                            // for `it.next()` rides through
-                            // [`Self::iterator_helper_dispatch`] on
-                            // the `Op::CallMethod` fast path; this
-                            // branch keeps `typeof it.next === "
-                            // function"` honest by synthesizing a
-                            // bound native that re-enters the
-                            // dispatcher when invoked directly.
-                            // Unknown keys return `undefined` so
-                            // `it.someProp` is a non-error read per
-                            // ordinary Iterator semantics.
-                            match name {
-                                "next" | "return" | "throw" => {
-                                    let receiver_value = read_register(frame, obj_reg)?.clone();
-                                    self.synthesize_iterator_method(&name, receiver_value)?
-                                }
-                                _ => Value::Undefined,
-                            }
-                        }
-                        v @ (Value::WeakRef(_) | Value::FinalizationRegistry(_)) => {
-                            // §26.1.4 / §26.2.4 — instances have no
-                            // own string keys; walk the realm
-                            // prototype.
-                            let proto_name = match v {
-                                Value::WeakRef(_) => "WeakRef",
-                                Value::FinalizationRegistry(_) => "FinalizationRegistry",
-                                _ => unreachable!(),
-                            };
-                            let proto = self.constructor_prototype_value(proto_name)?;
-                            if let Value::Object(proto_obj) = proto {
-                                let key = VmPropertyKey::String(name.to_string());
-                                match self.ordinary_get_value(
-                                    context,
-                                    Value::Object(proto_obj),
-                                    v.clone(),
-                                    &key,
-                                    0,
-                                )? {
-                                    VmGetOutcome::Value(value) => value,
-                                    VmGetOutcome::InvokeGetter { getter } => self
-                                        .run_callable_sync(
-                                            context,
-                                            &getter,
-                                            v.clone(),
-                                            smallvec::SmallVec::new(),
-                                        )?,
-                                }
-                            } else {
-                                Value::Undefined
-                            }
-                        }
-                        v @ Value::Promise(_) => {
-                            // §27.2.5 — Promise instances have no
-                            // own properties; walk
-                            // `Promise.prototype` for `then` /
-                            // `catch` / `finally` / `constructor`
-                            // so user-installed overrides surface
-                            // through ordinary `[[Get]]`.
-                            let proto = self.constructor_prototype_value("Promise")?;
-                            if let Value::Object(proto_obj) = proto {
-                                let key = VmPropertyKey::String(name.to_string());
-                                match self.ordinary_get_value(
-                                    context,
-                                    Value::Object(proto_obj),
-                                    v.clone(),
-                                    &key,
-                                    0,
-                                )? {
-                                    VmGetOutcome::Value(value) => value,
-                                    VmGetOutcome::InvokeGetter { getter } => self
-                                        .run_callable_sync(
-                                            context,
-                                            &getter,
-                                            v.clone(),
-                                            smallvec::SmallVec::new(),
-                                        )?,
-                                }
-                            } else {
-                                Value::Undefined
-                            }
-                        }
-                        v @ (Value::Map(_)
-                        | Value::Set(_)
-                        | Value::WeakMap(_)
-                        | Value::WeakSet(_)) => {
-                            // `size` is an own accessor on Map/Set
-                            // instances per the legacy intrinsic
-                            // fast-path; for every other name walk
-                            // the realm `<Collection>.prototype`
-                            // chain so user-installed methods and
-                            // overrides are observable per §24.*.3.
-                            match collections_prototype::load_property_with_heap(
-                                v,
-                                &name,
-                                &self.gc_heap,
-                            ) {
-                                Value::Undefined => {
-                                    let proto_name = match v {
-                                        Value::Map(_) => "Map",
-                                        Value::Set(_) => "Set",
-                                        Value::WeakMap(_) => "WeakMap",
-                                        Value::WeakSet(_) => "WeakSet",
-                                        _ => unreachable!(),
-                                    };
-                                    let proto = self.constructor_prototype_value(proto_name)?;
-                                    if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.to_string());
-                                        match self.ordinary_get_value(
-                                            context,
-                                            Value::Object(proto_obj),
-                                            v.clone(),
-                                            &key,
-                                            0,
-                                        )? {
-                                            VmGetOutcome::Value(value) => value,
-                                            VmGetOutcome::InvokeGetter { getter } => self
-                                                .run_callable_sync(
-                                                    context,
-                                                    &getter,
-                                                    v.clone(),
-                                                    smallvec::SmallVec::new(),
-                                                )?,
-                                        }
-                                    } else {
-                                        Value::Undefined
-                                    }
-                                }
-                                value => value,
-                            }
-                        }
-                        Value::Temporal(t) => temporal::load_property(t, &name),
-                        v @ Value::ArrayBuffer(_) => {
-                            let (direct, is_shared) = if let Value::ArrayBuffer(b) = v {
-                                (
-                                    binary::array_buffer_prototype::load_property(b, &name),
-                                    b.is_shared(),
-                                )
-                            } else {
-                                (Value::Undefined, false)
-                            };
-                            match direct {
-                                Value::Undefined => {
-                                    let proto_name = if is_shared {
-                                        "SharedArrayBuffer"
-                                    } else {
-                                        "ArrayBuffer"
-                                    };
-                                    let proto = self.constructor_prototype_value(proto_name)?;
-                                    if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.to_string());
-                                        match self.ordinary_get_value(
-                                            context,
-                                            Value::Object(proto_obj),
-                                            v.clone(),
-                                            &key,
-                                            0,
-                                        )? {
-                                            VmGetOutcome::Value(value) => value,
-                                            VmGetOutcome::InvokeGetter { getter } => self
-                                                .run_callable_sync(
-                                                    context,
-                                                    &getter,
-                                                    v.clone(),
-                                                    smallvec::SmallVec::new(),
-                                                )?,
-                                        }
-                                    } else {
-                                        Value::Undefined
-                                    }
-                                }
-                                value => value,
-                            }
-                        }
-                        v @ Value::DataView(_) => {
-                            let direct = if let Value::DataView(dv) = v {
-                                binary::data_view_prototype::load_property(dv, &name)
-                            } else {
-                                Value::Undefined
-                            };
-                            match direct {
-                                Value::Undefined => {
-                                    let proto = self.constructor_prototype_value("DataView")?;
-                                    if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.to_string());
-                                        match self.ordinary_get_value(
-                                            context,
-                                            Value::Object(proto_obj),
-                                            v.clone(),
-                                            &key,
-                                            0,
-                                        )? {
-                                            VmGetOutcome::Value(value) => value,
-                                            VmGetOutcome::InvokeGetter { getter } => self
-                                                .run_callable_sync(
-                                                    context,
-                                                    &getter,
-                                                    v.clone(),
-                                                    smallvec::SmallVec::new(),
-                                                )?,
-                                        }
-                                    } else {
-                                        Value::Undefined
-                                    }
-                                }
-                                value => value,
-                            }
-                        }
-                        v @ Value::TypedArray(_) => {
-                            let direct = if let Value::TypedArray(t) = v {
-                                binary::typed_array_prototype::load_property(t, &name)
-                            } else {
-                                Value::Undefined
-                            };
-                            match direct {
-                                Value::Undefined => {
-                                    let kind_name = if let Value::TypedArray(t) = v {
-                                        t.kind().name()
-                                    } else {
-                                        unreachable!()
-                                    };
-                                    let proto = self.constructor_prototype_value(kind_name)?;
-                                    if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.to_string());
-                                        match self.ordinary_get_value(
-                                            context,
-                                            Value::Object(proto_obj),
-                                            v.clone(),
-                                            &key,
-                                            0,
-                                        )? {
-                                            VmGetOutcome::Value(value) => value,
-                                            VmGetOutcome::InvokeGetter { getter } => self
-                                                .run_callable_sync(
-                                                    context,
-                                                    &getter,
-                                                    v.clone(),
-                                                    smallvec::SmallVec::new(),
-                                                )?,
-                                        }
-                                    } else {
-                                        Value::Undefined
-                                    }
-                                }
-                                value => value,
-                            }
-                        }
-                        v @ Value::BigInt(_) => {
-                            // §21.2.5 — BigInt values are primitives.
-                            // Walk `BigInt.prototype` for installed
-                            // methods (`toString`, `valueOf`) and
-                            // `constructor`.
-                            let proto = self.constructor_prototype_value("BigInt")?;
-                            if let Value::Object(proto_obj) = proto {
-                                let key = VmPropertyKey::String(name.to_string());
-                                match self.ordinary_get_value(
-                                    context,
-                                    Value::Object(proto_obj),
-                                    v.clone(),
-                                    &key,
-                                    0,
-                                )? {
-                                    VmGetOutcome::Value(value) => value,
-                                    VmGetOutcome::InvokeGetter { getter } => self
-                                        .run_callable_sync(
-                                            context,
-                                            &getter,
-                                            v.clone(),
-                                            smallvec::SmallVec::new(),
-                                        )?,
-                                }
-                            } else {
-                                Value::Undefined
-                            }
-                        }
-                        other => {
-                            return Err(VmError::TypeMismatchAt {
-                                op: "property read",
-                                kind: value_kind_name(other),
-                            });
-                        }
-                    };
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::StoreProperty => {
-                    let obj_reg = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
-                    let src = register_operand(operands.get(2))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value = read_register(frame, src)?.clone();
-                    let strict = Self::function_is_strict(context, frame.function_id);
-                    let receiver = read_register(frame, obj_reg)?.clone();
-                    let target = match &receiver {
-                        Value::Object(o) => Some(*o),
-                        Value::ClassConstructor(c) => Some(c.statics(&self.gc_heap)),
-                        Value::RegExp(r) => {
-                            regexp_prototype::store_property(
-                                r,
-                                &mut self.gc_heap,
-                                &name,
-                                value.clone(),
-                            );
-                            None
-                        }
-                        Value::Array(a) => {
-                            // §10.4.2.1 [[DefineOwnProperty]] for
-                            // arrays: indexed names route to the
-                            // dense element table; non-index names
-                            // land in the optional named-property
-                            // bag. `length` writes are filed.
-                            crate::array::set_named_property(
-                                *a,
-                                &mut self.gc_heap,
-                                &name,
-                                value.clone(),
-                            )?;
-                            None
-                        }
-                        // §9.2 Function-instance ordinary [[Set]]:
-                        // `f.foo = 1`, `Ctor.prototype = obj`, etc.
-                        // The function-property side table (keyed
-                        // by function_id) is shared across closure
-                        // handles for the same compiled function so
-                        // every closure observes the same bag.
-                        Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                            let fid = *function_id;
-                            if matches!(name, "name" | "length") {
-                                if let Some(desc) = self.ordinary_function_own_property_descriptor(
-                                    Some(context),
-                                    fid,
-                                    &name,
-                                )? && !desc.writable()
-                                {
-                                    Self::failed_set_result(
-                                        strict,
-                                        format!(
-                                            "Cannot assign to read-only property '{name}' of function"
-                                        ),
-                                    )?;
-                                    None
-                                } else {
-                                    let bag = match self.function_user_props.get(&fid).copied() {
-                                        Some(b) => b,
-                                        None => {
-                                            let new_bag =
-                                                crate::object::alloc_object(&mut self.gc_heap)?;
-                                            self.function_user_props.insert(fid, new_bag);
-                                            new_bag
-                                        }
-                                    };
-                                    if let Some(metadata_key) =
-                                        function_metadata::ordinary_function_metadata_key(&name)
-                                    {
-                                        self.function_deleted_metadata.remove(&(fid, metadata_key));
-                                    }
-                                    Some(bag)
-                                }
-                            } else {
-                                let bag = match self.function_user_props.get(&fid).copied() {
-                                    Some(b) => b,
-                                    None => {
-                                        let new_bag =
-                                            crate::object::alloc_object(&mut self.gc_heap)?;
-                                        self.function_user_props.insert(fid, new_bag);
-                                        new_bag
-                                    }
-                                };
-                                Some(bag)
-                            }
-                        }
-                        Value::NativeFunction(native) => {
-                            match native.own_property_descriptor(
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &name,
-                            )? {
-                                Some(desc) if !desc.writable() => {
-                                    Self::failed_set_result(
-                                        strict,
-                                        format!(
-                                            "Cannot assign to read-only property '{name}' of function {}",
-                                            native.name(&self.gc_heap)
-                                        ),
-                                    )?;
-                                    None
-                                }
-                                _ => {
-                                    let enumerable =
-                                        function_metadata::ordinary_function_metadata_key(&name)
-                                            .is_none();
-                                    let desc = crate::object::PropertyDescriptor::data(
-                                        value.clone(),
-                                        true,
-                                        enumerable,
-                                        true,
-                                    );
-                                    if !native.define_own_property(
-                                        &mut self.gc_heap,
-                                        &self.string_heap,
-                                        &name,
-                                        desc,
-                                    ) {
-                                        Self::failed_set_result(
-                                            strict,
-                                            format!(
-                                                "Cannot define property '{name}' on function {}",
-                                                native.name(&self.gc_heap)
-                                            ),
-                                        )?;
-                                    }
-                                    None
-                                }
-                            }
-                        }
-                        Value::BoundFunction(bound) => {
-                            match function_metadata::bound_own_property_descriptor(
-                                bound,
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &name,
-                            )? {
-                                Some(desc) if !desc.writable() => {
-                                    Self::failed_set_result(
-                                        strict,
-                                        format!(
-                                            "Cannot assign to read-only property '{name}' of bound function"
-                                        ),
-                                    )?;
-                                    None
-                                }
-                                _ => {
-                                    let desc = crate::object::PropertyDescriptor::data(
-                                        value.clone(),
-                                        true,
-                                        true,
-                                        true,
-                                    );
-                                    if !function_metadata::bound_define_own_property(
-                                        bound,
-                                        &mut self.gc_heap,
-                                        &self.string_heap,
-                                        &name,
-                                        desc,
-                                    ) {
-                                        Self::failed_set_result(
-                                            strict,
-                                            format!(
-                                                "Cannot define property '{name}' on bound function"
-                                            ),
-                                        )?;
-                                    }
-                                    None
-                                }
-                            }
-                        }
-                        Value::Undefined | Value::Null | Value::Hole => {
-                            return Err(VmError::TypeError {
-                                message: format!(
-                                    "Cannot set property '{name}' on {}",
-                                    value_kind_name(&receiver)
-                                ),
-                            });
-                        }
-                        Value::Boolean(_)
-                        | Value::Number(_)
-                        | Value::String(_)
-                        | Value::Symbol(_)
-                        | Value::BigInt(_) => {
-                            Self::failed_set_result(
-                                strict,
-                                format!(
-                                    "Cannot set property '{name}' on {}",
-                                    value_kind_name(&receiver)
-                                ),
-                            )?;
-                            None
-                        }
-                        other => {
-                            return Err(VmError::TypeError {
-                                message: format!(
-                                    "Cannot set property '{name}' on {}",
-                                    value_kind_name(other)
-                                ),
-                            });
-                        }
-                    };
-                    if let Some(target) = target {
-                        crate::object::set(target, &mut self.gc_heap, &name, value);
-                    }
-                    frame.pc += 1;
-                }
-                Op::DeleteProperty => {
-                    let dst = register_operand(operands.first())?;
-                    let obj_reg = register_operand(operands.get(1))?;
-                    let name_idx = const_operand(operands.get(2))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let removed = match read_register(frame, obj_reg)? {
-                        Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, &name),
-                        Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                            self.ordinary_function_delete_own_property(*function_id, &name)
-                        }
-                        Value::NativeFunction(native) => {
-                            native.delete_own_property(&mut self.gc_heap, &name)
-                        }
-                        Value::BoundFunction(bound) => {
-                            function_metadata::bound_delete_own_property(
-                                bound,
-                                &mut self.gc_heap,
-                                &name,
-                            )
-                        }
-                        other => {
-                            return Err(VmError::TypeError {
-                                message: format!(
-                                    "Cannot delete property '{name}' of {}",
-                                    value_kind_name(other)
-                                ),
-                            });
-                        }
-                    };
-                    write_register(frame, dst, Value::Boolean(removed))?;
-                    frame.pc += 1;
-                }
-                Op::GetPrototype => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let value = read_register(frame, src)?;
-                    let result = self.get_prototype_for_op(value)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                Op::SetPrototype => {
-                    let obj_reg = register_operand(operands.first())?;
-                    let proto_reg = register_operand(operands.get(1))?;
-                    // Class values chain through their statics
-                    // object — `class D extends C` sets
-                    // `D.statics.[[Prototype]] = C.statics` so
-                    // `D.staticMethod` walks up to `C.staticMethod`
-                    // through the existing prototype lookup.
-                    let proto = match read_register(frame, proto_reg)? {
-                        Value::Object(_) | Value::Proxy(_) | Value::Null => {
-                            read_register(frame, proto_reg)?.clone()
-                        }
-                        Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let receiver = read_register(frame, obj_reg)?.clone();
-                    match &receiver {
-                        Value::Object(_) => {
-                            // §20.1.2.21 Object.setPrototypeOf throws
-                            // when [[SetPrototypeOf]] returns false.
-                            let ok =
-                                self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
-                            if !ok {
-                                return Err(VmError::TypeError {
-                                    message: "Object.setPrototypeOf failed".to_string(),
-                                });
-                            }
-                        }
-                        Value::Function { .. }
-                        | Value::Closure { .. }
-                        | Value::BoundFunction(_)
-                        | Value::NativeFunction(_) => {}
-                        _ => return Err(VmError::TypeMismatch),
-                    }
-                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    frame.pc += 1;
-                }
-                Op::NewArray => {
-                    let dst = register_operand(operands.first())?;
-                    let count = match operands.get(1) {
-                        Some(&Operand::ConstIndex(n)) => n,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let mut elements: SmallVec<[Value; 4]> =
-                        SmallVec::with_capacity(count as usize);
-                    for i in 0..count as usize {
-                        let r = register_operand(operands.get(2 + i))?;
-                        elements.push(read_register(frame, r)?.clone());
-                    }
-                    let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
-                    write_register(frame, dst, Value::Array(array))?;
-                    frame.pc += 1;
-                }
-                Op::LoadElement => {
-                    let dst = register_operand(operands.first())?;
-                    let recv_reg = register_operand(operands.get(1))?;
-                    let idx_reg = register_operand(operands.get(2))?;
-                    let recv = read_register(frame, recv_reg)?.clone();
-                    let idx_value = read_register(frame, idx_reg)?.clone();
-                    let value = match (&recv, &idx_value) {
-                        // Symbol-keyed property access on objects —
-                        // foundation §7.4 (well-known symbols) +
-                        // §10.1 (ordinary objects). Arrays delegate
-                        // through their `JsObject`-style symbol
-                        // store too once the well-known iterator
-                        // exposes a callable (see below).
-                        (Value::Object(obj), Value::Symbol(sym)) => {
-                            crate::object::get_symbol(*obj, &self.gc_heap, sym)
-                                .unwrap_or(Value::Undefined)
-                        }
-                        // String-keyed access on objects with
-                        // computed names: `obj["foo"]` — falls back
-                        // to the string property table.
-                        (Value::Object(obj), Value::String(key)) => {
-                            crate::object::get(*obj, &self.gc_heap, &key.to_lossy_string())
-                                .unwrap_or(Value::Undefined)
-                        }
-                        // Computed numeric property access on
-                        // ordinary objects, e.g. `arguments[0]`,
-                        // uses ToPropertyKey(number) -> decimal
-                        // string.
-                        (Value::Object(obj), Value::Number(n)) => {
-                            let key = n.to_display_string();
-                            crate::object::get(*obj, &self.gc_heap, &key)
-                                .unwrap_or(Value::Undefined)
-                        }
-                        (
-                            Value::Function { function_id } | Value::Closure { function_id, .. },
-                            Value::String(key),
-                        ) => {
-                            match self.ordinary_function_own_property_descriptor(
-                                Some(context),
-                                *function_id,
-                                &key.to_lossy_string(),
-                            )? {
-                                Some(desc) => descriptor_value(&desc),
-                                None => Value::Undefined,
-                            }
-                        }
-                        // Computed access to built-in function
-                        // metadata, e.g. `Function.prototype.call["name"]`.
-                        (Value::NativeFunction(native), Value::String(key)) => {
-                            match native.own_property_descriptor(
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &key.to_lossy_string(),
-                            )? {
-                                Some(desc) => descriptor_value(&desc),
-                                None => Value::Undefined,
-                            }
-                        }
-                        // Computed access to bound-function metadata,
-                        // e.g. `bound["name"]`, follows the same
-                        // descriptor-backed state as direct `bound.name`.
-                        (Value::BoundFunction(bound), Value::String(key)) => {
-                            match function_metadata::bound_own_property_descriptor(
-                                bound,
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &key.to_lossy_string(),
-                            )? {
-                                Some(desc) => descriptor_value(&desc),
-                                None => Value::Undefined,
-                            }
-                        }
-                        // `arr[Symbol.iterator]` — return a native
-                        // callable producing the foundation
-                        // iterator state for the array.
-                        (Value::Array(arr), Value::Symbol(sym))
-                            if sym
-                                .well_known_tag()
-                                .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-                        {
-                            make_array_iterator_factory(*arr, &mut self.gc_heap)?
-                        }
-                        // `map[Symbol.iterator]` aliases `entries` per
-                        // Spec §24.1.3.12; `set[Symbol.iterator]`
-                        // aliases `values` per §24.2.3.11.
-                        (Value::Map(m), Value::Symbol(sym))
-                            if sym
-                                .well_known_tag()
-                                .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-                        {
-                            collections_prototype::make_map_iterator_factory(*m, &mut self.gc_heap)?
-                        }
-                        (Value::Set(s), Value::Symbol(sym))
-                            if sym
-                                .well_known_tag()
-                                .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-                        {
-                            collections_prototype::make_set_iterator_factory(*s, &mut self.gc_heap)?
-                        }
-                        // Numeric-indexed array / string element
-                        // reads.
-                        _ => {
-                            let idx = match &idx_value {
-                                Value::Number(n) => crate::array::index_from_number(*n)
-                                    .ok_or(VmError::TypeMismatch)?,
-                                _ => return Err(VmError::TypeMismatch),
-                            };
-                            match recv {
-                                Value::Array(a) => crate::array::get(a, &self.gc_heap, idx),
-                                Value::String(s) => match s.char_code_at(idx as u32) {
-                                    Some(unit) => Value::String(crate::JsString::from_utf16_units(
-                                        &[unit],
-                                        &self.string_heap,
-                                    )?),
-                                    None => {
-                                        Value::String(crate::JsString::empty(&self.string_heap)?)
-                                    }
-                                },
-                                // §10.4.5.13 IntegerIndexedElementGet
-                                // <https://tc39.es/ecma262/#sec-integerindexedelementget>
-                                Value::TypedArray(t) => t.get(idx),
-                                _ => return Err(VmError::TypeMismatch),
-                            }
-                        }
-                    };
-                    write_register(frame, dst, value)?;
                     frame.pc += 1;
                 }
                 Op::StoreElement => {
@@ -6342,353 +5995,33 @@ impl Interpreter {
                     }
                     frame.pc += 1;
                 }
-                Op::ArrayLength => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let arr = match read_register(frame, src)? {
-                        Value::Array(a) => *a,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let n = NumberValue::from_i32(crate::array::len(arr, &self.gc_heap) as i32);
-                    write_register(frame, dst, Value::Number(n))?;
-                    frame.pc += 1;
+                Op::ArrayLength | Op::IsArray | Op::Instanceof | Op::HasProperty => {
+                    unreachable!("property predicates handled earlier in this loop")
                 }
-                Op::Instanceof => {
-                    // ECMA-262 §13.10.2 InstanceofOperator —
-                    // OrdinaryHasInstance fallback: walk
-                    // `lhs.[[Prototype]]` looking for `rhs.prototype`
-                    // (or just `rhs` itself, kept as a
-                    // backwards-compatible foundation shape so
-                    // `obj instanceof proto` still works for tests
-                    // that pass a raw prototype object).
-                    //
-                    // <https://tc39.es/ecma262/#sec-ordinaryhasinstance>
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let result = match (&lhs, &rhs) {
-                        (Value::Object(a), Value::Object(target)) => {
-                            // Spec path: `target.prototype` is the
-                            // proto object instances inherit from.
-                            // When `target.prototype` resolves to an
-                            // object, walk the chain against it.
-                            // Otherwise fall back to walking the
-                            // chain against `target` directly so
-                            // older fixtures that pass a prototype
-                            // object as rhs still work.
-                            match crate::object::get(*target, &self.gc_heap, "prototype") {
-                                Some(Value::Object(proto)) => {
-                                    crate::object::has_in_proto_chain(*a, &self.gc_heap, proto)
-                                }
-                                _ => crate::object::has_in_proto_chain(*a, &self.gc_heap, *target),
-                            }
-                        }
-                        // §13.10.2 — for class values, walk the
-                        // proto chain against `class.prototype(&self.gc_heap)`.
-                        (Value::Object(a), Value::ClassConstructor(c)) => {
-                            crate::object::has_in_proto_chain(
-                                *a,
-                                &self.gc_heap,
-                                c.prototype(&self.gc_heap),
-                            )
-                        }
-                        _ => false,
-                    };
-                    write_register(frame, dst, Value::Boolean(result))?;
-                    frame.pc += 1;
-                }
-                // §13.10.1 / §7.3.10 HasProperty — `key in obj`.
-                // Right operand must be an Object. The left operand
-                // is coerced via §7.1.19 ToPropertyKey: strings stay
-                // as-is, symbols stay as-is, anything else coerces
-                // to its display string.
-                // <https://tc39.es/ecma262/#sec-hasproperty>
-                Op::HasProperty => {
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let present = match &rhs {
-                        Value::Object(obj) => match &lhs {
-                            Value::Symbol(s) => {
-                                crate::object::get_symbol(*obj, &self.gc_heap, s).is_some()
-                            }
-                            Value::String(s) => {
-                                let key = s.to_lossy_string();
-                                !matches!(
-                                    crate::object::lookup(*obj, &self.gc_heap, &key),
-                                    object::PropertyLookup::Absent
-                                )
-                            }
-                            Value::Number(n) => {
-                                let key = n.to_display_string();
-                                !matches!(
-                                    crate::object::lookup(*obj, &self.gc_heap, &key),
-                                    object::PropertyLookup::Absent
-                                )
-                            }
-                            other => {
-                                let key = other.display_string();
-                                !matches!(
-                                    crate::object::lookup(*obj, &self.gc_heap, &key),
-                                    object::PropertyLookup::Absent
-                                )
-                            }
-                        },
-                        Value::Array(arr) => match &lhs {
-                            // §10.4.2 ArrayExoticObject: indexed
-                            // properties are present iff a value (not
-                            // a hole) occupies the slot. The string
-                            // `"length"` is always present.
-                            Value::Number(n) => match n.as_smi() {
-                                Some(i) if i >= 0 => {
-                                    crate::array::has_own_element(*arr, &self.gc_heap, i as usize)
-                                }
-                                _ => false,
-                            },
-                            Value::String(s) => {
-                                let key = s.to_lossy_string();
-                                if key == "length" {
-                                    true
-                                } else if let Ok(i) = key.parse::<usize>() {
-                                    crate::array::has_own_element(*arr, &self.gc_heap, i)
-                                } else {
-                                    false
-                                }
-                            }
-                            _ => false,
-                        },
-                        Value::ClassConstructor(c) => {
-                            // Static side: "prototype" plus whatever
-                            // the statics object carries.
-                            match &lhs {
-                                Value::String(s) if s.to_lossy_string() == "prototype" => true,
-                                Value::String(s) => !matches!(
-                                    crate::object::lookup(
-                                        c.statics(&self.gc_heap),
-                                        &self.gc_heap,
-                                        &s.to_lossy_string()
-                                    ),
-                                    object::PropertyLookup::Absent
-                                ),
-                                _ => false,
-                            }
-                        }
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    write_register(frame, dst, Value::Boolean(present))?;
-                    frame.pc += 1;
-                }
-                Op::SameValue => {
-                    // `Object.is(x, y)` — ECMA-262 §7.2.11.
-                    // <https://tc39.es/ecma262/#sec-samevalue>
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let result = abstract_ops::same_value(&lhs, &rhs);
-                    write_register(frame, dst, Value::Boolean(result))?;
-                    frame.pc += 1;
-                }
-                Op::IsArray => {
-                    // `Array.isArray(v)` — ECMA-262 §7.2.2.
-                    // <https://tc39.es/ecma262/#sec-isarray>
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let value = read_register(frame, src)?.clone();
-                    let result = abstract_ops::is_array(&value);
-                    write_register(frame, dst, Value::Boolean(result))?;
-                    frame.pc += 1;
-                }
-                Op::Add => {
-                    self.run_add(&operands, frame)?;
-                }
-                Op::Sub => {
-                    self.run_numeric(&operands, frame, number::sub, bigint_sub_op)?;
-                }
-                Op::Mul => {
-                    self.run_numeric(&operands, frame, number::mul, bigint_mul_op)?;
-                }
-                Op::Div => {
-                    self.run_numeric(&operands, frame, number::div, bigint::ops::div)?;
-                }
-                Op::Rem => {
-                    self.run_numeric(&operands, frame, number::rem, bigint::ops::rem)?;
-                }
-                Op::Pow => {
-                    self.run_numeric(&operands, frame, number::pow, bigint::ops::pow)?;
-                }
-                Op::BitwiseAnd => {
-                    self.run_numeric(&operands, frame, number::bitwise_and, bigint_and_op)?;
-                }
-                Op::BitwiseOr => {
-                    self.run_numeric(&operands, frame, number::bitwise_or, bigint_or_op)?;
-                }
-                Op::BitwiseXor => {
-                    self.run_numeric(&operands, frame, number::bitwise_xor, bigint_xor_op)?;
-                }
-                Op::Shl => {
-                    self.run_numeric(&operands, frame, number::shl, bigint::ops::shl)?;
-                }
-                Op::Shr => {
-                    self.run_numeric(&operands, frame, number::shr_arith, bigint::ops::shr)?;
-                }
-                Op::Ushr => {
-                    // §13.10 `>>>` — BigInt operands raise TypeError;
-                    // every other primitive is coerced via
-                    // ToNumber. Compiler ToPrimitive(number) ahead.
-                    // <https://tc39.es/ecma262/#sec-unsigned-right-shift-operator>
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let lk = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
-                    let rk = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
-                    let result = match (lk, rk) {
-                        (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-                            Value::Number(number::shr_logical(a, b))
-                        }
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                Op::Neg => {
-                    // §13.5.6 unary `-`: ToNumeric, then negate.
-                    // Compiler emits ToPrimitive(number) ahead of
-                    // this op so we only see primitives.
-                    // <https://tc39.es/ecma262/#sec-unary-minus-operator>
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let v = read_register(frame, src)?.clone();
-                    let value = match abstract_ops::to_numeric_kind(&v)
-                        .ok_or(VmError::TypeMismatch)?
-                    {
-                        abstract_ops::NumericKind::Num(n) => Value::Number(number::neg(n)),
-                        abstract_ops::NumericKind::Big(b) => Value::BigInt(bigint::ops::neg(&b)),
-                    };
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::BitwiseNot => {
-                    // §13.5.7 unary `~`: ToNumeric, then bitwise
-                    // not. BigInt stays BigInt; otherwise Number.
-                    // <https://tc39.es/ecma262/#sec-bitwise-not-operator>
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let v = read_register(frame, src)?.clone();
-                    let value = match abstract_ops::to_numeric_kind(&v)
-                        .ok_or(VmError::TypeMismatch)?
-                    {
-                        abstract_ops::NumericKind::Num(n) => Value::Number(number::bitwise_not(n)),
-                        abstract_ops::NumericKind::Big(b) => {
-                            Value::BigInt(bigint::ops::bitwise_not(&b))
-                        }
-                    };
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::ToNumber => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let value = match read_register(frame, src)? {
-                        Value::Number(n) => *n,
-                        Value::Boolean(true) => NumberValue::Smi(1),
-                        Value::Boolean(false) | Value::Null => NumberValue::Smi(0),
-                        // Spec ToNumber(BigInt) is a TypeError; we
-                        // surface it here so the unary `+` operator
-                        // doesn't silently coerce.
-                        Value::BigInt(_) => return Err(VmError::TypeMismatch),
-                        // Spec ToNumber(Symbol) is a TypeError per
-                        // §7.1.4 step 4.
-                        Value::Symbol(_) => return Err(VmError::TypeMismatch),
-                        Value::Undefined
-                        | Value::Hole
-                        | Value::Function { .. }
-                        | Value::Closure { .. }
-                        | Value::BoundFunction(_)
-                        | Value::NativeFunction(_)
-                        | Value::Object(_)
-                        | Value::Array(_)
-                        | Value::Iterator(_)
-                        | Value::RegExp(_)
-                        | Value::Promise(_)
-                        | Value::ClassConstructor(_)
-                        | Value::Map(_)
-                        | Value::Set(_)
-                        | Value::WeakMap(_)
-                        | Value::WeakSet(_)
-                        | Value::WeakRef(_)
-                        | Value::FinalizationRegistry(_)
-                        | Value::Temporal(_)
-                        | Value::Intl(_)
-                        | Value::ArrayBuffer(_)
-                        | Value::DataView(_)
-                        | Value::TypedArray(_)
-                        | Value::Generator(_)
-                        | Value::Proxy(_) => NumberValue::Double(f64::NAN),
-                        // §21.4.4.45 Date.prototype[@@toPrimitive] —
-                        // ToNumber on a Date returns its time value.
-                        Value::Date(d) => NumberValue::from_f64(d.time()),
-                        Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
-                    };
-                    write_register(frame, dst, Value::Number(value))?;
-                    frame.pc += 1;
-                }
-                Op::Equal => {
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let eq = lhs == rhs;
-                    write_register(frame, dst, Value::Boolean(eq))?;
-                    frame.pc += 1;
-                }
-                Op::NotEqual => {
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let eq = lhs == rhs;
-                    write_register(frame, dst, Value::Boolean(!eq))?;
-                    frame.pc += 1;
-                }
-                Op::LooseEqual => {
-                    // ECMA-262 §7.2.13. The compiler has already
-                    // coerced both operands through
-                    // `Op::ToPrimitive(default)`, so the runtime
-                    // sees primitives only.
-                    // <https://tc39.es/ecma262/#sec-islooselyequal>
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let eq = abstract_ops::is_loosely_equal(&lhs, &rhs);
-                    write_register(frame, dst, Value::Boolean(eq))?;
-                    frame.pc += 1;
-                }
-                Op::LooseNotEqual => {
-                    let (dst, lhs, rhs) = self.binop_regs(&operands, frame)?;
-                    let eq = abstract_ops::is_loosely_equal(&lhs, &rhs);
-                    write_register(frame, dst, Value::Boolean(!eq))?;
-                    frame.pc += 1;
-                }
-                Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
-                    self.run_compare(&operands, frame, op)?;
-                }
-                Op::GetStringIndex => {
-                    let dst = register_operand(operands.first())?;
-                    let recv = register_operand(operands.get(1))?;
-                    let idx_reg = register_operand(operands.get(2))?;
-                    let recv_s = read_register(frame, recv)?
-                        .as_string()
-                        .ok_or(VmError::TypeMismatch)?
-                        .clone();
-                    let idx = match read_register(frame, idx_reg)? {
-                        Value::Number(n) => match n.as_smi() {
-                            Some(v) if v >= 0 => v as u32,
-                            _ => recv_s.len(), // out of range → empty
-                        },
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let result_str = match recv_s.char_code_at(idx) {
-                        Some(unit) => JsString::from_utf16_units(&[unit], &self.string_heap)?,
-                        None => JsString::empty(&self.string_heap)?,
-                    };
-                    write_register(frame, dst, Value::String(result_str))?;
-                    frame.pc += 1;
-                }
-                Op::LoadThis => {
-                    let dst = register_operand(operands.first())?;
-                    let value = frame.this_value.clone();
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::LoadNewTarget => {
-                    let dst = register_operand(operands.first())?;
-                    let value = frame.new_target.clone().unwrap_or(Value::Undefined);
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::Pow
+                | Op::BitwiseAnd
+                | Op::BitwiseOr
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Neg
+                | Op::BitwiseNot
+                | Op::Equal
+                | Op::NotEqual
+                | Op::LooseEqual
+                | Op::LooseNotEqual
+                | Op::SameValue => {
+                    unreachable!("register binary ops handled earlier in this loop")
                 }
                 Op::NewError => {
                     // Foundation `new Error(arg)` shape — preserved
@@ -7523,59 +6856,6 @@ impl Interpreter {
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
                 }
-                Op::TypeOf => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let tag = read_register(frame, src)?.typeof_string_with_heap(&self.gc_heap);
-                    let s = JsString::from_str(tag, &self.string_heap)?;
-                    write_register(frame, dst, Value::String(s))?;
-                    frame.pc += 1;
-                }
-                Op::DeleteElement => {
-                    let dst = register_operand(operands.first())?;
-                    let obj_reg = register_operand(operands.get(1))?;
-                    let idx_reg = register_operand(operands.get(2))?;
-                    let obj = read_register(frame, obj_reg)?.clone();
-                    let idx = read_register(frame, idx_reg)?.clone();
-                    let removed = match (&obj, idx) {
-                        (Value::Object(obj), Value::Symbol(sym)) => {
-                            crate::object::delete_symbol(*obj, &mut self.gc_heap, &sym)
-                        }
-                        (Value::Object(obj), Value::String(s)) => {
-                            crate::object::delete(*obj, &mut self.gc_heap, &s.to_lossy_string())
-                        }
-                        (Value::Object(obj), Value::Number(n)) => match n.as_smi() {
-                            Some(v) if v >= 0 => {
-                                crate::object::delete(*obj, &mut self.gc_heap, &v.to_string())
-                            }
-                            _ => crate::object::delete(
-                                *obj,
-                                &mut self.gc_heap,
-                                &n.to_display_string(),
-                            ),
-                        },
-                        (
-                            Value::Function { function_id } | Value::Closure { function_id, .. },
-                            Value::String(s),
-                        ) => self.ordinary_function_delete_own_property(
-                            *function_id,
-                            &s.to_lossy_string(),
-                        ),
-                        (Value::NativeFunction(native), Value::String(s)) => {
-                            native.delete_own_property(&mut self.gc_heap, &s.to_lossy_string())
-                        }
-                        (Value::BoundFunction(bound), Value::String(s)) => {
-                            function_metadata::bound_delete_own_property(
-                                bound,
-                                &mut self.gc_heap,
-                                &s.to_lossy_string(),
-                            )
-                        }
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    write_register(frame, dst, Value::Boolean(removed))?;
-                    frame.pc += 1;
-                }
                 Op::NewCollection => {
                     let dst = register_operand(operands.first())?;
                     let kind_idx = const_operand(operands.get(1))?;
@@ -8052,7 +7332,7 @@ impl Interpreter {
             });
         }
         let function = context
-            .function(function_id)
+            .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         // Async-call entry path (spec §27.7.5.1): synthesise a
         // fresh pending result promise, write it into the caller's
@@ -8070,9 +7350,10 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
-        let upvalues = Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues)?;
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
-        let mut new_frame = Frame::with_return_upvalues_and_this(
+        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
             upvalues,
@@ -9775,13 +9056,14 @@ impl Interpreter {
             _ => return Err(VmError::NotCallable),
         };
         let function = context
-            .function(function_id)
+            .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
-        let upvalues = Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues)?;
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
-            Frame::with_return_upvalues_and_this(function, None, upvalues, this_for_callee);
+            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
         let bind_count = (function.param_count as usize).min(effective_args.len());
         let total_args = effective_args.len();
         if function.needs_arguments {
@@ -9963,11 +9245,12 @@ impl Interpreter {
             _ => return Err(VmError::NotCallable),
         };
         let function = context
-            .function(function_id)
+            .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
-        let upvalues = Frame::build_upvalues(&mut self.gc_heap, function, parent_upvalues)?;
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let mut new_frame =
-            Frame::with_return_upvalues_and_this(function, None, upvalues, this_value);
+            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_value);
         new_frame.construct_target = Some(receiver);
         new_frame.new_target = Some(effective_new_target);
         if function.needs_arguments {
@@ -11499,16 +10782,16 @@ impl Interpreter {
         };
         let module = self.compile_eval_source(&source, EvalCompileOptions { force_strict })?;
         let context = ExecutionContext::from_module(module);
-        let main = context.main();
+        let main = context.exec_main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let upvalues =
-            Frame::build_upvalues(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))?;
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))?;
         let entry_this = if main.is_module || main.is_strict {
             Value::Undefined
         } else {
             Value::Object(self.global_this)
         };
-        let mut entry = Frame::with_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let mut entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
         let entry_promise = if main.is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending(&mut self.gc_heap)?;
@@ -15401,227 +14684,6 @@ impl Interpreter {
         self.invoke(stack, context, &next_fn, user_iter_value, args, value_dst)?;
         Ok(true)
     }
-
-    fn binop_regs(
-        &self,
-        operands: &[Operand],
-        frame: &Frame,
-    ) -> Result<(u16, Value, Value), VmError> {
-        let dst = register_operand(operands.first())?;
-        let lhs = register_operand(operands.get(1))?;
-        let rhs = register_operand(operands.get(2))?;
-        let l = read_register(frame, lhs)?.clone();
-        let r = read_register(frame, rhs)?.clone();
-        Ok((dst, l, r))
-    }
-
-    fn run_numeric(
-        &self,
-        operands: &[Operand],
-        frame: &mut Frame,
-        op: fn(NumberValue, NumberValue) -> NumberValue,
-        bigint_op: BigIntBinop,
-    ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
-        // §13.15.3 ApplyStringOrNumericBinaryOperator step 5/6:
-        // non-additive numeric ops apply ToNumeric to each operand
-        // (the compiler emits ToPrimitive(number) ahead of these
-        // ops so by the time we get here only primitives remain).
-        // A non-bigint operand becomes Number; bigint stays BigInt.
-        // <https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator>
-        let lnum = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
-        let rnum = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
-        let result = match (lnum, rnum) {
-            (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-                Value::Number(op(a, b))
-            }
-            (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-                Value::BigInt(bigint_op(&a, &b).map_err(bigint_to_vm_error)?)
-            }
-            // Mixed Number/BigInt is a spec TypeError.
-            _ => return Err(VmError::TypeMismatch),
-        };
-        write_register(frame, dst, result)?;
-        frame.pc += 1;
-        Ok(())
-    }
-
-    /// Implements ECMA-262 §13.15.4
-    /// `ApplyStringOrNumericBinaryOperator` for the `+` operator
-    /// after the compiler has already coerced both operands through
-    /// `Op::ToPrimitive(default)`.
-    ///
-    /// # Algorithm
-    /// 1. If either operand is a `String`, ToString the other
-    ///    operand and return the concatenation.
-    /// 2. Otherwise apply spec-faithful numeric add — `Number +
-    ///    Number` and `BigInt + BigInt` keep their kind; mixed
-    ///    `Number` / `BigInt` is a `TypeError`.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator>
-    fn run_add(&self, operands: &[Operand], frame: &mut Frame) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
-        let result = if matches!(lhs, Value::String(_)) || matches!(rhs, Value::String(_)) {
-            // §13.15.4 step 1.c.ii — string concat path. The
-            // operand that is already a String stays as-is; the
-            // other goes through ToString.
-            let l_str = self.to_display_string(&lhs)?;
-            let r_str = self.to_display_string(&rhs)?;
-            Value::String(JsString::concat(&l_str, &r_str, &self.string_heap)?)
-        } else {
-            match (&lhs, &rhs) {
-                (Value::Number(a), Value::Number(b)) => Value::Number(number::add(*a, *b)),
-                (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(bigint::ops::add(a, b)),
-                (Value::Number(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Number(_)) => {
-                    return Err(VmError::TypeMismatch);
-                }
-                _ => return Err(VmError::TypeMismatch),
-            }
-        };
-        write_register(frame, dst, result)?;
-        frame.pc += 1;
-        Ok(())
-    }
-
-    /// Display-form `ToString` over already-primitive `Value`s.
-    ///
-    /// Used by [`Self::run_add`]'s string-concat path — the
-    /// compiler has already inserted `Op::ToPrimitive(default)`
-    /// before the `+` so any object operand has been collapsed.
-    /// Symbol operands raise a `TypeError` per §7.1.17 step 4.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-tostring>
-    fn to_display_string(&self, value: &Value) -> Result<JsString, VmError> {
-        match value {
-            Value::String(s) => Ok(s.clone()),
-            Value::Number(n) => Ok(JsString::from_str(
-                &n.to_display_string(),
-                &self.string_heap,
-            )?),
-            Value::BigInt(b) => Ok(JsString::from_str(
-                &b.to_decimal_string(),
-                &self.string_heap,
-            )?),
-            Value::Boolean(true) => Ok(JsString::from_str("true", &self.string_heap)?),
-            Value::Boolean(false) => Ok(JsString::from_str("false", &self.string_heap)?),
-            Value::Null => Ok(JsString::from_str("null", &self.string_heap)?),
-            Value::Undefined => Ok(JsString::from_str("undefined", &self.string_heap)?),
-            // §7.1.17 step 4 — Symbol → TypeError.
-            Value::Symbol(_) => Err(VmError::TypeMismatch),
-            // Object-shaped values would normally come through
-            // ToPrimitive(string) first; reaching here means an
-            // object slipped through (e.g. ToPrimitive(default)
-            // returned an object via [Symbol.toPrimitive], in
-            // which case the resume path already raised
-            // TypeMismatch).
-            _ => Err(VmError::TypeMismatch),
-        }
-    }
-
-    /// Implements ECMA-262 §7.2.14 `AbstractRelationalComparison`
-    /// for the four relational operators `<`, `<=`, `>`, `>=`.
-    /// The compiler has already coerced both operands through
-    /// `Op::ToPrimitive(number)`, so the runtime sees primitives.
-    ///
-    /// # Algorithm
-    /// 1. Delegate to [`abstract_ops::abstract_relational_comparison`]
-    ///    with the operands in the canonical order — `lhs < rhs`
-    ///    for `LessThan` / `LessEq`, swapped for `GreaterThan` /
-    ///    `GreaterEq`.
-    /// 2. Translate the [`abstract_ops::RelationalOutcome`] into
-    ///    the boolean each opcode reports:
-    ///    - `<`  / `>`  → `LessThan` only.
-    ///    - `<=` / `>=` → spec `r === undefined ? false : !r` (i.e.
-    ///      `NotLessThan` of the swapped operands).
-    ///    - `Undefined` → always `false`.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
-    fn run_compare(&self, operands: &[Operand], frame: &mut Frame, op: Op) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = self.binop_regs(operands, frame)?;
-        let truthy = match op {
-            Op::LessThan => {
-                matches!(
-                    abstract_ops::abstract_relational_comparison(&lhs, &rhs),
-                    abstract_ops::RelationalOutcome::LessThan
-                )
-            }
-            Op::GreaterThan => {
-                matches!(
-                    abstract_ops::abstract_relational_comparison(&rhs, &lhs),
-                    abstract_ops::RelationalOutcome::LessThan
-                )
-            }
-            Op::LessEq => matches!(
-                abstract_ops::abstract_relational_comparison(&rhs, &lhs),
-                abstract_ops::RelationalOutcome::NotLessThan
-            ),
-            Op::GreaterEq => matches!(
-                abstract_ops::abstract_relational_comparison(&lhs, &rhs),
-                abstract_ops::RelationalOutcome::NotLessThan
-            ),
-            _ => unreachable!("run_compare called with non-relational op"),
-        };
-        write_register(frame, dst, Value::Boolean(truthy))?;
-        frame.pc += 1;
-        Ok(())
-    }
-}
-
-/// Function-pointer alias for the BigInt sibling of the
-/// `NumberValue` arithmetic helpers. A few `BigInt` ops can fail
-/// (division by zero, negative exponent, oversized shift); the
-/// VM dispatcher maps each error variant to the matching
-/// `VmError`.
-type BigIntBinop = fn(
-    &bigint::BigIntValue,
-    &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError>;
-
-fn bigint_sub_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
-    Ok(bigint::ops::sub(a, b))
-}
-
-fn bigint_mul_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
-    Ok(bigint::ops::mul(a, b))
-}
-
-fn bigint_and_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
-    Ok(bigint::ops::bitwise_and(a, b))
-}
-
-fn bigint_or_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
-    Ok(bigint::ops::bitwise_or(a, b))
-}
-
-fn bigint_xor_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
-    Ok(bigint::ops::bitwise_xor(a, b))
-}
-
-/// Map [`bigint::ops::OpError`] into the surrounding [`VmError`].
-fn bigint_to_vm_error(err: bigint::ops::OpError) -> VmError {
-    match err {
-        bigint::ops::OpError::DivisionByZero
-        | bigint::ops::OpError::NegativeExponent
-        | bigint::ops::OpError::ShiftOutOfRange => VmError::TypeMismatch,
-    }
 }
 
 /// Walk a live frame stack top-down and build a snapshot the
@@ -15853,42 +14915,6 @@ impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn register_operand(operand: Option<&Operand>) -> Result<u16, VmError> {
-    match operand {
-        Some(Operand::Register(r)) => Ok(*r),
-        _ => Err(VmError::InvalidOperand),
-    }
-}
-
-fn const_operand(operand: Option<&Operand>) -> Result<u32, VmError> {
-    match operand {
-        Some(Operand::ConstIndex(k)) => Ok(*k),
-        _ => Err(VmError::InvalidOperand),
-    }
-}
-
-fn imm32_operand(operand: Option<&Operand>) -> Result<i32, VmError> {
-    match operand {
-        Some(Operand::Imm32(v)) => Ok(*v),
-        _ => Err(VmError::InvalidOperand),
-    }
-}
-
-/// Apply a relative branch. Negative offsets are back-edges and
-/// poll the interrupt flag — that's the foundation plan's
-/// `every back-edge polls the runtime checkpoint` rule.
-fn apply_branch(frame: &mut Frame, offset: i32, interrupt: &InterruptFlag) -> Result<(), VmError> {
-    let next_pc = (frame.pc as i64 + 1).saturating_add(offset as i64);
-    if next_pc < 0 || next_pc > u32::MAX as i64 {
-        return Err(VmError::InvalidOperand);
-    }
-    if offset < 0 && interrupt.is_set() {
-        return Err(VmError::Interrupted);
-    }
-    frame.pc = next_pc as u32;
-    Ok(())
 }
 
 /// Render an uncaught JS value for diagnostic output. Routes
@@ -16195,7 +15221,7 @@ fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {
     }
 }
 
-fn value_kind_name(value: &Value) -> &'static str {
+pub(crate) fn value_kind_name(value: &Value) -> &'static str {
     match value {
         Value::Undefined | Value::Hole => "undefined",
         Value::Null => "null",

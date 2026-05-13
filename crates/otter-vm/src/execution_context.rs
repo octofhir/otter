@@ -25,12 +25,15 @@
 //! - [`crate::timers`]
 //! - [`crate::dynamic_import`]
 
-use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit};
+use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
+
+use crate::executable::{ExecInstr, ExecutableFunction, ExecutableModule};
 
 /// Cloneable dispatch context for VM-owned JS jobs.
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     module: std::rc::Rc<BytecodeModule>,
+    executable: std::rc::Rc<ExecutableModule>,
     decoded_strings: std::rc::Rc<[Option<String>]>,
 }
 
@@ -38,6 +41,7 @@ impl ExecutionContext {
     /// Build a context from an owned bytecode module.
     #[must_use]
     pub fn from_module(module: BytecodeModule) -> Self {
+        let executable = ExecutableModule::from_bytecode(&module);
         let decoded_strings: std::rc::Rc<[Option<String>]> = module
             .constants
             .iter()
@@ -48,6 +52,7 @@ impl ExecutionContext {
             .collect();
         Self {
             module: std::rc::Rc::new(module),
+            executable: std::rc::Rc::new(executable),
             decoded_strings,
         }
     }
@@ -64,6 +69,14 @@ impl ExecutionContext {
         self.module.main()
     }
 
+    /// Entry executable function for a script/module turn.
+    #[must_use]
+    pub(crate) fn exec_main(&self) -> &ExecutableFunction {
+        self.executable
+            .function(0)
+            .expect("bytecode modules always carry main function 0")
+    }
+
     /// Module initialization records for linked module graphs.
     #[must_use]
     pub fn module_inits(&self) -> &[ModuleInit] {
@@ -76,16 +89,66 @@ impl ExecutionContext {
         self.module.functions.get(function_id as usize)
     }
 
+    /// Executable function lookup by VM function id.
+    #[must_use]
+    pub(crate) fn exec_function(&self, function_id: u32) -> Option<&ExecutableFunction> {
+        self.executable.function(function_id)
+    }
+
+    /// Return an executable instruction's operands in declaration order.
+    #[must_use]
+    pub(crate) fn exec_operands<'a>(&'a self, instr: &'a ExecInstr) -> &'a [Operand] {
+        self.executable.operands(instr)
+    }
+
+    /// Return one executable instruction operand by index.
+    #[must_use]
+    pub(crate) fn exec_operand<'a>(
+        &'a self,
+        instr: &'a ExecInstr,
+        index: usize,
+    ) -> Option<&'a Operand> {
+        self.executable.operand(instr, index)
+    }
+
+    /// Decode one executable register operand.
+    #[must_use]
+    pub(crate) fn exec_register(&self, instr: &ExecInstr, index: usize) -> Option<u16> {
+        self.executable.register(instr, index)
+    }
+
+    /// Decode the common `dst, lhs, rhs` register triple.
+    #[must_use]
+    pub(crate) fn exec_register3(&self, instr: &ExecInstr) -> Option<(u16, u16, u16)> {
+        Some((
+            self.exec_register(instr, 0)?,
+            self.exec_register(instr, 1)?,
+            self.exec_register(instr, 2)?,
+        ))
+    }
+
+    /// Decode one executable constant-pool index operand.
+    #[must_use]
+    pub(crate) fn exec_const_index(&self, instr: &ExecInstr, index: usize) -> Option<u32> {
+        self.executable.const_index(instr, index)
+    }
+
+    /// Decode one executable signed immediate operand.
+    #[must_use]
+    pub(crate) fn exec_imm32(&self, instr: &ExecInstr, index: usize) -> Option<i32> {
+        self.executable.imm32(instr, index)
+    }
+
     /// `true` when the function id points at an arrow function.
     #[must_use]
     pub fn function_is_arrow(&self, function_id: u32) -> bool {
-        self.function(function_id).is_some_and(|f| f.is_arrow)
+        self.exec_function(function_id).is_some_and(|f| f.is_arrow)
     }
 
     /// `true` when the function id points at a strict function.
     #[must_use]
     pub fn function_is_strict(&self, function_id: u32) -> bool {
-        self.function(function_id).is_some_and(|f| f.is_strict)
+        self.exec_function(function_id).is_some_and(|f| f.is_strict)
     }
 
     /// Resolve a function-id constant.

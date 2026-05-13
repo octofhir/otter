@@ -49,3 +49,7 @@ harness = false
 [[bench]]
 name = "string_search"
 harness = false
+
+[[bench]]
+name = "property_ic"
+harness = false

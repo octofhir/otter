@@ -673,7 +673,7 @@ impl Interpreter {
             context,
             iterator.clone(),
             iterator.clone(),
-            &VmPropertyKey::String("next".to_string()),
+            &VmPropertyKey::String("next"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
@@ -712,7 +712,7 @@ impl Interpreter {
             context,
             result.clone(),
             result.clone(),
-            &VmPropertyKey::String("done".to_string()),
+            &VmPropertyKey::String("done"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
@@ -727,7 +727,7 @@ impl Interpreter {
             context,
             result.clone(),
             result.clone(),
-            &VmPropertyKey::String("value".to_string()),
+            &VmPropertyKey::String("value"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
@@ -757,7 +757,7 @@ impl Interpreter {
             context,
             iterator.clone(),
             iterator.clone(),
-            &VmPropertyKey::String("return".to_string()),
+            &VmPropertyKey::String("return"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,

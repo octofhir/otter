@@ -29,6 +29,8 @@ use crate::{
     binary, collections_prototype, descriptor_value, function_metadata,
     is_restricted_function_property, make_array_iterator_factory, object,
     operand_decode::{const_operand, register_operand},
+    property_atom::AtomizedPropertyKey,
+    property_ic::{LoadPropertyIc, StorePropertyIc},
     read_register, regexp_prototype, symbol, symbol_prototype, temporal, value_kind_name,
     write_register,
 };
@@ -87,8 +89,9 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
         obj_reg: u16,
-        name: &str,
+        key: AtomizedPropertyKey<'_>,
     ) -> Result<(), VmError> {
+        let name = key.name();
         let receiver = read_register(frame, obj_reg)?.clone();
         let removed = match &receiver {
             Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, name),
@@ -207,8 +210,9 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
         obj_reg: u16,
-        name: &str,
+        key: AtomizedPropertyKey<'_>,
     ) -> Result<(), VmError> {
+        let name = key.name();
         let value = match read_register(frame, obj_reg)? {
             Value::Object(o) => {
                 crate::object::get(*o, &self.gc_heap, name).unwrap_or(Value::Undefined)
@@ -407,9 +411,10 @@ impl Interpreter {
         context: &ExecutionContext,
         frame: &mut Frame,
         obj_reg: u16,
-        name: &str,
+        key: AtomizedPropertyKey<'_>,
         src: u16,
     ) -> Result<(), VmError> {
+        let name = key.name();
         let value = read_register(frame, src)?.clone();
         let strict = context.function_is_strict(frame.function_id);
         let receiver = read_register(frame, obj_reg)?.clone();
@@ -882,7 +887,7 @@ impl Interpreter {
         let Value::Object(proto_obj) = proto else {
             return Ok(Value::Undefined);
         };
-        let key = VmPropertyKey::String(name.to_string());
+        let key = VmPropertyKey::String(name);
         match self.ordinary_get_value(
             context,
             Value::Object(proto_obj),
@@ -929,13 +934,101 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
         let name_idx = const_operand(operands.get(2))?;
-        let name = context
-            .string_constant_str(name_idx)
+        let atomized_key = context
+            .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)?;
+        let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
-        if matches!(receiver, Value::Object(_) | Value::Proxy(_)) {
-            let key = VmPropertyKey::String(name.to_string());
+        if let Value::Object(obj) = &receiver {
+            let obj = *obj;
+            let receiver_shape_id = object::shape_id(obj, &self.gc_heap);
+            let site = context
+                .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
+                .ok_or(VmError::InvalidOperand)?;
+            let mut site_disabled = self.load_property_ics[site].is_disabled();
+            if let Some(ic) = self.load_property_ics[site].cached() {
+                if let Some(hit) = ic.matches_own_data(receiver_shape_id, atomized_key)
+                    && let Some(value) =
+                        object::load_own_data_slot_atom(obj, &self.gc_heap, atomized_key, hit)
+                {
+                    self.property_ic_stats.load_hits += 1;
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    write_register(&mut stack[top_idx], dst, value)?;
+                    return Ok(true);
+                }
+                if let Some(hit) = ic.direct_prototype_hit(receiver_shape_id, atomized_key)
+                    && let Some(proto) = object::prototype(obj, &self.gc_heap)
+                    && let Some(value) =
+                        object::load_own_data_slot_atom(proto, &self.gc_heap, atomized_key, hit)
+                {
+                    self.property_ic_stats.load_hits += 1;
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    write_register(&mut stack[top_idx], dst, value)?;
+                    return Ok(true);
+                }
+                self.property_ic_stats.load_misses += 1;
+                if self.load_property_ics[site].record_guard_miss() {
+                    self.property_ic_stats.load_disables += 1;
+                }
+                site_disabled = self.load_property_ics[site].is_disabled();
+            } else if !site_disabled {
+                self.property_ic_stats.load_misses += 1;
+            }
+            if !site_disabled && object::string_data(obj, &self.gc_heap).is_none() {
+                let atom_lookup = object::lookup_own_atom(obj, &self.gc_heap, atomized_key);
+                if let (Some(hit), object::PropertyLookup::Data { value, flags: _ }) =
+                    (atom_lookup.hit, atom_lookup.lookup)
+                {
+                    self.load_property_ics[site].install(LoadPropertyIc::own_data(hit));
+                    self.property_ic_stats.load_installs += 1;
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    write_register(&mut stack[top_idx], dst, value)?;
+                    return Ok(true);
+                }
+                if let Some(proto) = object::prototype(obj, &self.gc_heap) {
+                    let proto_lookup = object::lookup_own_atom(proto, &self.gc_heap, atomized_key);
+                    if let (Some(hit), object::PropertyLookup::Data { value, flags: _ }) =
+                        (proto_lookup.hit, proto_lookup.lookup)
+                    {
+                        self.load_property_ics[site].install(
+                            LoadPropertyIc::direct_prototype_data(receiver_shape_id, hit),
+                        );
+                        self.property_ic_stats.load_installs += 1;
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        write_register(&mut stack[top_idx], dst, value)?;
+                        return Ok(true);
+                    }
+                }
+            }
+            let key = VmPropertyKey::atom(atomized_key);
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.ordinary_get_value(
+                context,
+                Value::Object(obj),
+                Value::Object(obj),
+                &key,
+                0,
+            )? {
+                VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    if abstract_ops::is_callable(&getter) {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &getter, Value::Object(obj), args, dst)?;
+                    } else {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if let Value::Proxy(_) = &receiver {
+            let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
@@ -960,7 +1053,7 @@ impl Interpreter {
                 | Value::BigInt(_)
         ) {
             let boxed = self.box_sloppy_this_primitive(receiver.clone())?;
-            let key = VmPropertyKey::String(name.to_string());
+            let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.ordinary_get_value(context, boxed, receiver.clone(), &key, 0)? {
@@ -1176,8 +1269,8 @@ impl Interpreter {
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         let key_value = read_register(&stack[top_idx], key_reg)?.clone();
         let key = match &key_value {
-            Value::String(s) => VmPropertyKey::String(s.to_lossy_string()),
-            Value::Number(n) => VmPropertyKey::String(n.to_display_string()),
+            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+            Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
             _ => return Ok(false),
         };
@@ -1199,7 +1292,7 @@ impl Interpreter {
             return Ok(true);
         }
 
-        if let (Value::BoundFunction(bound), VmPropertyKey::String(key)) = (&receiver, &key) {
+        if let (Value::BoundFunction(bound), Some(key)) = (&receiver, key.string_name()) {
             match function_metadata::bound_own_property_descriptor(
                 bound,
                 &self.gc_heap,
@@ -1257,7 +1350,7 @@ impl Interpreter {
         let obj = match &receiver {
             Value::Object(obj) => *obj,
             Value::ClassConstructor(class) => {
-                if matches!(&key, VmPropertyKey::String(key) if key == "prototype") {
+                if key.string_name().is_some_and(|key| key == "prototype") {
                     let pc = stack[top_idx].pc;
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     write_register(
@@ -1278,8 +1371,13 @@ impl Interpreter {
             _ => return Ok(false),
         };
         let lookup = match &key {
-            VmPropertyKey::String(key) => crate::object::lookup(obj, &self.gc_heap, key),
             VmPropertyKey::Symbol(sym) => crate::object::lookup_symbol(obj, &self.gc_heap, sym),
+            _ => crate::object::lookup(
+                obj,
+                &self.gc_heap,
+                key.string_name()
+                    .expect("non-symbol key has string spelling"),
+            ),
         };
         match lookup {
             object::PropertyLookup::Data { value, .. } => {
@@ -1367,27 +1465,26 @@ impl Interpreter {
             match proto {
                 Value::Object(obj) => {
                     let lookup = match &key {
-                        VmPropertyKey::String(key) => object::lookup_own(obj, &self.gc_heap, key),
                         VmPropertyKey::Symbol(sym) => {
                             object::lookup_own_symbol(obj, &self.gc_heap, sym)
                         }
+                        _ => object::lookup_own(
+                            obj,
+                            &self.gc_heap,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                        ),
                     };
                     match lookup {
                         object::PropertyLookup::Data { flags, .. } => {
                             if !flags.writable() {
-                                let name = match &key {
-                                    VmPropertyKey::String(key) => key.as_str(),
-                                    VmPropertyKey::Symbol(_) => "symbol",
-                                };
+                                let name = key.string_name().unwrap_or("symbol");
                                 Self::failed_set_result(
                                     strict,
                                     format!("Cannot assign to read-only property '{name}'"),
                                 )?;
                             } else {
-                                let name = match &key {
-                                    VmPropertyKey::String(key) => key.as_str(),
-                                    VmPropertyKey::Symbol(_) => "symbol",
-                                };
+                                let name = key.string_name().unwrap_or("symbol");
                                 Self::failed_set_result(
                                     strict,
                                     format!("Cannot assign to property '{name}' on primitive"),
@@ -1424,12 +1521,7 @@ impl Interpreter {
                     }
                 }
                 Value::Proxy(proxy) => {
-                    let key_value = match &key {
-                        VmPropertyKey::String(key) => {
-                            Value::String(JsString::from_str(key, &self.string_heap)?)
-                        }
-                        VmPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
-                    };
+                    let key_value = self.vm_property_key_to_value(&key)?;
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         proxy.target(),
                         key_value,
@@ -1446,29 +1538,6 @@ impl Interpreter {
                                 return Err(VmError::TypeMismatch);
                             };
                             match &key {
-                                VmPropertyKey::String(key) => {
-                                    match object::resolve_set(target, &self.gc_heap, key) {
-                                        object::SetOutcome::AssignData => {}
-                                        object::SetOutcome::InvokeSetter { setter } => {
-                                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                            args.push(value);
-                                            self.invoke(
-                                                stack,
-                                                context,
-                                                &setter,
-                                                receiver,
-                                                args,
-                                                scratch_reg,
-                                            )?;
-                                        }
-                                        object::SetOutcome::Reject { .. } => {
-                                            Self::failed_set_result(
-                                                strict,
-                                                format!("Cannot assign to property '{key}'"),
-                                            )?;
-                                        }
-                                    }
-                                }
                                 VmPropertyKey::Symbol(sym) => {
                                     match object::resolve_symbol_set(target, &self.gc_heap, sym) {
                                         object::SetOutcome::AssignData => {}
@@ -1492,6 +1561,32 @@ impl Interpreter {
                                         }
                                     }
                                 }
+                                _ => {
+                                    let key = key
+                                        .string_name()
+                                        .expect("non-symbol key has string spelling");
+                                    match object::resolve_set(target, &self.gc_heap, key) {
+                                        object::SetOutcome::AssignData => {}
+                                        object::SetOutcome::InvokeSetter { setter } => {
+                                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                            args.push(value);
+                                            self.invoke(
+                                                stack,
+                                                context,
+                                                &setter,
+                                                receiver,
+                                                args,
+                                                scratch_reg,
+                                            )?;
+                                        }
+                                        object::SetOutcome::Reject { .. } => {
+                                            Self::failed_set_result(
+                                                strict,
+                                                format!("Cannot assign to property '{key}'"),
+                                            )?;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1502,10 +1597,7 @@ impl Interpreter {
         }
 
         let top_idx = stack.len() - 1;
-        let name = match &key {
-            VmPropertyKey::String(key) => key.as_str(),
-            VmPropertyKey::Symbol(_) => "symbol",
-        };
+        let name = key.string_name().unwrap_or("symbol");
         Self::failed_set_result(
             strict,
             format!("Cannot assign to property '{name}' on primitive"),
@@ -1565,7 +1657,9 @@ impl Interpreter {
                     let target_value = proxy.target();
                     let Value::Object(target) = target_value else {
                         let vm_key = match &key {
-                            ComputedPropertyKey::String(key) => VmPropertyKey::String(key.clone()),
+                            ComputedPropertyKey::String(key) => {
+                                VmPropertyKey::OwnedString(key.clone())
+                            }
                             ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
                         };
                         if !self.ordinary_set_data_value(
@@ -1701,7 +1795,7 @@ impl Interpreter {
                 | Value::BigInt(_)
         ) {
             let key = match key {
-                ComputedPropertyKey::String(key) => VmPropertyKey::String(key),
+                ComputedPropertyKey::String(key) => VmPropertyKey::OwnedString(key),
                 ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym),
             };
             return self.store_to_primitive_base(stack, context, receiver, key, value, scratch_reg);
@@ -1801,13 +1895,45 @@ impl Interpreter {
         let name_idx = const_operand(operands.get(1))?;
         let src_reg = register_operand(operands.get(2))?;
         let scratch_reg = register_operand(operands.get(3))?;
-        let name = context
-            .string_constant_str(name_idx)
+        let atomized_key = context
+            .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)?;
+        let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         let value = read_register(&stack[top_idx], src_reg)?.clone();
         let strict = Self::current_frame_is_strict(stack, context);
+        if let Value::Object(obj) = &receiver
+            && object::string_data(*obj, &self.gc_heap).is_none()
+        {
+            let obj = *obj;
+            let site = context
+                .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
+                .ok_or(VmError::InvalidOperand)?;
+            if let Some(ic) = self.store_property_ics[site].cached() {
+                if ic.matches(object::shape_id(obj, &self.gc_heap), atomized_key)
+                    && object::store_own_data_slot_atom(
+                        obj,
+                        &mut self.gc_heap,
+                        atomized_key,
+                        ic.hit,
+                        value.clone(),
+                    )
+                    .is_some()
+                {
+                    self.property_ic_stats.store_hits += 1;
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    return Ok(true);
+                }
+                self.property_ic_stats.store_misses += 1;
+                if self.store_property_ics[site].record_guard_miss() {
+                    self.property_ic_stats.store_disables += 1;
+                }
+            } else if !self.store_property_ics[site].is_disabled() {
+                self.property_ic_stats.store_misses += 1;
+            }
+        }
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
         // when present; otherwise delegate to the target.
         if let Value::Proxy(p) = &receiver {
@@ -1817,8 +1943,8 @@ impl Interpreter {
                     message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
                 });
             }
-            let key_str = JsString::from_str(&name, &self.string_heap)?;
-            let key_vm = VmPropertyKey::String(name.to_string());
+            let key_str = JsString::from_str(name, &self.string_heap)?;
+            let key_vm = VmPropertyKey::atom(atomized_key);
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(),
                 Value::String(key_str),
@@ -1879,7 +2005,7 @@ impl Interpreter {
                         if !self.ordinary_set_data_value(
                             context,
                             target_value,
-                            &VmPropertyKey::String(name.to_string()),
+                            &key_vm,
                             value,
                             Value::Proxy(proxy.clone()),
                             0,
@@ -2004,7 +2130,7 @@ impl Interpreter {
                 stack,
                 context,
                 receiver,
-                VmPropertyKey::String(name.to_string()),
+                VmPropertyKey::atom(atomized_key),
                 value,
                 scratch_reg,
             );
@@ -2045,6 +2171,23 @@ impl Interpreter {
                         context,
                         format!("Cannot assign to property '{name}'"),
                     );
+                }
+                if matches!(receiver, Value::Object(_)) {
+                    let atom_lookup = object::lookup_own_atom(obj, &self.gc_heap, atomized_key);
+                    if let (Some(hit), object::PropertyLookup::Data { flags, value: _ }) =
+                        (atom_lookup.hit, atom_lookup.lookup)
+                        && flags.writable()
+                    {
+                        let site = context
+                            .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
+                            .ok_or(VmError::InvalidOperand)?;
+                        if !self.store_property_ics[site].is_disabled()
+                            && object::string_data(obj, &self.gc_heap).is_none()
+                        {
+                            self.store_property_ics[site].install(StorePropertyIc::from_hit(hit));
+                            self.property_ic_stats.store_installs += 1;
+                        }
+                    }
                 }
                 let pc = stack[top_idx].pc;
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2095,8 +2238,8 @@ impl Interpreter {
         };
         let key = match &lhs {
             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
-            Value::String(s) => VmPropertyKey::String(s.to_lossy_string()),
-            other => VmPropertyKey::String(other.display_string()),
+            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+            other => VmPropertyKey::OwnedString(other.display_string()),
         };
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2116,8 +2259,8 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
         let name_idx = const_operand(operands.get(2))?;
-        let name = context
-            .string_constant_str(name_idx)
+        let atomized_key = context
+            .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
@@ -2129,7 +2272,7 @@ impl Interpreter {
         let removed = self.ordinary_delete_value(
             context,
             Value::Proxy(proxy),
-            &VmPropertyKey::String(name.to_string()),
+            &VmPropertyKey::atom(atomized_key),
             0,
         )?;
         write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;

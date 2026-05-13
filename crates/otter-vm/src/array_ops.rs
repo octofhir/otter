@@ -125,7 +125,7 @@ impl Interpreter {
                 context,
                 items.clone(),
                 items.clone(),
-                &VmPropertyKey::String("length".to_string()),
+                &VmPropertyKey::String("length"),
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
@@ -136,7 +136,7 @@ impl Interpreter {
             let len = to_length(&length_value)?;
             let mut out = Vec::with_capacity(len);
             for index in 0..len {
-                let key = VmPropertyKey::String(index.to_string());
+                let key = VmPropertyKey::OwnedString(index.to_string());
                 let value = match self.ordinary_get_value(
                     context,
                     items.clone(),

@@ -541,7 +541,7 @@ fn add_entries_from_iterable(
                 &context,
                 target.clone(),
                 target.clone(),
-                &VmPropertyKey::String(adder_name.to_string()),
+                &VmPropertyKey::String(adder_name),
                 0,
             )
             .map_err(|e| vm_to_native(e, ctor_name))?;
@@ -699,7 +699,7 @@ fn read_indexed_property(
         context,
         target.clone(),
         target.clone(),
-        &VmPropertyKey::String(name.to_string()),
+        &VmPropertyKey::String(name),
         0,
     )?;
     match outcome {

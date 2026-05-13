@@ -58,11 +58,12 @@ impl Interpreter {
     }
 
     pub(crate) fn vm_property_key_to_value(&self, key: &VmPropertyKey) -> Result<Value, VmError> {
-        match key {
-            VmPropertyKey::String(key) => {
-                Ok(Value::String(JsString::from_str(key, &self.string_heap)?))
-            }
-            VmPropertyKey::Symbol(sym) => Ok(Value::Symbol(sym.clone())),
+        if let Some(key) = key.string_name() {
+            Ok(Value::String(JsString::from_str(key, &self.string_heap)?))
+        } else if let VmPropertyKey::Symbol(sym) = key {
+            Ok(Value::Symbol(sym.clone()))
+        } else {
+            unreachable!("every non-string property key is a symbol")
         }
     }
 
@@ -72,8 +73,14 @@ impl Interpreter {
         key: &VmPropertyKey,
     ) -> object::PropertyLookup {
         match key {
-            VmPropertyKey::String(key) => object::lookup_own(obj, &self.gc_heap, key),
+            VmPropertyKey::Atom(key) => object::lookup_own_atom(obj, &self.gc_heap, *key).lookup,
             VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(obj, &self.gc_heap, sym),
+            _ => object::lookup_own(
+                obj,
+                &self.gc_heap,
+                key.string_name()
+                    .expect("non-symbol key has string spelling"),
+            ),
         }
     }
 
@@ -85,7 +92,7 @@ impl Interpreter {
         let Some(value) = object::string_data(obj, &self.gc_heap) else {
             return Ok(None);
         };
-        let VmPropertyKey::String(key) = key else {
+        let Some(key) = key.string_name() else {
             return Ok(None);
         };
         if key == "length" {
@@ -113,7 +120,7 @@ impl Interpreter {
         let Some(value) = object::string_data(obj, &self.gc_heap) else {
             return Ok(None);
         };
-        let VmPropertyKey::String(key) = key else {
+        let Some(key) = key.string_name() else {
             return Ok(None);
         };
         if key == "length" {
@@ -209,11 +216,12 @@ impl Interpreter {
         let Value::Object(obj) = target else {
             return None;
         };
-        match key {
-            VmPropertyKey::String(key) => object::get_own_descriptor(*obj, &self.gc_heap, key),
-            VmPropertyKey::Symbol(sym) => {
-                object::get_own_symbol_descriptor(*obj, &self.gc_heap, sym)
-            }
+        if let Some(key) = key.string_name() {
+            object::get_own_descriptor(*obj, &self.gc_heap, key)
+        } else if let VmPropertyKey::Symbol(sym) = key {
+            object::get_own_symbol_descriptor(*obj, &self.gc_heap, sym)
+        } else {
+            None
         }
     }
 
@@ -336,25 +344,26 @@ impl Interpreter {
                 if let Some(desc) = self.string_object_exotic_descriptor(obj, key)? {
                     return Ok(Some(desc));
                 }
-                Ok(match key {
-                    VmPropertyKey::String(key) => {
-                        object::get_own_descriptor(obj, &self.gc_heap, key)
-                    }
-                    VmPropertyKey::Symbol(sym) => {
-                        object::get_own_symbol_descriptor(obj, &self.gc_heap, sym)
-                    }
+                Ok(if let Some(key) = key.string_name() {
+                    object::get_own_descriptor(obj, &self.gc_heap, key)
+                } else if let VmPropertyKey::Symbol(sym) = key {
+                    object::get_own_symbol_descriptor(obj, &self.gc_heap, sym)
+                } else {
+                    None
                 })
             }
-            Value::Array(arr) => match key {
-                VmPropertyKey::String(key) if key == "length" => {
+            Value::Array(arr) => {
+                let Some(key) = key.string_name() else {
+                    return Ok(None);
+                };
+                if key == "length" {
                     Ok(Some(object::PropertyDescriptor::data(
                         Value::Number(NumberValue::from_i32(array::len(arr, &self.gc_heap) as i32)),
                         true,
                         false,
                         false,
                     )))
-                }
-                VmPropertyKey::String(key) => {
+                } else {
                     let Some(idx) = key
                         .parse::<usize>()
                         .ok()
@@ -369,52 +378,62 @@ impl Interpreter {
                         true,
                     )))
                 }
-                VmPropertyKey::Symbol(_) => Ok(None),
-            },
-            Value::RegExp(re) => match key {
-                VmPropertyKey::String(key) if key == "lastIndex" => {
+            }
+            Value::RegExp(re) => {
+                if key.string_name().is_some_and(|key| key == "lastIndex") {
                     Ok(Some(object::PropertyDescriptor::data(
                         re.last_index_value(&self.gc_heap),
                         true,
                         false,
                         false,
                     )))
+                } else {
+                    Ok(None)
                 }
-                _ => Ok(None),
-            },
+            }
             Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
-                VmPropertyKey::String(key) if key == "prototype" => {
-                    let _ = self.function_property_get(context, function_id, "prototype")?;
-                    let Some(bag) = self.function_user_props.get(&function_id).copied() else {
-                        return Ok(None);
-                    };
-                    Ok(object::get_own_descriptor(bag, &self.gc_heap, key))
-                }
-                VmPropertyKey::String(key) => {
-                    self.ordinary_function_own_property_descriptor(Some(context), function_id, key)
-                }
                 VmPropertyKey::Symbol(sym) => {
                     let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                         return Ok(None);
                     };
                     Ok(object::get_own_symbol_descriptor(bag, &self.gc_heap, sym))
                 }
+                _ => {
+                    let key = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    if key == "prototype" {
+                        let _ = self.function_property_get(context, function_id, "prototype")?;
+                        let Some(bag) = self.function_user_props.get(&function_id).copied() else {
+                            return Ok(None);
+                        };
+                        Ok(object::get_own_descriptor(bag, &self.gc_heap, key))
+                    } else {
+                        self.ordinary_function_own_property_descriptor(
+                            Some(context),
+                            function_id,
+                            key,
+                        )
+                    }
+                }
             },
-            Value::BoundFunction(bound) => match key {
-                VmPropertyKey::String(key) => function_metadata::bound_own_property_descriptor(
+            Value::BoundFunction(bound) => {
+                let Some(key) = key.string_name() else {
+                    return Ok(None);
+                };
+                function_metadata::bound_own_property_descriptor(
                     &bound,
                     &self.gc_heap,
                     &self.string_heap,
                     key,
-                ),
-                VmPropertyKey::Symbol(_) => Ok(None),
-            },
-            Value::NativeFunction(native) => match key {
-                VmPropertyKey::String(key) => {
-                    Ok(native.own_property_descriptor(&self.gc_heap, &self.string_heap, key)?)
-                }
-                VmPropertyKey::Symbol(_) => Ok(None),
-            },
+                )
+            }
+            Value::NativeFunction(native) => {
+                let Some(key) = key.string_name() else {
+                    return Ok(None);
+                };
+                Ok(native.own_property_descriptor(&self.gc_heap, &self.string_heap, key)?)
+            }
             _ => Ok(None),
         }
     }
@@ -643,51 +662,54 @@ impl Interpreter {
                 }
             }
             Value::Object(obj) => Ok(match key {
-                VmPropertyKey::String(k) => {
-                    object::define_own_property_partial(*obj, &mut self.gc_heap, k, descriptor)
-                }
                 VmPropertyKey::Symbol(sym) => object::define_own_symbol_property_partial(
                     *obj,
                     &mut self.gc_heap,
                     sym,
                     descriptor,
                 ),
+                _ => {
+                    let k = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    object::define_own_property_partial(*obj, &mut self.gc_heap, k, descriptor)
+                }
             }),
             // §10.4.2 ArrayExoticObject [[DefineOwnProperty]] —
             // foundation surface handles indexed writes by routing to
             // dense storage; descriptor attributes are not yet
             // tracked on Array slots, so accessor descriptors reject.
-            Value::Array(arr) => match key {
-                VmPropertyKey::String(k) => {
-                    if descriptor.is_accessor() {
-                        return Ok(false);
-                    }
-                    if let Ok(idx) = k.parse::<usize>() {
-                        let value = descriptor
-                            .value
-                            .clone()
-                            .or_else(|| {
-                                array::with_elements(*arr, &self.gc_heap, |elements| {
-                                    elements.get(idx).cloned()
-                                })
+            Value::Array(arr) => {
+                let Some(k) = key.string_name() else {
+                    return Ok(false);
+                };
+                if descriptor.is_accessor() {
+                    return Ok(false);
+                }
+                if let Ok(idx) = k.parse::<usize>() {
+                    let value = descriptor
+                        .value
+                        .clone()
+                        .or_else(|| {
+                            array::with_elements(*arr, &self.gc_heap, |elements| {
+                                elements.get(idx).cloned()
                             })
-                            .unwrap_or(Value::Undefined);
-                        array::set(*arr, &mut self.gc_heap, idx, value)
+                        })
+                        .unwrap_or(Value::Undefined);
+                    array::set(*arr, &mut self.gc_heap, idx, value)
+                        .map_err(|_| VmError::TypeMismatch)?;
+                    return Ok(true);
+                }
+                if k == "length" {
+                    if let Some(v) = &descriptor.value {
+                        array::set_named_property(*arr, &mut self.gc_heap, k, v.clone())
                             .map_err(|_| VmError::TypeMismatch)?;
                         return Ok(true);
                     }
-                    if k == "length" {
-                        if let Some(v) = &descriptor.value {
-                            array::set_named_property(*arr, &mut self.gc_heap, k, v.clone())
-                                .map_err(|_| VmError::TypeMismatch)?;
-                            return Ok(true);
-                        }
-                        return Ok(false);
-                    }
-                    Ok(false)
+                    return Ok(false);
                 }
-                VmPropertyKey::Symbol(_) => Ok(false),
-            },
+                Ok(false)
+            }
             _ => Ok(false),
         }
     }
@@ -782,7 +804,7 @@ impl Interpreter {
                 context,
                 input.clone(),
                 input.clone(),
-                &VmPropertyKey::String(name.to_string()),
+                &VmPropertyKey::String(name),
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
@@ -842,7 +864,7 @@ impl Interpreter {
         }
 
         let read_field = |this: &mut Self, name: &str| -> Result<Option<Value>, VmError> {
-            let key = VmPropertyKey::String(name.to_string());
+            let key = VmPropertyKey::String(name);
             if !this.ordinary_has_property_value(context, attributes.clone(), &key, 0)? {
                 return Ok(None);
             }
@@ -916,13 +938,13 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         input: &Value,
-    ) -> Result<VmPropertyKey, VmError> {
+    ) -> Result<VmPropertyKey<'static>, VmError> {
         let primitive =
             self.evaluate_to_primitive(context, input, abstract_ops::ToPrimitiveHint::String)?;
         if let Value::Symbol(sym) = primitive {
             return Ok(VmPropertyKey::Symbol(sym));
         }
-        Ok(VmPropertyKey::String(primitive.display_string()))
+        Ok(VmPropertyKey::OwnedString(primitive.display_string()))
     }
 
     /// §10.5.11 / §10.1.11 — value-level `[[OwnPropertyKeys]]`.
@@ -1032,7 +1054,7 @@ impl Interpreter {
             context,
             list_value.clone(),
             list_value.clone(),
-            &VmPropertyKey::String("length".to_string()),
+            &VmPropertyKey::String("length"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
@@ -1044,7 +1066,7 @@ impl Interpreter {
         let len = to_length(&len_value)?;
         let mut out: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
-            let key = VmPropertyKey::String(i.to_string());
+            let key = VmPropertyKey::OwnedString(i.to_string());
             let element = match self.ordinary_get_value(
                 context,
                 list_value.clone(),
@@ -1298,7 +1320,7 @@ impl Interpreter {
     ) -> Result<Option<Value>, VmError> {
         match rhs {
             Value::Object(_) | Value::Proxy(_) => {
-                let key = VmPropertyKey::String("prototype".to_string());
+                let key = VmPropertyKey::String("prototype");
                 match self.ordinary_get_value(context, rhs.clone(), rhs.clone(), &key, 0)? {
                     VmGetOutcome::Value(Value::Undefined) => Ok(Some(rhs.clone())),
                     VmGetOutcome::Value(value @ (Value::Object(_) | Value::Proxy(_))) => {
@@ -1406,7 +1428,18 @@ impl Interpreter {
             }
             Value::Array(arr) => {
                 let value = match key {
-                    VmPropertyKey::String(key_str) => {
+                    VmPropertyKey::Symbol(sym)
+                        if sym
+                            .well_known_tag()
+                            .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
+                    {
+                        make_array_iterator_factory(arr, &mut self.gc_heap)?
+                    }
+                    VmPropertyKey::Symbol(_) => Value::Undefined,
+                    _ => {
+                        let key_str = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
                         match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
                             Some(v) => v,
                             None => {
@@ -1434,27 +1467,22 @@ impl Interpreter {
                             }
                         }
                     }
-                    VmPropertyKey::Symbol(sym)
-                        if sym
-                            .well_known_tag()
-                            .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-                    {
-                        make_array_iterator_factory(arr, &mut self.gc_heap)?
-                    }
-                    VmPropertyKey::Symbol(_) => Value::Undefined,
                 };
                 Ok(VmGetOutcome::Value(value))
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let value = match key {
-                    VmPropertyKey::String(name) => {
-                        self.function_property_get(context, function_id, name)?
-                    }
                     VmPropertyKey::Symbol(sym) => self
                         .function_prototype_object()
                         .ok()
                         .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
                         .unwrap_or(Value::Undefined),
+                    _ => self.function_property_get(
+                        context,
+                        function_id,
+                        key.string_name()
+                            .expect("non-symbol key has string spelling"),
+                    )?,
                 };
                 if let Some(outcome) =
                     self.callable_realm_prototype_accessor_outcome(&value, key)?
@@ -1465,7 +1493,16 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => {
                 let value = match key {
-                    VmPropertyKey::String(key) if key == "name" || key == "length" => {
+                    VmPropertyKey::Symbol(sym) => self
+                        .function_prototype_object()
+                        .ok()
+                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                        .unwrap_or(Value::Undefined),
+                    _ if key
+                        .string_name()
+                        .is_some_and(|key| key == "name" || key == "length") =>
+                    {
+                        let key = key.string_name().expect("guard checked string key");
                         let ctx = function_metadata::FunctionMetadataContext::new(
                             context,
                             &self.gc_heap,
@@ -1479,15 +1516,14 @@ impl Interpreter {
                             key,
                         )?
                     }
-                    VmPropertyKey::String(key) => self
-                        .load_function_prototype_method(key)
-                        .or_else(|| self.load_object_prototype_method(key))
-                        .unwrap_or(Value::Undefined),
-                    VmPropertyKey::Symbol(sym) => self
-                        .function_prototype_object()
-                        .ok()
-                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                        .unwrap_or(Value::Undefined),
+                    _ => {
+                        let key = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        self.load_function_prototype_method(key)
+                            .or_else(|| self.load_object_prototype_method(key))
+                            .unwrap_or(Value::Undefined)
+                    }
                 };
                 if let Some(outcome) =
                     self.callable_realm_prototype_accessor_outcome(&value, key)?
@@ -1498,7 +1534,15 @@ impl Interpreter {
             }
             Value::BoundFunction(bound) => {
                 let value = match key {
-                    VmPropertyKey::String(key) => {
+                    VmPropertyKey::Symbol(sym) => self
+                        .function_prototype_object()
+                        .ok()
+                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                        .unwrap_or(Value::Undefined),
+                    _ => {
+                        let key = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
                         match function_metadata::bound_own_property_descriptor(
                             &bound,
                             &self.gc_heap,
@@ -1512,11 +1556,6 @@ impl Interpreter {
                                 .unwrap_or(Value::Undefined),
                         }
                     }
-                    VmPropertyKey::Symbol(sym) => self
-                        .function_prototype_object()
-                        .ok()
-                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                        .unwrap_or(Value::Undefined),
                 };
                 if let Some(outcome) =
                     self.callable_realm_prototype_accessor_outcome(&value, key)?
@@ -1527,17 +1566,20 @@ impl Interpreter {
             }
             Value::ClassConstructor(class) => {
                 let value = match key {
-                    VmPropertyKey::String(key) if key == "prototype" => {
-                        Value::Object(class.prototype(&self.gc_heap))
-                    }
-                    VmPropertyKey::String(key) => {
-                        object::get(class.statics(&self.gc_heap), &self.gc_heap, key)
-                            .unwrap_or(Value::Undefined)
-                    }
                     VmPropertyKey::Symbol(sym) => {
                         object::get_symbol(class.statics(&self.gc_heap), &self.gc_heap, sym)
                             .unwrap_or(Value::Undefined)
                     }
+                    _ if key.string_name().is_some_and(|key| key == "prototype") => {
+                        Value::Object(class.prototype(&self.gc_heap))
+                    }
+                    _ => object::get(
+                        class.statics(&self.gc_heap),
+                        &self.gc_heap,
+                        key.string_name()
+                            .expect("non-symbol key has string spelling"),
+                    )
+                    .unwrap_or(Value::Undefined),
                 };
                 if let Some(outcome) =
                     self.callable_realm_prototype_accessor_outcome(&value, key)?
@@ -1548,10 +1590,13 @@ impl Interpreter {
             }
             Value::RegExp(re) => {
                 let direct = match key {
-                    VmPropertyKey::String(key) => {
+                    VmPropertyKey::Symbol(_) => Value::Undefined,
+                    _ => {
+                        let key = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
                         regexp_prototype::load_property(&re, &self.gc_heap, key, &self.string_heap)
                     }
-                    VmPropertyKey::Symbol(_) => Value::Undefined,
                 };
                 match direct {
                     Value::Undefined => {
@@ -1698,8 +1743,17 @@ impl Interpreter {
             // implied prototype so nested-Proxy fall-through reaches
             // the underlying spec behaviour.
             Value::Array(arr) => match key {
-                VmPropertyKey::String(k) if k == "length" => Ok(true),
-                VmPropertyKey::String(k) => {
+                VmPropertyKey::Symbol(sym)
+                    if sym.well_known_tag() == Some(symbol::WellKnown::Iterator) =>
+                {
+                    Ok(true)
+                }
+                VmPropertyKey::Symbol(_) => Ok(false),
+                _ if key.string_name().is_some_and(|k| k == "length") => Ok(true),
+                _ => {
+                    let k = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
                     if let Ok(idx) = k.parse::<usize>()
                         && array::has_own_element(arr, &self.gc_heap, idx)
                     {
@@ -1712,12 +1766,6 @@ impl Interpreter {
                     }
                     self.ordinary_has_property_value(context, proto, key, hops + 1)
                 }
-                VmPropertyKey::Symbol(sym)
-                    if sym.well_known_tag() == Some(symbol::WellKnown::Iterator) =>
-                {
-                    Ok(true)
-                }
-                VmPropertyKey::Symbol(_) => Ok(false),
             },
             Value::Function { .. }
             | Value::Closure { .. }
@@ -1890,7 +1938,7 @@ impl Interpreter {
                     let desc = self.ordinary_get_own_property_descriptor_value(
                         context,
                         Value::Proxy(proxy.clone()),
-                        &VmPropertyKey::String(name.to_string()),
+                        &VmPropertyKey::OwnedString(name.clone()),
                         hops + 1,
                     )?;
                     if desc
@@ -2006,43 +2054,42 @@ impl Interpreter {
                 {
                     return Ok(false);
                 }
-                Ok(match key {
-                    VmPropertyKey::String(key) => object::delete(obj, &mut self.gc_heap, key),
-                    VmPropertyKey::Symbol(sym) => {
-                        object::delete_symbol(obj, &mut self.gc_heap, sym)
-                    }
+                Ok(if let Some(key) = key.string_name() {
+                    object::delete(obj, &mut self.gc_heap, key)
+                } else if let VmPropertyKey::Symbol(sym) = key {
+                    object::delete_symbol(obj, &mut self.gc_heap, sym)
+                } else {
+                    true
                 })
             }
-            Value::Array(arr) => Ok(match key {
-                VmPropertyKey::String(key) => {
-                    array::delete_named_property(arr, &mut self.gc_heap, key)
-                }
-                VmPropertyKey::Symbol(_) => true,
+            Value::Array(arr) => Ok(match key.string_name() {
+                Some(key) => array::delete_named_property(arr, &mut self.gc_heap, key),
+                None => true,
             }),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => Ok(match key {
-                VmPropertyKey::String(key) => {
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                Ok(if let Some(key) = key.string_name() {
                     self.ordinary_function_delete_own_property(function_id, key)
-                }
-                VmPropertyKey::Symbol(sym) => self
-                    .function_user_props
-                    .get(&function_id)
-                    .copied()
-                    .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, sym))
-                    .unwrap_or(true),
+                } else if let VmPropertyKey::Symbol(sym) = key {
+                    self.function_user_props
+                        .get(&function_id)
+                        .copied()
+                        .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, sym))
+                        .unwrap_or(true)
+                } else {
+                    true
+                })
+            }
+            Value::NativeFunction(native) => Ok(match key.string_name() {
+                Some(key) => native.delete_own_property(&mut self.gc_heap, key),
+                None => true,
             }),
-            Value::NativeFunction(native) => Ok(match key {
-                VmPropertyKey::String(key) => native.delete_own_property(&mut self.gc_heap, key),
-                VmPropertyKey::Symbol(_) => true,
-            }),
-            Value::BoundFunction(bound) => Ok(match key {
-                VmPropertyKey::String(key) => {
+            Value::BoundFunction(bound) => Ok(match key.string_name() {
+                Some(key) => {
                     function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, key)
                 }
-                VmPropertyKey::Symbol(_) => true,
+                None => true,
             }),
-            Value::RegExp(_) => {
-                Ok(!matches!(key, VmPropertyKey::String(key) if key == "lastIndex"))
-            }
+            Value::RegExp(_) => Ok(!key.string_name().is_some_and(|key| key == "lastIndex")),
             _ => Ok(true),
         }
     }
@@ -2127,14 +2174,13 @@ impl Interpreter {
                     ),
                 }
             }
-            Value::Array(arr) => match key {
-                VmPropertyKey::String(key) => {
+            Value::Array(arr) => {
+                if let Some(key) = key.string_name() {
                     array::set_named_property(arr, &mut self.gc_heap, key, value)
                         .map_err(|_| VmError::TypeMismatch)?;
-                    Ok(true)
                 }
-                VmPropertyKey::Symbol(_) => Ok(true),
-            },
+                Ok(true)
+            }
             Value::Object(obj) => {
                 if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
                     && !desc.writable()
@@ -2142,23 +2188,39 @@ impl Interpreter {
                     return Ok(false);
                 }
                 Ok(match key {
-                    VmPropertyKey::String(key) => {
-                        object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value)
-                    }
                     VmPropertyKey::Symbol(sym) => {
                         object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value)
                     }
+                    _ => object::ordinary_set_data_property(
+                        obj,
+                        &mut self.gc_heap,
+                        key.string_name()
+                            .expect("non-symbol key has string spelling"),
+                        value,
+                    ),
                 })
             }
             Value::RegExp(re) => match key {
-                VmPropertyKey::String(key) if key == "lastIndex" => {
+                VmPropertyKey::String(key) if *key == "lastIndex" => {
                     regexp_prototype::store_property(&re, &mut self.gc_heap, key, value);
                     Ok(true)
                 }
                 _ => Ok(false),
             },
             Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
-                VmPropertyKey::String(key) => {
+                VmPropertyKey::Symbol(sym) => {
+                    let bag = self.function_user_bag(function_id)?;
+                    Ok(object::set_symbol(
+                        bag,
+                        &mut self.gc_heap,
+                        sym.clone(),
+                        value,
+                    ))
+                }
+                _ => {
+                    let key = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
                     let descriptor = match self.ordinary_function_own_property_descriptor(
                         Some(context),
                         function_id,
@@ -2180,15 +2242,6 @@ impl Interpreter {
                         None,
                         descriptor,
                     )
-                }
-                VmPropertyKey::Symbol(sym) => {
-                    let bag = self.function_user_bag(function_id)?;
-                    Ok(object::set_symbol(
-                        bag,
-                        &mut self.gc_heap,
-                        sym.clone(),
-                        value,
-                    ))
                 }
             },
             _ => Ok(false),
@@ -2285,9 +2338,9 @@ fn same_property_key(a: &Value, b: &Value) -> bool {
 /// [`VmPropertyKey`]. Caller is responsible for ensuring the value
 /// actually holds a PropertyKey-typed entry; anything else is a
 /// `TypeMismatch`.
-fn property_key_from_value(value: &Value) -> Result<VmPropertyKey, VmError> {
+fn property_key_from_value(value: &Value) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
-        Value::String(s) => Ok(VmPropertyKey::String(s.to_lossy_string())),
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
         Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
         _ => Err(VmError::TypeMismatch),
     }

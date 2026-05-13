@@ -499,7 +499,7 @@ impl Interpreter {
         receiver: Value,
         key: &str,
     ) -> Result<Value, VmError> {
-        let property_key = VmPropertyKey::String(key.to_string());
+        let property_key = VmPropertyKey::String(key);
         match self.ordinary_get_value(
             context,
             receiver.clone(),
@@ -565,15 +565,15 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn coerce_vm_property_key(arg: Option<&Value>) -> Result<VmPropertyKey, VmError> {
+    pub(crate) fn coerce_vm_property_key(
+        arg: Option<&Value>,
+    ) -> Result<VmPropertyKey<'static>, VmError> {
         match arg {
-            Some(Value::String(s)) => Ok(VmPropertyKey::String(s.to_lossy_string())),
-            Some(Value::Number(n)) => Ok(VmPropertyKey::String(n.to_display_string())),
-            Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(
-                (if *b { "true" } else { "false" }).to_string(),
-            )),
-            Some(Value::Null) => Ok(VmPropertyKey::String("null".to_string())),
-            Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined".to_string())),
+            Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+            Some(Value::Number(n)) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
+            Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
+            Some(Value::Null) => Ok(VmPropertyKey::String("null")),
+            Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined")),
             Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(sym.clone())),
             _ => Err(VmError::TypeMismatch),
         }
@@ -735,7 +735,7 @@ impl Interpreter {
                     for key in trap_keys {
                         let Value::String(_) = &key else { continue };
                         let vm_key = match &key {
-                            Value::String(s) => VmPropertyKey::String(s.to_lossy_string()),
+                            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
                             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
                             _ => return Err(VmError::TypeMismatch),
                         };
@@ -796,34 +796,35 @@ impl Interpreter {
                 };
                 let descriptor = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
                 let completed = descriptor.complete_for_new_property();
-                let ok = match (&target, function_id, key) {
-                    (_, Some(function_id), VmPropertyKey::String(key)) => self
-                        .ordinary_function_define_own_property(
-                            context,
-                            function_id,
-                            &key,
-                            Some(desc_obj),
-                            completed,
-                        )?,
+                let ok = match (&target, function_id, &key) {
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let bag = self.function_user_bag(function_id)?;
                         crate::object::define_own_symbol_property_partial(
                             bag,
                             &mut self.gc_heap,
-                            &sym,
+                            sym,
                             descriptor,
                         )
                     }
-                    (Value::BoundFunction(bound), None, VmPropertyKey::String(key)) => {
+                    (_, Some(function_id), _) => self.ordinary_function_define_own_property(
+                        context,
+                        function_id,
+                        key.string_name()
+                            .expect("non-symbol key has string spelling"),
+                        Some(desc_obj),
+                        completed,
+                    )?,
+                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
+                    (Value::BoundFunction(bound), None, _) => {
                         function_metadata::bound_define_own_property(
                             bound,
                             &mut self.gc_heap,
                             &self.string_heap,
-                            &key,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
                             completed,
                         )
                     }
-                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
                     _ => return Ok(None),
                 };
                 if !ok {
@@ -833,25 +834,29 @@ impl Interpreter {
             }
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1))?;
-                let desc = match (&target, function_id, key) {
-                    (_, Some(function_id), VmPropertyKey::String(key)) => {
-                        self.ordinary_function_own_property_descriptor(context, function_id, &key)?
-                    }
+                let desc = match (&target, function_id, &key) {
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                             return Ok(Some(Value::Undefined));
                         };
-                        crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, &sym)
+                        crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
                     }
-                    (Value::BoundFunction(bound), None, VmPropertyKey::String(key)) => {
+                    (_, Some(function_id), _) => self.ordinary_function_own_property_descriptor(
+                        context,
+                        function_id,
+                        key.string_name()
+                            .expect("non-symbol key has string spelling"),
+                    )?,
+                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => None,
+                    (Value::BoundFunction(bound), None, _) => {
                         function_metadata::bound_own_property_descriptor(
                             bound,
                             &self.gc_heap,
                             &self.string_heap,
-                            &key,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
                         )?
                     }
-                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => None,
                     _ => return Ok(None),
                 };
                 match desc {
@@ -864,21 +869,30 @@ impl Interpreter {
             }
             M::HasOwn => {
                 let key = Self::coerce_vm_property_key(args.get(1))?;
-                let present = match (&target, function_id, key) {
-                    (_, Some(function_id), VmPropertyKey::String(key)) => {
+                let present = match (&target, function_id, &key) {
+                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => self
+                        .function_user_props
+                        .get(&function_id)
+                        .copied()
+                        .map(|bag| crate::object::has_own_symbol(bag, &self.gc_heap, sym))
+                        .unwrap_or(false),
+                    (_, Some(function_id), _) => {
+                        let key = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
                         let user_present = self
                             .function_user_props
                             .get(&function_id)
                             .copied()
                             .map(|bag| {
                                 !matches!(
-                                    crate::object::lookup_own(bag, &self.gc_heap, &key),
+                                    crate::object::lookup_own(bag, &self.gc_heap, key),
                                     object::PropertyLookup::Absent
                                 )
                             })
                             .unwrap_or(false);
                         user_present
-                            || function_metadata::ordinary_function_metadata_key(&key).is_some_and(
+                            || function_metadata::ordinary_function_metadata_key(key).is_some_and(
                                 |metadata_key| {
                                     !self
                                         .function_deleted_metadata
@@ -886,16 +900,15 @@ impl Interpreter {
                                 },
                             )
                     }
-                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => self
-                        .function_user_props
-                        .get(&function_id)
-                        .copied()
-                        .map(|bag| crate::object::has_own_symbol(bag, &self.gc_heap, &sym))
-                        .unwrap_or(false),
-                    (Value::BoundFunction(bound), None, VmPropertyKey::String(key)) => {
-                        function_metadata::bound_has_own_property(bound, &self.gc_heap, &key)
-                    }
                     (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
+                    (Value::BoundFunction(bound), None, _) => {
+                        function_metadata::bound_has_own_property(
+                            bound,
+                            &self.gc_heap,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                        )
+                    }
                     _ => return Ok(None),
                 };
                 Ok(Some(Value::Boolean(present)))

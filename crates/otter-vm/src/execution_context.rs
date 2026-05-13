@@ -28,6 +28,7 @@
 use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
 
 use crate::executable::{ExecInstr, ExecutableFunction, ExecutableModule};
+use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
 
 /// Cloneable dispatch context for VM-owned JS jobs.
 #[derive(Debug, Clone)]
@@ -35,6 +36,7 @@ pub struct ExecutionContext {
     module: std::rc::Rc<BytecodeModule>,
     executable: std::rc::Rc<ExecutableModule>,
     decoded_strings: std::rc::Rc<[Option<String>]>,
+    property_atoms: std::rc::Rc<[Option<PropertyAtom>]>,
 }
 
 impl ExecutionContext {
@@ -50,10 +52,23 @@ impl ExecutionContext {
                 _ => None,
             })
             .collect();
+        let property_atoms: std::rc::Rc<[Option<PropertyAtom>]> = module
+            .constants
+            .iter()
+            .enumerate()
+            .map(|(idx, constant)| match constant {
+                Constant::String { .. } => {
+                    let idx = u32::try_from(idx).expect("constant pool index exceeds u32");
+                    Some(PropertyAtom::new(AtomId::from_constant_index(idx)))
+                }
+                _ => None,
+            })
+            .collect();
         Self {
             module: std::rc::Rc::new(module),
             executable: std::rc::Rc::new(executable),
             decoded_strings,
+            property_atoms,
         }
     }
 
@@ -139,6 +154,21 @@ impl ExecutionContext {
         self.executable.imm32(instr, index)
     }
 
+    /// Number of dense named-property IC sites in this context.
+    #[must_use]
+    pub(crate) fn property_ic_site_count(&self) -> usize {
+        self.executable.property_ic_site_count() as usize
+    }
+
+    /// Dense property IC site for a named property instruction.
+    #[must_use]
+    pub(crate) fn property_ic_site(&self, function_id: u32, pc: u32) -> Option<usize> {
+        self.exec_function(function_id)?
+            .code
+            .get(pc as usize)?
+            .property_ic_site()
+    }
+
     /// `true` when the function id points at an arrow function.
     #[must_use]
     pub fn function_is_arrow(&self, function_id: u32) -> bool {
@@ -175,6 +205,17 @@ impl ExecutionContext {
         self.decoded_strings
             .get(idx as usize)
             .and_then(Option::as_deref)
+    }
+
+    /// Resolve a string constant as an atomized property key.
+    #[must_use]
+    pub(crate) fn property_atom(&self, idx: u32) -> Option<AtomizedPropertyKey<'_>> {
+        let atom = self
+            .property_atoms
+            .get(idx as usize)
+            .and_then(|atom| *atom)?;
+        let text = self.string_constant_str(idx)?;
+        Some(AtomizedPropertyKey::new(atom, text))
     }
 
     /// Resolve a numeric constant's raw IEEE-754 bits.
@@ -215,5 +256,436 @@ impl ExecutionContext {
             .iter()
             .find(|r| r.referrer == referrer && r.specifier == specifier)
             .map(|r| r.target.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use otter_bytecode::{
+        ArgumentsObjectKind, BytecodeModule, Constant, Function, Instruction, Op, Operand,
+        OperandList, SourceKind,
+    };
+
+    use super::ExecutionContext;
+    use crate::{Interpreter, Value};
+
+    fn instr(pc: u32, op: Op, operands: impl Into<OperandList>) -> Instruction {
+        Instruction {
+            pc,
+            op,
+            operands: operands.into(),
+        }
+    }
+
+    fn module_with(
+        code: Vec<Instruction>,
+        constants: Vec<Constant>,
+        scratch: u16,
+    ) -> BytecodeModule {
+        BytecodeModule {
+            module: "<test>".to_string(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                span: (0, 0),
+                locals: 0,
+                scratch,
+                param_count: 0,
+                own_upvalue_count: 0,
+                is_strict: false,
+                is_arrow: false,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_async_generator: false,
+                is_module: false,
+                needs_arguments: false,
+                arguments_object_kind: ArgumentsObjectKind::Unmapped,
+                mapped_argument_bindings: Vec::new(),
+                module_url: String::new(),
+                code,
+                spans: Vec::new(),
+            }],
+            constants,
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        }
+    }
+
+    fn string_constant(text: &str) -> Constant {
+        Constant::String {
+            utf16: text.encode_utf16().collect(),
+        }
+    }
+
+    fn run_module(module: BytecodeModule) -> Value {
+        run_module_with_interpreter(module).0
+    }
+
+    fn run_module_with_interpreter(module: BytecodeModule) -> (Value, Interpreter) {
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let value = interp.run(&context).expect("test bytecode runs");
+        (value, interp)
+    }
+
+    #[test]
+    fn string_constants_have_stable_property_atoms() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![instr(0, Op::ReturnUndefined, [])],
+            vec![string_constant("foo")],
+            1,
+        ));
+
+        let key = context
+            .property_atom(0)
+            .expect("string constant is atomized");
+        assert_eq!(key.name(), "foo");
+        assert!(context.property_atom(1).is_none());
+    }
+
+    #[test]
+    fn atomized_named_store_then_load_keeps_semantics() {
+        let module = module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    3,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(4, Op::Return, [Operand::Register(3)]),
+            ],
+            vec![string_constant("foo")],
+            4,
+        );
+
+        assert_eq!(run_module(module), Value::Boolean(true));
+    }
+
+    #[test]
+    fn named_load_installs_ordinary_own_data_ic() {
+        let module = module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    3,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(4, Op::Return, [Operand::Register(3)]),
+            ],
+            vec![string_constant("foo")],
+            4,
+        );
+
+        let (value, interp) = run_module_with_interpreter(module);
+
+        assert_eq!(value, Value::Boolean(true));
+        assert_eq!(interp.load_property_ic_count(), 1);
+    }
+
+    #[test]
+    fn named_store_installs_ordinary_own_data_ic() {
+        let module = module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    3,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(4, Op::Return, [Operand::Register(3)]),
+            ],
+            vec![string_constant("foo")],
+            4,
+        );
+
+        let (value, interp) = run_module_with_interpreter(module);
+
+        assert_eq!(value, Value::Boolean(true));
+        assert_eq!(interp.store_property_ic_count(), 1);
+    }
+
+    #[test]
+    fn property_ic_stats_record_load_hit_after_warmup() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    3,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(4, Op::Return, [Operand::Register(3)]),
+            ],
+            vec![string_constant("foo")],
+            4,
+        ));
+        let mut interp = Interpreter::new();
+
+        assert_eq!(
+            interp.run(&context).expect("first run"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            interp.run(&context).expect("second run"),
+            Value::Boolean(true)
+        );
+
+        let stats = interp.property_ic_stats();
+        assert_eq!(stats.load_hits, 1);
+        assert_eq!(stats.load_misses, 1);
+        assert_eq!(stats.load_installs, 1);
+    }
+
+    #[test]
+    fn property_ic_stats_record_direct_prototype_load_hit_after_warmup() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(3, Op::NewObject, [Operand::Register(3)]),
+                instr(
+                    4,
+                    Op::SetPrototype,
+                    [Operand::Register(3), Operand::Register(0)],
+                ),
+                instr(
+                    5,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(6, Op::Return, [Operand::Register(4)]),
+            ],
+            vec![string_constant("foo")],
+            5,
+        ));
+        let mut interp = Interpreter::new();
+
+        assert_eq!(
+            interp.run(&context).expect("first run"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            interp.run(&context).expect("second run"),
+            Value::Boolean(true)
+        );
+
+        let stats = interp.property_ic_stats();
+        assert_eq!(stats.load_hits, 1);
+        assert_eq!(stats.load_misses, 1);
+        assert_eq!(stats.load_installs, 1);
+    }
+
+    #[test]
+    fn property_ic_stats_record_store_hit_on_same_site() {
+        let module = module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadFalse, [Operand::Register(1)]),
+                instr(2, Op::LoadTrue, [Operand::Register(2)]),
+                instr(
+                    3,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(2),
+                        Operand::Register(4),
+                    ],
+                ),
+                instr(4, Op::JumpIfTrue, [Operand::Imm32(2), Operand::Register(1)]),
+                instr(5, Op::LoadTrue, [Operand::Register(1)]),
+                instr(6, Op::Jump, [Operand::Imm32(-4)]),
+                instr(
+                    7,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(8, Op::Return, [Operand::Register(3)]),
+            ],
+            vec![string_constant("foo")],
+            5,
+        );
+
+        let (value, interp) = run_module_with_interpreter(module);
+
+        assert_eq!(value, Value::Boolean(true));
+        let stats = interp.property_ic_stats();
+        assert_eq!(stats.store_hits, 1);
+        assert_eq!(stats.store_misses, 1);
+        assert_eq!(stats.store_installs, 1);
+    }
+
+    #[test]
+    fn atomized_named_delete_removes_property() {
+        let module = module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    3,
+                    Op::DeleteProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    4,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(4),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(5, Op::LoadUndefined, [Operand::Register(5)]),
+                instr(
+                    6,
+                    Op::Equal,
+                    [
+                        Operand::Register(6),
+                        Operand::Register(4),
+                        Operand::Register(5),
+                    ],
+                ),
+                instr(7, Op::Return, [Operand::Register(6)]),
+            ],
+            vec![string_constant("foo")],
+            7,
+        );
+
+        assert_eq!(run_module(module), Value::Boolean(true));
+    }
+
+    #[test]
+    fn computed_string_property_path_is_unchanged() {
+        let module = module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(
+                    1,
+                    Op::LoadString,
+                    [Operand::Register(1), Operand::ConstIndex(0)],
+                ),
+                instr(2, Op::LoadTrue, [Operand::Register(2)]),
+                instr(
+                    3,
+                    Op::StoreElement,
+                    [
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                        Operand::Register(4),
+                    ],
+                ),
+                instr(
+                    4,
+                    Op::LoadElement,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                instr(5, Op::Return, [Operand::Register(3)]),
+            ],
+            vec![string_constant("foo")],
+            5,
+        );
+
+        assert_eq!(run_module(module), Value::Boolean(true));
     }
 }

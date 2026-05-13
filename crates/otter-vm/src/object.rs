@@ -62,10 +62,12 @@ use std::any::Any;
 use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use smallvec::SmallVec;
 
 use crate::number::NumberValue;
+use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use crate::proxy::JsProxy;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
@@ -81,6 +83,12 @@ pub use descriptor::{
     DescriptorKind, PartialPropertyDescriptor, PropertyDescriptor, PropertyFlags,
 };
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
+
+static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_shape_id() -> ShapeId {
+    ShapeId(NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Rust-owned data attached to a JavaScript object.
 ///
@@ -247,6 +255,39 @@ impl PropertySlot {
 
 // ---------- shape (hidden class) ------------------------------------------
 
+/// VM-local hidden-class identity for interpreter inline-cache guards.
+///
+/// Shape ids are internal metadata only. They are not serialized and have no
+/// JavaScript-observable meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ShapeId(u64);
+
+/// Atom-aware own-property hit metadata.
+///
+/// This keeps the first inline-cache slice small: named property opcodes can
+/// learn the receiver shape, property atom, and slot offset without changing
+/// object storage or descriptor semantics yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomOwnPropertyHit {
+    /// Shape observed on the receiver object.
+    pub(crate) shape_id: ShapeId,
+    /// Atomized named-property key from the executable context.
+    pub(crate) atom_id: AtomId,
+    /// String-keyed own-property slot offset.
+    pub(crate) slot: u16,
+}
+
+/// Atom-aware property lookup result.
+#[derive(Debug, Clone)]
+pub(crate) struct AtomPropertyLookup {
+    /// Metadata for the slot that produced [`Self::lookup`], if the hit was a
+    /// string-keyed ordinary object property.
+    #[allow(dead_code)]
+    pub(crate) hit: Option<AtomOwnPropertyHit>,
+    /// Descriptor-shaped lookup result used by today's interpreter semantics.
+    pub(crate) lookup: PropertyLookup,
+}
+
 /// A hidden-class node. Shapes form a tree rooted at the empty
 /// shape; each non-root shape records the parent plus the single
 /// key added to reach it.
@@ -266,6 +307,7 @@ impl PropertySlot {
 /// they are `Rc`-shared leaf metadata and the [`ObjectBody`] tracer
 /// deliberately does not walk into them.
 pub struct Shape {
+    id: ShapeId,
     #[allow(dead_code)]
     parent: Option<Rc<Shape>>,
     #[allow(dead_code)]
@@ -288,6 +330,7 @@ impl Shape {
     #[must_use]
     pub fn root() -> Rc<Shape> {
         Rc::new(Shape {
+            id: next_shape_id(),
             parent: None,
             key: None,
             keys: Vec::new(),
@@ -300,6 +343,12 @@ impl Shape {
     #[must_use]
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Stable identity for this hidden-class node.
+    #[must_use]
+    pub(crate) const fn id(&self) -> ShapeId {
+        self.id
     }
 
     /// `true` for the empty (root) shape.
@@ -346,6 +395,7 @@ impl Shape {
         let mut keys = self_rc.keys.clone();
         keys.push(key.to_string());
         let child = Rc::new(Shape {
+            id: next_shape_id(),
             parent: Some(Rc::clone(self_rc)),
             key: Some(key.to_string()),
             keys,
@@ -726,6 +776,13 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
     len(obj, heap) == 0
 }
 
+/// Return the object's current hidden-class id.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
+    heap.read_payload(obj, |body| body.shape.id())
+}
+
 /// Read an **own** property with an accessor short-circuit:
 /// returns `Some(value)` for data slots, `Some(undefined)` for
 /// accessor slots (callers that need to invoke the getter must
@@ -785,6 +842,106 @@ pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Property
     })
 }
 
+/// Atom-aware own-property probe for named property bytecodes.
+#[must_use]
+pub(crate) fn lookup_own_atom(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> AtomPropertyLookup {
+    heap.read_payload(obj, |body| match body.shape.offset_of(key.name()) {
+        Some(offset) => {
+            let mut lookup = body.slots[offset as usize].to_lookup();
+            if let Some(cell) = mapped_argument_cell(body, key.name())
+                && let PropertyLookup::Data { value, .. } = &mut lookup
+            {
+                *value = read_upvalue(heap, cell);
+            }
+            AtomPropertyLookup {
+                hit: Some(AtomOwnPropertyHit {
+                    shape_id: body.shape.id(),
+                    atom_id: key.atom().id(),
+                    slot: offset,
+                }),
+                lookup,
+            }
+        }
+        None => AtomPropertyLookup {
+            hit: None,
+            lookup: PropertyLookup::Absent,
+        },
+    })
+}
+
+/// Load a cached own data slot after validating shape and atom guards.
+#[must_use]
+pub(crate) fn load_own_data_slot_atom(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    hit: AtomOwnPropertyHit,
+) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        if body.shape.id() != hit.shape_id || key.atom().id() != hit.atom_id {
+            return None;
+        }
+        let offset = hit.slot as usize;
+        if !matches!(body.shape.keys.get(offset), Some(name) if name == key.name()) {
+            return None;
+        }
+        if let Some(cell) = mapped_argument_cell(body, key.name()) {
+            return Some(read_upvalue(heap, cell));
+        }
+        match &body.slots.get(offset)?.body {
+            SlotBody::Data { value } => Some(value.clone()),
+            SlotBody::Accessor { .. } => None,
+        }
+    })
+}
+
+/// Store through a cached own data slot after validating shape and atom guards.
+///
+/// Returns `Some(())` only when the write was completed. `None` means the
+/// cache no longer applies and callers must fall back to ordinary `[[Set]]`.
+pub(crate) fn store_own_data_slot_atom(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    hit: AtomOwnPropertyHit,
+    value: Value,
+) -> Option<()> {
+    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
+    let barrier_value = value.clone();
+    let success = heap.with_payload(obj, |body| {
+        if body.shape.id() != hit.shape_id || key.atom().id() != hit.atom_id {
+            return false;
+        }
+        let offset = hit.slot as usize;
+        if !matches!(body.shape.keys.get(offset), Some(name) if name == key.name()) {
+            return false;
+        }
+        let Some(slot) = body.slots.get_mut(offset) else {
+            return false;
+        };
+        if !slot.flags.writable() {
+            return false;
+        }
+        let SlotBody::Data { value: stored } = &mut slot.body else {
+            return false;
+        };
+        *stored = value;
+        true
+    });
+    if !success {
+        return None;
+    }
+    if let Some(cell) = mapped_cell {
+        store_upvalue(heap, cell, barrier_value.clone());
+    }
+    heap.record_write(obj, &barrier_value);
+    Some(())
+}
+
 /// Probe for a property with full prototype-chain walk. Returns
 /// the first hit's descriptor body; useful for the LoadProperty
 /// dispatch path which needs to know whether to invoke a getter
@@ -813,6 +970,40 @@ pub fn lookup(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLook
         current = prototype(proto, heap);
     }
     PropertyLookup::Absent
+}
+
+/// Atom-aware property probe with a prototype-chain walk.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn lookup_atom(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> AtomPropertyLookup {
+    let own = lookup_own_atom(obj, heap, key);
+    if !matches!(own.lookup, PropertyLookup::Absent) {
+        return own;
+    }
+    let mut current = prototype(obj, heap);
+    let mut hops = 0;
+    while let Some(proto) = current {
+        if hops >= PROTO_CHAIN_HARD_CAP {
+            return AtomPropertyLookup {
+                hit: None,
+                lookup: PropertyLookup::Absent,
+            };
+        }
+        hops += 1;
+        let hit = lookup_own_atom(proto, heap, key);
+        if !matches!(hit.lookup, PropertyLookup::Absent) {
+            return hit;
+        }
+        current = prototype(proto, heap);
+    }
+    AtomPropertyLookup {
+        hit: None,
+        lookup: PropertyLookup::Absent,
+    }
 }
 
 /// Read the descriptor for an own property.
@@ -1283,6 +1474,7 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
         new_keys.remove(offset as usize);
         body.slots.remove(offset as usize);
         body.shape = Rc::new(Shape {
+            id: next_shape_id(),
             parent: None,
             key: None,
             keys: new_keys,
@@ -1850,6 +2042,97 @@ mod tests {
         let o = alloc_object(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(true))));
+    }
+
+    #[test]
+    fn atom_lookup_reports_shape_and_slot_metadata() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "x", Value::Boolean(true));
+        let shape = shape_id(o, &heap);
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+
+        let hit = lookup_own_atom(o, &heap, key);
+
+        assert_eq!(
+            hit.hit,
+            Some(AtomOwnPropertyHit {
+                shape_id: shape,
+                atom_id: key.atom().id(),
+                slot: 0,
+            })
+        );
+        assert!(matches!(
+            hit.lookup,
+            PropertyLookup::Data {
+                value: Value::Boolean(true),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn atom_slot_guard_rejects_shape_change() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "x", Value::Boolean(true));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
+        assert_eq!(
+            load_own_data_slot_atom(o, &heap, key, hit),
+            Some(Value::Boolean(true))
+        );
+
+        set(o, &mut heap, "y", Value::Null);
+
+        assert_eq!(load_own_data_slot_atom(o, &heap, key, hit), None);
+    }
+
+    #[test]
+    fn atom_slot_store_updates_guarded_data_slot() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        set(o, &mut heap, "x", Value::Boolean(true));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
+
+        assert_eq!(
+            store_own_data_slot_atom(o, &mut heap, key, hit, Value::Boolean(false)),
+            Some(())
+        );
+        assert_eq!(
+            load_own_data_slot_atom(o, &heap, key, hit),
+            Some(Value::Boolean(false))
+        );
+
+        set(o, &mut heap, "y", Value::Null);
+
+        assert_eq!(
+            store_own_data_slot_atom(o, &mut heap, key, hit, Value::Boolean(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn shape_id_changes_on_new_property_not_overwrite() {
+        let mut heap = fresh_heap();
+        let o = alloc_object(&mut heap).unwrap();
+        let empty = shape_id(o, &heap);
+        set(o, &mut heap, "x", Value::Boolean(true));
+        let with_x = shape_id(o, &heap);
+        set(o, &mut heap, "x", Value::Boolean(false));
+
+        assert_ne!(empty, with_x);
+        assert_eq!(shape_id(o, &heap), with_x);
     }
 
     #[test]

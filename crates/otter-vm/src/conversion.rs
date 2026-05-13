@@ -299,8 +299,13 @@ impl Interpreter {
             return Ok(None);
         };
         let lookup = match key {
-            VmPropertyKey::String(name) => object::lookup(proto, &self.gc_heap, name),
             VmPropertyKey::Symbol(sym) => object::lookup_symbol(proto, &self.gc_heap, sym),
+            _ => object::lookup(
+                proto,
+                &self.gc_heap,
+                key.string_name()
+                    .expect("non-symbol key has string spelling"),
+            ),
         };
         if let object::PropertyLookup::Accessor {
             getter: Some(getter),

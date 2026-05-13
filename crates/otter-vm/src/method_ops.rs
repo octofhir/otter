@@ -388,7 +388,7 @@ impl Interpreter {
         // same error as `obj.notFn()`.
         let lookup_via_property = match &recv_value {
             Value::Object(_) | Value::Proxy(_) => {
-                let key = VmPropertyKey::String(name.to_string());
+                let key = VmPropertyKey::String(name);
                 match self.ordinary_get_value(
                     context,
                     recv_value.clone(),

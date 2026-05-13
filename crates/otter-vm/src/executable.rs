@@ -15,6 +15,8 @@
 //! - Instructions with three or fewer operands store them inline.
 //! - Variadic instructions store operands in the module side table and carry
 //!   only a compact span into that table.
+//! - Named property IC sites get dense VM-local ids during executable
+//!   construction; bytecode JSON stays unchanged.
 //!
 //! # See also
 //! - [`crate::execution_context`]
@@ -26,12 +28,14 @@ use otter_bytecode::{
 
 const INLINE_OPERANDS: usize = 3;
 const EMPTY_OPERAND: Operand = Operand::Imm32(0);
+const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
 /// VM-owned executable view of a bytecode module.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutableModule {
     functions: Box<[ExecutableFunction]>,
     side_operands: Box<[Operand]>,
+    property_ic_site_count: u32,
 }
 
 impl ExecutableModule {
@@ -39,16 +43,24 @@ impl ExecutableModule {
     #[must_use]
     pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
         let mut side_operands = Vec::new();
+        let mut next_property_ic_site = 0_u32;
         let functions = module
             .functions
             .iter()
-            .map(|function| ExecutableFunction::from_bytecode(function, &mut side_operands))
+            .map(|function| {
+                ExecutableFunction::from_bytecode(
+                    function,
+                    &mut side_operands,
+                    &mut next_property_ic_site,
+                )
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
         Self {
             functions,
             side_operands: side_operands.into_boxed_slice(),
+            property_ic_site_count: next_property_ic_site,
         }
     }
 
@@ -87,6 +99,12 @@ impl ExecutableModule {
     #[must_use]
     pub(crate) fn imm32(&self, instr: &ExecInstr, index: usize) -> Option<i32> {
         instr.imm32(&self.side_operands, index)
+    }
+
+    /// Number of dense named-property IC sites in this module.
+    #[must_use]
+    pub(crate) const fn property_ic_site_count(&self) -> u32 {
+        self.property_ic_site_count
     }
 }
 
@@ -128,7 +146,11 @@ pub(crate) struct ExecutableFunction {
 }
 
 impl ExecutableFunction {
-    fn from_bytecode(function: &Function, side_operands: &mut Vec<Operand>) -> Self {
+    fn from_bytecode(
+        function: &Function,
+        side_operands: &mut Vec<Operand>,
+        next_property_ic_site: &mut u32,
+    ) -> Self {
         let register_count = function
             .param_count
             .saturating_add(function.locals)
@@ -137,7 +159,22 @@ impl ExecutableFunction {
             .code
             .iter()
             .map(|instr| {
-                ExecInstr::from_operands(instr.op, instr.operands.as_slice(), side_operands)
+                let property_ic_site = match instr.op {
+                    Op::LoadProperty | Op::StoreProperty => {
+                        let site = *next_property_ic_site;
+                        *next_property_ic_site = next_property_ic_site
+                            .checked_add(1)
+                            .expect("property IC site table exceeds u32");
+                        site
+                    }
+                    _ => NO_PROPERTY_IC_SITE,
+                };
+                ExecInstr::from_operands(
+                    instr.op,
+                    instr.operands.as_slice(),
+                    side_operands,
+                    property_ic_site,
+                )
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -190,10 +227,17 @@ pub(crate) struct ExecInstr {
     inline_operands: [Operand; INLINE_OPERANDS],
     /// Start index in [`ExecutableModule::side_operands`] for variadic ops.
     side_start: u32,
+    /// Dense module-local property IC site id for named property ops.
+    property_ic_site: u32,
 }
 
 impl ExecInstr {
-    fn from_operands(op: Op, operands: &[Operand], side_operands: &mut Vec<Operand>) -> Self {
+    fn from_operands(
+        op: Op,
+        operands: &[Operand],
+        side_operands: &mut Vec<Operand>,
+        property_ic_site: u32,
+    ) -> Self {
         let operand_len =
             u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
         if operands.len() <= INLINE_OPERANDS {
@@ -204,6 +248,7 @@ impl ExecInstr {
                 operand_len,
                 inline_operands,
                 side_start: 0,
+                property_ic_site,
             }
         } else {
             let side_start = u32::try_from(side_operands.len())
@@ -214,6 +259,7 @@ impl ExecInstr {
                 operand_len,
                 inline_operands: [EMPTY_OPERAND; INLINE_OPERANDS],
                 side_start,
+                property_ic_site,
             }
         }
     }
@@ -222,6 +268,16 @@ impl ExecInstr {
     #[must_use]
     pub(crate) const fn op(&self) -> Op {
         self.op
+    }
+
+    /// Dense property IC site index for named property opcodes.
+    #[must_use]
+    pub(crate) const fn property_ic_site(&self) -> Option<usize> {
+        if self.property_ic_site == NO_PROPERTY_IC_SITE {
+            None
+        } else {
+            Some(self.property_ic_site as usize)
+        }
     }
 
     fn operands<'a>(&'a self, side_operands: &'a [Operand]) -> &'a [Operand] {
@@ -354,5 +410,40 @@ mod tests {
         assert_eq!(executable.register(instr, 4), Some(3));
         assert_eq!(executable.register(instr, 5), None);
         assert_eq!(executable.operands(instr), operands.as_slice());
+    }
+
+    #[test]
+    fn named_property_ops_get_dense_ic_sites() {
+        let function = function(vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadProperty,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::StoreProperty,
+                operands: vec![
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::Register(0),
+                    Operand::Register(2),
+                ]
+                .into(),
+            },
+        ]);
+        let module = module(function);
+
+        let executable = ExecutableModule::from_bytecode(&module);
+        let function = executable.function(0).unwrap();
+
+        assert_eq!(executable.property_ic_site_count(), 2);
+        assert_eq!(function.code[0].property_ic_site(), Some(0));
+        assert_eq!(function.code[1].property_ic_site(), Some(1));
     }
 }

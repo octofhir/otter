@@ -218,10 +218,15 @@ pub fn call(
                 let outcome = {
                     let heap = interp.gc_heap();
                     match &key {
-                        VmPropertyKey::String(k) => crate::object::resolve_set(*obj, heap, k),
                         VmPropertyKey::Symbol(sym) => {
                             crate::object::resolve_symbol_set(*obj, heap, sym)
                         }
+                        _ => crate::object::resolve_set(
+                            *obj,
+                            heap,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                        ),
                     }
                 };
                 match outcome {
@@ -292,8 +297,13 @@ fn set_data_on_receiver(
     let existing = {
         let heap = interp.gc_heap();
         match key {
-            VmPropertyKey::String(k) => crate::object::lookup_own(recv_obj, heap, k),
             VmPropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(recv_obj, heap, sym),
+            _ => crate::object::lookup_own(
+                recv_obj,
+                heap,
+                key.string_name()
+                    .expect("non-symbol key has string spelling"),
+            ),
         }
     };
     match existing {
@@ -357,15 +367,13 @@ fn coerce_property_key(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     arg: Option<&Value>,
-) -> Result<VmPropertyKey, VmError> {
+) -> Result<VmPropertyKey<'static>, VmError> {
     match arg {
-        Some(Value::String(s)) => Ok(VmPropertyKey::String(s.to_lossy_string())),
-        Some(Value::Number(n)) => Ok(VmPropertyKey::String(n.to_display_string())),
-        Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(
-            (if *b { "true" } else { "false" }).to_string(),
-        )),
-        Some(Value::Null) => Ok(VmPropertyKey::String("null".to_string())),
-        Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined".to_string())),
+        Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Some(Value::Number(n)) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
+        Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
+        Some(Value::Null) => Ok(VmPropertyKey::String("null")),
+        Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined")),
         Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(sym.clone())),
         Some(v) => interp.evaluate_to_property_key(context, v),
     }

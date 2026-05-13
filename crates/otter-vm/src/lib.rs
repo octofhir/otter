@@ -91,7 +91,9 @@ mod operand_decode;
 pub mod promise;
 pub mod promise_dispatch;
 mod promise_ops;
+mod property_atom;
 mod property_dispatch;
+mod property_ic;
 pub mod proxy;
 pub mod reflect;
 mod reflect_ops;
@@ -118,6 +120,7 @@ pub use frame_state::{
     AsyncFrameState, Frame, PendingBindFunction, PendingBindStage, PendingGetIterator,
     PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage, TryHandler,
 };
+pub use property_ic::PropertyIcStats;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -413,9 +416,28 @@ pub struct ClassConstructorBody {
     pub statics: JsObject,
 }
 
-pub(crate) enum VmPropertyKey {
-    String(String),
+pub(crate) enum VmPropertyKey<'a> {
+    Atom(property_atom::AtomizedPropertyKey<'a>),
+    String(&'a str),
+    OwnedString(String),
     Symbol(symbol::JsSymbol),
+}
+
+impl<'a> VmPropertyKey<'a> {
+    #[must_use]
+    pub(crate) const fn atom(key: property_atom::AtomizedPropertyKey<'a>) -> Self {
+        Self::Atom(key)
+    }
+
+    #[must_use]
+    pub(crate) fn string_name(&self) -> Option<&str> {
+        match self {
+            Self::Atom(key) => Some(key.name()),
+            Self::String(key) => Some(key),
+            Self::OwnedString(key) => Some(key.as_str()),
+            Self::Symbol(_) => None,
+        }
+    }
 }
 
 pub(crate) enum VmGetOutcome {
@@ -1692,6 +1714,16 @@ pub struct Interpreter {
     /// alongside `module_environments`.
     module_resolution_cache:
         std::collections::HashMap<(std::rc::Rc<str>, String), std::rc::Rc<str>>,
+    /// Monomorphic `LoadProperty` inline caches keyed by
+    /// dense executable IC site id. These are interpreter-local
+    /// hints and never affect bytecode dumps or JS-visible semantics.
+    load_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::LoadPropertyIc>>,
+    /// Monomorphic `StoreProperty` inline caches keyed by
+    /// dense executable IC site id. These only cover ordinary own writable
+    /// data slots; every miss falls back to full `[[Set]]` semantics.
+    store_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::StorePropertyIc>>,
+    /// Cheap aggregate counters for interpreter property IC behavior.
+    property_ic_stats: property_ic::PropertyIcStats,
     /// Per-interpreter table of well-known symbol singletons
     /// (ECMA-262 §6.1.5.1). Populated in [`Self::new`]; constant
     /// across an interpreter's lifetime.
@@ -1922,6 +1954,9 @@ impl Interpreter {
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
+            load_property_ics: Vec::new(),
+            store_property_ics: Vec::new(),
+            property_ic_stats: property_ic::PropertyIcStats::default(),
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
             error_classes,
@@ -1937,6 +1972,40 @@ impl Interpreter {
             timer_callbacks: timers::TimerCallbacks::new(),
             dynamic_import_loader: None,
             dynamic_import_registry: dynamic_import::DynamicImportRegistry::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_property_ic_count(&self) -> usize {
+        self.load_property_ics
+            .iter()
+            .filter(|entry| entry.is_monomorphic())
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_property_ic_count(&self) -> usize {
+        self.store_property_ics
+            .iter()
+            .filter(|entry| entry.is_monomorphic())
+            .count()
+    }
+
+    /// Return aggregate property inline-cache counters.
+    #[must_use]
+    pub fn property_ic_stats(&self) -> property_ic::PropertyIcStats {
+        self.property_ic_stats
+    }
+
+    fn ensure_property_ic_capacity(&mut self, context: &ExecutionContext) {
+        let site_count = context.property_ic_site_count();
+        if self.load_property_ics.len() < site_count {
+            self.load_property_ics
+                .resize(site_count, property_ic::PropertyIcEntry::Empty);
+        }
+        if self.store_property_ics.len() < site_count {
+            self.store_property_ics
+                .resize(site_count, property_ic::PropertyIcEntry::Empty);
         }
     }
 
@@ -2604,6 +2673,7 @@ impl Interpreter {
     pub fn run(&mut self, context: &ExecutionContext) -> Result<Value, RunError> {
         self.pending_uncaught_throw = None;
         self.pending_uncaught_frames = None;
+        self.ensure_property_ic_capacity(context);
         match self.run_inner(context) {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError { error, frames }),
@@ -3041,6 +3111,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut SmallVec<[Frame; 8]>,
     ) -> Result<Value, VmError> {
+        self.ensure_property_ic_capacity(context);
         loop {
             match self.dispatch_loop_inner(context, stack) {
                 Ok(value) => return Ok(value),
@@ -3657,11 +3728,11 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
-                    let name = context
-                        .string_constant_str(name_idx)
+                    let key = context
+                        .property_atom(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_delete_property_reg(frame, dst, obj_reg, name)?;
+                    self.run_delete_property_reg(frame, dst, obj_reg, key)?;
                     continue;
                 }
                 Op::DeleteElement => {
@@ -3778,11 +3849,11 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
-                    let name = context
-                        .string_constant_str(name_idx)
+                    let key = context
+                        .property_atom(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_load_property_reg(context, frame, dst, obj_reg, name)?;
+                    self.run_load_property_reg(context, frame, dst, obj_reg, key)?;
                     continue;
                 }
                 Op::StoreProperty => {
@@ -3795,11 +3866,11 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
-                    let name = context
-                        .string_constant_str(name_idx)
+                    let key = context
+                        .property_atom(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_store_property_reg(context, frame, obj_reg, name, src)?;
+                    self.run_store_property_reg(context, frame, obj_reg, key, src)?;
                     continue;
                 }
                 Op::LoadElement => {

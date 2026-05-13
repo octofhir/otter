@@ -17,12 +17,15 @@
 //! - [`crate::executable`]
 //! - [`crate::ExecutionContext`]
 
-use otter_bytecode::Operand;
+use otter_bytecode::{BytecodeModule, Operand};
 use smallvec::SmallVec;
 
+use crate::promise::JsPromise;
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, operand_decode::register_operand,
-    read_register, write_register,
+    AsyncFrameState, EvalCompileOptions, ExecutionContext, Frame, Interpreter, NativeCtx, Value,
+    VmError, abstract_ops, function_metadata, native_function, object,
+    operand_decode::register_operand, promise_dispatch, read_register, render_thrown_value,
+    write_register,
 };
 
 impl Interpreter {
@@ -58,6 +61,262 @@ impl Interpreter {
         write_register(frame, dst, result)?;
         frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         Ok(())
+    }
+
+    /// Execute `eval(source)` per §19.4.1.1 indirect-eval semantics:
+    /// parse + compile via the embedder hook, then run `<main>`
+    /// on a sub-stack. The current dispatch loop's stack stays
+    /// untouched.
+    ///
+    /// # Errors
+    /// - [`VmError::SyntaxError`] when no eval hook is installed or
+    ///   parsing / compilation fail.
+    fn run_eval(&mut self, value: &Value, force_strict: bool) -> Result<Value, VmError> {
+        let source = match value {
+            Value::String(s) => s.to_lossy_string(),
+            // Per §19.4.1.1 step 4, eval'd non-strings are returned
+            // unchanged — `eval(42) === 42`.
+            _ => return Ok(value.clone()),
+        };
+        let module = self.compile_eval_source(&source, EvalCompileOptions { force_strict })?;
+        let context = ExecutionContext::from_module(module);
+        let main = context.exec_main();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))?;
+        let entry_this = if main.is_module || main.is_strict {
+            Value::Undefined
+        } else {
+            Value::Object(self.global_this)
+        };
+        let mut entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let entry_promise = if main.is_async {
+            let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending(&mut self.gc_heap)?;
+            entry.async_state = Some(AsyncFrameState {
+                result_promise: result,
+            });
+            Some(result)
+        } else {
+            None
+        };
+        stack.push(entry);
+        let value = self.dispatch_loop(&context, &mut stack)?;
+        if let Some(promise) = entry_promise {
+            // Drain microtasks attached to top-level await so the
+            // entry promise settles before we read its value.
+            self.drain_microtasks_with_default(Some(context))
+                .map_err(|e| e.error)?;
+            return Ok(match promise.state(&self.gc_heap) {
+                crate::promise::PromiseState::Fulfilled(v) => v,
+                crate::promise::PromiseState::Rejected(reason) => {
+                    return Err(VmError::Uncaught {
+                        value: render_thrown_value(&reason, &self.gc_heap),
+                    });
+                }
+                crate::promise::PromiseState::Pending => Value::Undefined,
+            });
+        }
+        Ok(value)
+    }
+
+    /// Build a `Function(args, body)` callable per §20.2.1.1. The
+    /// result is a [`crate::NativeFunction`] that holds the freshly
+    /// compiled inner module and dispatches it on every call;
+    /// inner-module function IDs aren't valid against the outer
+    /// running module, so wrapping in a native rather than
+    /// returning the inner closure handle directly keeps the call
+    /// surface correct.
+    pub(crate) fn build_function_constructor(
+        &mut self,
+        context: &ExecutionContext,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        // Coerce every argument to a string per §20.2.1.1 step 1.
+        let mut parts: Vec<String> = Vec::with_capacity(args.len());
+        for arg in args {
+            parts.push(self.function_constructor_arg_to_string(context, arg)?);
+        }
+        let (params, body): (Vec<&str>, &str) = if parts.is_empty() {
+            (Vec::new(), "")
+        } else {
+            let body = parts.last().expect("non-empty checked above").as_str();
+            let params: Vec<&str> = parts[..parts.len() - 1]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            (params, body)
+        };
+        let params_joined = params.join(",");
+        let source = format!("(function anonymous({params_joined}) {{\n{body}\n}})");
+        let module = self.compile_eval_source(&source, EvalCompileOptions::default())?;
+        let context = ExecutionContext::from_module(module);
+        // Running the synthesised module's `<main>` returns the
+        // function value (the parenthesised expression is the
+        // program's completion). We capture that value's
+        // `function_id` together with the inner context so the
+        // returned native can replay calls against the right
+        // bytecode.
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function_with_heap(
+            context.main(),
+            &mut self.gc_heap,
+        )?);
+        let value = self.dispatch_loop(&context, &mut stack)?;
+        self.wrap_eval_function_value(context, value)
+    }
+
+    fn wrap_eval_function_value(
+        &mut self,
+        function_context: ExecutionContext,
+        value: Value,
+    ) -> Result<Value, VmError> {
+        if !matches!(value, Value::Function { .. } | Value::Closure { .. }) {
+            return Ok(value);
+        }
+        let metadata_ctx = function_metadata::FunctionMetadataContext::new(
+            &function_context,
+            &self.gc_heap,
+            &self.string_heap,
+            &self.function_user_props,
+            &self.function_deleted_metadata,
+        );
+        let name_value =
+            function_metadata::callable_intrinsic_property(&metadata_ctx, &value, "name")?;
+        let length_value =
+            function_metadata::callable_intrinsic_property(&metadata_ctx, &value, "length")?;
+        let prototype_value = match &value {
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                self.function_property_get(&function_context, *function_id, "prototype")?
+            }
+            _ => Value::Undefined,
+        };
+        let target_capture = value.clone();
+        let callback_context = function_context.clone();
+        let wrapper = native_function::native_constructor_value_with_captures_unchecked(
+            &mut self.gc_heap,
+            "anonymous",
+            smallvec::smallvec![target_capture],
+            move |ctx: &mut NativeCtx<'_>, call_args: &[Value], captures: &[Value]| {
+                let Some(target) = captures.first().cloned() else {
+                    return Err(crate::native_function::NativeError::TypeError {
+                        name: "anonymous",
+                        reason: "missing wrapped function target".to_string(),
+                    });
+                };
+                let args: SmallVec<[Value; 8]> = call_args.iter().cloned().collect();
+                let is_construct_call = ctx.is_construct_call();
+                let this_value = ctx.this_value().clone();
+                let interp = ctx.interp_mut();
+                let result = if is_construct_call {
+                    interp.run_construct_sync(&callback_context, &target, target.clone(), args)
+                } else {
+                    interp.run_callable_sync(&callback_context, &target, this_value, args)
+                }
+                .map_err(|err| crate::native_function::NativeError::TypeError {
+                    name: "anonymous",
+                    reason: format!("{err}"),
+                })?;
+                interp
+                    .wrap_eval_function_value(callback_context.clone(), result)
+                    .map_err(|err| crate::native_function::NativeError::TypeError {
+                        name: "anonymous",
+                        reason: format!("{err}"),
+                    })
+            },
+        )
+        .map_err(VmError::from)?;
+
+        if let Value::NativeFunction(native) = &wrapper {
+            let name = object::PropertyDescriptor::data(name_value, false, false, true);
+            let _ = native.define_own_property(&mut self.gc_heap, &self.string_heap, "name", name);
+            let length = object::PropertyDescriptor::data(length_value, false, false, true);
+            let _ =
+                native.define_own_property(&mut self.gc_heap, &self.string_heap, "length", length);
+            let prototype =
+                object::PropertyDescriptor::data(prototype_value.clone(), true, false, false);
+            let _ = native.define_own_property(
+                &mut self.gc_heap,
+                &self.string_heap,
+                "prototype",
+                prototype,
+            );
+            if let Value::Object(proto) = prototype_value {
+                let constructor =
+                    object::PropertyDescriptor::data(wrapper.clone(), true, false, true);
+                let _ = object::define_own_property(
+                    proto,
+                    &mut self.gc_heap,
+                    "constructor",
+                    constructor,
+                );
+            }
+        }
+
+        Ok(wrapper)
+    }
+
+    fn function_constructor_arg_to_string(
+        &mut self,
+        context: &ExecutionContext,
+        value: &Value,
+    ) -> Result<String, VmError> {
+        let primitive = match value {
+            Value::Object(_) | Value::Proxy(_) => {
+                self.to_primitive_string_hint_sync(context, value.clone())?
+            }
+            other => other.clone(),
+        };
+        match primitive {
+            Value::String(s) => Ok(s.to_lossy_string()),
+            Value::Symbol(_) => Err(VmError::TypeError {
+                message: "Cannot convert a Symbol value to a string".to_string(),
+            }),
+            other => Ok(other.display_string()),
+        }
+    }
+
+    // `to_*` mirrors the spec abstract operation `ToPrimitive` (§7.1.1).
+    // The interpreter borrow is `&mut self` because the helper invokes
+    // user-defined `toString` / `valueOf`, which can re-enter dispatch.
+    #[allow(clippy::wrong_self_convention)]
+    fn to_primitive_string_hint_sync(
+        &mut self,
+        context: &ExecutionContext,
+        value: Value,
+    ) -> Result<Value, VmError> {
+        for method in ["toString", "valueOf"] {
+            let callee = self.get_property_value_for_call(context, value.clone(), method)?;
+            if !self.is_callable_runtime(&callee) {
+                continue;
+            }
+            let result =
+                self.run_callable_sync(context, &callee, value.clone(), SmallVec::new())?;
+            if abstract_ops::is_primitive(&result) {
+                return Ok(result);
+            }
+        }
+        Err(VmError::TypeError {
+            message: "Cannot convert object to primitive value".to_string(),
+        })
+    }
+
+    /// Helper — invoke the eval hook, mapping its error to a
+    /// VmError that the throwable-conversion path will surface as
+    /// `SyntaxError`.
+    fn compile_eval_source(
+        &self,
+        source: &str,
+        options: EvalCompileOptions,
+    ) -> Result<BytecodeModule, VmError> {
+        let hook = self
+            .eval_hook
+            .as_ref()
+            .ok_or_else(|| VmError::SyntaxError {
+                message: "eval / new Function are disabled (no compiler hook installed)"
+                    .to_string(),
+            })?;
+        hook(source, options).map_err(|message| VmError::SyntaxError { message })
     }
 }
 

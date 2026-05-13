@@ -21,8 +21,9 @@ use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, array_statics,
-    operand_decode::register_operand, read_register, write_register,
+    ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, array,
+    array_statics, number, operand_decode::register_operand, read_register, symbol, to_length,
+    write_register,
 };
 
 impl Interpreter {
@@ -48,6 +49,138 @@ impl Interpreter {
 
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)
+    }
+
+    /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)`.
+    ///
+    /// Splits on `items`:
+    /// - Has `@@iterator` → walk via [`Self::iterator_to_list_sync`]
+    ///   (sync iterator protocol, §7.4).
+    /// - Otherwise → array-like read of `length` + indexed
+    ///   properties (§7.3.18 CreateListFromArrayLike with no element
+    ///   type filter).
+    ///
+    /// When `mapFn` is supplied (must be callable), each value is
+    /// passed through `mapFn(value, index)` with `this` = `thisArg`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-array.from>
+    pub(crate) fn array_from_sync(
+        &mut self,
+        context: &ExecutionContext,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let items = args.first().cloned().unwrap_or(Value::Undefined);
+        let map_fn = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+        let has_map = !matches!(map_fn, Value::Undefined);
+        if has_map && !self.is_callable_runtime(&map_fn) {
+            return Err(VmError::TypeError {
+                message: "Array.from mapFn must be callable".to_string(),
+            });
+        }
+
+        // Step 1 — built-in iterable fast paths short-circuit the
+        // `@@iterator` round-trip; for everything else look up
+        // `@@iterator` to decide between iterable and array-like.
+        let is_builtin_iterable = matches!(
+            items,
+            Value::Array(_)
+                | Value::String(_)
+                | Value::Set(_)
+                | Value::Map(_)
+                | Value::Generator(_)
+        );
+        let iterator_method = if matches!(items, Value::Undefined | Value::Null) {
+            Value::Undefined
+        } else if is_builtin_iterable {
+            // Sentinel: any non-undefined value picks the iterator
+            // path below; `iterator_to_list_sync` handles built-ins
+            // via its fast-path branches.
+            Value::Boolean(true)
+        } else {
+            let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
+            match self.ordinary_get_value(
+                context,
+                items.clone(),
+                items.clone(),
+                &VmPropertyKey::Symbol(iterator_sym),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                }
+            }
+        };
+
+        let raw_values: Vec<Value> = if matches!(iterator_method, Value::Undefined | Value::Null) {
+            // Step 4 — ArrayLike path.
+            if matches!(items, Value::Undefined | Value::Null) {
+                return Err(VmError::TypeError {
+                    message: "Array.from requires an iterable or array-like".to_string(),
+                });
+            }
+            let length_value = match self.ordinary_get_value(
+                context,
+                items.clone(),
+                items.clone(),
+                &VmPropertyKey::String("length".to_string()),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                }
+            };
+            let len = to_length(&length_value)?;
+            let mut out = Vec::with_capacity(len);
+            for index in 0..len {
+                let key = VmPropertyKey::String(index.to_string());
+                let value = match self.ordinary_get_value(
+                    context,
+                    items.clone(),
+                    items.clone(),
+                    &key,
+                    0,
+                )? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                    }
+                };
+                out.push(value);
+            }
+            out
+        } else {
+            if !is_builtin_iterable && !self.is_callable_runtime(&iterator_method) {
+                return Err(VmError::TypeError {
+                    message: "iterator method is not callable".to_string(),
+                });
+            }
+            // `iterator_to_list_sync` short-circuits built-ins and
+            // routes everything else through `GetIterator` /
+            // `IteratorStep`.
+            self.iterator_to_list_sync(context, &items)?
+        };
+
+        let mut mapped: Vec<Value> = Vec::with_capacity(raw_values.len());
+        for (index, value) in raw_values.into_iter().enumerate() {
+            if has_map {
+                let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                cb_args.push(value);
+                cb_args.push(Value::Number(number::NumberValue::from_i32(index as i32)));
+                let mapped_value =
+                    self.run_callable_sync(context, &map_fn, this_arg.clone(), cb_args)?;
+                mapped.push(mapped_value);
+            } else {
+                mapped.push(value);
+            }
+        }
+        Ok(Value::Array(array::from_elements(
+            &mut self.gc_heap,
+            mapped,
+        )?))
     }
 }
 

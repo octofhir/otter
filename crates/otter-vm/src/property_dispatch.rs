@@ -18,11 +18,19 @@
 //! - [`crate::executable`]
 //! - [`crate::object`]
 
+use smallvec::SmallVec;
+
+use otter_bytecode::Operand;
+
 use crate::{
-    ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, NumberValue, Value, VmError,
-    VmGetOutcome, VmPropertyKey, array::JsArray, binary, collections_prototype, descriptor_value,
-    function_metadata, make_array_iterator_factory, object, read_register, regexp_prototype,
-    symbol, symbol_prototype, temporal, value_kind_name, write_register,
+    ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value,
+    VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    array::JsArray,
+    binary, collections_prototype, descriptor_value, function_metadata,
+    is_restricted_function_property, make_array_iterator_factory, object,
+    operand_decode::{const_operand, register_operand},
+    read_register, regexp_prototype, symbol, symbol_prototype, temporal, value_kind_name,
+    write_register,
 };
 
 impl Interpreter {
@@ -890,6 +898,1326 @@ impl Interpreter {
                 smallvec::SmallVec::new(),
             ),
         }
+    }
+    /// Drive one tick of [`Op::LoadProperty`] when the receiver is
+    /// an object and the resolved property is an accessor descriptor.
+    /// Returns `Ok(true)` when an accessor was dispatched (frame
+    /// pushed or undefined written) and the outer loop should
+    /// `continue`; `Ok(false)` when the in-frame fast path should
+    /// run (data slot, non-object receiver, or absent property).
+    ///
+    /// # Algorithm — §10.1.8 OrdinaryGet
+    /// 1. Decode the operands and read the receiver register.
+    /// 2. Probe the receiver's own + prototype chain.
+    ///    - Absent / data slot: hand off to the in-frame fast path.
+    ///    - Accessor with no getter: write `undefined` to `dst`,
+    ///      advance pc, signal handled.
+    ///    - Accessor with a getter: advance pc, push a call to the
+    ///      getter with `this = receiver` and dst = `dst`.
+    /// 3. Class constructors and other special receiver kinds skip
+    ///    accessor handling: their property tables are plain data
+    ///    today, so the in-frame match is authoritative.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinaryget>
+    pub(crate) fn drive_load_property(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let obj_reg = register_operand(operands.get(1))?;
+        let name_idx = const_operand(operands.get(2))?;
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        if matches!(receiver, Value::Object(_) | Value::Proxy(_)) {
+            let key = VmPropertyKey::String(name.to_string());
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
+                VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    if abstract_ops::is_callable(&getter) {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &getter, receiver, args, dst)?;
+                    } else {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if matches!(
+            receiver,
+            Value::Boolean(_)
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Symbol(_)
+                | Value::BigInt(_)
+        ) {
+            let boxed = self.box_sloppy_this_primitive(receiver.clone())?;
+            let key = VmPropertyKey::String(name.to_string());
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.ordinary_get_value(context, boxed, receiver.clone(), &key, 0)? {
+                VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    if abstract_ops::is_callable(&getter) {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &getter, receiver, args, dst)?;
+                    } else {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if let Value::BoundFunction(bound) = &receiver {
+            match function_metadata::bound_own_property_descriptor(
+                bound,
+                &self.gc_heap,
+                &self.string_heap,
+                &name,
+            )? {
+                Some(object::PropertyDescriptor {
+                    kind: object::DescriptorKind::Accessor { getter, .. },
+                    ..
+                }) => {
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    match getter {
+                        Some(callee) if abstract_ops::is_callable(&callee) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.invoke(stack, context, &callee, receiver, args, dst)?;
+                        }
+                        _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                    }
+                    return Ok(true);
+                }
+                Some(_) => return Ok(false),
+                None => {
+                    if let Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { getter, .. },
+                        ..
+                    }) = object::get_own_descriptor(
+                        self.function_prototype_object()?,
+                        &self.gc_heap,
+                        &name,
+                    ) {
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        match getter {
+                            Some(callee) if abstract_ops::is_callable(&callee) => {
+                                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                                self.invoke(stack, context, &callee, receiver, args, dst)?;
+                            }
+                            _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                        }
+                        return Ok(true);
+                    }
+                    if is_restricted_function_property(&name) {
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        let callee = self.restricted_throw_type_error()?;
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        // Function / Closure / NativeFunction / ClassConstructor —
+        // probe `%Function.prototype%` for accessor descriptors so
+        // §10.2.4 `AddRestrictedFunctionProperties` poison pills
+        // (`caller`, `arguments`) and any user-installed accessor on
+        // `Function.prototype` invoke their getter rather than
+        // collapsing to `undefined` through the in-frame data path.
+        if matches!(
+            receiver,
+            Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::ClassConstructor(_)
+        ) {
+            let own_present = match &receiver {
+                Value::Function { function_id } | Value::Closure { function_id, .. } => self
+                    .function_user_props
+                    .get(function_id)
+                    .copied()
+                    .is_some_and(|bag| {
+                        !matches!(
+                            object::lookup_own(bag, &self.gc_heap, &name),
+                            object::PropertyLookup::Absent
+                        )
+                    }),
+                Value::ClassConstructor(c) => !matches!(
+                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, &name),
+                    object::PropertyLookup::Absent
+                ),
+                Value::NativeFunction(native) => native
+                    .own_property_descriptor(&self.gc_heap, &self.string_heap, &name)?
+                    .is_some(),
+                _ => false,
+            };
+            if !own_present {
+                let proto = self.function_prototype_object()?;
+                if let object::PropertyLookup::Accessor { getter, .. } =
+                    object::lookup(proto, &self.gc_heap, &name)
+                {
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    match getter {
+                        Some(callee) if abstract_ops::is_callable(&callee) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.invoke(stack, context, &callee, receiver, args, dst)?;
+                        }
+                        _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+        let obj = match &receiver {
+            Value::Object(o) => *o,
+            Value::ClassConstructor(c) => c.statics(&self.gc_heap),
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let fid = *function_id;
+                match self.function_user_props.get(&fid).copied() {
+                    Some(bag) => bag,
+                    None => {
+                        let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                        self.function_user_props.insert(fid, new_bag);
+                        new_bag
+                    }
+                }
+            }
+            _ => return Ok(false),
+        };
+        match crate::object::lookup(obj, &self.gc_heap, &name) {
+            object::PropertyLookup::Accessor { getter, .. } => {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                match getter {
+                    Some(callee) if abstract_ops::is_callable(&callee) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
+                    }
+                    _ => {
+                        // No getter (or non-callable) — §10.1.8.1
+                        // step 4.b returns undefined.
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+                Ok(true)
+            }
+            // Data or absent — fall through to the in-frame fast path.
+            _ => Ok(false),
+        }
+    }
+
+    /// Drive one tick of [`Op::Instanceof`] through ECMA-262 §13.10.2
+    /// `InstanceofOperator(V, target)`. The previous foundation path
+    /// only walked `OrdinaryHasInstance`; this version honours
+    /// `target[@@hasInstance]` per spec.
+    ///
+    /// Returns `Ok(false)` only when the right-hand operand is one
+    /// of the legacy "raw prototype object as rhs" shapes the older
+    /// fixtures pass — those still fall through to the in-frame
+    /// fast path's prototype-walk fallback.
+    pub(crate) fn drive_instanceof(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let lhs_reg = register_operand(operands.get(1))?;
+        let rhs_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let lhs = read_register(&stack[top_idx], lhs_reg)?.clone();
+        let rhs = read_register(&stack[top_idx], rhs_reg)?.clone();
+        // Foundation back-compat: when `rhs` is a plain Object that
+        // has no own/inherited `prototype` property AND no
+        // `@@hasInstance`, older fixtures expect the in-frame path
+        // to walk lhs's chain against `rhs` directly. Those slip
+        // through `drive_instanceof` with `Ok(false)`.
+        if let Value::Object(rhs_obj) = &rhs
+            && object::get(*rhs_obj, &self.gc_heap, "prototype").is_none()
+            && !matches!(rhs, Value::Proxy(_))
+        {
+            let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
+            if object::get_symbol(*rhs_obj, &self.gc_heap, &has_instance_sym).is_none() {
+                return Ok(false);
+            }
+        }
+        let result = self.instanceof_operator(context, &lhs, &rhs)?;
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        write_register(&mut stack[top_idx], dst, Value::Boolean(result))?;
+        Ok(true)
+    }
+
+    /// Drive one tick of [`Op::LoadElement`] for computed ordinary
+    /// object/proxy reads whose resolved descriptor is an accessor.
+    pub(crate) fn drive_load_element(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let obj_reg = register_operand(operands.get(1))?;
+        let key_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let key_value = read_register(&stack[top_idx], key_reg)?.clone();
+        let key = match &key_value {
+            Value::String(s) => VmPropertyKey::String(s.to_lossy_string()),
+            Value::Number(n) => VmPropertyKey::String(n.to_display_string()),
+            Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+            _ => return Ok(false),
+        };
+
+        if matches!(receiver, Value::Object(_) | Value::Proxy(_)) {
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
+                VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    if abstract_ops::is_callable(&getter) {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &getter, receiver, args, dst)?;
+                    } else {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+            }
+            return Ok(true);
+        }
+
+        if let (Value::BoundFunction(bound), VmPropertyKey::String(key)) = (&receiver, &key) {
+            match function_metadata::bound_own_property_descriptor(
+                bound,
+                &self.gc_heap,
+                &self.string_heap,
+                key,
+            )? {
+                Some(object::PropertyDescriptor {
+                    kind: object::DescriptorKind::Accessor { getter, .. },
+                    ..
+                }) => {
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    match getter {
+                        Some(callee) if abstract_ops::is_callable(&callee) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.invoke(stack, context, &callee, receiver, args, dst)?;
+                        }
+                        _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                    }
+                    return Ok(true);
+                }
+                Some(_) => return Ok(false),
+                None => {
+                    if let Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { getter, .. },
+                        ..
+                    }) = object::get_own_descriptor(
+                        self.function_prototype_object()?,
+                        &self.gc_heap,
+                        key,
+                    ) {
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        match getter {
+                            Some(callee) if abstract_ops::is_callable(&callee) => {
+                                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                                self.invoke(stack, context, &callee, receiver, args, dst)?;
+                            }
+                            _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                        }
+                        return Ok(true);
+                    }
+                    if is_restricted_function_property(key) {
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        let callee = self.restricted_throw_type_error()?;
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        let obj = match &receiver {
+            Value::Object(obj) => *obj,
+            Value::ClassConstructor(class) => {
+                if matches!(&key, VmPropertyKey::String(key) if key == "prototype") {
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    write_register(
+                        &mut stack[top_idx],
+                        dst,
+                        Value::Object(class.prototype(&self.gc_heap)),
+                    )?;
+                    return Ok(true);
+                }
+                class.statics(&self.gc_heap)
+            }
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let Some(bag) = self.function_user_props.get(function_id).copied() else {
+                    return Ok(false);
+                };
+                bag
+            }
+            _ => return Ok(false),
+        };
+        let lookup = match &key {
+            VmPropertyKey::String(key) => crate::object::lookup(obj, &self.gc_heap, key),
+            VmPropertyKey::Symbol(sym) => crate::object::lookup_symbol(obj, &self.gc_heap, sym),
+        };
+        match lookup {
+            object::PropertyLookup::Data { value, .. } => {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                write_register(&mut stack[top_idx], dst, value)?;
+                Ok(true)
+            }
+            object::PropertyLookup::Accessor { getter, .. } => {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                match getter {
+                    Some(callee) if abstract_ops::is_callable(&callee) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.invoke(stack, context, &callee, receiver, args, dst)?;
+                    }
+                    _ => {
+                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Apply descriptor-aware data assignment for computed ordinary-object
+    /// writes (`obj[key] = value`).
+    fn function_is_strict(context: &ExecutionContext, function_id: u32) -> bool {
+        context.function_is_strict(function_id)
+    }
+
+    fn current_frame_is_strict(stack: &SmallVec<[Frame; 8]>, context: &ExecutionContext) -> bool {
+        stack
+            .last()
+            .is_some_and(|frame| Self::function_is_strict(context, frame.function_id))
+    }
+
+    fn finish_failed_set(
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        message: impl Into<String>,
+    ) -> Result<bool, VmError> {
+        if Self::current_frame_is_strict(stack, context) {
+            return Err(VmError::TypeError {
+                message: message.into(),
+            });
+        }
+        let top_idx = stack.len() - 1;
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        Ok(true)
+    }
+
+    fn failed_set_result(strict: bool, message: impl Into<String>) -> Result<(), VmError> {
+        if strict {
+            Err(VmError::TypeError {
+                message: message.into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn store_to_primitive_base(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        receiver: Value,
+        key: VmPropertyKey,
+        value: Value,
+        scratch_reg: u16,
+    ) -> Result<bool, VmError> {
+        let Some(base_object) = self.object_for_primitive_property_base(&receiver)? else {
+            return Ok(false);
+        };
+        let strict = Self::current_frame_is_strict(stack, context);
+        let mut current = object::prototype_value(base_object, &self.gc_heap);
+        let mut hops = 0;
+        while let Some(proto) = current {
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            hops += 1;
+            match proto {
+                Value::Object(obj) => {
+                    let lookup = match &key {
+                        VmPropertyKey::String(key) => object::lookup_own(obj, &self.gc_heap, key),
+                        VmPropertyKey::Symbol(sym) => {
+                            object::lookup_own_symbol(obj, &self.gc_heap, sym)
+                        }
+                    };
+                    match lookup {
+                        object::PropertyLookup::Data { flags, .. } => {
+                            if !flags.writable() {
+                                let name = match &key {
+                                    VmPropertyKey::String(key) => key.as_str(),
+                                    VmPropertyKey::Symbol(_) => "symbol",
+                                };
+                                Self::failed_set_result(
+                                    strict,
+                                    format!("Cannot assign to read-only property '{name}'"),
+                                )?;
+                            } else {
+                                let name = match &key {
+                                    VmPropertyKey::String(key) => key.as_str(),
+                                    VmPropertyKey::Symbol(_) => "symbol",
+                                };
+                                Self::failed_set_result(
+                                    strict,
+                                    format!("Cannot assign to property '{name}' on primitive"),
+                                )?;
+                            }
+                            let top_idx = stack.len() - 1;
+                            let pc = stack[top_idx].pc;
+                            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                            return Ok(true);
+                        }
+                        object::PropertyLookup::Accessor { setter, .. } => {
+                            let Some(setter) = setter else {
+                                Self::failed_set_result(
+                                    strict,
+                                    "Cannot assign to accessor property without a setter",
+                                )?;
+                                let top_idx = stack.len() - 1;
+                                let pc = stack[top_idx].pc;
+                                stack[top_idx].pc =
+                                    pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                                return Ok(true);
+                            };
+                            let top_idx = stack.len() - 1;
+                            let pc = stack[top_idx].pc;
+                            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                            args.push(value);
+                            self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                            return Ok(true);
+                        }
+                        object::PropertyLookup::Absent => {
+                            current = object::prototype_value(obj, &self.gc_heap);
+                        }
+                    }
+                }
+                Value::Proxy(proxy) => {
+                    let key_value = match &key {
+                        VmPropertyKey::String(key) => {
+                            Value::String(JsString::from_str(key, &self.string_heap)?)
+                        }
+                        VmPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
+                    };
+                    let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                        proxy.target(),
+                        key_value,
+                        value.clone(),
+                        receiver.clone()
+                    ];
+                    let top_idx = stack.len() - 1;
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
+                        Some(_) => {}
+                        None => {
+                            let Value::Object(target) = proxy.target() else {
+                                return Err(VmError::TypeMismatch);
+                            };
+                            match &key {
+                                VmPropertyKey::String(key) => {
+                                    match object::resolve_set(target, &self.gc_heap, key) {
+                                        object::SetOutcome::AssignData => {}
+                                        object::SetOutcome::InvokeSetter { setter } => {
+                                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                            args.push(value);
+                                            self.invoke(
+                                                stack,
+                                                context,
+                                                &setter,
+                                                receiver,
+                                                args,
+                                                scratch_reg,
+                                            )?;
+                                        }
+                                        object::SetOutcome::Reject { .. } => {
+                                            Self::failed_set_result(
+                                                strict,
+                                                format!("Cannot assign to property '{key}'"),
+                                            )?;
+                                        }
+                                    }
+                                }
+                                VmPropertyKey::Symbol(sym) => {
+                                    match object::resolve_symbol_set(target, &self.gc_heap, sym) {
+                                        object::SetOutcome::AssignData => {}
+                                        object::SetOutcome::InvokeSetter { setter } => {
+                                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                            args.push(value);
+                                            self.invoke(
+                                                stack,
+                                                context,
+                                                &setter,
+                                                receiver,
+                                                args,
+                                                scratch_reg,
+                                            )?;
+                                        }
+                                        object::SetOutcome::Reject { .. } => {
+                                            Self::failed_set_result(
+                                                strict,
+                                                "Cannot assign to symbol property",
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(true);
+                }
+                _ => break,
+            }
+        }
+
+        let top_idx = stack.len() - 1;
+        let name = match &key {
+            VmPropertyKey::String(key) => key.as_str(),
+            VmPropertyKey::Symbol(_) => "symbol",
+        };
+        Self::failed_set_result(
+            strict,
+            format!("Cannot assign to property '{name}' on primitive"),
+        )?;
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        Ok(true)
+    }
+
+    /// Drive one tick of [`Op::StoreElement`] when a computed
+    /// string, numeric, or symbol property write on an ordinary
+    /// object/proxy must obey §10.1.9 OrdinarySet.
+    pub(crate) fn drive_store_element(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let obj_reg = register_operand(operands.first())?;
+        let key_reg = register_operand(operands.get(1))?;
+        let src_reg = register_operand(operands.get(2))?;
+        let scratch_reg = register_operand(operands.get(3))?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let key_value = read_register(&stack[top_idx], key_reg)?.clone();
+        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        let strict = Self::current_frame_is_strict(stack, context);
+        enum ComputedPropertyKey {
+            String(String),
+            Symbol(crate::symbol::JsSymbol),
+        }
+        let key = match &key_value {
+            Value::String(s) => ComputedPropertyKey::String(s.to_lossy_string()),
+            Value::Number(n) => ComputedPropertyKey::String(n.to_display_string()),
+            Value::Symbol(sym) => ComputedPropertyKey::Symbol(sym.clone()),
+            _ => return Ok(false),
+        };
+        if let Value::Proxy(p) = &receiver {
+            let proxy = p.clone();
+            let key_arg = match &key {
+                ComputedPropertyKey::String(key) => {
+                    Value::String(JsString::from_str(key, &self.string_heap)?)
+                }
+                ComputedPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
+            };
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(),
+                key_arg,
+                value.clone(),
+                Value::Proxy(proxy.clone()),
+            ];
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
+                Some(_) => {}
+                None => {
+                    let target_value = proxy.target();
+                    let Value::Object(target) = target_value else {
+                        let vm_key = match &key {
+                            ComputedPropertyKey::String(key) => VmPropertyKey::String(key.clone()),
+                            ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+                        };
+                        if !self.ordinary_set_data_value(
+                            context,
+                            target_value,
+                            &vm_key,
+                            value,
+                            Value::Proxy(proxy.clone()),
+                            0,
+                        )? {
+                            Self::failed_set_result(strict, "Cannot assign to property")?;
+                        }
+                        return Ok(true);
+                    };
+                    let outcome = match &key {
+                        ComputedPropertyKey::String(key) => {
+                            object::resolve_set(target, &self.gc_heap, key)
+                        }
+                        ComputedPropertyKey::Symbol(sym) => {
+                            object::resolve_symbol_set(target, &self.gc_heap, sym)
+                        }
+                    };
+                    match outcome {
+                        object::SetOutcome::AssignData => {
+                            let ok = match &key {
+                                ComputedPropertyKey::String(key) => {
+                                    object::ordinary_set_data_property(
+                                        target,
+                                        &mut self.gc_heap,
+                                        key,
+                                        value,
+                                    )
+                                }
+                                ComputedPropertyKey::Symbol(sym) => object::set_symbol(
+                                    target,
+                                    &mut self.gc_heap,
+                                    sym.clone(),
+                                    value,
+                                ),
+                            };
+                            if !ok {
+                                Self::failed_set_result(strict, "Cannot assign to property")?;
+                            }
+                        }
+                        object::SetOutcome::InvokeSetter { setter } => {
+                            if !abstract_ops::is_callable(&setter) {
+                                Self::failed_set_result(
+                                    strict,
+                                    "Cannot assign to accessor property without a setter",
+                                )?;
+                            } else {
+                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                args.push(value);
+                                self.invoke(
+                                    stack,
+                                    context,
+                                    &setter,
+                                    Value::Proxy(proxy.clone()),
+                                    args,
+                                    scratch_reg,
+                                )?;
+                            }
+                        }
+                        object::SetOutcome::Reject { .. } => {
+                            Self::failed_set_result(strict, "Cannot assign to property")?;
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if let (Value::BoundFunction(bound), ComputedPropertyKey::String(key)) = (&receiver, &key) {
+            match function_metadata::bound_own_property_descriptor(
+                bound,
+                &self.gc_heap,
+                &self.string_heap,
+                key,
+            )? {
+                Some(object::PropertyDescriptor {
+                    kind: object::DescriptorKind::Accessor { setter, .. },
+                    ..
+                }) => {
+                    let setter = setter.ok_or(VmError::TypeMismatch)?;
+                    if !abstract_ops::is_callable(&setter) {
+                        return Err(VmError::TypeMismatch);
+                    }
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                    args.push(value);
+                    self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                    return Ok(true);
+                }
+                Some(_) => return Ok(false),
+                None => {
+                    if let Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { setter, .. },
+                        ..
+                    }) = object::get_own_descriptor(
+                        self.function_prototype_object()?,
+                        &self.gc_heap,
+                        key,
+                    ) {
+                        let setter = setter.ok_or(VmError::TypeMismatch)?;
+                        if !abstract_ops::is_callable(&setter) {
+                            return Err(VmError::TypeMismatch);
+                        }
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                        args.push(value);
+                        self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                        return Ok(true);
+                    }
+                    if is_restricted_function_property(key) {
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        let callee = self.restricted_throw_type_error()?;
+                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                        args.push(value);
+                        self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        if matches!(
+            receiver,
+            Value::Boolean(_)
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Symbol(_)
+                | Value::BigInt(_)
+        ) {
+            let key = match key {
+                ComputedPropertyKey::String(key) => VmPropertyKey::String(key),
+                ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym),
+            };
+            return self.store_to_primitive_base(stack, context, receiver, key, value, scratch_reg);
+        }
+        let obj = match &receiver {
+            Value::Object(obj) => *obj,
+            Value::ClassConstructor(class) => class.statics(&self.gc_heap),
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                if let ComputedPropertyKey::String(key) = &key
+                    && function_metadata::ordinary_function_metadata_key(key).is_some()
+                    && let Some(desc) = self.ordinary_function_own_property_descriptor(
+                        Some(context),
+                        *function_id,
+                        key,
+                    )?
+                    && !desc.writable()
+                {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        format!("Cannot assign to read-only property '{key}' of function"),
+                    );
+                }
+                self.function_user_bag(*function_id)?
+            }
+            _ => return Ok(false),
+        };
+        let outcome = match &key {
+            ComputedPropertyKey::String(key) => crate::object::resolve_set(obj, &self.gc_heap, key),
+            ComputedPropertyKey::Symbol(sym) => {
+                crate::object::resolve_symbol_set(obj, &self.gc_heap, sym)
+            }
+        };
+        match outcome {
+            object::SetOutcome::AssignData => {
+                let ok = match &key {
+                    ComputedPropertyKey::String(key) => {
+                        object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value)
+                    }
+                    ComputedPropertyKey::Symbol(sym) => {
+                        object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value)
+                    }
+                };
+                if !ok {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        "Cannot assign to read-only property",
+                    );
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                Ok(true)
+            }
+            object::SetOutcome::InvokeSetter { setter } => {
+                if !abstract_ops::is_callable(&setter) {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        "Cannot assign to accessor property without a setter",
+                    );
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                Ok(true)
+            }
+            object::SetOutcome::Reject { .. } => {
+                Self::finish_failed_set(stack, context, "Cannot assign to property")
+            }
+        }
+    }
+
+    /// Drive one tick of [`Op::StoreProperty`] when §10.1.9
+    /// OrdinarySet routes through an accessor setter, hits a
+    /// non-writable shadow, or hits a non-extensible receiver.
+    /// Returns `Ok(true)` when the dispatch path took over,
+    /// `Ok(false)` when the in-frame data-write fast path should run.
+    ///
+    /// Non-writable / accessor-without-setter / non-extensible
+    /// rejections follow the caller frame's compiled strict flag:
+    /// strict callers throw `TypeError`, sloppy callers silently
+    /// ignore the failed write after advancing the program counter.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinaryset>
+    /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
+    pub(crate) fn drive_store_property(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let obj_reg = register_operand(operands.first())?;
+        let name_idx = const_operand(operands.get(1))?;
+        let src_reg = register_operand(operands.get(2))?;
+        let scratch_reg = register_operand(operands.get(3))?;
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        let strict = Self::current_frame_is_strict(stack, context);
+        // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
+        // when present; otherwise delegate to the target.
+        if let Value::Proxy(p) = &receiver {
+            let proxy = p.clone();
+            if proxy.is_revoked() {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
+                });
+            }
+            let key_str = JsString::from_str(&name, &self.string_heap)?;
+            let key_vm = VmPropertyKey::String(name.to_string());
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(),
+                Value::String(key_str),
+                value.clone(),
+                Value::Proxy(proxy.clone()),
+            ];
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
+                Some(result) => {
+                    let ok = result.to_boolean();
+                    if !ok {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot assign to property '{name}'"),
+                        )?;
+                        return Ok(true);
+                    }
+                    // §10.5.9 step 13–14 invariants — when trap reports
+                    // success, ensure target descriptor admits the
+                    // value.
+                    let target_value = proxy.target();
+                    let target_desc = self.ordinary_get_own_property_descriptor_value(
+                        context,
+                        target_value.clone(),
+                        &key_vm,
+                        0,
+                    )?;
+                    if let Some(desc) = target_desc.as_ref()
+                        && !desc.configurable()
+                    {
+                        match &desc.kind {
+                            object::DescriptorKind::Data { value: target_v }
+                                if !desc.writable() =>
+                            {
+                                if !abstract_ops::same_value(target_v, &value) {
+                                    return Err(VmError::TypeError {
+                                        message:
+                                            "Proxy set trap reported success but target is non-configurable non-writable with a different value"
+                                                .to_string(),
+                                    });
+                                }
+                            }
+                            object::DescriptorKind::Accessor { setter: None, .. } => {
+                                return Err(VmError::TypeError {
+                                    message:
+                                        "Proxy set trap reported success but target is a non-configurable accessor without a setter"
+                                            .to_string(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None => {
+                    let target_value = proxy.target();
+                    let Value::Object(target) = target_value else {
+                        if !self.ordinary_set_data_value(
+                            context,
+                            target_value,
+                            &VmPropertyKey::String(name.to_string()),
+                            value,
+                            Value::Proxy(proxy.clone()),
+                            0,
+                        )? {
+                            Self::failed_set_result(
+                                strict,
+                                format!("Cannot assign to property '{name}'"),
+                            )?;
+                        }
+                        return Ok(true);
+                    };
+                    match object::resolve_set(target, &self.gc_heap, &name) {
+                        object::SetOutcome::AssignData => {
+                            if !object::ordinary_set_data_property(
+                                target,
+                                &mut self.gc_heap,
+                                &name,
+                                value,
+                            ) {
+                                Self::failed_set_result(
+                                    strict,
+                                    format!("Cannot assign to property '{name}'"),
+                                )?;
+                            }
+                        }
+                        object::SetOutcome::InvokeSetter { setter } => {
+                            if !abstract_ops::is_callable(&setter) {
+                                Self::failed_set_result(
+                                    strict,
+                                    format!(
+                                        "Cannot assign to accessor property '{name}' without a setter"
+                                    ),
+                                )?;
+                            } else {
+                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                args.push(value);
+                                self.invoke(
+                                    stack,
+                                    context,
+                                    &setter,
+                                    Value::Proxy(proxy.clone()),
+                                    args,
+                                    scratch_reg,
+                                )?;
+                            }
+                        }
+                        object::SetOutcome::Reject { .. } => {
+                            Self::failed_set_result(
+                                strict,
+                                format!("Cannot assign to property '{name}'"),
+                            )?;
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if let Value::BoundFunction(bound) = &receiver {
+            match function_metadata::bound_own_property_descriptor(
+                bound,
+                &self.gc_heap,
+                &self.string_heap,
+                &name,
+            )? {
+                Some(object::PropertyDescriptor {
+                    kind: object::DescriptorKind::Accessor { setter, .. },
+                    ..
+                }) => {
+                    let setter = setter.ok_or(VmError::TypeMismatch)?;
+                    if !abstract_ops::is_callable(&setter) {
+                        return Err(VmError::TypeMismatch);
+                    }
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                    args.push(value);
+                    self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                    return Ok(true);
+                }
+                Some(_) => return Ok(false),
+                None => {
+                    if let Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { setter, .. },
+                        ..
+                    }) = object::get_own_descriptor(
+                        self.function_prototype_object()?,
+                        &self.gc_heap,
+                        &name,
+                    ) {
+                        let setter = setter.ok_or(VmError::TypeMismatch)?;
+                        if !abstract_ops::is_callable(&setter) {
+                            return Err(VmError::TypeMismatch);
+                        }
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                        args.push(value);
+                        self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                        return Ok(true);
+                    }
+                    if is_restricted_function_property(&name) {
+                        let pc = stack[top_idx].pc;
+                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        let callee = self.restricted_throw_type_error()?;
+                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                        args.push(value);
+                        self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        if matches!(
+            receiver,
+            Value::Boolean(_)
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Symbol(_)
+                | Value::BigInt(_)
+        ) {
+            return self.store_to_primitive_base(
+                stack,
+                context,
+                receiver,
+                VmPropertyKey::String(name.to_string()),
+                value,
+                scratch_reg,
+            );
+        }
+        let obj = match &receiver {
+            Value::Object(o) => *o,
+            Value::ClassConstructor(c) => c.statics(&self.gc_heap),
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let fid = *function_id;
+                if function_metadata::ordinary_function_metadata_key(&name).is_some()
+                    && let Some(desc) =
+                        self.ordinary_function_own_property_descriptor(Some(context), fid, &name)?
+                    && !desc.writable()
+                {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        format!("Cannot assign to read-only property '{name}' of function"),
+                    );
+                }
+                match self.function_user_props.get(&fid).copied() {
+                    Some(bag) => bag,
+                    None => {
+                        let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
+                        self.function_user_props.insert(fid, new_bag);
+                        new_bag
+                    }
+                }
+            }
+            _ => return Ok(false),
+        };
+        let outcome = crate::object::resolve_set(obj, &self.gc_heap, &name);
+        match outcome {
+            object::SetOutcome::AssignData => {
+                if !object::ordinary_set_data_property(obj, &mut self.gc_heap, &name, value) {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        format!("Cannot assign to property '{name}'"),
+                    );
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                Ok(true)
+            }
+            object::SetOutcome::InvokeSetter { setter } => {
+                if !abstract_ops::is_callable(&setter) {
+                    // Spec §10.1.9 step 5.b — accessor with non-
+                    // callable setter rejects.
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        format!("Cannot assign to accessor property '{name}' without a setter"),
+                    );
+                }
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                Ok(true)
+            }
+            object::SetOutcome::Reject { .. } => Self::finish_failed_set(
+                stack,
+                context,
+                format!("Cannot assign to property '{name}'"),
+            ),
+        }
+    }
+
+    /// §7.3.10 HasProperty — ordinary objects may have Proxy
+    /// objects in their prototype chain, so the interpreter owns
+    /// the trap-aware walk instead of delegating to `object::lookup`.
+    pub(crate) fn drive_has_property_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let lhs_reg = register_operand(operands.get(1))?;
+        let rhs_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let lhs = read_register(&stack[top_idx], lhs_reg)?.clone();
+        let rhs = read_register(&stack[top_idx], rhs_reg)?.clone();
+        if !matches!(rhs, Value::Object(_) | Value::Proxy(_)) {
+            return Ok(false);
+        };
+        let key = match &lhs {
+            Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+            Value::String(s) => VmPropertyKey::String(s.to_lossy_string()),
+            other => VmPropertyKey::String(other.display_string()),
+        };
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        let present = self.ordinary_has_property_value(context, rhs, &key, 0)?;
+        write_register(&mut stack[top_idx], dst, Value::Boolean(present))?;
+        Ok(true)
+    }
+
+    /// §28.2.4.10 Proxy.[[Delete]] — invoke the `deleteProperty`
+    /// trap when the receiver of `delete obj.x` is a Proxy.
+    pub(crate) fn drive_delete_property_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let obj_reg = register_operand(operands.get(1))?;
+        let name_idx = const_operand(operands.get(2))?;
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let Value::Proxy(proxy) = receiver else {
+            return Ok(false);
+        };
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        let removed = self.ordinary_delete_value(
+            context,
+            Value::Proxy(proxy),
+            &VmPropertyKey::String(name.to_string()),
+            0,
+        )?;
+        write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
+        Ok(true)
+    }
+
+    /// §28.2.4.10 Proxy.[[Delete]] — computed delete uses the
+    /// same trap-aware path as `delete obj.x`.
+    pub(crate) fn drive_delete_element_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let obj_reg = register_operand(operands.get(1))?;
+        let idx_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        if !matches!(receiver, Value::Proxy(_)) {
+            return Ok(false);
+        }
+        let idx = read_register(&stack[top_idx], idx_reg)?.clone();
+        let key = Self::coerce_vm_property_key(Some(&idx))?;
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
+        write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
+        Ok(true)
+    }
+
+    /// §28.2.4.1 Proxy.[[GetPrototypeOf]] — invoke the
+    /// `getPrototypeOf` trap when the source is a Proxy.
+    pub(crate) fn drive_get_prototype_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let dst = register_operand(operands.first())?;
+        let src = register_operand(operands.get(1))?;
+        let top_idx = stack.len() - 1;
+        let value = read_register(&stack[top_idx], src)?.clone();
+        if !matches!(value, Value::Proxy(_)) {
+            return Ok(false);
+        };
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        let result = self.ordinary_get_prototype_value(context, value, 0)?;
+        write_register(&mut stack[top_idx], dst, result)?;
+        Ok(true)
+    }
+
+    /// §28.2.4.2 Proxy.[[SetPrototypeOf]] — invoke the
+    /// `setPrototypeOf` trap when the receiver is a Proxy.
+    pub(crate) fn drive_set_prototype_proxy(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<bool, VmError> {
+        let obj_reg = register_operand(operands.first())?;
+        let proto_reg = register_operand(operands.get(1))?;
+        let top_idx = stack.len() - 1;
+        let recv = read_register(&stack[top_idx], obj_reg)?.clone();
+        let Value::Proxy(_) = &recv else {
+            return Ok(false);
+        };
+        let proto_val = read_register(&stack[top_idx], proto_reg)?.clone();
+        let proto_obj = match &proto_val {
+            Value::Object(_) | Value::Proxy(_) | Value::Null => proto_val.clone(),
+            Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let pc = stack[top_idx].pc;
+        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        // §10.5.7 — dispatch through the value-level helper so
+        // nested proxies fall through correctly and §10.5.7 invariants
+        // apply on the trap result.
+        let ok = self.set_prototype_value_proxy_aware(context, &recv, &proto_obj)?;
+        if !ok {
+            // Object.setPrototypeOf throws when [[SetPrototypeOf]]
+            // returns false (§20.1.2.21 step 4 DefinePropertyOrThrow).
+            return Err(VmError::TypeError {
+                message: "Object.setPrototypeOf failed".to_string(),
+            });
+        }
+        Ok(true)
     }
 }
 

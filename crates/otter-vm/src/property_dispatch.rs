@@ -2,11 +2,12 @@
 //!
 //! The VM dispatch loop handles proxy or call-frame cases before entering the
 //! dense register path. This module owns the remaining synchronous property
-//! predicates that can run directly against a frame.
+//! operations that can run directly against a frame.
 //!
 //! # Contents
 //! - Legacy `instanceof` prototype-chain fallback.
 //! - Synchronous `in` / `HasProperty` checks for arrays and class static sides.
+//! - Synchronous property and element load/store tails.
 //!
 //! # Invariants
 //! - Stack-modifying proxy and `@@hasInstance` cases are handled before these
@@ -656,6 +657,210 @@ impl Interpreter {
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())
+    }
+
+    pub(crate) fn run_store_element_regs(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        recv_reg: u16,
+        idx_reg: u16,
+        src_reg: u16,
+    ) -> Result<(), VmError> {
+        let recv = read_register(frame, recv_reg)?.clone();
+        let idx_value = read_register(frame, idx_reg)?.clone();
+        let value = read_register(frame, src_reg)?.clone();
+        let strict = context.function_is_strict(frame.function_id);
+        match (&recv, &idx_value) {
+            // Symbol-keyed write on an object.
+            (Value::Object(obj), Value::Symbol(sym)) => {
+                if !crate::object::set_symbol(*obj, &mut self.gc_heap, sym.clone(), value) {
+                    Self::failed_set_result(strict, "Cannot assign to symbol property")?;
+                }
+            }
+            // Computed string-key write (`obj["k"] = ...`).
+            (Value::Object(obj), Value::String(key)) => {
+                let key = key.to_lossy_string();
+                self.store_computed_ordinary_property(*obj, &key, value, strict)?;
+            }
+            // Computed numeric property write on ordinary objects,
+            // e.g. `arguments[0] = v`.
+            (Value::Object(obj), Value::Number(n)) => {
+                let key = n.to_display_string();
+                self.store_computed_ordinary_property(*obj, &key, value, strict)?;
+            }
+            (
+                Value::Function { function_id } | Value::Closure { function_id, .. },
+                Value::String(key),
+            ) => {
+                let key = key.to_lossy_string();
+                match self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    *function_id,
+                    &key,
+                )? {
+                    Some(desc) if !desc.writable() => {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot assign to read-only property '{key}' of function"),
+                        )?;
+                    }
+                    _ => {
+                        let bag = self.function_user_bag(*function_id)?;
+                        crate::object::set(bag, &mut self.gc_heap, &key, value);
+                        if let Some(metadata_key) =
+                            function_metadata::ordinary_function_metadata_key(&key)
+                        {
+                            self.function_deleted_metadata
+                                .remove(&(*function_id, metadata_key));
+                        }
+                    }
+                }
+            }
+            // Computed write to built-in function metadata follows
+            // the same descriptor path as `f.name = ...`.
+            (Value::NativeFunction(native), Value::String(key)) => {
+                let key = key.to_lossy_string();
+                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, &key)? {
+                    Some(desc) if !desc.writable() => {
+                        Self::failed_set_result(
+                            strict,
+                            format!(
+                                "Cannot assign to read-only property '{key}' of function {}",
+                                native.name(&self.gc_heap)
+                            ),
+                        )?;
+                    }
+                    _ => {
+                        let desc = crate::object::PropertyDescriptor::data(
+                            value.clone(),
+                            true,
+                            false,
+                            true,
+                        );
+                        if !native.define_own_property(
+                            &mut self.gc_heap,
+                            &self.string_heap,
+                            &key,
+                            desc,
+                        ) {
+                            Self::failed_set_result(
+                                strict,
+                                format!(
+                                    "Cannot define property '{key}' on function {}",
+                                    native.name(&self.gc_heap)
+                                ),
+                            )?;
+                        }
+                    }
+                }
+            }
+            (Value::BoundFunction(bound), Value::String(key)) => {
+                let key = key.to_lossy_string();
+                match function_metadata::bound_own_property_descriptor(
+                    bound,
+                    &self.gc_heap,
+                    &self.string_heap,
+                    &key,
+                )? {
+                    Some(desc) if !desc.writable() => {
+                        Self::failed_set_result(
+                            strict,
+                            format!(
+                                "Cannot assign to read-only property '{key}' of bound function"
+                            ),
+                        )?;
+                    }
+                    _ => {
+                        let desc = crate::object::PropertyDescriptor::data(
+                            value.clone(),
+                            true,
+                            false,
+                            true,
+                        );
+                        if !function_metadata::bound_define_own_property(
+                            bound,
+                            &mut self.gc_heap,
+                            &self.string_heap,
+                            &key,
+                            desc,
+                        ) {
+                            Self::failed_set_result(
+                                strict,
+                                format!("Cannot define property '{key}' on bound function"),
+                            )?;
+                        }
+                    }
+                }
+            }
+            // Numeric-indexed array write.
+            (Value::Array(arr), Value::Number(n)) => {
+                let idx = crate::array::index_from_number(*n).ok_or(VmError::TypeMismatch)?;
+                crate::array::set(*arr, &mut self.gc_heap, idx, value)?;
+            }
+            // §10.4.5.14 IntegerIndexedElementSet — out-of-range indices
+            // silently no-op; element-type / value-type mismatches raise
+            // TypeError.
+            // <https://tc39.es/ecma262/#sec-integerindexedelementset>
+            (Value::TypedArray(t), Value::Number(n)) => match n.as_smi() {
+                Some(v) if v >= 0 => {
+                    let coerced = binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
+                    t.set(v as usize, &coerced);
+                }
+                _ => return Err(VmError::TypeMismatch),
+            },
+            (Value::Undefined | Value::Null | Value::Hole, _) => {
+                return Err(VmError::TypeError {
+                    message: format!("Cannot set property on {}", value_kind_name(&recv)),
+                });
+            }
+            (
+                Value::Boolean(_)
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Symbol(_)
+                | Value::BigInt(_),
+                _,
+            ) => {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot set property on {}", value_kind_name(&recv)),
+                )?;
+            }
+            _ => return Err(VmError::TypeMismatch),
+        }
+        frame.pc += 1;
+        Ok(())
+    }
+
+    /// Apply descriptor-aware data assignment for computed ordinary-object
+    /// writes (`obj[key] = value`).
+    fn store_computed_ordinary_property(
+        &mut self,
+        obj: JsObject,
+        key: &str,
+        value: Value,
+        strict: bool,
+    ) -> Result<(), VmError> {
+        match crate::object::resolve_set(obj, &self.gc_heap, key) {
+            object::SetOutcome::AssignData => {
+                if object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value) {
+                    Ok(())
+                } else {
+                    Self::failed_set_result(
+                        strict,
+                        format!("Cannot assign to read-only property '{key}'"),
+                    )
+                }
+            }
+            object::SetOutcome::InvokeSetter { .. } => Self::failed_set_result(
+                strict,
+                format!("Cannot assign to accessor property '{key}' without a setter"),
+            ),
+            object::SetOutcome::Reject { .. } => {
+                Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+            }
+        }
     }
 
     fn load_from_constructor_prototype(

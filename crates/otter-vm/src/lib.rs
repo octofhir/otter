@@ -30,6 +30,7 @@ mod allocation_ops;
 pub mod arguments_object;
 mod arithmetic_dispatch;
 pub mod array;
+mod array_ops;
 pub mod array_prototype;
 pub mod array_statics;
 pub mod atomics;
@@ -37,6 +38,8 @@ pub mod atomics_wait;
 pub mod bigint;
 pub mod binary;
 pub mod boolean_prototype;
+mod call_ops;
+mod collection_ops;
 pub mod collections;
 pub mod collections_prototype;
 pub mod console;
@@ -55,20 +58,28 @@ pub mod bootstrap_typed_array;
 pub mod bootstrap_weak_refs;
 pub mod dynamic_import;
 pub mod error_classes;
+mod error_ops;
+mod eval_ops;
 mod executable;
 pub mod execution_context;
 mod frame_ops;
 pub mod function_metadata;
+mod function_ops;
 pub mod function_prototype;
 pub mod gc_trace;
 pub mod generator;
 pub mod global_functions;
+mod global_ops;
 pub mod intl;
+mod intl_ops;
 pub mod intrinsics;
+mod iterator_ops;
 pub mod js_surface;
 pub mod json;
 pub mod math;
+mod method_ops;
 pub mod microtask;
+mod module_ops;
 pub mod native_function;
 pub mod number;
 pub mod object;
@@ -76,13 +87,17 @@ pub mod object_statics;
 mod operand_decode;
 pub mod promise;
 pub mod promise_dispatch;
+mod promise_ops;
 mod property_dispatch;
 pub mod proxy;
 pub mod reflect;
+mod reflect_ops;
 pub mod regexp;
 pub mod regexp_prototype;
 pub mod runtime_cx;
 pub mod runtime_state;
+mod static_call_ops;
+mod static_load_ops;
 pub mod string;
 pub mod string_dispatch;
 mod string_ops;
@@ -111,7 +126,7 @@ use arithmetic_dispatch::{
     bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
 };
 use executable::ExecutableFunction;
-use operand_decode::{apply_branch, const_operand, imm32_operand, register_operand};
+use operand_decode::{apply_branch, const_operand, register_operand};
 
 pub use array::JsArray;
 pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
@@ -4962,36 +4977,15 @@ impl Interpreter {
                 // modifying so it has to run before the in-frame
                 // borrow below.
                 Op::Eval => {
-                    let dst = register_operand(context.exec_operand(instr, 0))?;
-                    let src_reg = register_operand(context.exec_operand(instr, 1))?;
-                    let top_idx = stack.len() - 1;
-                    let value = read_register(&stack[top_idx], src_reg)?.clone();
-                    let force_strict = context.function_is_strict(stack[top_idx].function_id);
-                    let result = self.run_eval(&value, force_strict)?;
-                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    let operands = context.exec_operands(instr);
+                    self.run_eval_operands(context, stack, operands)?;
                     continue;
                 }
                 // §20.2.1.1 — `new Function(args, body)` recurses
                 // into the eval hook with a synthesised wrapper.
                 Op::NewFunction => {
                     let operands = context.exec_operands(instr);
-                    let dst = register_operand(operands.first())?;
-                    let argc = match operands.get(1) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let top_idx = stack.len() - 1;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(2 + i))?;
-                        args.push(read_register(&stack[top_idx], r)?.clone());
-                    }
-                    let result = self.build_function_constructor(context, &args)?;
-                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    self.run_new_function_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::CollectArguments => {
@@ -5350,6 +5344,22 @@ impl Interpreter {
                     self.run_store_upvalue_reg(frame, src, idx)?;
                     continue;
                 }
+                Op::CollectRest => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_collect_rest_reg(frame, dst)?;
+                    continue;
+                }
+                Op::CollectArguments => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_collect_arguments_reg(frame, dst)?;
+                    continue;
+                }
                 Op::LoadProperty => {
                     let dst = context
                         .exec_register(instr, 0)
@@ -5390,6 +5400,295 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg)?;
+                    continue;
+                }
+                Op::StoreElement => {
+                    let recv_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_element_regs(context, frame, recv_reg, idx_reg, src_reg)?;
+                    continue;
+                }
+                Op::GetIterator => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_get_iterator_regs(frame, dst, src)?;
+                    continue;
+                }
+                Op::IteratorNext => {
+                    let value_dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let done_dst = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let iter_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)?;
+                    continue;
+                }
+                Op::MakeFunction => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_make_function_reg(context, frame, dst, idx)?;
+                    continue;
+                }
+                Op::MakeClass => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let ctor_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let proto_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let statics_reg = context
+                        .exec_register(instr, 3)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_make_class_regs(frame, dst, ctor_reg, proto_reg, statics_reg)?;
+                    continue;
+                }
+                Op::NewError => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let msg_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_new_error_regs(frame, dst, msg_reg)?;
+                    continue;
+                }
+                Op::NewBuiltinError => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let kind_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let msg_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_new_builtin_error_regs(context, frame, dst, kind_idx, msg_reg)?;
+                    continue;
+                }
+                Op::LoadBuiltinError => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let kind_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_builtin_error_reg(context, frame, dst, kind_idx)?;
+                    continue;
+                }
+                Op::LoadGlobalThis => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_global_this_reg(frame, dst)?;
+                    continue;
+                }
+                Op::LoadGlobalOrThrow => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_global_or_throw_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
+                Op::LoadGlobalOrUndefined => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
+                Op::ImportNamespace => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let spec_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_import_namespace_reg(context, frame, dst, spec_idx)?;
+                    continue;
+                }
+                Op::ImportMetaResolve => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let spec_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_import_meta_resolve_regs(frame, dst, spec_reg)?;
+                    continue;
+                }
+                Op::PromiseFulfilledOf => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_promise_fulfilled_of_regs(context, frame, dst, src)?;
+                    continue;
+                }
+                Op::ArrayPush => {
+                    let arr_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_array_push_regs(frame, arr_reg, value_reg)?;
+                    continue;
+                }
+                Op::NewWeakRef => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let target_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_new_weak_ref_regs(frame, dst, target_reg)?;
+                    continue;
+                }
+                Op::NewFinalizationRegistry => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let callback_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_new_finalization_registry_regs(context, frame, dst, callback_reg)?;
+                    continue;
+                }
+                Op::NewCollection => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let kind_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let iter_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_new_collection_regs(context, frame, dst, kind_idx, iter_reg)?;
+                    continue;
+                }
+                Op::NewIntl => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let class_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let locale_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let options_reg = context
+                        .exec_register(instr, 3)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_new_intl_regs(
+                        context,
+                        frame,
+                        dst,
+                        class_idx,
+                        locale_reg,
+                        options_reg,
+                    )?;
+                    continue;
+                }
+                Op::MathLoad => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_math_load_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
+                Op::SymbolLoad => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_symbol_load_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
+                Op::TemporalLoad => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_temporal_load_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
+                Op::EnterTry => {
+                    let catch_off = context
+                        .exec_imm32(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let finally_off = context
+                        .exec_imm32(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let exc_register = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_enter_try_regs(frame, catch_off, finally_off, exc_register)?;
+                    continue;
+                }
+                Op::LeaveTry => {
+                    let frame = &mut stack[top_idx];
+                    self.run_leave_try(frame)?;
                     continue;
                 }
                 Op::Jump => {
@@ -5743,6 +6042,32 @@ impl Interpreter {
                 | Op::LoadProperty
                 | Op::StoreProperty
                 | Op::LoadElement
+                | Op::StoreElement
+                | Op::GetIterator
+                | Op::IteratorNext
+                | Op::MakeFunction
+                | Op::MakeClass
+                | Op::NewError
+                | Op::NewBuiltinError
+                | Op::LoadBuiltinError
+                | Op::LoadGlobalThis
+                | Op::LoadGlobalOrThrow
+                | Op::LoadGlobalOrUndefined
+                | Op::CollectRest
+                | Op::CollectArguments
+                | Op::ImportNamespace
+                | Op::ImportMetaResolve
+                | Op::PromiseFulfilledOf
+                | Op::ArrayPush
+                | Op::NewWeakRef
+                | Op::NewFinalizationRegistry
+                | Op::NewCollection
+                | Op::NewIntl
+                | Op::MathLoad
+                | Op::SymbolLoad
+                | Op::TemporalLoad
+                | Op::EnterTry
+                | Op::LeaveTry
                 | Op::Jump
                 | Op::JumpIfTrue
                 | Op::JumpIfFalse
@@ -5752,248 +6077,8 @@ impl Interpreter {
                 | Op::TdzError => {
                     unreachable!("fixed-width ops handled earlier in this loop")
                 }
-                Op::MakeFunction => {
-                    let dst = register_operand(operands.first())?;
-                    let idx = const_operand(operands.get(1))?;
-                    let function_id = context
-                        .function_id_constant(idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, Value::Function { function_id })?;
-                    frame.pc += 1;
-                }
                 Op::MakeClosure => {
-                    let dst = register_operand(operands.first())?;
-                    let idx = const_operand(operands.get(1))?;
-                    let function_id = context
-                        .function_id_constant(idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let count = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let mut cells: Vec<UpvalueCell> = Vec::with_capacity(count);
-                    for i in 0..count {
-                        let parent_idx = match operands.get(3 + i) {
-                            Some(&Operand::Imm32(n)) if n >= 0 => n as usize,
-                            _ => return Err(VmError::InvalidOperand),
-                        };
-                        let cell = *frame
-                            .upvalues
-                            .get(parent_idx)
-                            .ok_or(VmError::InvalidOperand)?;
-                        cells.push(cell);
-                    }
-                    let upvalues: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(cells);
-                    // Arrow-closure receivers are bound lexically:
-                    // every later invocation ignores the call site
-                    // and uses the enclosing frame's `this`.
-                    let is_arrow = context.function_is_arrow(function_id);
-                    let bound_this = if is_arrow {
-                        Some(Box::new(frame.this_value.clone()))
-                    } else {
-                        None
-                    };
-                    write_register(
-                        frame,
-                        dst,
-                        Value::Closure {
-                            function_id,
-                            upvalues,
-                            bound_this,
-                        },
-                    )?;
-                    frame.pc += 1;
-                }
-                Op::StoreElement => {
-                    let recv_reg = register_operand(operands.first())?;
-                    let idx_reg = register_operand(operands.get(1))?;
-                    let src_reg = register_operand(operands.get(2))?;
-                    let _scratch_reg = register_operand(operands.get(3))?;
-                    let recv = read_register(frame, recv_reg)?.clone();
-                    let idx_value = read_register(frame, idx_reg)?.clone();
-                    let value = read_register(frame, src_reg)?.clone();
-                    let strict = Self::function_is_strict(context, frame.function_id);
-                    match (&recv, &idx_value) {
-                        // Symbol-keyed write on an object.
-                        (Value::Object(obj), Value::Symbol(sym)) => {
-                            if !crate::object::set_symbol(
-                                *obj,
-                                &mut self.gc_heap,
-                                sym.clone(),
-                                value,
-                            ) {
-                                Self::failed_set_result(
-                                    strict,
-                                    "Cannot assign to symbol property",
-                                )?;
-                            }
-                        }
-                        // Computed string-key write (`obj["k"] = …`).
-                        (Value::Object(obj), Value::String(key)) => {
-                            let key = key.to_lossy_string();
-                            self.store_computed_ordinary_property(*obj, &key, value, strict)?;
-                        }
-                        // Computed numeric property write on
-                        // ordinary objects, e.g. `arguments[0] = v`.
-                        (Value::Object(obj), Value::Number(n)) => {
-                            let key = n.to_display_string();
-                            self.store_computed_ordinary_property(*obj, &key, value, strict)?;
-                        }
-                        (
-                            Value::Function { function_id } | Value::Closure { function_id, .. },
-                            Value::String(key),
-                        ) => {
-                            let key = key.to_lossy_string();
-                            match self.ordinary_function_own_property_descriptor(
-                                Some(context),
-                                *function_id,
-                                &key,
-                            )? {
-                                Some(desc) if !desc.writable() => {
-                                    Self::failed_set_result(
-                                        strict,
-                                        format!(
-                                            "Cannot assign to read-only property '{key}' of function"
-                                        ),
-                                    )?;
-                                }
-                                _ => {
-                                    let bag = self.function_user_bag(*function_id)?;
-                                    crate::object::set(bag, &mut self.gc_heap, &key, value);
-                                    if let Some(metadata_key) =
-                                        function_metadata::ordinary_function_metadata_key(&key)
-                                    {
-                                        self.function_deleted_metadata
-                                            .remove(&(*function_id, metadata_key));
-                                    }
-                                }
-                            }
-                        }
-                        // Computed write to built-in function
-                        // metadata follows the same descriptor path
-                        // as `f.name = ...`.
-                        (Value::NativeFunction(native), Value::String(key)) => {
-                            let key = key.to_lossy_string();
-                            match native.own_property_descriptor(
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &key,
-                            )? {
-                                Some(desc) if !desc.writable() => {
-                                    Self::failed_set_result(
-                                        strict,
-                                        format!(
-                                            "Cannot assign to read-only property '{key}' of function {}",
-                                            native.name(&self.gc_heap)
-                                        ),
-                                    )?;
-                                }
-                                _ => {
-                                    let desc = crate::object::PropertyDescriptor::data(
-                                        value.clone(),
-                                        true,
-                                        false,
-                                        true,
-                                    );
-                                    if !native.define_own_property(
-                                        &mut self.gc_heap,
-                                        &self.string_heap,
-                                        &key,
-                                        desc,
-                                    ) {
-                                        Self::failed_set_result(
-                                            strict,
-                                            format!(
-                                                "Cannot define property '{key}' on function {}",
-                                                native.name(&self.gc_heap)
-                                            ),
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-                        (Value::BoundFunction(bound), Value::String(key)) => {
-                            let key = key.to_lossy_string();
-                            match function_metadata::bound_own_property_descriptor(
-                                bound,
-                                &self.gc_heap,
-                                &self.string_heap,
-                                &key,
-                            )? {
-                                Some(desc) if !desc.writable() => {
-                                    Self::failed_set_result(
-                                        strict,
-                                        format!(
-                                            "Cannot assign to read-only property '{key}' of bound function"
-                                        ),
-                                    )?;
-                                }
-                                _ => {
-                                    let desc = crate::object::PropertyDescriptor::data(
-                                        value.clone(),
-                                        true,
-                                        false,
-                                        true,
-                                    );
-                                    if !function_metadata::bound_define_own_property(
-                                        bound,
-                                        &mut self.gc_heap,
-                                        &self.string_heap,
-                                        &key,
-                                        desc,
-                                    ) {
-                                        Self::failed_set_result(
-                                            strict,
-                                            format!(
-                                                "Cannot define property '{key}' on bound function"
-                                            ),
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-                        // Numeric-indexed array write.
-                        (Value::Array(arr), Value::Number(n)) => {
-                            let idx =
-                                crate::array::index_from_number(*n).ok_or(VmError::TypeMismatch)?;
-                            crate::array::set(*arr, &mut self.gc_heap, idx, value)?;
-                        }
-                        // §10.4.5.14 IntegerIndexedElementSet — out-of-
-                        // range indices silently no-op; element-type /
-                        // value-type mismatches raise TypeError.
-                        // <https://tc39.es/ecma262/#sec-integerindexedelementset>
-                        (Value::TypedArray(t), Value::Number(n)) => match n.as_smi() {
-                            Some(v) if v >= 0 => {
-                                let coerced =
-                                    binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
-                                t.set(v as usize, &coerced);
-                            }
-                            _ => return Err(VmError::TypeMismatch),
-                        },
-                        (Value::Undefined | Value::Null | Value::Hole, _) => {
-                            return Err(VmError::TypeError {
-                                message: format!(
-                                    "Cannot set property on {}",
-                                    value_kind_name(&recv)
-                                ),
-                            });
-                        }
-                        (
-                            Value::Boolean(_)
-                            | Value::Number(_)
-                            | Value::String(_)
-                            | Value::Symbol(_)
-                            | Value::BigInt(_),
-                            _,
-                        ) => {
-                            Self::failed_set_result(
-                                strict,
-                                format!("Cannot set property on {}", value_kind_name(&recv)),
-                            )?;
-                        }
-                        _ => return Err(VmError::TypeMismatch),
-                    }
-                    frame.pc += 1;
+                    self.run_make_closure_operands(context, frame, operands)?;
                 }
                 Op::ArrayLength | Op::IsArray | Op::Instanceof | Op::HasProperty => {
                     unreachable!("property predicates handled earlier in this loop")
@@ -6023,923 +6108,61 @@ impl Interpreter {
                 | Op::SameValue => {
                     unreachable!("register binary ops handled earlier in this loop")
                 }
-                Op::NewError => {
-                    // Foundation `new Error(arg)` shape — preserved
-                    // alongside the wider [`Op::NewBuiltinError`]
-                    // opcode for backwards compatibility with already-
-                    // shipped fixtures. Both routes consult the per-
-                    // interpreter [`ErrorClassRegistry`] so prototype
-                    // identity matches `instanceof Error`.
-                    //
-                    // <https://tc39.es/ecma262/#sec-error-constructor>
-                    let dst = register_operand(operands.first())?;
-                    let msg_reg = register_operand(operands.get(1))?;
-                    let value = read_register(frame, msg_reg)?.clone();
-                    let owned_message: Option<String> = match value {
-                        Value::Undefined => None,
-                        Value::String(s) => Some(s.to_lossy_string()),
-                        other => Some(other.display_string()),
-                    };
-                    let obj = {
-                        let string_heap = self.string_heap.clone();
-                        let registry = self.error_classes.clone();
-                        registry.make_instance(
-                            ErrorKind::Error,
-                            owned_message.as_deref(),
-                            &string_heap,
-                            &mut self.gc_heap,
-                        )?
-                    };
-                    write_register(frame, dst, Value::Object(obj))?;
-                    frame.pc += 1;
-                }
-                Op::NewBuiltinError => {
-                    // ECMA-262 §19.3 / §20.5 native error
-                    // constructors. The compiler resolves the
-                    // identifier to an [`ErrorKind`] before emitting
-                    // this opcode, so a missing variant in the
-                    // constant pool is a compiler bug surfaced as
-                    // `InvalidOperand`.
-                    //
-                    // <https://tc39.es/ecma262/#sec-error-objects>
-                    let dst = register_operand(operands.first())?;
-                    let kind_idx = const_operand(operands.get(1))?;
-                    let msg_reg = register_operand(operands.get(2))?;
-                    let kind_name = context
-                        .string_constant_str(kind_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let kind =
-                        ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
-                    let value = read_register(frame, msg_reg)?.clone();
-                    let owned_message: Option<String> = match value {
-                        Value::Undefined => None,
-                        Value::String(s) => Some(s.to_lossy_string()),
-                        other => Some(other.display_string()),
-                    };
-                    let obj = {
-                        let string_heap = self.string_heap.clone();
-                        let registry = self.error_classes.clone();
-                        registry.make_instance(
-                            kind,
-                            owned_message.as_deref(),
-                            &string_heap,
-                            &mut self.gc_heap,
-                        )?
-                    };
-                    write_register(frame, dst, Value::Object(obj))?;
-                    frame.pc += 1;
-                }
-                Op::LoadBuiltinError => {
-                    // Resolve a bare identifier reference (e.g.
-                    // `e instanceof TypeError`) to the matching
-                    // constructor object out of
-                    // [`ErrorClassRegistry`].
-                    //
-                    // <https://tc39.es/ecma262/#sec-error-objects>
-                    let dst = register_operand(operands.first())?;
-                    let kind_idx = const_operand(operands.get(1))?;
-                    let kind_name = context
-                        .string_constant_str(kind_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let kind =
-                        ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
-                    let ctor = self.error_classes.constructor(kind);
-                    write_register(frame, dst, Value::Object(ctor))?;
-                    frame.pc += 1;
-                }
-                Op::MathLoad => {
-                    let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value =
-                        math::load_constant(&name).ok_or_else(|| VmError::UnknownIntrinsic {
-                            name: format!("Math.{name}"),
-                        })?;
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::MathCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::MathMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = math::call(method, &args).map_err(math_to_vm_error)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                Op::JsonCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::JsonMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = json::call(method, &args, &self.string_heap, &mut self.gc_heap)
-                        .map_err(json_to_vm_error)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §22.1.1 / §22.1.2 String constructor + statics.
-                // <https://tc39.es/ecma262/#sec-string-constructor>
-                // §21.4 Date constructor + statics.
-                // <https://tc39.es/ecma262/#sec-date-objects>
-                Op::DateCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::DateMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = date::dispatch::call(method, &args)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §21.2.1 / §21.2.2 BigInt static dispatch.
-                // <https://tc39.es/ecma262/#sec-bigint-constructor>
-                Op::BigIntCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::BigIntMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = bigint::dispatch::call(method, &args)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §25.1.4 ArrayBuffer constructor + isView static.
-                // <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
-                Op::ArrayBufferCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::ArrayBufferMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = binary::dispatch::array_buffer_call(method, &args, &self.gc_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §25.3 DataView constructor.
-                // <https://tc39.es/ecma262/#sec-dataview-constructor>
-                Op::DataViewCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::DataViewMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = binary::dispatch::data_view_call(method, &args)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §23.2 TypedArray constructor + statics.
-                // <https://tc39.es/ecma262/#sec-typedarray-constructors>
-                Op::TypedArrayCall => {
-                    let dst = register_operand(operands.first())?;
-                    let kind_idx = const_operand(operands.get(1))?;
-                    let method_idx = const_operand(operands.get(2))?;
-                    let argc = match operands.get(3) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let kind = binary::TypedArrayKind::from_u32(kind_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let method = otter_bytecode::method_id::TypedArrayMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(4 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result =
-                        binary::dispatch::typed_array_call(kind, method, &args, &self.gc_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // Iterator-helpers proposal — `Iterator.from(iter)`
-                // and friends.
-                // <https://tc39.es/proposal-iterator-helpers/>
-                Op::IteratorCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::IteratorMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = iterator_static_call(method, &args, &mut self.gc_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §25.2 SharedArrayBuffer constructor.
-                // <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
-                Op::SharedArrayBufferCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method =
-                        otter_bytecode::method_id::SharedArrayBufferMethod::from_u32(method_idx)
-                            .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result =
-                        binary::dispatch::shared_array_buffer_call(method, &args, &self.gc_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                // §28.2 Proxy constructor + statics — `new Proxy`
-                // and `Proxy.revocable`.
-                // <https://tc39.es/ecma262/#sec-proxy-constructor>
-                Op::ProxyCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::ProxyMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = proxy_static_call(method, &args, &mut self.gc_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
+                Op::MathCall
+                | Op::JsonCall
+                | Op::DateCall
+                | Op::BigIntCall
+                | Op::ArrayBufferCall
+                | Op::DataViewCall
+                | Op::TypedArrayCall
+                | Op::IteratorCall
+                | Op::SharedArrayBufferCall
+                | Op::ProxyCall => {
+                    self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 // §28.1 Reflect static surface — single dispatcher
                 // covering every spec method.
                 // <https://tc39.es/ecma262/#sec-reflect-object>
                 Op::ReflectCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::ReflectMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(&stack[top_idx], r)?.clone());
-                    }
-                    // Apply / construct need interp access; advance pc
-                    // first so the sub-dispatch returns to the next op.
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    let heap = self.string_heap.clone();
-                    let result = reflect::call(self, context, method, &args, &heap)?;
-                    write_register(&mut stack[top_idx], dst, result)?;
+                    self.run_reflect_call_operands(context, stack, operands)?;
                     continue;
                 }
                 // §23.1.1 / §23.1.2 — typed Array static dispatch.
                 // No string indirection: each shape has its own
                 // opcode with `dst, argc, args...` operands.
                 Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {
-                    let dst = register_operand(operands.first())?;
-                    let argc = match operands.get(1) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(2 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    // Advance pc first so any iterator dispatch
-                    // re-enters the outer loop on the next op.
-                    let pc = frame.pc;
-                    frame.pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    let result = match op {
-                        Op::ArrayConstruct => array_statics::construct(&args, &mut self.gc_heap)?,
-                        Op::ArrayFrom => self.array_from_sync(context, &args)?,
-                        Op::ArrayOf => array_statics::of(&args, &mut self.gc_heap)?,
-                        _ => unreachable!("outer match guarantees Array static op"),
-                    };
-                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, result)?;
+                    self.run_array_static_operands(op, context, stack, operands)?;
+                    continue;
                 }
-                // §20.1.2 / §10.1.6 — Object static dispatch.
-                // Routes through `object_statics::call` which honours
-                // ECMA-262 ValidateAndApplyPropertyDescriptor and the
-                // freeze/seal/preventExtensions integrity ladder.
-                // <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
                 Op::ObjectCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::ObjectMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = if let Some(result) =
-                        self.try_function_object_static_call(Some(context), method, &args)?
-                    {
-                        result
-                    } else if let Some(result) =
-                        self.try_proxy_object_static_call(context, method, &args)?
-                    {
-                        result
-                    } else {
-                        object_statics::call(method, &args, &self.string_heap, &mut self.gc_heap)?
-                    };
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
+                    self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 Op::QueueMicrotask => {
-                    // Operands: callee, argc, args... — no dst.
-                    let callee_reg = register_operand(operands.first())?;
-                    let argc = match operands.get(1) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let callee = read_register(frame, callee_reg)?.clone();
-                    if !self.is_callable_runtime(&callee) {
-                        return Err(VmError::NotCallable);
-                    }
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(2 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    // Advance pc *before* mutating self.microtasks
-                    // — the per-frame `frame: &mut Frame` borrow
-                    // ends at the next statement, so the disjoint
-                    // `&mut self.microtasks` borrow is legal.
-                    frame.pc += 1;
-                    self.microtasks.enqueue(Microtask {
-                        callee,
-                        this_value: Value::Undefined,
-                        args,
-                        context: Some(context.clone()),
-                        result_capability: None,
-                        kind: microtask::MicrotaskKind::Call,
-                    });
+                    self.run_queue_microtask_operands(context, frame, operands)?;
                 }
                 Op::PromiseNew => {
-                    // Operands: dst, executor_reg, scratch_dst.
-                    let dst = register_operand(operands.first())?;
-                    let executor_reg = register_operand(operands.get(1))?;
-                    let scratch_dst = register_operand(operands.get(2))?;
-                    let executor = read_register(frame, executor_reg)?.clone();
-                    if !self.is_callable_runtime(&executor) {
-                        return Err(VmError::NotCallable);
-                    }
-                    let (handle, resolve, reject) =
-                        promise_dispatch::PromiseBuilder::with_context(context.clone())
-                            .construct(&mut self.gc_heap)?;
-                    let promise_value = Value::Promise(handle);
-                    write_register(frame, dst, promise_value)?;
-                    // Advance pc, then invoke executor with [resolve, reject].
-                    frame.pc += 1;
-                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                    args.push(resolve);
-                    args.push(reject);
-                    self.invoke(
-                        stack,
-                        context,
-                        &executor,
-                        Value::Undefined,
-                        args,
-                        scratch_dst,
-                    )?;
+                    self.run_promise_new_operands(context, stack, operands)?;
+                    continue;
                 }
                 Op::PromiseCall => {
-                    // Operands: dst, method_id, argc, args...
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::PromiseMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let argv: Vec<Value> = args.into_iter().collect();
-                    frame.pc += 1;
-                    let result =
-                        promise_dispatch::statics_call(self, Some(context.clone()), method, &argv)
-                            .map_err(native_to_vm_error)?;
-                    let top_idx = stack.len() - 1;
-                    write_register(&mut stack[top_idx], dst, result)?;
-                }
-                Op::CollectRest => {
-                    let dst = register_operand(operands.first())?;
-                    // Drain rather than clone — the rest array is
-                    // built once per call and CollectRest is the
-                    // single consumer, so freeing the backing
-                    // storage promptly keeps frame sizes small.
-                    let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
-                    let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
-                    write_register(frame, dst, Value::Array(array))?;
-                    frame.pc += 1;
-                }
-                Op::CollectArguments => {
-                    // Handled before the in-frame borrow above.
-                    let dst = register_operand(operands.first())?;
-                    write_register(frame, dst, Value::Undefined)?;
-                    frame.pc += 1;
-                }
-                Op::ImportNamespace => {
-                    let dst = register_operand(operands.first())?;
-                    let spec_idx = const_operand(operands.get(1))?;
-                    let specifier = context
-                        .string_constant_str(spec_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let referrer = frame.module_url.clone();
-                    let namespace = self
-                        .resolve_module_namespace(context, referrer.as_ref(), &specifier)
-                        .ok_or(VmError::UnknownIntrinsic {
-                            name: format!("import \"{specifier}\""),
-                        })?;
-                    write_register(frame, dst, Value::Object(namespace))?;
-                    frame.pc += 1;
-                }
-                Op::LoadGlobalThis => {
-                    let dst = register_operand(operands.first())?;
-                    let value = Value::Object(self.global_this);
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::LoadGlobalOrThrow => {
-                    // §10.2.4.1 ResolveBinding + §10.2.4.5 GetValue:
-                    // when the global env has no binding for `name`,
-                    // throw a `ReferenceError`. Foundation lowers
-                    // free-identifier reads to this opcode.
-                    let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    if let Some(value) = crate::object::get(self.global_this, &self.gc_heap, &name)
-                    {
-                        write_register(frame, dst, value)?;
-                        frame.pc += 1;
-                    } else {
-                        // Throw a real `ReferenceError` instance so
-                        // `e instanceof ReferenceError` checks
-                        // observe the spec-correct shape.
-                        return Err(VmError::UndefinedIdentifier {
-                            name: name.to_string(),
-                        });
-                    }
-                }
-                Op::LoadGlobalOrUndefined => {
-                    // §13.5.3 typeof — IsUnresolvableReference path:
-                    // a free identifier with no global binding
-                    // resolves to `undefined` rather than throwing.
-                    let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value = crate::object::get(self.global_this, &self.gc_heap, &name)
-                        .unwrap_or(Value::Undefined);
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
+                    self.run_promise_call_operands(context, stack, operands)?;
+                    continue;
                 }
                 Op::GlobalCall => {
-                    // §19.2 global functions — parseInt / parseFloat /
-                    // isNaN / isFinite / encodeURI* / decodeURI*.
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::GlobalMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = global_functions::call(method, &args, &self.string_heap)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                Op::ImportMetaResolve => {
-                    // Resolve `specifier` against frame.module_url
-                    // and write the resulting absolute URL string.
-                    let dst = register_operand(operands.first())?;
-                    let spec_reg = register_operand(operands.get(1))?;
-                    let spec_value = read_register(frame, spec_reg)?.clone();
-                    let specifier = match spec_value {
-                        Value::String(s) => s.to_lossy_string(),
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let referrer_str: &str = &frame.module_url;
-                    let resolved = resolve_relative_url(Some(referrer_str), &specifier);
-                    let resolved_str = JsString::from_str(&resolved, &self.string_heap)
-                        .map_err(|_| VmError::TypeMismatch)?;
-                    write_register(frame, dst, Value::String(resolved_str))?;
-                    frame.pc += 1;
+                    self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 Op::ImportNamespaceDynamic => {
-                    // §16.2.1.7 ImportCall (runtime-resolved). The
-                    // specifier is whatever string the user
-                    // expression evaluated to. The opcode always
-                    // produces a [`Value::Promise`]:
-                    //
-                    // 1. Pre-resolved (linker-merged) specifier —
-                    //    Promise fulfilled with the imported
-                    //    namespace, matching the literal
-                    //    `import("./x")` shape.
-                    // 2. Specifier the linker has not seen, host
-                    //    dynamic-import scheduler installed —
-                    //    register a fresh pending Promise + hand
-                    //    the host-issued token to
-                    //    [`crate::DynamicImportLoader::schedule`].
-                    //    The runtime layer's inbox handler then
-                    //    drives the load + compile + link +
-                    //    evaluate and settles via
-                    //    [`crate::Interpreter::settle_dynamic_import`].
-                    // 3. Specifier the linker has not seen, no
-                    //    scheduler (Layer-A direct mode) — reject
-                    //    with a `TypeError`.
-                    // 4. Non-string specifier — reject with a
-                    //    `TypeError`, matching §16.2.1.7 step 7.b.i.
-                    let dst = register_operand(operands.first())?;
-                    let spec_reg = register_operand(operands.get(1))?;
-                    let spec_value = read_register(frame, spec_reg)?.clone();
-                    let referrer = frame.module_url.clone();
-                    let import_context = context.clone();
-                    let promise = match spec_value {
-                        Value::String(s) => {
-                            let specifier = s.to_lossy_string();
-                            if let Some(ns) = self.resolve_module_namespace(
-                                context,
-                                referrer.as_ref(),
-                                &specifier,
-                            ) {
-                                promise_dispatch::PromiseBuilder::with_context(
-                                    import_context.clone(),
-                                )
-                                .fulfilled(&mut self.gc_heap, Value::Object(ns))?
-                            } else if let Some(loader) = self.dynamic_import_loader.clone() {
-                                let pending = promise_dispatch::PromiseBuilder::with_context(
-                                    import_context.clone(),
-                                )
-                                .pending(&mut self.gc_heap)?;
-                                let token = self
-                                    .dynamic_import_registry
-                                    .insert(pending, import_context.clone());
-                                loader.schedule(token, specifier, referrer.as_ref().to_string());
-                                pending
-                            } else {
-                                let reason = self.make_type_error(&format!(
-                                    "dynamic import: module not resolvable: \"{specifier}\""
-                                ))?;
-                                promise_dispatch::PromiseBuilder::with_context(
-                                    import_context.clone(),
-                                )
-                                .rejected(&mut self.gc_heap, reason)?
-                            }
-                        }
-                        _ => {
-                            let reason =
-                                self.make_type_error("dynamic import: specifier must be a string")?;
-                            promise_dispatch::PromiseBuilder::with_context(import_context)
-                                .rejected(&mut self.gc_heap, reason)?
-                        }
-                    };
-                    write_register(frame, dst, Value::Promise(promise))?;
-                    frame.pc += 1;
-                }
-                Op::PromiseFulfilledOf => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let value = read_register(frame, src)?.clone();
-                    let promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                        .fulfilled(&mut self.gc_heap, value)?;
-                    write_register(frame, dst, Value::Promise(promise))?;
-                    frame.pc += 1;
-                }
-                Op::MakeClass => {
-                    let dst = register_operand(operands.first())?;
-                    let ctor_reg = register_operand(operands.get(1))?;
-                    let proto_reg = register_operand(operands.get(2))?;
-                    let statics_reg = register_operand(operands.get(3))?;
-                    let ctor = read_register(frame, ctor_reg)?.clone();
-                    if !self.is_callable_runtime(&ctor) {
-                        return Err(VmError::NotCallable);
-                    }
-                    let prototype = match read_register(frame, proto_reg)? {
-                        Value::Object(o) => *o,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let statics = match read_register(frame, statics_reg)? {
-                        Value::Object(o) => *o,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let class = ClassConstructor::new(&mut self.gc_heap, ctor, prototype, statics)?;
-                    write_register(frame, dst, Value::ClassConstructor(class))?;
-                    frame.pc += 1;
-                }
-                Op::EnterTry => {
-                    let catch_off = imm32_operand(operands.first())?;
-                    let finally_off = imm32_operand(operands.get(1))?;
-                    let exc_register = register_operand(operands.get(2))?;
-                    let next_pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)? as i64;
-                    let resolve = |off: i32| -> Result<Option<u32>, VmError> {
-                        if off == NO_HANDLER_OFFSET {
-                            return Ok(None);
-                        }
-                        let target = next_pc + off as i64;
-                        if target < 0 || target > u32::MAX as i64 {
-                            return Err(VmError::InvalidOperand);
-                        }
-                        Ok(Some(target as u32))
-                    };
-                    let catch_pc = resolve(catch_off)?;
-                    let finally_pc = resolve(finally_off)?;
-                    if catch_pc.is_none() && finally_pc.is_none() {
-                        return Err(VmError::InvalidOperand);
-                    }
-                    frame.handlers.push(TryHandler {
-                        catch_pc,
-                        finally_pc,
-                        exc_register,
-                    });
-                    frame.pc += 1;
-                }
-                Op::LeaveTry => {
-                    if frame.handlers.pop().is_none() {
-                        return Err(VmError::InvalidOperand);
-                    }
-                    frame.pc += 1;
+                    self.run_import_namespace_dynamic_operands(context, frame, operands)?;
                 }
                 Op::BindFunction => {
                     self.drive_bind_function(stack, context, &operands)?;
                     continue;
                 }
-                Op::GetIterator => {
-                    let dst = register_operand(operands.first())?;
-                    let src = register_operand(operands.get(1))?;
-                    let value = read_register(frame, src)?.clone();
-                    let state = match value {
-                        Value::Array(array) => IteratorState::Array { array, index: 0 },
-                        Value::String(string) => IteratorState::String { string, index: 0 },
-                        // `for…of` over a `Map` yields `[key, value]`
-                        // pairs (Spec §24.1.3.12 — `@@iterator` aliases
-                        // `entries`); over a `Set` yields values
-                        // (Spec §24.2.3.11). We snapshot at iteration
-                        // start, building a synthetic backing array.
-                        Value::Map(m) => {
-                            let entries = crate::collections::map_entries(m, &self.gc_heap);
-                            let mut snap: SmallVec<[Value; 4]> =
-                                SmallVec::with_capacity(entries.len());
-                            for (k, v) in entries {
-                                let mut pair: SmallVec<[Value; 4]> = SmallVec::new();
-                                pair.push(k);
-                                pair.push(v);
-                                let pair_array =
-                                    crate::array::from_elements(&mut self.gc_heap, pair)?;
-                                snap.push(Value::Array(pair_array));
-                            }
-                            IteratorState::Array {
-                                array: crate::array::from_elements(&mut self.gc_heap, snap)?,
-                                index: 0,
-                            }
-                        }
-                        Value::Set(s) => {
-                            let snap: SmallVec<[Value; 4]> =
-                                crate::collections::set_values(s, &self.gc_heap)
-                                    .into_iter()
-                                    .collect();
-                            IteratorState::Array {
-                                array: crate::array::from_elements(&mut self.gc_heap, snap)?,
-                                index: 0,
-                            }
-                        }
-                        // §27.5 — generator objects are iterable;
-                        // `[@@iterator]()` returns the generator
-                        // itself, and `next()` drives the suspended
-                        // body.
-                        Value::Generator(handle) => IteratorState::Generator { handle },
-                        // Already-an-iterator (from
-                        // `Iterator.from(...)` / a helper wrapper)
-                        // should pass through unchanged.
-                        Value::Iterator(rc) => {
-                            write_register(frame, dst, Value::Iterator(rc))?;
-                            frame.pc += 1;
-                            continue;
-                        }
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let iter = alloc_iterator_state(&mut self.gc_heap, state)?;
-                    write_register(frame, dst, Value::Iterator(iter))?;
-                    frame.pc += 1;
-                }
-                Op::IteratorNext => {
-                    let value_dst = register_operand(operands.first())?;
-                    let done_dst = register_operand(operands.get(1))?;
-                    let iter_reg = register_operand(operands.get(2))?;
-                    let iter = match read_register(frame, iter_reg)? {
-                        Value::Iterator(rc) => *rc,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let (value, done) = step_iterator(iter, &self.string_heap, &mut self.gc_heap)?;
-                    write_register(frame, value_dst, value)?;
-                    write_register(frame, done_dst, Value::Boolean(done))?;
-                    frame.pc += 1;
-                }
-                Op::ArrayPush => {
-                    let arr_reg = register_operand(operands.first())?;
-                    let value_reg = register_operand(operands.get(1))?;
-                    let value = read_register(frame, value_reg)?.clone();
-                    let array = match read_register(frame, arr_reg)? {
-                        Value::Array(a) => *a,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    crate::array::push(array, &mut self.gc_heap, value)?;
-                    frame.pc += 1;
-                }
-                Op::SymbolLoad => {
-                    let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value =
-                        symbol_dispatch::load_static(self, &name).map_err(symbol_to_vm_error)?;
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
                 Op::SymbolCall => {
-                    let dst = register_operand(operands.first())?;
-                    let method_idx = const_operand(operands.get(1))?;
-                    let argc = match operands.get(2) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let method = otter_bytecode::method_id::SymbolMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(3 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result =
-                        symbol_dispatch::call(self, method, &args).map_err(symbol_to_vm_error)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                Op::NewCollection => {
-                    let dst = register_operand(operands.first())?;
-                    let kind_idx = const_operand(operands.get(1))?;
-                    let iter_reg = register_operand(operands.get(2))?;
-                    let kind = context
-                        .string_constant_str(kind_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let seed = read_register(frame, iter_reg)?.clone();
-                    let value = build_collection(&kind, &seed, &mut self.gc_heap)?;
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::NewWeakRef => {
-                    let dst = register_operand(operands.first())?;
-                    let target_reg = register_operand(operands.get(1))?;
-                    let target = read_register(frame, target_reg)?.clone();
-                    let weak_ref = crate::weak_refs::alloc_weak_ref(&mut self.gc_heap, &target)?;
-                    write_register(frame, dst, Value::WeakRef(weak_ref))?;
-                    frame.pc += 1;
-                }
-                Op::NewFinalizationRegistry => {
-                    let dst = register_operand(operands.first())?;
-                    let callback_reg = register_operand(operands.get(1))?;
-                    let callback = read_register(frame, callback_reg)?.clone();
-                    let registry = crate::weak_refs::alloc_finalization_registry_with_context(
-                        &mut self.gc_heap,
-                        callback,
-                        Some(context.clone()),
-                    )?;
-                    write_register(frame, dst, Value::FinalizationRegistry(registry))?;
-                    frame.pc += 1;
+                    self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 Op::TemporalCall => {
-                    let dst = register_operand(operands.first())?;
-                    let class_idx = const_operand(operands.get(1))?;
-                    let method_idx = const_operand(operands.get(2))?;
-                    let argc = match operands.get(3) {
-                        Some(&Operand::ConstIndex(n)) => n as usize,
-                        _ => return Err(VmError::InvalidOperand),
-                    };
-                    let class = otter_bytecode::method_id::TemporalClassId::from_u32(class_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let method = otter_bytecode::method_id::TemporalMethod::from_u32(method_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-                    for i in 0..argc {
-                        let r = register_operand(operands.get(4 + i))?;
-                        args.push(read_register(frame, r)?.clone());
-                    }
-                    let result = temporal::call_static(
-                        &self.string_heap,
-                        &self.gc_heap,
-                        class,
-                        method,
-                        &args,
-                    )
-                    .map_err(temporal_to_vm_error)?;
-                    write_register(frame, dst, result)?;
-                    frame.pc += 1;
-                }
-                Op::TemporalLoad => {
-                    let dst = register_operand(operands.first())?;
-                    let name_idx = const_operand(operands.get(1))?;
-                    let name = context
-                        .string_constant_str(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let value = temporal::load_static(&name).map_err(temporal_to_vm_error)?;
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
-                }
-                Op::NewIntl => {
-                    let dst = register_operand(operands.first())?;
-                    let class_idx = const_operand(operands.get(1))?;
-                    let locale_reg = register_operand(operands.get(2))?;
-                    let options_reg = register_operand(operands.get(3))?;
-                    let class = context
-                        .string_constant_str(class_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let locale = read_register(frame, locale_reg)?.clone();
-                    let options = read_register(frame, options_reg)?.clone();
-                    let value = intl::construct(&class, &locale, &options, &self.gc_heap)
-                        .map_err(intl_to_vm_error)?;
-                    write_register(frame, dst, value)?;
-                    frame.pc += 1;
+                    self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 Op::ToPrimitive => {
                     // Stack-modifying ladder dispatched in the
@@ -7005,405 +6228,6 @@ impl Interpreter {
         // Caller's pc was set to the next instruction at call time;
         // nothing to advance here.
         Ok(None)
-    }
-
-    fn drive_bind_function(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let top_idx = stack.len() - 1;
-        let pc = stack[top_idx].pc;
-        let pending = stack[top_idx]
-            .pending_bind_function
-            .as_ref()
-            .filter(|state| state.pc == pc && state.dst == dst)
-            .cloned();
-        if let Some(state) = pending {
-            let produced = read_register(&stack[top_idx], dst)?.clone();
-            return match state.stage {
-                PendingBindStage::Name => self.continue_bind_function_after_name(
-                    stack,
-                    context,
-                    dst,
-                    state.target,
-                    state.bound_this,
-                    state.bound_args,
-                    produced,
-                ),
-                PendingBindStage::Length => {
-                    let target_name = state.target_name.ok_or(VmError::InvalidOperand)?;
-                    stack[top_idx].pending_bind_function = None;
-                    self.finish_bind_function(
-                        stack,
-                        dst,
-                        state.target,
-                        state.bound_this,
-                        state.bound_args,
-                        target_name,
-                        produced,
-                    )
-                }
-            };
-        }
-
-        let callee_reg = register_operand(operands.get(1))?;
-        let this_reg = register_operand(operands.get(2))?;
-        let argc = match operands.get(3) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
-        };
-        let target = read_register(&stack[top_idx], callee_reg)?.clone();
-        if !self.is_callable_runtime(&target) {
-            return Err(VmError::NotCallable);
-        }
-        let bound_this = read_register(&stack[top_idx], this_reg)?.clone();
-        let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
-        for i in 0..argc {
-            let r = register_operand(operands.get(4 + i))?;
-            bound_args.push(read_register(&stack[top_idx], r)?.clone());
-        }
-        match self.callable_bind_metadata_get(context, &target, "name")? {
-            BindMetadataGet::Value(target_name) => self.continue_bind_function_after_name(
-                stack,
-                context,
-                dst,
-                target,
-                bound_this,
-                bound_args,
-                target_name,
-            ),
-            BindMetadataGet::Getter(getter) => {
-                stack[top_idx].pending_bind_function = Some(PendingBindFunction {
-                    pc,
-                    dst,
-                    target: target.clone(),
-                    bound_this,
-                    bound_args,
-                    stage: PendingBindStage::Name,
-                    target_name: None,
-                });
-                self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
-            }
-        }
-    }
-
-    fn continue_bind_function_after_name(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        dst: u16,
-        target: Value,
-        bound_this: Value,
-        bound_args: SmallVec<[Value; 4]>,
-        target_name: Value,
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        let pc = stack[top_idx].pc;
-        match self.callable_bind_metadata_get(context, &target, "length")? {
-            BindMetadataGet::Value(target_length) => {
-                stack[top_idx].pending_bind_function = None;
-                self.finish_bind_function(
-                    stack,
-                    dst,
-                    target,
-                    bound_this,
-                    bound_args,
-                    target_name,
-                    target_length,
-                )
-            }
-            BindMetadataGet::Getter(getter) => {
-                stack[top_idx].pending_bind_function = Some(PendingBindFunction {
-                    pc,
-                    dst,
-                    target: target.clone(),
-                    bound_this,
-                    bound_args,
-                    stage: PendingBindStage::Length,
-                    target_name: Some(target_name),
-                });
-                self.invoke(stack, context, &getter, target, SmallVec::new(), dst)
-            }
-        }
-    }
-
-    fn finish_bind_function(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        dst: u16,
-        target: Value,
-        bound_this: Value,
-        bound_args: SmallVec<[Value; 4]>,
-        target_name: Value,
-        target_length: Value,
-    ) -> Result<(), VmError> {
-        let metadata = function_metadata::bound_create_metadata_from_values(
-            &target_name,
-            &target_length,
-            bound_args.len(),
-        );
-        let bound = BoundFunction::new_with_metadata(
-            &mut self.gc_heap,
-            target,
-            bound_this,
-            bound_args,
-            metadata,
-        )?;
-        let top_idx = stack.len() - 1;
-        stack[top_idx].pending_bind_function = None;
-        write_register(&mut stack[top_idx], dst, Value::BoundFunction(bound))?;
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        Ok(())
-    }
-
-    /// Handle `Op::Call`: push a new frame for the callee with
-    /// arguments copied into the parameter slots and `this` bound
-    /// to `Value::Undefined` (foundation strict default).
-    fn do_call(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let argc = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n,
-            _ => return Err(VmError::InvalidOperand),
-        };
-
-        let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
-        for i in 0..argc as usize {
-            let r = register_operand(operands.get(3 + i))?;
-            args.push(read_register(&stack[top_idx], r)?.clone());
-        }
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, context, &callee, Value::Undefined, args, dst)
-    }
-
-    /// Invoke `callee` with the explicit receiver `this_value` and
-    /// the given argument list. Centralizes the BoundFunction
-    /// unwrapping, closure `bound_this` override, and frame push so
-    /// every call opcode (`Op::Call`, `Op::CallWithThis`,
-    /// `Op::CallMethodValue`) shares one path.
-    ///
-    /// `dst` is the **caller's** register that should receive the
-    /// completion value when the callee returns. `caller_pc` must
-    /// already be advanced before this call so the post-pop
-    /// dispatch resumes after the originating instruction.
-    fn invoke(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        callee: &Value,
-        this_value: Value,
-        args: SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        // Walk through any number of `bind` layers, accumulating
-        // their bound arguments and overriding `this_value` with
-        // the innermost `bound_this`. The loop bound matches the
-        // JS-call stack-depth limit so a pathological self-bound
-        // chain still surfaces as `StackOverflow` rather than
-        // unbounded recursion.
-        let mut current = callee.clone();
-        let mut effective_this = this_value;
-        let mut effective_args = args;
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            match current {
-                Value::BoundFunction(bound) => {
-                    hops += 1;
-                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                    let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                    combined.extend(bound_args);
-                    combined.extend(effective_args);
-                    effective_this = bound_this;
-                    effective_args = combined;
-                    current = target;
-                }
-                Value::ClassConstructor(cc) => {
-                    hops += 1;
-                    current = cc.ctor(&self.gc_heap).clone();
-                }
-                _ => break,
-            }
-        }
-        // Native callables short-circuit the frame push: invoke
-        // the closure inline, write the result into the caller's
-        // dst, and advance pc on the caller frame. No stack frame
-        // is created — the closure cannot itself push frames.
-        if let Value::Object(obj) = &current
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::call_native(*obj, &self.gc_heap)
-        {
-            let call = native.call_target(&self.gc_heap);
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(());
-        }
-        if let Value::NativeFunction(native) = &current {
-            let call = native.call_target(&self.gc_heap);
-            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                let result =
-                    self.run_vm_intrinsic_sync(context, intrinsic, effective_this, effective_args)?;
-                let top_idx = stack.len() - 1;
-                write_register(&mut stack[top_idx], dst, result)?;
-                return Ok(());
-            }
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(());
-        }
-        // §28.2.4.13 Proxy.[[Call]] — delegate to the `apply`
-        // trap when present; otherwise call through to the
-        // target as a function.
-        if let Value::Proxy(p) = &current {
-            let proxy = p.clone();
-            let argv_array =
-                crate::array::from_elements(&mut self.gc_heap, effective_args.iter().cloned())?;
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(),
-                effective_this.clone(),
-                Value::Array(argv_array),
-            ];
-            let result = match self.invoke_proxy_trap(context, &proxy, "apply", trap_args)? {
-                Some(v) => v,
-                None => {
-                    // Fall through to the target's [[Call]] —
-                    // `proxy.target()` returns the original Value,
-                    // which may be a callable directly.
-                    let underlying = proxy.target();
-                    self.run_callable_sync(context, &underlying, effective_this, effective_args)?
-                }
-            };
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(());
-        }
-        let (function_id, parent_upvalues, this_for_callee) = match current {
-            Value::Function { function_id } => {
-                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
-            }
-            Value::Closure {
-                function_id,
-                upvalues,
-                bound_this,
-            } => {
-                let this_value = match bound_this {
-                    Some(t) => *t,
-                    None => effective_this,
-                };
-                (function_id, upvalues, this_value)
-            }
-            _ => return Err(VmError::NotCallable),
-        };
-
-        if stack.len() as u32 >= self.max_stack_depth {
-            return Err(VmError::StackOverflow {
-                limit: self.max_stack_depth,
-            });
-        }
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        // Async-call entry path (spec §27.7.5.1): synthesise a
-        // fresh pending result promise, write it into the caller's
-        // `dst` register *now* so the call expression's value is
-        // visible synchronously, and park the new frame with
-        // `return_register = None` so its eventual completion
-        // settles the promise instead of writing back.
-        let (return_register, async_state) = if function.is_async {
-            let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending(&mut self.gc_heap)?;
-            let promise_value = Value::Promise(result_promise);
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, promise_value)?;
-            (None, Some(AsyncFrameState { result_promise }))
-        } else {
-            (Some(dst), None)
-        };
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
-        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            return_register,
-            upvalues,
-            this_for_callee,
-        );
-        new_frame.async_state = async_state;
-        // Bind parameters: extra args are dropped, missing args
-        // stay `Value::Undefined` (matches JS semantics).
-        let bind_count = (function.param_count as usize).min(effective_args.len());
-        let total_args = effective_args.len();
-        // Snapshot the full argv when the callee body references
-        // `arguments`. Cloning is cheap because effective_args is a
-        // SmallVec; the snapshot is consumed exactly once by
-        // `Op::CollectArguments`.
-        if function.needs_arguments {
-            new_frame.incoming_args = effective_args.iter().cloned().collect();
-        }
-        let mut iter = effective_args.into_iter();
-        for i in 0..bind_count {
-            let value = iter.next().expect("bind_count <= len");
-            let slot = new_frame
-                .registers
-                .get_mut(i)
-                .ok_or(VmError::InvalidOperand)?;
-            *slot = value;
-        }
-        // Stash the trailing args for `Op::CollectRest`. Only the
-        // rest-aware callees pay the allocation; everyone else
-        // leaves `rest_args` empty as initialised.
-        if function.has_rest && total_args > function.param_count as usize {
-            new_frame.rest_args = iter.collect();
-        }
-        // §27.5 Generator-call entry: instead of pushing the frame
-        // onto the dispatch stack, hand the caller a paused
-        // [`Value::Generator`] handle that owns the prepared frame.
-        // The body only runs when `.next()` resumes it.
-        if function.is_generator {
-            new_frame.return_register = None;
-            let async_gen = function.is_async_generator;
-            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, new_frame)?;
-            gen_handle.set_async(&mut self.gc_heap, async_gen);
-            // Backlink the generator into the frame so `Op::Yield`
-            // can find its owner once execution starts.
-            gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
-            return Ok(());
-        }
-        stack.push(new_frame);
-        Ok(())
     }
 
     /// Handle [`otter_bytecode::Op::Await`]: park the current
@@ -7775,1752 +6599,6 @@ impl Interpreter {
             frame.pc = finally_pc;
             frame.pending_throw = Some(payload);
             return Ok(());
-        }
-    }
-
-    /// Handle `Op::New`: allocate a fresh receiver, set its
-    /// `[[Prototype]]` to `callee.prototype` (when present), and
-    /// invoke the callee with `this = receiver`. The caller's `dst`
-    /// register receives either the constructor's returned object
-    /// or the freshly allocated receiver — `pop_frame` performs
-    /// that swap so the unwind path is uniform across call shapes.
-    fn do_construct(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let argc = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n,
-            _ => return Err(VmError::InvalidOperand),
-        };
-        let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
-            return Err(VmError::NotCallable);
-        }
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
-        for i in 0..argc as usize {
-            let r = register_operand(operands.get(3 + i))?;
-            args.push(read_register(&stack[top_idx], r)?.clone());
-        }
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        self.dispatch_construct(stack, context, callee, args, dst)
-    }
-
-    fn do_construct_spread(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let args_reg = register_operand(operands.get(2))?;
-        let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
-            return Err(VmError::NotCallable);
-        }
-        let args_value = read_register(&stack[top_idx], args_reg)?.clone();
-        let arr = match args_value {
-            Value::Array(a) => a,
-            _ => return Err(VmError::TypeMismatch),
-        };
-        let args: SmallVec<[Value; 8]> =
-            crate::array::with_elements(arr, &self.gc_heap, |elements| {
-                elements.iter().cloned().collect()
-            });
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        self.dispatch_construct(stack, context, callee, args, dst)
-    }
-
-    fn dispatch_construct(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        callee: Value,
-        args: SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let mut callee = callee;
-        let mut new_target = callee.clone();
-        let mut args = args;
-        let mut hops: u32 = 0;
-        while let Value::BoundFunction(bound) = &callee {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            hops += 1;
-            let (target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
-            let mut combined: SmallVec<[Value; 8]> =
-                SmallVec::with_capacity(bound_args.len() + args.len());
-            combined.extend(bound_args);
-            combined.extend(args);
-            if abstract_ops::same_value(&callee, &new_target) {
-                new_target = target.clone();
-            }
-            callee = target;
-            args = combined;
-        }
-        // §28.2.4.14 Proxy.[[Construct]] — `new <proxy>(args)`
-        // routes through the `construct` trap when present;
-        // otherwise delegates to the target.
-        if let Value::Proxy(p) = &callee {
-            let proxy = p.clone();
-            let argv_array = crate::array::from_elements(&mut self.gc_heap, args.iter().cloned())?;
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(),
-                Value::Array(argv_array),
-                Value::Proxy(proxy.clone()),
-            ];
-            let result = match self.invoke_proxy_trap(context, &proxy, "construct", trap_args)? {
-                Some(v) => {
-                    // §10.5.13 step 9 — trap result must be an Object;
-                    // primitive returns surface as TypeError.
-                    if !constructor_return_is_object(&v) {
-                        return Err(VmError::TypeError {
-                            message: "Proxy construct trap returned non-object".to_string(),
-                        });
-                    }
-                    v
-                }
-                None => {
-                    // Fall through to [[Construct]] on the underlying
-                    // target via `run_construct_sync`, which honours
-                    // bound/proxy/native paths and re-checks the
-                    // constructor-return invariants.
-                    self.run_construct_sync(context, &proxy.target(), callee.clone(), args)?
-                }
-            };
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, result)?;
-            return Ok(());
-        }
-        // Allocate receiver and link its prototype before pushing
-        // the new frame. The constructor might mutate the receiver
-        // immediately, so the prototype link must already be in
-        // place.
-        let proto = self.construct_prototype_for_callee(context, &new_target)?;
-        let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
-        if let Some(proto) = proto {
-            crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-        }
-        let this_value = Value::Object(receiver);
-        // Built-in constructor objects (`Number`, `Boolean`, …)
-        // surface as a `Value::Object` with an internal native
-        // constructor slot. Promote to the native-function construct
-        // path so the JS-visible callee can also carry own
-        // properties (statics + `prototype`) without leaking the
-        // implementation slot through reflection.
-        if let Value::Object(obj) = &callee
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::constructor_native(*obj, &self.gc_heap)
-        {
-            let argv: Vec<Value> = args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let constructed = if constructor_return_is_object(&result) {
-                // Spec §10.1.13 step 5 — non-undefined "object-like"
-                // returns are honoured. Builtin constructors such as
-                // `Array` produce a `Value::Array` (still an object
-                // per ECMA-262), so the foundation also forwards it.
-                result
-            } else {
-                this_value
-            };
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, constructed)?;
-            return Ok(());
-        }
-        // `Value::NativeFunction` carries `[[Construct]]` whenever
-        // the runtime needs the callable to behave as a constructor
-        // (e.g. `new Number(x)`). The native callback inspects
-        // `NativeCtx::is_construct_call()` to differentiate the
-        // call shape.
-        if let Value::NativeFunction(native) = &callee {
-            let argv: Vec<Value> = args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let constructed = if constructor_return_is_object(&result) {
-                // Spec §10.1.13 step 5 — non-undefined "object-like"
-                // returns are honoured. Builtin constructors such as
-                // `Array` produce a `Value::Array` (still an object
-                // per ECMA-262), so the foundation also forwards it.
-                result
-            } else {
-                this_value
-            };
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, constructed)?;
-            return Ok(());
-        }
-        if let Value::ClassConstructor(class) = &callee
-            && let Value::NativeFunction(native) = &class.ctor(&self.gc_heap)
-        {
-            let argv: Vec<Value> = args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let constructed = if constructor_return_is_object(&result) {
-                // Spec §10.1.13 step 5 — non-undefined "object-like"
-                // returns are honoured. Builtin constructors such as
-                // `Array` produce a `Value::Array` (still an object
-                // per ECMA-262), so the foundation also forwards it.
-                result
-            } else {
-                this_value
-            };
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, constructed)?;
-            return Ok(());
-        }
-        self.invoke(stack, context, &callee, this_value, args, dst)?;
-        // The pushed frame is now on top; mark it so `pop_frame`
-        // can substitute the receiver for any non-object return.
-        if let Some(top) = stack.last_mut() {
-            top.construct_target = Some(receiver);
-            top.new_target = Some(new_target);
-        }
-        Ok(())
-    }
-
-    fn construct_prototype_for_callee(
-        &mut self,
-        context: &ExecutionContext,
-        callee: &Value,
-    ) -> Result<Option<Value>, VmError> {
-        match callee {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                match self.function_property_get(context, *function_id, "prototype")? {
-                    proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
-                    _ => Ok(None),
-                }
-            }
-            Value::ClassConstructor(c) => Ok(Some(Value::Object(c.prototype(&self.gc_heap)))),
-            Value::Object(obj) => Ok(match crate::object::get(*obj, &self.gc_heap, "prototype") {
-                Some(proto) if constructor_return_is_object(&proto) => Some(proto),
-                _ => None,
-            }),
-            Value::BoundFunction(b) => {
-                let (target, _, _) = b.parts(&self.gc_heap);
-                self.construct_prototype_for_callee(context, &target)
-            }
-            Value::NativeFunction(_) => Ok(None),
-            _ => Ok(None),
-        }
-    }
-
-    /// Handle `Op::CallSpread`: read the args array, fan it out
-    /// into the standard call path. The receiver register holds
-    /// the explicit `this` value (foundation lowers free spread
-    /// calls with `this = undefined`).
-    fn do_call_spread(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let this_reg = register_operand(operands.get(2))?;
-        let args_reg = register_operand(operands.get(3))?;
-        let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        let this_value = read_register(&stack[top_idx], this_reg)?.clone();
-        let args_array = match read_register(&stack[top_idx], args_reg)? {
-            Value::Array(a) => *a,
-            _ => return Err(VmError::TypeMismatch),
-        };
-        let args: SmallVec<[Value; 8]> =
-            crate::array::with_elements(args_array, &self.gc_heap, |elements| {
-                elements.iter().cloned().collect()
-            });
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, context, &callee, this_value, args, dst)
-    }
-
-    /// Handle `Op::CallWithThis`: same as `do_call` but the call
-    /// site supplies an explicit `this` register. Used by
-    /// `Function.prototype.call` lowering and the array-literal
-    /// path of `Function.prototype.apply`.
-    fn do_call_with_this(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let callee_reg = register_operand(operands.get(1))?;
-        let this_reg = register_operand(operands.get(2))?;
-        let argc = match operands.get(3) {
-            Some(&Operand::ConstIndex(n)) => n,
-            _ => return Err(VmError::InvalidOperand),
-        };
-        let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        let this_value = read_register(&stack[top_idx], this_reg)?.clone();
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
-        for i in 0..argc as usize {
-            let r = register_operand(operands.get(4 + i))?;
-            args.push(read_register(&stack[top_idx], r)?.clone());
-        }
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, context, &callee, this_value, args, dst)
-    }
-
-    /// Handle `Op::CallMethodValue`: the universal method-call op.
-    /// Branches by receiver kind:
-    /// - `String` / `Array` — synchronous intrinsic-table dispatch.
-    ///   Result lands in the destination register without pushing
-    ///   a frame.
-    /// - `Object` — load the property; raise `NotCallable` if the
-    ///   resolved value is not a function; otherwise call it with
-    ///   `this = receiver`.
-    /// - `Function` / `Closure` / `BoundFunction` — only the
-    ///   `call`, `apply`, and `bind` shapes are recognised; anything
-    ///   else surfaces as `UnknownIntrinsic`.
-    fn do_call_method_value(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let dst = register_operand(operands.first())?;
-        let recv_reg = register_operand(operands.get(1))?;
-        let name_idx = const_operand(operands.get(2))?;
-        let argc = match operands.get(3) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
-        };
-        let name = context
-            .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let top_idx = stack.len() - 1;
-        let recv_value = read_register(&stack[top_idx], recv_reg)?.clone();
-        let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
-        for i in 0..argc {
-            let r = register_operand(operands.get(4 + i))?;
-            arg_values.push(read_register(&stack[top_idx], r)?.clone());
-        }
-
-        // Promise.prototype dispatches separately because it
-        // needs `&mut self` to enqueue microtasks.
-        if let Value::Promise(p) = &recv_value {
-            let promise = *p;
-            let argv: Vec<Value> = arg_values.iter().cloned().collect();
-            let result = promise_dispatch::prototype_call(
-                self,
-                Some(context.clone()),
-                &promise,
-                &name,
-                &argv,
-            )
-            .map_err(native_to_vm_error)?;
-            let top_idx = stack.len() - 1;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            return Ok(());
-        }
-
-        // `forEach` on a collection requires a callback dispatch
-        // that pushes a frame; lives outside the static intrinsic
-        // table so it can drive `self.invoke`.
-        if name == "forEach" && matches!(&recv_value, Value::Map(_) | Value::Set(_)) {
-            return self.do_collection_for_each(stack, context, &recv_value, &arg_values, dst);
-        }
-
-        // Iterator-helpers proposal — when receiver is an iterator
-        // value, route through the dedicated dispatcher that builds
-        // lazy wrappers / drains for terminals.
-        // <https://tc39.es/proposal-iterator-helpers/>
-        if let Value::Iterator(rc) = &recv_value {
-            let iter_rc = *rc;
-            if self.iterator_helper_dispatch(stack, context, &iter_rc, &name, &arg_values, dst)? {
-                return Ok(());
-            }
-        }
-
-        // §27.5.3 Generator.prototype methods — `.next` / `.return`
-        // / `.throw`. The receiver carries the suspended frame; the
-        // resume helper drives a sub-dispatch until the next Yield
-        // or completion.
-        // <https://tc39.es/ecma262/#sec-generator-objects>
-        if let Value::Generator(g) = &recv_value {
-            let kind = match name {
-                "next" => Some(GeneratorResumeKind::Next(
-                    arg_values.first().cloned().unwrap_or(Value::Undefined),
-                )),
-                "return" => Some(GeneratorResumeKind::Return(
-                    arg_values.first().cloned().unwrap_or(Value::Undefined),
-                )),
-                "throw" => Some(GeneratorResumeKind::Throw(
-                    arg_values.first().cloned().unwrap_or(Value::Undefined),
-                )),
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                let g = *g;
-                let is_async_gen = g.is_async(&self.gc_heap);
-                if is_async_gen {
-                    // §27.6.3 — async-generator method calls always
-                    // return a Promise. Allocate the outer
-                    // capability up front and stash it on
-                    // `pending_request` so `Op::Yield` /
-                    // `resume_generator` / the await-resume native
-                    // can settle it from inside the dispatch loop.
-                    let cap = promise_dispatch::make_capability_with_context(
-                        &mut self.gc_heap,
-                        context.clone(),
-                    )?;
-                    let promise = cap.promise.clone();
-                    g.set_pending_request(&mut self.gc_heap, cap.clone());
-                    let outcome = self.resume_generator(context, &g, kind);
-                    match outcome {
-                        Ok(_) => {
-                            // resume_generator drained the request
-                            // — either by Op::Yield, by completion,
-                            // or it left the request pending while
-                            // an `Op::Await` parked the body. In
-                            // any case, the outer promise is the
-                            // user-visible handle.
-                        }
-                        Err(err) => {
-                            if let Some(thrown) = self.pending_generator_throw.take() {
-                                if let Some(req) = g.take_pending_request(&mut self.gc_heap) {
-                                    let request_context =
-                                        req.context.clone().unwrap_or_else(|| context.clone());
-                                    self.run_callable_sync(
-                                        &request_context,
-                                        &req.reject,
-                                        Value::Undefined,
-                                        smallvec::smallvec![thrown],
-                                    )?;
-                                }
-                            } else {
-                                g.clear_pending_request(&mut self.gc_heap);
-                                return Err(err);
-                            }
-                        }
-                    }
-                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, promise)?;
-                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    return Ok(());
-                }
-                match self.resume_generator(context, &g, kind) {
-                    Ok(result) => {
-                        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                        write_register(frame, dst, result)?;
-                        frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        // If the generator body unwound an
-                        // uncaught throw, re-raise the *original*
-                        // value on the caller's frame stack so a
-                        // surrounding `try { gen.throw(x) } catch`
-                        // observes the right payload.
-                        if let Some(thrown) = self.pending_generator_throw.take() {
-                            self.unwind_throw(stack, thrown)?;
-                            return Ok(());
-                        }
-                        return Err(err);
-                    }
-                }
-            }
-        }
-
-        // §23.1.3 callback-driven Array.prototype methods. The
-        // intrinsic table can't drive callbacks, so the foundation
-        // dispatches them here via `run_callable_sync`. Each method
-        // matches its ECMA-262 algorithm with sloppy edge handling
-        // (sparse holes, throwing comparators, length mutation
-        // mid-walk) deferred to follow-ups.
-        if let Value::Array(arr) = &recv_value
-            && matches!(
-                name,
-                "forEach"
-                    | "map"
-                    | "filter"
-                    | "reduce"
-                    | "reduceRight"
-                    | "find"
-                    | "findIndex"
-                    | "every"
-                    | "some"
-                    | "flatMap"
-                    | "sort"
-            )
-            && self.array_callback_dispatch(stack, context, arr, &name, &arg_values, dst)?
-        {
-            return Ok(());
-        }
-        // Primitive prototypes go through the intrinsic table —
-        // synchronous, no frame push, advance pc and write directly.
-        let intrinsic = match &recv_value {
-            Value::String(_) => string_prototype::lookup(&name),
-            Value::Array(_) => array_prototype::lookup(&name),
-            Value::Number(_) => number::prototype_lookup(&name),
-            Value::Boolean(_) => boolean_prototype::lookup(&name),
-            Value::BigInt(_) => bigint::prototype::lookup(&name),
-            Value::Date(_) => date::prototype::lookup(&name),
-            Value::RegExp(_) => regexp_prototype::lookup(&name),
-            Value::Symbol(_) => symbol_prototype::lookup(&name),
-            Value::Map(_) => collections_prototype::lookup_map(&name),
-            Value::Set(_) => collections_prototype::lookup_set(&name),
-            Value::WeakMap(_) => collections_prototype::lookup_weak_map(&name),
-            Value::WeakSet(_) => collections_prototype::lookup_weak_set(&name),
-            Value::WeakRef(_) => weak_refs::lookup_weak_ref(&name),
-            Value::FinalizationRegistry(_) => weak_refs::lookup_finalization_registry(&name),
-            Value::Temporal(_) => temporal::lookup_prototype(&recv_value, &name),
-            Value::Intl(_) => intl::lookup_prototype(&recv_value, &name),
-            Value::ArrayBuffer(_) => binary::array_buffer_prototype::lookup(&name),
-            Value::DataView(_) => binary::data_view_prototype::lookup(&name),
-            Value::TypedArray(_) => binary::typed_array_prototype::lookup(&name),
-            _ => None,
-        };
-        if let Some(entry) = intrinsic {
-            let small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
-            let result = {
-                let string_heap = self.string_heap.clone();
-                let gc_heap = std::cell::RefCell::new(&mut self.gc_heap);
-                (entry.impl_fn)(&IntrinsicArgs {
-                    receiver: &recv_value,
-                    args: &small_args,
-                    string_heap: &string_heap,
-                    gc_heap,
-                })
-                .map_err(intrinsic_to_vm_error)?
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            return Ok(());
-        }
-
-        // §20.1.3 Object.prototype methods that ordinary objects
-        // inherit. Foundation has no installed Object.prototype yet,
-        // so the runtime intercepts the canonical names directly when
-        // the receiver is an ordinary `JsObject`. Once the prototype
-        // tree is real (task 61 follow-up) these route through the
-        // standard property lookup below.
-        // <https://tc39.es/ecma262/#sec-properties-of-the-object-prototype-object>
-        if let Value::Object(obj) = &recv_value {
-            // Only intercept when the user hasn't overridden the
-            // method via an own / inherited data property. This
-            // keeps `Object.create({hasOwnProperty: () => 'shadow'})`
-            // observable.
-            if matches!(
-                crate::object::lookup(*obj, &self.gc_heap, &name),
-                crate::object::PropertyLookup::Absent
-            ) && let Some(result) = object_prototype_intercept(
-                obj,
-                &name,
-                &arg_values,
-                &self.string_heap,
-                &self.gc_heap,
-                self.function_prototype_object().ok(),
-            )? {
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, result)?;
-                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                return Ok(());
-            }
-        }
-        // Functions / closures inherit Object.prototype-style
-        // methods. Foundation routes the call through the user-
-        // properties bag attached to the compiled function.
-        if let Value::Function { function_id } | Value::Closure { function_id, .. } = &recv_value
-            && matches!(
-                name,
-                "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
-            )
-        {
-            let result = match name {
-                "hasOwnProperty" => {
-                    let key = property_key_from_arg(arg_values.first())?;
-                    self.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        *function_id,
-                        &key,
-                    )?
-                    .is_some()
-                }
-                "propertyIsEnumerable" => {
-                    let key = property_key_from_arg(arg_values.first())?;
-                    self.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        *function_id,
-                        &key,
-                    )?
-                    .is_some_and(|desc| desc.enumerable())
-                }
-                "isPrototypeOf" => false,
-                _ => unreachable!("guarded by method-name match"),
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::Boolean(result))?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            return Ok(());
-        }
-        if let Value::NativeFunction(native) = &recv_value
-            && let Some(result) = native_function_object_prototype_intercept(
-                native,
-                &name,
-                &arg_values,
-                &self.gc_heap,
-                &self.string_heap,
-            )?
-        {
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            return Ok(());
-        }
-        if let Value::BoundFunction(bound) = &recv_value
-            && let Some(result) =
-                bound_function_object_prototype_intercept(bound, &name, &arg_values, &self.gc_heap)?
-        {
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            return Ok(());
-        }
-
-        // §20.2.3 Function.prototype canonical methods —
-        // `call` / `apply` / `bind` / `toString`. They are
-        // unconditionally available on any callable, even when the
-        // receiver is a ClassConstructor whose statics object
-        // hasn't installed them. The intercept runs before the
-        // property-lookup so user-installed shadows take precedence
-        // only when the receiver is a plain Object. Callable
-        // receivers go straight here.
-        // <https://tc39.es/ecma262/#sec-properties-of-the-function-prototype-object>
-        if matches!(name, "call" | "apply" | "bind" | "toString")
-            && self.is_callable_runtime(&recv_value)
-        {
-            return self.dispatch_function_method(
-                stack,
-                context,
-                &recv_value,
-                &name,
-                arg_values,
-                dst,
-            );
-        }
-
-        // Property-bearing receivers — load the property first.
-        // For class constructors, `prototype` resolves to the
-        // instance prototype object (mirroring `Op::LoadProperty`'s
-        // class shape) and other names walk the static side. Only
-        // when the property lookup hands back a callable do we
-        // dispatch with `this = recv`; missing or non-callable
-        // properties surface as `NotCallable` so callers see the
-        // same error as `obj.notFn()`.
-        let lookup_via_property = match &recv_value {
-            Value::Object(_) | Value::Proxy(_) => {
-                let key = VmPropertyKey::String(name.to_string());
-                match self.ordinary_get_value(
-                    context,
-                    recv_value.clone(),
-                    recv_value.clone(),
-                    &key,
-                    0,
-                )? {
-                    VmGetOutcome::Value(value) => Some(value),
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        Some(self.run_callable_sync(context, &getter, recv_value.clone(), args)?)
-                    }
-                }
-            }
-            Value::ClassConstructor(c) => Some(if name == "prototype" {
-                Value::Object(c.prototype(&self.gc_heap))
-            } else {
-                crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, &name)
-                    .unwrap_or(Value::Undefined)
-            }),
-            // §10.1.8 OrdinaryGet on a callable receiver — user
-            // properties (e.g. `assert.sameValue = function(){}`)
-            // resolve via the function-properties side table; the
-            // fallback to `Function.prototype.{call,apply,bind}`
-            // happens below if we hand back `Undefined`.
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                let fid = *function_id;
-                Some(self.function_property_get(context, fid, &name)?)
-            }
-            // Native callable receiver (e.g. global `Promise` /
-            // `Map` constructors). Look up `name` on the function
-            // object's own-property table so `Promise.all(...)`,
-            // `Map.groupBy(...)`, etc. dispatch through ordinary
-            // method invocation.
-            Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, &name)? {
-                    Some(desc) => Some(descriptor_value(&desc)),
-                    None => None,
-                }
-            }
-            _ => None,
-        };
-        if let Some(method) = lookup_via_property {
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].pc = stack[top_idx]
-                .pc
-                .checked_add(1)
-                .ok_or(VmError::InvalidOperand)?;
-            return self.invoke(stack, context, &method, recv_value.clone(), arg_values, dst);
-        }
-
-        // `Function.prototype.{call, apply, bind, toString}` on a
-        // callable receiver that doesn't expose the method as a
-        // property — fallback path.
-        if matches!(name, "call" | "apply" | "bind" | "toString")
-            && self.is_callable_runtime(&recv_value)
-        {
-            return self.dispatch_function_method(
-                stack,
-                context,
-                &recv_value,
-                &name,
-                arg_values,
-                dst,
-            );
-        }
-
-        Err(VmError::UnknownIntrinsic {
-            name: name.to_string(),
-        })
-    }
-
-    /// Dispatch `call` / `apply` / `bind` on a callable receiver.
-    /// Foundation handles only the literal-array shape of `apply`
-    /// — non-array second arguments raise `TypeMismatch` so callers
-    /// learn quickly that the foundation slice rejects dynamic
-    /// argument arrays.
-    /// Drive `Map.prototype.forEach` / `Set.prototype.forEach` —
-    /// invoke the callback on each entry in insertion order.
-    ///
-    /// # Algorithm
-    /// 1. Snapshot the entry list at call time (matches Spec
-    ///    §24.1.3.5 / §24.2.3.6 — observable mutation during the
-    ///    walk is captured by re-reading the live receiver, but the
-    ///    snapshot still gates `index < snapshot.len()`).
-    /// 2. For each entry, enqueue an inline call: every callback is
-    ///    invoked synchronously through `self.invoke`. Because each
-    ///    invoke pushes a frame and returns through the dispatch
-    ///    loop, the foundation chains them by stashing the iteration
-    ///    state in a tiny native closure that re-enters this helper.
-    /// 3. Foundation simplification: rather than a re-entrant
-    ///    chain, walk the snapshot here and synchronously invoke
-    ///    each callback via a fresh dispatch_loop run on a new
-    ///    stack. This matches the synchronous-callback model the
-    ///    rest of the foundation already uses (see
-    ///    [`Interpreter::run_callable_sync`]).
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-map.prototype.foreach>
-    /// - <https://tc39.es/ecma262/#sec-set.prototype.foreach>
-    fn do_collection_for_each(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        recv: &Value,
-        args: &SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let callee = match args.first() {
-            Some(c) if is_callable(c) => c.clone(),
-            _ => return Err(VmError::NotCallable),
-        };
-        let entries: Vec<(Value, Value)> = match recv {
-            Value::Map(m) => crate::collections::map_entries(*m, &self.gc_heap),
-            Value::Set(s) => crate::collections::set_values(*s, &self.gc_heap)
-                .into_iter()
-                .map(|v| (v.clone(), v))
-                .collect(),
-            _ => return Err(VmError::TypeMismatch),
-        };
-        // Advance pc *before* invoking the callbacks so each
-        // callback returns to the next instruction in the caller
-        // frame.
-        let top_idx = stack.len() - 1;
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        // Write `undefined` into the dst slot — `forEach` returns
-        // `undefined` synchronously, even if the callback chain
-        // produces values.
-        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
-        let recv_for_callback = recv.clone();
-        for (key, value) in entries {
-            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-            cb_args.push(value);
-            cb_args.push(key);
-            cb_args.push(recv_for_callback.clone());
-            self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-        }
-        Ok(())
-    }
-
-    /// Dispatch the §23.1.3 callback-driven Array prototype methods.
-    /// Returns `Ok(true)` when the call was handled here (the
-    /// dispatcher should fall through to the post-dispatch return),
-    /// `Ok(false)` when the method is `sort` with no comparator
-    /// (intrinsic-table path takes over).
-    ///
-    /// All callbacks run synchronously through
-    /// [`Self::run_callable_sync`] — the foundation walks the array
-    /// snapshot at call time, matching spec semantics for arrays
-    /// whose length doesn't change mid-iteration.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.foreach>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.map>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.filter>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.reduce>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.find>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.findindex>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.every>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.some>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.flatmap>
-    /// - <https://tc39.es/ecma262/#sec-array.prototype.sort>
-    #[allow(clippy::too_many_arguments)]
-    fn array_callback_dispatch(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        arr: &JsArray,
-        name: &str,
-        args: &SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<bool, VmError> {
-        // `sort` without a comparator falls through to the intrinsic
-        // table's lexicographic path. Comparator-driven sort is
-        // handled here.
-        if name == "sort" && matches!(args.first(), None | Some(Value::Undefined)) {
-            return Ok(false);
-        }
-
-        let arr_value = Value::Array(*arr);
-        // Snapshot the elements so callback-driven mutation of the
-        // receiver does not corrupt iteration. Foundation matches
-        // ECMA-262's "single-pass over indices 0..len" by capturing
-        // length at entry; growing the array inside the callback
-        // does not extend the walk (spec-compliant for `forEach` /
-        // `map` / `filter`).
-        let elements: Vec<Value> =
-            crate::array::with_elements(*arr, &self.gc_heap, |elements| elements.to_vec());
-        let len = elements.len();
-
-        let top_idx = stack.len() - 1;
-        // Advance pc up front so each synchronous callback returns to
-        // the next caller instruction.
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-
-        let result = match name {
-            "forEach" => {
-                let callee = require_callable(args.first())?;
-                for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
-                        continue;
-                    }
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                }
-                Value::Undefined
-            }
-            "map" => {
-                // §23.1.3.21: callback NOT invoked for holes; the
-                // result array preserves holes at the same indices.
-                let callee = require_callable(args.first())?;
-                let mut out: Vec<Value> = Vec::with_capacity(len);
-                for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
-                        out.push(Value::Hole);
-                        continue;
-                    }
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    out.push(self.run_callable_sync(
-                        context,
-                        &callee,
-                        Value::Undefined,
-                        cb_args,
-                    )?);
-                }
-                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
-            }
-            "filter" => {
-                let callee = require_callable(args.first())?;
-                let mut out: Vec<Value> = Vec::new();
-                for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
-                        continue;
-                    }
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let kept =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                    if kept.to_boolean() {
-                        out.push(crate::array::get(*arr, &self.gc_heap, i));
-                    }
-                }
-                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
-            }
-            "reduce" | "reduceRight" => {
-                // §23.1.3.24 / §23.1.3.25: skip holes; if no
-                // initialValue and every slot is a hole, raise
-                // TypeError.
-                let callee = require_callable(args.first())?;
-                let has_init = args.len() >= 2;
-                let initial = if has_init {
-                    args[1].clone()
-                } else {
-                    Value::Undefined
-                };
-                let reverse = name == "reduceRight";
-                let mut acc;
-                let start_idx: i64;
-                let step: i64 = if reverse { -1 } else { 1 };
-                if has_init {
-                    acc = initial;
-                    start_idx = if reverse {
-                        len.saturating_sub(1) as i64
-                    } else {
-                        0
-                    };
-                } else {
-                    let mut seed_idx: Option<usize> = None;
-                    if reverse {
-                        for i in (0..len).rev() {
-                            if !matches!(elements[i], Value::Hole) {
-                                seed_idx = Some(i);
-                                break;
-                            }
-                        }
-                    } else {
-                        for (i, value) in elements.iter().enumerate() {
-                            if !matches!(value, Value::Hole) {
-                                seed_idx = Some(i);
-                                break;
-                            }
-                        }
-                    }
-                    let seed = seed_idx.ok_or(VmError::TypeMismatch)?;
-                    acc = elements[seed].clone();
-                    start_idx = seed as i64 + step;
-                }
-                let mut i = start_idx;
-                while i >= 0 && (i as usize) < len {
-                    if matches!(elements[i as usize], Value::Hole) {
-                        i += step;
-                        continue;
-                    }
-                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(acc.clone());
-                    cb_args.push(elements[i as usize].clone());
-                    cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
-                    cb_args.push(arr_value.clone());
-                    acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                    i += step;
-                }
-                acc
-            }
-            "find" => {
-                // §23.1.3.10: holes are visited but produce
-                // `undefined` for the callback's element argument.
-                let callee = require_callable(args.first())?;
-                let mut found = Value::Undefined;
-                for (i, value) in elements.into_iter().enumerate() {
-                    let elem = if matches!(value, Value::Hole) {
-                        Value::Undefined
-                    } else {
-                        value
-                    };
-                    let cb_args = build_array_cb_args(&elem, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                    if hit.to_boolean() {
-                        found = elem;
-                        break;
-                    }
-                }
-                found
-            }
-            "findIndex" => {
-                // §23.1.3.11: same hole semantics as `find`.
-                let callee = require_callable(args.first())?;
-                let mut idx: i32 = -1;
-                for (i, value) in elements.into_iter().enumerate() {
-                    let elem = if matches!(value, Value::Hole) {
-                        Value::Undefined
-                    } else {
-                        value
-                    };
-                    let cb_args = build_array_cb_args(&elem, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                    if hit.to_boolean() {
-                        idx = i as i32;
-                        break;
-                    }
-                }
-                Value::Number(NumberValue::from_i32(idx))
-            }
-            "every" => {
-                // §23.1.3.6: callback NOT invoked for holes.
-                let callee = require_callable(args.first())?;
-                let mut all = true;
-                for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
-                        continue;
-                    }
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                    if !hit.to_boolean() {
-                        all = false;
-                        break;
-                    }
-                }
-                Value::Boolean(all)
-            }
-            "some" => {
-                // §23.1.3.27: callback NOT invoked for holes.
-                let callee = require_callable(args.first())?;
-                let mut any = false;
-                for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
-                        continue;
-                    }
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                    if hit.to_boolean() {
-                        any = true;
-                        break;
-                    }
-                }
-                Value::Boolean(any)
-            }
-            "flatMap" => {
-                // §23.1.3.12: callback NOT invoked for holes; the
-                // hole simply contributes nothing to the flattened
-                // result.
-                let callee = require_callable(args.first())?;
-                let mut out: Vec<Value> = Vec::with_capacity(len);
-                for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
-                        continue;
-                    }
-                    let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let mapped =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
-                    match mapped {
-                        Value::Array(inner) => {
-                            crate::array::with_elements(inner, &self.gc_heap, |elements| {
-                                out.extend(elements.iter().cloned());
-                            });
-                        }
-                        other => out.push(other),
-                    }
-                }
-                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
-            }
-            "sort" => {
-                // §23.1.3.30: SortIndexedProperties sorts only
-                // present elements; holes (and any explicit
-                // `undefined`s, but we keep those in the sort) are
-                // pushed to the end of the array.
-                let callee = require_callable(args.first())?;
-                let mut buffer: Vec<Value> = Vec::with_capacity(elements.len());
-                let mut hole_count: usize = 0;
-                for v in elements {
-                    if matches!(v, Value::Hole) {
-                        hole_count += 1;
-                    } else {
-                        buffer.push(v);
-                    }
-                }
-                // Manual insertion sort over the present-elements
-                // snapshot — a closure-driven `sort_by` would have
-                // to call back into the interpreter from inside
-                // `Ord::cmp`. O(n²), correctness-first.
-                let n = buffer.len();
-                for i in 1..n {
-                    let mut j = i;
-                    while j > 0 {
-                        let mut cmp_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        cmp_args.push(buffer[j - 1].clone());
-                        cmp_args.push(buffer[j].clone());
-                        let outcome =
-                            self.run_callable_sync(context, &callee, Value::Undefined, cmp_args)?;
-                        let order = match outcome {
-                            Value::Number(n) => n.as_f64(),
-                            _ => 0.0,
-                        };
-                        if order > 0.0 {
-                            buffer.swap(j - 1, j);
-                            j -= 1;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                {
-                    crate::array::with_elements_mut(*arr, &mut self.gc_heap, |elements| {
-                        elements.clear();
-                        elements.extend(buffer);
-                        for _ in 0..hole_count {
-                            elements.push(Value::Hole);
-                        }
-                    });
-                }
-                arr_value.clone()
-            }
-            _ => return Ok(false),
-        };
-
-        let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-        write_register(frame_top, dst, result)?;
-        Ok(true)
-    }
-
-    /// Synchronously invoke `callee(args)` with the given `this` and
-    /// return the completion value.
-    ///
-    /// # Algorithm
-    /// 1. NativeFunction callees run inline — the foundation native
-    ///    surface is `Fn`, so calling them here is just a function
-    ///    pointer hop with `&mut self` access.
-    /// 2. BoundFunction layers are unwrapped iteratively, prepending
-    ///    bound args and replacing `this_value` with `bound_this`.
-    /// 3. Bytecode / closure callees push a frame whose
-    ///    `return_register` is `None`, which makes
-    ///    [`Self::dispatch_loop`] return the completion value when
-    ///    the frame pops.
-    ///
-    /// Used by collection `forEach` and other host-driven iteration
-    /// helpers.
-    pub fn run_callable_sync(
-        &mut self,
-        context: &ExecutionContext,
-        callee: &Value,
-        this_value: Value,
-        args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
-        let mut current = callee.clone();
-        let mut effective_this = this_value;
-        let mut effective_args = args;
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            match current {
-                Value::BoundFunction(bound) => {
-                    hops += 1;
-                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                    let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                    combined.extend(bound_args);
-                    combined.extend(effective_args);
-                    effective_this = bound_this;
-                    effective_args = combined;
-                    current = target;
-                }
-                Value::ClassConstructor(cc) => {
-                    hops += 1;
-                    current = cc.ctor(&self.gc_heap).clone();
-                }
-                // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
-                // fall through to target.[[Call]] when the trap is
-                // absent. Target may itself be a Proxy, hence the
-                // surrounding loop. §10.5.1 revocation check.
-                // <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-call-thisargument-argumentslist>
-                Value::Proxy(proxy) => {
-                    if proxy.is_revoked() {
-                        return Err(VmError::TypeError {
-                            message: "Cannot perform 'apply' on a proxy that has been revoked"
-                                .to_string(),
-                        });
-                    }
-                    hops += 1;
-                    let handler = proxy.handler();
-                    let trap_value = crate::object::get(handler, &self.gc_heap, "apply");
-                    match trap_value {
-                        Some(trap) if self.is_callable_runtime(&trap) => {
-                            let argv_array = crate::array::from_elements(
-                                &mut self.gc_heap,
-                                effective_args.iter().cloned(),
-                            )?;
-                            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                                proxy.target(),
-                                effective_this.clone(),
-                                Value::Array(argv_array),
-                            ];
-                            return self.run_callable_sync(
-                                context,
-                                &trap,
-                                Value::Object(handler),
-                                trap_args,
-                            );
-                        }
-                        Some(Value::Undefined) | Some(Value::Null) | None => {
-                            current = proxy.target();
-                        }
-                        Some(_) => {
-                            return Err(VmError::TypeError {
-                                message: "Proxy apply trap is not callable".to_string(),
-                            });
-                        }
-                    }
-                }
-                _ => break,
-            }
-        }
-        if let Value::Object(obj) = &current
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::call_native(*obj, &self.gc_heap)
-        {
-            let call = native.call_target(&self.gc_heap);
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
-        }
-        if let Value::NativeFunction(native) = &current {
-            let call = native.call_target(&self.gc_heap);
-            if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                return self.run_vm_intrinsic_sync(
-                    context,
-                    intrinsic,
-                    effective_this,
-                    effective_args,
-                );
-            }
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call_info = NativeCallInfo::call(effective_this.clone());
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
-        }
-        let (function_id, parent_upvalues, this_for_callee) = match current {
-            Value::Function { function_id } => {
-                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
-            }
-            Value::Closure {
-                function_id,
-                upvalues,
-                bound_this,
-            } => {
-                let this_value = match bound_this {
-                    Some(t) => *t,
-                    None => effective_this,
-                };
-                (function_id, upvalues, this_value)
-            }
-            _ => return Err(VmError::NotCallable),
-        };
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
-        let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut new_frame =
-            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
-        let bind_count = (function.param_count as usize).min(effective_args.len());
-        let total_args = effective_args.len();
-        if function.needs_arguments {
-            new_frame.incoming_args = effective_args.iter().cloned().collect();
-        }
-        let mut arg_iter = effective_args.into_iter();
-        for i in 0..bind_count {
-            let v = arg_iter.next().expect("bind_count <= len");
-            let slot = new_frame
-                .registers
-                .get_mut(i)
-                .ok_or(VmError::InvalidOperand)?;
-            *slot = v;
-        }
-        if function.has_rest && total_args > function.param_count as usize {
-            new_frame.rest_args = arg_iter.collect();
-        }
-        inner.push(new_frame);
-        self.dispatch_loop(context, &mut inner)
-    }
-
-    /// Synchronously perform `Construct(target, args, newTarget)`.
-    ///
-    /// This mirrors the `Op::New` user-function entry path but
-    /// returns the completion directly for builtins such as
-    /// `Reflect.construct`. Bound functions are unwrapped with the
-    /// ECMA-262 `[[Construct]]` newTarget rewrite: constructing a
-    /// bound function as itself exposes the bound target as
-    /// `new.target` inside the target body.
-    pub(crate) fn run_construct_sync(
-        &mut self,
-        context: &ExecutionContext,
-        target: &Value,
-        new_target: Value,
-        args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
-        let mut current = target.clone();
-        let mut effective_new_target = new_target;
-        let mut effective_args = args;
-        let mut hops: u32 = 0;
-        loop {
-            if hops >= self.max_stack_depth {
-                return Err(VmError::StackOverflow {
-                    limit: self.max_stack_depth,
-                });
-            }
-            match &current {
-                Value::BoundFunction(bound) => {
-                    hops += 1;
-                    let (next_target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
-                    let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                    combined.extend(bound_args);
-                    combined.extend(effective_args);
-                    if abstract_ops::same_value(&current, &effective_new_target) {
-                        effective_new_target = next_target.clone();
-                    }
-                    current = next_target;
-                    effective_args = combined;
-                }
-                // §10.5.13 Proxy [[Construct]] — dispatch `construct`
-                // trap or fall through to target.[[Construct]]. Target
-                // may be another Proxy, hence the loop.
-                // <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-construct-argumentslist-newtarget>
-                Value::Proxy(proxy) => {
-                    if proxy.is_revoked() {
-                        return Err(VmError::TypeError {
-                            message: "Cannot perform 'construct' on a proxy that has been revoked"
-                                .to_string(),
-                        });
-                    }
-                    hops += 1;
-                    let handler = proxy.handler();
-                    let trap_value = crate::object::get(handler, &self.gc_heap, "construct");
-                    match trap_value {
-                        Some(trap) if self.is_callable_runtime(&trap) => {
-                            let target_value = proxy.target();
-                            let argv_array = crate::array::from_elements(
-                                &mut self.gc_heap,
-                                effective_args.iter().cloned(),
-                            )?;
-                            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                                target_value,
-                                Value::Array(argv_array),
-                                effective_new_target.clone(),
-                            ];
-                            let result = self.run_callable_sync(
-                                context,
-                                &trap,
-                                Value::Object(handler),
-                                trap_args,
-                            )?;
-                            if !constructor_return_is_object(&result) {
-                                return Err(VmError::TypeError {
-                                    message: "Proxy construct trap returned non-object".to_string(),
-                                });
-                            }
-                            return Ok(result);
-                        }
-                        Some(Value::Undefined) | Some(Value::Null) | None => {
-                            current = proxy.target();
-                        }
-                        Some(_) => {
-                            return Err(VmError::TypeError {
-                                message: "Proxy construct trap is not callable".to_string(),
-                            });
-                        }
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        let proto = self.construct_prototype_for_callee(context, &effective_new_target)?;
-        let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
-        if let Some(proto) = proto {
-            crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
-        }
-        let this_value = Value::Object(receiver);
-
-        if let Value::Object(obj) = &current
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::constructor_native(*obj, &self.gc_heap)
-        {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info =
-                NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            return Ok(if constructor_return_is_object(&result) {
-                result
-            } else {
-                this_value
-            });
-        }
-        if let Value::NativeFunction(native) = &current {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info =
-                NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            return Ok(if constructor_return_is_object(&result) {
-                result
-            } else {
-                this_value
-            });
-        }
-        if let Value::ClassConstructor(class) = &current
-            && let Value::NativeFunction(native) = &class.ctor(&self.gc_heap)
-        {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info =
-                NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            return Ok(if constructor_return_is_object(&result) {
-                result
-            } else {
-                this_value
-            });
-        }
-        if let Value::ClassConstructor(class) = &current {
-            current = class.ctor(&self.gc_heap).clone();
-        }
-
-        let (function_id, parent_upvalues) = match current {
-            Value::Function { function_id } => (function_id, std::rc::Rc::from(Vec::new())),
-            Value::Closure {
-                function_id,
-                upvalues,
-                ..
-            } => (function_id, upvalues),
-            _ => return Err(VmError::NotCallable),
-        };
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let mut new_frame =
-            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_value);
-        new_frame.construct_target = Some(receiver);
-        new_frame.new_target = Some(effective_new_target);
-        if function.needs_arguments {
-            new_frame.incoming_args = effective_args.iter().cloned().collect();
-        }
-        let bind_count = (function.param_count as usize).min(effective_args.len());
-        let total_args = effective_args.len();
-        let mut arg_iter = effective_args.into_iter();
-        for i in 0..bind_count {
-            let v = arg_iter.next().expect("bind_count <= len");
-            let slot = new_frame
-                .registers
-                .get_mut(i)
-                .ok_or(VmError::InvalidOperand)?;
-            *slot = v;
-        }
-        if function.has_rest && total_args > function.param_count as usize {
-            new_frame.rest_args = arg_iter.collect();
-        }
-        let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
-        inner.push(new_frame);
-        self.dispatch_loop(context, &mut inner)
-    }
-
-    /// Synchronously advance an iterator one step, with full
-    /// interpreter access so user-iterator `next()` calls and
-    /// helper-wrapper callbacks can run inline. Mirrors the
-    /// fast-path [`step_iterator`] helper but also handles the
-    /// `User` / `Map` / `Filter` / `Take` / `Drop` / `FlatMap`
-    /// variants by driving callbacks through
-    /// [`Self::run_callable_sync`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-iteratornext>
-    /// - <https://tc39.es/proposal-iterator-helpers/>
-    fn iterator_next_full(
-        &mut self,
-        context: &ExecutionContext,
-        iter: &IteratorHandle,
-    ) -> Result<(Value, bool), VmError> {
-        // First try the fast path; falls through to the
-        // interpreter-aware branch on `User` / wrapper variants.
-        match step_iterator(*iter, &self.string_heap, &mut self.gc_heap) {
-            Ok((value, done)) => Ok((value, done)),
-            Err(_) => self.iterator_next_full_slow(context, iter),
-        }
-    }
-
-    fn iterator_next_full_slow(
-        &mut self,
-        context: &ExecutionContext,
-        iter: &IteratorHandle,
-    ) -> Result<(Value, bool), VmError> {
-        // Snapshot the current state to avoid holding the borrow
-        // across user-callback dispatch.
-        let snapshot: Option<IteratorStateSnapshot> =
-            self.gc_heap.read_payload(*iter, |state| match state {
-                IteratorState::User { iterator } => {
-                    Some(IteratorStateSnapshot::User(iterator.clone()))
-                }
-                IteratorState::Generator { handle } => {
-                    Some(IteratorStateSnapshot::Generator(*handle))
-                }
-                IteratorState::Map { source, mapper } => Some(IteratorStateSnapshot::Map {
-                    source: *source,
-                    mapper: mapper.clone(),
-                }),
-                IteratorState::Filter { source, predicate } => {
-                    Some(IteratorStateSnapshot::Filter {
-                        source: *source,
-                        predicate: predicate.clone(),
-                    })
-                }
-                IteratorState::Take { source, remaining } => Some(IteratorStateSnapshot::Take {
-                    source: *source,
-                    remaining: *remaining,
-                }),
-                IteratorState::Drop { source, to_drop } => Some(IteratorStateSnapshot::Drop {
-                    source: *source,
-                    to_drop: *to_drop,
-                }),
-                IteratorState::FlatMap {
-                    source,
-                    mapper,
-                    inner,
-                } => Some(IteratorStateSnapshot::FlatMap {
-                    source: *source,
-                    mapper: mapper.clone(),
-                    inner: *inner,
-                }),
-                _ => None,
-            });
-        let snapshot = snapshot.ok_or(VmError::TypeMismatch)?;
-        match snapshot {
-            IteratorStateSnapshot::Generator(handle) => {
-                let result = self.resume_generator(
-                    context,
-                    &handle,
-                    GeneratorResumeKind::Next(Value::Undefined),
-                )?;
-                let Value::Object(record) = &result else {
-                    return Err(VmError::TypeMismatch);
-                };
-                let value =
-                    crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
-                let done = crate::object::get(*record, &self.gc_heap, "done")
-                    .unwrap_or(Value::Undefined)
-                    .to_boolean();
-                if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                }
-                Ok((value, done))
-            }
-            IteratorStateSnapshot::User(iter_value) => {
-                let Value::Object(iter_obj) = &iter_value else {
-                    return Err(VmError::TypeMismatch);
-                };
-                let next_fn = crate::object::get(*iter_obj, &self.gc_heap, "next")
-                    .ok_or(VmError::TypeMismatch)?;
-                if !self.is_callable_runtime(&next_fn) {
-                    return Err(VmError::TypeMismatch);
-                }
-                let result =
-                    self.run_callable_sync(context, &next_fn, iter_value.clone(), SmallVec::new())?;
-                let Value::Object(record) = &result else {
-                    return Err(VmError::TypeMismatch);
-                };
-                let value =
-                    crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
-                let done = crate::object::get(*record, &self.gc_heap, "done")
-                    .unwrap_or(Value::Undefined)
-                    .to_boolean();
-                if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                }
-                Ok((value, done))
-            }
-            IteratorStateSnapshot::Map { source, mapper } => {
-                let (v, done) = self.iterator_next_full(context, &source)?;
-                if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                    return Ok((Value::Undefined, true));
-                }
-                let mapped = self.run_callable_sync(
-                    context,
-                    &mapper,
-                    Value::Undefined,
-                    smallvec::smallvec![v],
-                )?;
-                Ok((mapped, false))
-            }
-            IteratorStateSnapshot::Filter { source, predicate } => loop {
-                let (v, done) = self.iterator_next_full(context, &source)?;
-                if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                    return Ok((Value::Undefined, true));
-                }
-                let kept = self.run_callable_sync(
-                    context,
-                    &predicate,
-                    Value::Undefined,
-                    smallvec::smallvec![v.clone()],
-                )?;
-                if kept.to_boolean() {
-                    return Ok((v, false));
-                }
-            },
-            IteratorStateSnapshot::Take { source, remaining } => {
-                if remaining == 0 {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                    return Ok((Value::Undefined, true));
-                }
-                let (v, done) = self.iterator_next_full(context, &source)?;
-                if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                    return Ok((Value::Undefined, true));
-                }
-                self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Take { remaining, .. } = state {
-                        *remaining = remaining.saturating_sub(1);
-                    }
-                });
-                Ok((v, false))
-            }
-            IteratorStateSnapshot::Drop { source, to_drop } => {
-                for _ in 0..to_drop {
-                    let (_, done) = self.iterator_next_full(context, &source)?;
-                    if done {
-                        self.gc_heap
-                            .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                        return Ok((Value::Undefined, true));
-                    }
-                }
-                self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Drop { to_drop, .. } = state {
-                        *to_drop = 0;
-                    }
-                });
-                let (v, done) = self.iterator_next_full(context, &source)?;
-                if done {
-                    self.gc_heap
-                        .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                    return Ok((Value::Undefined, true));
-                }
-                Ok((v, false))
-            }
-            IteratorStateSnapshot::FlatMap {
-                source,
-                mapper,
-                mut inner,
-            } => {
-                loop {
-                    if let Some(inner_iter) = inner.take() {
-                        let (v, done) = self.iterator_next_full(context, &inner_iter)?;
-                        if !done {
-                            // `inner_iter` remains the active inner
-                            // iterator for the next call; the FlatMap
-                            // slot still holds it.
-                            return Ok((v, false));
-                        }
-                        self.gc_heap.with_payload(*iter, |state| {
-                            if let IteratorState::FlatMap { inner: slot, .. } = state {
-                                *slot = None;
-                            }
-                        });
-                    }
-                    let (v, done) = self.iterator_next_full(context, &source)?;
-                    if done {
-                        self.gc_heap
-                            .with_payload(*iter, |state| *state = IteratorState::Exhausted);
-                        return Ok((Value::Undefined, true));
-                    }
-                    let mapped = self.run_callable_sync(
-                        context,
-                        &mapper,
-                        Value::Undefined,
-                        smallvec::smallvec![v],
-                    )?;
-                    let inner_state = match mapped {
-                        Value::Array(arr) => IteratorState::Array {
-                            array: arr,
-                            index: 0,
-                        },
-                        Value::Iterator(rc) => {
-                            let new_inner = rc;
-                            self.gc_heap.with_payload(*iter, |state| {
-                                if let IteratorState::FlatMap { inner: slot, .. } = state {
-                                    *slot = Some(new_inner);
-                                }
-                            });
-                            inner = Some(new_inner);
-                            continue;
-                        }
-                        other => return Ok((other, false)),
-                    };
-                    let new_inner = alloc_iterator_state(&mut self.gc_heap, inner_state)?;
-                    self.gc_heap.with_payload(*iter, |state| {
-                        if let IteratorState::FlatMap { inner: slot, .. } = state {
-                            *slot = Some(new_inner);
-                        }
-                    });
-                    inner = Some(new_inner);
-                }
-            }
         }
     }
 
@@ -10207,562 +7285,6 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, receiver, SmallVec::new())
             }
         }
-    }
-
-    fn dispatch_function_method(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        callee: &Value,
-        name: &str,
-        args: SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        match name {
-            "call" => {
-                let mut iter = args.into_iter();
-                let this_value = iter.next().unwrap_or(Value::Undefined);
-                let forwarded: SmallVec<[Value; 8]> = iter.collect();
-                stack[top_idx].pc = stack[top_idx]
-                    .pc
-                    .checked_add(1)
-                    .ok_or(VmError::InvalidOperand)?;
-                self.invoke(stack, context, callee, this_value, forwarded, dst)
-            }
-            "apply" => {
-                let mut iter = args.into_iter();
-                let this_value = iter.next().unwrap_or(Value::Undefined);
-                let forwarded: SmallVec<[Value; 8]> = match iter.next() {
-                    None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
-                    Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
-                };
-                stack[top_idx].pc = stack[top_idx]
-                    .pc
-                    .checked_add(1)
-                    .ok_or(VmError::InvalidOperand)?;
-                self.invoke(stack, context, callee, this_value, forwarded, dst)
-            }
-            "bind" => {
-                let mut iter = args.into_iter();
-                let this_value = iter.next().unwrap_or(Value::Undefined);
-                let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let ctx = function_metadata::FunctionMetadataContext::new(
-                    context,
-                    &self.gc_heap,
-                    &self.string_heap,
-                    &self.function_user_props,
-                    &self.function_deleted_metadata,
-                );
-                let metadata =
-                    function_metadata::bound_create_metadata(&ctx, callee, bound_args.len())?;
-                let bound = BoundFunction::new_with_metadata(
-                    &mut self.gc_heap,
-                    callee.clone(),
-                    this_value,
-                    bound_args,
-                    metadata,
-                )?;
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::BoundFunction(bound))?;
-                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                Ok(())
-            }
-            // §20.2.3.5 Function.prototype.toString — foundation
-            // returns the canonical `function <name>() { [native
-            // code] }` placeholder. Spec mandates a source-faithful
-            // representation when source is available; the
-            // foundation defers source preservation to a follow-up.
-            // <https://tc39.es/ecma262/#sec-function.prototype.tostring>
-            "toString" => {
-                let ctx = function_metadata::FunctionMetadataContext::new(
-                    context,
-                    &self.gc_heap,
-                    &self.string_heap,
-                    &self.function_user_props,
-                    &self.function_deleted_metadata,
-                );
-                let display = function_metadata::callable_to_string(&ctx, callee);
-                let s = JsString::from_str(&display, &self.string_heap)
-                    .map_err(|_| VmError::TypeMismatch)?;
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::String(s))?;
-                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                Ok(())
-            }
-            _ => Err(VmError::UnknownIntrinsic {
-                name: name.to_string(),
-            }),
-        }
-    }
-
-    /// Pre-dispatch hook for [`Op::ToNumber`] that consults
-    /// `[Symbol.toPrimitive]` on object operands.
-    ///
-    /// # Algorithm
-    /// 1. If the source register holds a [`Value::Object`] whose
-    ///    `[Symbol.toPrimitive]` symbol-keyed property is callable,
-    ///    advance pc past the `ToNumber` instruction and invoke
-    ///    the hook with `this = obj` and `args = ["number"]`.
-    /// 2. The hook's return value lands in the `ToNumber`'s
-    ///    destination register on frame pop. The foundation does
-    ///    not re-coerce; tests targeting this slice return a
-    ///    Number directly.
-    /// 3. Return `Ok(Some(()))` when the hook fired (caller
-    ///    `continue`s the dispatch loop), `Ok(None)` otherwise so
-    ///    the in-frame fast path runs.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-toprimitive>
-    /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
-    fn try_to_primitive_dispatch(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<Option<()>, VmError> {
-        let dst = register_operand(operands.first())?;
-        let src = register_operand(operands.get(1))?;
-        let top_idx = stack.len() - 1;
-        let recv = read_register(&stack[top_idx], src)?.clone();
-        let Value::Object(obj) = &recv else {
-            return Ok(None);
-        };
-        let to_primitive_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let Some(callee) = crate::object::get_symbol(*obj, &self.gc_heap, &to_primitive_sym) else {
-            return Ok(None);
-        };
-        if !self.is_callable_runtime(&callee) {
-            return Ok(None);
-        }
-        let hint = JsString::from_str("number", &self.string_heap)?;
-        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-        args.push(Value::String(hint));
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, context, &callee, recv.clone(), args, dst)?;
-        Ok(Some(()))
-    }
-
-    /// Drive one tick of the [`Op::ToPrimitive`] ladder.
-    ///
-    /// # Algorithm
-    /// Implements ECMA-262 §7.1.1 `ToPrimitive` plus §7.1.1.1
-    /// `OrdinaryToPrimitive`:
-    ///
-    /// 1. **Already primitive** — write `src` to `dst`, advance pc.
-    /// 2. **Resume from prior stage** — read the result the called
-    ///    function wrote into `dst`. If primitive, advance pc and
-    ///    clear the parked state. Otherwise advance the stage.
-    /// 3. **`SymbolToPrim`** — look up `[Symbol.toPrimitive]`. If
-    ///    callable, push a frame with `[hint]` and `this = obj`,
-    ///    park state with `stage = OrdinaryFirst` (set so a
-    ///    non-primitive result falls through to the ordinary
-    ///    chain). Otherwise fall through to `OrdinaryFirst`
-    ///    immediately.
-    /// 4. **`OrdinaryFirst` / `OrdinarySecond`** — pick `valueOf`
-    ///    (default / number) or `toString` (string) for the first
-    ///    slot; the other method for the second. If callable, push
-    ///    a frame with no arguments. If neither slot returns a
-    ///    primitive, raise `VmError::TypeMismatch` (task 25 will
-    ///    upgrade this to a real `TypeError` Error object).
-    ///
-    /// Returns `Ok(true)` when the ladder pushed a frame (the
-    /// dispatch loop must `continue` to the new top frame),
-    /// `Ok(false)` when the ladder finished synchronously and pc
-    /// advanced.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-toprimitive>
-    /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
-    fn drive_to_primitive(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<bool, VmError> {
-        let dst = register_operand(operands.first())?;
-        let src = register_operand(operands.get(1))?;
-        let hint_idx = const_operand(operands.get(2))?;
-        let hint_token = context
-            .string_constant_str(hint_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let hint = abstract_ops::ToPrimitiveHint::from_token(&hint_token)
-            .ok_or(VmError::InvalidOperand)?;
-
-        let top_idx = stack.len() - 1;
-        let pc = stack[top_idx].pc;
-
-        // 1. Resume path — only when the parked state matches this
-        //    instruction. Read the result the called function wrote
-        //    to `dst`; if primitive, finish.
-        let resume = stack[top_idx]
-            .pending_to_primitive
-            .as_ref()
-            .filter(|s| s.pc == pc && s.dst == dst)
-            .cloned();
-        if let Some(state) = resume {
-            let produced = read_register(&stack[top_idx], dst)?.clone();
-            if abstract_ops::is_primitive(&produced) {
-                stack[top_idx].pending_to_primitive = None;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                return Ok(false);
-            }
-            // Non-primitive — advance to the next stage.
-            return self.drive_to_primitive_stage(
-                stack,
-                context,
-                dst,
-                state.obj,
-                hint,
-                state.stage,
-            );
-        }
-
-        // 2. Fresh entry — primitive fast path.
-        let recv = read_register(&stack[top_idx], src)?.clone();
-        if abstract_ops::is_primitive(&recv) {
-            write_register(&mut stack[top_idx], dst, recv)?;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            return Ok(false);
-        }
-
-        // 3. Object operand — start the ladder at SymbolToPrim.
-        self.drive_to_primitive_stage(
-            stack,
-            context,
-            dst,
-            recv,
-            hint,
-            ToPrimitiveStage::SymbolToPrim,
-        )
-    }
-
-    /// If `value` (the data-path result of a callable property
-    /// lookup) is `Undefined`, probe `%Function.prototype%` for an
-    /// inherited accessor descriptor under `key`. Returns
-    /// `Some(VmGetOutcome::InvokeGetter)` only when the chain hosts
-    /// a callable getter (e.g. the §10.2.4
-    /// `AddRestrictedFunctionProperties` poison pills for `caller`
-    /// and `arguments`). All other outcomes — data hit, accessor
-    /// without getter, no chain entry — return `None` so the caller
-    /// keeps the original `value`.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-ordinaryget>
-    /// - <https://tc39.es/ecma262/#sec-addrestrictedfunctionproperties>
-    fn callable_realm_prototype_accessor_outcome(
-        &self,
-        value: &Value,
-        key: &VmPropertyKey,
-    ) -> Result<Option<VmGetOutcome>, VmError> {
-        if !matches!(value, Value::Undefined) {
-            return Ok(None);
-        }
-        let Ok(proto) = self.function_prototype_object() else {
-            return Ok(None);
-        };
-        let lookup = match key {
-            VmPropertyKey::String(name) => object::lookup(proto, &self.gc_heap, name),
-            VmPropertyKey::Symbol(sym) => object::lookup_symbol(proto, &self.gc_heap, sym),
-        };
-        if let object::PropertyLookup::Accessor {
-            getter: Some(getter),
-            ..
-        } = lookup
-            && abstract_ops::is_callable(&getter)
-        {
-            return Ok(Some(VmGetOutcome::InvokeGetter { getter }));
-        }
-        Ok(None)
-    }
-
-    /// Resolve the realm prototype Object that `[[Get]]` walks for a
-    /// non-`Value::Object` heap-shape value. Mirrors §7.1.1 step 1's
-    /// requirement that any object — Function, Array, Map, etc. —
-    /// participate in `ToPrimitive` lookup through its own prototype
-    /// chain. `Value::Object` is handled directly by callers; this
-    /// helper only resolves the exotic shapes whose prototype lives
-    /// on the realm's intrinsic constructor object.
-    ///
-    /// Returns `None` when:
-    /// - the value is a primitive (callers short-circuit before
-    ///   reaching this helper),
-    /// - the value is `Value::Object` (already an ordinary object),
-    /// - the value is `Value::Proxy` (proxy lookups must invoke the
-    ///   `get` trap; §7.1.1 callers fall back to the trap dispatcher
-    ///   rather than direct proto walking), or
-    /// - the realm has no installed constructor for that shape.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-toprimitive>
-    /// - <https://tc39.es/ecma262/#sec-ordinaryget>
-    fn intrinsic_prototype_object_for(&self, value: &Value) -> Option<JsObject> {
-        let constructor_name = match value {
-            Value::Function { .. }
-            | Value::Closure { .. }
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_) => return self.function_prototype_object().ok(),
-            Value::Array(_) => "Array",
-            Value::RegExp(_) => "RegExp",
-            Value::Map(_) => "Map",
-            Value::Set(_) => "Set",
-            Value::WeakMap(_) => "WeakMap",
-            Value::WeakSet(_) => "WeakSet",
-            Value::WeakRef(_) => "WeakRef",
-            Value::FinalizationRegistry(_) => "FinalizationRegistry",
-            Value::Promise(_) => "Promise",
-            Value::ArrayBuffer(b) => {
-                if b.is_shared() {
-                    "SharedArrayBuffer"
-                } else {
-                    "ArrayBuffer"
-                }
-            }
-            Value::DataView(_) => "DataView",
-            Value::TypedArray(t) => t.kind().name(),
-            Value::Object(_) | Value::Proxy(_) => return None,
-            _ => return None,
-        };
-        match self.constructor_prototype_value(constructor_name).ok()? {
-            Value::Object(o) => Some(o),
-            _ => None,
-        }
-    }
-
-    /// Look up a string-keyed property over a non-primitive value's
-    /// `[[Prototype]]` chain. Returns `None` when the chain has no
-    /// inherited definition. This is the §7.1.1.1 `OrdinaryToPrimitive`
-    /// fast path for `valueOf` / `toString` and intentionally does
-    /// not invoke accessor getters: callers want the raw `[[Value]]`
-    /// of an inherited data property (typically the realm's installed
-    /// `valueOf` / `toString` callables) and treat accessor hits as
-    /// "no callable found" so the next stage runs.
-    fn get_proto_string_for_to_primitive(&self, base: &Value, name: &str) -> Option<Value> {
-        let proto = match base {
-            Value::Object(o) => Some(*o),
-            _ => self.intrinsic_prototype_object_for(base),
-        };
-        proto.and_then(|o| object::get(o, &self.gc_heap, name))
-    }
-
-    /// Look up a Symbol-keyed property over a non-primitive value's
-    /// `[[Prototype]]` chain. Used by the §7.1.1 step 2 lookup of
-    /// `[Symbol.toPrimitive]`. Same accessor policy as
-    /// [`Self::get_proto_string_for_to_primitive`].
-    fn get_proto_symbol_for_to_primitive(
-        &self,
-        base: &Value,
-        sym: &symbol::JsSymbol,
-    ) -> Option<Value> {
-        let proto = match base {
-            Value::Object(o) => Some(*o),
-            _ => self.intrinsic_prototype_object_for(base),
-        };
-        proto.and_then(|o| object::get_symbol(o, &self.gc_heap, sym))
-    }
-
-    /// Run a single stage of the §7.1.1 / §7.1.1.1 ladder, falling
-    /// through synchronously when the chosen method is missing or
-    /// non-callable until we either push a frame, throw, or write
-    /// a primitive result.
-    fn drive_to_primitive_stage(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        dst: u16,
-        obj: Value,
-        hint: abstract_ops::ToPrimitiveHint,
-        mut stage: ToPrimitiveStage,
-    ) -> Result<bool, VmError> {
-        loop {
-            match stage {
-                ToPrimitiveStage::SymbolToPrim => {
-                    let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-                    let callee = self.get_proto_symbol_for_to_primitive(&obj, &to_prim_sym);
-                    if let Some(callee) = callee
-                        && self.is_callable_runtime(&callee)
-                    {
-                        let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
-                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                        args.push(Value::String(hint_str));
-                        // §7.1.1 step 5.d. The resume guard
-                        // upstream validates the result is a
-                        // primitive — if not, that branch lands
-                        // on `OrdinaryFirst` which is **wrong**
-                        // per spec (a non-primitive return from
-                        // `[Symbol.toPrimitive]` is supposed to
-                        // throw TypeError directly). The runtime
-                        // currently routes that case through the
-                        // ordinary chain rather than throwing, to
-                        // mirror the existing `Op::ToNumber` hook
-                        // behaviour. Task 25 + a follow-up will
-                        // tighten this branch to spec.
-                        return self.push_to_primitive_call(
-                            stack,
-                            context,
-                            dst,
-                            obj.clone(),
-                            hint,
-                            ToPrimitiveStage::OrdinaryFirst,
-                            &callee,
-                            obj.clone(),
-                            args,
-                        );
-                    }
-                    stage = ToPrimitiveStage::OrdinaryFirst;
-                }
-                ToPrimitiveStage::OrdinaryFirst => {
-                    let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_proto_string_for_to_primitive(&obj, method);
-                    if let Some(callee) = callee
-                        && self.is_callable_runtime(&callee)
-                    {
-                        // OrdinaryToPrimitive calls valueOf /
-                        // toString with `this = obj` and no args.
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        return self.push_to_primitive_call(
-                            stack,
-                            context,
-                            dst,
-                            obj.clone(),
-                            hint,
-                            ToPrimitiveStage::OrdinarySecond,
-                            &callee,
-                            obj.clone(),
-                            args,
-                        );
-                    }
-                    // Fallback: when the prototype chain has no
-                    // own / inherited callable for `method`, fall
-                    // back to the synthetic Object.prototype
-                    // intercept (the same one the call dispatcher
-                    // routes plain `obj.valueOf()` / `obj.toString()`
-                    // through). This keeps behaviour consistent
-                    // for plain object literals which never receive
-                    // a real Object.prototype linkage.
-                    if let Value::Object(o) = &obj {
-                        let no_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        if let Some(v) = object_prototype_intercept(
-                            o,
-                            method,
-                            &no_args,
-                            &self.string_heap,
-                            &self.gc_heap,
-                            self.function_prototype_object().ok(),
-                        )? && abstract_ops::is_primitive(&v)
-                        {
-                            let top_idx = stack.len() - 1;
-                            stack[top_idx].pending_to_primitive = None;
-                            write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].pc = stack[top_idx]
-                                .pc
-                                .checked_add(1)
-                                .ok_or(VmError::InvalidOperand)?;
-                            return Ok(false);
-                        }
-                    }
-                    stage = ToPrimitiveStage::OrdinarySecond;
-                }
-                ToPrimitiveStage::OrdinarySecond => {
-                    let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_proto_string_for_to_primitive(&obj, method);
-                    if let Some(callee) = callee
-                        && self.is_callable_runtime(&callee)
-                    {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        // After OrdinarySecond the only spec-legal
-                        // outcomes are: primitive result (resume
-                        // path writes it) or non-primitive →
-                        // throw. Park the stage as `Exhausted` so
-                        // the resume re-entry can't loop back into
-                        // this slot.
-                        return self.push_to_primitive_call(
-                            stack,
-                            context,
-                            dst,
-                            obj.clone(),
-                            hint,
-                            ToPrimitiveStage::Exhausted,
-                            &callee,
-                            obj.clone(),
-                            args,
-                        );
-                    }
-                    // Same prototype-intercept fallback as
-                    // OrdinaryFirst above — runs the second method
-                    // (`toString` for hint=number, `valueOf` for
-                    // hint=string) when the chain has nothing
-                    // callable.
-                    if let Value::Object(o) = &obj {
-                        let no_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        if let Some(v) = object_prototype_intercept(
-                            o,
-                            method,
-                            &no_args,
-                            &self.string_heap,
-                            &self.gc_heap,
-                            self.function_prototype_object().ok(),
-                        )? && abstract_ops::is_primitive(&v)
-                        {
-                            let top_idx = stack.len() - 1;
-                            stack[top_idx].pending_to_primitive = None;
-                            write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].pc = stack[top_idx]
-                                .pc
-                                .checked_add(1)
-                                .ok_or(VmError::InvalidOperand)?;
-                            return Ok(false);
-                        }
-                    }
-                    stage = ToPrimitiveStage::Exhausted;
-                }
-                ToPrimitiveStage::Exhausted => {
-                    // §7.1.1.1 step 6 — TypeError. Task 25 will
-                    // upgrade `VmError::TypeMismatch` to a real
-                    // `TypeError` Error object.
-                    let top_idx = stack.len() - 1;
-                    stack[top_idx].pending_to_primitive = None;
-                    return Err(VmError::TypeMismatch);
-                }
-            }
-        }
-    }
-
-    /// Park `Op::ToPrimitive` ladder state on the running frame and
-    /// invoke `callee`. The dispatcher re-enters the same opcode
-    /// after the call returns; the resume path validates the
-    /// result.
-    #[allow(clippy::too_many_arguments)]
-    fn push_to_primitive_call(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        dst: u16,
-        obj: Value,
-        hint: abstract_ops::ToPrimitiveHint,
-        next_stage: ToPrimitiveStage,
-        callee: &Value,
-        this_value: Value,
-        args: SmallVec<[Value; 8]>,
-    ) -> Result<bool, VmError> {
-        let top_idx = stack.len() - 1;
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pending_to_primitive = Some(PendingToPrimitive {
-            pc,
-            dst,
-            obj,
-            hint,
-            stage: next_stage,
-        });
-        // pc stays on the Op::ToPrimitive instruction so the
-        // dispatcher re-enters the resume path after the called
-        // function returns.
-        self.invoke(stack, context, callee, this_value, args, dst)?;
-        Ok(true)
     }
 
     /// Execute `eval(source)` per §19.4.1.1 indirect-eval semantics:
@@ -13719,36 +10241,6 @@ impl Interpreter {
         Ok(true)
     }
 
-    /// Apply descriptor-aware data assignment for computed ordinary-object
-    /// writes (`obj[key] = value`).
-    fn store_computed_ordinary_property(
-        &mut self,
-        obj: JsObject,
-        key: &str,
-        value: Value,
-        strict: bool,
-    ) -> Result<(), VmError> {
-        match crate::object::resolve_set(obj, &self.gc_heap, key) {
-            object::SetOutcome::AssignData => {
-                if object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value) {
-                    Ok(())
-                } else {
-                    Self::failed_set_result(
-                        strict,
-                        format!("Cannot assign to read-only property '{key}'"),
-                    )
-                }
-            }
-            object::SetOutcome::InvokeSetter { .. } => Self::failed_set_result(
-                strict,
-                format!("Cannot assign to accessor property '{key}' without a setter"),
-            ),
-            object::SetOutcome::Reject { .. } => {
-                Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))
-            }
-        }
-    }
-
     /// Drive one tick of [`Op::StoreElement`] when a computed
     /// string, numeric, or symbol property write on an ordinary
     /// object/proxy must obey §10.1.9 OrdinarySet.
@@ -14777,26 +11269,6 @@ fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
     }
 }
 
-fn intl_to_vm_error(err: intl::IntlError) -> VmError {
-    match err {
-        intl::IntlError::UnknownClass(name) => VmError::UnknownIntrinsic {
-            name: format!("Intl.{name}"),
-        },
-        intl::IntlError::UnknownMember { class, method } => VmError::UnknownIntrinsic {
-            name: format!("Intl.{class}.prototype.{method}"),
-        },
-        intl::IntlError::BadArgument { .. } => VmError::TypeMismatch,
-        intl::IntlError::Engine { message, .. } => VmError::Uncaught { value: message },
-        intl::IntlError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => VmError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-    }
-}
-
 fn temporal_to_vm_error(err: temporal::TemporalError) -> VmError {
     match err {
         temporal::TemporalError::UnknownMember { class, method } => VmError::UnknownIntrinsic {
@@ -15424,125 +11896,6 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
     Ok(())
 }
 
-/// Drive an iterator one step. Returns `(value, done)`. Once an
-/// iterator hands back `done = true`, its state transitions to
-/// `Exhausted` so subsequent calls are stable no-ops (matches the
-/// spec rule "an iterator never produces values after it has
-/// produced `done: true`"; §7.4.2 step 6).
-/// Build a fresh `Map` / `Set` / `WeakMap` / `WeakSet`, optionally
-/// seeded from an iterable.
-///
-/// # Algorithm
-/// 1. Match `kind` against the four collection names and allocate
-///    the corresponding handle.
-/// 2. If `seed` is `Value::Undefined` or `Value::Null`, return the
-///    fresh empty handle (Spec §24.1.1.1 / §24.2.1.1 step 5 et al.).
-/// 3. Otherwise the seed must be a `Value::Array` (foundation
-///    relaxation: a real iterable protocol consultation lands when
-///    user-defined iterables are wired); for `Map` / `WeakMap`
-///    each element is a 2-element `[key, value]` array; for
-///    `Set` / `WeakSet` each element is added directly.
-///
-/// # Errors
-/// - [`VmError::TypeMismatch`] when the seed is non-iterable, when a
-///   `Map` / `WeakMap` seed element is not a 2-array, or when a
-///   `WeakMap` / `WeakSet` seed key is a primitive (the underlying
-///   [`crate::collections::CollectionError::NonObjectKey`] surfaces
-///   through this arm).
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-map-constructor>
-/// - <https://tc39.es/ecma262/#sec-set-constructor>
-/// - <https://tc39.es/ecma262/#sec-weakmap-constructor>
-/// - <https://tc39.es/ecma262/#sec-weakset-constructor>
-fn build_collection(
-    kind: &str,
-    seed: &Value,
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, VmError> {
-    match kind {
-        "Map" => {
-            let m = crate::collections::alloc_map(gc_heap)?;
-            if seed_is_present(seed) {
-                let entries = seed_array(seed, gc_heap)?;
-                for entry in entries {
-                    let pair = match entry {
-                        Value::Array(a) => a,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    if crate::array::len(pair, gc_heap) < 2 {
-                        return Err(VmError::TypeMismatch);
-                    }
-                    crate::collections::map_set(
-                        m,
-                        gc_heap,
-                        crate::array::get(pair, gc_heap, 0),
-                        crate::array::get(pair, gc_heap, 1),
-                    )?;
-                }
-            }
-            Ok(Value::Map(m))
-        }
-        "Set" => {
-            let s = crate::collections::alloc_set(gc_heap)?;
-            if seed_is_present(seed) {
-                for v in seed_array(seed, gc_heap)? {
-                    crate::collections::set_add(s, gc_heap, v)?;
-                }
-            }
-            Ok(Value::Set(s))
-        }
-        "WeakMap" => {
-            let m = crate::collections::alloc_weak_map(gc_heap)?;
-            if seed_is_present(seed) {
-                for entry in seed_array(seed, gc_heap)? {
-                    let pair = match entry {
-                        Value::Array(a) => a,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    if crate::array::len(pair, gc_heap) < 2 {
-                        return Err(VmError::TypeMismatch);
-                    }
-                    crate::collections::weak_map_set(
-                        m,
-                        gc_heap,
-                        crate::array::get(pair, gc_heap, 0),
-                        crate::array::get(pair, gc_heap, 1),
-                    )
-                    .map_err(|_| VmError::TypeMismatch)?;
-                }
-            }
-            Ok(Value::WeakMap(m))
-        }
-        "WeakSet" => {
-            let s = crate::collections::alloc_weak_set(gc_heap)?;
-            if seed_is_present(seed) {
-                for v in seed_array(seed, gc_heap)? {
-                    crate::collections::weak_set_add(s, gc_heap, v)
-                        .map_err(|_| VmError::TypeMismatch)?;
-                }
-            }
-            Ok(Value::WeakSet(s))
-        }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("new {kind}"),
-        }),
-    }
-}
-
-fn seed_is_present(v: &Value) -> bool {
-    !matches!(v, Value::Undefined | Value::Null)
-}
-
-fn seed_array(seed: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
-    match seed {
-        Value::Array(a) => Ok(crate::array::with_elements(*a, gc_heap, |elements| {
-            elements.to_vec()
-        })),
-        _ => Err(VmError::TypeMismatch),
-    }
-}
-
 /// Build the native callable that `arr[Symbol.iterator]` evaluates
 /// to. Invoking the returned function (with any `this`) yields a
 /// fresh [`Value::Iterator`] over the captured array — matching the
@@ -15731,34 +12084,6 @@ fn iterator_static_call(
     }
 }
 
-/// Cloned snapshot of an [`IteratorState`] taken before driving a
-/// helper callback so the GC body borrow does not span dispatch.
-enum IteratorStateSnapshot {
-    User(Value),
-    Generator(crate::generator::JsGenerator),
-    Map {
-        source: IteratorHandle,
-        mapper: Value,
-    },
-    Filter {
-        source: IteratorHandle,
-        predicate: Value,
-    },
-    Take {
-        source: IteratorHandle,
-        remaining: u64,
-    },
-    Drop {
-        source: IteratorHandle,
-        to_drop: u64,
-    },
-    FlatMap {
-        source: IteratorHandle,
-        mapper: Value,
-        inner: Option<IteratorHandle>,
-    },
-}
-
 /// Coerce `take(n)` / `drop(n)` argument to a non-negative integer.
 /// Per the iterator-helpers proposal step 3, NaN / non-integer
 /// inputs raise a RangeError-equivalent (surfaced here as
@@ -15783,6 +12108,11 @@ fn take_drop_count(arg: Option<&Value>) -> Result<u64, VmError> {
     Ok(n.trunc() as u64)
 }
 
+/// Drive an iterator one step. Returns `(value, done)`. Once an
+/// iterator hands back `done = true`, its state transitions to
+/// `Exhausted` so subsequent calls are stable no-ops (matches the
+/// spec rule "an iterator never produces values after it has
+/// produced `done: true`"; §7.4.2 step 6).
 fn step_iterator(
     iter: IteratorHandle,
     string_heap: &StringHeap,

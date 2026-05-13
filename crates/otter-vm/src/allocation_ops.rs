@@ -7,6 +7,8 @@
 //! # Contents
 //! - Object literal allocation.
 //! - Array literal allocation from variadic register operands.
+//! - Array push helper used by spread/rest lowering.
+//! - WeakRef and FinalizationRegistry allocation.
 //!
 //! # Invariants
 //! - Inputs are decoded from executable operands.
@@ -77,6 +79,53 @@ impl Interpreter {
                 }
             })?;
         write_register(frame, dst, Value::RegExp(regex))?;
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_array_push_regs(
+        &mut self,
+        frame: &mut Frame,
+        arr_reg: u16,
+        value_reg: u16,
+    ) -> Result<(), VmError> {
+        let value = read_register(frame, value_reg)?.clone();
+        let array = match read_register(frame, arr_reg)? {
+            Value::Array(a) => *a,
+            _ => return Err(VmError::TypeMismatch),
+        };
+        crate::array::push(array, &mut self.gc_heap, value)?;
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_new_weak_ref_regs(
+        &mut self,
+        frame: &mut Frame,
+        dst: u16,
+        target_reg: u16,
+    ) -> Result<(), VmError> {
+        let target = read_register(frame, target_reg)?.clone();
+        let weak_ref = crate::weak_refs::alloc_weak_ref(&mut self.gc_heap, &target)?;
+        write_register(frame, dst, Value::WeakRef(weak_ref))?;
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_new_finalization_registry_regs(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        callback_reg: u16,
+    ) -> Result<(), VmError> {
+        let callback = read_register(frame, callback_reg)?.clone();
+        let registry = crate::weak_refs::alloc_finalization_registry_with_context(
+            &mut self.gc_heap,
+            callback,
+            Some(context.clone()),
+        )?;
+        write_register(frame, dst, Value::FinalizationRegistry(registry))?;
         frame.pc += 1;
         Ok(())
     }

@@ -7,6 +7,8 @@
 //! # Contents
 //! - `this` and `new.target` register loads.
 //! - Upvalue load/store register operations.
+//! - Rest/arguments materialisation.
+//! - Try-handler stack maintenance.
 //!
 //! # Invariants
 //! - Inputs are decoded from the executable instruction format before reaching
@@ -17,8 +19,11 @@
 //! - [`crate::Frame`]
 //! - [`crate::executable`]
 
+use smallvec::SmallVec;
+
 use crate::{
-    Frame, Interpreter, Value, VmError, read_register, read_upvalue, store_upvalue, write_register,
+    Frame, Interpreter, TryHandler, Value, VmError, read_register, read_upvalue, store_upvalue,
+    write_register,
 };
 
 impl Interpreter {
@@ -74,6 +79,70 @@ impl Interpreter {
             .get(idx as usize)
             .ok_or(VmError::InvalidOperand)?;
         store_upvalue(&mut self.gc_heap, cell, value);
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_collect_rest_reg(
+        &mut self,
+        frame: &mut Frame,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        // Drain rather than clone: the rest array is built once per call and
+        // CollectRest is the single consumer.
+        let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
+        let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
+        write_register(frame, dst, Value::Array(array))?;
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_collect_arguments_reg(
+        &self,
+        frame: &mut Frame,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        write_register(frame, dst, Value::Undefined)?;
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_enter_try_regs(
+        &self,
+        frame: &mut Frame,
+        catch_off: i32,
+        finally_off: i32,
+        exc_register: u16,
+    ) -> Result<(), VmError> {
+        let next_pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)? as i64;
+        let resolve = |off: i32| -> Result<Option<u32>, VmError> {
+            if off == crate::NO_HANDLER_OFFSET {
+                return Ok(None);
+            }
+            let target = next_pc + off as i64;
+            if target < 0 || target > u32::MAX as i64 {
+                return Err(VmError::InvalidOperand);
+            }
+            Ok(Some(target as u32))
+        };
+        let catch_pc = resolve(catch_off)?;
+        let finally_pc = resolve(finally_off)?;
+        if catch_pc.is_none() && finally_pc.is_none() {
+            return Err(VmError::InvalidOperand);
+        }
+        frame.handlers.push(TryHandler {
+            catch_pc,
+            finally_pc,
+            exc_register,
+        });
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_leave_try(&self, frame: &mut Frame) -> Result<(), VmError> {
+        if frame.handlers.pop().is_none() {
+            return Err(VmError::InvalidOperand);
+        }
         frame.pc += 1;
         Ok(())
     }

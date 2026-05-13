@@ -33,13 +33,6 @@ pub(crate) fn const_operand(operand: Option<&Operand>) -> Result<u32, VmError> {
     }
 }
 
-pub(crate) fn imm32_operand(operand: Option<&Operand>) -> Result<i32, VmError> {
-    match operand {
-        Some(Operand::Imm32(v)) => Ok(*v),
-        _ => Err(VmError::InvalidOperand),
-    }
-}
-
 /// Apply a relative branch. Negative offsets are back-edges and poll the
 /// interrupt flag.
 pub(crate) fn apply_branch(

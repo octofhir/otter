@@ -334,11 +334,7 @@ impl JsArrayBuffer {
                     body.bytes.borrow().len()
                 }
             }
-            BufferStorage::Shared(body) => body
-                .bytes
-                .lock()
-                .map(|g| g.len())
-                .unwrap_or(0),
+            BufferStorage::Shared(body) => body.bytes.lock().map(|g| g.len()).unwrap_or(0),
         }
     }
 
@@ -355,9 +351,9 @@ impl JsArrayBuffer {
                 body.max_byte_length
                     .unwrap_or_else(|| body.bytes.borrow().len())
             }
-            BufferStorage::Shared(body) => body.max_byte_length.unwrap_or_else(|| {
-                body.bytes.lock().map(|g| g.len()).unwrap_or(0)
-            }),
+            BufferStorage::Shared(body) => body
+                .max_byte_length
+                .unwrap_or_else(|| body.bytes.lock().map(|g| g.len()).unwrap_or(0)),
         }
     }
 
@@ -400,9 +396,9 @@ impl JsArrayBuffer {
     pub fn borrow_bytes_mut(&self) -> BytesRefMut<'_> {
         match &self.storage {
             BufferStorage::Local(body) => BytesRefMut::Local(body.bytes.borrow_mut()),
-            BufferStorage::Shared(body) => BytesRefMut::Shared(
-                body.bytes.lock().expect("SharedArrayBuffer mutex poisoned"),
-            ),
+            BufferStorage::Shared(body) => {
+                BytesRefMut::Shared(body.bytes.lock().expect("SharedArrayBuffer mutex poisoned"))
+            }
         }
     }
 

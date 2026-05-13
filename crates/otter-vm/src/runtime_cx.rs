@@ -201,9 +201,7 @@ impl<'rt> NativeCtx<'rt> {
     /// harness in `crates/otter-test262/src/agent.rs`, future
     /// runtime extensions) can re-enter the interpreter without
     /// reimplementing the borrow split.
-    pub fn interp_mut_and_context(
-        &mut self,
-    ) -> (&mut Interpreter, Option<ExecutionContext>) {
+    pub fn interp_mut_and_context(&mut self) -> (&mut Interpreter, Option<ExecutionContext>) {
         (self.cx.interp, self.context.clone())
     }
 

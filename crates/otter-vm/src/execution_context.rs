@@ -31,14 +31,24 @@ use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit};
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     module: std::rc::Rc<BytecodeModule>,
+    decoded_strings: std::rc::Rc<[Option<String>]>,
 }
 
 impl ExecutionContext {
     /// Build a context from an owned bytecode module.
     #[must_use]
     pub fn from_module(module: BytecodeModule) -> Self {
+        let decoded_strings: std::rc::Rc<[Option<String>]> = module
+            .constants
+            .iter()
+            .map(|constant| match constant {
+                Constant::String { utf16 } => Some(String::from_utf16_lossy(utf16)),
+                _ => None,
+            })
+            .collect();
         Self {
             module: std::rc::Rc::new(module),
+            decoded_strings,
         }
     }
 
@@ -96,11 +106,12 @@ impl ExecutionContext {
         }
     }
 
-    /// Resolve a string constant as a Rust `String`.
+    /// Resolve a string constant as a borrowed UTF-8 string.
     #[must_use]
-    pub fn string_constant(&self, idx: u32) -> Option<String> {
-        self.string_constant_units(idx)
-            .map(String::from_utf16_lossy)
+    pub fn string_constant_str(&self, idx: u32) -> Option<&str> {
+        self.decoded_strings
+            .get(idx as usize)
+            .and_then(Option::as_deref)
     }
 
     /// Resolve a numeric constant's raw IEEE-754 bits.

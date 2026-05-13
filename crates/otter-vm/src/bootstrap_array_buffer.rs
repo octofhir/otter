@@ -49,7 +49,12 @@ pub(crate) fn install_array_buffer(
     {
         let mut builder = ObjectBuilder::from_object(heap, prototype);
         for (name, length, call) in AB_METHODS {
-            builder.method(name, *length, NativeCall::Static(*call), Attr::builtin_function())?;
+            builder.method(
+                name,
+                *length,
+                NativeCall::Static(*call),
+                Attr::builtin_function(),
+            )?;
         }
     }
     install_accessor(heap, prototype, "byteLength", ab_byte_length)?;
@@ -107,20 +112,25 @@ pub(crate) fn install_shared_array_buffer(
         let mut builder = ObjectBuilder::from_object(heap, prototype);
         // `slice` + `grow` are the spec methods on SAB. `transfer`
         // / `transferToFixedLength` belong to ArrayBuffer only.
-        builder.method("slice", 2, NativeCall::Static(ab_slice), Attr::builtin_function())?;
-        builder.method("grow", 1, NativeCall::Static(sab_grow), Attr::builtin_function())?;
+        builder.method(
+            "slice",
+            2,
+            NativeCall::Static(ab_slice),
+            Attr::builtin_function(),
+        )?;
+        builder.method(
+            "grow",
+            1,
+            NativeCall::Static(sab_grow),
+            Attr::builtin_function(),
+        )?;
     }
     install_accessor(heap, prototype, "byteLength", ab_byte_length)?;
     install_accessor(heap, prototype, "maxByteLength", ab_max_byte_length)?;
     install_accessor(heap, prototype, "growable", sab_growable)?;
 
-    let ctor = NativeFunction::new_constructor_static(
-        heap,
-        "SharedArrayBuffer",
-        1,
-        sab_ctor_call,
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor = NativeFunction::new_constructor_static(heap, "SharedArrayBuffer", 1, sab_ctor_call)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
@@ -285,10 +295,11 @@ fn dispatch_method(
     args: &[Value],
     method_name: &str,
 ) -> Result<Value, NativeError> {
-    let entry = array_buffer_prototype::lookup(method_name).ok_or_else(|| NativeError::TypeError {
-        name: "ArrayBuffer.prototype",
-        reason: format!("method {method_name} missing"),
-    })?;
+    let entry =
+        array_buffer_prototype::lookup(method_name).ok_or_else(|| NativeError::TypeError {
+            name: "ArrayBuffer.prototype",
+            reason: format!("method {method_name} missing"),
+        })?;
     let receiver = ctx.this_value().clone();
     let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
     let string_heap = ctx.interp_mut().string_heap_clone();
@@ -315,8 +326,8 @@ fn install_accessor(
     name: &'static str,
     call: crate::native_function::NativeFastFn,
 ) -> Result<(), JsSurfaceError> {
-    let getter = NativeFunction::new_static(heap, name, 0, call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let getter =
+        NativeFunction::new_static(heap, name, 0, call).map_err(|_| JsSurfaceError::OutOfMemory)?;
     let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
@@ -334,7 +345,9 @@ fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn ab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.maxByteLength")?;
-    Ok(Value::Number(NumberValue::from_i32(b.max_byte_length() as i32)))
+    Ok(Value::Number(NumberValue::from_i32(
+        b.max_byte_length() as i32
+    )))
 }
 
 fn ab_resizable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -362,12 +375,18 @@ fn receiver_ab(
 
 fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError { name, reason: message },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
         VmError::TypeMismatch => NativeError::TypeError {
             name,
             reason: "type mismatch".to_string(),
         },
-        VmError::RangeError { message } => NativeError::RangeError { name, reason: message },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

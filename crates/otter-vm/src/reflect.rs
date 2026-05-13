@@ -154,12 +154,7 @@ pub fn call(
                             );
                         }
                     }
-                    crate::object::set(
-                        obj,
-                        heap,
-                        "enumerable",
-                        Value::Boolean(flags.enumerable()),
-                    );
+                    crate::object::set(obj, heap, "enumerable", Value::Boolean(flags.enumerable()));
                     crate::object::set(
                         obj,
                         heap,
@@ -245,14 +240,13 @@ pub fn call(
                         // §10.1.9 step 4 — data path. Honour receiver:
                         // when target ≠ receiver, the data write lands
                         // on receiver, not target.
-                        return Ok(Value::Boolean(
-                            set_data_on_receiver(interp, context, &target, &key, value, &receiver)?,
-                        ));
+                        return Ok(Value::Boolean(set_data_on_receiver(
+                            interp, context, &target, &key, value, &receiver,
+                        )?));
                     }
                 }
             }
-            let ok =
-                interp.ordinary_set_data_value(context, target, &key, value, receiver, 0)?;
+            let ok = interp.ordinary_set_data_value(context, target, &key, value, receiver, 0)?;
             Ok(Value::Boolean(ok))
         }
         // §28.1.14 Reflect.setPrototypeOf(target, prototype)
@@ -354,7 +348,6 @@ fn expect_object_value(arg: Option<&Value>) -> Result<Value, VmError> {
         _ => Err(VmError::TypeMismatch),
     }
 }
-
 
 /// §7.1.19 ToPropertyKey, invoked observably for non-primitive
 /// argument values. Primitive inputs short-circuit to their canonical
@@ -612,4 +605,3 @@ fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc::Gc
         _ => crate::abstract_ops::is_constructor(value, context, heap),
     }
 }
-

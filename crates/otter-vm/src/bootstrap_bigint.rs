@@ -129,14 +129,12 @@ fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             reason: "BigInt is not a constructor".to_string(),
         });
     }
-    bigint::dispatch::call(BigIntMethod::Construct, args)
-        .map_err(|e| vm_to_native(e, "BigInt"))
+    bigint::dispatch::call(BigIntMethod::Construct, args).map_err(|e| vm_to_native(e, "BigInt"))
 }
 
 fn bigint_static_as_int_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let _ = ctx;
-    bigint::dispatch::call(BigIntMethod::AsIntN, args)
-        .map_err(|e| vm_to_native(e, "BigInt.asIntN"))
+    bigint::dispatch::call(BigIntMethod::AsIntN, args).map_err(|e| vm_to_native(e, "BigInt.asIntN"))
 }
 
 fn bigint_static_as_uint_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -231,14 +229,26 @@ fn oom(name: &'static str) -> NativeError {
 
 fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError { name, reason: message },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
         VmError::TypeMismatch => NativeError::TypeError {
             name,
             reason: "type mismatch".to_string(),
         },
-        VmError::RangeError { message } => NativeError::RangeError { name, reason: message },
-        VmError::SyntaxError { message } => NativeError::SyntaxError { name, reason: message },
-        VmError::Uncaught { value } => NativeError::Thrown { name, message: value },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
+        VmError::SyntaxError { message } => NativeError::SyntaxError {
+            name,
+            reason: message,
+        },
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

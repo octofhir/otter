@@ -652,14 +652,12 @@ fn install_symbol(
             }
             Some(other) => {
                 let string_heap = ctx.interp_mut().string_heap_clone();
-                let rendered = crate::string::JsString::from_str(
-                    &other.display_string(),
-                    &string_heap,
-                )
-                .map_err(|_| NativeError::TypeError {
-                    name: "Symbol",
-                    reason: "out of memory".to_string(),
-                })?;
+                let rendered =
+                    crate::string::JsString::from_str(&other.display_string(), &string_heap)
+                        .map_err(|_| NativeError::TypeError {
+                            name: "Symbol",
+                            reason: "out of memory".to_string(),
+                        })?;
                 Some(rendered)
             }
         };
@@ -702,12 +700,13 @@ fn install_symbol(
         match key {
             Some(key) => {
                 let string_heap = ctx.interp_mut().string_heap_clone();
-                let value = crate::string::JsString::from_str(&key, &string_heap).map_err(
-                    |_| NativeError::TypeError {
-                        name: "Symbol.keyFor",
-                        reason: "out of memory".to_string(),
-                    },
-                )?;
+                let value =
+                    crate::string::JsString::from_str(&key, &string_heap).map_err(|_| {
+                        NativeError::TypeError {
+                            name: "Symbol.keyFor",
+                            reason: "out of memory".to_string(),
+                        }
+                    })?;
                 Ok(Value::String(value))
             }
             None => Ok(Value::Undefined),
@@ -805,19 +804,11 @@ fn install_symbol(
             Attr::builtin_function(),
         )?;
         // §20.4.3.2 Symbol.prototype.description — accessor.
-        let getter = NativeFunction::new_static(
-            heap,
-            "get description",
-            0,
-            symbol_proto_description_get,
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc_desc = PropertyDescriptor::accessor(
-            Some(Value::NativeFunction(getter)),
-            None,
-            false,
-            true,
-        );
+        let getter =
+            NativeFunction::new_static(heap, "get description", 0, symbol_proto_description_get)
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let desc_desc =
+            PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
         if !object::define_own_property(prototype, heap, "description", desc_desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("description"));
         }
@@ -839,12 +830,8 @@ fn install_symbol(
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let for_desc =
         PropertyDescriptor::data(Value::NativeFunction(symbol_for_fn), true, false, true);
-    let key_for_desc = PropertyDescriptor::data(
-        Value::NativeFunction(symbol_key_for_fn),
-        true,
-        false,
-        true,
-    );
+    let key_for_desc =
+        PropertyDescriptor::data(Value::NativeFunction(symbol_key_for_fn), true, false, true);
     if !symbol_ctor.define_own_property(heap, &string_heap, "for", for_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("for"));
     }
@@ -935,19 +922,17 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         .own_property_descriptor(heap, string_heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match proto_desc.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data { value: Value::Object(p) } => Some(p),
+        crate::object::DescriptorKind::Data {
+            value: Value::Object(p),
+        } => Some(p),
         _ => None,
     }) {
         Some(p) => p,
         None => return Ok(()),
     };
-    let to_prim_fn = NativeFunction::new_static(
-        heap,
-        "[Symbol.toPrimitive]",
-        1,
-        symbol_proto_to_primitive,
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let to_prim_fn =
+        NativeFunction::new_static(heap, "[Symbol.toPrimitive]", 1, symbol_proto_to_primitive)
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
     object::set_symbol(
         prototype,

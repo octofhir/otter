@@ -60,7 +60,7 @@ mod tests {
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::Return,
-                    operands: vec![Operand::Register(0)],
+                    operands: vec![Operand::Register(0)].into(),
                 }],
                 spans: vec![SpanEntry {
                     pc: 0,

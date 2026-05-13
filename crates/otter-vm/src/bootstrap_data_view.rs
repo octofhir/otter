@@ -69,7 +69,12 @@ pub(crate) fn install_data_view(
     {
         let mut builder = ObjectBuilder::from_object(heap, prototype);
         for (name, length, call) in DATA_VIEW_METHODS {
-            builder.method(name, *length, NativeCall::Static(*call), Attr::builtin_function())?;
+            builder.method(
+                name,
+                *length,
+                NativeCall::Static(*call),
+                Attr::builtin_function(),
+            )?;
         }
     }
     // Accessor properties: buffer / byteLength / byteOffset.
@@ -139,10 +144,7 @@ pub fn install_data_view_well_knowns_post_bootstrap(
 // Constructor
 // ---------------------------------------------------------------
 
-fn data_view_ctor_call(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
+fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "DataView",
@@ -250,14 +252,9 @@ fn install_accessor(
     name: &'static str,
     call: crate::native_function::NativeFastFn,
 ) -> Result<(), JsSurfaceError> {
-    let getter = NativeFunction::new_static(heap, name, 0, call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let desc = PropertyDescriptor::accessor(
-        Some(Value::NativeFunction(getter)),
-        None,
-        false,
-        true,
-    );
+    let getter =
+        NativeFunction::new_static(heap, name, 0, call).map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
     }
@@ -306,10 +303,7 @@ fn receiver_dv(
 // Error coercion
 // ---------------------------------------------------------------
 
-fn intrinsic_to_native(
-    err: crate::intrinsics::IntrinsicError,
-    name: &str,
-) -> NativeError {
+fn intrinsic_to_native(err: crate::intrinsics::IntrinsicError, name: &str) -> NativeError {
     let _ = name;
     NativeError::TypeError {
         name: "DataView.prototype",
@@ -319,12 +313,18 @@ fn intrinsic_to_native(
 
 fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError { name, reason: message },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
         VmError::TypeMismatch => NativeError::TypeError {
             name,
             reason: "type mismatch".to_string(),
         },
-        VmError::RangeError { message } => NativeError::RangeError { name, reason: message },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

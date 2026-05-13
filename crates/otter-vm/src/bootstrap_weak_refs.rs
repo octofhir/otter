@@ -89,13 +89,9 @@ pub(crate) fn install_finalization_registry(
             Attr::builtin_function(),
         )?;
     }
-    let ctor = NativeFunction::new_constructor_static(
-        heap,
-        "FinalizationRegistry",
-        1,
-        fr_ctor_call,
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor =
+        NativeFunction::new_constructor_static(heap, "FinalizationRegistry", 1, fr_ctor_call)
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
@@ -122,7 +118,10 @@ pub fn install_weak_well_knowns_post_bootstrap(
     use crate::symbol::WellKnown;
 
     let tag_sym = well_known.get(WellKnown::ToStringTag);
-    for (ctor_name, tag_value) in [("WeakRef", "WeakRef"), ("FinalizationRegistry", "FinalizationRegistry")] {
+    for (ctor_name, tag_value) in [
+        ("WeakRef", "WeakRef"),
+        ("FinalizationRegistry", "FinalizationRegistry"),
+    ] {
         let Some(prototype) = ctor_prototype(global, heap, string_heap, ctor_name) else {
             continue;
         };
@@ -182,12 +181,9 @@ fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         });
     }
     let context = ctx.execution_context().cloned();
-    let registry = weak_refs::alloc_finalization_registry_with_context(
-        ctx.heap_mut(),
-        cleanup,
-        context,
-    )
-    .map_err(|_| oom("FinalizationRegistry"))?;
+    let registry =
+        weak_refs::alloc_finalization_registry_with_context(ctx.heap_mut(), cleanup, context)
+            .map_err(|_| oom("FinalizationRegistry"))?;
     Ok(Value::FinalizationRegistry(registry))
 }
 
@@ -201,8 +197,7 @@ fn weak_ref_proto_deref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Valu
 }
 
 fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let registry =
-        receiver_finalization_registry(ctx, "FinalizationRegistry.prototype.register")?;
+    let registry = receiver_finalization_registry(ctx, "FinalizationRegistry.prototype.register")?;
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let held_value = args.get(1).cloned().unwrap_or(Value::Undefined);
     let unregister_token = args.get(2).cloned();
@@ -253,7 +248,10 @@ fn ctor_prototype(
     let Some(Value::NativeFunction(f)) = object::get(global, heap, ctor_name) else {
         return None;
     };
-    let descriptor = f.own_property_descriptor(heap, string_heap, "prototype").ok().flatten()?;
+    let descriptor = f
+        .own_property_descriptor(heap, string_heap, "prototype")
+        .ok()
+        .flatten()?;
     match descriptor.kind {
         crate::object::DescriptorKind::Data {
             value: Value::Object(p),

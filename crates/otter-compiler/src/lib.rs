@@ -50,7 +50,7 @@ pub use compiled_module::{
 };
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Constant, Function, Instruction,
-    MappedArgumentBinding, Op, Operand, SourceKind as BytecodeSourceKind, SpanEntry,
+    MappedArgumentBinding, Op, Operand, OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_syntax::{
     Parsed, SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, with_program,
@@ -320,14 +320,14 @@ fn compile_program(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::LoadUndefined,
-                vec![Operand::Register(dst)],
+                [Operand::Register(dst)],
                 (program.span.start, program.span.end),
             );
             dst
         }
     };
     let span = (program.span.start, program.span.end);
-    cx.emit(Op::Return, vec![Operand::Register(return_reg)], span);
+    cx.emit(Op::Return, [Operand::Register(return_reg)], span);
 
     // Finalize `<main>` into the module's function table, then
     // drop `cx` so the module Rc has a single owner before
@@ -607,12 +607,12 @@ pub fn compile_module_fragment(
     let meta_uv = cx.module_state.as_ref().unwrap().import_meta_uv;
     cx.emit(
         Op::StoreUpvalue,
-        vec![Operand::Register(0), Operand::Imm32(env_uv as i32)],
+        [Operand::Register(0), Operand::Imm32(env_uv as i32)],
         span0,
     );
     cx.emit(
         Op::StoreUpvalue,
-        vec![Operand::Register(1), Operand::Imm32(meta_uv as i32)],
+        [Operand::Register(1), Operand::Imm32(meta_uv as i32)],
         span0,
     );
     cx.scratch = 2; // params occupy r0, r1
@@ -625,12 +625,12 @@ pub fn compile_module_fragment(
         let spec_const = cx.intern_string_constant(specifier);
         cx.emit(
             Op::ImportNamespace,
-            vec![Operand::Register(scratch), Operand::ConstIndex(spec_const)],
+            [Operand::Register(scratch), Operand::ConstIndex(spec_const)],
             span0,
         );
         cx.emit(
             Op::StoreUpvalue,
-            vec![Operand::Register(scratch), Operand::Imm32(record_uv as i32)],
+            [Operand::Register(scratch), Operand::Imm32(record_uv as i32)],
             span0,
         );
     }
@@ -656,7 +656,7 @@ pub fn compile_module_fragment(
     }
     cx.exit_scope();
 
-    cx.emit(Op::ReturnUndefined, vec![], span0);
+    cx.emit(Op::ReturnUndefined, [], span0);
 
     {
         let mut m = module.borrow_mut();
@@ -789,7 +789,7 @@ fn compile_export_inner_declaration(
                     Some(init) => compile_expr(cx, init, dspan)?,
                     None => {
                         let dst = cx.alloc_scratch();
-                        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], dspan);
+                        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], dspan);
                         dst
                     }
                 };
@@ -1493,11 +1493,12 @@ impl FunctionContext {
         self.code.push(Instruction {
             pc,
             op: Op::EnterTry,
-            operands: vec![
+            operands: [
                 Operand::Imm32(catch_offset),
                 Operand::Imm32(finally_offset),
                 Operand::Register(exc_reg),
-            ],
+            ]
+            .into(),
         });
         self.spans.push(SpanEntry { pc, span });
         self.next_pc += 1;
@@ -1530,12 +1531,12 @@ impl FunctionContext {
     /// Emit a placeholder branch and return its instruction index
     /// so a later [`Self::patch_branch`] can fill in the offset.
     fn emit_branch_placeholder(&mut self, op: Op, cond_reg: Option<u16>, span: (u32, u32)) -> u32 {
-        let mut operands: Vec<Operand> = Vec::with_capacity(2);
-        operands.push(Operand::Imm32(0));
-        if let Some(reg) = cond_reg {
-            operands.push(Operand::Register(reg));
-        }
         let pc = self.next_pc;
+        let operands = if let Some(reg) = cond_reg {
+            [Operand::Imm32(0), Operand::Register(reg)].into()
+        } else {
+            [Operand::Imm32(0)].into()
+        };
         self.code.push(Instruction { pc, op, operands });
         self.spans.push(SpanEntry { pc, span });
         self.next_pc += 1;
@@ -1653,9 +1654,13 @@ impl FunctionContext {
         (module.constants.len() - 1) as u32
     }
 
-    fn emit(&mut self, op: Op, operands: Vec<Operand>, span: (u32, u32)) {
+    fn emit(&mut self, op: Op, operands: impl Into<OperandList>, span: (u32, u32)) {
         let pc = self.next_pc;
-        self.code.push(Instruction { pc, op, operands });
+        self.code.push(Instruction {
+            pc,
+            op,
+            operands: operands.into(),
+        });
         self.spans.push(SpanEntry { pc, span });
         self.next_pc += 1;
     }
@@ -1666,12 +1671,12 @@ impl FunctionContext {
         match storage {
             BindingStorage::Register { reg } => self.emit(
                 Op::LoadLocal,
-                vec![Operand::Register(dst), Operand::Imm32(reg as i32)],
+                [Operand::Register(dst), Operand::Imm32(reg as i32)],
                 span,
             ),
             BindingStorage::Upvalue { idx } => self.emit(
                 Op::LoadUpvalue,
-                vec![Operand::Register(dst), Operand::Imm32(idx as i32)],
+                [Operand::Register(dst), Operand::Imm32(idx as i32)],
                 span,
             ),
         }
@@ -1692,7 +1697,7 @@ impl FunctionContext {
         let env_reg = self.alloc_scratch();
         self.emit(
             Op::LoadUpvalue,
-            vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+            [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
             span,
         );
         self.emit_store_property(env_reg, name, value_reg, span);
@@ -1714,7 +1719,7 @@ impl FunctionContext {
         let env_reg = self.alloc_scratch();
         self.emit(
             Op::LoadUpvalue,
-            vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+            [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
             span,
         );
         self.emit_store_property(env_reg, "default", value_reg, span);
@@ -1764,7 +1769,7 @@ impl FunctionContext {
         let name_const = self.intern_string_constant(name);
         self.emit(
             Op::LoadProperty,
-            vec![
+            [
                 Operand::Register(dst),
                 Operand::Register(obj_reg),
                 Operand::ConstIndex(name_const),
@@ -1779,12 +1784,12 @@ impl FunctionContext {
         match storage {
             BindingStorage::Register { reg } => self.emit(
                 Op::StoreLocal,
-                vec![Operand::Register(src), Operand::Imm32(reg as i32)],
+                [Operand::Register(src), Operand::Imm32(reg as i32)],
                 span,
             ),
             BindingStorage::Upvalue { idx } => self.emit(
                 Op::StoreUpvalue,
-                vec![Operand::Register(src), Operand::Imm32(idx as i32)],
+                [Operand::Register(src), Operand::Imm32(idx as i32)],
                 span,
             ),
         }
@@ -1892,7 +1897,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                         Some(init) => compile_expr(cx, init, span)?,
                         None => {
                             let dst = cx.alloc_scratch();
-                            cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
                             dst
                         }
                     };
@@ -2099,10 +2104,10 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             match &r.argument {
                 Some(arg) => {
                     let reg = compile_expr(cx, arg, span)?;
-                    cx.emit(Op::ReturnValue, vec![Operand::Register(reg)], span);
+                    cx.emit(Op::ReturnValue, [Operand::Register(reg)], span);
                 }
                 None => {
-                    cx.emit(Op::ReturnUndefined, vec![], span);
+                    cx.emit(Op::ReturnUndefined, [], span);
                 }
             }
             Ok(None)
@@ -2136,7 +2141,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
         Statement::ThrowStatement(s) => {
             let span = (s.span.start, s.span.end);
             let reg = compile_expr(cx, &s.argument, span)?;
-            cx.emit(Op::Throw, vec![Operand::Register(reg)], span);
+            cx.emit(Op::Throw, [Operand::Register(reg)], span);
             Ok(None)
         }
 
@@ -2244,7 +2249,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
                 let env_reg = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadUpvalue,
-                    vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+                    [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
                     span,
                 );
                 cx.emit_store_property(env_reg, &exported, value_reg, span);
@@ -2320,7 +2325,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             let env_reg = cx.alloc_scratch();
             cx.emit(
                 Op::LoadUpvalue,
-                vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+                [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
                 span,
             );
             cx.emit_store_property(env_reg, "default", value_reg, span);
@@ -2381,7 +2386,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
             let env_reg = cx.alloc_scratch();
             cx.emit(
                 Op::LoadUpvalue,
-                vec![Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
+                [Operand::Register(env_reg), Operand::Imm32(env_uv as i32)],
                 span,
             );
             cx.emit_store_property(env_reg, &exported_alias, record_reg, span);
@@ -2482,7 +2487,7 @@ fn compile_for_init_decl(
                     Some(init) => compile_expr(cx, init, span)?,
                     None => {
                         let dst = cx.alloc_scratch();
-                        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
                         dst
                     }
                 };
@@ -2820,7 +2825,7 @@ fn pre_declare_var_bindings(
         }
         let storage = cx.declare_binding(name, false, span)?;
         let dst = cx.alloc_scratch();
-        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
         cx.emit_store_storage(dst, storage, span);
         cx.mark_initialized(name);
     }
@@ -3052,7 +3057,7 @@ fn hoist_function_declarations(
         if cx.lookup_binding(&name).is_none() {
             let storage = cx.declare_binding(&name, false, span)?;
             let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
             cx.emit_store_storage(dst, storage, span);
             cx.mark_initialized(&name);
         }
@@ -3190,7 +3195,7 @@ fn compile_function_full(
     let tmp = parent.alloc_scratch();
     parent.emit(
         Op::MakeFunction,
-        vec![Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+        [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
         span,
     );
     parent.emit_store_storage(tmp, self_storage, span);
@@ -3207,7 +3212,7 @@ fn compile_function_full(
         // Skip if a parameter named `arguments` already exists.
         let storage = parent.declare_binding("arguments", false, span)?;
         let tmp = parent.alloc_scratch();
-        parent.emit(Op::CollectArguments, vec![Operand::Register(tmp)], span);
+        parent.emit(Op::CollectArguments, [Operand::Register(tmp)], span);
         parent.emit_store_storage(tmp, storage, span);
         parent.mark_initialized("arguments");
     }
@@ -3456,7 +3461,7 @@ fn compile_assignment(
                 Some(s) => cx.emit_load_storage(current, s, span),
                 None => {
                     let global = cx.alloc_scratch();
-                    cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                    cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
                     cx.emit_load_property(current, global, &name, span);
                 }
             }
@@ -3483,7 +3488,7 @@ fn compile_assignment(
         None => {
             // Store to the globalThis property table.
             let global = cx.alloc_scratch();
-            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+            cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
             let name_idx = cx.intern_string_constant(&name);
             let scratch = cx.alloc_scratch();
             cx.emit(
@@ -3519,7 +3524,7 @@ fn compile_logical_assignment(
                 cx.emit_load_storage(load, BindingStorage::Upvalue { idx }, span);
             } else {
                 let global = cx.alloc_scratch();
-                cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
                 cx.emit_load_property(load, global, &name, span);
             }
             load
@@ -3570,7 +3575,7 @@ fn compile_logical_assignment(
             let bool_r = cx.alloc_scratch();
             cx.emit(
                 Op::ToBoolean,
-                vec![Operand::Register(bool_r), Operand::Register(cur)],
+                [Operand::Register(bool_r), Operand::Register(cur)],
                 span,
             );
             bool_r
@@ -3580,13 +3585,13 @@ fn compile_logical_assignment(
             let bool_r = cx.alloc_scratch();
             cx.emit(
                 Op::ToBoolean,
-                vec![Operand::Register(bool_r), Operand::Register(cur)],
+                [Operand::Register(bool_r), Operand::Register(cur)],
                 span,
             );
             let not_r = cx.alloc_scratch();
             cx.emit(
                 Op::LogicalNot,
-                vec![Operand::Register(not_r), Operand::Register(bool_r)],
+                [Operand::Register(not_r), Operand::Register(bool_r)],
                 span,
             );
             not_r
@@ -3595,9 +3600,9 @@ fn compile_logical_assignment(
             // `??=` — assign only when cur is null/undefined.
             // Compare cur === null || cur === undefined.
             let undef_r = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, vec![Operand::Register(undef_r)], span);
+            cx.emit(Op::LoadUndefined, [Operand::Register(undef_r)], span);
             let null_r = cx.alloc_scratch();
-            cx.emit(Op::LoadNull, vec![Operand::Register(null_r)], span);
+            cx.emit(Op::LoadNull, [Operand::Register(null_r)], span);
             let eq_undef = cx.alloc_scratch();
             cx.emit(
                 Op::Equal,
@@ -3623,7 +3628,7 @@ fn compile_logical_assignment(
             let merged = cx.alloc_scratch();
             cx.emit(
                 Op::ToBoolean,
-                vec![Operand::Register(merged), Operand::Register(eq_undef)],
+                [Operand::Register(merged), Operand::Register(eq_undef)],
                 span,
             );
             // `merged = merged || eq_null`. The simplest is a
@@ -3631,7 +3636,7 @@ fn compile_logical_assignment(
             let jump_if_true = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(merged), span);
             cx.emit(
                 Op::StoreLocal,
-                vec![Operand::Register(eq_null), Operand::Imm32(merged as i32)],
+                [Operand::Register(eq_null), Operand::Imm32(merged as i32)],
                 span,
             );
             cx.patch_branch_to_here(jump_if_true);
@@ -3644,7 +3649,7 @@ fn compile_logical_assignment(
     let result = cx.alloc_scratch();
     cx.emit(
         Op::StoreLocal,
-        vec![Operand::Register(cur), Operand::Imm32(result as i32)],
+        [Operand::Register(cur), Operand::Imm32(result as i32)],
         span,
     );
     let skip = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(test_reg), span);
@@ -3654,7 +3659,7 @@ fn compile_logical_assignment(
     assign_to_target(cx, &a.left, new_value, span)?;
     cx.emit(
         Op::StoreLocal,
-        vec![Operand::Register(new_value), Operand::Imm32(result as i32)],
+        [Operand::Register(new_value), Operand::Imm32(result as i32)],
         span,
     );
     cx.patch_branch_to_here(skip);
@@ -3734,7 +3739,7 @@ fn assign_array_pattern(
         let idx_reg = cx.alloc_scratch();
         cx.emit(
             Op::LoadInt32,
-            vec![Operand::Register(idx_reg), Operand::Imm32(idx as i32)],
+            [Operand::Register(idx_reg), Operand::Imm32(idx as i32)],
             elem_span,
         );
         let val_reg = cx.alloc_scratch();
@@ -3814,7 +3819,7 @@ fn assign_object_pattern(
                             let s = cx.intern_string_constant(id.name.as_str());
                             cx.emit(
                                 Op::LoadString,
-                                vec![Operand::Register(r), Operand::ConstIndex(s)],
+                                [Operand::Register(r), Operand::ConstIndex(s)],
                                 pspan,
                             );
                             r
@@ -3863,7 +3868,7 @@ fn assign_object_pattern(
         // §13.15.5 RestObjectAssignment — same shape as the
         // BindingPattern variant.
         let rest_obj = cx.alloc_scratch();
-        cx.emit(Op::NewObject, vec![Operand::Register(rest_obj)], span);
+        cx.emit(Op::NewObject, [Operand::Register(rest_obj)], span);
         let scratch = cx.alloc_scratch();
         cx.emit(
             Op::ObjectCall,
@@ -3947,7 +3952,7 @@ fn apply_default(
     let tag_reg = cx.alloc_scratch();
     cx.emit(
         Op::TypeOf,
-        vec![Operand::Register(tag_reg), Operand::Register(value_reg)],
+        [Operand::Register(tag_reg), Operand::Register(value_reg)],
         span,
     );
     let undef_str_reg = cx.alloc_scratch();
@@ -3977,14 +3982,14 @@ fn apply_default(
     let init_val = compile_expr(cx, init, span)?;
     cx.emit(
         Op::StoreLocal,
-        vec![Operand::Register(init_val), Operand::Imm32(result as i32)],
+        [Operand::Register(init_val), Operand::Imm32(result as i32)],
         span,
     );
     let jump_to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
     cx.patch_branch_to_here(jump_to_use_value);
     cx.emit(
         Op::StoreLocal,
-        vec![Operand::Register(value_reg), Operand::Imm32(result as i32)],
+        [Operand::Register(value_reg), Operand::Imm32(result as i32)],
         span,
     );
     cx.patch_branch_to_here(jump_to_end);
@@ -4021,7 +4026,7 @@ fn store_identifier(
         None => {
             // §10.2.4.1 PutValue fallback to globalThis.
             let global = cx.alloc_scratch();
-            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+            cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
             let name_idx = cx.intern_string_constant(name);
             let scratch = cx.alloc_scratch();
             cx.emit(
@@ -4180,7 +4185,7 @@ fn compile_rest_parameter(
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     let rest_reg = parent.alloc_scratch();
-    parent.emit(Op::CollectRest, vec![Operand::Register(rest_reg)], span);
+    parent.emit(Op::CollectRest, [Operand::Register(rest_reg)], span);
     destructure_into(parent, rest_reg, pattern, span)
 }
 
@@ -4202,7 +4207,7 @@ fn apply_default_into(
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     let undef_reg = parent.alloc_scratch();
-    parent.emit(Op::LoadUndefined, vec![Operand::Register(undef_reg)], span);
+    parent.emit(Op::LoadUndefined, [Operand::Register(undef_reg)], span);
     let cond_reg = parent.alloc_scratch();
     parent.emit(
         Op::Equal,
@@ -4300,7 +4305,7 @@ fn destructure_array_inner(
     let iter_reg = parent.alloc_scratch();
     parent.emit(
         Op::GetIterator,
-        vec![Operand::Register(iter_reg), Operand::Register(src_reg)],
+        [Operand::Register(iter_reg), Operand::Register(src_reg)],
         span,
     );
     for elem in &pattern.elements {
@@ -4326,7 +4331,7 @@ fn destructure_array_inner(
         let arr_reg = parent.alloc_scratch();
         parent.emit(
             Op::NewArray,
-            vec![Operand::Register(arr_reg), Operand::ConstIndex(0)],
+            [Operand::Register(arr_reg), Operand::ConstIndex(0)],
             span,
         );
         let value_reg = parent.alloc_scratch();
@@ -4344,7 +4349,7 @@ fn destructure_array_inner(
         let exit = parent.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
         parent.emit(
             Op::ArrayPush,
-            vec![Operand::Register(arr_reg), Operand::Register(value_reg)],
+            [Operand::Register(arr_reg), Operand::Register(value_reg)],
             span,
         );
         let back = parent.emit_branch_placeholder(Op::Jump, None, span);
@@ -4383,7 +4388,7 @@ fn destructure_object_inner(
                     let s = parent.intern_string_constant(id.name.as_str());
                     parent.emit(
                         Op::LoadString,
-                        vec![Operand::Register(r), Operand::ConstIndex(s)],
+                        [Operand::Register(r), Operand::ConstIndex(s)],
                         prop_span,
                     );
                     r
@@ -4455,7 +4460,7 @@ fn destructure_object_inner(
         // copy every enumerable own property of `src`, then delete
         // each previously-extracted key.
         let rest_obj = parent.alloc_scratch();
-        parent.emit(Op::NewObject, vec![Operand::Register(rest_obj)], span);
+        parent.emit(Op::NewObject, [Operand::Register(rest_obj)], span);
         let scratch = parent.alloc_scratch();
         parent.emit(
             Op::ObjectCall,
@@ -4533,7 +4538,7 @@ fn compile_expr_as_property_key(
             let s = cx.intern_string_constant(id.name.as_str());
             cx.emit(
                 Op::LoadString,
-                vec![Operand::Register(r), Operand::ConstIndex(s)],
+                [Operand::Register(r), Operand::ConstIndex(s)],
                 span,
             );
             Ok(r)
@@ -4622,7 +4627,7 @@ fn compile_arrow_function(
         };
         let inner_span = (es.span.start, es.span.end);
         let reg = compile_expr(parent, &es.expression, inner_span)?;
-        parent.emit(Op::ReturnValue, vec![Operand::Register(reg)], inner_span);
+        parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
     } else {
         for stmt in &arrow.body.statements {
             compile_statement(parent, stmt)?;
@@ -4671,7 +4676,7 @@ fn emit_make_callable(
     if captures.is_empty() && !is_arrow {
         cx.emit(
             Op::MakeFunction,
-            vec![Operand::Register(dst), Operand::ConstIndex(function_const)],
+            [Operand::Register(dst), Operand::ConstIndex(function_const)],
             span,
         );
         return;
@@ -4705,11 +4710,7 @@ fn compile_expr(
     match expr {
         Expression::Identifier(id) if id.name.as_str() == "undefined" => {
             let dst = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadUndefined,
-                vec![Operand::Register(dst)],
-                enclosing_span,
-            );
+            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], enclosing_span);
             Ok(dst)
         }
 
@@ -4723,11 +4724,7 @@ fn compile_expr(
                 && find_module_import_binding(cx, "globalThis").is_none() =>
         {
             let dst = cx.alloc_scratch();
-            cx.emit(
-                Op::LoadGlobalThis,
-                vec![Operand::Register(dst)],
-                enclosing_span,
-            );
+            cx.emit(Op::LoadGlobalThis, [Operand::Register(dst)], enclosing_span);
             Ok(dst)
         }
 
@@ -4735,7 +4732,7 @@ fn compile_expr(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::LoadNull,
-                vec![Operand::Register(dst)],
+                [Operand::Register(dst)],
                 (lit.span.start, lit.span.end),
             );
             Ok(dst)
@@ -4744,7 +4741,7 @@ fn compile_expr(
         Expression::ThisExpression(t) => {
             let span = (t.span.start, t.span.end);
             let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadThis, vec![Operand::Register(dst)], span);
+            cx.emit(Op::LoadThis, [Operand::Register(dst)], span);
             Ok(dst)
         }
 
@@ -4770,7 +4767,7 @@ fn compile_expr(
                     let const_idx = cx.intern_number_constant(f64::NAN);
                     cx.emit(
                         Op::LoadNumber,
-                        vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                        [Operand::Register(dst), Operand::ConstIndex(const_idx)],
                         span,
                     );
                     return Ok(dst);
@@ -4780,7 +4777,7 @@ fn compile_expr(
                     let const_idx = cx.intern_number_constant(f64::INFINITY);
                     cx.emit(
                         Op::LoadNumber,
-                        vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                        [Operand::Register(dst), Operand::ConstIndex(const_idx)],
                         span,
                     );
                     return Ok(dst);
@@ -4807,7 +4804,7 @@ fn compile_expr(
                 let kind_idx = cx.intern_string_constant(id.name.as_str());
                 cx.emit(
                     Op::LoadBuiltinError,
-                    vec![Operand::Register(dst), Operand::ConstIndex(kind_idx)],
+                    [Operand::Register(dst), Operand::ConstIndex(kind_idx)],
                     span,
                 );
                 return Ok(dst);
@@ -4860,7 +4857,7 @@ fn compile_expr(
                         BindingStorage::Register { reg } => reg,
                         BindingStorage::Upvalue { idx } => idx,
                     };
-                    cx.emit(Op::TdzError, vec![Operand::Imm32(diag_idx as i32)], span);
+                    cx.emit(Op::TdzError, [Operand::Imm32(diag_idx as i32)], span);
                 }
                 return Ok(dst);
             }
@@ -4869,7 +4866,7 @@ fn compile_expr(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadUpvalue,
-                    vec![Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
+                    [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
                     span,
                 );
                 return Ok(dst);
@@ -4887,7 +4884,7 @@ fn compile_expr(
             let name_idx = cx.intern_string_constant(id.name.as_str());
             cx.emit(
                 Op::LoadGlobalOrThrow,
-                vec![Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                [Operand::Register(dst), Operand::ConstIndex(name_idx)],
                 span,
             );
             Ok(dst)
@@ -4902,7 +4899,7 @@ fn compile_expr(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::StoreLocal,
-                vec![Operand::Register(left), Operand::Imm32(dst as i32)],
+                [Operand::Register(left), Operand::Imm32(dst as i32)],
                 span,
             );
             // Note: locals and scratch share the same register
@@ -4928,7 +4925,7 @@ fn compile_expr(
                     let right = compile_expr(cx, &l.right, span)?;
                     cx.emit(
                         Op::StoreLocal,
-                        vec![Operand::Register(right), Operand::Imm32(dst as i32)],
+                        [Operand::Register(right), Operand::Imm32(dst as i32)],
                         span,
                     );
                     cx.patch_branch_to_here(skip);
@@ -4936,7 +4933,7 @@ fn compile_expr(
                         let out = cx.alloc_scratch();
                         cx.emit(
                             Op::LoadLocal,
-                            vec![Operand::Register(out), Operand::Imm32(dst as i32)],
+                            [Operand::Register(out), Operand::Imm32(dst as i32)],
                             span,
                         );
                         out
@@ -4948,14 +4945,14 @@ fn compile_expr(
             let right = compile_expr(cx, &l.right, span)?;
             cx.emit(
                 Op::StoreLocal,
-                vec![Operand::Register(right), Operand::Imm32(dst as i32)],
+                [Operand::Register(right), Operand::Imm32(dst as i32)],
                 span,
             );
             cx.patch_branch_to_here(short_circuit);
             let out = cx.alloc_scratch();
             cx.emit(
                 Op::LoadLocal,
-                vec![Operand::Register(out), Operand::Imm32(dst as i32)],
+                [Operand::Register(out), Operand::Imm32(dst as i32)],
                 span,
             );
             Ok(out)
@@ -4969,7 +4966,7 @@ fn compile_expr(
             let cons = compile_expr(cx, &c.consequent, span)?;
             cx.emit(
                 Op::StoreLocal,
-                vec![Operand::Register(cons), Operand::Imm32(dst as i32)],
+                [Operand::Register(cons), Operand::Imm32(dst as i32)],
                 span,
             );
             let to_end = cx.emit_branch_placeholder(Op::Jump, None, span);
@@ -4977,14 +4974,14 @@ fn compile_expr(
             let alt = compile_expr(cx, &c.alternate, span)?;
             cx.emit(
                 Op::StoreLocal,
-                vec![Operand::Register(alt), Operand::Imm32(dst as i32)],
+                [Operand::Register(alt), Operand::Imm32(dst as i32)],
                 span,
             );
             cx.patch_branch_to_here(to_end);
             let out = cx.alloc_scratch();
             cx.emit(
                 Op::LoadLocal,
-                vec![Operand::Register(out), Operand::Imm32(dst as i32)],
+                [Operand::Register(out), Operand::Imm32(dst as i32)],
                 span,
             );
             Ok(out)
@@ -5002,7 +4999,7 @@ fn compile_expr(
             };
             cx.emit(
                 Op::LoadString,
-                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                [Operand::Register(dst), Operand::ConstIndex(const_idx)],
                 (lit.span.start, lit.span.end),
             );
             Ok(dst)
@@ -5024,7 +5021,7 @@ fn compile_expr(
             let const_idx = cx.intern_bigint_constant(&decimal);
             cx.emit(
                 Op::LoadBigInt,
-                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                [Operand::Register(dst), Operand::ConstIndex(const_idx)],
                 span,
             );
             Ok(dst)
@@ -5087,7 +5084,7 @@ fn compile_expr(
             let const_idx = cx.intern_regexp_constant(&pattern_utf16, &flags_str);
             cx.emit(
                 Op::LoadRegExp,
-                vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                [Operand::Register(dst), Operand::ConstIndex(const_idx)],
                 span,
             );
             Ok(dst)
@@ -5104,14 +5101,14 @@ fn compile_expr(
             {
                 cx.emit(
                     Op::LoadInt32,
-                    vec![Operand::Register(dst), Operand::Imm32(lit.value as i32)],
+                    [Operand::Register(dst), Operand::Imm32(lit.value as i32)],
                     span,
                 );
             } else {
                 let const_idx = cx.intern_number_constant(lit.value);
                 cx.emit(
                     Op::LoadNumber,
-                    vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                    [Operand::Register(dst), Operand::ConstIndex(const_idx)],
                     span,
                 );
             }
@@ -5127,7 +5124,7 @@ fn compile_expr(
                 } else {
                     Op::LoadFalse
                 },
-                vec![Operand::Register(dst)],
+                [Operand::Register(dst)],
                 span,
             );
             Ok(dst)
@@ -5182,7 +5179,7 @@ fn compile_expr(
                 // <https://tc39.es/ecma262/#sec-delete-operator-runtime-semantics-evaluation>
                 let _ = compile_expr(cx, &u.argument, span)?;
                 let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadTrue, vec![Operand::Register(dst)], span);
+                cx.emit(Op::LoadTrue, [Operand::Register(dst)], span);
                 return Ok(dst);
             }
             // §13.5.2 `void expr` — evaluate, discard, return `undefined`.
@@ -5190,7 +5187,7 @@ fn compile_expr(
             if matches!(u.operator, UnaryOperator::Void) {
                 let _ = compile_expr(cx, &u.argument, span)?;
                 let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
                 return Ok(dst);
             }
             // §13.5.3 `typeof Identifier` — IsUnresolvableReference
@@ -5215,13 +5212,13 @@ fn compile_expr(
                     let name_idx = cx.intern_string_constant(name);
                     cx.emit(
                         Op::LoadGlobalOrUndefined,
-                        vec![Operand::Register(value_reg), Operand::ConstIndex(name_idx)],
+                        [Operand::Register(value_reg), Operand::ConstIndex(name_idx)],
                         span,
                     );
                     let dst = cx.alloc_scratch();
                     cx.emit(
                         Op::TypeOf,
-                        vec![Operand::Register(dst), Operand::Register(value_reg)],
+                        [Operand::Register(dst), Operand::Register(value_reg)],
                         span,
                     );
                     return Ok(dst);
@@ -5256,7 +5253,7 @@ fn compile_expr(
             };
             cx.emit(
                 op,
-                vec![Operand::Register(dst), Operand::Register(inner_in)],
+                [Operand::Register(dst), Operand::Register(inner_in)],
                 span,
             );
             Ok(dst)
@@ -5268,7 +5265,7 @@ fn compile_expr(
         Expression::SequenceExpression(s) => {
             let span = (s.span.start, s.span.end);
             let mut last = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, vec![Operand::Register(last)], span);
+            cx.emit(Op::LoadUndefined, [Operand::Register(last)], span);
             for expr in s.expressions.iter() {
                 last = compile_expr(cx, expr, span)?;
             }
@@ -5324,7 +5321,7 @@ fn compile_expr(
             let key_idx = cx.intern_string_constant(&mangled);
             cx.emit(
                 Op::LoadString,
-                vec![Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
+                [Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
                 pspan,
             );
             let obj_reg = compile_expr(cx, &p.right, pspan)?;
@@ -5470,7 +5467,7 @@ fn compile_expr(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::LoadInt32,
-                    vec![Operand::Register(dst), Operand::Imm32(bpe)],
+                    [Operand::Register(dst), Operand::Imm32(bpe)],
                     span,
                 );
                 return Ok(dst);
@@ -5491,7 +5488,7 @@ fn compile_expr(
                 let const_idx = cx.intern_number_constant(value);
                 cx.emit(
                     Op::LoadNumber,
-                    vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+                    [Operand::Register(dst), Operand::ConstIndex(const_idx)],
                     span,
                 );
                 return Ok(dst);
@@ -5507,7 +5504,7 @@ fn compile_expr(
                 let name_idx = cx.intern_string_constant(m.property.name.as_str());
                 cx.emit(
                     Op::MathLoad,
-                    vec![Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                    [Operand::Register(dst), Operand::ConstIndex(name_idx)],
                     span,
                 );
                 return Ok(dst);
@@ -5522,7 +5519,7 @@ fn compile_expr(
                 let name_idx = cx.intern_string_constant(m.property.name.as_str());
                 cx.emit(
                     Op::SymbolLoad,
-                    vec![Operand::Register(dst), Operand::ConstIndex(name_idx)],
+                    [Operand::Register(dst), Operand::ConstIndex(name_idx)],
                     span,
                 );
                 return Ok(dst);
@@ -5603,7 +5600,7 @@ fn compile_expr(
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
                 if arg_regs.is_empty() {
                     let dst = cx.alloc_scratch();
-                    cx.emit(Op::NewObject, vec![Operand::Register(dst)], new_span);
+                    cx.emit(Op::NewObject, [Operand::Register(dst)], new_span);
                     return Ok(dst);
                 }
                 return Ok(arg_regs[0]);
@@ -5720,12 +5717,12 @@ fn compile_expr(
                 let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
                 let locale_reg = arg_regs.first().copied().unwrap_or_else(|| {
                     let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], new_span);
                     r
                 });
                 let options_reg = arg_regs.get(1).copied().unwrap_or_else(|| {
                     let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], new_span);
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], new_span);
                     r
                 });
                 let dst = cx.alloc_scratch();
@@ -5840,7 +5837,7 @@ fn compile_expr(
                             // `Array.prototype` callbacks, and JSON
                             // serialisation.
                             let r = cx.alloc_scratch();
-                            cx.emit(Op::LoadHole, vec![Operand::Register(r)], span);
+                            cx.emit(Op::LoadHole, [Operand::Register(r)], span);
                             element_regs.push(r);
                         }
                         other => {
@@ -5865,7 +5862,7 @@ fn compile_expr(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::NewArray,
-                    vec![Operand::Register(dst), Operand::ConstIndex(0)],
+                    [Operand::Register(dst), Operand::ConstIndex(0)],
                     span,
                 );
                 for el in &arr.elements {
@@ -5880,10 +5877,10 @@ fn compile_expr(
                             // above. `Op::ArrayPush` simply forwards
                             // the register value into the body.
                             let r = cx.alloc_scratch();
-                            cx.emit(Op::LoadHole, vec![Operand::Register(r)], span);
+                            cx.emit(Op::LoadHole, [Operand::Register(r)], span);
                             cx.emit(
                                 Op::ArrayPush,
-                                vec![Operand::Register(dst), Operand::Register(r)],
+                                [Operand::Register(dst), Operand::Register(r)],
                                 span,
                             );
                         }
@@ -5892,7 +5889,7 @@ fn compile_expr(
                             let r = compile_expr(cx, expr, span)?;
                             cx.emit(
                                 Op::ArrayPush,
-                                vec![Operand::Register(dst), Operand::Register(r)],
+                                [Operand::Register(dst), Operand::Register(r)],
                                 span,
                             );
                         }
@@ -5905,7 +5902,7 @@ fn compile_expr(
         Expression::ObjectExpression(obj) => {
             let span = (obj.span.start, obj.span.end);
             let dst = cx.alloc_scratch();
-            cx.emit(Op::NewObject, vec![Operand::Register(dst)], span);
+            cx.emit(Op::NewObject, [Operand::Register(dst)], span);
             for prop in &obj.properties {
                 match prop {
                     oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) => {
@@ -5949,7 +5946,7 @@ fn compile_expr(
                                     let const_idx = cx.intern_string_constant(key);
                                     cx.emit(
                                         Op::LoadString,
-                                        vec![Operand::Register(r), Operand::ConstIndex(const_idx)],
+                                        [Operand::Register(r), Operand::ConstIndex(const_idx)],
                                         key_span,
                                     );
                                     r
@@ -5967,7 +5964,7 @@ fn compile_expr(
                             };
                             let function_reg = compile_expr(cx, &p.value, key_span)?;
                             let desc_reg = cx.alloc_scratch();
-                            cx.emit(Op::NewObject, vec![Operand::Register(desc_reg)], key_span);
+                            cx.emit(Op::NewObject, [Operand::Register(desc_reg)], key_span);
                             let accessor_key = match p.kind {
                                 oxc_ast::ast::PropertyKind::Get => "get",
                                 oxc_ast::ast::PropertyKind::Set => "set",
@@ -5986,7 +5983,7 @@ fn compile_expr(
                                 key_span,
                             );
                             let true_reg = cx.alloc_scratch();
-                            cx.emit(Op::LoadTrue, vec![Operand::Register(true_reg)], key_span);
+                            cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], key_span);
                             for attr in ["enumerable", "configurable"] {
                                 let attr_const = cx.intern_string_constant(attr);
                                 let attr_scratch = cx.alloc_scratch();
@@ -6141,7 +6138,7 @@ fn compile_expr(
             let span = (meta.span.start, meta.span.end);
             if meta.meta.name.as_str() == "new" && meta.property.name.as_str() == "target" {
                 let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadNewTarget, vec![Operand::Register(dst)], span);
+                cx.emit(Op::LoadNewTarget, [Operand::Register(dst)], span);
                 return Ok(dst);
             }
             // The only legal MetaProperty inside a module is
@@ -6208,13 +6205,13 @@ fn compile_expr(
                     let ns_dst = cx.alloc_scratch();
                     cx.emit(
                         Op::ImportNamespace,
-                        vec![Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
+                        [Operand::Register(ns_dst), Operand::ConstIndex(spec_const)],
                         span,
                     );
                     let promise_dst = cx.alloc_scratch();
                     cx.emit(
                         Op::PromiseFulfilledOf,
-                        vec![Operand::Register(promise_dst), Operand::Register(ns_dst)],
+                        [Operand::Register(promise_dst), Operand::Register(ns_dst)],
                         span,
                     );
                     Ok(promise_dst)
@@ -6227,7 +6224,7 @@ fn compile_expr(
                     let promise_dst = cx.alloc_scratch();
                     cx.emit(
                         Op::ImportNamespaceDynamic,
-                        vec![Operand::Register(promise_dst), Operand::Register(spec_reg)],
+                        [Operand::Register(promise_dst), Operand::Register(spec_reg)],
                         span,
                     );
                     Ok(promise_dst)
@@ -6241,7 +6238,7 @@ fn compile_expr(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::Await,
-                vec![Operand::Register(dst), Operand::Register(src)],
+                [Operand::Register(dst), Operand::Register(src)],
                 span,
             );
             Ok(dst)
@@ -6283,7 +6280,7 @@ fn compile_expr(
                 let iter_reg = cx.alloc_scratch();
                 cx.emit(
                     Op::GetIterator,
-                    vec![Operand::Register(iter_reg), Operand::Register(arg_reg)],
+                    [Operand::Register(iter_reg), Operand::Register(arg_reg)],
                     span,
                 );
                 let value_reg = cx.alloc_scratch();
@@ -6302,28 +6299,28 @@ fn compile_expr(
                 let yield_dst = cx.alloc_scratch();
                 cx.emit(
                     Op::Yield,
-                    vec![Operand::Register(yield_dst), Operand::Register(value_reg)],
+                    [Operand::Register(yield_dst), Operand::Register(value_reg)],
                     span,
                 );
                 let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
                 cx.patch_branch(back_jmp, loop_top);
                 cx.patch_branch_to_here(exit_jmp);
                 let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
                 return Ok(dst);
             }
             let src = match &y.argument {
                 Some(arg) => compile_expr(cx, arg, span)?,
                 None => {
                     let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
                     r
                 }
             };
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::Yield,
-                vec![Operand::Register(dst), Operand::Register(src)],
+                [Operand::Register(dst), Operand::Register(src)],
                 span,
             );
             Ok(dst)
@@ -6380,7 +6377,7 @@ fn compile_expr(
                         Some(s) => cx.emit_load_storage(old, s, span),
                         None => {
                             let global = cx.alloc_scratch();
-                            cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                            cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
                             cx.emit_load_property(old, global, &name, span);
                         }
                     }
@@ -6424,13 +6421,13 @@ fn compile_expr(
             let cur = cx.alloc_scratch();
             cx.emit(
                 Op::ToNumber,
-                vec![Operand::Register(cur), Operand::Register(old)],
+                [Operand::Register(cur), Operand::Register(old)],
                 span,
             );
             let one = cx.alloc_scratch();
             cx.emit(
                 Op::LoadInt32,
-                vec![Operand::Register(one), Operand::Imm32(1)],
+                [Operand::Register(one), Operand::Imm32(1)],
                 span,
             );
             let next = cx.alloc_scratch();
@@ -6452,7 +6449,7 @@ fn compile_expr(
                     Some(s) => cx.emit_store_storage(next, s, span),
                     None => {
                         let global = cx.alloc_scratch();
-                        cx.emit(Op::LoadGlobalThis, vec![Operand::Register(global)], span);
+                        cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
                         let name_idx = cx.intern_string_constant(&name);
                         let scratch = cx.alloc_scratch();
                         cx.emit(
@@ -6531,7 +6528,7 @@ fn compile_for_of_statement(
     let iter_reg = cx.alloc_scratch();
     cx.emit(
         Op::GetIterator,
-        vec![Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+        [Operand::Register(iter_reg), Operand::Register(iterable_reg)],
         span,
     );
 
@@ -6565,7 +6562,7 @@ fn compile_for_of_statement(
         let awaited = cx.alloc_scratch();
         cx.emit(
             Op::Await,
-            vec![Operand::Register(awaited), Operand::Register(value_reg)],
+            [Operand::Register(awaited), Operand::Register(value_reg)],
             span,
         );
         awaited
@@ -6875,7 +6872,7 @@ fn compile_for_in_statement(
     let iter_reg = cx.alloc_scratch();
     cx.emit(
         Op::GetIterator,
-        vec![Operand::Register(iter_reg), Operand::Register(keys_reg)],
+        [Operand::Register(iter_reg), Operand::Register(keys_reg)],
         span,
     );
 
@@ -7199,7 +7196,7 @@ fn compile_method_call(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::ImportMetaResolve,
-            vec![Operand::Register(dst), Operand::Register(spec_reg)],
+            [Operand::Register(dst), Operand::Register(spec_reg)],
             span,
         );
         return Ok(dst);
@@ -7377,7 +7374,7 @@ fn compile_method_call(
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::IsArray,
-                    vec![Operand::Register(dst), Operand::Register(arg_regs[0])],
+                    [Operand::Register(dst), Operand::Register(arg_regs[0])],
                     span,
                 );
                 return Ok(dst);
@@ -7574,12 +7571,12 @@ fn compile_method_call(
             Some(src) => {
                 cx.emit(
                     Op::ToBoolean,
-                    vec![Operand::Register(dst), Operand::Register(src)],
+                    [Operand::Register(dst), Operand::Register(src)],
                     span,
                 );
             }
             None => {
-                cx.emit(Op::LoadFalse, vec![Operand::Register(dst)], span);
+                cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
             }
         }
         return Ok(dst);
@@ -7608,12 +7605,12 @@ fn compile_method_call(
         match arg_regs.first().copied() {
             Some(src) => cx.emit(
                 Op::ToNumber,
-                vec![Operand::Register(dst), Operand::Register(src)],
+                [Operand::Register(dst), Operand::Register(src)],
                 span,
             ),
             None => cx.emit(
                 Op::LoadInt32,
-                vec![Operand::Register(dst), Operand::Imm32(0)],
+                [Operand::Register(dst), Operand::Imm32(0)],
                 span,
             ),
         }
@@ -7630,10 +7627,10 @@ fn compile_method_call(
         match arg_regs.first().copied() {
             Some(src) => cx.emit(
                 Op::ToBoolean,
-                vec![Operand::Register(dst), Operand::Register(src)],
+                [Operand::Register(dst), Operand::Register(src)],
                 span,
             ),
-            None => cx.emit(Op::LoadFalse, vec![Operand::Register(dst)], span),
+            None => cx.emit(Op::LoadFalse, [Operand::Register(dst)], span),
         }
         return Ok(dst);
     }
@@ -7668,7 +7665,7 @@ fn compile_method_call(
         // Foundation: when no args, return a fresh object via NewObject.
         if arg_regs.is_empty() {
             let dst = cx.alloc_scratch();
-            cx.emit(Op::NewObject, vec![Operand::Register(dst)], span);
+            cx.emit(Op::NewObject, [Operand::Register(dst)], span);
             return Ok(dst);
         }
         // With one arg, return the arg unchanged when it's an
@@ -7733,14 +7730,14 @@ fn compile_method_call(
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         if arg_regs.is_empty() {
             let dst = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
             return Ok(dst);
         }
         let src_reg = arg_regs[0];
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::Eval,
-            vec![Operand::Register(dst), Operand::Register(src_reg)],
+            [Operand::Register(dst), Operand::Register(src_reg)],
             span,
         );
         return Ok(dst);
@@ -7796,7 +7793,7 @@ fn compile_method_call(
         cx.emit(Op::QueueMicrotask, operands, span);
         // queueMicrotask returns `undefined` synchronously.
         let dst = cx.alloc_scratch();
-        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
         return Ok(dst);
     }
     if let Expression::StaticMemberExpression(member) = callee {
@@ -7916,7 +7913,7 @@ fn compile_spread_call(
         other => {
             let r = compile_expr(cx, other, span)?;
             let this_dst = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, vec![Operand::Register(this_dst)], span);
+            cx.emit(Op::LoadUndefined, [Operand::Register(this_dst)], span);
             (r, this_dst)
         }
     };
@@ -7963,7 +7960,7 @@ fn try_compile_function_method(
                 Some(r) => r,
                 None => {
                     let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
                     r
                 }
             };
@@ -7986,7 +7983,7 @@ fn try_compile_function_method(
                 Some(r) => r,
                 None => {
                     let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
                     r
                 }
             };
@@ -8019,7 +8016,7 @@ fn try_compile_function_method(
                 Some(other) => compile_expr(cx, other.to_expression(), span)?,
                 None => {
                     let r = cx.alloc_scratch();
-                    cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
                     r
                 }
             };
@@ -8048,11 +8045,7 @@ fn try_compile_function_method(
                                     }
                                     oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
                                         let r = cx.alloc_scratch();
-                                        cx.emit(
-                                            Op::LoadUndefined,
-                                            vec![Operand::Register(r)],
-                                            span,
-                                        );
+                                        cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
                                         forwarded.push(r);
                                     }
                                     el_expr => {
@@ -8157,7 +8150,7 @@ fn compile_class(
         // Pure type-level declaration — emit nothing observable
         // and hand the caller a `Value::Undefined` register.
         let dst = cx.alloc_scratch();
-        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], span);
+        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
         return Ok(dst);
     }
 
@@ -8186,7 +8179,7 @@ fn compile_class(
     // installed on it as we walk the class body. For `extends`,
     // chain `C.prototype` from the parent's prototype.
     let prototype_reg = cx.alloc_scratch();
-    cx.emit(Op::NewObject, vec![Operand::Register(prototype_reg)], span);
+    cx.emit(Op::NewObject, [Operand::Register(prototype_reg)], span);
     if let Some(parent_reg) = super_reg {
         let parent_proto = cx.alloc_scratch();
         let proto_const = cx.intern_string_constant("prototype");
@@ -8212,7 +8205,7 @@ fn compile_class(
     // Statics object — own static methods live here and chain to
     // the parent's statics for `extends`.
     let statics_reg = cx.alloc_scratch();
-    cx.emit(Op::NewObject, vec![Operand::Register(statics_reg)], span);
+    cx.emit(Op::NewObject, [Operand::Register(statics_reg)], span);
     if let Some(parent_reg) = super_reg {
         cx.emit(
             Op::SetPrototype,
@@ -8447,7 +8440,7 @@ fn compile_class(
                     Some(expr) => compile_expr(cx, expr, pspan)?,
                     None => {
                         let dst = cx.alloc_scratch();
-                        cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], pspan);
+                        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], pspan);
                         dst
                     }
                 };
@@ -8498,7 +8491,7 @@ fn compile_class(
                 let fn_reg = cx.alloc_scratch();
                 cx.emit(
                     Op::MakeFunction,
-                    vec![Operand::Register(fn_reg), Operand::ConstIndex(const_idx)],
+                    [Operand::Register(fn_reg), Operand::ConstIndex(const_idx)],
                     bspan,
                 );
                 let dst = cx.alloc_scratch();
@@ -8577,7 +8570,7 @@ fn compile_synthetic_constructor(
         // sufficient for the common chained-base-init case.
         let super_ctor = load_synthetic_capture(parent, SUPER_CTOR_NAME, span)?;
         let this_reg = parent.alloc_scratch();
-        parent.emit(Op::LoadThis, vec![Operand::Register(this_reg)], span);
+        parent.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
         let dst = parent.alloc_scratch();
         parent.emit(
             Op::CallWithThis,
@@ -8681,7 +8674,7 @@ fn compile_class_constructor(
     let tmp = parent.alloc_scratch();
     parent.emit(
         Op::MakeFunction,
-        vec![Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+        [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
         span,
     );
     parent.emit_store_storage(tmp, self_storage, span);
@@ -8759,12 +8752,12 @@ fn emit_instance_field_inits(
             Some(expr) => compile_expr(cx, expr, pspan)?,
             None => {
                 let dst = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, vec![Operand::Register(dst)], pspan);
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], pspan);
                 dst
             }
         };
         let this_reg = cx.alloc_scratch();
-        cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], pspan);
+        cx.emit(Op::LoadThis, [Operand::Register(this_reg)], pspan);
         if p.computed {
             // §15.7.10 — computed-key field. Evaluate the key
             // expression at constructor-run time and write via
@@ -8905,7 +8898,7 @@ fn load_synthetic_capture(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::LoadUpvalue,
-            vec![Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
+            [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
             span,
         );
         return Ok(dst);
@@ -8925,7 +8918,7 @@ fn compile_super_call(
 ) -> Result<u16, CompileError> {
     let super_ctor = load_synthetic_capture(cx, SUPER_CTOR_NAME, span)?;
     let this_reg = cx.alloc_scratch();
-    cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], span);
+    cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
     let has_spread = arguments
         .iter()
         .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
@@ -8966,7 +8959,7 @@ fn compile_super_method_call(
 ) -> Result<u16, CompileError> {
     let method_reg = load_super_method(cx, method_name, span)?;
     let this_reg = cx.alloc_scratch();
-    cx.emit(Op::LoadThis, vec![Operand::Register(this_reg)], span);
+    cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
     let has_spread = arguments
         .iter()
         .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
@@ -9016,7 +9009,7 @@ fn load_super_method(cx: &mut Compiler, name: &str, span: (u32, u32)) -> Result<
     let parent_reg = cx.alloc_scratch();
     cx.emit(
         Op::GetPrototype,
-        vec![Operand::Register(parent_reg), Operand::Register(home_reg)],
+        [Operand::Register(parent_reg), Operand::Register(home_reg)],
         span,
     );
     let name_idx = cx.intern_string_constant(name);
@@ -9105,7 +9098,7 @@ fn compile_builtin_error_construct(
         let errors_reg = match arguments.first() {
             None => {
                 let r = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
                 r
             }
             Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
@@ -9119,7 +9112,7 @@ fn compile_builtin_error_construct(
         let msg_reg = match arguments.get(1) {
             None => {
                 let r = cx.alloc_scratch();
-                cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+                cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
                 r
             }
             Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
@@ -9165,7 +9158,7 @@ fn compile_builtin_error_construct(
     let msg_reg = match arguments.first() {
         None => {
             let r = cx.alloc_scratch();
-            cx.emit(Op::LoadUndefined, vec![Operand::Register(r)], span);
+            cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
             r
         }
         Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
@@ -9180,7 +9173,7 @@ fn compile_builtin_error_construct(
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::NewError,
-            vec![Operand::Register(dst), Operand::Register(msg_reg)],
+            [Operand::Register(dst), Operand::Register(msg_reg)],
             span,
         );
         return Ok(dst);
@@ -9212,10 +9205,10 @@ fn compile_object_builtin(
         ("create", 1) => {
             let proto_reg = arg_regs[0];
             let dst = cx.alloc_scratch();
-            cx.emit(Op::NewObject, vec![Operand::Register(dst)], span);
+            cx.emit(Op::NewObject, [Operand::Register(dst)], span);
             cx.emit(
                 Op::SetPrototype,
-                vec![Operand::Register(dst), Operand::Register(proto_reg)],
+                [Operand::Register(dst), Operand::Register(proto_reg)],
                 span,
             );
             Ok(dst)
@@ -9245,7 +9238,7 @@ fn compile_object_builtin(
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::GetPrototype,
-                vec![Operand::Register(dst), Operand::Register(obj_reg)],
+                [Operand::Register(dst), Operand::Register(obj_reg)],
                 span,
             );
             Ok(dst)
@@ -9255,7 +9248,7 @@ fn compile_object_builtin(
             let proto_reg = arg_regs[1];
             cx.emit(
                 Op::SetPrototype,
-                vec![Operand::Register(obj_reg), Operand::Register(proto_reg)],
+                [Operand::Register(obj_reg), Operand::Register(proto_reg)],
                 span,
             );
             // Spec says `setPrototypeOf` returns `obj`; foundation
@@ -9383,7 +9376,7 @@ fn compile_template_literal(
         let const_idx = intern_template_quasi(cx, &t.quasis[0]);
         cx.emit(
             Op::LoadString,
-            vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            [Operand::Register(dst), Operand::ConstIndex(const_idx)],
             span,
         );
         return Ok(dst);
@@ -9394,7 +9387,7 @@ fn compile_template_literal(
         let const_idx = intern_template_quasi(cx, &t.quasis[0]);
         cx.emit(
             Op::LoadString,
-            vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            [Operand::Register(dst), Operand::ConstIndex(const_idx)],
             span,
         );
         dst
@@ -9426,7 +9419,7 @@ fn compile_template_literal(
             let const_idx = intern_template_quasi(cx, next_quasi);
             cx.emit(
                 Op::LoadString,
-                vec![Operand::Register(quasi_reg), Operand::ConstIndex(const_idx)],
+                [Operand::Register(quasi_reg), Operand::ConstIndex(const_idx)],
                 span,
             );
             let lhs_in = emit_to_primitive(cx, acc, "default", span);
@@ -9498,14 +9491,14 @@ fn compile_tagged_template(
         let ci = cx.intern_string_constant(cooked);
         cx.emit(
             Op::LoadString,
-            vec![Operand::Register(cr), Operand::ConstIndex(ci)],
+            [Operand::Register(cr), Operand::ConstIndex(ci)],
             span,
         );
         let rr = cx.alloc_scratch();
         let ri = cx.intern_string_constant(raw);
         cx.emit(
             Op::LoadString,
-            vec![Operand::Register(rr), Operand::ConstIndex(ri)],
+            [Operand::Register(rr), Operand::ConstIndex(ri)],
             span,
         );
         cooked_regs.push(cr);
@@ -9566,7 +9559,7 @@ fn compile_string_raw_template(
         let const_idx = cx.intern_string_constant(raw);
         cx.emit(
             Op::LoadString,
-            vec![Operand::Register(dst), Operand::ConstIndex(const_idx)],
+            [Operand::Register(dst), Operand::ConstIndex(const_idx)],
             span,
         );
         dst
@@ -9592,7 +9585,7 @@ fn compile_string_raw_template(
             let const_idx = cx.intern_string_constant(raw);
             cx.emit(
                 Op::LoadString,
-                vec![Operand::Register(qr), Operand::ConstIndex(const_idx)],
+                [Operand::Register(qr), Operand::ConstIndex(const_idx)],
                 span,
             );
             let lhs_in = emit_to_primitive(cx, acc, "default", span);
@@ -9653,7 +9646,7 @@ fn compile_chain_expression(
     for pc in exits {
         cx.patch_branch_to_here(pc);
     }
-    cx.emit(Op::LoadUndefined, vec![Operand::Register(result)], span);
+    cx.emit(Op::LoadUndefined, [Operand::Register(result)], span);
     cx.patch_branch_to_here(join);
     Ok(result)
 }
@@ -9944,7 +9937,7 @@ fn compile_spread_call_args(
     let dst = cx.alloc_scratch();
     cx.emit(
         Op::NewArray,
-        vec![Operand::Register(dst), Operand::ConstIndex(0)],
+        [Operand::Register(dst), Operand::ConstIndex(0)],
         span,
     );
     for arg in args {
@@ -9957,7 +9950,7 @@ fn compile_spread_call_args(
                 let r = compile_expr(cx, other.to_expression(), span)?;
                 cx.emit(
                     Op::ArrayPush,
-                    vec![Operand::Register(dst), Operand::Register(r)],
+                    [Operand::Register(dst), Operand::Register(r)],
                     span,
                 );
             }
@@ -9980,7 +9973,7 @@ fn emit_spread_into_array(
     let iter_reg = cx.alloc_scratch();
     cx.emit(
         Op::GetIterator,
-        vec![Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+        [Operand::Register(iter_reg), Operand::Register(iterable_reg)],
         span,
     );
     let value_reg = cx.alloc_scratch();
@@ -9998,7 +9991,7 @@ fn emit_spread_into_array(
     let exit = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
     cx.emit(
         Op::ArrayPush,
-        vec![Operand::Register(dst_reg), Operand::Register(value_reg)],
+        [Operand::Register(dst_reg), Operand::Register(value_reg)],
         span,
     );
     let back = cx.emit_branch_placeholder(Op::Jump, None, span);

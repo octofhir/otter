@@ -34,12 +34,12 @@
 
 use smallvec::SmallVec;
 
+use crate::bootstrap::BootstrapEntry;
 use crate::collections::{self, CollectionError};
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::NativeFunction;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
-use crate::bootstrap::BootstrapEntry;
 
 // ---------------------------------------------------------------
 // Public bootstrap install entry points
@@ -189,11 +189,7 @@ impl CollectionKind {
     }
 }
 
-fn ctor_prototype(
-    global: JsObject,
-    heap: &otter_gc::GcHeap,
-    ctor_name: &str,
-) -> Option<JsObject> {
+fn ctor_prototype(global: JsObject, heap: &otter_gc::GcHeap, ctor_name: &str) -> Option<JsObject> {
     let ctor = object::get(global, heap, ctor_name)?;
     let Value::NativeFunction(f) = ctor else {
         return None;
@@ -242,8 +238,7 @@ fn install_collection(
 
     // §24.1.2.1 / §24.2.2.1 — `prototype` own data property:
     // non-writable, non-enumerable, non-configurable.
-    let proto_desc =
-        PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -270,36 +265,156 @@ fn install_prototype_methods(
     let mut builder = ObjectBuilder::from_object(heap, prototype);
     match kind {
         CollectionKind::Map => {
-            builder.method("get", 1, NativeCall::Static(map_proto_get), Attr::builtin_function())?;
-            builder.method("set", 2, NativeCall::Static(map_proto_set), Attr::builtin_function())?;
-            builder.method("has", 1, NativeCall::Static(map_proto_has), Attr::builtin_function())?;
-            builder.method("delete", 1, NativeCall::Static(map_proto_delete), Attr::builtin_function())?;
-            builder.method("clear", 0, NativeCall::Static(map_proto_clear), Attr::builtin_function())?;
-            builder.method("keys", 0, NativeCall::Static(map_proto_keys), Attr::builtin_function())?;
-            builder.method("values", 0, NativeCall::Static(map_proto_values), Attr::builtin_function())?;
-            builder.method("entries", 0, NativeCall::Static(map_proto_entries), Attr::builtin_function())?;
-            builder.method("forEach", 1, NativeCall::Static(map_proto_for_each), Attr::builtin_function())?;
+            builder.method(
+                "get",
+                1,
+                NativeCall::Static(map_proto_get),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "set",
+                2,
+                NativeCall::Static(map_proto_set),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "has",
+                1,
+                NativeCall::Static(map_proto_has),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "delete",
+                1,
+                NativeCall::Static(map_proto_delete),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "clear",
+                0,
+                NativeCall::Static(map_proto_clear),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "keys",
+                0,
+                NativeCall::Static(map_proto_keys),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "values",
+                0,
+                NativeCall::Static(map_proto_values),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "entries",
+                0,
+                NativeCall::Static(map_proto_entries),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "forEach",
+                1,
+                NativeCall::Static(map_proto_for_each),
+                Attr::builtin_function(),
+            )?;
         }
         CollectionKind::Set => {
-            builder.method("add", 1, NativeCall::Static(set_proto_add), Attr::builtin_function())?;
-            builder.method("has", 1, NativeCall::Static(set_proto_has), Attr::builtin_function())?;
-            builder.method("delete", 1, NativeCall::Static(set_proto_delete), Attr::builtin_function())?;
-            builder.method("clear", 0, NativeCall::Static(set_proto_clear), Attr::builtin_function())?;
-            builder.method("keys", 0, NativeCall::Static(set_proto_keys), Attr::builtin_function())?;
-            builder.method("values", 0, NativeCall::Static(set_proto_values), Attr::builtin_function())?;
-            builder.method("entries", 0, NativeCall::Static(set_proto_entries), Attr::builtin_function())?;
-            builder.method("forEach", 1, NativeCall::Static(set_proto_for_each), Attr::builtin_function())?;
+            builder.method(
+                "add",
+                1,
+                NativeCall::Static(set_proto_add),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "has",
+                1,
+                NativeCall::Static(set_proto_has),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "delete",
+                1,
+                NativeCall::Static(set_proto_delete),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "clear",
+                0,
+                NativeCall::Static(set_proto_clear),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "keys",
+                0,
+                NativeCall::Static(set_proto_keys),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "values",
+                0,
+                NativeCall::Static(set_proto_values),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "entries",
+                0,
+                NativeCall::Static(set_proto_entries),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "forEach",
+                1,
+                NativeCall::Static(set_proto_for_each),
+                Attr::builtin_function(),
+            )?;
         }
         CollectionKind::WeakMap => {
-            builder.method("get", 1, NativeCall::Static(weak_map_proto_get), Attr::builtin_function())?;
-            builder.method("set", 2, NativeCall::Static(weak_map_proto_set), Attr::builtin_function())?;
-            builder.method("has", 1, NativeCall::Static(weak_map_proto_has), Attr::builtin_function())?;
-            builder.method("delete", 1, NativeCall::Static(weak_map_proto_delete), Attr::builtin_function())?;
+            builder.method(
+                "get",
+                1,
+                NativeCall::Static(weak_map_proto_get),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "set",
+                2,
+                NativeCall::Static(weak_map_proto_set),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "has",
+                1,
+                NativeCall::Static(weak_map_proto_has),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "delete",
+                1,
+                NativeCall::Static(weak_map_proto_delete),
+                Attr::builtin_function(),
+            )?;
         }
         CollectionKind::WeakSet => {
-            builder.method("add", 1, NativeCall::Static(weak_set_proto_add), Attr::builtin_function())?;
-            builder.method("has", 1, NativeCall::Static(weak_set_proto_has), Attr::builtin_function())?;
-            builder.method("delete", 1, NativeCall::Static(weak_set_proto_delete), Attr::builtin_function())?;
+            builder.method(
+                "add",
+                1,
+                NativeCall::Static(weak_set_proto_add),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "has",
+                1,
+                NativeCall::Static(weak_set_proto_has),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "delete",
+                1,
+                NativeCall::Static(weak_set_proto_delete),
+                Attr::builtin_function(),
+            )?;
         }
     }
     // §24.1.3.11 / §24.2.3.11 — `size` accessor on Map/Set
@@ -313,8 +428,12 @@ fn install_prototype_methods(
             };
             let getter = NativeFunction::new_static(heap, "get size", 0, getter_call)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            let desc =
-                PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
+            let desc = PropertyDescriptor::accessor(
+                Some(Value::NativeFunction(getter)),
+                None,
+                false,
+                true,
+            );
             if !object::define_own_property(prototype, heap, "size", desc) {
                 return Err(JsSurfaceError::DefinePropertyFailed("size"));
             }
@@ -365,10 +484,7 @@ fn construct_collection(
     Ok(target)
 }
 
-fn alloc_collection(
-    ctx: &mut NativeCtx<'_>,
-    kind: CollectionKind,
-) -> Result<Value, NativeError> {
+fn alloc_collection(ctx: &mut NativeCtx<'_>, kind: CollectionKind) -> Result<Value, NativeError> {
     let name = kind.name();
     match kind {
         CollectionKind::Map => collections::alloc_map(ctx.heap_mut())
@@ -408,12 +524,13 @@ fn add_entries_from_iterable(
     kind: CollectionKind,
 ) -> Result<(), NativeError> {
     let ctor_name = kind.name();
-    let context = ctx.execution_context().cloned().ok_or_else(|| {
-        NativeError::TypeError {
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: ctor_name,
             reason: "no active execution context".to_string(),
-        }
-    })?;
+        })?;
 
     // Spec step 6 — adder = ? Get(target, kind.adder_name())
     let adder_name = kind.adder_name();
@@ -454,11 +571,7 @@ fn add_entries_from_iterable(
 fn iterable_uses_fast_materialization(iterable: &Value) -> bool {
     matches!(
         iterable,
-        Value::Array(_)
-            | Value::String(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::Generator(_)
+        Value::Array(_) | Value::String(_) | Value::Map(_) | Value::Set(_) | Value::Generator(_)
     )
 }
 
@@ -524,9 +637,7 @@ fn add_entries_lazy(
             interp.run_callable_sync(context, adder, target.clone(), call_args)
         };
         if let Err(err) = call_result {
-            let _ = ctx
-                .interp_mut()
-                .iterator_close_sync(context, &iterator);
+            let _ = ctx.interp_mut().iterator_close_sync(context, &iterator);
             return Err(vm_to_native(err, ctor_name));
         }
     }
@@ -549,9 +660,7 @@ fn build_adder_args(
     let ctor_name = kind.name();
     if !value_is_object_like(next) {
         if let Some(iterator) = iterator_for_close {
-            let _ = ctx
-                .interp_mut()
-                .iterator_close_sync(context, iterator);
+            let _ = ctx.interp_mut().iterator_close_sync(context, iterator);
         }
         return Err(NativeError::TypeError {
             name: ctor_name,
@@ -562,9 +671,7 @@ fn build_adder_args(
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
-                let _ = ctx
-                    .interp_mut()
-                    .iterator_close_sync(context, iterator);
+                let _ = ctx.interp_mut().iterator_close_sync(context, iterator);
             }
             return Err(vm_to_native(err, ctor_name));
         }
@@ -573,9 +680,7 @@ fn build_adder_args(
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
-                let _ = ctx
-                    .interp_mut()
-                    .iterator_close_sync(context, iterator);
+                let _ = ctx.interp_mut().iterator_close_sync(context, iterator);
             }
             return Err(vm_to_native(err, ctor_name));
         }
@@ -632,7 +737,11 @@ fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.delete")?;
     let key = args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(Value::Boolean(collections::map_delete(m, ctx.heap_mut(), &key)))
+    Ok(Value::Boolean(collections::map_delete(
+        m,
+        ctx.heap_mut(),
+        &key,
+    )))
 }
 
 fn map_proto_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -668,12 +777,13 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let entries = collections::map_entries(m, ctx.heap_mut());
-    let context = ctx.execution_context().cloned().ok_or_else(|| {
-        NativeError::TypeError {
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: "Map.prototype.forEach",
             reason: "no active execution context".to_string(),
-        }
-    })?;
+        })?;
     let map_value = Value::Map(m);
     for (k, v) in entries {
         let interp = ctx.interp_mut();
@@ -716,7 +826,11 @@ fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.delete")?;
     let v = args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(Value::Boolean(collections::set_delete(s, ctx.heap_mut(), &v)))
+    Ok(Value::Boolean(collections::set_delete(
+        s,
+        ctx.heap_mut(),
+        &v,
+    )))
 }
 
 fn set_proto_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -774,12 +888,13 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let values = collections::set_values(s, ctx.heap());
-    let context = ctx.execution_context().cloned().ok_or_else(|| {
-        NativeError::TypeError {
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
             name: "Set.prototype.forEach",
             reason: "no active execution context".to_string(),
-        }
-    })?;
+        })?;
     let set_value = Value::Set(s);
     for v in values {
         let interp = ctx.interp_mut();
@@ -948,8 +1063,8 @@ fn make_map_iterator(
         };
         snapshot.push(element);
     }
-    let array = crate::array::from_elements(ctx.heap_mut(), snapshot)
-        .map_err(|_| oom("Map iterator"))?;
+    let array =
+        crate::array::from_elements(ctx.heap_mut(), snapshot).map_err(|_| oom("Map iterator"))?;
     let iter = crate::alloc_iterator_state(
         ctx.heap_mut(),
         crate::IteratorState::Array { array, index: 0 },
@@ -1010,18 +1125,30 @@ fn collection_to_native(err: CollectionError, name: &'static str) -> NativeError
 
 fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError { name, reason: message },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
         VmError::TypeMismatch => NativeError::TypeError {
             name,
             reason: "type mismatch".to_string(),
         },
-        VmError::SyntaxError { message } => NativeError::SyntaxError { name, reason: message },
-        VmError::RangeError { message } => NativeError::RangeError { name, reason: message },
+        VmError::SyntaxError { message } => NativeError::SyntaxError {
+            name,
+            reason: message,
+        },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
         VmError::NotCallable => NativeError::TypeError {
             name,
             reason: "value is not callable".to_string(),
         },
-        VmError::Uncaught { value } => NativeError::Thrown { name, message: value },
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
         VmError::OutOfMemory { .. } => NativeError::TypeError {
             name,
             reason: "out of memory".to_string(),

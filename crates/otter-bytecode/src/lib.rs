@@ -29,7 +29,7 @@ pub mod disasm;
 pub mod dump;
 pub mod method_id;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Sentinel offset value that means "this try block does not have
 /// a catch (or finally) clause". Picked as `i32::MIN` so any real
@@ -1364,11 +1364,11 @@ pub struct Instruction {
     /// Opcode.
     pub op: Op,
     /// Operands in declaration order.
-    pub operands: Vec<Operand>,
+    pub operands: OperandList,
 }
 
 /// One operand value with a kind tag for the JSON dump.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum Operand {
     /// Register index (locals + scratch live in one register window).
@@ -1377,6 +1377,183 @@ pub enum Operand {
     ConstIndex(u32),
     /// Inline signed 32-bit immediate (used by `LoadInt32`).
     Imm32(i32),
+}
+
+/// Inline-first instruction operand storage.
+///
+/// Most VM instructions use one to three operands. Keeping those
+/// operands inside the instruction avoids one heap allocation per
+/// fixed-width instruction while preserving the existing decoded
+/// operand-list API shape for disassembly, dumps, and the interpreter.
+#[derive(Clone, PartialEq, Eq)]
+pub enum OperandList {
+    /// Inline storage for common fixed-width instructions.
+    Inline {
+        /// Number of valid entries in `operands`.
+        len: u8,
+        /// Inline operand slots.
+        operands: [Operand; 3],
+    },
+    /// Heap storage for rare variadic instructions.
+    Spill(Vec<Operand>),
+}
+
+impl OperandList {
+    /// Return operands in declaration order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Operand] {
+        match self {
+            Self::Inline { len, operands } => &operands[..*len as usize],
+            Self::Spill(operands) => operands.as_slice(),
+        }
+    }
+
+    /// Return mutable operands in declaration order.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [Operand] {
+        match self {
+            Self::Inline { len, operands } => &mut operands[..*len as usize],
+            Self::Spill(operands) => operands.as_mut_slice(),
+        }
+    }
+
+    /// Number of operands.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// Whether the instruction has no operands.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    /// First operand, if present.
+    #[must_use]
+    pub fn first(&self) -> Option<&Operand> {
+        self.as_slice().first()
+    }
+
+    /// First mutable operand, if present.
+    #[must_use]
+    pub fn first_mut(&mut self) -> Option<&mut Operand> {
+        self.as_mut_slice().first_mut()
+    }
+
+    /// Operand by index.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&Operand> {
+        self.as_slice().get(index)
+    }
+
+    /// Mutable operand by index.
+    #[must_use]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Operand> {
+        self.as_mut_slice().get_mut(index)
+    }
+
+    /// Iterator over operands in declaration order.
+    pub fn iter(&self) -> std::slice::Iter<'_, Operand> {
+        self.as_slice().iter()
+    }
+
+    /// Heap-backed operand capacity. Inline operands report zero.
+    #[must_use]
+    pub fn heap_capacity(&self) -> usize {
+        match self {
+            Self::Inline { .. } => 0,
+            Self::Spill(operands) => operands.capacity(),
+        }
+    }
+}
+
+impl Default for OperandList {
+    fn default() -> Self {
+        Self::Inline {
+            len: 0,
+            operands: [Operand::Register(0); 3],
+        }
+    }
+}
+
+impl std::fmt::Debug for OperandList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+impl From<Vec<Operand>> for OperandList {
+    fn from(operands: Vec<Operand>) -> Self {
+        match operands.len() {
+            0 => Self::default(),
+            1..=3 => {
+                let len = operands.len();
+                let mut inline = [Operand::Register(0); 3];
+                for (slot, operand) in inline.iter_mut().zip(operands) {
+                    *slot = operand;
+                }
+                Self::Inline {
+                    len: len as u8,
+                    operands: inline,
+                }
+            }
+            _ => Self::Spill(operands),
+        }
+    }
+}
+
+impl<const N: usize> From<[Operand; N]> for OperandList {
+    fn from(operands: [Operand; N]) -> Self {
+        Vec::from(operands).into()
+    }
+}
+
+impl From<&[Operand]> for OperandList {
+    fn from(operands: &[Operand]) -> Self {
+        operands.to_vec().into()
+    }
+}
+
+impl<'a> IntoIterator for &'a OperandList {
+    type IntoIter = std::slice::Iter<'a, Operand>;
+    type Item = &'a Operand;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl std::ops::Index<usize> for OperandList {
+    type Output = Operand;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for OperandList {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
+    }
+}
+
+impl Serialize for OperandList {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OperandList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<Operand>::deserialize(deserializer).map(Self::from)
+    }
 }
 
 /// One source-span entry attached to a `pc`.

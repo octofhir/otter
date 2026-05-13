@@ -1375,7 +1375,8 @@ pub fn define_own_property_partial(
             }
             let new_shape = Shape::add_property(&body.shape, key);
             body.shape = new_shape;
-            body.slots.push(PropertySlot::from_descriptor(completed.clone()));
+            body.slots
+                .push(PropertySlot::from_descriptor(completed.clone()));
             true
         }
     });
@@ -1422,8 +1423,10 @@ pub fn define_own_symbol_property_partial(
             if !body.extensible {
                 return false;
             }
-            body.symbol_props
-                .push((key.clone(), PropertySlot::from_descriptor(completed.clone())));
+            body.symbol_props.push((
+                key.clone(),
+                PropertySlot::from_descriptor(completed.clone()),
+            ));
             true
         }
     });

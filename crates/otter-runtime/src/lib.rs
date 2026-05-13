@@ -1730,13 +1730,11 @@ impl Runtime {
         length: u8,
         call: RuntimeNativeFastFn,
     ) -> Result<(), OtterError> {
-        let value =
-            otter_vm::native_value_static(self.interp.gc_heap_mut(), name, length, call).map_err(
-                |oom| OtterError::OutOfMemory {
-                    requested_bytes: oom.requested_bytes(),
-                    heap_limit_bytes: oom.heap_limit_bytes(),
-                },
-            )?;
+        let value = otter_vm::native_value_static(self.interp.gc_heap_mut(), name, length, call)
+            .map_err(|oom| OtterError::OutOfMemory {
+                requested_bytes: oom.requested_bytes(),
+                heap_limit_bytes: oom.heap_limit_bytes(),
+            })?;
         self.interp.set_global(name, value);
         Ok(())
     }

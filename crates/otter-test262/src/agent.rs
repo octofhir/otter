@@ -125,7 +125,11 @@ const NATIVES: &[(&'static str, u8, NativeFastFn)] = &[
     ("__otter_agent_get_report", 0, agent_get_report),
     ("__otter_agent_sleep", 1, agent_sleep),
     ("__otter_agent_monotonic_now", 0, agent_monotonic_now),
-    ("__otter_agent_receive_broadcast", 1, agent_receive_broadcast),
+    (
+        "__otter_agent_receive_broadcast",
+        1,
+        agent_receive_broadcast,
+    ),
     ("__otter_agent_report", 1, agent_report),
     ("__otter_agent_leaving", 0, agent_leaving),
 ];
@@ -206,10 +210,7 @@ fn run_agent_source(source: String) {
     if install_natives(&mut runtime).is_err() {
         return;
     }
-    let _ = runtime.run_script(
-        SourceInput::from_javascript(combined),
-        "test262-agent",
-    );
+    let _ = runtime.run_script(SourceInput::from_javascript(combined), "test262-agent");
 }
 
 // =====================================================================
@@ -249,14 +250,14 @@ fn agent_broadcast(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 // $262.agent.receiveBroadcast(handler)
 // =====================================================================
 
-fn agent_receive_broadcast(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
+fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let handler = args.first().cloned().unwrap_or(Value::Undefined);
     if !matches!(
         handler,
-        Value::NativeFunction(_) | Value::Closure { .. } | Value::BoundFunction(_) | Value::ClassConstructor(_)
+        Value::NativeFunction(_)
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
     ) {
         return Err(type_err("receiveBroadcast handler must be a function"));
     }
@@ -266,9 +267,7 @@ fn agent_receive_broadcast(
     // valid for the next call; we put it back after recv returns.
     let rx = AGENT_INBOX.with(|cell| cell.borrow_mut().take());
     let Some(rx) = rx else {
-        return Err(type_err(
-            "receiveBroadcast called outside an agent thread",
-        ));
+        return Err(type_err("receiveBroadcast called outside an agent thread"));
     };
     let result = rx.recv();
     // Always put the receiver back. If it's closed, the next
@@ -352,8 +351,8 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
         Some(s) => {
             let (interp, _exec) = ctx.interp_mut_and_context();
             let heap = interp.string_heap();
-            let js = JsString::from_str(&s, heap)
-                .map_err(|e| type_err(format!("string alloc: {e}")))?;
+            let js =
+                JsString::from_str(&s, heap).map_err(|e| type_err(format!("string alloc: {e}")))?;
             Ok(Value::String(js))
         }
     }
@@ -367,4 +366,3 @@ fn agent_leaving(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     AGENT_LEAVING.with(|f| f.store(true, Ordering::Release));
     Ok(Value::Undefined)
 }
-

@@ -45,7 +45,7 @@ use std::path::Path;
 
 use otter_bytecode::{
     BytecodeModule, Constant, Function, Instruction, ModuleInit, ModuleResolution, Op, Operand,
-    SourceKind as BytecodeSourceKind, SpanEntry,
+    OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_compiler::{
     CompileError, CompiledModuleMetadata, ModuleHostInfo, compile_module_fragment_to_module,
@@ -263,7 +263,7 @@ fn hosted_module_fragment(url: &str) -> BytecodeModule {
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
-                operands: Vec::new(),
+                operands: Vec::new().into(),
             }],
             spans: Vec::new(),
             ..Default::default()
@@ -539,13 +539,14 @@ fn rewrite_const_indices(code: &[Instruction], offset: u32) -> Vec<Instruction> 
                     .operands
                     .iter()
                     .enumerate()
-                    .map(|(pos, operand)| match operand {
+                    .map(|(pos, operand)| match *operand {
                         Operand::ConstIndex(k) if op.is_const_pool_operand(pos) => {
                             Operand::ConstIndex(k + offset)
                         }
-                        other => other.clone(),
+                        other => other,
                     })
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
             }
         })
         .collect()
@@ -627,7 +628,7 @@ fn build_entry_body(
             &mut spans,
             &mut next_pc,
             Op::ImportNamespace,
-            vec![Operand::Register(r_env), Operand::ConstIndex(url_const_idx)],
+            [Operand::Register(r_env), Operand::ConstIndex(url_const_idx)],
         );
 
         // r_meta = new JsObject; r_meta.url = url.
@@ -638,7 +639,7 @@ fn build_entry_body(
             &mut spans,
             &mut next_pc,
             Op::NewObject,
-            vec![Operand::Register(r_meta)],
+            [Operand::Register(r_meta)],
         );
 
         let r_url_str = next_reg;
@@ -648,7 +649,7 @@ fn build_entry_body(
             &mut spans,
             &mut next_pc,
             Op::LoadString,
-            vec![
+            [
                 Operand::Register(r_url_str),
                 Operand::ConstIndex(url_const_idx),
             ],
@@ -677,7 +678,7 @@ fn build_entry_body(
             &mut spans,
             &mut next_pc,
             Op::MakeFunction,
-            vec![
+            [
                 Operand::Register(r_init),
                 Operand::ConstIndex(init_const_idx),
             ],
@@ -693,7 +694,7 @@ fn build_entry_body(
             &mut spans,
             &mut next_pc,
             Op::LoadUndefined,
-            vec![Operand::Register(r_undef)],
+            [Operand::Register(r_undef)],
         );
         emit_op(
             &mut code,
@@ -711,13 +712,7 @@ fn build_entry_body(
         );
     }
 
-    emit_op(
-        &mut code,
-        &mut spans,
-        &mut next_pc,
-        Op::ReturnUndefined,
-        vec![],
-    );
+    emit_op(&mut code, &mut spans, &mut next_pc, Op::ReturnUndefined, []);
     EntryBody {
         code,
         spans,
@@ -730,10 +725,14 @@ fn emit_op(
     spans: &mut Vec<SpanEntry>,
     next_pc: &mut u32,
     op: Op,
-    operands: Vec<Operand>,
+    operands: impl Into<OperandList>,
 ) {
     let pc = *next_pc;
-    code.push(Instruction { pc, op, operands });
+    code.push(Instruction {
+        pc,
+        op,
+        operands: operands.into(),
+    });
     spans.push(SpanEntry { pc, span: (0, 0) });
     *next_pc += 1;
 }

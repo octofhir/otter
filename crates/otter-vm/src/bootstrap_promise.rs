@@ -96,7 +96,13 @@ pub(crate) fn install_promise(
     define_ctor_method(heap, ctor, "race", 1, promise_static_race)?;
     define_ctor_method(heap, ctor, "allSettled", 1, promise_static_all_settled)?;
     define_ctor_method(heap, ctor, "any", 1, promise_static_any)?;
-    define_ctor_method(heap, ctor, "withResolvers", 0, promise_static_with_resolvers)?;
+    define_ctor_method(
+        heap,
+        ctor,
+        "withResolvers",
+        0,
+        promise_static_with_resolvers,
+    )?;
 
     // §27.2.5.2 — `Promise.prototype.constructor` back-pointer.
     object::define_own_property(
@@ -181,18 +187,21 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
             reason: "Promise executor is not callable".to_string(),
         });
     }
-    let context = ctx.execution_context().cloned().ok_or_else(|| NativeError::TypeError {
-        name: "Promise",
-        reason: "no active execution context".to_string(),
-    })?;
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Promise",
+            reason: "no active execution context".to_string(),
+        })?;
     let (handle, resolve, reject) = PromiseBuilder::with_context(context.clone())
         .construct(ctx.heap_mut())
         .map_err(|_| oom("Promise"))?;
     let promise_value = Value::Promise(handle);
     let invoke_args: SmallVec<[Value; 8]> = smallvec::smallvec![resolve, reject.clone()];
-    let invoke_result = ctx
-        .interp_mut()
-        .run_callable_sync(&context, &executor, Value::Undefined, invoke_args);
+    let invoke_result =
+        ctx.interp_mut()
+            .run_callable_sync(&context, &executor, Value::Undefined, invoke_args);
     if let Err(err) = invoke_result {
         // §27.2.1.4 step 3 — wrap the abrupt completion's value,
         // route it through the captured native `reject`. The

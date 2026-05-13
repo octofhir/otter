@@ -2789,8 +2789,7 @@ impl Interpreter {
                 // to enumerable strings per §20.1.2.17 Object.keys.
                 if matches!(target, Value::Proxy(_)) {
                     let string_heap = self.string_heap.clone();
-                    let trap_keys =
-                        self.own_property_keys_value(context, &target, &string_heap)?;
+                    let trap_keys = self.own_property_keys_value(context, &target, &string_heap)?;
                     let mut values: Vec<Value> = Vec::with_capacity(trap_keys.len());
                     for key in trap_keys {
                         let Value::String(_) = &key else { continue };
@@ -3015,10 +3014,8 @@ impl Interpreter {
                     | Value::ClassConstructor(_)
             )
         {
-            let key = self.evaluate_to_property_key(
-                context,
-                args.get(1).unwrap_or(&Value::Undefined),
-            )?;
+            let key =
+                self.evaluate_to_property_key(context, args.get(1).unwrap_or(&Value::Undefined))?;
             let attributes = args.get(2).cloned().unwrap_or(Value::Undefined);
             let descriptor = self.evaluate_to_property_descriptor(context, &attributes)?;
             let ok = self.define_own_property_value(context, target, &key, descriptor)?;
@@ -3051,10 +3048,8 @@ impl Interpreter {
             // §20.1.2.4 Object.defineProperty(O, P, Attributes) —
             // handled in the pre-Proxy block above.
             M::DefineProperty => {
-                let key = self.evaluate_to_property_key(
-                    context,
-                    args.get(1).unwrap_or(&Value::Undefined),
-                )?;
+                let key = self
+                    .evaluate_to_property_key(context, args.get(1).unwrap_or(&Value::Undefined))?;
                 let attributes = args.get(2).cloned().unwrap_or(Value::Undefined);
                 let descriptor = self.evaluate_to_property_descriptor(context, &attributes)?;
                 let ok = self.define_own_property_value(context, target, &key, descriptor)?;
@@ -3150,7 +3145,7 @@ impl Interpreter {
                     let desc = self.ordinary_get_own_property_descriptor_value(
                         context,
                         Value::Proxy(proxy.clone()),
-                        &VmPropertyKey::String(name.clone()),
+                        &VmPropertyKey::String(name.to_string()),
                         hops + 1,
                     )?;
                     if desc
@@ -4515,8 +4510,7 @@ impl Interpreter {
                 "type mismatch: this operation does not accept a value of this type",
             ),
             VmError::TypeMismatchAt { op, kind } => {
-                dynamic_message =
-                    format!("{op}: cannot operate on a value of type {kind}");
+                dynamic_message = format!("{op}: cannot operate on a value of type {kind}");
                 (
                     error_classes::ErrorKind::TypeError,
                     dynamic_message.as_str(),
@@ -4627,7 +4621,7 @@ impl Interpreter {
                 .get(pc as usize)
                 .ok_or(VmError::MissingReturn)?;
             let op = instr.op;
-            let operands = instr.operands.clone();
+            let operands = instr.operands.as_slice();
 
             // Stack-modifying opcodes go first so we don't hold a
             // `&mut Frame` borrow while pushing / popping.
@@ -4651,27 +4645,27 @@ impl Interpreter {
                     continue;
                 }
                 Op::Call => {
-                    self.do_call(stack, context, &operands)?;
+                    self.do_call(stack, context, operands)?;
                     continue;
                 }
                 Op::CallWithThis => {
-                    self.do_call_with_this(stack, context, &operands)?;
+                    self.do_call_with_this(stack, context, operands)?;
                     continue;
                 }
                 Op::CallMethodValue => {
-                    self.do_call_method_value(stack, context, &operands)?;
+                    self.do_call_method_value(stack, context, operands)?;
                     continue;
                 }
                 Op::CallSpread => {
-                    self.do_call_spread(stack, context, &operands)?;
+                    self.do_call_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::New => {
-                    self.do_construct(stack, context, &operands)?;
+                    self.do_construct(stack, context, operands)?;
                     continue;
                 }
                 Op::NewSpread => {
-                    self.do_construct_spread(stack, context, &operands)?;
+                    self.do_construct_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::Throw => {
@@ -4767,7 +4761,7 @@ impl Interpreter {
                 // pushes a frame, so the dispatch happens here —
                 // outside the in-frame mutable borrow below.
                 Op::ToNumber => {
-                    if let Some(()) = self.try_to_primitive_dispatch(stack, context, &operands)? {
+                    if let Some(()) = self.try_to_primitive_dispatch(stack, context, operands)? {
                         continue;
                     }
                 }
@@ -4781,7 +4775,7 @@ impl Interpreter {
                 // the dispatch loop afterwards — the in-frame
                 // match below has no arm for `Op::ToPrimitive`.
                 Op::ToPrimitive => {
-                    self.drive_to_primitive(stack, context, &operands)?;
+                    self.drive_to_primitive(stack, context, operands)?;
                     continue;
                 }
                 // §7.4.3 `GetIterator`. Built-in iterables fall
@@ -4789,7 +4783,7 @@ impl Interpreter {
                 // route through the call-frame ladder.
                 // <https://tc39.es/ecma262/#sec-getiterator>
                 Op::GetIterator => {
-                    if self.drive_get_iterator(stack, context, &operands)? {
+                    if self.drive_get_iterator(stack, context, operands)? {
                         continue;
                     }
                 }
@@ -4799,7 +4793,7 @@ impl Interpreter {
                 // `done`.
                 // <https://tc39.es/ecma262/#sec-iteratornext>
                 Op::IteratorNext => {
-                    if self.drive_iterator_next(stack, context, &operands)? {
+                    if self.drive_iterator_next(stack, context, operands)? {
                         continue;
                     }
                 }
@@ -4811,12 +4805,12 @@ impl Interpreter {
                 // below.
                 // <https://tc39.es/ecma262/#sec-ordinaryget>
                 Op::LoadProperty => {
-                    if self.drive_load_property(stack, context, &operands)? {
+                    if self.drive_load_property(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::LoadElement => {
-                    if self.drive_load_element(stack, context, &operands)? {
+                    if self.drive_load_element(stack, context, operands)? {
                         continue;
                     }
                 }
@@ -4825,17 +4819,17 @@ impl Interpreter {
                 // and non-extensible rejections surface here too.
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
-                    if self.drive_store_property(stack, context, &operands)? {
+                    if self.drive_store_property(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::StoreElement => {
-                    if self.drive_store_element(stack, context, &operands)? {
+                    if self.drive_store_element(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::Instanceof => {
-                    if self.drive_instanceof(stack, context, &operands)? {
+                    if self.drive_instanceof(stack, context, operands)? {
                         continue;
                     }
                 }
@@ -4843,17 +4837,17 @@ impl Interpreter {
                 // [[Delete]] — invoke `has` / `deleteProperty`
                 // traps when the receiver is a Proxy.
                 Op::HasProperty => {
-                    if self.drive_has_property_proxy(stack, context, &operands)? {
+                    if self.drive_has_property_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::DeleteProperty => {
-                    if self.drive_delete_property_proxy(stack, context, &operands)? {
+                    if self.drive_delete_property_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::DeleteElement => {
-                    if self.drive_delete_element_proxy(stack, context, &operands)? {
+                    if self.drive_delete_element_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
@@ -4862,12 +4856,12 @@ impl Interpreter {
                 // `setPrototypeOf` traps when the receiver is a
                 // Proxy.
                 Op::GetPrototype => {
-                    if self.drive_get_prototype_proxy(stack, context, &operands)? {
+                    if self.drive_get_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
                 Op::SetPrototype => {
-                    if self.drive_set_prototype_proxy(stack, context, &operands)? {
+                    if self.drive_set_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
                 }
@@ -5265,7 +5259,7 @@ impl Interpreter {
                     let obj_reg = register_operand(operands.get(1))?;
                     let name_idx = const_operand(operands.get(2))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let value = match read_register(frame, obj_reg)? {
                         Value::Object(o) => {
@@ -5331,7 +5325,7 @@ impl Interpreter {
                                     // <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
                                     let proto = self.constructor_prototype_value("Array")?;
                                     if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.clone());
+                                        let key = VmPropertyKey::String(name.to_string());
                                         match self.ordinary_get_value(
                                             context,
                                             Value::Object(proto_obj),
@@ -5411,10 +5405,9 @@ impl Interpreter {
                                 Value::Undefined => {
                                     // Walk `RegExp.prototype` for
                                     // methods + accessors per §22.2.6.
-                                    let proto =
-                                        self.constructor_prototype_value("RegExp")?;
+                                    let proto = self.constructor_prototype_value("RegExp")?;
                                     if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.clone());
+                                        let key = VmPropertyKey::String(name.to_string());
                                         match self.ordinary_get_value(
                                             context,
                                             Value::Object(proto_obj),
@@ -5453,7 +5446,7 @@ impl Interpreter {
                             // Unknown keys return `undefined` so
                             // `it.someProp` is a non-error read per
                             // ordinary Iterator semantics.
-                            match name.as_str() {
+                            match name {
                                 "next" | "return" | "throw" => {
                                     let receiver_value = read_register(frame, obj_reg)?.clone();
                                     self.synthesize_iterator_method(&name, receiver_value)?
@@ -5472,7 +5465,7 @@ impl Interpreter {
                             };
                             let proto = self.constructor_prototype_value(proto_name)?;
                             if let Value::Object(proto_obj) = proto {
-                                let key = VmPropertyKey::String(name.clone());
+                                let key = VmPropertyKey::String(name.to_string());
                                 match self.ordinary_get_value(
                                     context,
                                     Value::Object(proto_obj),
@@ -5502,7 +5495,7 @@ impl Interpreter {
                             // through ordinary `[[Get]]`.
                             let proto = self.constructor_prototype_value("Promise")?;
                             if let Value::Object(proto_obj) = proto {
-                                let key = VmPropertyKey::String(name.clone());
+                                let key = VmPropertyKey::String(name.to_string());
                                 match self.ordinary_get_value(
                                     context,
                                     Value::Object(proto_obj),
@@ -5548,7 +5541,7 @@ impl Interpreter {
                                     };
                                     let proto = self.constructor_prototype_value(proto_name)?;
                                     if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.clone());
+                                        let key = VmPropertyKey::String(name.to_string());
                                         match self.ordinary_get_value(
                                             context,
                                             Value::Object(proto_obj),
@@ -5557,14 +5550,13 @@ impl Interpreter {
                                             0,
                                         )? {
                                             VmGetOutcome::Value(value) => value,
-                                            VmGetOutcome::InvokeGetter { getter } => {
-                                                self.run_callable_sync(
+                                            VmGetOutcome::InvokeGetter { getter } => self
+                                                .run_callable_sync(
                                                     context,
                                                     &getter,
                                                     v.clone(),
                                                     smallvec::SmallVec::new(),
-                                                )?
-                                            }
+                                                )?,
                                         }
                                     } else {
                                         Value::Undefined
@@ -5592,7 +5584,7 @@ impl Interpreter {
                                     };
                                     let proto = self.constructor_prototype_value(proto_name)?;
                                     if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.clone());
+                                        let key = VmPropertyKey::String(name.to_string());
                                         match self.ordinary_get_value(
                                             context,
                                             Value::Object(proto_obj),
@@ -5626,7 +5618,7 @@ impl Interpreter {
                                 Value::Undefined => {
                                     let proto = self.constructor_prototype_value("DataView")?;
                                     if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.clone());
+                                        let key = VmPropertyKey::String(name.to_string());
                                         match self.ordinary_get_value(
                                             context,
                                             Value::Object(proto_obj),
@@ -5665,7 +5657,7 @@ impl Interpreter {
                                     };
                                     let proto = self.constructor_prototype_value(kind_name)?;
                                     if let Value::Object(proto_obj) = proto {
-                                        let key = VmPropertyKey::String(name.clone());
+                                        let key = VmPropertyKey::String(name.to_string());
                                         match self.ordinary_get_value(
                                             context,
                                             Value::Object(proto_obj),
@@ -5696,7 +5688,7 @@ impl Interpreter {
                             // `constructor`.
                             let proto = self.constructor_prototype_value("BigInt")?;
                             if let Value::Object(proto_obj) = proto {
-                                let key = VmPropertyKey::String(name.clone());
+                                let key = VmPropertyKey::String(name.to_string());
                                 match self.ordinary_get_value(
                                     context,
                                     Value::Object(proto_obj),
@@ -5732,7 +5724,7 @@ impl Interpreter {
                     let name_idx = const_operand(operands.get(1))?;
                     let src = register_operand(operands.get(2))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let value = read_register(frame, src)?.clone();
                     let strict = Self::function_is_strict(context, frame.function_id);
@@ -5771,7 +5763,7 @@ impl Interpreter {
                         // every closure observes the same bag.
                         Value::Function { function_id } | Value::Closure { function_id, .. } => {
                             let fid = *function_id;
-                            if matches!(name.as_str(), "name" | "length") {
+                            if matches!(name, "name" | "length") {
                                 if let Some(desc) = self.ordinary_function_own_property_descriptor(
                                     Some(context),
                                     fid,
@@ -5941,7 +5933,7 @@ impl Interpreter {
                     let obj_reg = register_operand(operands.get(1))?;
                     let name_idx = const_operand(operands.get(2))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let removed = match read_register(frame, obj_reg)? {
                         Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, &name),
@@ -5998,9 +5990,8 @@ impl Interpreter {
                         Value::Object(_) => {
                             // §20.1.2.21 Object.setPrototypeOf throws
                             // when [[SetPrototypeOf]] returns false.
-                            let ok = self.set_prototype_value_proxy_aware(
-                                context, &receiver, &proto,
-                            )?;
+                            let ok =
+                                self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
                             if !ok {
                                 return Err(VmError::TypeError {
                                     message: "Object.setPrototypeOf failed".to_string(),
@@ -6742,7 +6733,7 @@ impl Interpreter {
                     let kind_idx = const_operand(operands.get(1))?;
                     let msg_reg = register_operand(operands.get(2))?;
                     let kind_name = context
-                        .string_constant(kind_idx)
+                        .string_constant_str(kind_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let kind =
                         ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
@@ -6775,7 +6766,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let kind_idx = const_operand(operands.get(1))?;
                     let kind_name = context
-                        .string_constant(kind_idx)
+                        .string_constant_str(kind_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let kind =
                         ErrorKind::from_class_name(&kind_name).ok_or(VmError::InvalidOperand)?;
@@ -6787,7 +6778,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let value =
                         math::load_constant(&name).ok_or_else(|| VmError::UnknownIntrinsic {
@@ -7084,12 +7075,7 @@ impl Interpreter {
                     {
                         result
                     } else {
-                        object_statics::call(
-                            method,
-                            &args,
-                            &self.string_heap,
-                            &mut self.gc_heap,
-                        )?
+                        object_statics::call(method, &args, &self.string_heap, &mut self.gc_heap)?
                     };
                     write_register(frame, dst, result)?;
                     frame.pc += 1;
@@ -7196,7 +7182,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let spec_idx = const_operand(operands.get(1))?;
                     let specifier = context
-                        .string_constant(spec_idx)
+                        .string_constant_str(spec_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let referrer = frame.module_url.clone();
                     let namespace = self
@@ -7221,7 +7207,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     if let Some(value) = crate::object::get(self.global_this, &self.gc_heap, &name)
                     {
@@ -7231,7 +7217,9 @@ impl Interpreter {
                         // Throw a real `ReferenceError` instance so
                         // `e instanceof ReferenceError` checks
                         // observe the spec-correct shape.
-                        return Err(VmError::UndefinedIdentifier { name });
+                        return Err(VmError::UndefinedIdentifier {
+                            name: name.to_string(),
+                        });
                     }
                 }
                 Op::LoadGlobalOrUndefined => {
@@ -7241,7 +7229,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let value = crate::object::get(self.global_this, &self.gc_heap, &name)
                         .unwrap_or(Value::Undefined);
@@ -7509,7 +7497,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let value =
                         symbol_dispatch::load_static(self, &name).map_err(symbol_to_vm_error)?;
@@ -7593,7 +7581,7 @@ impl Interpreter {
                     let kind_idx = const_operand(operands.get(1))?;
                     let iter_reg = register_operand(operands.get(2))?;
                     let kind = context
-                        .string_constant(kind_idx)
+                        .string_constant_str(kind_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let seed = read_register(frame, iter_reg)?.clone();
                     let value = build_collection(&kind, &seed, &mut self.gc_heap)?;
@@ -7652,7 +7640,7 @@ impl Interpreter {
                     let dst = register_operand(operands.first())?;
                     let name_idx = const_operand(operands.get(1))?;
                     let name = context
-                        .string_constant(name_idx)
+                        .string_constant_str(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let value = temporal::load_static(&name).map_err(temporal_to_vm_error)?;
                     write_register(frame, dst, value)?;
@@ -7664,7 +7652,7 @@ impl Interpreter {
                     let locale_reg = register_operand(operands.get(2))?;
                     let options_reg = register_operand(operands.get(3))?;
                     let class = context
-                        .string_constant(class_idx)
+                        .string_constant_str(class_idx)
                         .ok_or(VmError::InvalidOperand)?;
                     let locale = read_register(frame, locale_reg)?.clone();
                     let options = read_register(frame, options_reg)?.clone();
@@ -8849,7 +8837,7 @@ impl Interpreter {
             _ => return Err(VmError::InvalidOperand),
         };
         let name = context
-            .string_constant(name_idx)
+            .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let recv_value = read_register(&stack[top_idx], recv_reg)?.clone();
@@ -8903,7 +8891,7 @@ impl Interpreter {
         // or completion.
         // <https://tc39.es/ecma262/#sec-generator-objects>
         if let Value::Generator(g) = &recv_value {
-            let kind = match name.as_str() {
+            let kind = match name {
                 "next" => Some(GeneratorResumeKind::Next(
                     arg_values.first().cloned().unwrap_or(Value::Undefined),
                 )),
@@ -8995,7 +8983,7 @@ impl Interpreter {
         // mid-walk) deferred to follow-ups.
         if let Value::Array(arr) = &recv_value
             && matches!(
-                name.as_str(),
+                name,
                 "forEach"
                     | "map"
                     | "filter"
@@ -9089,11 +9077,11 @@ impl Interpreter {
         // properties bag attached to the compiled function.
         if let Value::Function { function_id } | Value::Closure { function_id, .. } = &recv_value
             && matches!(
-                name.as_str(),
+                name,
                 "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
             )
         {
-            let result = match name.as_str() {
+            let result = match name {
                 "hasOwnProperty" => {
                     let key = property_key_from_arg(arg_values.first())?;
                     self.ordinary_function_own_property_descriptor(
@@ -9153,7 +9141,7 @@ impl Interpreter {
         // only when the receiver is a plain Object. Callable
         // receivers go straight here.
         // <https://tc39.es/ecma262/#sec-properties-of-the-function-prototype-object>
-        if matches!(name.as_str(), "call" | "apply" | "bind" | "toString")
+        if matches!(name, "call" | "apply" | "bind" | "toString")
             && self.is_callable_runtime(&recv_value)
         {
             return self.dispatch_function_method(
@@ -9176,7 +9164,7 @@ impl Interpreter {
         // same error as `obj.notFn()`.
         let lookup_via_property = match &recv_value {
             Value::Object(_) | Value::Proxy(_) => {
-                let key = VmPropertyKey::String(name.clone());
+                let key = VmPropertyKey::String(name.to_string());
                 match self.ordinary_get_value(
                     context,
                     recv_value.clone(),
@@ -9212,11 +9200,7 @@ impl Interpreter {
             // `Map.groupBy(...)`, etc. dispatch through ordinary
             // method invocation.
             Value::NativeFunction(native) => {
-                match native.own_property_descriptor(
-                    &self.gc_heap,
-                    &self.string_heap,
-                    &name,
-                )? {
+                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, &name)? {
                     Some(desc) => Some(descriptor_value(&desc)),
                     None => None,
                 }
@@ -9237,7 +9221,7 @@ impl Interpreter {
         // `Function.prototype.{call, apply, bind, toString}` on a
         // callable receiver that doesn't expose the method as a
         // property — fallback path.
-        if matches!(name.as_str(), "call" | "apply" | "bind" | "toString")
+        if matches!(name, "call" | "apply" | "bind" | "toString")
             && self.is_callable_runtime(&recv_value)
         {
             return self.dispatch_function_method(
@@ -9250,7 +9234,9 @@ impl Interpreter {
             );
         }
 
-        Err(VmError::UnknownIntrinsic { name })
+        Err(VmError::UnknownIntrinsic {
+            name: name.to_string(),
+        })
     }
 
     /// Dispatch `call` / `apply` / `bind` on a callable receiver.
@@ -9890,8 +9876,7 @@ impl Interpreter {
                             )?;
                             if !constructor_return_is_object(&result) {
                                 return Err(VmError::TypeError {
-                                    message: "Proxy construct trap returned non-object"
-                                        .to_string(),
+                                    message: "Proxy construct trap returned non-object".to_string(),
                                 });
                             }
                             return Ok(result);
@@ -10279,17 +10264,13 @@ impl Interpreter {
             "throw" => "throw",
             _ => return Ok(Value::Undefined),
         };
-        let captures: smallvec::SmallVec<[Value; 4]> =
-            smallvec::smallvec![receiver];
+        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![receiver];
         let value = crate::native_value_with_captures(
             &mut self.gc_heap,
             method_name,
             captures,
             move |ctx, args, captures| {
-                let receiver = captures
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                let receiver = captures.first().cloned().unwrap_or(Value::Undefined);
                 let Value::Iterator(iter_rc) = receiver else {
                     return Err(NativeError::TypeError {
                         name: method_name,
@@ -10304,11 +10285,12 @@ impl Interpreter {
                 let small_args: smallvec::SmallVec<[Value; 8]> = args.iter().cloned().collect();
                 match method_name {
                     "next" => {
-                        let (v, done) = interp
-                            .iterator_next_full(&exec, &iter_rc)
-                            .map_err(|e| NativeError::TypeError {
-                                name: method_name,
-                                reason: e.to_string(),
+                        let (v, done) =
+                            interp.iterator_next_full(&exec, &iter_rc).map_err(|e| {
+                                NativeError::TypeError {
+                                    name: method_name,
+                                    reason: e.to_string(),
+                                }
                             })?;
                         let obj = crate::object::alloc_object(&mut interp.gc_heap)?;
                         crate::object::set(obj, &mut interp.gc_heap, "value", v);
@@ -10316,18 +10298,10 @@ impl Interpreter {
                         Ok(Value::Object(obj))
                     }
                     "return" => {
-                        let arg = small_args
-                            .first()
-                            .cloned()
-                            .unwrap_or(Value::Undefined);
+                        let arg = small_args.first().cloned().unwrap_or(Value::Undefined);
                         let obj = crate::object::alloc_object(&mut interp.gc_heap)?;
                         crate::object::set(obj, &mut interp.gc_heap, "value", arg);
-                        crate::object::set(
-                            obj,
-                            &mut interp.gc_heap,
-                            "done",
-                            Value::Boolean(true),
-                        );
+                        crate::object::set(obj, &mut interp.gc_heap, "done", Value::Boolean(true));
                         Ok(Value::Object(obj))
                     }
                     _ => Err(NativeError::Thrown {
@@ -11130,7 +11104,7 @@ impl Interpreter {
         let src = register_operand(operands.get(1))?;
         let hint_idx = const_operand(operands.get(2))?;
         let hint_token = context
-            .string_constant(hint_idx)
+            .string_constant_str(hint_idx)
             .ok_or(VmError::InvalidOperand)?;
         let hint = abstract_ops::ToPrimitiveHint::from_token(&hint_token)
             .ok_or(VmError::InvalidOperand)?;
@@ -12111,11 +12085,7 @@ impl Interpreter {
                 Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::Null))
             }
             Some(Value::NativeFunction(ctor)) => {
-                match ctor.own_property_descriptor(
-                    &self.gc_heap,
-                    &self.string_heap,
-                    "prototype",
-                ) {
+                match ctor.own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype") {
                     Ok(Some(descriptor)) => Ok(descriptor_value(&descriptor)),
                     _ => Ok(Value::Null),
                 }
@@ -12253,9 +12223,8 @@ impl Interpreter {
             Value::Proxy(proxy) => {
                 if proxy.is_revoked() {
                     return Err(VmError::TypeError {
-                        message:
-                            "Cannot perform 'defineProperty' on a proxy that has been revoked"
-                                .to_string(),
+                        message: "Cannot perform 'defineProperty' on a proxy that has been revoked"
+                            .to_string(),
                     });
                 }
                 let key_value = self.vm_property_key_to_value(key)?;
@@ -12280,13 +12249,12 @@ impl Interpreter {
                         )?;
                         let extensible = self.is_extensible_value(context, &target_value)?;
                         let setting_config_false = matches!(descriptor.configurable, Some(false))
-                            || (descriptor.configurable.is_none() && !descriptor.is_generic()
-                                && {
-                                    // Defaults when adding (current undefined):
-                                    // configurable=false. The non-generic clause
-                                    // only matters when target_desc is None.
-                                    target_desc.is_none()
-                                });
+                            || (descriptor.configurable.is_none() && !descriptor.is_generic() && {
+                                // Defaults when adding (current undefined):
+                                // configurable=false. The non-generic clause
+                                // only matters when target_desc is None.
+                                target_desc.is_none()
+                            });
                         match target_desc.as_ref() {
                             None => {
                                 if !extensible {
@@ -12363,12 +12331,7 @@ impl Interpreter {
                     }
                     None => {
                         // Trap missing — fall through to target.
-                        self.define_own_property_value(
-                            context,
-                            &proxy.target(),
-                            key,
-                            descriptor,
-                        )
+                        self.define_own_property_value(context, &proxy.target(), key, descriptor)
                     }
                 }
             }
@@ -12509,19 +12472,13 @@ impl Interpreter {
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                    context,
-                    &getter,
-                    items.clone(),
-                    SmallVec::new(),
-                )?,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                }
             }
         };
 
-        let raw_values: Vec<Value> = if matches!(
-            iterator_method,
-            Value::Undefined | Value::Null
-        ) {
+        let raw_values: Vec<Value> = if matches!(iterator_method, Value::Undefined | Value::Null) {
             // Step 4 — ArrayLike path.
             if matches!(items, Value::Undefined | Value::Null) {
                 return Err(VmError::TypeError {
@@ -12536,12 +12493,9 @@ impl Interpreter {
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                    context,
-                    &getter,
-                    items.clone(),
-                    SmallVec::new(),
-                )?,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                }
             };
             let len = to_length(&length_value)?;
             let mut out = Vec::with_capacity(len);
@@ -12555,12 +12509,9 @@ impl Interpreter {
                     0,
                 )? {
                     VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                        context,
-                        &getter,
-                        items.clone(),
-                        SmallVec::new(),
-                    )?,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                    }
                 };
                 out.push(value);
             }
@@ -12583,18 +12534,17 @@ impl Interpreter {
                 let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                 cb_args.push(value);
                 cb_args.push(Value::Number(number::NumberValue::from_i32(index as i32)));
-                let mapped_value = self.run_callable_sync(
-                    context,
-                    &map_fn,
-                    this_arg.clone(),
-                    cb_args,
-                )?;
+                let mapped_value =
+                    self.run_callable_sync(context, &map_fn, this_arg.clone(), cb_args)?;
                 mapped.push(mapped_value);
             } else {
                 mapped.push(value);
             }
         }
-        Ok(Value::Array(array::from_elements(&mut self.gc_heap, mapped)?))
+        Ok(Value::Array(array::from_elements(
+            &mut self.gc_heap,
+            mapped,
+        )?))
     }
 
     /// §7.4.1 GetIterator(obj, hint=sync) sync helper.
@@ -12616,9 +12566,7 @@ impl Interpreter {
         context: &ExecutionContext,
         iterable: &Value,
     ) -> Result<(Value, Value), VmError> {
-        let iterator_sym = self
-            .well_known_symbols
-            .get(symbol::WellKnown::Iterator);
+        let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
         let method = match self.ordinary_get_value(
             context,
             iterable.clone(),
@@ -12627,12 +12575,9 @@ impl Interpreter {
             0,
         )? {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                context,
-                &getter,
-                iterable.clone(),
-                SmallVec::new(),
-            )?,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, iterable.clone(), SmallVec::new())?
+            }
         };
         if matches!(method, Value::Undefined | Value::Null) {
             return Err(VmError::TypeError {
@@ -12644,12 +12589,8 @@ impl Interpreter {
                 message: "iterator method is not callable".to_string(),
             });
         }
-        let iterator = self.run_callable_sync(
-            context,
-            &method,
-            iterable.clone(),
-            SmallVec::new(),
-        )?;
+        let iterator =
+            self.run_callable_sync(context, &method, iterable.clone(), SmallVec::new())?;
         if !matches!(
             iterator,
             Value::Object(_)
@@ -12672,12 +12613,9 @@ impl Interpreter {
             0,
         )? {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                context,
-                &getter,
-                iterator.clone(),
-                SmallVec::new(),
-            )?,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, iterator.clone(), SmallVec::new())?
+            }
         };
         Ok((iterator, next_method))
     }
@@ -12699,16 +12637,9 @@ impl Interpreter {
         iterator: &Value,
         next_method: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let result = self.run_callable_sync(
-            context,
-            next_method,
-            iterator.clone(),
-            SmallVec::new(),
-        )?;
-        if !matches!(
-            result,
-            Value::Object(_) | Value::Proxy(_)
-        ) {
+        let result =
+            self.run_callable_sync(context, next_method, iterator.clone(), SmallVec::new())?;
+        if !matches!(result, Value::Object(_) | Value::Proxy(_)) {
             return Err(VmError::TypeError {
                 message: "iterator result is not an object".to_string(),
             });
@@ -12721,12 +12652,9 @@ impl Interpreter {
             0,
         )? {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                context,
-                &getter,
-                result.clone(),
-                SmallVec::new(),
-            )?,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
+            }
         };
         if done_value.to_boolean() {
             return Ok(None);
@@ -12739,12 +12667,9 @@ impl Interpreter {
             0,
         )? {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                context,
-                &getter,
-                result.clone(),
-                SmallVec::new(),
-            )?,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
+            }
         };
         Ok(Some(value))
     }
@@ -12772,12 +12697,9 @@ impl Interpreter {
             0,
         )? {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                context,
-                &getter,
-                iterator.clone(),
-                SmallVec::new(),
-            )?,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, iterator.clone(), SmallVec::new())?
+            }
         };
         if matches!(return_method, Value::Undefined | Value::Null) {
             return Ok(());
@@ -12787,12 +12709,8 @@ impl Interpreter {
                 message: "iterator `return` is not callable".to_string(),
             });
         }
-        let result = self.run_callable_sync(
-            context,
-            &return_method,
-            iterator.clone(),
-            SmallVec::new(),
-        )?;
+        let result =
+            self.run_callable_sync(context, &return_method, iterator.clone(), SmallVec::new())?;
         if !matches!(result, Value::Object(_) | Value::Proxy(_)) {
             return Err(VmError::TypeError {
                 message: "iterator `return` did not yield an object".to_string(),
@@ -12831,8 +12749,7 @@ impl Interpreter {
                 let mut out = Vec::with_capacity(len);
                 for i in 0..s.len() {
                     let unit = s.char_code_at(i).unwrap_or(0);
-                    let unit_str =
-                        JsString::from_utf16_units(&[unit], &self.string_heap)?;
+                    let unit_str = JsString::from_utf16_units(&[unit], &self.string_heap)?;
                     out.push(Value::String(unit_str));
                 }
                 return Ok(out);
@@ -13120,8 +13037,8 @@ impl Interpreter {
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
                 match self.invoke_proxy_trap(context, proxy, "ownKeys", trap_args)? {
                     Some(trap_result) => {
-                        let trap_keys = self
-                            .create_list_from_array_like_property_keys(context, trap_result)?;
+                        let trap_keys =
+                            self.create_list_from_array_like_property_keys(context, trap_result)?;
                         self.validate_proxy_own_keys(context, proxy, trap_keys, string_heap)
                     }
                     None => self.own_property_keys_value(context, &proxy.target(), string_heap),
@@ -13148,8 +13065,8 @@ impl Interpreter {
                 for idx in 0..len {
                     if array::has_own_element(*arr, &self.gc_heap, idx) {
                         let key = idx.to_string();
-                        let s = string::JsString::from_str(&key, string_heap)
-                            .map_err(VmError::from)?;
+                        let s =
+                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?;
                         keys.push(Value::String(s));
                     }
                 }
@@ -13163,8 +13080,7 @@ impl Interpreter {
                 let names = native.own_property_keys(&self.gc_heap);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s =
-                        string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -13173,8 +13089,7 @@ impl Interpreter {
                 let names = function_metadata::bound_own_property_keys(bound, &self.gc_heap);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s =
-                        string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -13254,8 +13169,7 @@ impl Interpreter {
             for j in (i + 1)..trap_result.len() {
                 if same_property_key(&trap_result[i], &trap_result[j]) {
                     return Err(VmError::TypeError {
-                        message: "Proxy ownKeys trap result contains duplicate entries"
-                            .to_string(),
+                        message: "Proxy ownKeys trap result contains duplicate entries".to_string(),
                     });
                 }
             }
@@ -13336,9 +13250,8 @@ impl Interpreter {
             Value::Proxy(proxy) => {
                 if proxy.is_revoked() {
                     return Err(VmError::TypeError {
-                        message:
-                            "Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
-                                .to_string(),
+                        message: "Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
+                            .to_string(),
                     });
                 }
                 let trap_args: SmallVec<[Value; 8]> =
@@ -13354,8 +13267,7 @@ impl Interpreter {
                         // the requested prototype must equal the
                         // target's current prototype.
                         let target_value = proxy.target();
-                        let target_extensible =
-                            self.is_extensible_value(context, &target_value)?;
+                        let target_extensible = self.is_extensible_value(context, &target_value)?;
                         if !target_extensible {
                             let target_proto =
                                 self.ordinary_get_prototype_value(context, target_value, 0)?;
@@ -13415,7 +13327,11 @@ impl Interpreter {
                     Value::Null => None,
                     v => Some(v.clone()),
                 };
-                Ok(object::set_prototype_value(obj, &mut self.gc_heap, proto_opt))
+                Ok(object::set_prototype_value(
+                    obj,
+                    &mut self.gc_heap,
+                    proto_opt,
+                ))
             }
             _ => Ok(true),
         }
@@ -13832,13 +13748,12 @@ impl Interpreter {
                         // exists.
                         if !result {
                             let target_value = proxy.target();
-                            let target_desc = self
-                                .ordinary_get_own_property_descriptor_value(
-                                    context,
-                                    target_value.clone(),
-                                    key,
-                                    hops + 1,
-                                )?;
+                            let target_desc = self.ordinary_get_own_property_descriptor_value(
+                                context,
+                                target_value.clone(),
+                                key,
+                                hops + 1,
+                            )?;
                             if let Some(desc) = target_desc {
                                 if !desc.configurable() {
                                     return Err(VmError::TypeError {
@@ -13936,12 +13851,12 @@ impl Interpreter {
         let obj_reg = register_operand(operands.get(1))?;
         let name_idx = const_operand(operands.get(2))?;
         let name = context
-            .string_constant(name_idx)
+            .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         if matches!(receiver, Value::Object(_) | Value::Proxy(_)) {
-            let key = VmPropertyKey::String(name.clone());
+            let key = VmPropertyKey::String(name.to_string());
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
@@ -13966,7 +13881,7 @@ impl Interpreter {
                 | Value::BigInt(_)
         ) {
             let boxed = self.box_sloppy_this_primitive(receiver.clone())?;
-            let key = VmPropertyKey::String(name.clone());
+            let key = VmPropertyKey::String(name.to_string());
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.ordinary_get_value(context, boxed, receiver.clone(), &key, 0)? {
@@ -14838,7 +14753,7 @@ impl Interpreter {
         let src_reg = register_operand(operands.get(2))?;
         let scratch_reg = register_operand(operands.get(3))?;
         let name = context
-            .string_constant(name_idx)
+            .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
@@ -14854,7 +14769,7 @@ impl Interpreter {
                 });
             }
             let key_str = JsString::from_str(&name, &self.string_heap)?;
-            let key_vm = VmPropertyKey::String(name.clone());
+            let key_vm = VmPropertyKey::String(name.to_string());
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(),
                 Value::String(key_str),
@@ -14915,7 +14830,7 @@ impl Interpreter {
                         if !self.ordinary_set_data_value(
                             context,
                             target_value,
-                            &VmPropertyKey::String(name.clone()),
+                            &VmPropertyKey::String(name.to_string()),
                             value,
                             Value::Proxy(proxy.clone()),
                             0,
@@ -15040,7 +14955,7 @@ impl Interpreter {
                 stack,
                 context,
                 receiver,
-                VmPropertyKey::String(name),
+                VmPropertyKey::String(name.to_string()),
                 value,
                 scratch_reg,
             );
@@ -15153,7 +15068,7 @@ impl Interpreter {
         let obj_reg = register_operand(operands.get(1))?;
         let name_idx = const_operand(operands.get(2))?;
         let name = context
-            .string_constant(name_idx)
+            .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
@@ -15165,7 +15080,7 @@ impl Interpreter {
         let removed = self.ordinary_delete_value(
             context,
             Value::Proxy(proxy),
-            &VmPropertyKey::String(name),
+            &VmPropertyKey::String(name.to_string()),
             0,
         )?;
         write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
@@ -15928,7 +15843,9 @@ fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {
         IntrinsicError::OutOfRange { index, reason } => VmError::RangeError {
             message: format!("argument {index} out of range: {reason}"),
         },
-        IntrinsicError::UnknownMethod { name } => VmError::UnknownIntrinsic { name },
+        IntrinsicError::UnknownMethod { name } => VmError::UnknownIntrinsic {
+            name: name.to_string(),
+        },
     }
 }
 
@@ -17099,12 +17016,12 @@ mod tests {
                 Instruction {
                     pc: 0,
                     op: Op::LoadUndefined,
-                    operands: vec![Operand::Register(0)],
+                    operands: vec![Operand::Register(0)].into(),
                 },
                 Instruction {
                     pc: 1,
                     op: Op::Return,
-                    operands: vec![Operand::Register(0)],
+                    operands: vec![Operand::Register(0)].into(),
                 },
             ],
             1,
@@ -17120,7 +17037,7 @@ mod tests {
             vec![Instruction {
                 pc: 0,
                 op: Op::Nop,
-                operands: vec![],
+                operands: vec![].into(),
             }],
             0,
         );
@@ -17158,7 +17075,7 @@ mod tests {
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
-                operands: vec![],
+                operands: vec![].into(),
             }],
             spans: vec![SpanEntry {
                 pc: 0,
@@ -17205,7 +17122,7 @@ mod tests {
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
-                operands: vec![],
+                operands: vec![].into(),
             }],
             spans: vec![SpanEntry {
                 pc: 0,
@@ -17314,7 +17231,7 @@ mod tests {
             code: vec![Instruction {
                 pc: 0,
                 op: Op::ReturnUndefined,
-                operands: vec![],
+                operands: vec![].into(),
             }],
             spans: vec![SpanEntry {
                 pc: 0,
@@ -17344,12 +17261,12 @@ mod tests {
                 Instruction {
                     pc: 0,
                     op: Op::LoadThis,
-                    operands: vec![Operand::Register(0)],
+                    operands: vec![Operand::Register(0)].into(),
                 },
                 Instruction {
                     pc: 1,
                     op: Op::ReturnValue,
-                    operands: vec![Operand::Register(0)],
+                    operands: vec![Operand::Register(0)].into(),
                 },
             ],
             spans: vec![SpanEntry {
@@ -17430,12 +17347,12 @@ mod tests {
                 Instruction {
                     pc: 0,
                     op: Op::Nop,
-                    operands: vec![],
+                    operands: vec![].into(),
                 },
                 Instruction {
                     pc: 1,
                     op: Op::Return,
-                    operands: vec![Operand::Register(0)],
+                    operands: vec![Operand::Register(0)].into(),
                 },
             ],
             1,

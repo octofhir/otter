@@ -36,8 +36,8 @@
 
 use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::atomics_wait::{self, WaitOutcome};
-use crate::binary::{JsTypedArray, TypedArrayKind};
 use crate::bigint::BigIntValue;
+use crate::binary::{JsTypedArray, TypedArrayKind};
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
 use crate::number::NumberValue;
 use crate::number::parse::to_integer_or_infinity;
@@ -257,7 +257,9 @@ fn coerce_element_value(
                 let parsed = trimmed.parse::<num_bigint::BigInt>();
                 parsed
                     .map(|b| Value::BigInt(BigIntValue::from_inner(b)))
-                    .map_err(|_| type_err(method_name, format!("cannot convert {trimmed:?} to BigInt")))
+                    .map_err(|_| {
+                        type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
+                    })
             }
             Value::Number(_) => Err(type_err(
                 method_name,
@@ -321,14 +323,32 @@ const fn spec_name(method: &'static str) -> &'static str {
 // =====================================================================
 
 fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, "Atomics.load")?;
-    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), "Atomics.load")?;
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::Undefined),
+        false,
+        "Atomics.load",
+    )?;
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::Undefined),
+        "Atomics.load",
+    )?;
     Ok(ta.get(idx))
 }
 
 fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, "Atomics.store")?;
-    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), "Atomics.store")?;
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::Undefined),
+        false,
+        "Atomics.store",
+    )?;
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::Undefined),
+        "Atomics.store",
+    )?;
     let value = coerce_element_value(
         ctx,
         ta.kind(),
@@ -346,8 +366,17 @@ fn modify_op(
     op: fn(i64, i64) -> i64,
     op_big: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
 ) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, method_name)?;
-    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), method_name)?;
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::Undefined),
+        false,
+        method_name,
+    )?;
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::Undefined),
+        method_name,
+    )?;
     let coerced = coerce_element_value(
         ctx,
         ta.kind(),
@@ -414,8 +443,17 @@ fn native_xor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 }
 
 fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), false, "Atomics.exchange")?;
-    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), "Atomics.exchange")?;
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::Undefined),
+        false,
+        "Atomics.exchange",
+    )?;
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::Undefined),
+        "Atomics.exchange",
+    )?;
     let value = coerce_element_value(
         ctx,
         ta.kind(),
@@ -528,21 +566,14 @@ fn native_wait_async(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     do_wait(ctx, args, /* is_async */ true)
 }
 
-fn do_wait(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    is_async: bool,
-) -> Result<Value, NativeError> {
+fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Value, NativeError> {
     let method_name = if is_async {
         "Atomics.waitAsync"
     } else {
         "Atomics.wait"
     };
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::Undefined),
-        true,
-        method_name,
-    )?;
+    let ta =
+        validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), true, method_name)?;
     // §25.4.3.13 Atomics.wait — buffer must be a SharedArrayBuffer.
     if !ta.buffer().is_shared() {
         return Err(type_err(
@@ -554,7 +585,12 @@ fn do_wait(
         .buffer()
         .shared_id()
         .expect("is_shared() guards shared_id");
-    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::Undefined), method_name)?;
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::Undefined),
+        method_name,
+    )?;
     // Coerce expected `value` before timeout for spec-faithful order.
     let expected = coerce_element_value(
         ctx,
@@ -575,7 +611,11 @@ fn do_wait(
                 ));
             }
             let n = crate::number::parse::to_number_value(&primitive);
-            if n.is_nan() { f64::INFINITY } else { n.max(0.0) }
+            if n.is_nan() {
+                f64::INFINITY
+            } else {
+                n.max(0.0)
+            }
         }
     };
     let current = ta.get(idx);
@@ -603,9 +643,8 @@ fn do_wait(
         }
     };
     let string_heap = ctx.cx.interp.string_heap.clone();
-    let label_str = JsString::from_str(label, &string_heap).map_err(|e| {
-        type_err(method_name, format!("string allocation failed: {e}"))
-    })?;
+    let label_str = JsString::from_str(label, &string_heap)
+        .map_err(|e| type_err(method_name, format!("string allocation failed: {e}")))?;
     if is_async {
         let heap = ctx.heap_mut();
         let promise = JsPromiseHandle::fulfilled(heap, Value::String(label_str))
@@ -674,4 +713,3 @@ fn values_equal_strict(a: &Value, b: &Value) -> bool {
         _ => false,
     }
 }
-

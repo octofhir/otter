@@ -83,9 +83,7 @@ pub fn park_until_notified(buf_id: u64, idx: usize, timeout: Option<Duration>) -
 
     // Register this slot in the global registry.
     {
-        let mut reg = REGISTRY
-            .lock()
-            .expect("Atomics wait registry poisoned");
+        let mut reg = REGISTRY.lock().expect("Atomics wait registry poisoned");
         reg.entry((buf_id, idx))
             .or_default()
             .push(Arc::clone(&slot));
@@ -113,9 +111,7 @@ pub fn park_until_notified(buf_id: u64, idx: usize, timeout: Option<Duration>) -
     // drained already; on TimedOut we need to evict ourselves so a
     // future notify does not target a dead slot.
     {
-        let mut reg = REGISTRY
-            .lock()
-            .expect("Atomics wait registry poisoned");
+        let mut reg = REGISTRY.lock().expect("Atomics wait registry poisoned");
         if let Some(slots) = reg.get_mut(&(buf_id, idx)) {
             slots.retain(|s| !Arc::ptr_eq(s, &slot));
             if slots.is_empty() {
@@ -134,9 +130,7 @@ pub fn notify_waiters(buf_id: u64, idx: usize, count: usize) -> usize {
         return 0;
     }
     let drained: Vec<Arc<ParkSlot>> = {
-        let mut reg = REGISTRY
-            .lock()
-            .expect("Atomics wait registry poisoned");
+        let mut reg = REGISTRY.lock().expect("Atomics wait registry poisoned");
         let Some(slots) = reg.get_mut(&(buf_id, idx)) else {
             return 0;
         };

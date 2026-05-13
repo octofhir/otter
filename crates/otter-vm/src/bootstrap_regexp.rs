@@ -139,10 +139,9 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     // Source + flag string preparation.
     let (pattern_utf16, flags_str): (Vec<u16>, String) = match (&pattern_arg, &flags_arg) {
         // RegExp + RegExp source clone.
-        (Value::RegExp(re), Value::Undefined) => (
-            re.pattern_utf16(heap),
-            re.flags(heap).to_js_string(),
-        ),
+        (Value::RegExp(re), Value::Undefined) => {
+            (re.pattern_utf16(heap), re.flags(heap).to_js_string())
+        }
         (Value::RegExp(re), Value::String(s)) => (re.pattern_utf16(heap), s.to_lossy_string()),
         // String + flag.
         (Value::String(s), flags) => {
@@ -233,7 +232,8 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
     let flags = re.flags(ctx.heap()).to_js_string();
     let rendered = format!("/{source}/{flags}");
     let string_heap = ctx.interp_mut().string_heap_clone();
-    let s = JsString::from_str(&rendered, &string_heap).map_err(|_| oom("RegExp.prototype.toString"))?;
+    let s = JsString::from_str(&rendered, &string_heap)
+        .map_err(|_| oom("RegExp.prototype.toString"))?;
     Ok(Value::String(s))
 }
 
@@ -264,14 +264,9 @@ fn install_accessor(
     name: &'static str,
     call: crate::native_function::NativeFastFn,
 ) -> Result<(), JsSurfaceError> {
-    let getter = NativeFunction::new_static(heap, name, 0, call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let desc = PropertyDescriptor::accessor(
-        Some(Value::NativeFunction(getter)),
-        None,
-        false,
-        true,
-    );
+    let getter =
+        NativeFunction::new_static(heap, name, 0, call).map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
     }
@@ -378,4 +373,3 @@ fn intrinsic_to_native(err: crate::intrinsics::IntrinsicError, name: &'static st
         reason: err.to_string(),
     }
 }
-

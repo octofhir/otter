@@ -91,7 +91,7 @@ mod tests {
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::Return,
-                    operands: vec![Operand::Register(0)],
+                    operands: vec![Operand::Register(0)].into(),
                 }],
                 spans: vec![SpanEntry {
                     pc: 0,
@@ -116,7 +116,7 @@ mod tests {
             .map(|(pc, op)| Instruction {
                 pc: pc as u32,
                 op: *op,
-                operands: fixture_operands(*op),
+                operands: fixture_operands(*op).into(),
             })
             .collect();
         let spans = code

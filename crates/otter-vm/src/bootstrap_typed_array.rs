@@ -77,7 +77,11 @@ const TYPED_ARRAY_METHODS: &[(&str, u8, crate::native_function::NativeFastFn)] =
 const TYPED_ARRAY_CTORS: &[(&str, TypedArrayKind, crate::native_function::NativeFastFn)] = &[
     ("Int8Array", TypedArrayKind::Int8, ctor_int8),
     ("Uint8Array", TypedArrayKind::Uint8, ctor_uint8),
-    ("Uint8ClampedArray", TypedArrayKind::Uint8Clamped, ctor_uint8_clamped),
+    (
+        "Uint8ClampedArray",
+        TypedArrayKind::Uint8Clamped,
+        ctor_uint8_clamped,
+    ),
     ("Int16Array", TypedArrayKind::Int16, ctor_int16),
     ("Uint16Array", TypedArrayKind::Uint16, ctor_uint16),
     ("Int32Array", TypedArrayKind::Int32, ctor_int32),
@@ -117,7 +121,12 @@ pub(crate) fn install_typed_array_entry(
         prototype,
         heap,
         "BYTES_PER_ELEMENT",
-        PropertyDescriptor::data(Value::Number(NumberValue::from_i32(bpe)), false, false, false),
+        PropertyDescriptor::data(
+            Value::Number(NumberValue::from_i32(bpe)),
+            false,
+            false,
+            false,
+        ),
     );
 
     let ctor = NativeFunction::new_constructor_static(heap, entry.name, 3, ctor_call)
@@ -226,7 +235,12 @@ fn ensure_abstract_typed_array_prototype(
     {
         let mut builder = ObjectBuilder::from_object(heap, proto);
         for (name, length, call) in TYPED_ARRAY_METHODS {
-            builder.method(name, *length, NativeCall::Static(*call), Attr::builtin_function())?;
+            builder.method(
+                name,
+                *length,
+                NativeCall::Static(*call),
+                Attr::builtin_function(),
+            )?;
         }
     }
     // Hide the slot itself from enumeration.
@@ -363,12 +377,11 @@ fn ta_proto_dispatch(
     args: &[Value],
     method_name: &str,
 ) -> Result<Value, NativeError> {
-    let entry = typed_array_prototype::lookup(method_name).ok_or_else(|| {
-        NativeError::TypeError {
+    let entry =
+        typed_array_prototype::lookup(method_name).ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype",
             reason: format!("method {method_name} missing"),
-        }
-    })?;
+        })?;
     let receiver = ctx.this_value().clone();
     let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
     let string_heap = ctx.interp_mut().string_heap_clone();
@@ -391,12 +404,18 @@ fn ta_proto_dispatch(
 
 fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     match err {
-        VmError::TypeError { message } => NativeError::TypeError { name, reason: message },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
         VmError::TypeMismatch => NativeError::TypeError {
             name,
             reason: "type mismatch".to_string(),
         },
-        VmError::RangeError { message } => NativeError::RangeError { name, reason: message },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

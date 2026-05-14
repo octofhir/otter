@@ -277,6 +277,49 @@ pub(crate) struct AtomOwnPropertyHit {
     pub(crate) slot: u16,
 }
 
+/// Atom-aware hidden-class transition for adding one ordinary own data slot.
+#[derive(Debug, Clone)]
+pub(crate) struct AddOwnPropertyTransition {
+    /// Shape observed before adding the property.
+    pub(crate) from_shape_id: ShapeId,
+    /// Atomized named-property key from the executable context.
+    pub(crate) atom_id: AtomId,
+    /// Shared child shape reached by adding the property.
+    pub(crate) to_shape: Rc<Shape>,
+    /// Prototype condition that made the add-property transition valid.
+    pub(crate) prototype_guard: AddOwnPropertyPrototypeGuard,
+    /// Slot offset added by this transition.
+    pub(crate) slot: u16,
+}
+
+/// Prototype guard for a cached add-property transition.
+#[derive(Debug, Clone)]
+pub(crate) enum AddOwnPropertyPrototypeGuard {
+    /// Receiver had `null` prototype.
+    Null,
+    /// Receiver's direct prototype had this shape, no own key, and no further
+    /// prototype chain when the transition was installed.
+    DirectMissing {
+        /// Direct prototype shape observed at install time.
+        shape_id: ShapeId,
+    },
+    /// Receiver's direct prototype had a writable ordinary data property for
+    /// this key. Setting through it creates an own data property on receiver.
+    DirectWritableData {
+        /// Direct-prototype data slot metadata.
+        hit: AtomOwnPropertyHit,
+    },
+}
+
+/// Own-property slot metadata for non-atomized named-property ICs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnPropertySlotHit {
+    /// Shape observed on the receiver object.
+    pub(crate) shape_id: ShapeId,
+    /// String-keyed own-property slot offset.
+    pub(crate) slot: u16,
+}
+
 /// Atom-aware property lookup result.
 #[derive(Debug, Clone)]
 pub(crate) struct AtomPropertyLookup {
@@ -842,6 +885,33 @@ pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Property
     })
 }
 
+/// Own-property probe that also returns shape/slot metadata for IC install.
+#[must_use]
+pub(crate) fn lookup_own_slot(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: &str,
+) -> (Option<OwnPropertySlotHit>, PropertyLookup) {
+    heap.read_payload(obj, |body| match body.shape.offset_of(key) {
+        Some(offset) => {
+            let mut lookup = body.slots[offset as usize].to_lookup();
+            if let Some(cell) = mapped_argument_cell(body, key)
+                && let PropertyLookup::Data { value, .. } = &mut lookup
+            {
+                *value = read_upvalue(heap, cell);
+            }
+            (
+                Some(OwnPropertySlotHit {
+                    shape_id: body.shape.id(),
+                    slot: offset,
+                }),
+                lookup,
+            )
+        }
+        None => (None, PropertyLookup::Absent),
+    })
+}
+
 /// Atom-aware own-property probe for named property bytecodes.
 #[must_use]
 pub(crate) fn lookup_own_atom(
@@ -870,6 +940,22 @@ pub(crate) fn lookup_own_atom(
             hit: None,
             lookup: PropertyLookup::Absent,
         },
+    })
+}
+
+/// Validate that a cached own-property slot is still present.
+#[must_use]
+pub(crate) fn has_own_slot(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    hit: OwnPropertySlotHit,
+) -> bool {
+    heap.read_payload(obj, |body| {
+        if body.shape.id() != hit.shape_id {
+            return false;
+        }
+        let offset = hit.slot as usize;
+        body.shape.keys.get(offset).is_some() && body.slots.get(offset).is_some()
     })
 }
 
@@ -908,10 +994,9 @@ pub(crate) fn store_own_data_slot_atom(
     heap: &mut otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
     hit: AtomOwnPropertyHit,
-    value: Value,
+    value: &Value,
 ) -> Option<()> {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
-    let barrier_value = value.clone();
     let success = heap.with_payload(obj, |body| {
         if body.shape.id() != hit.shape_id || key.atom().id() != hit.atom_id {
             return false;
@@ -929,17 +1014,188 @@ pub(crate) fn store_own_data_slot_atom(
         let SlotBody::Data { value: stored } = &mut slot.body else {
             return false;
         };
-        *stored = value;
+        *stored = value.clone();
         true
     });
     if !success {
         return None;
     }
     if let Some(cell) = mapped_cell {
-        store_upvalue(heap, cell, barrier_value.clone());
+        store_upvalue(heap, cell, value.clone());
     }
-    heap.record_write(obj, &barrier_value);
+    heap.record_write(obj, value);
     Some(())
+}
+
+/// Add a missing own data property on a prototype-safe ordinary object.
+///
+/// Returns transition metadata that can be reused by a monomorphic store IC.
+/// Callers must only use this after `[[Set]]` has already resolved to
+/// [`SetOutcome::AssignData`]; this helper deliberately only accepts either a
+/// prototype-free receiver, a direct ordinary prototype with no matching key
+/// and no deeper chain, or a direct ordinary prototype with a writable data
+/// property for this key.
+pub(crate) fn add_own_data_property_atom_transition(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    value: &Value,
+) -> Option<AddOwnPropertyTransition> {
+    let prototype_guard = add_transition_prototype_guard(obj, heap, key)?;
+    let transition = heap.with_payload(obj, |body| {
+        if !body.extensible || !prototype_guard_matches(body, &prototype_guard) {
+            return None;
+        }
+        if body.shape.offset_of(key.name()).is_some() {
+            return None;
+        }
+        let slot = u16::try_from(body.slots.len()).ok()?;
+        let from_shape_id = body.shape.id();
+        let to_shape = Shape::add_property(&body.shape, key.name());
+        body.shape = Rc::clone(&to_shape);
+        body.slots.push(PropertySlot::data_default(value.clone()));
+        Some(AddOwnPropertyTransition {
+            from_shape_id,
+            atom_id: key.atom().id(),
+            to_shape,
+            prototype_guard,
+            slot,
+        })
+    })?;
+    heap.record_write(obj, value);
+    Some(transition)
+}
+
+/// Replay a cached add-property transition for a fresh matching receiver.
+///
+/// Returns `Some(())` only after the property was added. Any shape/key,
+/// prototype, or extensibility mismatch falls back to ordinary `[[Set]]`.
+pub(crate) fn store_new_own_data_slot_transition(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    transition: &AddOwnPropertyTransition,
+    value: &Value,
+) -> Option<()> {
+    if !transition_prototype_guard_matches(obj, heap, transition) {
+        return None;
+    }
+    let success = heap.with_payload(obj, |body| {
+        if body.shape.id() != transition.from_shape_id
+            || key.atom().id() != transition.atom_id
+            || !prototype_guard_matches(body, &transition.prototype_guard)
+            || !body.extensible
+        {
+            return false;
+        }
+        let offset = usize::from(transition.slot);
+        debug_assert_eq!(body.shape.offset_of(key.name()), None);
+        debug_assert_eq!(
+            transition.to_shape.offset_of(key.name()),
+            Some(transition.slot)
+        );
+        if body.slots.len() != offset {
+            return false;
+        }
+        body.shape = Rc::clone(&transition.to_shape);
+        body.slots.push(PropertySlot::data_default(value.clone()));
+        true
+    });
+    if !success {
+        return None;
+    }
+    heap.record_write(obj, value);
+    Some(())
+}
+
+fn add_transition_prototype_guard(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<AddOwnPropertyPrototypeGuard> {
+    match heap.read_payload(obj, |body| body.prototype.clone()) {
+        ObjectPrototype::Null => Some(AddOwnPropertyPrototypeGuard::Null),
+        ObjectPrototype::Object(proto) => {
+            if string_data(proto, heap).is_some() {
+                return None;
+            }
+            let lookup = lookup_own_atom(proto, heap, key);
+            match lookup.lookup {
+                PropertyLookup::Absent => prototype_value(proto, heap).is_none().then(|| {
+                    AddOwnPropertyPrototypeGuard::DirectMissing {
+                        shape_id: shape_id(proto, heap),
+                    }
+                }),
+                PropertyLookup::Data { flags, .. } if flags.writable() => lookup
+                    .hit
+                    .map(|hit| AddOwnPropertyPrototypeGuard::DirectWritableData { hit }),
+                PropertyLookup::Data { .. } | PropertyLookup::Accessor { .. } => None,
+            }
+        }
+        ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => None,
+    }
+}
+
+fn transition_prototype_guard_matches(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    transition: &AddOwnPropertyTransition,
+) -> bool {
+    let prototype = heap.read_payload(obj, |body| body.prototype.clone());
+    match (&transition.prototype_guard, prototype) {
+        (AddOwnPropertyPrototypeGuard::Null, ObjectPrototype::Null) => true,
+        (
+            AddOwnPropertyPrototypeGuard::DirectMissing {
+                shape_id: expected_shape_id,
+            },
+            ObjectPrototype::Object(proto),
+        ) => {
+            string_data(proto, heap).is_none()
+                && prototype_value(proto, heap).is_none()
+                && shape_id(proto, heap) == *expected_shape_id
+        }
+        (
+            AddOwnPropertyPrototypeGuard::DirectWritableData { hit },
+            ObjectPrototype::Object(proto),
+        ) => {
+            string_data(proto, heap).is_none()
+                && has_writable_own_data_slot_atom(proto, heap, transition.atom_id, *hit)
+        }
+        _ => false,
+    }
+}
+
+fn prototype_guard_matches(
+    body: &ObjectBody,
+    prototype_guard: &AddOwnPropertyPrototypeGuard,
+) -> bool {
+    match (prototype_guard, &body.prototype) {
+        (AddOwnPropertyPrototypeGuard::Null, ObjectPrototype::Null) => true,
+        (
+            AddOwnPropertyPrototypeGuard::DirectMissing { .. }
+            | AddOwnPropertyPrototypeGuard::DirectWritableData { .. },
+            ObjectPrototype::Object(_),
+        ) => true,
+        _ => false,
+    }
+}
+
+fn has_writable_own_data_slot_atom(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    atom_id: AtomId,
+    hit: AtomOwnPropertyHit,
+) -> bool {
+    heap.read_payload(obj, |body| {
+        if body.shape.id() != hit.shape_id || atom_id != hit.atom_id {
+            return false;
+        }
+        let offset = hit.slot as usize;
+        let Some(slot) = body.slots.get(offset) else {
+            return false;
+        };
+        slot.flags.writable() && matches!(slot.body, SlotBody::Data { .. })
+    })
 }
 
 /// Probe for a property with full prototype-chain walk. Returns
@@ -2106,7 +2362,7 @@ mod tests {
         let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
 
         assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, Value::Boolean(false)),
+            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::Boolean(false)),
             Some(())
         );
         assert_eq!(
@@ -2117,7 +2373,154 @@ mod tests {
         set(o, &mut heap, "y", Value::Null);
 
         assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, Value::Boolean(true)),
+            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::Boolean(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn atom_add_transition_replays_on_matching_direct_prototype_shape() {
+        let mut heap = fresh_heap();
+        let proto = alloc_object(&mut heap).unwrap();
+        let first = alloc_object(&mut heap).unwrap();
+        set_prototype(first, &mut heap, Some(proto));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let transition =
+            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(true))
+                .expect("transition install");
+
+        let second = alloc_object(&mut heap).unwrap();
+        set_prototype(second, &mut heap, Some(proto));
+
+        assert_eq!(
+            store_new_own_data_slot_transition(
+                second,
+                &mut heap,
+                key,
+                &transition,
+                &Value::Boolean(false),
+            ),
+            Some(())
+        );
+        assert_eq!(get_own(second, &heap, "x"), Some(Value::Boolean(false)));
+    }
+
+    #[test]
+    fn atom_add_transition_rejects_changed_direct_prototype_shape() {
+        let mut heap = fresh_heap();
+        let proto = alloc_object(&mut heap).unwrap();
+        let first = alloc_object(&mut heap).unwrap();
+        set_prototype(first, &mut heap, Some(proto));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let transition =
+            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(true))
+                .expect("transition install");
+        set(proto, &mut heap, "x", Value::Null);
+
+        let second = alloc_object(&mut heap).unwrap();
+        set_prototype(second, &mut heap, Some(proto));
+
+        assert_eq!(
+            store_new_own_data_slot_transition(
+                second,
+                &mut heap,
+                key,
+                &transition,
+                &Value::Boolean(false),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn atom_add_transition_rejects_deeper_prototype_after_mutation() {
+        let mut heap = fresh_heap();
+        let proto = alloc_object(&mut heap).unwrap();
+        let first = alloc_object(&mut heap).unwrap();
+        set_prototype(first, &mut heap, Some(proto));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let transition =
+            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(true))
+                .expect("transition install");
+        let deep_proto = alloc_object(&mut heap).unwrap();
+        set_prototype(proto, &mut heap, Some(deep_proto));
+
+        let second = alloc_object(&mut heap).unwrap();
+        set_prototype(second, &mut heap, Some(proto));
+
+        assert_eq!(
+            store_new_own_data_slot_transition(
+                second,
+                &mut heap,
+                key,
+                &transition,
+                &Value::Boolean(false),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn atom_add_transition_replays_inherited_writable_data_store() {
+        let mut heap = fresh_heap();
+        let proto = alloc_object(&mut heap).unwrap();
+        set(proto, &mut heap, "x", Value::Boolean(true));
+        let first = alloc_object(&mut heap).unwrap();
+        set_prototype(first, &mut heap, Some(proto));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let transition =
+            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(false))
+                .expect("transition install");
+
+        let second = alloc_object(&mut heap).unwrap();
+        set_prototype(second, &mut heap, Some(proto));
+
+        assert_eq!(
+            store_new_own_data_slot_transition(second, &mut heap, key, &transition, &Value::Null,),
+            Some(())
+        );
+        assert_eq!(get_own(second, &heap, "x"), Some(Value::Null));
+        assert_eq!(get_own(proto, &heap, "x"), Some(Value::Boolean(true)));
+    }
+
+    #[test]
+    fn atom_add_transition_rejects_inherited_data_after_writable_change() {
+        let mut heap = fresh_heap();
+        let proto = alloc_object(&mut heap).unwrap();
+        set(proto, &mut heap, "x", Value::Boolean(true));
+        let first = alloc_object(&mut heap).unwrap();
+        set_prototype(first, &mut heap, Some(proto));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let transition =
+            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(false))
+                .expect("transition install");
+        assert!(define_own_property(
+            proto,
+            &mut heap,
+            "x",
+            PropertyDescriptor::data(Value::Boolean(true), false, true, true),
+        ));
+
+        let second = alloc_object(&mut heap).unwrap();
+        set_prototype(second, &mut heap, Some(proto));
+
+        assert_eq!(
+            store_new_own_data_slot_transition(second, &mut heap, key, &transition, &Value::Null,),
             None
         );
     }

@@ -160,7 +160,7 @@ impl ExecutableFunction {
             .iter()
             .map(|instr| {
                 let property_ic_site = match instr.op {
-                    Op::LoadProperty | Op::StoreProperty => {
+                    Op::LoadProperty | Op::StoreProperty | Op::HasProperty => {
                         let site = *next_property_ic_site;
                         *next_property_ic_site = next_property_ic_site
                             .checked_add(1)

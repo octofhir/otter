@@ -1722,6 +1722,9 @@ pub struct Interpreter {
     /// dense executable IC site id. These only cover ordinary own writable
     /// data slots; every miss falls back to full `[[Set]]` semantics.
     store_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::StorePropertyIc>>,
+    /// Monomorphic `HasProperty` inline caches keyed by dense executable IC
+    /// site id. These only cover ordinary own/direct-prototype data presence.
+    has_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::HasPropertyIc>>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
     /// Per-interpreter table of well-known symbol singletons
@@ -1956,6 +1959,7 @@ impl Interpreter {
             module_resolution_cache: std::collections::HashMap::new(),
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
+            has_property_ics: Vec::new(),
             property_ic_stats: property_ic::PropertyIcStats::default(),
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
@@ -2005,6 +2009,10 @@ impl Interpreter {
         }
         if self.store_property_ics.len() < site_count {
             self.store_property_ics
+                .resize(site_count, property_ic::PropertyIcEntry::Empty);
+        }
+        if self.has_property_ics.len() < site_count {
+            self.has_property_ics
                 .resize(site_count, property_ic::PropertyIcEntry::Empty);
         }
     }

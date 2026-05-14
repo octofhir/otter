@@ -554,27 +554,133 @@ mod tests {
     }
 
     #[test]
-    fn property_ic_stats_record_store_hit_on_same_site() {
-        let module = module_with(
+    fn property_ic_stats_record_has_property_hit_after_warmup() {
+        let context = ExecutionContext::from_module(module_with(
             vec![
                 instr(0, Op::NewObject, [Operand::Register(0)]),
-                instr(1, Op::LoadFalse, [Operand::Register(1)]),
-                instr(2, Op::LoadTrue, [Operand::Register(2)]),
+                instr(
+                    1,
+                    Op::LoadString,
+                    [Operand::Register(7), Operand::ConstIndex(0)],
+                ),
+                instr(2, Op::LoadTrue, [Operand::Register(1)]),
                 instr(
                     3,
                     Op::StoreProperty,
                     [
                         Operand::Register(0),
                         Operand::ConstIndex(0),
-                        Operand::Register(2),
+                        Operand::Register(1),
+                        Operand::Register(8),
+                    ],
+                ),
+                instr(
+                    4,
+                    Op::HasProperty,
+                    [
+                        Operand::Register(4),
+                        Operand::Register(7),
+                        Operand::Register(0),
+                    ],
+                ),
+                instr(5, Op::Return, [Operand::Register(4)]),
+            ],
+            vec![string_constant("foo")],
+            9,
+        ));
+        let mut interp = Interpreter::new();
+
+        assert_eq!(
+            interp.run(&context).expect("first run"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            interp.run(&context).expect("second run"),
+            Value::Boolean(true)
+        );
+
+        let stats = interp.property_ic_stats();
+        assert_eq!(stats.has_hits, 1);
+        assert_eq!(stats.has_misses, 1);
+        assert_eq!(stats.has_installs, 1);
+    }
+
+    #[test]
+    fn property_ic_stats_record_direct_prototype_has_property_hit_after_warmup() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(
+                    1,
+                    Op::LoadString,
+                    [Operand::Register(7), Operand::ConstIndex(0)],
+                ),
+                instr(2, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    3,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(8),
+                    ],
+                ),
+                instr(4, Op::NewObject, [Operand::Register(3)]),
+                instr(
+                    5,
+                    Op::SetPrototype,
+                    [Operand::Register(3), Operand::Register(0)],
+                ),
+                instr(
+                    6,
+                    Op::HasProperty,
+                    [
+                        Operand::Register(4),
+                        Operand::Register(7),
+                        Operand::Register(3),
+                    ],
+                ),
+                instr(7, Op::Return, [Operand::Register(4)]),
+            ],
+            vec![string_constant("foo")],
+            9,
+        ));
+        let mut interp = Interpreter::new();
+
+        assert_eq!(
+            interp.run(&context).expect("first run"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            interp.run(&context).expect("second run"),
+            Value::Boolean(true)
+        );
+
+        let stats = interp.property_ic_stats();
+        assert_eq!(stats.has_hits, 1);
+        assert_eq!(stats.has_misses, 1);
+        assert_eq!(stats.has_installs, 1);
+    }
+
+    #[test]
+    fn property_ic_stats_record_store_hit_on_same_site() {
+        let module = module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
                         Operand::Register(4),
                     ],
                 ),
-                instr(4, Op::JumpIfTrue, [Operand::Imm32(2), Operand::Register(1)]),
-                instr(5, Op::LoadTrue, [Operand::Register(1)]),
-                instr(6, Op::Jump, [Operand::Imm32(-4)]),
                 instr(
-                    7,
+                    3,
                     Op::LoadProperty,
                     [
                         Operand::Register(3),
@@ -582,15 +688,23 @@ mod tests {
                         Operand::ConstIndex(0),
                     ],
                 ),
-                instr(8, Op::Return, [Operand::Register(3)]),
+                instr(4, Op::Return, [Operand::Register(3)]),
             ],
             vec![string_constant("foo")],
             5,
         );
 
-        let (value, interp) = run_module_with_interpreter(module);
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
 
-        assert_eq!(value, Value::Boolean(true));
+        assert_eq!(
+            interp.run(&context).expect("first run"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            interp.run(&context).expect("second run"),
+            Value::Boolean(true)
+        );
         let stats = interp.property_ic_stats();
         assert_eq!(stats.store_hits, 1);
         assert_eq!(stats.store_misses, 1);

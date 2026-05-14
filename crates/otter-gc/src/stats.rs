@@ -44,6 +44,9 @@ pub struct TypeStats {
     /// Total allocations of this type since the heap was created
     /// (monotone — never decremented).
     pub alloc_count_total: u64,
+    /// Total bytes allocated for this type since the heap was
+    /// created (monotone — never decremented).
+    pub alloc_bytes_total: u64,
     /// Total objects of this type reclaimed since the heap was
     /// created (derived after each GC).
     pub free_count_total: u64,
@@ -54,6 +57,7 @@ impl TypeStats {
     pub const DEFAULT: Self = Self {
         live_bytes: 0,
         alloc_count_total: 0,
+        alloc_bytes_total: 0,
         free_count_total: 0,
     };
 }
@@ -73,6 +77,8 @@ pub struct GcStats {
     pub live_bytes: usize,
     /// Per-`type_tag` rows; index by [`crate::trace::Traceable::TYPE_TAG`].
     pub by_type: [TypeStats; TYPE_TAG_COUNT],
+    /// Total GC-cell bytes allocated since heap creation.
+    pub alloc_bytes_total: u64,
     /// Wall-clock duration of the most recent full GC pause, in
     /// milliseconds. `0.0` until the first full GC fires.
     pub last_gc_pause_ms: f32,
@@ -89,6 +95,7 @@ impl Default for GcStats {
             live_objects: 0,
             live_bytes: 0,
             by_type: [TypeStats::DEFAULT; TYPE_TAG_COUNT],
+            alloc_bytes_total: 0,
             last_gc_pause_ms: 0.0,
             last_gc_reclaimed_bytes: 0,
             gc_cycles: 0,
@@ -109,6 +116,7 @@ impl std::fmt::Debug for GcStats {
         f.debug_struct("GcStats")
             .field("live_objects", &self.live_objects)
             .field("live_bytes", &self.live_bytes)
+            .field("alloc_bytes_total", &self.alloc_bytes_total)
             .field("last_gc_pause_ms", &self.last_gc_pause_ms)
             .field("last_gc_reclaimed_bytes", &self.last_gc_reclaimed_bytes)
             .field("gc_cycles", &self.gc_cycles)
@@ -131,11 +139,17 @@ impl GcStats {
     pub fn record_alloc(&mut self, type_tag: u8, size_bytes: usize) {
         self.live_objects = self.live_objects.wrapping_add(1);
         self.live_bytes = self.live_bytes.wrapping_add(size_bytes);
+        self.alloc_bytes_total = self
+            .alloc_bytes_total
+            .wrapping_add(u64::try_from(size_bytes).unwrap_or(u64::MAX));
         // SAFETY of indexing: `type_tag` is a `u8`, range
         // `[0, 256)`; `by_type` has exactly 256 entries.
         let row = &mut self.by_type[type_tag as usize];
         row.live_bytes = row.live_bytes.wrapping_add(size_bytes);
         row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
+        row.alloc_bytes_total = row
+            .alloc_bytes_total
+            .wrapping_add(u64::try_from(size_bytes).unwrap_or(u64::MAX));
     }
 }
 
@@ -153,8 +167,10 @@ mod tests {
         assert_eq!(stats.live_bytes, 64 + 64 + 32);
         assert_eq!(stats.by_type[7].live_bytes, 128);
         assert_eq!(stats.by_type[7].alloc_count_total, 2);
+        assert_eq!(stats.by_type[7].alloc_bytes_total, 128);
         assert_eq!(stats.by_type[9].live_bytes, 32);
         assert_eq!(stats.by_type[9].alloc_count_total, 1);
+        assert_eq!(stats.alloc_bytes_total, 64 + 64 + 32);
         assert_eq!(stats.by_type[0].alloc_count_total, 0);
     }
 

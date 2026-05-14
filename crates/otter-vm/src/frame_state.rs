@@ -310,6 +310,17 @@ pub struct TryHandler {
 }
 
 impl Frame {
+    /// Shared empty upvalue slice for plain functions without captured
+    /// parent cells.
+    pub(crate) fn empty_upvalues() -> std::rc::Rc<[UpvalueCell]> {
+        thread_local! {
+            static EMPTY_UPVALUES: std::rc::Rc<[UpvalueCell]> =
+                std::rc::Rc::from(Vec::<UpvalueCell>::new());
+        }
+
+        EMPTY_UPVALUES.with(std::clone::Clone::clone)
+    }
+
     /// Allocate a frame for `function`. Registers are pre-filled
     /// with `Value::Undefined`. Used for test-side construction
     /// of trivial functions.
@@ -340,7 +351,7 @@ impl Frame {
         function: &Function,
         heap: &mut otter_gc::GcHeap,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let upvalues = Self::build_upvalues(heap, function, std::rc::Rc::from(Vec::new()))?;
+        let upvalues = Self::build_upvalues(heap, function, Self::empty_upvalues())?;
         Ok(Self::with_return_upvalues_and_this(
             function,
             None,
@@ -357,7 +368,7 @@ impl Frame {
         Self::with_return_upvalues_and_this(
             function,
             return_register,
-            std::rc::Rc::from(Vec::new()),
+            Self::empty_upvalues(),
             Value::Undefined,
         )
     }
@@ -406,7 +417,7 @@ impl Frame {
     /// Full constructor used by call sites that need to bind a
     /// non-default `this`. The caller is responsible for
     /// pre-building `upvalues` via [`Self::build_upvalues`] (or
-    /// passing `Rc::from(Vec::new())` when the function has none).
+    /// passing [`Self::empty_upvalues`] when the function has none).
     /// See [`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)
     /// for the layout.
     #[must_use]

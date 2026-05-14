@@ -75,13 +75,12 @@ impl Interpreter {
         // needs `&mut self` to enqueue microtasks.
         if let Value::Promise(p) = &recv_value {
             let promise = *p;
-            let argv: Vec<Value> = arg_values.iter().cloned().collect();
             let result = promise_dispatch::prototype_call(
                 self,
                 Some(context.clone()),
                 &promise,
                 &name,
-                &argv,
+                arg_values.as_slice(),
             )
             .map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;

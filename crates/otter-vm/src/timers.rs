@@ -252,6 +252,7 @@ fn schedule_timer_common(
         name: native_name,
         reason: "host runtime did not install a timer scheduler".to_string(),
     })?;
+    interp.record_runtime_host_op_enqueued();
     let token = scheduler.schedule(delay_ms, repeat.then_some(delay_ms));
     interp.timer_callbacks_mut().insert(
         token,

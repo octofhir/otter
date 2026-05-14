@@ -99,6 +99,7 @@ pub mod reflect;
 mod reflect_ops;
 pub mod regexp;
 pub mod regexp_prototype;
+pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
 mod static_call_ops;
@@ -170,7 +171,10 @@ pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 pub use timers::{TimerCallbacks, TimerEntry, TimerScheduler, TimerSchedulerHandle};
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
+pub use runtime_budget::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
 pub use runtime_cx::{NativeCallInfo, NativeCtx};
+
+use runtime_budget::RuntimeHeapSnapshot;
 
 use otter_gc::raw::{RawGc, SlotVisitor};
 
@@ -1488,6 +1492,12 @@ pub enum VmError {
     },
     /// `InterruptFlag` was tripped before the next checkpoint.
     Interrupted,
+    /// A configured runtime budget rejected the current VM turn at
+    /// a checkpoint.
+    BudgetExceeded {
+        /// Human-readable diagnostic.
+        message: String,
+    },
     /// `CALL_STRING_METHOD` referenced a method name not in
     /// [`string_prototype::STRING_PROTOTYPE_TABLE`].
     UnknownIntrinsic {
@@ -1577,6 +1587,7 @@ impl std::fmt::Display for VmError {
                 "out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}"
             ),
             VmError::Interrupted => write!(f, "interrupted"),
+            VmError::BudgetExceeded { message } => write!(f, "{message}"),
             VmError::UnknownIntrinsic { name } => write!(f, "unknown intrinsic method `{name}`"),
             VmError::TemporalDeadZone { local_index } => {
                 write!(f, "cannot access local {local_index} before initialization")
@@ -1727,6 +1738,16 @@ pub struct Interpreter {
     has_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::HasPropertyIc>>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
+    /// Optional per-turn resource policy. This slice records observations but
+    /// does not yet yield or reject when a limit is exceeded.
+    runtime_budget: RuntimeBudget,
+    /// Aggregate VM resource counters for diagnostics and embedding policy
+    /// work.
+    runtime_budget_stats: RuntimeBudgetStats,
+    /// Nested dispatch loops share one root-turn accounting window.
+    runtime_budget_depth: u32,
+    runtime_budget_turn_started_at: Option<std::time::Instant>,
+    runtime_budget_heap_start: Option<RuntimeHeapSnapshot>,
     /// Per-interpreter table of well-known symbol singletons
     /// (ECMA-262 §6.1.5.1). Populated in [`Self::new`]; constant
     /// across an interpreter's lifetime.
@@ -1961,6 +1982,11 @@ impl Interpreter {
             store_property_ics: Vec::new(),
             has_property_ics: Vec::new(),
             property_ic_stats: property_ic::PropertyIcStats::default(),
+            runtime_budget: RuntimeBudget::default(),
+            runtime_budget_stats: RuntimeBudgetStats::default(),
+            runtime_budget_depth: 0,
+            runtime_budget_turn_started_at: None,
+            runtime_budget_heap_start: None,
             well_known_symbols,
             symbol_registry: SymbolRegistry::new(),
             error_classes,
@@ -1999,6 +2025,135 @@ impl Interpreter {
     #[must_use]
     pub fn property_ic_stats(&self) -> property_ic::PropertyIcStats {
         self.property_ic_stats
+    }
+
+    /// Return the current observational runtime budget policy.
+    #[must_use]
+    pub fn runtime_budget(&self) -> RuntimeBudget {
+        self.runtime_budget
+    }
+
+    /// Set the observational runtime budget policy.
+    ///
+    /// The current VM records exceedance observations but does not preempt,
+    /// yield, or reject when limits are crossed.
+    pub fn set_runtime_budget(&mut self, budget: RuntimeBudget) {
+        self.runtime_budget = budget;
+    }
+
+    /// Return aggregate runtime budget/resource counters.
+    #[must_use]
+    pub fn runtime_budget_stats(&self) -> RuntimeBudgetStats {
+        self.runtime_budget_stats
+    }
+
+    /// Reset aggregate runtime budget/resource counters.
+    pub fn reset_runtime_budget_stats(&mut self) {
+        self.runtime_budget_stats = RuntimeBudgetStats::default();
+        self.runtime_budget_depth = 0;
+        self.runtime_budget_turn_started_at = None;
+        self.runtime_budget_heap_start = None;
+    }
+
+    fn begin_runtime_budget_turn(&mut self) {
+        if self.runtime_budget_depth == 0 {
+            self.runtime_budget_stats.begin_turn();
+            self.runtime_budget_turn_started_at = Some(std::time::Instant::now());
+            let heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
+            self.runtime_budget_heap_start = Some(heap);
+        }
+        self.runtime_budget_depth = self.runtime_budget_depth.saturating_add(1);
+    }
+
+    fn finish_runtime_budget_turn(&mut self) {
+        self.runtime_budget_depth = self.runtime_budget_depth.saturating_sub(1);
+        if self.runtime_budget_depth == 0
+            && let Some(started_at) = self.runtime_budget_turn_started_at.take()
+        {
+            if let Some(start_heap) = self.runtime_budget_heap_start.take() {
+                let end_heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
+                self.runtime_budget_stats
+                    .record_turn_heap_delta(start_heap, end_heap);
+            }
+            self.runtime_budget_stats
+                .finish_turn(started_at.elapsed(), self.runtime_budget);
+        }
+    }
+
+    fn record_runtime_reductions(&mut self, units: u64) {
+        self.runtime_budget_stats.record_reductions(units);
+    }
+
+    fn enforce_runtime_budget_checkpoint(&mut self) -> Result<(), VmError> {
+        if !self.runtime_budget.rejects_on_exceedance() {
+            return Ok(());
+        }
+        let Some(started_at) = self.runtime_budget_turn_started_at else {
+            return Ok(());
+        };
+        if self.runtime_budget.has_heap_checkpoint_limits()
+            && let Some(start_heap) = self.runtime_budget_heap_start
+        {
+            let end_heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
+            self.runtime_budget_stats
+                .observe_current_turn_heap_delta(start_heap, end_heap);
+        }
+        let elapsed_nanos = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if runtime_budget::budget_exceeded(
+            self.runtime_budget_stats.current_turn_reductions,
+            self.runtime_budget_stats.current_turn_allocated_bytes,
+            self.runtime_budget_stats.current_turn_host_ops,
+            elapsed_nanos,
+            self.runtime_budget_stats.current_external_bytes,
+            self.runtime_budget,
+        ) {
+            self.runtime_budget_stats.record_budget_rejection();
+            return Err(VmError::BudgetExceeded {
+                message: "runtime budget exceeded".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn observe_runtime_stack_depth(&mut self, depth: usize) {
+        self.runtime_budget_stats.observe_stack_depth(depth);
+    }
+
+    fn record_runtime_bytecode_call(&mut self) {
+        self.runtime_budget_stats.record_bytecode_call();
+    }
+
+    fn record_runtime_native_call(&mut self) {
+        self.runtime_budget_stats.record_native_call();
+    }
+
+    fn record_runtime_construct_call(&mut self) {
+        self.runtime_budget_stats.record_construct_call();
+    }
+
+    pub(crate) fn record_runtime_host_op_enqueued(&mut self) {
+        self.runtime_budget_stats.record_host_op_enqueued();
+    }
+
+    fn record_runtime_microtask_drain_started(&mut self) {
+        self.runtime_budget_stats.record_microtask_drain_started();
+    }
+
+    fn record_runtime_microtask_executed(&mut self) {
+        self.runtime_budget_stats.record_microtask_executed();
+    }
+
+    fn observe_runtime_microtask_budget(&mut self, microtasks_this_drain: u64) -> bool {
+        if self
+            .runtime_budget
+            .max_microtasks_per_drain
+            .is_some_and(|limit| microtasks_this_drain > limit)
+        {
+            self.runtime_budget_stats.record_budget_limit_observation();
+            true
+        } else {
+            false
+        }
     }
 
     fn ensure_property_ic_capacity(&mut self, context: &ExecutionContext) {
@@ -2713,7 +2868,9 @@ impl Interpreter {
         &mut self,
         default_context: Option<ExecutionContext>,
     ) -> Result<(), RunError> {
+        self.record_runtime_microtask_drain_started();
         let mut iters: u32 = 0;
+        let mut observed_microtask_budget = false;
         loop {
             let Some(batch) = self.microtasks.begin_drain() else {
                 return Ok(());
@@ -2740,6 +2897,21 @@ impl Interpreter {
                     });
                 }
                 iters += 1;
+                self.record_runtime_microtask_executed();
+                if !observed_microtask_budget {
+                    observed_microtask_budget =
+                        self.observe_runtime_microtask_budget(u64::from(iters));
+                    if observed_microtask_budget && self.runtime_budget.rejects_on_exceedance() {
+                        self.runtime_budget_stats.record_budget_rejection();
+                        self.microtasks.end_drain();
+                        return Err(RunError {
+                            error: VmError::BudgetExceeded {
+                                message: "runtime microtask budget exceeded".to_string(),
+                            },
+                            frames: Vec::new(),
+                        });
+                    }
+                }
                 let context = task.context.clone().or_else(|| default_context.clone());
                 let Some(context) = context else {
                     self.microtasks.end_drain();
@@ -2868,11 +3040,11 @@ impl Interpreter {
                     }
                 };
             }
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
+            self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            return match call.invoke(&mut ctx, &argv) {
+            return match call.invoke(&mut ctx, effective_args.as_slice()) {
                 Ok(value) => {
                     self.settle_microtask_capability(context, result_capability, Ok(value));
                     Ok(())
@@ -2895,28 +3067,16 @@ impl Interpreter {
                 }
             };
         }
-        let (function_id, parent_upvalues, this_for_callee) = match current {
-            Value::Function { function_id } => {
-                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
-            }
-            Value::Closure {
-                function_id,
-                upvalues,
-                bound_this,
-            } => {
-                let this_value = match bound_this {
-                    Some(t) => *t,
-                    None => effective_this,
-                };
-                (function_id, upvalues, this_value)
-            }
-            _ => {
-                return Err(RunError {
-                    error: VmError::NotCallable,
-                    frames: Vec::new(),
-                });
-            }
-        };
+        let (function_id, parent_upvalues, this_for_callee) =
+            match Self::bytecode_call_target_parts(current, effective_this) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    return Err(RunError {
+                        error,
+                        frames: Vec::new(),
+                    });
+                }
+            };
         let function = match context.exec_function(function_id) {
             Some(f) => f,
             None => {
@@ -2951,21 +3111,12 @@ impl Interpreter {
             upvalues,
             this_for_callee,
         );
-        let bind_count = (function.param_count as usize).min(effective_args.len());
-        let total_args = effective_args.len();
-        if function.needs_arguments {
-            new_frame.incoming_args = effective_args.iter().cloned().collect();
-        }
-        let mut iter = effective_args.into_iter();
-        for i in 0..bind_count {
-            let value = iter.next().expect("bind_count <= len");
-            if let Some(slot) = new_frame.registers.get_mut(i) {
-                *slot = value;
-            }
-        }
-        if function.has_rest && total_args > function.param_count as usize {
-            new_frame.rest_args = iter.collect();
-        }
+        Self::bind_bytecode_call_arguments(function, &mut new_frame, effective_args).map_err(
+            |error| RunError {
+                error,
+                frames: Vec::new(),
+            },
+        )?;
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(new_frame);
         match self.dispatch_loop(context, &mut stack) {
@@ -3040,7 +3191,7 @@ impl Interpreter {
         let main = context.exec_main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
         let entry_this = if main.is_module || main.is_strict {
             Value::Undefined
@@ -3120,9 +3271,10 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
     ) -> Result<Value, VmError> {
         self.ensure_property_ic_capacity(context);
-        loop {
+        self.begin_runtime_budget_turn();
+        let result = loop {
             match self.dispatch_loop_inner(context, stack) {
-                Ok(value) => return Ok(value),
+                Ok(value) => break Ok(value),
                 Err(err) => {
                     if matches!(err, VmError::Uncaught { .. })
                         && !stack.is_empty()
@@ -3135,7 +3287,7 @@ impl Interpreter {
                         }
                         unwind?;
                         if stack.is_empty() {
-                            return Ok(Value::Undefined);
+                            break Ok(Value::Undefined);
                         }
                         continue;
                     }
@@ -3152,14 +3304,16 @@ impl Interpreter {
                         }
                         unwind?;
                         if stack.is_empty() {
-                            return Ok(Value::Undefined);
+                            break Ok(Value::Undefined);
                         }
                         continue;
                     }
-                    return Err(err);
+                    break Err(err);
                 }
             }
-        }
+        };
+        self.finish_runtime_budget_turn();
+        result
     }
 
     fn dispatch_loop_inner(
@@ -3195,6 +3349,9 @@ impl Interpreter {
                 .get(pc as usize)
                 .ok_or(VmError::MissingReturn)?;
             let op = instr.op();
+            self.record_runtime_reductions(runtime_budget::opcode_reductions(op));
+            self.enforce_runtime_budget_checkpoint()?;
+            self.observe_runtime_stack_depth(stack.len());
 
             // Stack-modifying opcodes go first so we don't hold a
             // `&mut Frame` borrow while pushing / popping.
@@ -5551,6 +5708,119 @@ mod tests {
     }
 
     #[test]
+    fn runtime_budget_stats_record_reductions_and_budget_observations() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadUndefined,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+            1,
+        );
+        let mut interp = Interpreter::new();
+        interp.set_runtime_budget(RuntimeBudget {
+            max_reductions_per_turn: Some(1),
+            ..RuntimeBudget::default()
+        });
+        let context = ExecutionContext::from_module(module);
+        assert_eq!(interp.run(&context).unwrap(), Value::Undefined);
+        let stats = interp.runtime_budget_stats();
+        assert_eq!(stats.turns_started, 1);
+        assert_eq!(stats.turns_finished, 1);
+        assert!(stats.reductions_executed >= 2);
+        assert!(stats.max_turn_reductions >= 2);
+        assert_eq!(stats.budget_limit_observations, 1);
+        assert_eq!(stats.max_stack_depth_observed, 1);
+    }
+
+    #[test]
+    fn runtime_budget_can_reject_on_reduction_limit() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadUndefined,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+            1,
+        );
+        let mut interp = Interpreter::new();
+        interp.set_runtime_budget(RuntimeBudget {
+            on_exceeded: RuntimeBudgetExceededAction::Reject,
+            max_reductions_per_turn: Some(0),
+            ..RuntimeBudget::default()
+        });
+        let context = ExecutionContext::from_module(module);
+        let err = interp.run(&context).unwrap_err();
+        assert!(matches!(err.error, VmError::BudgetExceeded { .. }));
+        let stats = interp.runtime_budget_stats();
+        assert_eq!(stats.budget_rejections, 1);
+        assert_eq!(stats.budget_limit_observations, 1);
+    }
+
+    #[test]
+    fn runtime_budget_stats_record_heap_allocations() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::NewObject,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+            1,
+        );
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(interp.run(&context).unwrap(), Value::Object(_)));
+        let stats = interp.runtime_budget_stats();
+        assert!(stats.allocated_objects_observed >= 1);
+        assert!(stats.allocated_bytes_observed > 0);
+        assert!(stats.max_turn_allocated_bytes > 0);
+        assert!(stats.max_live_heap_bytes > 0);
+    }
+
+    #[test]
+    fn runtime_budget_stats_record_host_ops_and_external_bytes() {
+        let mut interp = Interpreter::new();
+        interp.set_runtime_budget(RuntimeBudget {
+            max_host_ops_per_turn: Some(0),
+            max_external_bytes: Some(0),
+            ..RuntimeBudget::default()
+        });
+
+        interp.begin_runtime_budget_turn();
+        interp.record_runtime_host_op_enqueued();
+        let external = interp.gc_heap_mut().reserve_external(64).unwrap();
+        interp.finish_runtime_budget_turn();
+
+        let stats = interp.runtime_budget_stats();
+        assert_eq!(stats.host_ops_enqueued, 1);
+        assert_eq!(stats.max_turn_host_ops, 1);
+        assert!(stats.max_external_bytes_observed >= 64);
+        assert!(stats.budget_limit_observations >= 1);
+        drop(external);
+    }
+
+    #[test]
     fn missing_return_errors() {
         let module = module_with(
             vec![Instruction {
@@ -5670,7 +5940,7 @@ mod tests {
         assert!(is_callable(&Value::Function { function_id: 7 }));
         assert!(is_callable(&Value::Closure {
             function_id: 7,
-            upvalues: std::rc::Rc::from(Vec::new()),
+            upvalues: Frame::empty_upvalues(),
             bound_this: None,
         }));
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
@@ -5727,7 +5997,6 @@ mod tests {
         // is proving that the arrow's lexical receiver wins, not
         // that the compiler emits the right opcode (the engine
         // suite's `arrow-this.ts` covers the latter).
-        use std::rc::Rc;
         let main = Function {
             id: 0,
             name: "<main>".to_string(),
@@ -5808,7 +6077,7 @@ mod tests {
         let bound = JsString::from_str("outer", interp.string_heap()).unwrap();
         let closure = Value::Closure {
             function_id: 1,
-            upvalues: Rc::from(Vec::new()),
+            upvalues: Frame::empty_upvalues(),
             bound_this: Some(Box::new(Value::String(bound.clone()))),
         };
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();

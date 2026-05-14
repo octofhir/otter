@@ -712,6 +712,134 @@ mod tests {
     }
 
     #[test]
+    fn deleted_object_shape_does_not_install_later_store_ic() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    3,
+                    Op::DeleteProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    4,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    5,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(4),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(6, Op::Return, [Operand::Register(4)]),
+            ],
+            vec![string_constant("foo")],
+            5,
+        ));
+        let mut interp = Interpreter::new();
+
+        assert_eq!(
+            interp.run(&context).expect("first run"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            interp.run(&context).expect("second run"),
+            Value::Boolean(true)
+        );
+
+        let stats = interp.property_ic_stats();
+        assert_eq!(stats.store_installs, 1);
+        assert_eq!(interp.store_property_ic_count(), 1);
+    }
+
+    #[test]
+    fn deleted_object_shape_does_not_install_later_load_ic() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![
+                instr(0, Op::NewObject, [Operand::Register(0)]),
+                instr(1, Op::LoadTrue, [Operand::Register(1)]),
+                instr(
+                    2,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    3,
+                    Op::DeleteProperty,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+                instr(
+                    4,
+                    Op::StoreProperty,
+                    [
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    5,
+                    Op::LoadProperty,
+                    [
+                        Operand::Register(4),
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                    ],
+                ),
+                instr(6, Op::Return, [Operand::Register(4)]),
+            ],
+            vec![string_constant("foo"), string_constant("bar")],
+            5,
+        ));
+        let mut interp = Interpreter::new();
+
+        assert_eq!(
+            interp.run(&context).expect("first run"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            interp.run(&context).expect("second run"),
+            Value::Boolean(true)
+        );
+
+        assert_eq!(interp.load_property_ic_count(), 0);
+    }
+
+    #[test]
     fn atomized_named_delete_removes_property() {
         let module = module_with(
             vec![

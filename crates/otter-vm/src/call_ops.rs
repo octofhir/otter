@@ -25,13 +25,185 @@ use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::{
-    AsyncFrameState, ExecutionContext, Frame, Interpreter, NativeCallInfo, NativeCtx, Value,
-    VmError, abstract_ops, constructor_return_is_object, is_constructor_runtime,
-    native_to_vm_error, operand_decode::register_operand, promise_dispatch, read_register,
-    write_register,
+    AsyncFrameState, ExecutableFunction, ExecutionContext, Frame, Interpreter, JsObject,
+    NativeCallInfo, NativeCtx, NativeFunction, UpvalueCell, Value, VmError, abstract_ops,
+    constructor_return_is_object, is_constructor_runtime, native_to_vm_error,
+    operand_decode::register_operand, promise_dispatch, read_register, write_register,
 };
 
 impl Interpreter {
+    pub(crate) fn bind_bytecode_call_arguments(
+        function: &ExecutableFunction,
+        frame: &mut Frame,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<(), VmError> {
+        let bind_count = (function.param_count as usize).min(args.len());
+        let total_args = args.len();
+        if function.needs_arguments {
+            frame.incoming_args = args.iter().cloned().collect();
+        }
+        let mut iter = args.into_iter();
+        for i in 0..bind_count {
+            let value = iter.next().expect("bind_count <= len");
+            let slot = frame.registers.get_mut(i).ok_or(VmError::InvalidOperand)?;
+            *slot = value;
+        }
+        if function.has_rest && total_args > function.param_count as usize {
+            frame.rest_args = iter.collect();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bytecode_call_target_parts(
+        current: Value,
+        effective_this: Value,
+    ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>, Value), VmError> {
+        match current {
+            Value::Function { function_id } => {
+                Ok((function_id, Frame::empty_upvalues(), effective_this))
+            }
+            Value::Closure {
+                function_id,
+                upvalues,
+                bound_this,
+            } => {
+                let this_value = match bound_this {
+                    Some(t) => *t,
+                    None => effective_this,
+                };
+                Ok((function_id, upvalues, this_value))
+            }
+            _ => Err(VmError::NotCallable),
+        }
+    }
+
+    fn bytecode_construct_target_parts(
+        current: Value,
+    ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>), VmError> {
+        match current {
+            Value::Function { function_id } => Ok((function_id, Frame::empty_upvalues())),
+            Value::Closure {
+                function_id,
+                upvalues,
+                ..
+            } => Ok((function_id, upvalues)),
+            _ => Err(VmError::NotCallable),
+        }
+    }
+
+    fn build_construct_bytecode_frame(
+        &mut self,
+        context: &ExecutionContext,
+        current: Value,
+        receiver: JsObject,
+        new_target: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Frame, VmError> {
+        let (function_id, parent_upvalues) = Self::bytecode_construct_target_parts(current)?;
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let mut frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            None,
+            upvalues,
+            Value::Object(receiver),
+        );
+        frame.construct_target = Some(receiver);
+        frame.new_target = Some(new_target);
+        Self::bind_bytecode_call_arguments(function, &mut frame, args)?;
+        Ok(frame)
+    }
+
+    fn invoke_native_construct(
+        &mut self,
+        context: &ExecutionContext,
+        native: NativeFunction,
+        this_value: &Value,
+        new_target: &Value,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let call = native.call_target(&self.gc_heap);
+        let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
+        self.record_runtime_native_call();
+        let mut ctx =
+            NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
+        let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error)?;
+        Ok(if constructor_return_is_object(&result) {
+            result
+        } else {
+            this_value.clone()
+        })
+    }
+
+    fn push_bytecode_call_frame(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        function_id: u32,
+        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+        this_for_callee: Value,
+        effective_args: SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        self.record_runtime_bytecode_call();
+        if stack.len() as u32 >= self.max_stack_depth {
+            return Err(VmError::StackOverflow {
+                limit: self.max_stack_depth,
+            });
+        }
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        // Async-call entry path (spec §27.7.5.1): synthesise a
+        // fresh pending result promise, write it into the caller's
+        // `dst` register *now* so the call expression's value is
+        // visible synchronously, and park the new frame with
+        // `return_register = None` so its eventual completion
+        // settles the promise instead of writing back.
+        let (return_register, async_state) = if function.is_async {
+            let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending(&mut self.gc_heap)?;
+            let promise_value = Value::Promise(result_promise);
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, promise_value)?;
+            (None, Some(AsyncFrameState { result_promise }))
+        } else {
+            (Some(dst), None)
+        };
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
+        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            return_register,
+            upvalues,
+            this_for_callee,
+        );
+        new_frame.async_state = async_state;
+        Self::bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
+        // §27.5 Generator-call entry: instead of pushing the frame
+        // onto the dispatch stack, hand the caller a paused
+        // [`Value::Generator`] handle that owns the prepared frame.
+        // The body only runs when `.next()` resumes it.
+        if function.is_generator {
+            new_frame.return_register = None;
+            let async_gen = function.is_async_generator;
+            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, new_frame)?;
+            gen_handle.set_async(&mut self.gc_heap, async_gen);
+            // Backlink the generator into the frame so `Op::Yield`
+            // can find its owner once execution starts.
+            gen_handle.install_owner_on_frame(&mut self.gc_heap);
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
+            return Ok(());
+        }
+        stack.push(new_frame);
+        Ok(())
+    }
+
     /// Handle `Op::Call`: push a new frame for the callee with
     /// arguments copied into the parameter slots and `this` bound
     /// to `Value::Undefined` (foundation strict default).
@@ -116,6 +288,19 @@ impl Interpreter {
                 _ => break,
             }
         }
+        if matches!(current, Value::Function { .. } | Value::Closure { .. }) {
+            let (function_id, parent_upvalues, this_for_callee) =
+                Self::bytecode_call_target_parts(current, effective_this)?;
+            return self.push_bytecode_call_frame(
+                stack,
+                context,
+                function_id,
+                parent_upvalues,
+                this_for_callee,
+                effective_args,
+                dst,
+            );
+        }
         // Native callables short-circuit the frame push: invoke
         // the closure inline, write the result into the caller's
         // dst, and advance pc on the caller frame. No stack frame
@@ -125,11 +310,13 @@ impl Interpreter {
                 crate::object::call_native(*obj, &self.gc_heap)
         {
             let call = native.call_target(&self.gc_heap);
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
+            self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
+            let result = call
+                .invoke(&mut ctx, effective_args.as_slice())
+                .map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -143,11 +330,13 @@ impl Interpreter {
                 write_register(&mut stack[top_idx], dst, result)?;
                 return Ok(());
             }
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
+            self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
+            let result = call
+                .invoke(&mut ctx, effective_args.as_slice())
+                .map_err(native_to_vm_error)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -178,102 +367,17 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
-        let (function_id, parent_upvalues, this_for_callee) = match current {
-            Value::Function { function_id } => {
-                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
-            }
-            Value::Closure {
-                function_id,
-                upvalues,
-                bound_this,
-            } => {
-                let this_value = match bound_this {
-                    Some(t) => *t,
-                    None => effective_this,
-                };
-                (function_id, upvalues, this_value)
-            }
-            _ => return Err(VmError::NotCallable),
-        };
-
-        if stack.len() as u32 >= self.max_stack_depth {
-            return Err(VmError::StackOverflow {
-                limit: self.max_stack_depth,
-            });
-        }
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        // Async-call entry path (spec §27.7.5.1): synthesise a
-        // fresh pending result promise, write it into the caller's
-        // `dst` register *now* so the call expression's value is
-        // visible synchronously, and park the new frame with
-        // `return_register = None` so its eventual completion
-        // settles the promise instead of writing back.
-        let (return_register, async_state) = if function.is_async {
-            let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending(&mut self.gc_heap)?;
-            let promise_value = Value::Promise(result_promise);
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, promise_value)?;
-            (None, Some(AsyncFrameState { result_promise }))
-        } else {
-            (Some(dst), None)
-        };
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
-        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            return_register,
-            upvalues,
+        let (function_id, parent_upvalues, this_for_callee) =
+            Self::bytecode_call_target_parts(current, effective_this)?;
+        self.push_bytecode_call_frame(
+            stack,
+            context,
+            function_id,
+            parent_upvalues,
             this_for_callee,
-        );
-        new_frame.async_state = async_state;
-        // Bind parameters: extra args are dropped, missing args
-        // stay `Value::Undefined` (matches JS semantics).
-        let bind_count = (function.param_count as usize).min(effective_args.len());
-        let total_args = effective_args.len();
-        // Snapshot the full argv when the callee body references
-        // `arguments`. Cloning is cheap because effective_args is a
-        // SmallVec; the snapshot is consumed exactly once by
-        // `Op::CollectArguments`.
-        if function.needs_arguments {
-            new_frame.incoming_args = effective_args.iter().cloned().collect();
-        }
-        let mut iter = effective_args.into_iter();
-        for i in 0..bind_count {
-            let value = iter.next().expect("bind_count <= len");
-            let slot = new_frame
-                .registers
-                .get_mut(i)
-                .ok_or(VmError::InvalidOperand)?;
-            *slot = value;
-        }
-        // Stash the trailing args for `Op::CollectRest`. Only the
-        // rest-aware callees pay the allocation; everyone else
-        // leaves `rest_args` empty as initialised.
-        if function.has_rest && total_args > function.param_count as usize {
-            new_frame.rest_args = iter.collect();
-        }
-        // §27.5 Generator-call entry: instead of pushing the frame
-        // onto the dispatch stack, hand the caller a paused
-        // [`Value::Generator`] handle that owns the prepared frame.
-        // The body only runs when `.next()` resumes it.
-        if function.is_generator {
-            new_frame.return_register = None;
-            let async_gen = function.is_async_generator;
-            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, new_frame)?;
-            gen_handle.set_async(&mut self.gc_heap, async_gen);
-            // Backlink the generator into the frame so `Op::Yield`
-            // can find its owner once execution starts.
-            gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
-            return Ok(());
-        }
-        stack.push(new_frame);
-        Ok(())
+            effective_args,
+            dst,
+        )
     }
 
     /// Handle `Op::New`: allocate a fresh receiver, set its
@@ -349,6 +453,7 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
+        self.record_runtime_construct_call();
         let mut callee = callee;
         let mut new_target = callee.clone();
         let mut args = args;
@@ -425,21 +530,13 @@ impl Interpreter {
             && let Some(Value::NativeFunction(native)) =
                 crate::object::constructor_native(*obj, &self.gc_heap)
         {
-            let argv: Vec<Value> = args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let constructed = if constructor_return_is_object(&result) {
-                // Spec §10.1.13 step 5 — non-undefined "object-like"
-                // returns are honoured. Builtin constructors such as
-                // `Array` produce a `Value::Array` (still an object
-                // per ECMA-262), so the foundation also forwards it.
-                result
-            } else {
-                this_value
-            };
+            let constructed = self.invoke_native_construct(
+                context,
+                native,
+                &this_value,
+                &new_target,
+                args.as_slice(),
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, constructed)?;
             return Ok(());
@@ -450,21 +547,13 @@ impl Interpreter {
         // `NativeCtx::is_construct_call()` to differentiate the
         // call shape.
         if let Value::NativeFunction(native) = &callee {
-            let argv: Vec<Value> = args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let constructed = if constructor_return_is_object(&result) {
-                // Spec §10.1.13 step 5 — non-undefined "object-like"
-                // returns are honoured. Builtin constructors such as
-                // `Array` produce a `Value::Array` (still an object
-                // per ECMA-262), so the foundation also forwards it.
-                result
-            } else {
-                this_value
-            };
+            let constructed = self.invoke_native_construct(
+                context,
+                *native,
+                &this_value,
+                &new_target,
+                args.as_slice(),
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, constructed)?;
             return Ok(());
@@ -472,23 +561,33 @@ impl Interpreter {
         if let Value::ClassConstructor(class) = &callee
             && let Value::NativeFunction(native) = &class.ctor(&self.gc_heap)
         {
-            let argv: Vec<Value> = args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            let constructed = if constructor_return_is_object(&result) {
-                // Spec §10.1.13 step 5 — non-undefined "object-like"
-                // returns are honoured. Builtin constructors such as
-                // `Array` produce a `Value::Array` (still an object
-                // per ECMA-262), so the foundation also forwards it.
-                result
-            } else {
-                this_value
-            };
+            let constructed = self.invoke_native_construct(
+                context,
+                *native,
+                &this_value,
+                &new_target,
+                args.as_slice(),
+            )?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, constructed)?;
+            return Ok(());
+        }
+        let bytecode_callee = match &callee {
+            Value::ClassConstructor(class) => class.ctor(&self.gc_heap).clone(),
+            _ => callee.clone(),
+        };
+        if matches!(
+            bytecode_callee,
+            Value::Function { .. } | Value::Closure { .. }
+        ) {
+            let frame = self.build_construct_bytecode_frame(
+                context,
+                bytecode_callee,
+                receiver,
+                new_target,
+                args,
+            )?;
+            stack.push(frame);
             return Ok(());
         }
         self.invoke(stack, context, &callee, this_value, args, dst)?;
@@ -690,11 +789,13 @@ impl Interpreter {
                 crate::object::call_native(*obj, &self.gc_heap)
         {
             let call = native.call_target(&self.gc_heap);
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
+            self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
+            return call
+                .invoke(&mut ctx, effective_args.as_slice())
+                .map_err(native_to_vm_error);
         }
         if let Value::NativeFunction(native) = &current {
             let call = native.call_target(&self.gc_heap);
@@ -706,29 +807,16 @@ impl Interpreter {
                     effective_args,
                 );
             }
-            let argv: Vec<Value> = effective_args.into_iter().collect();
             let call_info = NativeCallInfo::call(effective_this.clone());
+            self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            return call.invoke(&mut ctx, &argv).map_err(native_to_vm_error);
+            return call
+                .invoke(&mut ctx, effective_args.as_slice())
+                .map_err(native_to_vm_error);
         }
-        let (function_id, parent_upvalues, this_for_callee) = match current {
-            Value::Function { function_id } => {
-                (function_id, std::rc::Rc::from(Vec::new()), effective_this)
-            }
-            Value::Closure {
-                function_id,
-                upvalues,
-                bound_this,
-            } => {
-                let this_value = match bound_this {
-                    Some(t) => *t,
-                    None => effective_this,
-                };
-                (function_id, upvalues, this_value)
-            }
-            _ => return Err(VmError::NotCallable),
-        };
+        let (function_id, parent_upvalues, this_for_callee) =
+            Self::bytecode_call_target_parts(current, effective_this)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -738,23 +826,7 @@ impl Interpreter {
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
-        let bind_count = (function.param_count as usize).min(effective_args.len());
-        let total_args = effective_args.len();
-        if function.needs_arguments {
-            new_frame.incoming_args = effective_args.iter().cloned().collect();
-        }
-        let mut arg_iter = effective_args.into_iter();
-        for i in 0..bind_count {
-            let v = arg_iter.next().expect("bind_count <= len");
-            let slot = new_frame
-                .registers
-                .get_mut(i)
-                .ok_or(VmError::InvalidOperand)?;
-            *slot = v;
-        }
-        if function.has_rest && total_args > function.param_count as usize {
-            new_frame.rest_args = arg_iter.collect();
-        }
+        Self::bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         inner.push(new_frame);
         self.dispatch_loop(context, &mut inner)
     }
@@ -774,6 +846,7 @@ impl Interpreter {
         new_target: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
+        self.record_runtime_construct_call();
         let mut current = target.clone();
         let mut effective_new_target = new_target;
         let mut effective_args = args;
@@ -862,88 +935,45 @@ impl Interpreter {
             && let Some(Value::NativeFunction(native)) =
                 crate::object::constructor_native(*obj, &self.gc_heap)
         {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info =
-                NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            return Ok(if constructor_return_is_object(&result) {
-                result
-            } else {
-                this_value
-            });
+            return self.invoke_native_construct(
+                context,
+                native,
+                &this_value,
+                &effective_new_target,
+                effective_args.as_slice(),
+            );
         }
         if let Value::NativeFunction(native) = &current {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info =
-                NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            return Ok(if constructor_return_is_object(&result) {
-                result
-            } else {
-                this_value
-            });
+            return self.invoke_native_construct(
+                context,
+                *native,
+                &this_value,
+                &effective_new_target,
+                effective_args.as_slice(),
+            );
         }
         if let Value::ClassConstructor(class) = &current
             && let Value::NativeFunction(native) = &class.ctor(&self.gc_heap)
         {
-            let argv: Vec<Value> = effective_args.into_iter().collect();
-            let call = native.call_target(&self.gc_heap);
-            let call_info =
-                NativeCallInfo::construct(this_value.clone(), Some(effective_new_target));
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
-            let result = call.invoke(&mut ctx, &argv).map_err(native_to_vm_error)?;
-            return Ok(if constructor_return_is_object(&result) {
-                result
-            } else {
-                this_value
-            });
+            return self.invoke_native_construct(
+                context,
+                *native,
+                &this_value,
+                &effective_new_target,
+                effective_args.as_slice(),
+            );
         }
         if let Value::ClassConstructor(class) = &current {
             current = class.ctor(&self.gc_heap).clone();
         }
 
-        let (function_id, parent_upvalues) = match current {
-            Value::Function { function_id } => (function_id, std::rc::Rc::from(Vec::new())),
-            Value::Closure {
-                function_id,
-                upvalues,
-                ..
-            } => (function_id, upvalues),
-            _ => return Err(VmError::NotCallable),
-        };
-        let function = context
-            .exec_function(function_id)
-            .ok_or(VmError::InvalidOperand)?;
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let mut new_frame =
-            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_value);
-        new_frame.construct_target = Some(receiver);
-        new_frame.new_target = Some(effective_new_target);
-        if function.needs_arguments {
-            new_frame.incoming_args = effective_args.iter().cloned().collect();
-        }
-        let bind_count = (function.param_count as usize).min(effective_args.len());
-        let total_args = effective_args.len();
-        let mut arg_iter = effective_args.into_iter();
-        for i in 0..bind_count {
-            let v = arg_iter.next().expect("bind_count <= len");
-            let slot = new_frame
-                .registers
-                .get_mut(i)
-                .ok_or(VmError::InvalidOperand)?;
-            *slot = v;
-        }
-        if function.has_rest && total_args > function.param_count as usize {
-            new_frame.rest_args = arg_iter.collect();
-        }
+        let new_frame = self.build_construct_bytecode_frame(
+            context,
+            current,
+            receiver,
+            effective_new_target,
+            effective_args,
+        )?;
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         inner.push(new_frame);
         self.dispatch_loop(context, &mut inner)

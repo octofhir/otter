@@ -83,7 +83,7 @@ impl Interpreter {
         let main = context.exec_main();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, std::rc::Rc::from(Vec::new()))?;
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
         let entry_this = if main.is_module || main.is_strict {
             Value::Undefined
         } else {

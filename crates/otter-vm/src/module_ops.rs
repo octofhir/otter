@@ -91,6 +91,7 @@ impl Interpreter {
                     let token = self
                         .dynamic_import_registry
                         .insert(pending, import_context.clone());
+                    self.record_runtime_host_op_enqueued();
                     loader.schedule(token, specifier, referrer.as_ref().to_string());
                     pending
                 } else {

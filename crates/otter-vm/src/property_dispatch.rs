@@ -30,7 +30,7 @@ use crate::{
     is_restricted_function_property, make_array_iterator_factory, object,
     operand_decode::{const_operand, register_operand},
     property_atom::AtomizedPropertyKey,
-    property_ic::{HasPropertyIc, LoadPropertyIc, StorePropertyIc},
+    property_ic::{HasPropertyIc, LoadPropertyIc, PropertyIcKind, StorePropertyIc},
     read_register, regexp_prototype, symbol, symbol_prototype, temporal, value_kind_name,
     write_register,
 };
@@ -942,68 +942,38 @@ impl Interpreter {
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
         if let Value::Object(obj) = &receiver {
             let obj = *obj;
-            let receiver_shape_id = object::shape_id(obj, &self.gc_heap);
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
             let mut site_disabled = self.load_property_ics[site].is_disabled();
             if let Some(ic) = self.load_property_ics[site].cached() {
-                if let Some(hit) = ic.matches_own_data(receiver_shape_id, atomized_key)
-                    && let Some(value) =
-                        object::load_own_data_slot_atom(obj, &self.gc_heap, atomized_key, hit)
-                {
-                    self.property_ic_stats.load_hits += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, value)?;
+                if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
+                    self.property_ic_stats.record_hit(PropertyIcKind::Load);
+                    Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
                     return Ok(true);
                 }
-                if let Some(hit) = ic.direct_prototype_hit(receiver_shape_id, atomized_key)
-                    && let Some(proto) = object::prototype(obj, &self.gc_heap)
-                    && let Some(value) =
-                        object::load_own_data_slot_atom(proto, &self.gc_heap, atomized_key, hit)
-                {
-                    self.property_ic_stats.load_hits += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, value)?;
-                    return Ok(true);
-                }
-                self.property_ic_stats.load_misses += 1;
-                if self.load_property_ics[site].record_guard_miss() {
-                    self.property_ic_stats.load_disables += 1;
-                }
+                self.load_property_ics[site].record_guard_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Load,
+                );
                 site_disabled = self.load_property_ics[site].is_disabled();
-            } else if !site_disabled {
-                self.property_ic_stats.load_misses += 1;
+            } else {
+                self.load_property_ics[site].record_uncached_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Load,
+                );
             }
-            if !site_disabled && object::string_data(obj, &self.gc_heap).is_none() {
-                let atom_lookup = object::lookup_own_atom(obj, &self.gc_heap, atomized_key);
-                if let (Some(hit), object::PropertyLookup::Data { value, flags: _ }) =
-                    (atom_lookup.hit, atom_lookup.lookup)
-                {
-                    self.load_property_ics[site].install(LoadPropertyIc::own_data(hit));
-                    self.property_ic_stats.load_installs += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, value)?;
-                    return Ok(true);
-                }
-                if let Some(proto) = object::prototype(obj, &self.gc_heap) {
-                    let proto_lookup = object::lookup_own_atom(proto, &self.gc_heap, atomized_key);
-                    if let (Some(hit), object::PropertyLookup::Data { value, flags: _ }) =
-                        (proto_lookup.hit, proto_lookup.lookup)
-                    {
-                        self.load_property_ics[site].install(
-                            LoadPropertyIc::direct_prototype_data(receiver_shape_id, hit),
-                        );
-                        self.property_ic_stats.load_installs += 1;
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                        write_register(&mut stack[top_idx], dst, value)?;
-                        return Ok(true);
-                    }
-                }
+            if !site_disabled
+                && let Some((ic, value)) =
+                    LoadPropertyIc::install_candidate(obj, &self.gc_heap, atomized_key)
+            {
+                self.load_property_ics[site].install_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Load,
+                    ic,
+                );
+                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
+                return Ok(true);
             }
             let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
@@ -1440,6 +1410,21 @@ impl Interpreter {
         } else {
             Ok(())
         }
+    }
+
+    fn advance_property_fast_path(frame: &mut Frame) -> Result<(), VmError> {
+        let pc = frame.pc;
+        frame.pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        Ok(())
+    }
+
+    fn finish_property_fast_path_value(
+        frame: &mut Frame,
+        dst: u16,
+        value: Value,
+    ) -> Result<(), VmError> {
+        Self::advance_property_fast_path(frame)?;
+        write_register(frame, dst, value)
     }
 
     fn store_to_primitive_base(
@@ -1904,50 +1889,30 @@ impl Interpreter {
         let value = read_register(&stack[top_idx], src_reg)?.clone();
         let strict = Self::current_frame_is_strict(stack, context);
         if let Value::Object(obj) = &receiver
-            && object::string_data(*obj, &self.gc_heap).is_none()
+            && object::supports_fast_property_ic(*obj, &self.gc_heap)
         {
             let obj = *obj;
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
             if let Some(ic) = self.store_property_ics[site].cached_ref() {
-                let shape_id = object::shape_id(obj, &self.gc_heap);
-                if let Some(hit) = ic.own_data_hit(shape_id, atomized_key)
-                    && object::store_own_data_slot_atom(
-                        obj,
-                        &mut self.gc_heap,
-                        atomized_key,
-                        hit,
-                        &value,
-                    )
+                if ic
+                    .store(obj, &mut self.gc_heap, atomized_key, &value)
                     .is_some()
                 {
-                    self.property_ic_stats.store_hits += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    self.property_ic_stats.record_hit(PropertyIcKind::Store);
+                    Self::advance_property_fast_path(&mut stack[top_idx])?;
                     return Ok(true);
                 }
-                if let Some(transition) = ic.add_own_data_transition(shape_id, atomized_key)
-                    && object::store_new_own_data_slot_transition(
-                        obj,
-                        &mut self.gc_heap,
-                        atomized_key,
-                        transition,
-                        &value,
-                    )
-                    .is_some()
-                {
-                    self.property_ic_stats.store_hits += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    return Ok(true);
-                }
-                self.property_ic_stats.store_misses += 1;
-                if self.store_property_ics[site].record_guard_miss() {
-                    self.property_ic_stats.store_disables += 1;
-                }
-            } else if !self.store_property_ics[site].is_disabled() {
-                self.property_ic_stats.store_misses += 1;
+                self.store_property_ics[site].record_guard_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                );
+            } else {
+                self.store_property_ics[site].record_uncached_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                );
             }
         }
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
@@ -2182,9 +2147,9 @@ impl Interpreter {
         match outcome {
             object::SetOutcome::AssignData => {
                 let transition = if matches!(receiver, Value::Object(_))
-                    && object::string_data(obj, &self.gc_heap).is_none()
+                    && object::supports_fast_property_ic(obj, &self.gc_heap)
                 {
-                    object::add_own_data_property_atom_transition(
+                    object::capture_store_property_transition(
                         obj,
                         &mut self.gc_heap,
                         atomized_key,
@@ -2207,23 +2172,26 @@ impl Interpreter {
                         .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                         .ok_or(VmError::InvalidOperand)?;
                     if !self.store_property_ics[site].is_disabled()
-                        && object::string_data(obj, &self.gc_heap).is_none()
+                        && object::supports_fast_property_ic(obj, &self.gc_heap)
                     {
                         if let Some(transition) = transition {
-                            self.store_property_ics[site]
-                                .install(StorePropertyIc::add_own_data(transition));
-                            self.property_ic_stats.store_installs += 1;
-                        } else {
-                            let atom_lookup =
-                                object::lookup_own_atom(obj, &self.gc_heap, atomized_key);
-                            if let (Some(hit), object::PropertyLookup::Data { flags, value: _ }) =
-                                (atom_lookup.hit, atom_lookup.lookup)
-                                && flags.writable()
-                            {
-                                self.store_property_ics[site]
-                                    .install(StorePropertyIc::own_data(hit));
-                                self.property_ic_stats.store_installs += 1;
-                            }
+                            self.store_property_ics[site].install_with_stats(
+                                &mut self.property_ic_stats,
+                                PropertyIcKind::Store,
+                                StorePropertyIc::transition(transition),
+                            );
+                        } else if let Some(ic) =
+                            StorePropertyIc::existing_own_data_install_candidate(
+                                obj,
+                                &self.gc_heap,
+                                atomized_key,
+                            )
+                        {
+                            self.store_property_ics[site].install_with_stats(
+                                &mut self.property_ic_stats,
+                                PropertyIcKind::Store,
+                                ic,
+                            );
                         }
                     }
                 }
@@ -2276,75 +2244,46 @@ impl Interpreter {
         };
         if let (Value::Object(obj), Value::String(key_string)) = (&rhs, &lhs) {
             let obj = *obj;
-            let receiver_shape_id = object::shape_id(obj, &self.gc_heap);
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
             let mut site_disabled = self.has_property_ics[site].is_disabled();
             if let Some(ic) = self.has_property_ics[site].cached_ref() {
-                if let Some(hit) = ic.own_hit(receiver_shape_id, key_string)
-                    && object::has_own_slot(obj, &self.gc_heap, hit)
-                {
-                    self.property_ic_stats.has_hits += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, Value::Boolean(true))?;
+                if ic.probe(obj, &self.gc_heap, key_string).is_some() {
+                    self.property_ic_stats.record_hit(PropertyIcKind::Has);
+                    Self::finish_property_fast_path_value(
+                        &mut stack[top_idx],
+                        dst,
+                        Value::Boolean(true),
+                    )?;
                     return Ok(true);
                 }
-                if let Some(hit) = ic.direct_prototype_hit(receiver_shape_id, key_string)
-                    && let Some(proto) = object::prototype(obj, &self.gc_heap)
-                    && object::has_own_slot(proto, &self.gc_heap, hit)
-                {
-                    self.property_ic_stats.has_hits += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, Value::Boolean(true))?;
-                    return Ok(true);
-                }
-                self.property_ic_stats.has_misses += 1;
-                if self.has_property_ics[site].record_guard_miss() {
-                    self.property_ic_stats.has_disables += 1;
-                }
+                self.has_property_ics[site]
+                    .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
                 site_disabled = self.has_property_ics[site].is_disabled();
-            } else if !site_disabled {
-                self.property_ic_stats.has_misses += 1;
+            } else {
+                self.has_property_ics[site].record_uncached_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Has,
+                );
             }
-            if !site_disabled && object::string_data(obj, &self.gc_heap).is_none() {
-                let key_name = key_string.to_lossy_string();
-                let (own_hit, own_lookup) = object::lookup_own_slot(obj, &self.gc_heap, &key_name);
-                if let (Some(hit), object::PropertyLookup::Data { .. }) = (own_hit, own_lookup) {
-                    self.has_property_ics[site]
-                        .install(HasPropertyIc::own_data(key_string.clone(), hit));
-                    self.property_ic_stats.has_installs += 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(&mut stack[top_idx], dst, Value::Boolean(true))?;
-                    return Ok(true);
-                }
-                if let Some(proto) = object::prototype(obj, &self.gc_heap) {
-                    let (proto_hit, proto_lookup) =
-                        object::lookup_own_slot(proto, &self.gc_heap, &key_name);
-                    if let (Some(hit), object::PropertyLookup::Data { .. }) =
-                        (proto_hit, proto_lookup)
-                    {
-                        self.has_property_ics[site].install(HasPropertyIc::direct_prototype_data(
-                            receiver_shape_id,
-                            key_string.clone(),
-                            hit,
-                        ));
-                        self.property_ic_stats.has_installs += 1;
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                        write_register(&mut stack[top_idx], dst, Value::Boolean(true))?;
-                        return Ok(true);
-                    }
-                }
-                self.has_property_ics[site].disable();
-                self.property_ic_stats.has_disables += 1;
-            } else if !site_disabled {
-                self.has_property_ics[site].disable();
-                self.property_ic_stats.has_disables += 1;
+            if !site_disabled
+                && let Some(ic) = HasPropertyIc::install_candidate(obj, &self.gc_heap, key_string)
+            {
+                self.has_property_ics[site].install_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Has,
+                    ic,
+                );
+                Self::finish_property_fast_path_value(
+                    &mut stack[top_idx],
+                    dst,
+                    Value::Boolean(true),
+                )?;
+                return Ok(true);
             }
+            self.has_property_ics[site]
+                .disable_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
         }
         let key = match &lhs {
             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),

@@ -101,6 +101,7 @@ pub use otter_compiler::{
     CompiledSourceSpan, LiveBindingSlot,
 };
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
+pub use otter_vm::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
 pub use promise_registry::{HostSettleOutcome, PromiseId};
 pub use structured_clone::{
     StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
@@ -1946,6 +1947,31 @@ impl Runtime {
         self.interp.gc_heap_mut().gc_stats()
     }
 
+    /// Return the VM's observational runtime budget policy.
+    #[must_use]
+    pub fn runtime_budget(&self) -> RuntimeBudget {
+        self.interp.runtime_budget()
+    }
+
+    /// Set the VM's observational runtime budget policy.
+    ///
+    /// This does not yet enforce preemption; it records limit exceedance in
+    /// [`RuntimeBudgetStats`].
+    pub fn set_runtime_budget(&mut self, budget: RuntimeBudget) {
+        self.interp.set_runtime_budget(budget);
+    }
+
+    /// Snapshot VM runtime budget/resource counters.
+    #[must_use]
+    pub fn runtime_budget_stats(&self) -> RuntimeBudgetStats {
+        self.interp.runtime_budget_stats()
+    }
+
+    /// Reset VM runtime budget/resource counters.
+    pub fn reset_runtime_budget_stats(&mut self) {
+        self.interp.reset_runtime_budget_stats();
+    }
+
     /// Force a full GC cycle (scavenge + old-gen mark-sweep).
     ///
     /// **Debug / test only.** Production code must never call
@@ -3073,6 +3099,11 @@ fn map_vm_error(run_err: otter_vm::RunError) -> OtterError {
             requested_bytes,
             heap_limit_bytes,
         },
+        VmError::BudgetExceeded { message } => runtime_diagnostic(
+            DiagnosticKind::Timeout,
+            DiagnosticCode::BudgetExceeded,
+            message,
+        ),
         VmError::TypeMismatch => {
             runtime_diagnostic(DiagnosticKind::Type, DiagnosticCode::TypeMismatch, display)
         }

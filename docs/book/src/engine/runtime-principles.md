@@ -48,6 +48,12 @@ The exact public API can change, but the policy needs these dimensions:
 - maximum contiguous turn duration;
 - optional stack depth and recursion limits.
 
+The default policy is observational: it records exceedances for these
+dimensions without changing JavaScript-visible completion. Embedders can opt
+into hard rejection, which returns a structured `BUDGET_EXCEEDED` runtime
+diagnostic at VM checkpoints. Cooperative yield and resumable scheduling remain
+future work.
+
 Budget exhaustion must not be modeled as an arbitrary internal crash. The
 VM should distinguish:
 
@@ -166,6 +172,7 @@ production diagnostics:
 - max contiguous VM turn duration;
 - allocations and allocated bytes;
 - external/off-heap bytes;
+- host-operation enqueues from VM work;
 - GC count, GC time, reclaimed bytes;
 - pending commands, timers, host ops, dynamic module jobs, and microtasks;
 - cancelled or rejected host work;

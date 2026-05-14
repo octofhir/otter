@@ -30,6 +30,10 @@
 //! - [`SetOutcome`] — what the runtime should do after a property
 //!   write resolved through the prototype chain (write data, invoke
 //!   setter, or reject).
+//! - [`StorePropertyTransition`] / [`StorePropertyTransitionKind`] — guarded
+//!   transition records used by StoreProperty IC replay.
+//! - [`ShapeCacheMode`] — fast-shape eligibility marker for current and future
+//!   dictionary-compatible object storage.
 //! - [`JsObject`] / [`Shape`] / [`ObjectBody`] / [`Properties`] —
 //!   the public object handle, its hidden class, the GC-allocated
 //!   storage, and the read-only view used by JSON serialisation and
@@ -45,6 +49,9 @@
 //!   object is non-extensible (writable may still be true).
 //! - Accessor descriptors never carry a `writable` bit — its slot is
 //!   reused as a discriminator (always `false`).
+//! - Hidden-class ICs may cache only [`ShapeCacheMode::Fast`] objects;
+//!   string-keyed delete moves an object to dictionary-compatible mode even
+//!   though the current backing store still uses a fresh shape.
 //! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
 //!   prototype assignment, and every symbol-property write records
 //!   the store through [`otter_gc::GcHeap::record_write`] so the
@@ -78,11 +85,18 @@ mod descriptor;
 mod descriptor_core;
 mod key_order;
 mod lookup;
+mod shape_cache;
+mod shape_transition;
 
 pub use descriptor::{
     DescriptorKind, PartialPropertyDescriptor, PropertyDescriptor, PropertyFlags,
 };
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
+pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
+pub(crate) use shape_transition::{
+    StorePropertyTransition, StorePropertyTransitionKind, capture_store_property_transition,
+    replay_store_property_transition,
+};
 
 static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -277,40 +291,6 @@ pub(crate) struct AtomOwnPropertyHit {
     pub(crate) slot: u16,
 }
 
-/// Atom-aware hidden-class transition for adding one ordinary own data slot.
-#[derive(Debug, Clone)]
-pub(crate) struct AddOwnPropertyTransition {
-    /// Shape observed before adding the property.
-    pub(crate) from_shape_id: ShapeId,
-    /// Atomized named-property key from the executable context.
-    pub(crate) atom_id: AtomId,
-    /// Shared child shape reached by adding the property.
-    pub(crate) to_shape: Rc<Shape>,
-    /// Prototype condition that made the add-property transition valid.
-    pub(crate) prototype_guard: AddOwnPropertyPrototypeGuard,
-    /// Slot offset added by this transition.
-    pub(crate) slot: u16,
-}
-
-/// Prototype guard for a cached add-property transition.
-#[derive(Debug, Clone)]
-pub(crate) enum AddOwnPropertyPrototypeGuard {
-    /// Receiver had `null` prototype.
-    Null,
-    /// Receiver's direct prototype had this shape, no own key, and no further
-    /// prototype chain when the transition was installed.
-    DirectMissing {
-        /// Direct prototype shape observed at install time.
-        shape_id: ShapeId,
-    },
-    /// Receiver's direct prototype had a writable ordinary data property for
-    /// this key. Setting through it creates an own data property on receiver.
-    DirectWritableData {
-        /// Direct-prototype data slot metadata.
-        hit: AtomOwnPropertyHit,
-    },
-}
-
 /// Own-property slot metadata for non-atomized named-property ICs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OwnPropertySlotHit {
@@ -484,6 +464,13 @@ pub struct ObjectBody {
     /// post-transition; per architecture plan §4.1 shapes are NOT
     /// GC-managed.
     shape: Rc<Shape>,
+    /// Whether string-keyed shape assumptions are IC-compatible.
+    ///
+    /// Ordinary shape transitions stay in [`ShapeCacheMode::Fast`].
+    /// Deleting string-keyed own properties marks the object
+    /// [`ShapeCacheMode::DictionaryCompatible`] so future dictionary storage
+    /// can keep the same invalidation contract without installing stale ICs.
+    shape_cache_mode: ShapeCacheMode,
     /// Slot table aligned with [`Shape::keys`].
     slots: SmallVec<[PropertySlot; 4]>,
     /// `[[Prototype]]` — [`otter_gc::Gc::null()`] encodes JS
@@ -522,6 +509,7 @@ impl std::fmt::Debug for ObjectBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectBody")
             .field("shape_len", &self.shape.len())
+            .field("shape_cache_mode", &self.shape_cache_mode)
             .field("slot_count", &self.slots.len())
             .field(
                 "has_prototype",
@@ -655,6 +643,7 @@ pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::O
     let shape = ROOT_SHAPE.with(Rc::clone);
     heap.alloc_old(ObjectBody {
         shape,
+        shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
         symbol_props: Vec::new(),
@@ -690,6 +679,7 @@ pub fn alloc_diagnostic_object(
     let shape = ROOT_SHAPE.with(Rc::clone);
     heap.alloc_old_diagnostic(ObjectBody {
         shape,
+        shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
         symbol_props: Vec::new(),
@@ -716,6 +706,7 @@ pub fn alloc_host_object<T: HostObjectData>(
     let shape = ROOT_SHAPE.with(Rc::clone);
     heap.alloc_old(ObjectBody {
         shape,
+        shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
         symbol_props: Vec::new(),
@@ -824,6 +815,15 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 #[allow(dead_code)]
 pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
     heap.read_payload(obj, |body| body.shape.id())
+}
+
+/// `true` when hidden-class ICs may cache this object's string-keyed slots.
+///
+/// This excludes string exotic wrappers and objects that have taken delete-like
+/// mutations reserved for future dictionary storage.
+#[must_use]
+pub(crate) fn supports_fast_property_ic(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, shape_cache::supports_fast_property_ic)
 }
 
 /// Read an **own** property with an accessor short-circuit:
@@ -1025,159 +1025,6 @@ pub(crate) fn store_own_data_slot_atom(
     }
     heap.record_write(obj, value);
     Some(())
-}
-
-/// Add a missing own data property on a prototype-safe ordinary object.
-///
-/// Returns transition metadata that can be reused by a monomorphic store IC.
-/// Callers must only use this after `[[Set]]` has already resolved to
-/// [`SetOutcome::AssignData`]; this helper deliberately only accepts either a
-/// prototype-free receiver, a direct ordinary prototype with no matching key
-/// and no deeper chain, or a direct ordinary prototype with a writable data
-/// property for this key.
-pub(crate) fn add_own_data_property_atom_transition(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: AtomizedPropertyKey<'_>,
-    value: &Value,
-) -> Option<AddOwnPropertyTransition> {
-    let prototype_guard = add_transition_prototype_guard(obj, heap, key)?;
-    let transition = heap.with_payload(obj, |body| {
-        if !body.extensible || !prototype_guard_matches(body, &prototype_guard) {
-            return None;
-        }
-        if body.shape.offset_of(key.name()).is_some() {
-            return None;
-        }
-        let slot = u16::try_from(body.slots.len()).ok()?;
-        let from_shape_id = body.shape.id();
-        let to_shape = Shape::add_property(&body.shape, key.name());
-        body.shape = Rc::clone(&to_shape);
-        body.slots.push(PropertySlot::data_default(value.clone()));
-        Some(AddOwnPropertyTransition {
-            from_shape_id,
-            atom_id: key.atom().id(),
-            to_shape,
-            prototype_guard,
-            slot,
-        })
-    })?;
-    heap.record_write(obj, value);
-    Some(transition)
-}
-
-/// Replay a cached add-property transition for a fresh matching receiver.
-///
-/// Returns `Some(())` only after the property was added. Any shape/key,
-/// prototype, or extensibility mismatch falls back to ordinary `[[Set]]`.
-pub(crate) fn store_new_own_data_slot_transition(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: AtomizedPropertyKey<'_>,
-    transition: &AddOwnPropertyTransition,
-    value: &Value,
-) -> Option<()> {
-    if !transition_prototype_guard_matches(obj, heap, transition) {
-        return None;
-    }
-    let success = heap.with_payload(obj, |body| {
-        if body.shape.id() != transition.from_shape_id
-            || key.atom().id() != transition.atom_id
-            || !prototype_guard_matches(body, &transition.prototype_guard)
-            || !body.extensible
-        {
-            return false;
-        }
-        let offset = usize::from(transition.slot);
-        debug_assert_eq!(body.shape.offset_of(key.name()), None);
-        debug_assert_eq!(
-            transition.to_shape.offset_of(key.name()),
-            Some(transition.slot)
-        );
-        if body.slots.len() != offset {
-            return false;
-        }
-        body.shape = Rc::clone(&transition.to_shape);
-        body.slots.push(PropertySlot::data_default(value.clone()));
-        true
-    });
-    if !success {
-        return None;
-    }
-    heap.record_write(obj, value);
-    Some(())
-}
-
-fn add_transition_prototype_guard(
-    obj: JsObject,
-    heap: &otter_gc::GcHeap,
-    key: AtomizedPropertyKey<'_>,
-) -> Option<AddOwnPropertyPrototypeGuard> {
-    match heap.read_payload(obj, |body| body.prototype.clone()) {
-        ObjectPrototype::Null => Some(AddOwnPropertyPrototypeGuard::Null),
-        ObjectPrototype::Object(proto) => {
-            if string_data(proto, heap).is_some() {
-                return None;
-            }
-            let lookup = lookup_own_atom(proto, heap, key);
-            match lookup.lookup {
-                PropertyLookup::Absent => prototype_value(proto, heap).is_none().then(|| {
-                    AddOwnPropertyPrototypeGuard::DirectMissing {
-                        shape_id: shape_id(proto, heap),
-                    }
-                }),
-                PropertyLookup::Data { flags, .. } if flags.writable() => lookup
-                    .hit
-                    .map(|hit| AddOwnPropertyPrototypeGuard::DirectWritableData { hit }),
-                PropertyLookup::Data { .. } | PropertyLookup::Accessor { .. } => None,
-            }
-        }
-        ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => None,
-    }
-}
-
-fn transition_prototype_guard_matches(
-    obj: JsObject,
-    heap: &otter_gc::GcHeap,
-    transition: &AddOwnPropertyTransition,
-) -> bool {
-    let prototype = heap.read_payload(obj, |body| body.prototype.clone());
-    match (&transition.prototype_guard, prototype) {
-        (AddOwnPropertyPrototypeGuard::Null, ObjectPrototype::Null) => true,
-        (
-            AddOwnPropertyPrototypeGuard::DirectMissing {
-                shape_id: expected_shape_id,
-            },
-            ObjectPrototype::Object(proto),
-        ) => {
-            string_data(proto, heap).is_none()
-                && prototype_value(proto, heap).is_none()
-                && shape_id(proto, heap) == *expected_shape_id
-        }
-        (
-            AddOwnPropertyPrototypeGuard::DirectWritableData { hit },
-            ObjectPrototype::Object(proto),
-        ) => {
-            string_data(proto, heap).is_none()
-                && has_writable_own_data_slot_atom(proto, heap, transition.atom_id, *hit)
-        }
-        _ => false,
-    }
-}
-
-fn prototype_guard_matches(
-    body: &ObjectBody,
-    prototype_guard: &AddOwnPropertyPrototypeGuard,
-) -> bool {
-    match (prototype_guard, &body.prototype) {
-        (AddOwnPropertyPrototypeGuard::Null, ObjectPrototype::Null) => true,
-        (
-            AddOwnPropertyPrototypeGuard::DirectMissing { .. }
-            | AddOwnPropertyPrototypeGuard::DirectWritableData { .. },
-            ObjectPrototype::Object(_),
-        ) => true,
-        _ => false,
-    }
 }
 
 fn has_writable_own_data_slot_atom(
@@ -1737,6 +1584,10 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
             offsets: OnceCell::new(),
             transitions: Cell::new(HashMap::new()),
         });
+        shape_cache::invalidate_fast_shape_assumptions(
+            body,
+            ShapeCacheInvalidation::DeleteOwnProperty,
+        );
         remove_mapped_argument(body, key);
         true
     })
@@ -2389,14 +2240,18 @@ mod tests {
             "x",
         );
         let transition =
-            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(true))
+            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(true))
                 .expect("transition install");
+        assert!(matches!(
+            transition.kind,
+            StorePropertyTransitionKind::DirectPrototypeMissing { .. }
+        ));
 
         let second = alloc_object(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            store_new_own_data_slot_transition(
+            replay_store_property_transition(
                 second,
                 &mut heap,
                 key,
@@ -2419,7 +2274,7 @@ mod tests {
             "x",
         );
         let transition =
-            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(true))
+            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(true))
                 .expect("transition install");
         set(proto, &mut heap, "x", Value::Null);
 
@@ -2427,7 +2282,7 @@ mod tests {
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            store_new_own_data_slot_transition(
+            replay_store_property_transition(
                 second,
                 &mut heap,
                 key,
@@ -2449,7 +2304,7 @@ mod tests {
             "x",
         );
         let transition =
-            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(true))
+            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(true))
                 .expect("transition install");
         let deep_proto = alloc_object(&mut heap).unwrap();
         set_prototype(proto, &mut heap, Some(deep_proto));
@@ -2458,7 +2313,7 @@ mod tests {
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            store_new_own_data_slot_transition(
+            replay_store_property_transition(
                 second,
                 &mut heap,
                 key,
@@ -2481,14 +2336,18 @@ mod tests {
             "x",
         );
         let transition =
-            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(false))
+            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(false))
                 .expect("transition install");
+        assert!(matches!(
+            transition.kind,
+            StorePropertyTransitionKind::DirectPrototypeWritableData { .. }
+        ));
 
         let second = alloc_object(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            store_new_own_data_slot_transition(second, &mut heap, key, &transition, &Value::Null,),
+            replay_store_property_transition(second, &mut heap, key, &transition, &Value::Null,),
             Some(())
         );
         assert_eq!(get_own(second, &heap, "x"), Some(Value::Null));
@@ -2507,7 +2366,7 @@ mod tests {
             "x",
         );
         let transition =
-            add_own_data_property_atom_transition(first, &mut heap, key, &Value::Boolean(false))
+            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(false))
                 .expect("transition install");
         assert!(define_own_property(
             proto,
@@ -2520,9 +2379,32 @@ mod tests {
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            store_new_own_data_slot_transition(second, &mut heap, key, &transition, &Value::Null,),
+            replay_store_property_transition(second, &mut heap, key, &transition, &Value::Null,),
             None
         );
+    }
+
+    #[test]
+    fn atom_add_transition_rejects_inherited_non_writable_data() {
+        let mut heap = fresh_heap();
+        let proto = alloc_object(&mut heap).unwrap();
+        assert!(define_own_property(
+            proto,
+            &mut heap,
+            "x",
+            PropertyDescriptor::data(Value::Boolean(true), false, true, true),
+        ));
+        let receiver = alloc_object(&mut heap).unwrap();
+        set_prototype(receiver, &mut heap, Some(proto));
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+
+        assert!(
+            capture_store_property_transition(receiver, &mut heap, key, &Value::Null).is_none()
+        );
+        assert!(get_own(receiver, &heap, "x").is_none());
     }
 
     #[test]
@@ -2669,9 +2551,11 @@ mod tests {
         set(o, &mut heap, "a", Value::Boolean(true));
         set(o, &mut heap, "b", Value::Null);
         let before = shape(o, &heap);
+        assert!(supports_fast_property_ic(o, &heap));
         delete(o, &mut heap, "a");
         let after = shape(o, &heap);
         assert!(!Rc::ptr_eq(&before, &after));
+        assert!(!supports_fast_property_ic(o, &heap));
         assert_eq!(len(o, &heap), 1);
         assert!(get(o, &heap, "a").is_none());
         assert!(matches!(get(o, &heap, "b"), Some(Value::Null)));

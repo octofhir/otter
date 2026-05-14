@@ -105,6 +105,9 @@ pub struct HeapStats {
     /// of slot allocations + outstanding [`GcHeap::reserve_bytes`]
     /// reservations). `0` until the first allocation.
     pub tracked_bytes: u64,
+    /// Outstanding off-slot/external bytes reserved through
+    /// [`GcHeap::reserve_bytes`] or [`GcHeap::reserve_external`].
+    pub reserved_bytes: u64,
     /// Configured heap cap in bytes (`0` = disabled).
     pub max_heap_bytes: u64,
 }
@@ -231,6 +234,7 @@ impl GcHeap {
     /// emergency full GC.
     pub fn reserve_bytes(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
         if self.max_heap_bytes == 0 {
+            self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
         }
         self.account_or_collect(bytes)?;
@@ -267,6 +271,7 @@ impl GcHeap {
     /// the configured cap.
     pub fn reserve_bytes_no_collect(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
         if self.max_heap_bytes == 0 {
+            self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
         }
         let projected = self.tracked_bytes.saturating_add(bytes);
@@ -287,12 +292,11 @@ impl GcHeap {
     /// keeps the counter monotone-correct under arithmetic edge
     /// cases.
     pub fn release_bytes(&mut self, bytes: u64) {
-        if self.max_heap_bytes == 0 {
-            return;
-        }
         let actual = bytes.min(self.reserved_bytes);
         self.reserved_bytes = self.reserved_bytes.saturating_sub(actual);
-        self.tracked_bytes = self.tracked_bytes.saturating_sub(actual);
+        if self.max_heap_bytes != 0 {
+            self.tracked_bytes = self.tracked_bytes.saturating_sub(actual);
+        }
     }
 
     /// Account `bytes` against the cap. Outlined so the alloc
@@ -466,6 +470,7 @@ impl GcHeap {
             + self.old_space.page_count()
             + self.large_space.page_count();
         s.tracked_bytes = self.tracked_bytes;
+        s.reserved_bytes = self.reserved_bytes;
         s.max_heap_bytes = self.max_heap_bytes;
         s
     }
@@ -561,6 +566,9 @@ impl GcHeap {
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
         row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
+        row.alloc_bytes_total = row
+            .alloc_bytes_total
+            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
         // SAFETY: offset is the cage offset of a freshly-alloc-ed
         // T payload; type tag matches `T::TYPE_TAG`.
         Ok(unsafe { Gc::from_offset(offset) })
@@ -657,6 +665,9 @@ impl GcHeap {
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
         row.live_bytes = row.live_bytes.wrapping_add(aligned);
         row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
+        row.alloc_bytes_total = row
+            .alloc_bytes_total
+            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
         // SAFETY: offset references a fresh `T` payload.
         Ok(unsafe { Gc::from_offset(offset) })
     }
@@ -1098,6 +1109,7 @@ impl GcHeap {
     pub fn gc_stats(&mut self) -> &GcStats {
         let mut live_objects = 0usize;
         let mut live_bytes = 0usize;
+        let mut alloc_bytes_total = 0u64;
         for row in &self.gc_stats.by_type {
             // Live count per tag = alloc_count_total -
             // free_count_total; live_bytes is already maintained
@@ -1105,9 +1117,11 @@ impl GcHeap {
             let live_count = row.alloc_count_total.saturating_sub(row.free_count_total);
             live_objects = live_objects.wrapping_add(live_count as usize);
             live_bytes = live_bytes.wrapping_add(row.live_bytes);
+            alloc_bytes_total = alloc_bytes_total.saturating_add(row.alloc_bytes_total);
         }
         self.gc_stats.live_objects = live_objects;
         self.gc_stats.live_bytes = live_bytes;
+        self.gc_stats.alloc_bytes_total = alloc_bytes_total;
         &self.gc_stats
     }
 

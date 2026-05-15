@@ -28,15 +28,14 @@
 use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
 
 use crate::executable::{ExecInstr, ExecutableFunction, ExecutableModule};
-use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
+use crate::property_atom::{AtomTable, AtomizedPropertyKey};
 
 /// Cloneable dispatch context for VM-owned JS jobs.
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     module: std::rc::Rc<BytecodeModule>,
     executable: std::rc::Rc<ExecutableModule>,
-    decoded_strings: std::rc::Rc<[Option<String>]>,
-    property_atoms: std::rc::Rc<[Option<PropertyAtom>]>,
+    atoms: std::rc::Rc<AtomTable>,
 }
 
 impl ExecutionContext {
@@ -44,31 +43,11 @@ impl ExecutionContext {
     #[must_use]
     pub fn from_module(module: BytecodeModule) -> Self {
         let executable = ExecutableModule::from_bytecode(&module);
-        let decoded_strings: std::rc::Rc<[Option<String>]> = module
-            .constants
-            .iter()
-            .map(|constant| match constant {
-                Constant::String { utf16 } => Some(String::from_utf16_lossy(utf16)),
-                _ => None,
-            })
-            .collect();
-        let property_atoms: std::rc::Rc<[Option<PropertyAtom>]> = module
-            .constants
-            .iter()
-            .enumerate()
-            .map(|(idx, constant)| match constant {
-                Constant::String { .. } => {
-                    let idx = u32::try_from(idx).expect("constant pool index exceeds u32");
-                    Some(PropertyAtom::new(AtomId::from_constant_index(idx)))
-                }
-                _ => None,
-            })
-            .collect();
+        let atoms = AtomTable::from_constants(&module.constants);
         Self {
             module: std::rc::Rc::new(module),
             executable: std::rc::Rc::new(executable),
-            decoded_strings,
-            property_atoms,
+            atoms: std::rc::Rc::new(atoms),
         }
     }
 
@@ -202,20 +181,13 @@ impl ExecutionContext {
     /// Resolve a string constant as a borrowed UTF-8 string.
     #[must_use]
     pub fn string_constant_str(&self, idx: u32) -> Option<&str> {
-        self.decoded_strings
-            .get(idx as usize)
-            .and_then(Option::as_deref)
+        self.atoms.string_constant_str(idx)
     }
 
     /// Resolve a string constant as an atomized property key.
     #[must_use]
     pub(crate) fn property_atom(&self, idx: u32) -> Option<AtomizedPropertyKey<'_>> {
-        let atom = self
-            .property_atoms
-            .get(idx as usize)
-            .and_then(|atom| *atom)?;
-        let text = self.string_constant_str(idx)?;
-        Some(AtomizedPropertyKey::new(atom, text))
+        self.atoms.property_atom(idx)
     }
 
     /// Resolve a numeric constant's raw IEEE-754 bits.

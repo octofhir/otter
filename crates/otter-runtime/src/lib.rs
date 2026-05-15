@@ -77,8 +77,7 @@ use std::time::Duration;
 
 use otter_bytecode::{BytecodeModule, SpanEntry};
 use otter_compiler::{
-    compile_parsed_program as compile_script_program, compile_source as compile_script_source,
-    compile_source_to_module as compile_script_source_to_module,
+    compile_script_program, compile_script_source, compile_script_source_to_module,
 };
 use otter_gc::GcStats;
 use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
@@ -1298,7 +1297,7 @@ impl Runtime {
         // builds a fresh `BytecodeModule`.
         let hook: otter_vm::EvalHook =
             std::rc::Rc::new(|source: &str, options: EvalCompileOptions| {
-                otter_compiler::compile_source_with_forced_strict(
+                otter_compiler::compile_script_source_with_forced_strict(
                     source,
                     SourceKind::JavaScript,
                     "<eval>",
@@ -1629,9 +1628,9 @@ impl Runtime {
     /// dynamically.
     ///
     /// # Algorithm
-    /// 1. Parse the response body as UTF-8 source text. Compile
+    /// 1. Parse the response body as UTF-8 source text once. Compile
     ///    it as one ES-module fragment via
-    ///    `otter_compiler::compile_module_fragment`. Any own
+    ///    `otter_compiler::compile_module_program`. Any own
     ///    static imports are rejected for this slice — the
     ///    HTTPS fetcher does not yet recurse into dependencies.
     ///    Local file imports from an HTTPS module are also
@@ -1645,17 +1644,27 @@ impl Runtime {
         target_url: &str,
         response_text: String,
     ) -> Result<otter_vm::Value, DynLoadError> {
-        let parsed = otter_syntax::parse(response_text, otter_syntax::SourceKind::JavaScript)
-            .map_err(|e| {
-                DynLoadError::Diagnostic(format!(
-                    "dynamic import: parse failed for \"{target_url}\": {e:?}"
-                ))
-            })?;
         let host = otter_compiler::ModuleHostInfo {
             module_url: target_url.to_string(),
             resolved_imports: std::collections::HashMap::new(),
         };
-        let fragment = otter_compiler::compile_module_fragment(&parsed, &host).map_err(|e| {
+        let fragment = otter_syntax::with_program(
+            response_text,
+            otter_syntax::SourceKind::JavaScript,
+            |program| {
+                otter_compiler::compile_module_program(
+                    program,
+                    otter_syntax::SourceKind::JavaScript,
+                    &host,
+                )
+            },
+        )
+        .map_err(|e| {
+            DynLoadError::Diagnostic(format!(
+                "dynamic import: parse failed for \"{target_url}\": {e:?}"
+            ))
+        })?
+        .map_err(|e| {
             DynLoadError::Diagnostic(format!(
                 "dynamic import: compile failed for \"{target_url}\": {e:?}"
             ))

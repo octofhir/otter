@@ -20,25 +20,79 @@
 //! - [`crate::executable`]
 
 use otter_bytecode::Operand;
+use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError,
     operand_decode::{const_operand, register_operand},
-    read_register, regexp, write_register,
+    read_register, regexp,
+    runtime_state::RuntimeState,
+    write_register,
 };
 
 impl Interpreter {
+    fn collect_allocation_roots(&self, stack: &SmallVec<[Frame; 8]>) -> Vec<*mut RawGc> {
+        let mut roots = Vec::new();
+        RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
+        for frame in stack {
+            frame.trace_frame_slots(&mut |slot| roots.push(slot));
+        }
+        roots
+    }
+
+    pub(crate) fn alloc_stack_rooted_object(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+    ) -> Result<crate::object::JsObject, VmError> {
+        self.alloc_stack_rooted_object_with_extra_roots(stack, &[])
+    }
+
+    pub(crate) fn alloc_stack_rooted_object_with_extra_roots(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        extra_roots: &[&Value],
+    ) -> Result<crate::object::JsObject, VmError> {
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in extra_roots {
+                value.trace_value_slots(visitor);
+            }
+        };
+        crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
+    fn alloc_stack_rooted_array_from_elements(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        elements: SmallVec<[Value; 4]>,
+    ) -> Result<crate::array::JsArray, VmError> {
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        crate::array::from_elements_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
     pub(crate) fn run_new_object_reg(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
         let proto = self.object_prototype_object_opt();
-        let obj = crate::object::alloc_object(&mut self.gc_heap)?;
+        let obj = self.alloc_stack_rooted_object(stack)?;
         if let Some(proto) = proto {
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::Object(obj))?;
         frame.pc += 1;
         Ok(())
@@ -46,17 +100,22 @@ impl Interpreter {
 
     pub(crate) fn run_new_array_operands(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let count = const_operand(operands.get(1))? as usize;
         let mut elements: SmallVec<[Value; 4]> = SmallVec::with_capacity(count);
-        for i in 0..count {
-            let r = register_operand(operands.get(2 + i))?;
-            elements.push(read_register(frame, r)?.clone());
+        {
+            let frame = &stack[top_idx];
+            for i in 0..count {
+                let r = register_operand(operands.get(2 + i))?;
+                elements.push(read_register(frame, r)?.clone());
+            }
         }
-        let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
+        let array = self.alloc_stack_rooted_array_from_elements(stack, elements)?;
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::Array(array))?;
         frame.pc += 1;
         Ok(())

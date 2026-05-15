@@ -27,6 +27,7 @@
 
 pub mod abstract_ops;
 mod allocation_ops;
+mod argument_window;
 pub mod arguments_object;
 mod arithmetic_dispatch;
 pub mod array;
@@ -99,6 +100,7 @@ pub mod reflect;
 mod reflect_ops;
 pub mod regexp;
 pub mod regexp_prototype;
+pub mod run_control;
 pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
@@ -122,12 +124,14 @@ pub use frame_state::{
     PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage, TryHandler,
 };
 pub use property_ic::PropertyIcStats;
+pub use run_control::{
+    DEFAULT_MAX_STACK_DEPTH, InterruptFlag, NO_HANDLER_OFFSET, RunError, StackFrameSnapshot,
+    VmError,
+};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
-use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
@@ -1402,290 +1406,6 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
-
-/// Cooperative cancellation flag.
-///
-/// Cheap, cloneable, `Send + Sync`. The interpreter polls this flag
-/// before each instruction. An interrupt request converts into
-/// [`VmError::Interrupted`] at the next checkpoint.
-#[derive(Debug, Default, Clone)]
-pub struct InterruptFlag(Arc<AtomicBool>);
-
-impl InterruptFlag {
-    /// Construct a fresh, un-tripped flag.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Trip the flag from any thread.
-    pub fn interrupt(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    /// Check the flag without resetting it.
-    #[must_use]
-    pub fn is_set(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-
-    /// Reset the flag.
-    pub fn reset(&self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-/// Runtime errors raised by the interpreter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum VmError {
-    /// The program counter walked off the end of `code` without a
-    /// `RETURN`. Indicates a compiler bug.
-    MissingReturn,
-    /// An operand index was out of range. Indicates a compiler bug
-    /// or a malformed bytecode dump.
-    InvalidOperand,
-    /// An operand had the wrong type for its opcode (e.g.,
-    /// `STRING_CONCAT` on a non-string register). Indicates a
-    /// compiler bug at this slice.
-    TypeMismatch,
-    /// User-facing version of [`Self::TypeMismatch`] that carries
-    /// the operation name and the offending value's type. Surfaced
-    /// to JS as a `TypeError` with the spec-shaped message
-    /// `<op>: cannot operate on <kind>` so the user can read which
-    /// site rejected which kind without learning the engine
-    /// internals.
-    TypeMismatchAt {
-        /// Operation that rejected the value (e.g.
-        /// `"Object.getPrototypeOf"`, `"Op::LoadProperty"`).
-        op: &'static str,
-        /// Value-kind name from
-        /// [`value_kind_name`] (e.g. `"Symbol"`, `"BigInt"`,
-        /// `"TypedArray"`).
-        kind: &'static str,
-    },
-    /// User-visible `TypeError` with operation context.
-    TypeError {
-        /// Human-readable diagnostic.
-        message: String,
-    },
-    /// User-visible `RangeError`. Distinct from
-    /// [`Self::TypeError`] so that intrinsics like
-    /// `Number.prototype.toFixed` can surface the spec-mandated
-    /// `RangeError` for out-of-range arguments instead of the
-    /// fallback `TypeError`.
-    RangeError {
-        /// Human-readable diagnostic.
-        message: String,
-    },
-    /// SyntaxError raised from dynamic parse/compile paths.
-    SyntaxError {
-        /// Human-readable diagnostic.
-        message: String,
-    },
-    /// String allocation failed because the heap cap was hit.
-    OutOfMemory {
-        /// Bytes the allocation requested.
-        requested_bytes: u64,
-        /// Heap cap (`0` = unlimited).
-        heap_limit_bytes: u64,
-    },
-    /// `InterruptFlag` was tripped before the next checkpoint.
-    Interrupted,
-    /// A configured runtime budget rejected the current VM turn at
-    /// a checkpoint.
-    BudgetExceeded {
-        /// Human-readable diagnostic.
-        message: String,
-    },
-    /// `CALL_STRING_METHOD` referenced a method name not in
-    /// [`string_prototype::STRING_PROTOTYPE_TABLE`].
-    UnknownIntrinsic {
-        /// Method name as it appeared in the constant pool.
-        name: String,
-    },
-    /// A `let`/`const` binding was read before its initializer ran
-    /// (Temporal Dead Zone).
-    TemporalDeadZone {
-        /// Compiler-assigned local index.
-        local_index: u32,
-    },
-    /// JS call-stack depth exceeded the configured limit. Catchable
-    /// per foundation plan §M7 ("stack-depth limit returns a
-    /// catchable JS error").
-    StackOverflow {
-        /// Maximum depth that was about to be exceeded.
-        limit: u32,
-    },
-    /// Tried to call a value that is not callable.
-    NotCallable,
-    /// `LoadGlobalOrThrow` (or another lookup site) hit an
-    /// unbound free identifier in strict mode. Convertible to a
-    /// real `ReferenceError` instance via `vm_error_to_throwable`.
-    UndefinedIdentifier {
-        /// Name of the unbound identifier.
-        name: String,
-    },
-    /// A user `throw` (or a re-throw from `finally`) walked the
-    /// entire frame stack without finding a matching handler. The
-    /// payload is the JS value that was thrown, rendered for
-    /// diagnostics through [`Value::display_string`]; the runtime
-    /// surfaces this as `OtterError::Runtime { code = "UNCAUGHT" }`.
-    Uncaught {
-        /// Display rendering of the thrown value.
-        value: String,
-    },
-    /// `Op::LoadRegExp` produced a pattern that the regex backend
-    /// could not compile. Catchable as `SyntaxError` once a real
-    /// error model lands; for now it surfaces through the standard
-    /// runtime-error code.
-    InvalidRegExp {
-        /// Backend diagnostic — pattern + flags + reason.
-        message: String,
-    },
-    /// `JSON.stringify` / `JSON.parse` rejected its input. The
-    /// `code` discriminates the failure family so the runtime can
-    /// surface a precise diagnostic (`JSON.stringify cannot
-    /// serialize cyclic structures.`, `JSON Parse error: <reason>
-    /// at byte N`, …) instead of the generic `TYPE_MISMATCH`.
-    JsonError {
-        /// Stable identifier (e.g. `"JSON_CYCLIC"`).
-        code: &'static str,
-        /// Human-readable diagnostic. Includes the byte position
-        /// for `JSON_PARSE`.
-        message: String,
-    },
-    /// Host-visible termination requested by a native such as
-    /// `process.exit(code)`. This is not a JS exception and is not
-    /// routed through catch/finally handlers.
-    Exit {
-        /// Process-style exit status.
-        code: u8,
-    },
-}
-
-impl std::fmt::Display for VmError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VmError::MissingReturn => write!(f, "function did not RETURN"),
-            VmError::InvalidOperand => write!(f, "invalid operand"),
-            VmError::TypeMismatch => write!(
-                f,
-                "type mismatch: this operation does not accept a value of this type"
-            ),
-            VmError::TypeMismatchAt { op, kind } => {
-                write!(f, "{op}: cannot operate on a value of type {kind}")
-            }
-            VmError::TypeError { message } => write!(f, "{message}"),
-            VmError::RangeError { message } => write!(f, "{message}"),
-            VmError::SyntaxError { message } => write!(f, "{message}"),
-            VmError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => write!(
-                f,
-                "out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}"
-            ),
-            VmError::Interrupted => write!(f, "interrupted"),
-            VmError::BudgetExceeded { message } => write!(f, "{message}"),
-            VmError::UnknownIntrinsic { name } => write!(f, "unknown intrinsic method `{name}`"),
-            VmError::TemporalDeadZone { local_index } => {
-                write!(f, "cannot access local {local_index} before initialization")
-            }
-            VmError::StackOverflow { limit } => {
-                write!(f, "maximum call stack size exceeded (limit {limit})")
-            }
-            VmError::NotCallable => write!(f, "value is not a function"),
-            VmError::UndefinedIdentifier { name } => write!(f, "{name} is not defined"),
-            VmError::Uncaught { value } => write!(f, "uncaught exception: {value}"),
-            VmError::InvalidRegExp { message } => write!(f, "{message}"),
-            VmError::JsonError { message, .. } => write!(f, "{message}"),
-            VmError::Exit { code } => write!(f, "process exited with code {code}"),
-        }
-    }
-}
-
-impl std::error::Error for VmError {}
-
-impl From<StringError> for VmError {
-    fn from(err: StringError) -> Self {
-        match err {
-            StringError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => VmError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            },
-        }
-    }
-}
-
-impl From<otter_gc::OutOfMemory> for VmError {
-    fn from(err: otter_gc::OutOfMemory) -> Self {
-        VmError::OutOfMemory {
-            requested_bytes: err.requested_bytes(),
-            heap_limit_bytes: err.heap_limit_bytes(),
-        }
-    }
-}
-
-/// Default JS call-stack depth limit. Catchable via
-/// [`VmError::StackOverflow`].
-pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
-
-/// Re-export of the bytecode-defined sentinel for "this try block
-/// has no catch / finally clause". Kept on the VM surface so
-/// embedders that want to hand-build EnterTry operands have one
-/// import path for the runtime semantics.
-pub use otter_bytecode::NO_HANDLER_OFFSET;
-
-/// One stack-frame snapshot captured at the moment an error is
-/// raised. Foundation slice 16 ships this — task 24 (exceptions)
-/// reuses it for catchable error frames.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StackFrameSnapshot {
-    /// Function name; `<main>` for the script entry,
-    /// `<arrow>`/`<anonymous>` for function expressions.
-    pub function_name: String,
-    /// Module specifier the function was compiled from.
-    pub module: String,
-    /// Source span of the failing instruction (byte offsets).
-    pub span: (u32, u32),
-}
-
-/// Result type returned by [`Interpreter::run`] on failure: the
-/// underlying [`VmError`] plus a snapshot of the live frame stack
-/// at the moment the error was raised. Caller-level translation
-/// (e.g., `otter-runtime::map_vm_error`) propagates `frames` into
-/// `Diagnostic.frames`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunError {
-    /// Underlying error.
-    pub error: VmError,
-    /// Top-of-stack first; element zero is the failing function.
-    pub frames: Vec<StackFrameSnapshot>,
-}
-
-impl RunError {
-    /// Convenience constructor for the no-frames case (e.g., setup
-    /// errors before any frame exists).
-    #[must_use]
-    pub fn bare(error: VmError) -> Self {
-        Self {
-            error,
-            frames: Vec::new(),
-        }
-    }
-}
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.error)
-    }
-}
-
-impl std::error::Error for RunError {}
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may
 /// later switch to threaded dispatch after benchmark-driven review
@@ -3934,14 +3654,12 @@ impl Interpreter {
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_new_object_reg(frame, dst)?;
+                    self.run_new_object_reg(&mut *stack, top_idx, dst)?;
                     continue;
                 }
                 Op::NewArray => {
                     let operands = context.exec_operands(instr);
-                    let frame = &mut stack[top_idx];
-                    self.run_new_array_operands(frame, operands)?;
+                    self.run_new_array_operands(&mut *stack, top_idx, operands)?;
                     continue;
                 }
                 Op::LoadRegExp => {
@@ -5643,42 +5361,55 @@ pub fn is_callable_value(value: &Value) -> bool {
 mod tests {
     use super::*;
     use otter_bytecode::{
-        Function, Instruction, Op, Operand, SourceKind as BcSourceKind, SpanEntry,
+        Constant, Function, Instruction, Op, Operand, SourceKind as BcSourceKind, SpanEntry,
     };
 
-    fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
-        let spans: Vec<SpanEntry> = code
-            .iter()
+    fn spans_for(code: &[Instruction]) -> Vec<SpanEntry> {
+        code.iter()
             .map(|i| SpanEntry {
                 pc: i.pc,
                 span: (0, 0),
             })
-            .collect();
+            .collect()
+    }
+
+    fn test_function(
+        id: u32,
+        name: &str,
+        param_count: u16,
+        scratch: u16,
+        code: Vec<Instruction>,
+    ) -> Function {
+        let spans = spans_for(&code);
+        Function {
+            id,
+            name: name.to_string(),
+            span: (0, 0),
+            locals: 0,
+            scratch,
+            param_count,
+            own_upvalue_count: 0,
+            is_strict: false,
+            is_arrow: false,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_async_generator: false,
+            is_module: false,
+            needs_arguments: false,
+            arguments_object_kind: ArgumentsObjectKind::Unmapped,
+            mapped_argument_bindings: Vec::new(),
+            module_url: String::new(),
+            code,
+            spans,
+        }
+    }
+
+    fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
         BytecodeModule {
             module: "test.ts".to_string(),
             source_kind: BcSourceKind::TypeScript,
-            functions: vec![Function {
-                id: 0,
-                name: "<main>".to_string(),
-                span: (0, 0),
-                locals: 0,
-                scratch,
-                param_count: 0,
-                own_upvalue_count: 0,
-                is_strict: false,
-                is_arrow: false,
-                has_rest: false,
-                is_async: false,
-                is_generator: false,
-                is_async_generator: false,
-                is_module: false,
-                needs_arguments: false,
-                arguments_object_kind: ArgumentsObjectKind::Unmapped,
-                mapped_argument_bindings: Vec::new(),
-                module_url: String::new(),
-                code,
-                spans,
-            }],
+            functions: vec![test_function(0, "<main>", 0, scratch, code)],
             constants: vec![],
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
@@ -5705,6 +5436,493 @@ mod tests {
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module);
         assert_eq!(interp.run(&context).unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn direct_bytecode_call_binds_arguments_from_register_window() {
+        let callee = test_function(
+            1,
+            "callee",
+            3,
+            2,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(3), Operand::Imm32(100)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Mul,
+                    operands: vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(3),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 2,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(4), Operand::Imm32(10)].into(),
+                },
+                Instruction {
+                    pc: 3,
+                    op: Op::Mul,
+                    operands: vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Register(4),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 4,
+                    op: Op::Add,
+                    operands: vec![
+                        Operand::Register(3),
+                        Operand::Register(3),
+                        Operand::Register(4),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 5,
+                    op: Op::Add,
+                    operands: vec![
+                        Operand::Register(3),
+                        Operand::Register(3),
+                        Operand::Register(2),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 6,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(3)].into(),
+                },
+            ],
+        );
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(1), Operand::Imm32(1)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(2), Operand::Imm32(2)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(3), Operand::Imm32(3)].into(),
+            },
+            Instruction {
+                pc: 3,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(4), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 4,
+                op: Op::Call,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(4),
+                    Operand::ConstIndex(3),
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 5,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 5, main_code), callee],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+        assert_eq!(
+            interp.run(&context).unwrap(),
+            Value::Number(NumberValue::Smi(312))
+        );
+    }
+
+    #[test]
+    fn direct_bytecode_call_window_populates_arguments_object() {
+        let mut callee = test_function(
+            1,
+            "callee",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::CollectArguments,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        callee.needs_arguments = true;
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(1), Operand::Imm32(21)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(2), Operand::Imm32(34)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(3), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 3,
+                op: Op::Call,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(3),
+                    Operand::ConstIndex(2),
+                    Operand::Register(2),
+                    Operand::Register(1),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 4,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 4, main_code), callee],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+        let Value::Object(args) = interp.run(&context).unwrap() else {
+            panic!("expected arguments object");
+        };
+        assert_eq!(
+            object::get(args, interp.gc_heap(), "0"),
+            Some(Value::Number(NumberValue::Smi(34)))
+        );
+        assert_eq!(
+            object::get(args, interp.gc_heap(), "1"),
+            Some(Value::Number(NumberValue::Smi(21)))
+        );
+        assert_eq!(
+            object::get(args, interp.gc_heap(), "length"),
+            Some(Value::Number(NumberValue::Smi(2)))
+        );
+    }
+
+    #[test]
+    fn direct_bytecode_call_window_populates_rest_arguments() {
+        let mut callee = test_function(
+            1,
+            "callee",
+            1,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::CollectRest,
+                    operands: vec![Operand::Register(1)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(1)].into(),
+                },
+            ],
+        );
+        callee.has_rest = true;
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(1), Operand::Imm32(5)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(2), Operand::Imm32(8)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(3), Operand::Imm32(13)].into(),
+            },
+            Instruction {
+                pc: 3,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(4), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 4,
+                op: Op::Call,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(4),
+                    Operand::ConstIndex(3),
+                    Operand::Register(1),
+                    Operand::Register(3),
+                    Operand::Register(2),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 5,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 5, main_code), callee],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+        let Value::Array(rest) = interp.run(&context).unwrap() else {
+            panic!("expected rest array");
+        };
+        let elements = array::with_elements(rest, interp.gc_heap(), |elements| elements.to_vec());
+        assert_eq!(
+            elements,
+            vec![
+                Value::Number(NumberValue::Smi(13)),
+                Value::Number(NumberValue::Smi(8))
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_bytecode_async_call_window_populates_parameters() {
+        let mut callee = test_function(
+            1,
+            "async_callee",
+            1,
+            1,
+            vec![Instruction {
+                pc: 0,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            }],
+        );
+        callee.is_async = true;
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(1), Operand::Imm32(144)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(2), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Call,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(2),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 3,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 3, main_code), callee],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+        let Value::Promise(promise) = interp.run(&context).unwrap() else {
+            panic!("expected async function call to return a promise");
+        };
+        assert_eq!(
+            promise.state(interp.gc_heap()),
+            crate::promise::PromiseState::Fulfilled(Value::Number(NumberValue::Smi(144)))
+        );
+    }
+
+    #[test]
+    fn direct_bytecode_construct_window_populates_arguments_object() {
+        let mut ctor = test_function(
+            1,
+            "Ctor",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::CollectArguments,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        ctor.needs_arguments = true;
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(1), Operand::Imm32(55)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(2), Operand::Imm32(89)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(3), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 3,
+                op: Op::New,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(3),
+                    Operand::ConstIndex(2),
+                    Operand::Register(2),
+                    Operand::Register(1),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 4,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 4, main_code), ctor],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+        let Value::Object(args) = interp.run(&context).unwrap() else {
+            panic!("expected constructor-returned arguments object");
+        };
+        assert_eq!(
+            object::get(args, interp.gc_heap(), "0"),
+            Some(Value::Number(NumberValue::Smi(89)))
+        );
+        assert_eq!(
+            object::get(args, interp.gc_heap(), "1"),
+            Some(Value::Number(NumberValue::Smi(55)))
+        );
+    }
+
+    #[test]
+    fn direct_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
+        let ctor = test_function(
+            1,
+            "Ctor",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadThis,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::New,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, main_code), ctor],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(interp.run(&context).unwrap(), Value::Object(_)));
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "ordinary bytecode constructor receiver should allocate in young space"
+        );
     }
 
     #[test]
@@ -5796,6 +6014,72 @@ mod tests {
         assert!(stats.allocated_bytes_observed > 0);
         assert!(stats.max_turn_allocated_bytes > 0);
         assert!(stats.max_live_heap_bytes > 0);
+    }
+
+    #[test]
+    fn bytecode_new_object_uses_young_allocation_with_frame_roots() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::NewObject,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+            1,
+        );
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(interp.run(&context).unwrap(), Value::Object(_)));
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NewObject should allocate the object body in young space"
+        );
+    }
+
+    #[test]
+    fn bytecode_new_array_uses_young_allocation_with_frame_roots() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(0), Operand::Imm32(42)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::NewArray,
+                    operands: vec![
+                        Operand::Register(1),
+                        Operand::ConstIndex(1),
+                        Operand::Register(0),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 2,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(1)].into(),
+                },
+            ],
+            2,
+        );
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(interp.run(&context).unwrap(), Value::Array(_)));
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NewArray should allocate the array body in young space"
+        );
     }
 
     #[test]
@@ -5985,6 +6269,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(stack[0].registers[0], receiver);
+    }
+
+    #[test]
+    fn direct_native_call_uses_contiguous_argument_window() {
+        fn sum_smi_args(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            let mut sum = 0;
+            for arg in args {
+                match arg {
+                    Value::Number(NumberValue::Smi(n)) => sum += *n,
+                    _ => {
+                        return Err(NativeError::TypeError {
+                            name: "sum",
+                            reason: "expected smi".to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(Value::Number(NumberValue::Smi(sum)))
+        }
+
+        let module = module_with(vec![], 4);
+        let mut interp = Interpreter::new();
+        let callee =
+            native_value_static(interp.gc_heap_mut(), "sum", 2, sum_smi_args).expect("native");
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = callee;
+        frame.registers[1] = Value::Number(NumberValue::Smi(8));
+        frame.registers[2] = Value::Number(NumberValue::Smi(13));
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module.clone());
+        let operands = vec![
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::ConstIndex(2),
+            Operand::Register(1),
+            Operand::Register(2),
+        ];
+
+        interp.do_call(&mut stack, &context, &operands).unwrap();
+
+        assert_eq!(stack[0].registers[3], Value::Number(NumberValue::Smi(21)));
     }
 
     #[test]

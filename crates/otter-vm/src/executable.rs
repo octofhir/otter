@@ -6,6 +6,7 @@
 //! instructions.
 //!
 //! # Contents
+//! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
 //! - [`ExecutableFunction`] — one function's compact instruction stream.
 //! - [`ExecInstr`] — hot instruction record with inline operands.
@@ -30,6 +31,53 @@ const INLINE_OPERANDS: usize = 3;
 const EMPTY_OPERAND: Operand = Operand::Imm32(0);
 const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
+/// Transient builder for [`ExecutableModule`].
+///
+/// The builder owns mutable side tables and dense IC-site assignment while the
+/// VM creates an [`crate::ExecutionContext`]. Dispatch receives only the frozen
+/// [`ExecutableModule`] produced by [`Self::freeze`].
+#[derive(Debug, Default)]
+pub(crate) struct ExecutableModuleBuilder {
+    functions: Vec<ExecutableFunction>,
+    side_operands: Vec<Operand>,
+    next_property_ic_site: u32,
+}
+
+impl ExecutableModuleBuilder {
+    /// Build a transient executable view from the compiler/debug module DTO.
+    #[must_use]
+    pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
+        let mut builder = Self {
+            functions: Vec::with_capacity(module.functions.len()),
+            side_operands: Vec::new(),
+            next_property_ic_site: 0,
+        };
+        for function in &module.functions {
+            builder.push_function(function);
+        }
+        builder
+    }
+
+    fn push_function(&mut self, function: &Function) {
+        let function = ExecutableFunction::from_bytecode(
+            function,
+            &mut self.side_operands,
+            &mut self.next_property_ic_site,
+        );
+        self.functions.push(function);
+    }
+
+    /// Seal mutable build buffers into the VM-owned frozen execution product.
+    #[must_use]
+    pub(crate) fn freeze(self) -> ExecutableModule {
+        ExecutableModule {
+            functions: self.functions.into_boxed_slice(),
+            side_operands: self.side_operands.into_boxed_slice(),
+            property_ic_site_count: self.next_property_ic_site,
+        }
+    }
+}
+
 /// VM-owned executable view of a bytecode module.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutableModule {
@@ -42,26 +90,7 @@ impl ExecutableModule {
     /// Build a frozen execution view from the compiler/debug module DTO.
     #[must_use]
     pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
-        let mut side_operands = Vec::new();
-        let mut next_property_ic_site = 0_u32;
-        let functions = module
-            .functions
-            .iter()
-            .map(|function| {
-                ExecutableFunction::from_bytecode(
-                    function,
-                    &mut side_operands,
-                    &mut next_property_ic_site,
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        Self {
-            functions,
-            side_operands: side_operands.into_boxed_slice(),
-            property_ic_site_count: next_property_ic_site,
-        }
+        ExecutableModuleBuilder::from_bytecode(module).freeze()
     }
 
     /// Function-table lookup by VM function id.
@@ -445,5 +474,51 @@ mod tests {
         assert_eq!(executable.property_ic_site_count(), 2);
         assert_eq!(function.code[0].property_ic_site(), Some(0));
         assert_eq!(function.code[1].property_ic_site(), Some(1));
+    }
+
+    #[test]
+    fn builder_freezes_side_operands_and_ic_site_count() {
+        let function = function(vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadProperty,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::Call,
+                operands: vec![
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::ConstIndex(4),
+                    Operand::Register(5),
+                ]
+                .into(),
+            },
+        ]);
+        let module = module(function);
+
+        let builder = ExecutableModuleBuilder::from_bytecode(&module);
+        assert_eq!(builder.functions.len(), 1);
+        assert_eq!(builder.side_operands.len(), 4);
+        assert_eq!(builder.next_property_ic_site, 1);
+
+        let executable = builder.freeze();
+        assert_eq!(executable.function(0).unwrap().code.len(), 2);
+        assert_eq!(executable.property_ic_site_count(), 1);
+        assert_eq!(
+            executable.side_operands.as_ref(),
+            &[
+                Operand::Register(2),
+                Operand::Register(3),
+                Operand::ConstIndex(4),
+                Operand::Register(5)
+            ]
+        );
     }
 }

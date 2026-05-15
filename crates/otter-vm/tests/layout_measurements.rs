@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Prints `size_of` / `align_of` for hot VM and bytecode structs.
-//! - Prints operand-vector pressure for a representative fixed-width
+//! - Prints spilled operand pressure for a representative fixed-width
 //!   bytecode function.
 //!
 //! # Invariants
@@ -46,24 +46,24 @@ fn print_representative_bytecode_operand_pressure() {
     let function = representative_fixed_width_function();
     let instruction_stream_bytes = function.code.len() * size_of::<Instruction>();
     let operand_slots: usize = function.code.iter().map(|instr| instr.operands.len()).sum();
-    let operand_vec_allocations = function
+    let spilled_operand_instructions = function
         .code
         .iter()
-        .filter(|instr| instr.operands.heap_capacity() > 0)
+        .filter(|instr| instr.operands.spilled_operand_len() > 0)
         .count();
-    let operand_heap_capacity_bytes: usize = function
+    let spilled_operand_bytes: usize = function
         .code
         .iter()
-        .map(|instr| instr.operands.heap_capacity() * size_of::<Operand>())
+        .map(|instr| instr.operands.spilled_operand_len() * size_of::<Operand>())
         .sum();
 
     eprintln!(
-        "representative fixed-width function: instrs={} instruction_stream_bytes={} operand_slots={} operand_vec_allocations={} operand_heap_capacity_bytes={}",
+        "representative fixed-width function: instrs={} instruction_stream_bytes={} operand_slots={} spilled_operand_instructions={} spilled_operand_bytes={}",
         function.code.len(),
         instruction_stream_bytes,
         operand_slots,
-        operand_vec_allocations,
-        operand_heap_capacity_bytes
+        spilled_operand_instructions,
+        spilled_operand_bytes
     );
 }
 

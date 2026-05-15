@@ -1383,8 +1383,9 @@ pub enum Operand {
 ///
 /// Most VM instructions use one to three operands. Keeping those
 /// operands inside the instruction avoids one heap allocation per
-/// fixed-width instruction while preserving the existing decoded
-/// operand-list API shape for disassembly, dumps, and the interpreter.
+/// fixed-width instruction. Rare variadic instructions spill into a frozen
+/// boxed slice so compiled bytecode does not retain builder-only vector
+/// capacity.
 #[derive(Clone, PartialEq, Eq)]
 pub enum OperandList {
     /// Inline storage for common fixed-width instructions.
@@ -1395,7 +1396,7 @@ pub enum OperandList {
         operands: [Operand; 3],
     },
     /// Heap storage for rare variadic instructions.
-    Spill(Vec<Operand>),
+    Spill(Box<[Operand]>),
 }
 
 impl OperandList {
@@ -1404,7 +1405,7 @@ impl OperandList {
     pub fn as_slice(&self) -> &[Operand] {
         match self {
             Self::Inline { len, operands } => &operands[..*len as usize],
-            Self::Spill(operands) => operands.as_slice(),
+            Self::Spill(operands) => operands,
         }
     }
 
@@ -1413,7 +1414,7 @@ impl OperandList {
     pub fn as_mut_slice(&mut self) -> &mut [Operand] {
         match self {
             Self::Inline { len, operands } => &mut operands[..*len as usize],
-            Self::Spill(operands) => operands.as_mut_slice(),
+            Self::Spill(operands) => operands,
         }
     }
 
@@ -1458,12 +1459,12 @@ impl OperandList {
         self.as_slice().iter()
     }
 
-    /// Heap-backed operand capacity. Inline operands report zero.
+    /// Heap-backed operand slots. Inline operands report zero.
     #[must_use]
-    pub fn heap_capacity(&self) -> usize {
+    pub fn spilled_operand_len(&self) -> usize {
         match self {
             Self::Inline { .. } => 0,
-            Self::Spill(operands) => operands.capacity(),
+            Self::Spill(operands) => operands.len(),
         }
     }
 }
@@ -1498,7 +1499,7 @@ impl From<Vec<Operand>> for OperandList {
                     operands: inline,
                 }
             }
-            _ => Self::Spill(operands),
+            _ => Self::Spill(operands.into_boxed_slice()),
         }
     }
 }

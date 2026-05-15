@@ -8,10 +8,6 @@
 //! # Contents
 //! - [`SourceKind`] — JavaScript / TypeScript / JSX flavor selector.
 //! - [`detect_source_kind`] — decide kind from file extension.
-//! - [`Parsed`] — owns an [`oxc_allocator::Allocator`] plus the
-//!   resulting [`oxc_ast::ast::Program`] (lifetime-bound to the
-//!   allocator).
-//! - [`parse`] — parse a string with an explicit [`SourceKind`].
 //! - [`with_program`] — parse once and consume the AST inside a callback.
 //! - [`SyntaxError`] — concrete error returned when OXC reports
 //!   parser diagnostics.
@@ -89,80 +85,12 @@ pub fn detect_source_kind(path: &Path) -> Option<SourceKind> {
     })
 }
 
-/// Result of [`parse`]: owns its allocator so the AST stays alive.
-pub struct Parsed {
-    /// Bump-allocated arena that owns every AST node.
-    pub allocator: Allocator,
-    /// Source text the AST refers into.
-    pub source: String,
-    /// Source kind used for parsing.
-    pub kind: SourceKind,
-}
-
-impl std::fmt::Debug for Parsed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Parsed")
-            .field("kind", &self.kind)
-            .field("source_len", &self.source.len())
-            .finish()
-    }
-}
-
-impl Parsed {
-    /// Parse the program back out of the allocator.
-    ///
-    /// Re-parses on each call: cheap because OXC is fast, and lets
-    /// the caller hold a `&Program` with the allocator's lifetime.
-    /// In practice the compiler calls this once.
-    ///
-    /// # Errors
-    /// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
-    pub fn program<'a>(&'a self) -> Result<Program<'a>, SyntaxError> {
-        let parser = Parser::new(&self.allocator, &self.source, self.kind.to_oxc()).with_options(
-            ParseOptions {
-                parse_regular_expression: true,
-                ..Default::default()
-            },
-        );
-        let ret = parser.parse();
-        if !ret.errors.is_empty() {
-            return Err(SyntaxError::from_oxc(&ret.errors));
-        }
-        Ok(ret.program)
-    }
-}
-
-/// Parse `source` with the given [`SourceKind`].
-///
-/// # Errors
-/// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
-pub fn parse(source: impl Into<String>, kind: SourceKind) -> Result<Parsed, SyntaxError> {
-    let parsed = Parsed {
-        allocator: Allocator::default(),
-        source: source.into(),
-        kind,
-    };
-    // Validate by parsing once.
-    {
-        let parser = Parser::new(&parsed.allocator, &parsed.source, kind.to_oxc()).with_options(
-            ParseOptions {
-                parse_regular_expression: true,
-                ..Default::default()
-            },
-        );
-        let ret = parser.parse();
-        if !ret.errors.is_empty() {
-            return Err(SyntaxError::from_oxc(&ret.errors));
-        }
-    }
-    Ok(parsed)
-}
-
 /// Parse `source` once and pass the AST to `f`.
 ///
-/// Use this on hot compile paths that only need to consume the AST once. It
-/// avoids the validation parse performed by [`parse`] plus the later
-/// [`Parsed::program`] parse.
+/// Use this on compile and analysis paths that need to inspect AST state. The
+/// callback form keeps the OXC allocator and source text alive for the exact
+/// lifetime of the borrowed [`Program`] without exposing a reparse-capable
+/// wrapper.
 ///
 /// # Errors
 /// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
@@ -210,22 +138,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_empty_typescript() {
-        let parsed = parse("", SourceKind::TypeScript).unwrap();
-        let program = parsed.program().unwrap();
-        assert!(program.body.is_empty());
+    fn with_program_parses_empty_typescript() {
+        let is_empty = with_program("", SourceKind::TypeScript, |program| {
+            program.body.is_empty()
+        })
+        .unwrap();
+        assert!(is_empty);
     }
 
     #[test]
-    fn parses_undefined_literal_typescript() {
-        let parsed = parse("undefined;", SourceKind::TypeScript).unwrap();
-        assert_eq!(parsed.program().unwrap().body.len(), 1);
+    fn with_program_parses_undefined_literal_typescript() {
+        let len = with_program("undefined;", SourceKind::TypeScript, |program| {
+            program.body.len()
+        })
+        .unwrap();
+        assert_eq!(len, 1);
     }
 
     #[test]
-    fn parses_jsx_and_tsx_sources() {
-        assert!(parse("const x = <div />;", SourceKind::JavaScriptJsx).is_ok());
-        assert!(parse("const x: JSX.Element = <div />;", SourceKind::TypeScriptJsx).is_ok());
+    fn with_program_parses_jsx_and_tsx_sources() {
+        assert!(with_program("const x = <div />;", SourceKind::JavaScriptJsx, |_| ()).is_ok());
+        assert!(
+            with_program(
+                "const x: JSX.Element = <div />;",
+                SourceKind::TypeScriptJsx,
+                |_| ()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -235,12 +175,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(len, 1);
-    }
-
-    #[test]
-    fn rejects_garbage() {
-        let err = parse("@@@@", SourceKind::TypeScript).unwrap_err();
-        assert!(!err.messages.is_empty());
     }
 
     #[test]

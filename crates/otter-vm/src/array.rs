@@ -27,7 +27,9 @@ use smallvec::SmallVec;
 
 use crate::Value;
 use crate::number::NumberValue;
-use otter_gc::raw::SlotVisitor;
+use otter_gc::GcHeap;
+use otter_gc::heap::RootSlotVisitor;
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ArrayBody`].
 ///
@@ -92,7 +94,7 @@ impl otter_gc::SafeTraceable for ArrayBody {
 ///
 /// Returns [`otter_gc::OutOfMemory`] if the array shell allocation
 /// would exceed the configured heap cap.
-pub fn alloc_array(heap: &mut otter_gc::GcHeap) -> Result<JsArray, otter_gc::OutOfMemory> {
+pub fn alloc_array(heap: &mut GcHeap) -> Result<JsArray, otter_gc::OutOfMemory> {
     heap.alloc_old(ArrayBody::default())
 }
 
@@ -103,7 +105,7 @@ pub fn alloc_array(heap: &mut otter_gc::GcHeap) -> Result<JsArray, otter_gc::Out
 /// Returns [`otter_gc::OutOfMemory`] if either the array shell or
 /// off-slot dense storage reservation would exceed the heap cap.
 pub fn from_elements(
-    heap: &mut otter_gc::GcHeap,
+    heap: &mut GcHeap,
     values: impl IntoIterator<Item = Value>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
@@ -111,6 +113,33 @@ pub fn from_elements(
     reserve_elements_for_len(&mut body, heap, collected.len())?;
     body.elements.extend(collected);
     heap.alloc_old(body)
+}
+
+/// Construct an array from initial elements through the young-generation
+/// allocation path.
+///
+/// The caller-provided roots cover interpreter/runtime slots. The allocation
+/// API also traces the pending [`ArrayBody`] payload itself, so the copied
+/// element values are visible if a collection runs before the array shell is
+/// materialised.
+pub(crate) fn from_elements_with_roots(
+    heap: &mut GcHeap,
+    values: impl IntoIterator<Item = Value>,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
+    let collected: Vec<Value> = values.into_iter().collect();
+    let mut body = ArrayBody::default();
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            for value in &collected {
+                value.trace_value_slots(visitor);
+            }
+        };
+        reserve_elements_for_len_with_roots(&mut body, heap, collected.len(), &mut reserve_roots)?;
+    }
+    body.elements.extend(collected);
+    heap.alloc_with_roots(body, external_visit)
 }
 
 /// Construct an array from initial elements **and** attach the
@@ -128,7 +157,7 @@ pub fn from_elements(
 /// Returns [`otter_gc::OutOfMemory`] if either the array shell or
 /// off-slot dense storage reservation would exceed the heap cap.
 pub fn from_elements_with_source(
-    heap: &mut otter_gc::GcHeap,
+    heap: &mut GcHeap,
     values: impl IntoIterator<Item = Value>,
     source_bytes: Arc<[u8]>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
@@ -469,6 +498,26 @@ fn reserve_elements_for_len(
     let after = spilled_capacity_bytes(target_len);
     if after > before {
         heap.reserve_bytes_no_collect((after - before) as u64)?;
+    }
+    body.elements
+        .reserve_exact(target_len.saturating_sub(body.elements.len()));
+    Ok(())
+}
+
+fn reserve_elements_for_len_with_roots(
+    body: &mut ArrayBody,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    if target_len <= body.elements.capacity() {
+        return Ok(());
+    }
+
+    let before = spilled_capacity_bytes(body.elements.capacity());
+    let after = spilled_capacity_bytes(target_len);
+    if after > before {
+        heap.reserve_bytes_with_roots((after - before) as u64, external_visit)?;
     }
     body.elements
         .reserve_exact(target_len.saturating_sub(body.elements.len()));

@@ -242,6 +242,33 @@ impl GcHeap {
         Ok(())
     }
 
+    /// Reserve `bytes` against the cap while exposing caller-owned roots to a
+    /// possible emergency full GC.
+    ///
+    /// Use this for off-slot backing storage that is being prepared by a
+    /// mutator stack frame whose values are not all present in heap
+    /// handle/global tables. The reservation is booked only after the cap
+    /// check succeeds.
+    ///
+    /// # Errors
+    ///
+    /// [`OutOfMemory::HeapCapExceeded`] when the cap is enabled and the
+    /// reservation cannot be satisfied even after an emergency full GC that
+    /// sees `external_visit`.
+    pub fn reserve_bytes_with_roots(
+        &mut self,
+        bytes: u64,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        if self.max_heap_bytes == 0 {
+            self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
+            return Ok(());
+        }
+        self.account_or_collect_with_roots(bytes, external_visit)?;
+        self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
     /// Reserve native / backing-store bytes with RAII release.
     ///
     /// Use this for memory not represented by GC cell sizes: typed
@@ -309,19 +336,18 @@ impl GcHeap {
     /// disabled-cap branch never executes here.
     #[cold]
     #[inline(never)]
-    fn account_or_collect(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+    fn account_or_collect_with_roots(
+        &mut self,
+        bytes: u64,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
         let cap = self.max_heap_bytes;
         let projected = self.tracked_bytes.saturating_add(bytes);
         if projected <= cap {
             self.tracked_bytes = projected;
             return Ok(());
         }
-        // External root visitor is empty — the handle stack and
-        // global handle table are walked from inside
-        // `collect_full`, and the embedder has no opportunity to
-        // re-enter the heap during a refused allocation.
-        let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.collect_full(&mut noop);
+        self.collect_full(external_visit);
         self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
         let projected = self.tracked_bytes.saturating_add(bytes);
         if projected <= cap {
@@ -333,6 +359,17 @@ impl GcHeap {
             requested_bytes: bytes,
             heap_limit_bytes: cap,
         })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn account_or_collect(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+        // External root visitor is empty — the handle stack and
+        // global handle table are walked from inside
+        // `collect_full`, and the embedder has no opportunity to
+        // re-enter the heap during a refused allocation.
+        let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        self.account_or_collect_with_roots(bytes, &mut noop)
     }
 
     /// Sum of allocated bytes across new + old + LOS. Counts
@@ -490,6 +527,32 @@ impl GcHeap {
     ///   a fresh page request.
     #[inline]
     pub fn alloc<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
+        let mut empty = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        self.alloc_with_roots(value, &mut empty)
+    }
+
+    /// Allocate a `T` while exposing caller-owned root slots to any
+    /// emergency full GC or minor scavenge triggered by the allocation.
+    ///
+    /// Use this for mutator allocation sites whose live roots are not stored
+    /// in the heap's handle/global tables, such as VM interpreter frames held
+    /// on the Rust call stack. The visitor may be called during this
+    /// allocation and must yield rewriteable `RawGc` slots.
+    ///
+    /// If collection is triggered before the payload is materialised in a heap
+    /// cell, the pending `value` is traced as part of the temporary root set.
+    /// This keeps GC-bearing fields inside arrays, objects, or other compound
+    /// payloads valid across allocation-triggered collection.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alloc`].
+    #[inline]
+    pub fn alloc_with_roots<T: Traceable>(
+        &mut self,
+        mut value: T,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Gc<T>, OutOfMemory> {
         // Lazy register so callers never forget. Idempotent.
         if self.trace_table.get(T::TYPE_TAG).is_none() {
             self.trace_table.register::<T>();
@@ -505,9 +568,22 @@ impl GcHeap {
         // §2.1 caveat). When the cap is disabled (`max_heap_bytes
         // == 0`), the hot path adds one load + branch and skips
         // accounting entirely; the cap-enabled path is outlined
-        // under [`Self::account_or_collect`].
+        // under [`Self::account_or_collect_with_roots`].
+        let pending_value = std::ptr::addr_of_mut!(value);
+        let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            // SAFETY: `pending_value` points at the still-unpublished
+            // allocation payload on this stack frame. During the STW
+            // collection triggered by this allocation, tracing may rewrite any
+            // GC slots embedded in that payload before it is copied into the
+            // freshly carved heap cell below.
+            unsafe {
+                T::trace_slots(pending_value, visitor);
+            }
+        };
+
         if self.max_heap_bytes != 0 {
-            self.account_or_collect(aligned as u64)?;
+            self.account_or_collect_with_roots(aligned as u64, &mut allocation_roots)?;
         }
 
         let is_marking = self.marking.is_marking();
@@ -519,11 +595,10 @@ impl GcHeap {
             match self.new_space.alloc(aligned) {
                 Some(off) => off,
                 None => {
-                    // Trigger scavenge with the empty external
-                    // root visitor (handle stack + globals are
-                    // walked internally).
-                    let empty: fn(&mut dyn FnMut(*mut RawGc)) = |_| {};
-                    self.collect_minor_internal(&mut |v| empty(v));
+                    // Trigger scavenge with caller-supplied
+                    // external roots; handle stack + globals are
+                    // walked internally.
+                    self.collect_minor_internal(&mut allocation_roots);
                     self.new_space
                         .alloc(aligned)
                         .ok_or(OutOfMemory::CageExhausted)?

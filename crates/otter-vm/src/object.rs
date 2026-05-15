@@ -34,10 +34,11 @@
 //!   transition records used by StoreProperty IC replay.
 //! - [`ShapeCacheMode`] — fast-shape eligibility marker for current and future
 //!   dictionary-compatible object storage.
-//! - [`JsObject`] / [`Shape`] / [`ObjectBody`] / [`Properties`] —
-//!   the public object handle, its hidden class, the GC-allocated
-//!   storage, and the read-only view used by JSON serialisation and
-//!   `Object.keys` enumeration.
+//! - `ShapeBuilder -> Shape` — transient shape construction followed by frozen
+//!   hidden-class metadata.
+//! - [`JsObject`] / [`Shape`] / [`ObjectBody`] / [`Properties`] — the public
+//!   object handle, its hidden class, the GC-allocated storage, and the
+//!   read-only view used by JSON serialisation and `Object.keys` enumeration.
 //!
 //! # Invariants
 //! - Insertion order is encoded by the shape's key vector and shared
@@ -52,6 +53,8 @@
 //! - Hidden-class ICs may cache only [`ShapeCacheMode::Fast`] objects;
 //!   string-keyed delete moves an object to dictionary-compatible mode even
 //!   though the current backing store still uses a fresh shape.
+//! - Shapes are immutable after `ShapeBuilder::freeze`; transition tables and
+//!   offset maps are caches around frozen key metadata, not builder state.
 //! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
 //!   prototype assignment, and every symbol-property write records
 //!   the store through [`otter_gc::GcHeap::record_write`] so the
@@ -79,6 +82,8 @@ use crate::proxy::JsProxy;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
 use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
+use otter_gc::GcHeap;
+use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 mod descriptor;
@@ -348,18 +353,58 @@ impl std::fmt::Debug for Shape {
     }
 }
 
-impl Shape {
-    /// Construct the root (empty) shape.
-    #[must_use]
-    pub fn root() -> Rc<Shape> {
-        Rc::new(Shape {
+/// Transient hidden-class builder.
+///
+/// Construction may clone/extend key vectors while a new shape is being
+/// created. Once frozen, the resulting [`Shape`] exposes immutable key metadata
+/// to object storage and inline-cache guards.
+#[derive(Debug)]
+struct ShapeBuilder {
+    id: ShapeId,
+    parent: Option<Rc<Shape>>,
+    key: Option<String>,
+    keys: Vec<String>,
+}
+
+impl ShapeBuilder {
+    fn root() -> Self {
+        Self {
             id: next_shape_id(),
             parent: None,
             key: None,
             keys: Vec::new(),
+        }
+    }
+
+    fn child(parent: &Rc<Shape>, key: &str) -> Self {
+        let key = key.to_string();
+        let mut keys = parent.keys.clone();
+        keys.push(key.clone());
+        Self {
+            id: next_shape_id(),
+            parent: Some(Rc::clone(parent)),
+            key: Some(key),
+            keys,
+        }
+    }
+
+    fn freeze(self) -> Rc<Shape> {
+        Rc::new(Shape {
+            id: self.id,
+            parent: self.parent,
+            key: self.key,
+            keys: self.keys,
             offsets: OnceCell::new(),
             transitions: Cell::new(HashMap::new()),
         })
+    }
+}
+
+impl Shape {
+    /// Construct the root (empty) shape.
+    #[must_use]
+    pub fn root() -> Rc<Shape> {
+        ShapeBuilder::root().freeze()
     }
 
     /// Number of properties carried by this shape.
@@ -415,16 +460,7 @@ impl Shape {
             self_rc.transitions.set(transitions);
             return hit;
         }
-        let mut keys = self_rc.keys.clone();
-        keys.push(key.to_string());
-        let child = Rc::new(Shape {
-            id: next_shape_id(),
-            parent: Some(Rc::clone(self_rc)),
-            key: Some(key.to_string()),
-            keys,
-            offsets: OnceCell::new(),
-            transitions: Cell::new(HashMap::new()),
-        });
+        let child = ShapeBuilder::child(self_rc, key).freeze();
         transitions.insert(key.to_string(), Rc::clone(&child));
         self_rc.transitions.set(transitions);
         child
@@ -623,25 +659,9 @@ pub type JsObject = otter_gc::Gc<ObjectBody>;
 /// Maximum prototype-chain hops a property lookup will follow.
 pub const PROTO_CHAIN_HARD_CAP: usize = 1024;
 
-/// Allocate a fresh empty extensible object on the root shape.
-///
-/// Routes through [`otter_gc::GcHeap::alloc_old`] so the body is
-/// allocated directly in old-space — Phase-1 callers may still hold
-/// raw `JsObject` slots inside `Rc`-shared containers that the
-/// young-gen scavenger cannot rewrite. Phase 2 may switch back to
-/// [`otter_gc::GcHeap::alloc`] once every container slot is walked.
-///
-/// # Errors
-///
-/// Surfaces [`otter_gc::OutOfMemory`] verbatim; runtime callers
-/// translate it into [`crate::VmError::OutOfMemory`].
-///
-/// # Spec
-///
-/// - <https://tc39.es/ecma262/#sec-ordinaryobjectcreate>
-pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+fn empty_object_body() -> ObjectBody {
     let shape = ROOT_SHAPE.with(Rc::clone);
-    heap.alloc_old(ObjectBody {
+    ObjectBody {
         shape,
         shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
@@ -654,7 +674,39 @@ pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::O
         number_data: None,
         string_data: None,
         extensible: true,
-    })
+    }
+}
+
+/// Allocate a fresh empty extensible object on the root shape.
+///
+/// Routes through [`otter_gc::GcHeap::alloc_old`] so the body is allocated
+/// directly in old-space. Stack-aware bytecode allocation sites should use the
+/// narrower young-generation helper once they can expose their live frame
+/// roots.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim; runtime callers translate it
+/// into [`crate::VmError::OutOfMemory`].
+///
+/// # Spec
+///
+/// - <https://tc39.es/ecma262/#sec-ordinaryobjectcreate>
+pub fn alloc_object(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+    heap.alloc_old(empty_object_body())
+}
+
+/// Allocate a fresh empty object through the young-generation allocation path.
+///
+/// This is intentionally narrower than [`alloc_object`]: callers must provide
+/// every stack/register root the scavenger may need to rewrite if allocation
+/// triggers a minor collection. Use only at VM bytecode allocation sites that
+/// can expose the live frame stack.
+pub(crate) fn alloc_object_with_roots(
+    heap: &mut GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    heap.alloc_with_roots(empty_object_body(), external_visit)
 }
 
 /// Allocate a fresh empty object for diagnostic delivery after the
@@ -673,24 +725,8 @@ pub fn alloc_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::O
 /// # Spec
 ///
 /// - <https://tc39.es/ecma262/#sec-error-objects>
-pub fn alloc_diagnostic_object(
-    heap: &mut otter_gc::GcHeap,
-) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let shape = ROOT_SHAPE.with(Rc::clone);
-    heap.alloc_old_diagnostic(ObjectBody {
-        shape,
-        shape_cache_mode: ShapeCacheMode::Fast,
-        slots: SmallVec::new(),
-        prototype: ObjectPrototype::Null,
-        symbol_props: Vec::new(),
-        host_data: None,
-        call_native: None,
-        constructor_native: None,
-        boolean_data: None,
-        number_data: None,
-        string_data: None,
-        extensible: true,
-    })
+pub fn alloc_diagnostic_object(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+    heap.alloc_old_diagnostic(empty_object_body())
 }
 
 /// Allocate a fresh object backed by Rust-owned host data.
@@ -2405,6 +2441,35 @@ mod tests {
             capture_store_property_transition(receiver, &mut heap, key, &Value::Null).is_none()
         );
         assert!(get_own(receiver, &heap, "x").is_none());
+    }
+
+    #[test]
+    fn shape_builder_freezes_root_and_child_metadata() {
+        let root = ShapeBuilder::root().freeze();
+        assert!(root.is_empty());
+        assert_eq!(root.len(), 0);
+        assert_eq!(root.offset_of("x"), None);
+
+        let child = ShapeBuilder::child(&root, "x").freeze();
+        let keys: Vec<&str> = child.keys().map(String::as_str).collect();
+
+        assert_eq!(child.len(), 1);
+        assert_eq!(keys, vec!["x"]);
+        assert_eq!(child.offset_of("x"), Some(0));
+        assert_eq!(child.offset_of("missing"), None);
+        assert!(root.is_empty());
+        assert_eq!(root.offset_of("x"), None);
+    }
+
+    #[test]
+    fn shape_add_property_reuses_frozen_transition_child() {
+        let root = Shape::root();
+        let first = Shape::add_property(&root, "x");
+        let second = Shape::add_property(&root, "x");
+
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(first.offset_of("x"), Some(0));
+        assert!(root.is_empty());
     }
 
     #[test]

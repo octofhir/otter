@@ -19,7 +19,7 @@
 //! - Live-binding slots are deterministic and sorted by exported name.
 //!
 //! # See also
-//! - [`crate::compile_module_fragment_to_module`]
+//! - [`crate::compile_module_program_to_module`]
 //! - [`crate::ModuleHostInfo`]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -361,8 +361,8 @@ fn record_exports_from_declaration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ModuleHostInfo, compile_module_fragment_to_module};
-    use otter_syntax::{SourceKind as SyntaxSourceKind, parse};
+    use crate::{ModuleHostInfo, compile_module_program_to_module};
+    use otter_syntax::{SourceKind as SyntaxSourceKind, with_program};
 
     fn host_info(specifiers: &[(&str, &str)]) -> ModuleHostInfo {
         ModuleHostInfo {
@@ -382,12 +382,15 @@ mod tests {
             export { answer as renamed };
             import("./lazy.ts");
         "#;
-        let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
         let host = host_info(&[
             ("./other.ts", "file:///test/other.ts"),
             ("./lazy.ts", "file:///test/lazy.ts"),
         ]);
-        let compiled = compile_module_fragment_to_module(&parsed, &host).unwrap();
+        let compiled = with_program(src, SyntaxSourceKind::TypeScript, |program| {
+            compile_module_program_to_module(program, SyntaxSourceKind::TypeScript, &host)
+        })
+        .unwrap()
+        .unwrap();
 
         assert_eq!(compiled.metadata.source_url, "file:///test/main.ts");
         assert_eq!(
@@ -435,5 +438,46 @@ mod tests {
                 .any(|slot| slot.name == "answer")
         );
         assert!(!compiled.metadata.spans.is_empty());
+    }
+
+    #[test]
+    fn borrowed_program_module_api_emits_metadata_without_parse_wrapper() {
+        let src = r#"
+            import { value } from "./other.ts";
+            export const answer = value + 1;
+            import("./lazy.ts");
+        "#;
+        let host = host_info(&[
+            ("./other.ts", "file:///test/other.ts"),
+            ("./lazy.ts", "file:///test/lazy.ts"),
+        ]);
+        let compiled = with_program(src, SyntaxSourceKind::TypeScript, |program| {
+            compile_module_program_to_module(program, SyntaxSourceKind::TypeScript, &host)
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(compiled.metadata.source_url, "file:///test/main.ts");
+        assert_eq!(compiled.metadata.imports.len(), 2);
+        assert!(
+            compiled
+                .metadata
+                .exports
+                .iter()
+                .any(|export| export.name == "answer")
+        );
+        assert!(
+            compiled
+                .metadata
+                .live_binding_slots
+                .iter()
+                .any(|slot| slot.name == "answer")
+        );
+        assert_eq!(compiled.bytecode.module, "file:///test/main.ts");
+        assert_eq!(
+            compiled.bytecode.module_resolutions.len(),
+            2,
+            "host imports should be preserved in bytecode metadata"
+        );
     }
 }

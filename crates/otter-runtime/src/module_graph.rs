@@ -4,7 +4,7 @@
 //! 1. Walks the dependency graph from an entry specifier (BFS),
 //!    parsing each `.ts` / `.js` file once and scanning it for
 //!    static imports + literal-string `import("./x")` references.
-//! 2. Compiles each module via [`otter_compiler::compile_module_fragment`]
+//! 2. Compiles each module via [`otter_compiler::compile_module_program_to_module`]
 //!    with a `ModuleHostInfo` carrying the pre-resolved
 //!    `(specifier → target URL)` table for that file.
 //! 3. Post-order DFS topological sort with cycle detection
@@ -25,6 +25,8 @@
 //! - [`load_program`] — top-level entry that loads + links a graph
 //!   rooted at a `.ts` / `.js` file path and returns the unified
 //!   [`BytecodeModule`].
+//! - `ModuleGraphBuilder -> ModuleGraph -> LinkedProgram` — transient graph
+//!   discovery followed by frozen linked output.
 //! - [`GraphError`] — distinct error enum for graph-build failures.
 //!
 //! # Invariants
@@ -48,10 +50,10 @@ use otter_bytecode::{
     OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_compiler::{
-    CompileError, CompiledModuleMetadata, ModuleHostInfo, compile_module_fragment_to_module,
+    CompileError, CompiledModuleMetadata, ModuleHostInfo, compile_module_program_to_module,
 };
-use otter_syntax::{Parsed, SourceKind, SyntaxError, parse};
-use oxc_ast::ast::Expression;
+use otter_syntax::{SourceKind, SyntaxError, with_program};
+use oxc_ast::ast::{Expression, Program};
 use oxc_ast_visit::Visit;
 
 use crate::module_loader::{LoaderError, ModuleLoader};
@@ -96,7 +98,7 @@ pub enum GraphError {
 /// dependency edges.
 #[derive(Debug)]
 struct ModuleNode {
-    /// Compiled fragment from `compile_module_fragment`.
+    /// Compiled fragment from `compile_module_program_to_module`.
     fragment: BytecodeModule,
     /// Compiler-owned metadata for this unlinked source module.
     metadata: CompiledModuleMetadata,
@@ -104,6 +106,138 @@ struct ModuleNode {
     /// `fragment.module_resolutions` — used by the topological
     /// sort to walk to dependencies.
     deps: Vec<(String, String)>,
+}
+
+/// Frozen module graph assembled by [`ModuleGraphBuilder`].
+#[derive(Debug)]
+struct ModuleGraph {
+    entry_url: String,
+    nodes: BTreeMap<String, ModuleNode>,
+}
+
+impl ModuleGraph {
+    fn link(self) -> Result<LinkedProgram, GraphError> {
+        let order = topological_order(&self.nodes, &self.entry_url)?;
+        let module = link(&self.nodes, &order, &self.entry_url);
+        let metadata = order
+            .iter()
+            .filter_map(|url| {
+                self.nodes
+                    .get(url)
+                    .map(|node| node.metadata.clone())
+                    .filter(|metadata| !metadata.source_url.is_empty())
+            })
+            .collect();
+
+        Ok(LinkedProgram {
+            module,
+            entry_url: self.entry_url,
+            metadata,
+        })
+    }
+}
+
+/// Transient dependency-graph builder.
+///
+/// Owns BFS queueing, per-run load counters, and mutable node insertion while
+/// the graph is discovered. Once built, callers receive a frozen [`ModuleGraph`]
+/// and linking no longer mutates graph topology.
+struct ModuleGraphBuilder<'a> {
+    loader: &'a ModuleLoader,
+    entry_url: String,
+    nodes: BTreeMap<String, ModuleNode>,
+    queue: Vec<(String, SourceKind, String)>,
+    load_count: usize,
+}
+
+impl<'a> ModuleGraphBuilder<'a> {
+    fn new(
+        loader: &'a ModuleLoader,
+        entry_url: String,
+        entry_kind: SourceKind,
+        entry_text: String,
+    ) -> Self {
+        Self {
+            loader,
+            entry_url: entry_url.clone(),
+            nodes: BTreeMap::new(),
+            queue: vec![(entry_url, entry_kind, entry_text)],
+            load_count: 0,
+        }
+    }
+
+    fn build(mut self) -> Result<ModuleGraph, GraphError> {
+        while let Some((url, kind, text)) = self.queue.pop() {
+            self.load_one(url, kind, text)?;
+        }
+        Ok(ModuleGraph {
+            entry_url: self.entry_url,
+            nodes: self.nodes,
+        })
+    }
+
+    fn load_one(&mut self, url: String, kind: SourceKind, text: String) -> Result<(), GraphError> {
+        if self.nodes.contains_key(&url) {
+            return Ok(());
+        }
+        if self.loader.is_hosted_url(&url) {
+            self.nodes.insert(
+                url.clone(),
+                ModuleNode {
+                    fragment: hosted_module_fragment(&url),
+                    metadata: CompiledModuleMetadata::default(),
+                    deps: Vec::new(),
+                },
+            );
+            return Ok(());
+        }
+        self.load_count += 1;
+        if self.load_count > MODULE_DEPTH_LIMIT {
+            return Err(GraphError::Cycle { url });
+        }
+
+        let (compiled, deps, queued) = with_program(text, kind, |program| {
+            let specifiers = collect_specifiers(program);
+            let mut resolved_imports: HashMap<String, String> = HashMap::new();
+            let mut deps: Vec<(String, String)> = Vec::with_capacity(specifiers.len());
+            let mut queued: Vec<(String, SourceKind, String)> = Vec::new();
+            for spec in &specifiers {
+                let target = self.loader.resolve(spec, Some(&url))?;
+                resolved_imports.insert(spec.clone(), target.clone());
+                deps.push((spec.clone(), target.clone()));
+                if !self.nodes.contains_key(&target) {
+                    let loaded = self.loader.load(spec, Some(&url))?;
+                    queued.push((loaded.url, loaded.kind, loaded.text));
+                }
+            }
+            let host = ModuleHostInfo {
+                module_url: url.clone(),
+                resolved_imports,
+            };
+            let compiled = compile_module_program_to_module(program, kind, &host).map_err(|e| {
+                GraphError::Compile {
+                    url: url.clone(),
+                    error: e,
+                }
+            })?;
+            Ok::<_, GraphError>((compiled, deps, queued))
+        })
+        .map_err(|e| GraphError::Parse {
+            url: url.clone(),
+            error: e,
+        })??;
+
+        self.queue.extend(queued);
+        self.nodes.insert(
+            nodes_key_for(&compiled.bytecode),
+            ModuleNode {
+                fragment: compiled.bytecode,
+                metadata: compiled.metadata,
+                deps,
+            },
+        );
+        Ok(())
+    }
 }
 
 /// Key used by the module-set BTreeMap. Returns the fragment's
@@ -121,16 +255,12 @@ fn nodes_key_for(fragment: &BytecodeModule) -> String {
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-imports>,
 ///       <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>.
-fn collect_specifiers(parsed: &Parsed, url: &str) -> Result<Vec<String>, GraphError> {
-    let program = parsed.program().map_err(|e| GraphError::Parse {
-        url: url.to_string(),
-        error: e,
-    })?;
+fn collect_specifiers(program: &Program<'_>) -> Vec<String> {
     let mut visitor = SpecifierVisitor::default();
     for stmt in &program.body {
         visitor.visit_statement(stmt);
     }
-    Ok(visitor.out)
+    visitor.out
 }
 
 #[derive(Default)]
@@ -178,76 +308,6 @@ impl<'a> Visit<'a> for SpecifierVisitor {
         }
         oxc_ast_visit::walk::walk_import_expression(self, imp);
     }
-}
-
-/// Load + parse + compile every module reachable from `entry_url`.
-/// Returns the per-URL compiled fragments in the order they were
-/// first seen by the BFS. Cycle detection uses a separate
-/// "in-progress" set during the recursive resolve.
-fn build_module_set(
-    loader: &ModuleLoader,
-    entry_url: String,
-    entry_kind: SourceKind,
-    entry_text: String,
-) -> Result<BTreeMap<String, ModuleNode>, GraphError> {
-    let mut nodes: BTreeMap<String, ModuleNode> = BTreeMap::new();
-    let mut queue: Vec<(String, SourceKind, String)> = vec![(entry_url, entry_kind, entry_text)];
-    let mut load_count = 0usize;
-    while let Some((url, kind, text)) = queue.pop() {
-        if nodes.contains_key(&url) {
-            continue;
-        }
-        if loader.is_hosted_url(&url) {
-            nodes.insert(
-                url.clone(),
-                ModuleNode {
-                    fragment: hosted_module_fragment(&url),
-                    metadata: CompiledModuleMetadata::default(),
-                    deps: Vec::new(),
-                },
-            );
-            continue;
-        }
-        load_count += 1;
-        if load_count > MODULE_DEPTH_LIMIT {
-            return Err(GraphError::Cycle { url });
-        }
-        let parsed = parse(text, kind).map_err(|e| GraphError::Parse {
-            url: url.clone(),
-            error: e,
-        })?;
-        let specifiers = collect_specifiers(&parsed, &url)?;
-        let mut resolved_imports: HashMap<String, String> = HashMap::new();
-        let mut deps: Vec<(String, String)> = Vec::with_capacity(specifiers.len());
-        for spec in &specifiers {
-            let target = loader.resolve(spec, Some(&url))?;
-            resolved_imports.insert(spec.clone(), target.clone());
-            deps.push((spec.clone(), target.clone()));
-            if !nodes.contains_key(&target) {
-                let loaded = loader.load(spec, Some(&url))?;
-                queue.push((loaded.url, loaded.kind, loaded.text));
-            }
-        }
-        let host = ModuleHostInfo {
-            module_url: url.clone(),
-            resolved_imports,
-        };
-        let compiled =
-            compile_module_fragment_to_module(&parsed, &host).map_err(|e| GraphError::Compile {
-                url: url.clone(),
-                error: e,
-            })?;
-        let _ = url; // url is the BTreeMap key; ModuleNode itself doesn't need it
-        nodes.insert(
-            nodes_key_for(&compiled.bytecode),
-            ModuleNode {
-                fragment: compiled.bytecode,
-                metadata: compiled.metadata,
-                deps,
-            },
-        );
-    }
-    Ok(nodes)
 }
 
 fn hosted_module_fragment(url: &str) -> BytecodeModule {
@@ -372,7 +432,7 @@ pub struct LinkedProgram {
 /// # Algorithm
 /// 1. Load the entry source through `loader`.
 /// 2. BFS to compile every reachable fragment via
-///    [`compile_module_fragment`].
+///    [`compile_module_program_to_module`].
 /// 3. Topologically sort with cycle detection.
 /// 4. Link: assign function-ID and constant offsets per fragment;
 ///    rewrite each fragment's `Constant::FunctionId` operands
@@ -416,24 +476,9 @@ pub fn load_program(loader: &ModuleLoader, entry_path: &Path) -> Result<LinkedPr
         message: e.to_string(),
     })?;
 
-    let nodes = build_module_set(loader, entry_url.clone(), entry_kind, entry_text)?;
-    let order = topological_order(&nodes, &entry_url)?;
-    let module = link(&nodes, &order, &entry_url);
-    let metadata = order
-        .iter()
-        .filter_map(|url| {
-            nodes
-                .get(url)
-                .map(|node| node.metadata.clone())
-                .filter(|metadata| !metadata.source_url.is_empty())
-        })
-        .collect();
-
-    Ok(LinkedProgram {
-        module,
-        entry_url,
-        metadata,
-    })
+    ModuleGraphBuilder::new(loader, entry_url, entry_kind, entry_text)
+        .build()?
+        .link()
 }
 
 /// Merge fragments into one `BytecodeModule`, prepending a
@@ -760,4 +805,50 @@ fn intern_function_id_const(constants: &mut Vec<Constant>, function_id: u32) -> 
     }
     constants.push(Constant::FunctionId { index: function_id });
     (constants.len() - 1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_freezes_graph_before_linking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry_path = dir.path().join("entry.ts");
+        let dep_path = dir.path().join("dep.ts");
+        std::fs::write(
+            &entry_path,
+            "import { value } from './dep.ts'; export const out = value;",
+        )
+        .expect("write entry");
+        std::fs::write(&dep_path, "export const value = 7;").expect("write dep");
+
+        let loader = ModuleLoader::new(dir.path().to_path_buf());
+        let entry_url = format!(
+            "file://{}",
+            std::fs::canonicalize(&entry_path).unwrap().display()
+        );
+        let entry_text = std::fs::read_to_string(&entry_path).unwrap();
+
+        let graph = ModuleGraphBuilder::new(
+            &loader,
+            entry_url.clone(),
+            SourceKind::TypeScript,
+            entry_text,
+        )
+        .build()
+        .expect("build graph");
+
+        assert_eq!(graph.entry_url, entry_url);
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(graph.nodes.contains_key(&entry_url));
+        let order = topological_order(&graph.nodes, &entry_url).expect("topological order");
+        assert_eq!(order.len(), 2);
+
+        let linked = graph.link().expect("link graph");
+        assert_eq!(linked.entry_url, entry_url);
+        assert_eq!(linked.module.functions[0].name, "<entry>");
+        assert_eq!(linked.module.module_inits.len(), 2);
+        assert_eq!(linked.metadata.len(), 2);
+    }
 }

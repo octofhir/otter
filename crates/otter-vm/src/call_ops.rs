@@ -27,9 +27,16 @@ use smallvec::SmallVec;
 use crate::{
     AsyncFrameState, ExecutableFunction, ExecutionContext, Frame, Interpreter, JsObject,
     NativeCallInfo, NativeCtx, NativeFunction, UpvalueCell, Value, VmError, abstract_ops,
-    constructor_return_is_object, is_constructor_runtime, native_to_vm_error,
-    operand_decode::register_operand, promise_dispatch, read_register, write_register,
+    argument_window::BytecodeArgumentWindow, constructor_return_is_object, is_constructor_runtime,
+    native_to_vm_error, operand_decode::register_operand, promise_dispatch, read_register,
+    write_register,
 };
+
+struct PreparedBytecodeFrame {
+    frame: Frame,
+    is_generator: bool,
+    is_async_generator: bool,
+}
 
 impl Interpreter {
     pub(crate) fn bind_bytecode_call_arguments(
@@ -114,6 +121,32 @@ impl Interpreter {
         frame.construct_target = Some(receiver);
         frame.new_target = Some(new_target);
         Self::bind_bytecode_call_arguments(function, &mut frame, args)?;
+        Ok(frame)
+    }
+
+    fn build_construct_bytecode_frame_from_window(
+        &mut self,
+        context: &ExecutionContext,
+        current: Value,
+        receiver: JsObject,
+        new_target: Value,
+        args: &BytecodeArgumentWindow<'_>,
+    ) -> Result<Frame, VmError> {
+        let (function_id, parent_upvalues) = Self::bytecode_construct_target_parts(current)?;
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let mut frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            None,
+            upvalues,
+            Value::Object(receiver),
+        );
+        frame.construct_target = Some(receiver);
+        frame.new_target = Some(new_target);
+        args.bind_into(function, &mut frame)?;
         Ok(frame)
     }
 
@@ -204,6 +237,186 @@ impl Interpreter {
         Ok(())
     }
 
+    fn prepare_bytecode_call_frame_from_window(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        parent_upvalues: std::rc::Rc<[UpvalueCell]>,
+        this_for_callee: Value,
+        args: &BytecodeArgumentWindow<'_>,
+        return_register: Option<u16>,
+        async_state: Option<AsyncFrameState>,
+    ) -> Result<PreparedBytecodeFrame, VmError> {
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let upvalues =
+            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
+        let mut frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            return_register,
+            upvalues,
+            this_for_callee,
+        );
+        frame.async_state = async_state;
+        args.bind_into(function, &mut frame)?;
+        Ok(PreparedBytecodeFrame {
+            frame,
+            is_generator: function.is_generator,
+            is_async_generator: function.is_async_generator,
+        })
+    }
+
+    fn push_prepared_bytecode_call_frame(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        dst: u16,
+        prepared: PreparedBytecodeFrame,
+    ) -> Result<(), VmError> {
+        let PreparedBytecodeFrame {
+            mut frame,
+            is_generator,
+            is_async_generator,
+        } = prepared;
+        if is_generator {
+            frame.return_register = None;
+            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, frame)?;
+            gen_handle.set_async(&mut self.gc_heap, is_async_generator);
+            gen_handle.install_owner_on_frame(&mut self.gc_heap);
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
+            return Ok(());
+        }
+        stack.push(frame);
+        Ok(())
+    }
+
+    fn try_push_bytecode_call_frame_from_window(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        callee: &Value,
+        this_value: Value,
+        operands: &[Operand],
+        first_arg_operand: usize,
+        argc: usize,
+        dst: u16,
+    ) -> Result<bool, VmError> {
+        let mut current = callee.clone();
+        let effective_this = this_value;
+        let mut hops: u32 = 0;
+        loop {
+            if hops >= self.max_stack_depth {
+                return Err(VmError::StackOverflow {
+                    limit: self.max_stack_depth,
+                });
+            }
+            match current {
+                Value::ClassConstructor(cc) => {
+                    hops += 1;
+                    current = cc.ctor(&self.gc_heap).clone();
+                }
+                Value::BoundFunction(_) => return Ok(false),
+                _ => break,
+            }
+        }
+        if !matches!(current, Value::Function { .. } | Value::Closure { .. }) {
+            return Ok(false);
+        }
+        let (function_id, parent_upvalues, this_for_callee) =
+            Self::bytecode_call_target_parts(current, effective_this)?;
+        let function = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        self.record_runtime_bytecode_call();
+        if stack.len() as u32 >= self.max_stack_depth {
+            return Err(VmError::StackOverflow {
+                limit: self.max_stack_depth,
+            });
+        }
+        let top_idx = stack.len() - 1;
+        let (return_register, async_state) = if function.is_async {
+            let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending(&mut self.gc_heap)?;
+            let promise_value = Value::Promise(result_promise);
+            write_register(&mut stack[top_idx], dst, promise_value)?;
+            (None, Some(AsyncFrameState { result_promise }))
+        } else {
+            (Some(dst), None)
+        };
+        let prepared = {
+            let caller = &stack[top_idx];
+            let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+            self.prepare_bytecode_call_frame_from_window(
+                context,
+                function_id,
+                parent_upvalues,
+                this_for_callee,
+                &args,
+                return_register,
+                async_state,
+            )?
+        };
+        self.push_prepared_bytecode_call_frame(stack, dst, prepared)?;
+        Ok(true)
+    }
+
+    fn try_invoke_native_call_from_window(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        callee: &Value,
+        this_value: Value,
+        operands: &[Operand],
+        first_arg_operand: usize,
+        argc: usize,
+        dst: u16,
+    ) -> Result<bool, VmError> {
+        let top_idx = stack.len() - 1;
+        let args = {
+            let caller = &stack[top_idx];
+            let window = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+            let Some(args) = window.contiguous_slice()? else {
+                return Ok(false);
+            };
+            args
+        };
+
+        if let Value::Object(obj) = callee
+            && let Some(Value::NativeFunction(native)) =
+                crate::object::call_native(*obj, &self.gc_heap)
+        {
+            let call = native.call_target(&self.gc_heap);
+            if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
+                return Ok(false);
+            }
+            let call_info = NativeCallInfo::call(this_value.clone());
+            self.record_runtime_native_call();
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
+            let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error)?;
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(true);
+        }
+
+        if let Value::NativeFunction(native) = callee {
+            let call = native.call_target(&self.gc_heap);
+            if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
+                return Ok(false);
+            }
+            let call_info = NativeCallInfo::call(this_value.clone());
+            self.record_runtime_native_call();
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
+            let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error)?;
+            write_register(&mut stack[top_idx], dst, result)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     /// Handle `Op::Call`: push a new frame for the callee with
     /// arguments copied into the parameter slots and `this` bound
     /// to `Value::Undefined` (foundation strict default).
@@ -222,15 +435,36 @@ impl Interpreter {
 
         let top_idx = stack.len() - 1;
         let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
-        for i in 0..argc as usize {
-            let r = register_operand(operands.get(3 + i))?;
-            args.push(read_register(&stack[top_idx], r)?.clone());
-        }
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
+        if self.try_push_bytecode_call_frame_from_window(
+            stack,
+            context,
+            &callee,
+            Value::Undefined,
+            operands,
+            3,
+            argc as usize,
+            dst,
+        )? {
+            return Ok(());
+        }
+        if self.try_invoke_native_call_from_window(
+            stack,
+            context,
+            &callee,
+            Value::Undefined,
+            operands,
+            3,
+            argc as usize,
+            dst,
+        )? {
+            return Ok(());
+        }
+        let args = BytecodeArgumentWindow::new(&stack[top_idx], operands, 3, argc as usize)
+            .to_smallvec8()?;
         self.invoke(stack, context, &callee, Value::Undefined, args, dst)
     }
 
@@ -403,16 +637,70 @@ impl Interpreter {
         if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
-        for i in 0..argc as usize {
-            let r = register_operand(operands.get(3 + i))?;
-            args.push(read_register(&stack[top_idx], r)?.clone());
-        }
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
+        if self.try_dispatch_construct_from_window(
+            stack,
+            context,
+            callee.clone(),
+            operands,
+            3,
+            argc as usize,
+            dst,
+        )? {
+            return Ok(());
+        }
+        let args = BytecodeArgumentWindow::new(&stack[top_idx], operands, 3, argc as usize)
+            .to_smallvec8()?;
         self.dispatch_construct(stack, context, callee, args, dst)
+    }
+
+    fn try_dispatch_construct_from_window(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        callee: Value,
+        operands: &[Operand],
+        first_arg_operand: usize,
+        argc: usize,
+        _dst: u16,
+    ) -> Result<bool, VmError> {
+        let mut current = callee;
+        let effective_new_target = current.clone();
+        if let Value::ClassConstructor(class) = &current {
+            current = class.ctor(&self.gc_heap).clone();
+        }
+        if !matches!(current, Value::Function { .. } | Value::Closure { .. }) {
+            return Ok(false);
+        }
+
+        self.record_runtime_construct_call();
+        let proto = self.construct_prototype_for_callee(context, &effective_new_target)?;
+        let receiver = match proto.as_ref() {
+            Some(proto_value) => {
+                self.alloc_stack_rooted_object_with_extra_roots(stack, &[proto_value])?
+            }
+            None => self.alloc_stack_rooted_object(stack)?,
+        };
+        if let Some(proto) = proto {
+            crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
+        }
+        let top_idx = stack.len() - 1;
+        let frame = {
+            let caller = &stack[top_idx];
+            let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
+            self.build_construct_bytecode_frame_from_window(
+                context,
+                current,
+                receiver,
+                effective_new_target,
+                &args,
+            )?
+        };
+        stack.push(frame);
+        Ok(true)
     }
 
     pub(crate) fn do_construct_spread(
@@ -678,15 +966,36 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let callee = read_register(&stack[top_idx], callee_reg)?.clone();
         let this_value = read_register(&stack[top_idx], this_reg)?.clone();
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc as usize);
-        for i in 0..argc as usize {
-            let r = register_operand(operands.get(4 + i))?;
-            args.push(read_register(&stack[top_idx], r)?.clone());
-        }
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
+        if self.try_push_bytecode_call_frame_from_window(
+            stack,
+            context,
+            &callee,
+            this_value.clone(),
+            operands,
+            4,
+            argc as usize,
+            dst,
+        )? {
+            return Ok(());
+        }
+        if self.try_invoke_native_call_from_window(
+            stack,
+            context,
+            &callee,
+            this_value.clone(),
+            operands,
+            4,
+            argc as usize,
+            dst,
+        )? {
+            return Ok(());
+        }
+        let args = BytecodeArgumentWindow::new(&stack[top_idx], operands, 4, argc as usize)
+            .to_smallvec8()?;
         self.invoke(stack, context, &callee, this_value, args, dst)
     }
     /// Synchronously invoke `callee(args)` with the given `this` and

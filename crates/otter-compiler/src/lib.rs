@@ -20,7 +20,11 @@
 //! tasks `09`–`13` add real value loading, control flow, and calls.
 //!
 //! # Contents
-//! - [`compile`] — entry point.
+//! - [`compile_script_source`] / [`compile_script_source_to_module`] — script
+//!   source entry points.
+//! - [`compile_script_program`] — borrowed-AST script lowering.
+//! - [`compile_module_program`] / [`compile_module_program_to_module`] —
+//!   borrowed-AST ES-module lowering.
 //! - [`CompileError`] — concrete error enum (`Syntax`,
 //!   `TypeScriptUnsupported`, `Unsupported`).
 //! - [`unwrap_ts_expr`] — strip TS-erasable expression wrappers.
@@ -52,36 +56,13 @@ use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Constant, Function, Instruction,
     MappedArgumentBinding, Op, Operand, OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
 };
-use otter_syntax::{
-    Parsed, SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, with_program,
-};
+use otter_syntax::{SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, with_program};
 use oxc_ast::ast::{
     AssignmentOperator, AssignmentTarget, BinaryOperator, Expression, LogicalOperator, Program,
     SimpleAssignmentTarget, Statement, UnaryOperator, UpdateOperator,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-/// Compile-time mode discriminator. Reserved for the public API
-/// once embedders gain a single entry point; today the two
-/// flavours have separate functions ([`compile`] for scripts,
-/// [`compile_module_fragment`] for ES-module fragments).
-///
-/// Spec: <https://tc39.es/ecma262/#sec-types-of-source-code>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // public-API consolidation is its own slice
-pub enum CompileMode {
-    /// Plain script. Top-level statements compile into `<main>`'s
-    /// body; `import` / `export` declarations are rejected.
-    Script,
-    /// ES module fragment. Top-level statements compile into a
-    /// `<module-init>` whose first two parameters are `module_env`
-    /// and `import_meta`, with `is_module = true` set on the
-    /// resulting [`Function`]. Import / export declarations
-    /// lower against the captured environment objects so live
-    /// bindings fall out via `LoadProperty` / `StoreProperty`.
-    Module,
-}
 
 /// One pre-resolved import-record binding: maps an importer-side
 /// alias (`import { a as alias } from "./other.ts"`) to the
@@ -134,7 +115,7 @@ struct ModuleState {
 
 /// Pre-resolved import / export information passed by the host
 /// (typically the runtime's module-graph driver) into
-/// [`compile_module_fragment`]. The compiler trusts the host for
+/// [`compile_module_program`]. The compiler trusts the host for
 /// resolution; it lowers identifier references against the
 /// resolved structure.
 #[derive(Debug, Clone, Default)]
@@ -148,45 +129,21 @@ pub struct ModuleHostInfo {
     pub resolved_imports: HashMap<String, String>,
 }
 
-/// Compile a parsed program into a [`BytecodeModule`] script.
-///
-/// `module_specifier` is recorded on the resulting bytecode and
-/// surfaces in dump output, traces, and diagnostics.
-///
-/// # Errors
-/// Returns [`CompileError`] when the AST contains constructs outside
-/// the foundation subset (see [`CompileError::Unsupported`]).
-pub fn compile(parsed: &Parsed, module_specifier: &str) -> Result<BytecodeModule, CompileError> {
-    let program = parsed.program().map_err(CompileError::from)?;
-    compile_program(&program, parsed.kind, module_specifier, false)
-}
-
-/// Compile a parsed script into the frozen runtime boundary product.
-///
-/// # Errors
-/// Returns [`CompileError`] when parsing or lowering fails.
-pub fn compile_to_module(
-    parsed: &Parsed,
-    module_specifier: &str,
-) -> Result<CompiledModule, CompileError> {
-    let bytecode = compile(parsed, module_specifier)?;
-    Ok(CompiledModule::from_bytecode(bytecode))
-}
-
 /// Compile source text through a single OXC parse.
 ///
-/// This is the runtime hot path. Use [`compile`] when a caller already owns a
-/// [`Parsed`] value for tests or staged analysis.
+/// This is the runtime hot path for scripts that do not need to inspect the AST
+/// before lowering. Use [`compile_script_program`] when a caller already has a
+/// borrowed OXC program from [`otter_syntax::with_program`].
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing fails or the AST contains constructs
 /// outside the foundation subset.
-pub fn compile_source(
+pub fn compile_script_source(
     source: &str,
     kind: SyntaxSourceKind,
     module_specifier: &str,
 ) -> Result<BytecodeModule, CompileError> {
-    compile_source_with_forced_strict(source, kind, module_specifier, false)
+    compile_script_source_with_forced_strict(source, kind, module_specifier, false)
 }
 
 /// Compile source text with an optional inherited strict-mode
@@ -195,7 +152,7 @@ pub fn compile_source(
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
-pub fn compile_source_with_forced_strict(
+pub fn compile_script_source_with_forced_strict(
     source: &str,
     kind: SyntaxSourceKind,
     module_specifier: &str,
@@ -213,16 +170,16 @@ pub fn compile_source_with_forced_strict(
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing or lowering fails.
-pub fn compile_source_to_module(
+pub fn compile_script_source_to_module(
     source: &str,
     kind: SyntaxSourceKind,
     module_specifier: &str,
 ) -> Result<CompiledModule, CompileError> {
-    let bytecode = compile_source(source, kind, module_specifier)?;
+    let bytecode = compile_script_source(source, kind, module_specifier)?;
     Ok(CompiledModule::from_bytecode(bytecode))
 }
 
-/// Compile an already parsed OXC program.
+/// Compile an already parsed OXC program as a script.
 ///
 /// This keeps callers that need a syntax pass for routing or analysis from
 /// parsing the same source twice. The caller must pass the same source kind
@@ -231,26 +188,12 @@ pub fn compile_source_to_module(
 /// # Errors
 /// Returns [`CompileError`] when the AST contains constructs outside the
 /// foundation subset.
-pub fn compile_parsed_program(
+pub fn compile_script_program(
     program: &Program<'_>,
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
 ) -> Result<BytecodeModule, CompileError> {
     compile_program(program, source_kind, module_specifier, false)
-}
-
-/// Compile an already parsed OXC program into the frozen runtime boundary
-/// product.
-///
-/// # Errors
-/// Returns [`CompileError`] when lowering fails.
-pub fn compile_parsed_program_to_module(
-    program: &Program<'_>,
-    source_kind: SyntaxSourceKind,
-    module_specifier: &str,
-) -> Result<CompiledModule, CompileError> {
-    let bytecode = compile_parsed_program(program, source_kind, module_specifier)?;
-    Ok(CompiledModule::from_bytecode(bytecode))
 }
 
 fn compile_program(
@@ -403,12 +346,20 @@ fn compile_program(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-modules>
 /// - <https://tc39.es/ecma262/#sec-source-text-module-records>
-pub fn compile_module_fragment(
-    parsed: &Parsed,
+/// Compile an already parsed OXC program as one ES-module fragment.
+///
+/// This is the module-graph hot path: callers that already borrowed an AST for
+/// import collection can lower the same AST without reparsing.
+///
+/// # Errors
+/// - [`CompileError::Unsupported`] for foundation-out-of-scope constructs.
+/// - [`CompileError::TypeScriptUnsupported`] for unsupported TS syntax that
+///   survives parser erasure.
+pub fn compile_module_program(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
     host: &ModuleHostInfo,
 ) -> Result<BytecodeModule, CompileError> {
-    let program = parsed.program().map_err(CompileError::from)?;
-
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let init_is_async = module_body_uses_top_level_await(&program.body);
     module.borrow_mut().functions.push(Function {
@@ -668,7 +619,7 @@ pub fn compile_module_fragment(
     }
     drop(cx);
 
-    let kind = bytecode_source_kind(parsed.kind);
+    let kind = bytecode_source_kind(source_kind);
 
     let ModuleBuilder {
         functions,
@@ -709,17 +660,26 @@ pub fn compile_module_fragment(
 ///
 /// # Errors
 /// Returns [`CompileError`] when parsing or lowering fails.
-pub fn compile_module_fragment_to_module(
-    parsed: &Parsed,
+/// Compile an already parsed ES-module program into the frozen runtime boundary
+/// product.
+///
+/// Metadata collection and bytecode lowering consume the same borrowed OXC AST.
+/// Runtime module loading uses this API after dependency scanning so module
+/// compilation does not reparse source.
+///
+/// # Errors
+/// Returns [`CompileError`] when lowering fails.
+pub fn compile_module_program_to_module(
+    program: &Program<'_>,
+    source_kind: SyntaxSourceKind,
     host: &ModuleHostInfo,
 ) -> Result<CompiledModule, CompileError> {
-    let program = parsed.program().map_err(CompileError::from)?;
-    let module_metadata = collect_module_metadata(&program, host);
-    let bytecode = compile_module_fragment(parsed, host)?;
+    let module_metadata = collect_module_metadata(program, host);
+    let bytecode = compile_module_program(program, source_kind, host)?;
     let mut metadata = CompiledModuleMetadata::from_bytecode(
         &bytecode,
         host.module_url.clone(),
-        bytecode_source_kind(parsed.kind),
+        bytecode_source_kind(source_kind),
     );
     metadata.imports = module_metadata.imports;
     metadata.exports = module_metadata.exports;
@@ -2150,7 +2110,7 @@ fn compile_statement(cx: &mut Compiler, stmt: &Statement<'_>) -> Result<Option<u
         Statement::ImportDeclaration(decl) => {
             // Type-only `import type { … }` is erased earlier via
             // `is_erased_ts_statement`. Runtime imports were
-            // pre-resolved by `compile_module_fragment`'s pre-pass:
+            // pre-resolved by `compile_module_program`'s pre-pass:
             // the import-record upvalue is already populated and
             // identifier resolution routes references through
             // `imported_names`. Nothing left to do at the
@@ -10173,7 +10133,7 @@ impl From<SyntaxError> for CompileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otter_syntax::parse;
+    use otter_syntax::with_program;
 
     fn host_info(specifiers: &[(&str, &str)]) -> ModuleHostInfo {
         ModuleHostInfo {
@@ -10185,10 +10145,25 @@ mod tests {
         }
     }
 
+    fn compile_module_src(src: &str, host: &ModuleHostInfo) -> BytecodeModule {
+        with_program(src, SyntaxSourceKind::TypeScript, |program| {
+            compile_module_program(program, SyntaxSourceKind::TypeScript, host)
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    fn compile_script_src(src: &str) -> BytecodeModule {
+        compile_script_source(src, SyntaxSourceKind::TypeScript, "test.ts").unwrap()
+    }
+
+    fn compile_script_src_err(src: &str) -> CompileError {
+        compile_script_source(src, SyntaxSourceKind::TypeScript, "test.ts").unwrap_err()
+    }
+
     #[test]
     fn module_fragment_marks_module_init() {
-        let parsed = parse("export let x = 7;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+        let module = compile_module_src("export let x = 7;", &host_info(&[]));
         let init = &module.functions[0];
         assert!(init.is_module);
         assert_eq!(init.name, "<module-init>");
@@ -10201,12 +10176,10 @@ mod tests {
 
     #[test]
     fn module_export_mirrors_assignment() {
-        let parsed = parse(
+        let module = compile_module_src(
             "export let counter = 0; counter = counter + 1;",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+            &host_info(&[]),
+        );
         let init = &module.functions[0];
         // Two StoreProperty ops expected: initial declaration
         // mirror + assignment mirror.
@@ -10224,9 +10197,8 @@ mod tests {
     #[test]
     fn module_import_lowers_to_load_property_chain() {
         let src = "import { value } from \"./other.ts\"; let y = value;";
-        let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
         let host = host_info(&[("./other.ts", "file:///test/other.ts")]);
-        let module = compile_module_fragment(&parsed, &host).unwrap();
+        let module = compile_module_src(src, &host);
         let init = &module.functions[0];
         // ImportNamespace at the top of the body.
         assert!(init.code.iter().any(|i| i.op == Op::ImportNamespace));
@@ -10240,12 +10212,7 @@ mod tests {
 
     #[test]
     fn import_outside_module_mode_is_rejected() {
-        let parsed = parse(
-            "import { a } from \"./x.ts\";",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let err = compile(&parsed, "test.ts").unwrap_err();
+        let err = compile_script_src_err("import { a } from \"./x.ts\";");
         match err {
             CompileError::Unsupported { node, .. } => {
                 assert!(node.contains("ImportDeclaration"), "got {node}");
@@ -10260,8 +10227,7 @@ mod tests {
         // `Op::ImportNamespaceDynamic`. The runtime resolves the
         // string against the active module's resolution table.
         let src = "let s = \"./x.ts\"; import(s);";
-        let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+        let module = compile_module_src(src, &host_info(&[]));
         let init = &module.functions[0];
         let dyn_count = init
             .code
@@ -10274,8 +10240,7 @@ mod tests {
     #[test]
     fn import_meta_lowers_to_load_upvalue() {
         let src = "let u = import.meta.url;";
-        let parsed = parse(src, SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile_module_fragment(&parsed, &host_info(&[])).unwrap();
+        let module = compile_module_src(src, &host_info(&[]));
         let init = &module.functions[0];
         // The body should LoadUpvalue then LoadProperty for .url.
         let load_upvalue_count = init.code.iter().filter(|i| i.op == Op::LoadUpvalue).count();
@@ -10288,8 +10253,7 @@ mod tests {
 
     #[test]
     fn bigint_literal_emits_load_bigint() {
-        let parsed = parse("123n;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("123n;");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::LoadBigInt));
         let interned = module
@@ -10301,12 +10265,7 @@ mod tests {
 
     #[test]
     fn bitwise_binary_ops_lower_directly() {
-        let parsed = parse(
-            "5 & 3; 5 | 3; 5 ^ 3; 1 << 3; -1 >> 1; -1 >>> 0;",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("5 & 3; 5 | 3; 5 ^ 3; 1 << 3; -1 >> 1; -1 >>> 0;");
         let main = module.main();
         for op in [
             Op::BitwiseAnd,
@@ -10326,15 +10285,13 @@ mod tests {
 
     #[test]
     fn pow_operator_emits_pow() {
-        let parsed = parse("2 ** 10;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("2 ** 10;");
         assert!(module.main().code.iter().any(|i| i.op == Op::Pow));
     }
 
     #[test]
     fn compound_assign_load_modify_store() {
-        let parsed = parse("let n = 4; n &= 1; n **= 2;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("let n = 4; n &= 1; n **= 2;");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::BitwiseAnd));
         assert!(main.code.iter().any(|i| i.op == Op::Pow));
@@ -10342,12 +10299,7 @@ mod tests {
 
     #[test]
     fn math_namespace_lowers_to_dedicated_ops() {
-        let parsed = parse(
-            "Math.PI; Math.abs(-1); Math.max(1, 2, 3);",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("Math.PI; Math.abs(-1); Math.max(1, 2, 3);");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::MathLoad));
         let calls = main.code.iter().filter(|i| i.op == Op::MathCall).count();
@@ -10356,12 +10308,7 @@ mod tests {
 
     #[test]
     fn rest_param_marks_function_and_emits_collect_rest() {
-        let parsed = parse(
-            "function f(...rest) { return rest.length; }",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("function f(...rest) { return rest.length; }");
         let f = &module.functions[1];
         assert!(f.has_rest, "rest flag should be set");
         assert_eq!(f.param_count, 0);
@@ -10370,12 +10317,7 @@ mod tests {
 
     #[test]
     fn default_param_emits_undefined_check() {
-        let parsed = parse(
-            "function f(a, b = 5) { return a + b; }",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("function f(a, b = 5) { return a + b; }");
         let f = &module.functions[1];
         // Default lowering emits LoadUndefined + Equal + JumpIfFalse
         // before the body's normal store. Their presence is a
@@ -10387,12 +10329,7 @@ mod tests {
 
     #[test]
     fn array_destructure_uses_iterator_protocol() {
-        let parsed = parse(
-            "const [a, b, ...rest] = [1, 2, 3, 4];",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("const [a, b, ...rest] = [1, 2, 3, 4];");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::GetIterator));
         assert!(main.code.iter().any(|i| i.op == Op::IteratorNext));
@@ -10402,12 +10339,7 @@ mod tests {
 
     #[test]
     fn object_destructure_loads_each_key() {
-        let parsed = parse(
-            "function f({ x, y = 9 }) { return x + y; }",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("function f({ x, y = 9 }) { return x + y; }");
         let f = &module.functions[1];
         // Two property loads (one per declared key), with the
         // default applied to `y`.
@@ -10421,8 +10353,7 @@ mod tests {
 
     #[test]
     fn for_of_emits_iterator_dispatch() {
-        let parsed = parse("for (let n of [1, 2]) { n; }", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("for (let n of [1, 2]) { n; }");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::GetIterator));
         assert!(main.code.iter().any(|i| i.op == Op::IteratorNext));
@@ -10430,12 +10361,7 @@ mod tests {
 
     #[test]
     fn array_literal_spread_emits_array_push_loop() {
-        let parsed = parse(
-            "const inner = [1, 2]; [0, ...inner, 3];",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("const inner = [1, 2]; [0, ...inner, 3];");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::GetIterator));
         assert!(main.code.iter().any(|i| i.op == Op::ArrayPush));
@@ -10443,20 +10369,14 @@ mod tests {
 
     #[test]
     fn spread_call_emits_call_spread() {
-        let parsed = parse(
-            "function f(a, b) { return a + b; } f(...[1, 2]);",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("function f(a, b) { return a + b; } f(...[1, 2]);");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::CallSpread));
     }
 
     #[test]
     fn throw_statement_emits_throw_op() {
-        let parsed = parse("throw new Error(\"x\");", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("throw new Error(\"x\");");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::NewError));
         assert!(main.code.iter().any(|i| i.op == Op::Throw));
@@ -10464,12 +10384,7 @@ mod tests {
 
     #[test]
     fn try_catch_emits_enter_and_leave() {
-        let parsed = parse(
-            "try { throw new Error(\"x\"); } catch (e) { e; }",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("try { throw new Error(\"x\"); } catch (e) { e; }");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::EnterTry));
         assert!(main.code.iter().any(|i| i.op == Op::LeaveTry));
@@ -10479,8 +10394,7 @@ mod tests {
 
     #[test]
     fn try_finally_emits_end_finally() {
-        let parsed = parse("try { 1; } finally { 2; }", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("try { 1; } finally { 2; }");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::EnterTry));
         assert!(main.code.iter().any(|i| i.op == Op::EndFinally));
@@ -10488,12 +10402,8 @@ mod tests {
 
     #[test]
     fn try_catch_finally_emits_two_enter_try_blocks() {
-        let parsed = parse(
-            "try { throw new Error(\"x\"); } catch (e) { e; } finally { 1; }",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module =
+            compile_script_src("try { throw new Error(\"x\"); } catch (e) { e; } finally { 1; }");
         let main = module.main();
         let enters = main.code.iter().filter(|i| i.op == Op::EnterTry).count();
         assert_eq!(
@@ -10506,12 +10416,7 @@ mod tests {
 
     #[test]
     fn class_declaration_emits_make_class_and_new() {
-        let parsed = parse(
-            "class Foo { speak() { return 1; } } new Foo();",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("class Foo { speak() { return 1; } } new Foo();");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::MakeClass));
         assert!(main.code.iter().any(|i| i.op == Op::New));
@@ -10519,8 +10424,7 @@ mod tests {
 
     #[test]
     fn this_expression_emits_load_this() {
-        let parsed = parse("this;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("this;");
         let main = module.main();
         assert!(
             main.code.iter().any(|i| i.op == Op::LoadThis),
@@ -10531,12 +10435,7 @@ mod tests {
 
     #[test]
     fn method_call_emits_call_method_value() {
-        let parsed = parse(
-            "const o = { v: 1 }; o.toString();",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("const o = { v: 1 }; o.toString();");
         let main = module.main();
         assert!(
             main.code.iter().any(|i| i.op == Op::CallMethodValue),
@@ -10547,12 +10446,7 @@ mod tests {
 
     #[test]
     fn fn_call_lowers_to_call_with_this() {
-        let parsed = parse(
-            "function f() { return this; } f.call({});",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("function f() { return this; } f.call({});");
         let main = module.main();
         assert!(
             main.code.iter().any(|i| i.op == Op::CallWithThis),
@@ -10563,12 +10457,7 @@ mod tests {
 
     #[test]
     fn fn_apply_with_array_literal_unpacks() {
-        let parsed = parse(
-            "function f(a, b) { return a + b; } f.apply({}, [1, 2]);",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("function f(a, b) { return a + b; } f.apply({}, [1, 2]);");
         let main = module.main();
         assert!(
             main.code.iter().any(|i| i.op == Op::CallWithThis),
@@ -10578,27 +10467,19 @@ mod tests {
     }
 
     #[test]
-    fn fn_apply_with_dynamic_args_rejected() {
-        let parsed = parse(
-            "function f() {} const args = [1]; f.apply({}, args);",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let err = compile(&parsed, "test.ts").unwrap_err();
+    fn fn_apply_with_dynamic_args_uses_method_value_fallback() {
+        let module = compile_script_src("function f() {} const args = [1]; f.apply({}, args);");
+        let main = module.main();
         assert!(
-            matches!(err, CompileError::Unsupported { ref node, .. } if node.contains("apply")),
-            "unexpected error: {err:?}"
+            main.code.iter().any(|i| i.op == Op::CallMethodValue),
+            "dynamic apply args should stay on method-call fallback: {:?}",
+            main.code
         );
     }
 
     #[test]
     fn fn_bind_emits_bind_function() {
-        let parsed = parse(
-            "function f() {} f.bind({}, 1, 2);",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("function f() {} f.bind({}, 1, 2);");
         let main = module.main();
         assert!(
             main.code.iter().any(|i| i.op == Op::BindFunction),
@@ -10609,8 +10490,7 @@ mod tests {
 
     #[test]
     fn arrow_record_marked_arrow_and_emits_make_closure() {
-        let parsed = parse("const f = () => 1; f();", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("const f = () => 1; f();");
         // Arrows always go through MakeClosure (even with zero
         // captures) so the runtime can snapshot enclosing `this`.
         let main = module.main();
@@ -10629,12 +10509,9 @@ mod tests {
 
     #[test]
     fn closure_emits_make_closure_with_capture() {
-        let parsed = parse(
+        let module = compile_script_src(
             "function makeCounter() { let n = 0; return function() { n = n + 1; return n; }; }\nmakeCounter();",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        );
         // The inner function captures `n` from `makeCounter`, so the
         // outer body emits `MakeClosure` instead of `MakeFunction`.
         let outer = &module.functions[1];
@@ -10660,8 +10537,7 @@ mod tests {
 
     #[test]
     fn empty_script_compiles() {
-        let parsed = parse("", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("");
         let main = module.main();
         assert_eq!(main.code.len(), 2);
         assert_eq!(main.code[0].op, Op::LoadUndefined);
@@ -10670,8 +10546,7 @@ mod tests {
 
     #[test]
     fn undefined_literal_compiles() {
-        let parsed = parse("undefined;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("undefined;");
         let main = module.main();
         assert_eq!(main.code.len(), 2);
         assert_eq!(main.code[0].op, Op::LoadUndefined);
@@ -10684,19 +10559,13 @@ mod tests {
         // expect the Unsupported diagnostic with a descriptive node
         // name. (`try`/`catch` shipped in task 24 so it's no longer
         // a useful exemplar here.)
-        let parsed = parse("with (o) { x; }", SyntaxSourceKind::TypeScript).unwrap();
-        let err = compile(&parsed, "test.ts").unwrap_err();
+        let err = compile_script_src_err("with (o) { x; }");
         assert!(matches!(err, CompileError::Unsupported { .. }));
     }
 
     #[test]
     fn type_alias_is_erased() {
-        let parsed = parse(
-            "type Foo = number; undefined;",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("type Foo = number; undefined;");
         // LoadUndefined for the body + Return.
         let main = module.main();
         assert_eq!(main.code.len(), 2);
@@ -10704,67 +10573,44 @@ mod tests {
 
     #[test]
     fn interface_is_erased() {
-        let parsed = parse(
-            "interface I { x: number; } undefined;",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("interface I { x: number; } undefined;");
         assert_eq!(module.main().code.len(), 2);
     }
 
     #[test]
     fn declare_function_is_erased() {
-        let parsed = parse(
-            "declare function foo(): void; undefined;",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("declare function foo(): void; undefined;");
         assert_eq!(module.main().code.len(), 2);
     }
 
     #[test]
     fn import_type_is_erased() {
-        let parsed = parse(
-            "import type { Foo } from \"./foo\"; undefined;",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("import type { Foo } from \"./foo\"; undefined;");
         assert_eq!(module.main().code.len(), 2);
     }
 
     #[test]
     fn as_expression_unwraps_to_undefined() {
-        let parsed = parse("(undefined as any);", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("(undefined as any);");
         // `(undefined as any)` is statement-level; LoadUndefined + Return.
         assert_eq!(module.main().code.len(), 2);
     }
 
     #[test]
     fn satisfies_expression_unwraps_to_undefined() {
-        let parsed = parse(
-            "(undefined satisfies unknown);",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("(undefined satisfies unknown);");
         assert_eq!(module.main().code.len(), 2);
     }
 
     #[test]
     fn non_null_unwraps_to_undefined() {
-        let parsed = parse("undefined!;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("undefined!;");
         assert_eq!(module.main().code.len(), 2);
     }
 
     #[test]
     fn enum_is_rejected_with_ts_unsupported() {
-        let parsed = parse("enum E { A }", SyntaxSourceKind::TypeScript).unwrap();
-        let err = compile(&parsed, "test.ts").unwrap_err();
+        let err = compile_script_src_err("enum E { A }");
         match err {
             CompileError::TypeScriptUnsupported { node, .. } => {
                 assert_eq!(node, "TSEnumDeclaration");
@@ -10775,23 +10621,13 @@ mod tests {
 
     #[test]
     fn namespace_with_runtime_body_is_rejected() {
-        let parsed = parse(
-            "namespace N { export const x = 1; }",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let err = compile(&parsed, "test.ts").unwrap_err();
+        let err = compile_script_src_err("namespace N { export const x = 1; }");
         assert!(matches!(err, CompileError::TypeScriptUnsupported { .. }));
     }
 
     #[test]
     fn declared_namespace_is_erased() {
-        let parsed = parse(
-            "declare namespace N { function f(): void; } undefined;",
-            SyntaxSourceKind::TypeScript,
-        )
-        .unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("declare namespace N { function f(): void; } undefined;");
         assert_eq!(module.main().code.len(), 2);
     }
 
@@ -10799,8 +10635,7 @@ mod tests {
     fn string_literal_compiles_to_load_string() {
         // Parenthesize to keep OXC from treating the bare literal
         // as a directive prologue.
-        let parsed = parse("(\"abc\");", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("(\"abc\");");
         let main = module.main();
         assert_eq!(main.code.len(), 2);
         assert_eq!(main.code[0].op, Op::LoadString);
@@ -10814,30 +10649,26 @@ mod tests {
 
     #[test]
     fn string_concat_compiles_to_add() {
-        let parsed = parse("\"a\" + \"b\";", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("\"a\" + \"b\";");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::Add));
     }
 
     #[test]
     fn strict_equals_compiles_to_eq() {
-        let parsed = parse("\"a\" === \"a\";", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("\"a\" === \"a\";");
         assert!(module.main().code.iter().any(|i| i.op == Op::Equal));
     }
 
     #[test]
     fn numeric_literal_smi_compiles_to_load_int32() {
-        let parsed = parse("(42);", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("(42);");
         assert!(module.main().code.iter().any(|i| i.op == Op::LoadInt32));
     }
 
     #[test]
     fn arithmetic_lowers_to_numeric_ops() {
-        let parsed = parse("1 + 2 * 3 - 4 / 5;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("1 + 2 * 3 - 4 / 5;");
         let ops: Vec<Op> = module.main().code.iter().map(|i| i.op).collect();
         assert!(ops.contains(&Op::Add));
         assert!(ops.contains(&Op::Sub));
@@ -10847,15 +10678,13 @@ mod tests {
 
     #[test]
     fn unary_minus_lowers_to_neg() {
-        let parsed = parse("-(5);", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("-(5);");
         assert!(module.main().code.iter().any(|i| i.op == Op::Neg));
     }
 
     #[test]
     fn boolean_literal_lowers() {
-        let parsed = parse("(true);", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("(true);");
         assert!(module.main().code.iter().any(|i| i.op == Op::LoadTrue));
     }
 
@@ -10865,22 +10694,19 @@ mod tests {
         // `LoadProperty` opcode used for object property access;
         // the runtime keeps the string-length fast path inside
         // the dispatcher.
-        let parsed = parse("\"abc\".length;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("\"abc\".length;");
         assert!(module.main().code.iter().any(|i| i.op == Op::LoadProperty));
     }
 
     #[test]
     fn template_no_interpolation_compiles_to_load_string() {
-        let parsed = parse("`abc`;", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("`abc`;");
         assert!(module.main().code.iter().any(|i| i.op == Op::LoadString));
     }
 
     #[test]
     fn duplicate_string_literals_share_constant() {
-        let parsed = parse("(\"abc\"); (\"abc\");", SyntaxSourceKind::TypeScript).unwrap();
-        let module = compile(&parsed, "test.ts").unwrap();
+        let module = compile_script_src("(\"abc\"); (\"abc\");");
         assert_eq!(module.constants.len(), 1);
     }
 }

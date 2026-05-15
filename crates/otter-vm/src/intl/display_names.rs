@@ -136,7 +136,7 @@ fn lookup_name(kind: &str, code: &str) -> Option<&'static str> {
 }
 
 /// §12.5.5 `of(code)`.
-fn impl_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let code = match args.args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
@@ -163,18 +163,18 @@ fn impl_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     )?))
 }
 
-fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
     let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
     let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
     let fallback = js_string(&payload.fallback, args.string_heap).map_err(intl_to_intrinsic)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let obj = crate::object::alloc_object(*heap)?;
-    crate::object::set(obj, *heap, "locale", locale);
-    crate::object::set(obj, *heap, "type", kind);
-    crate::object::set(obj, *heap, "style", style);
-    crate::object::set(obj, *heap, "fallback", fallback);
+    let heap = &mut *args.gc_heap;
+    let obj = crate::object::alloc_object(heap)?;
+    crate::object::set(obj, heap, "locale", locale);
+    crate::object::set(obj, heap, "type", kind);
+    crate::object::set(obj, heap, "style", style);
+    crate::object::set(obj, heap, "fallback", fallback);
     Ok(Value::Object(obj))
 }
 

@@ -35,8 +35,6 @@
 //! - <https://tc39.es/ecma262/#sec-typedarray-constructors>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
 
-use std::cell::RefCell;
-
 use otter_bytecode::method_id::TypedArrayMethod;
 use smallvec::SmallVec;
 
@@ -384,15 +382,19 @@ fn ta_proto_dispatch(
         })?;
     let receiver = ctx.this_value().clone();
     let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    let string_heap = ctx.interp_mut().string_heap_clone();
+    let (string_heap, allocation_roots) = {
+        let interp = ctx.interp_mut();
+        (interp.string_heap_clone(), interp.collect_runtime_roots())
+    };
     let gc_heap = ctx.heap_mut();
-    let intrinsic_args = IntrinsicArgs {
+    let mut intrinsic_args = IntrinsicArgs {
         receiver: &receiver,
         args: &small_args,
         string_heap: &string_heap,
-        gc_heap: RefCell::new(gc_heap),
+        gc_heap,
+        allocation_roots: allocation_roots.as_slice(),
     };
-    (entry.impl_fn)(&intrinsic_args).map_err(|e| NativeError::TypeError {
+    (entry.impl_fn)(&mut intrinsic_args).map_err(|e| NativeError::TypeError {
         name: "TypedArray.prototype",
         reason: e.to_string(),
     })

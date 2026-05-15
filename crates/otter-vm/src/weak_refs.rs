@@ -41,6 +41,7 @@ use crate::collections::{
 use crate::execution_context::ExecutionContext;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::object::{OBJECT_BODY_TYPE_TAG, ObjectBody};
+use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`WeakRefBody`].
@@ -126,6 +127,31 @@ pub fn alloc_weak_ref(
     Ok(weak_ref)
 }
 
+/// Allocate a fresh `WeakRef` while exposing caller-owned roots.
+pub(crate) fn alloc_weak_ref_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    target: &Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsWeakRef, crate::VmError> {
+    weak_target_raw(target)?;
+    let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        target.trace_value_slots(visitor);
+    };
+    let weak_ref = heap.alloc_with_roots(
+        WeakRefBody {
+            target: RawGc::NULL,
+        },
+        &mut allocation_roots,
+    )?;
+    let target = weak_target_raw(target)?;
+    heap.with_payload(weak_ref, |body| {
+        body.target = target;
+    });
+    heap.register_weak_ref(weak_ref);
+    Ok(weak_ref)
+}
+
 /// Return the target while live, otherwise `undefined`.
 #[must_use]
 pub fn weak_ref_deref(weak_ref: JsWeakRef, heap: &otter_gc::GcHeap) -> Value {
@@ -159,6 +185,31 @@ pub fn alloc_finalization_registry_with_context(
         cleanup_context,
         cells: Vec::new(),
     })?;
+    heap.register_finalization_registry(registry);
+    Ok(registry)
+}
+
+/// Allocate a fresh `FinalizationRegistry` while exposing caller-owned roots.
+pub(crate) fn alloc_finalization_registry_with_context_and_roots(
+    heap: &mut otter_gc::GcHeap,
+    cleanup_callback: Value,
+    cleanup_context: Option<ExecutionContext>,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsFinalizationRegistry, crate::VmError> {
+    if !is_callable(&cleanup_callback) {
+        return Err(crate::VmError::NotCallable);
+    }
+    let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+    };
+    let registry = heap.alloc_with_roots(
+        FinalizationRegistryBody {
+            cleanup_callback,
+            cleanup_context,
+            cells: Vec::new(),
+        },
+        &mut allocation_roots,
+    )?;
     heap.register_finalization_registry(registry);
     Ok(registry)
 }
@@ -322,7 +373,7 @@ fn receiver_weak_ref(args: &IntrinsicArgs<'_>) -> Result<JsWeakRef, IntrinsicErr
 }
 
 fn receiver_finalization_registry(
-    args: &IntrinsicArgs<'_>,
+    args: &mut IntrinsicArgs<'_>,
 ) -> Result<JsFinalizationRegistry, IntrinsicError> {
     match args.receiver {
         Value::FinalizationRegistry(r) => Ok(*r),
@@ -332,31 +383,33 @@ fn receiver_finalization_registry(
     }
 }
 
-fn impl_weak_ref_deref(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_weak_ref_deref(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let weak_ref = receiver_weak_ref(args)?;
-    let heap = args.gc_heap.borrow();
-    Ok(weak_ref_deref(weak_ref, &heap))
+    let heap = &*args.gc_heap;
+    Ok(weak_ref_deref(weak_ref, heap))
 }
 
-fn impl_finalization_registry_register(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_finalization_registry_register(
+    args: &mut IntrinsicArgs<'_>,
+) -> Result<Value, IntrinsicError> {
     let registry = receiver_finalization_registry(args)?;
     let target = args.args.first().cloned().unwrap_or(Value::Undefined);
     let held_value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
     let unregister_token = args.args.get(2);
-    let mut heap = args.gc_heap.borrow_mut();
-    finalization_registry_register(registry, &mut heap, &target, held_value, unregister_token)
+    let heap = &mut *args.gc_heap;
+    finalization_registry_register(registry, heap, &target, held_value, unregister_token)
         .map_err(vm_to_intrinsic)?;
     Ok(Value::Undefined)
 }
 
 fn impl_finalization_registry_unregister(
-    args: &IntrinsicArgs<'_>,
+    args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     let registry = receiver_finalization_registry(args)?;
     let token = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let mut heap = args.gc_heap.borrow_mut();
+    let heap = &mut *args.gc_heap;
     let removed =
-        finalization_registry_unregister(registry, &mut heap, &token).map_err(vm_to_intrinsic)?;
+        finalization_registry_unregister(registry, heap, &token).map_err(vm_to_intrinsic)?;
     Ok(Value::Boolean(removed))
 }
 

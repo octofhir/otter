@@ -36,7 +36,9 @@
 
 use std::marker::PhantomData;
 
-use crate::{ExecutionContext, Interpreter, Value};
+use otter_gc::raw::RawGc;
+
+use crate::{ExecutionContext, Interpreter, IteratorHandle, IteratorState, Value, array, object};
 
 /// Internal VM context. Carried explicitly through the dispatch
 /// loop and built-in helper signatures so every algorithm sees the
@@ -244,7 +246,13 @@ impl<'rt> NativeCtx<'rt> {
         &mut self,
         value: T,
     ) -> Result<otter_gc::Gc<T>, otter_gc::OutOfMemory> {
-        self.heap_mut().alloc(value)
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        self.heap_mut().alloc_with_roots(value, &mut external_visit)
     }
 
     /// Allocate a long-lived GC payload directly in old-space.
@@ -272,7 +280,133 @@ impl<'rt> NativeCtx<'rt> {
         &mut self,
         bytes: u64,
     ) -> Result<otter_gc::ExternalMemory, otter_gc::OutOfMemory> {
-        self.heap_mut().reserve_external(bytes)
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        self.heap_mut()
+            .reserve_external_with_roots(bytes, &mut external_visit)
+    }
+
+    /// Allocate an ordinary object through the native root contract.
+    pub fn alloc_object(&mut self) -> Result<object::JsObject, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        object::alloc_object_with_roots(self.heap_mut(), &mut external_visit)
+    }
+
+    /// Allocate an array through the native root contract.
+    pub fn array_from_elements<I>(
+        &mut self,
+        elements: I,
+    ) -> Result<array::JsArray, otter_gc::OutOfMemory>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        self.array_from_elements_with_roots(elements, &[], &[])
+    }
+
+    /// Allocate an array while keeping additional local values alive.
+    pub fn array_from_elements_with_roots<I>(
+        &mut self,
+        elements: I,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<array::JsArray, otter_gc::OutOfMemory>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let elements: Vec<Value> = elements.into_iter().collect();
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        array::from_elements_with_roots(self.heap_mut(), elements, &mut external_visit)
+    }
+
+    /// Store an array element through the native root contract.
+    pub fn array_set(
+        &mut self,
+        array: array::JsArray,
+        index: usize,
+        value: Value,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let value_root = value.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                &[&value_root],
+                &[],
+            );
+        };
+        array::set_with_roots(array, self.heap_mut(), index, value, &mut external_visit)
+    }
+
+    /// Push an array element through the native root contract.
+    pub fn array_push(
+        &mut self,
+        array: array::JsArray,
+        value: Value,
+    ) -> Result<usize, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let value_root = value.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                &[&value_root],
+                &[],
+            );
+        };
+        array::push_with_roots(array, self.heap_mut(), value, &mut external_visit)
+    }
+
+    /// Allocate iterator state through the native root contract.
+    pub fn alloc_iterator_state(
+        &mut self,
+        state: IteratorState,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<IteratorHandle, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        self.heap_mut().alloc_with_roots(state, &mut external_visit)
     }
 
     /// Enter a branded GC session for root/weak operations.
@@ -293,6 +427,10 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     pub fn interp_mut(&mut self) -> &mut Interpreter {
         self.cx.interp
+    }
+
+    fn collect_native_roots(&self) -> Vec<*mut RawGc> {
+        self.cx.interp.collect_runtime_roots()
     }
 
     /// Queue an isolate-local microtask for the current execution
@@ -326,6 +464,74 @@ impl<'rt> NativeCtx<'rt> {
             kind: crate::microtask::MicrotaskKind::Call,
         });
         Ok(())
+    }
+}
+
+fn visit_native_roots(
+    visitor: &mut dyn FnMut(*mut RawGc),
+    runtime_roots: &[*mut RawGc],
+    this_value: &Value,
+    new_target: Option<&Value>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) {
+    for &slot in runtime_roots {
+        visitor(slot);
+    }
+    this_value.trace_value_slots(visitor);
+    if let Some(new_target) = new_target {
+        new_target.trace_value_slots(visitor);
+    }
+    for value in value_roots {
+        value.trace_value_slots(visitor);
+    }
+    for slice in slice_roots {
+        for value in *slice {
+            value.trace_value_slots(visitor);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NativeCallInfo, NativeCtx};
+    use crate::{Interpreter, NumberValue, Value};
+
+    #[test]
+    fn native_ctx_object_allocation_uses_young_space() {
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+        {
+            let mut ctx = NativeCtx::new(&mut interp);
+            let _object = ctx.alloc_object().expect("native object allocation");
+        }
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NativeCtx::alloc_object should allocate through root-aware young allocation"
+        );
+    }
+
+    #[test]
+    fn native_ctx_array_allocation_uses_young_space() {
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+        {
+            let mut ctx = NativeCtx::new_with_call_info(
+                &mut interp,
+                NativeCallInfo::call(Value::Number(NumberValue::from_i32(7))),
+            );
+            let array = ctx
+                .array_from_elements([Value::Number(NumberValue::from_i32(1))])
+                .expect("native array allocation");
+            ctx.array_push(array, Value::Number(NumberValue::from_i32(2)))
+                .expect("native array growth");
+        }
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NativeCtx::array_from_elements should allocate through root-aware young allocation"
+        );
     }
 }
 

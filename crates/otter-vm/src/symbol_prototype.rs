@@ -33,7 +33,7 @@ fn receiver_symbol<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsSymbol, Intr
 
 /// `Symbol.prototype.toString` — Spec §20.4.3.3. Returns
 /// `"Symbol(<desc>)"`, with no description rendered as `"Symbol()"`.
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
     let s = JsString::from_str(&sym.descriptive_string(), args.string_heap)?;
     Ok(Value::String(s))
@@ -41,14 +41,14 @@ fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 /// `Symbol.prototype.valueOf` — Spec §20.4.3.4. Returns the
 /// receiver symbol primitive.
-fn impl_value_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
     Ok(Value::Symbol(sym.clone()))
 }
 
 /// `Symbol.prototype[@@toPrimitive]` — Spec §20.4.3.5. The hint is
 /// ignored; the symbol primitive is returned for every hint.
-fn impl_to_primitive(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
     Ok(Value::Symbol(sym.clone()))
 }
@@ -104,11 +104,12 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let sym = JsSymbol::new(Some(JsString::from_str("ok", &heap).unwrap()));
         let entry = lookup("toString").unwrap();
-        let result = (entry.impl_fn)(&IntrinsicArgs {
+        let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &Value::Symbol(sym),
             args: &[],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap();
         assert_eq!(result.display_string(), "Symbol(ok)");

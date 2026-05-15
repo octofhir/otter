@@ -102,7 +102,7 @@ fn format_number(n: f64) -> String {
 }
 
 /// §17.5.3 `format(value, unit)`.
-fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let value = match args.args.first() {
         Some(Value::Number(n)) => n.as_f64(),
@@ -130,32 +130,32 @@ fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// single `{ type: "literal", value: <full string> }` part. The
 /// shape is spec-compatible; per-token splitting arrives with the
 /// full ICU integration.
-fn impl_format_to_parts(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = impl_format(args)?;
     let literal = Value::String(crate::string::JsString::from_str(
         "literal",
         args.string_heap,
     )?);
-    let mut heap = args.gc_heap.borrow_mut();
-    let part = crate::object::alloc_object(*heap)?;
-    crate::object::set(part, *heap, "type", literal);
-    crate::object::set(part, *heap, "value", s);
+    let heap = &mut *args.gc_heap;
+    let part = crate::object::alloc_object(heap)?;
+    crate::object::set(part, heap, "type", literal);
+    crate::object::set(part, heap, "value", s);
     Ok(Value::Array(crate::array::from_elements(
-        *heap,
+        heap,
         [Value::Object(part)],
     )?))
 }
 
-fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
     let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
     let numeric = js_string(&payload.numeric, args.string_heap).map_err(intl_to_intrinsic)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let obj = crate::object::alloc_object(*heap)?;
-    crate::object::set(obj, *heap, "locale", locale);
-    crate::object::set(obj, *heap, "style", style);
-    crate::object::set(obj, *heap, "numeric", numeric);
+    let heap = &mut *args.gc_heap;
+    let obj = crate::object::alloc_object(heap)?;
+    crate::object::set(obj, heap, "locale", locale);
+    crate::object::set(obj, heap, "style", style);
+    crate::object::set(obj, heap, "numeric", numeric);
     Ok(Value::Object(obj))
 }
 

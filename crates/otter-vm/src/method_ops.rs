@@ -251,12 +251,13 @@ impl Interpreter {
             let small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
             let result = {
                 let string_heap = self.string_heap.clone();
-                let gc_heap = std::cell::RefCell::new(&mut self.gc_heap);
-                (entry.impl_fn)(&IntrinsicArgs {
+                let allocation_roots = self.collect_allocation_roots(stack);
+                (entry.impl_fn)(&mut IntrinsicArgs {
                     receiver: &recv_value,
                     args: &small_args,
                     string_heap: &string_heap,
-                    gc_heap,
+                    gc_heap: &mut self.gc_heap,
+                    allocation_roots: allocation_roots.as_slice(),
                 })
                 .map_err(intrinsic_to_vm_error)?
             };

@@ -82,7 +82,7 @@ pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
 
 // ── Prototype table ──────────────────────────────────────────────
 
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pt = require_plain_time(args)?;
     let s = pt
         .to_ixdtf_string(temporal_rs::options::ToStringRoundingOptions::default())
@@ -90,14 +90,14 @@ fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     js_string_value(s, args)
 }
 
-fn impl_add(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pt = require_plain_time(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pt.add(&dur).map_err(temporal_err)?;
     Ok(make_temporal(TemporalPayload::PlainTime(result)))
 }
 
-fn impl_subtract(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pt = require_plain_time(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pt.subtract(&dur).map_err(temporal_err)?;
@@ -117,8 +117,8 @@ fn duration_arg(
             }),
         },
         Some(Value::Object(obj)) => {
-            let heap = args.gc_heap.borrow();
-            partial_from_object(obj, &heap).map_err(|_| IntrinsicError::BadArgument {
+            let heap = &*args.gc_heap;
+            partial_from_object(obj, heap).map_err(|_| IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration partial",
             })

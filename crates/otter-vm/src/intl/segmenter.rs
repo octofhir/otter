@@ -96,7 +96,7 @@ fn segment(text: &str, granularity: &str) -> Vec<(usize, String)> {
 /// returns an array (each element is a `{segment, index, input,
 /// isWordLike?}` plain object) which is iterable through the
 /// existing iterator-protocol path.
-fn impl_segment(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let text = match args.args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
@@ -120,35 +120,35 @@ fn impl_segment(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let wordlike = granularity_word && seg.chars().any(char::is_alphanumeric);
         prepared.push((seg_str, idx as i32, wordlike));
     }
-    let mut heap = args.gc_heap.borrow_mut();
+    let heap = &mut *args.gc_heap;
     let mut elements: Vec<Value> = Vec::with_capacity(prepared.len());
     for (seg_str, idx, wordlike) in prepared {
-        let obj = crate::object::alloc_object(*heap)?;
-        crate::object::set(obj, *heap, "segment", seg_str);
+        let obj = crate::object::alloc_object(heap)?;
+        crate::object::set(obj, heap, "segment", seg_str);
         crate::object::set(
             obj,
-            *heap,
+            heap,
             "index",
             Value::Number(crate::number::NumberValue::from_i32(idx)),
         );
-        crate::object::set(obj, *heap, "input", input_value.clone());
+        crate::object::set(obj, heap, "input", input_value.clone());
         if granularity_word {
-            crate::object::set(obj, *heap, "isWordLike", Value::Boolean(wordlike));
+            crate::object::set(obj, heap, "isWordLike", Value::Boolean(wordlike));
         }
         elements.push(Value::Object(obj));
     }
-    Ok(Value::Array(crate::array::from_elements(*heap, elements)?))
+    Ok(Value::Array(crate::array::from_elements(heap, elements)?))
 }
 
-fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
     let granularity =
         js_string(&payload.granularity, args.string_heap).map_err(intl_to_intrinsic)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let obj = crate::object::alloc_object(*heap)?;
-    crate::object::set(obj, *heap, "locale", locale);
-    crate::object::set(obj, *heap, "granularity", granularity);
+    let heap = &mut *args.gc_heap;
+    let obj = crate::object::alloc_object(heap)?;
+    crate::object::set(obj, heap, "locale", locale);
+    crate::object::set(obj, heap, "granularity", granularity);
     Ok(Value::Object(obj))
 }
 

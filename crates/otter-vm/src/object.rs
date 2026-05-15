@@ -2730,7 +2730,7 @@ mod tests {
         // `set` is the construction-time path that doesn't honour
         // attribute flags, so it doesn't apply here. The dispatch
         // layer reaches this through `resolve_set`.
-        match resolve_set(o, &heap, "x") {
+        match resolve_set(o, &mut heap, "x") {
             SetOutcome::Reject {
                 reason: SetRejectReason::NonWritable,
             } => {}
@@ -2746,7 +2746,7 @@ mod tests {
         seal(o, &mut heap);
         assert!(is_sealed(o, &heap));
         assert!(!is_frozen(o, &heap));
-        match resolve_set(o, &heap, "b") {
+        match resolve_set(o, &mut heap, "b") {
             SetOutcome::Reject {
                 reason: SetRejectReason::NonExtensible,
             } => {}

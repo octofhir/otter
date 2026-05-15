@@ -21,6 +21,7 @@
 use smallvec::SmallVec;
 
 use otter_bytecode::Operand;
+use otter_gc::raw::RawGc;
 
 use crate::{
     ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value,
@@ -36,6 +37,22 @@ use crate::{
 };
 
 impl Interpreter {
+    fn function_user_bag_with_stack_roots(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        function_id: u32,
+        value_roots: &[&Value],
+    ) -> Result<JsObject, VmError> {
+        match self.function_user_props.get(&function_id).copied() {
+            Some(bag) => Ok(bag),
+            None => {
+                let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots)?;
+                self.function_user_props.insert(function_id, bag);
+                Ok(bag)
+            }
+        }
+    }
+
     pub(crate) fn run_instanceof_legacy_regs(
         &self,
         frame: &mut Frame,
@@ -409,12 +426,14 @@ impl Interpreter {
     pub(crate) fn run_store_property_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         obj_reg: u16,
         key: AtomizedPropertyKey<'_>,
         src: u16,
     ) -> Result<(), VmError> {
         let name = key.name();
+        let frame = &stack[top_idx];
         let value = read_register(frame, src)?.clone();
         let strict = context.function_is_strict(frame.function_id);
         let receiver = read_register(frame, obj_reg)?.clone();
@@ -442,14 +461,11 @@ impl Interpreter {
                         )?;
                         None
                     } else {
-                        let bag = match self.function_user_props.get(&fid).copied() {
-                            Some(b) => b,
-                            None => {
-                                let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
-                                self.function_user_props.insert(fid, new_bag);
-                                new_bag
-                            }
-                        };
+                        let bag = self.function_user_bag_with_stack_roots(
+                            stack,
+                            fid,
+                            &[&receiver, &value],
+                        )?;
                         if let Some(metadata_key) =
                             function_metadata::ordinary_function_metadata_key(name)
                         {
@@ -458,14 +474,8 @@ impl Interpreter {
                         Some(bag)
                     }
                 } else {
-                    let bag = match self.function_user_props.get(&fid).copied() {
-                        Some(b) => b,
-                        None => {
-                            let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
-                            self.function_user_props.insert(fid, new_bag);
-                            new_bag
-                        }
-                    };
+                    let bag =
+                        self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?;
                     Some(bag)
                 }
             }
@@ -565,7 +575,7 @@ impl Interpreter {
         if let Some(target) = target {
             crate::object::set(target, &mut self.gc_heap, name, value);
         }
-        frame.pc += 1;
+        stack[top_idx].pc += 1;
         Ok(())
     }
 
@@ -675,11 +685,13 @@ impl Interpreter {
     pub(crate) fn run_store_element_regs(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         recv_reg: u16,
         idx_reg: u16,
         src_reg: u16,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
         let recv = read_register(frame, recv_reg)?.clone();
         let idx_value = read_register(frame, idx_reg)?.clone();
         let value = read_register(frame, src_reg)?.clone();
@@ -809,7 +821,19 @@ impl Interpreter {
             // Numeric-indexed array write.
             (Value::Array(arr), Value::Number(n)) => {
                 let idx = crate::array::index_from_number(*n).ok_or(VmError::TypeMismatch)?;
-                crate::array::set(*arr, &mut self.gc_heap, idx, value)?;
+                let roots = self.collect_allocation_roots(stack);
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                };
+                crate::array::set_with_roots(
+                    *arr,
+                    &mut self.gc_heap,
+                    idx,
+                    value,
+                    &mut external_visit,
+                )?;
             }
             // §10.4.5.14 IntegerIndexedElementSet — out-of-range indices
             // silently no-op; element-type / value-type mismatches raise
@@ -842,6 +866,7 @@ impl Interpreter {
             }
             _ => return Err(VmError::TypeMismatch),
         }
+        let frame = &mut stack[top_idx];
         frame.pc += 1;
         Ok(())
     }
@@ -1151,11 +1176,7 @@ impl Interpreter {
                 let fid = *function_id;
                 match self.function_user_props.get(&fid).copied() {
                     Some(bag) => bag,
-                    None => {
-                        let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
-                        self.function_user_props.insert(fid, new_bag);
-                        new_bag
-                    }
+                    None => self.function_user_bag_with_stack_roots(stack, fid, &[&receiver])?,
                 }
             }
             _ => return Ok(false),
@@ -2135,9 +2156,7 @@ impl Interpreter {
                 match self.function_user_props.get(&fid).copied() {
                     Some(bag) => bag,
                     None => {
-                        let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
-                        self.function_user_props.insert(fid, new_bag);
-                        new_bag
+                        self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?
                     }
                 }
             }

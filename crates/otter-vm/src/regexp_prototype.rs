@@ -217,27 +217,27 @@ fn pair_array(
     )?))
 }
 
-fn impl_exec(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_exec(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
     let text = arg_string(args, 0)?.clone();
     let re_clone = *re;
-    let mut heap = args.gc_heap.borrow_mut();
-    exec_once(&re_clone, &text, args.string_heap, *heap)
+    let heap = &mut *args.gc_heap;
+    exec_once(&re_clone, &text, args.string_heap, heap)
 }
 
-fn impl_test(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
     let text = arg_string(args, 0)?.clone();
     let re_clone = *re;
-    let mut heap = args.gc_heap.borrow_mut();
-    let result = exec_once(&re_clone, &text, args.string_heap, *heap)?;
+    let heap = &mut *args.gc_heap;
+    let result = exec_once(&re_clone, &text, args.string_heap, heap)?;
     Ok(Value::Boolean(!matches!(result, Value::Null)))
 }
 
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
-    let heap = args.gc_heap.borrow();
-    let rendered = format!("/{}/{}", re.source(&heap), re.flags(&heap).to_js_string());
+    let heap = &*args.gc_heap;
+    let rendered = format!("/{}/{}", re.source(heap), re.flags(heap).to_js_string());
     Ok(Value::String(JsString::from_str(
         &rendered,
         args.string_heap,
@@ -317,11 +317,12 @@ mod tests {
     fn call(method: &str, recv: &Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
         let heap = StringHeap::default();
         let entry = lookup(method).unwrap();
-        (entry.impl_fn)(&IntrinsicArgs {
+        (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: recv,
             args,
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(gc_heap),
+            gc_heap,
+            allocation_roots: &[],
         })
         .unwrap()
     }

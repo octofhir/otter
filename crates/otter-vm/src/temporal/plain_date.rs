@@ -105,27 +105,27 @@ pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
 
 // ── Prototype table ──────────────────────────────────────────────
 
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let s = pd.to_ixdtf_string(temporal_rs::options::DisplayCalendar::Auto);
     js_string_value(s, args)
 }
 
-fn impl_add(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pd.add(&dur, None).map_err(temporal_err)?;
     Ok(make_temporal(TemporalPayload::PlainDate(result)))
 }
 
-fn impl_subtract(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pd.subtract(&dur, None).map_err(temporal_err)?;
     Ok(make_temporal(TemporalPayload::PlainDate(result)))
 }
 
-fn impl_equals(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let other = match args.args.first() {
         Some(Value::Temporal(t)) => match t.payload() {
@@ -164,8 +164,8 @@ fn duration_arg(
             }),
         },
         Some(Value::Object(obj)) => {
-            let heap = args.gc_heap.borrow();
-            partial_from_object(obj, &heap).map_err(|_| IntrinsicError::BadArgument {
+            let heap = &*args.gc_heap;
+            partial_from_object(obj, heap).map_err(|_| IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration partial",
             })

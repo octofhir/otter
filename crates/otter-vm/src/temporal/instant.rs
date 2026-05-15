@@ -136,7 +136,7 @@ pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
 
 // ── Prototype table ──────────────────────────────────────────────
 
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let s = inst
         .to_ixdtf_string(
@@ -147,21 +147,21 @@ fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     js_string_value(s, args)
 }
 
-fn impl_add(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let dur = arg_as_duration(args, 0)?;
     let result = inst.add(&dur).map_err(temporal_err)?;
     Ok(make_temporal(TemporalPayload::Instant(result)))
 }
 
-fn impl_subtract(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let dur = arg_as_duration(args, 0)?;
     let result = inst.subtract(&dur).map_err(temporal_err)?;
     Ok(make_temporal(TemporalPayload::Instant(result)))
 }
 
-fn impl_equals(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let other = match args.args.first() {
         Some(Value::Temporal(t)) => match t.payload() {
@@ -200,8 +200,8 @@ fn arg_as_duration(
             }),
         },
         Some(Value::Object(obj)) => {
-            let heap = args.gc_heap.borrow();
-            crate::temporal::duration::partial_from_object(obj, &heap).map_err(|_| {
+            let heap = &*args.gc_heap;
+            crate::temporal::duration::partial_from_object(obj, heap).map_err(|_| {
                 IntrinsicError::BadArgument {
                     index,
                     reason: "must be a Temporal.Duration partial",

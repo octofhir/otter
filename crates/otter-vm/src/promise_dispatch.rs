@@ -41,9 +41,48 @@ use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
     PromiseThenOutcome,
 };
-use crate::{Interpreter, Microtask, Value};
+use crate::{Interpreter, Microtask, NativeCtx, Value};
 use otter_gc::raw::SlotVisitor;
 use smallvec::smallvec;
+use std::cell::{Cell, OnceCell};
+use std::rc::Rc;
+
+struct PromiseSlots {
+    values: Vec<OnceCell<Value>>,
+    remaining: Cell<usize>,
+}
+
+impl PromiseSlots {
+    fn new(total: usize) -> Rc<Self> {
+        let values = std::iter::repeat_with(OnceCell::new).take(total).collect();
+        Rc::new(Self {
+            values,
+            remaining: Cell::new(total),
+        })
+    }
+
+    fn trace(&self, visitor: &mut SlotVisitor<'_>) {
+        for value in self.values.iter().filter_map(OnceCell::get) {
+            value.trace_value_slots(visitor);
+        }
+    }
+
+    fn fill(&self, index: usize, value: Value) -> bool {
+        if self.values[index].set(value).is_err() {
+            return false;
+        }
+        let count = self.remaining.get().saturating_sub(1);
+        self.remaining.set(count);
+        count == 0
+    }
+
+    fn collect_values(&self) -> Vec<Value> {
+        self.values
+            .iter()
+            .map(|slot| slot.get().cloned().unwrap_or(Value::Undefined))
+            .collect()
+    }
+}
 
 /// Boa-style helper for constructing promises and capabilities with
 /// an explicit VM execution context.
@@ -243,7 +282,12 @@ fn static_all(
         PromiseBuilder::with_optional_context(context.clone()).pending(interp.gc_heap_mut())?;
     if entries.is_empty() {
         // Spec: empty iterable resolves immediately with [].
-        let arr = match crate::array::alloc_array(interp.gc_heap_for_cx_mut()) {
+        let result_value = Value::Promise(result);
+        let arr = match interp.alloc_runtime_rooted_array_from_values(
+            std::iter::empty::<Value>(),
+            &[&result_value],
+            &[],
+        ) {
             Ok(arr) => arr,
             Err(_) => {
                 return Ok(Value::Promise(
@@ -262,14 +306,9 @@ fn static_all(
     // per-element resolver mutates. The native function bodies
     // install trace hooks over this state, so any fulfilled GC
     // values remain live while the combinator is pending.
-    let total = entries.len();
-    let slots: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(vec![None; total]));
-    let remaining: std::rc::Rc<std::cell::Cell<usize>> =
-        std::rc::Rc::new(std::cell::Cell::new(total));
+    let slots = PromiseSlots::new(entries.len());
     for (i, entry) in entries.into_iter().enumerate() {
         let slots = slots.clone();
-        let remaining = remaining.clone();
         let result_clone = result;
         let entry_promise = match entry {
             Value::Promise(p) => p,
@@ -278,11 +317,7 @@ fn static_all(
         };
         let trace_slots = {
             let slots = slots.clone();
-            std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-                for value in slots.borrow().iter().flatten() {
-                    value.trace_value_slots(visitor);
-                }
-            })
+            Rc::new(move |visitor: &mut SlotVisitor<'_>| slots.trace(visitor))
         };
         let on_fulfill = native_value_with_trace_unchecked(
             interp.gc_heap_mut(),
@@ -290,19 +325,11 @@ fn static_all(
             smallvec![Value::Promise(result_clone)],
             trace_slots,
             move |ctx, args, _captures| {
-                let interp = ctx.interp_mut();
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let mut slots_mut = slots.borrow_mut();
-                slots_mut[i] = Some(v);
-                let count = remaining.get().saturating_sub(1);
-                remaining.set(count);
-                if count == 0 {
-                    let collected: Vec<Value> = slots_mut
-                        .drain(..)
-                        .map(|opt| opt.unwrap_or(Value::Undefined))
-                        .collect();
-                    drop(slots_mut);
-                    let arr = crate::array::from_elements(interp.gc_heap_mut(), collected)?;
+                if slots.fill(i, v) {
+                    let collected = slots.collect_values();
+                    let arr = ctx.array_from_elements(collected)?;
+                    let interp = ctx.interp_mut();
                     let jobs = result_clone.fulfill(interp.gc_heap_mut(), Value::Array(arr));
                     for j in jobs.jobs {
                         interp.microtasks_mut().enqueue(j);
@@ -427,7 +454,12 @@ fn static_all_settled(
     let result =
         PromiseBuilder::with_optional_context(context.clone()).pending(interp.gc_heap_mut())?;
     if entries.is_empty() {
-        let arr = match crate::array::alloc_array(interp.gc_heap_for_cx_mut()) {
+        let result_value = Value::Promise(result);
+        let arr = match interp.alloc_runtime_rooted_array_from_values(
+            std::iter::empty::<Value>(),
+            &[&result_value],
+            &[],
+        ) {
             Ok(arr) => arr,
             Err(_) => {
                 return Ok(Value::Promise(
@@ -442,11 +474,7 @@ fn static_all_settled(
         }
         return Ok(Value::Promise(result));
     }
-    let total = entries.len();
-    let slots: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(vec![None; total]));
-    let remaining: std::rc::Rc<std::cell::Cell<usize>> =
-        std::rc::Rc::new(std::cell::Cell::new(total));
+    let slots = PromiseSlots::new(entries.len());
     let heap = interp.string_heap_clone();
     for (i, entry) in entries.into_iter().enumerate() {
         let entry_promise = match entry {
@@ -456,15 +484,10 @@ fn static_all_settled(
         };
         let on_fulfill = {
             let slots = slots.clone();
-            let remaining = remaining.clone();
             let heap = heap.clone();
             let trace_slots = {
                 let slots = slots.clone();
-                std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-                    for value in slots.borrow().iter().flatten() {
-                        value.trace_value_slots(visitor);
-                    }
-                })
+                Rc::new(move |visitor: &mut SlotVisitor<'_>| slots.trace(visitor))
             };
             native_value_with_trace_unchecked(
                 interp.gc_heap_mut(),
@@ -472,29 +495,24 @@ fn static_all_settled(
                 smallvec![Value::Promise(result)],
                 trace_slots,
                 move |ctx, args, _captures| {
-                    let interp = ctx.interp_mut();
                     let v = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(true, v, &heap, interp.gc_heap_for_cx_mut())
-                        .map_err(|e| NativeError::TypeError {
+                    let record = build_settled_record(true, v, &heap, ctx).map_err(|e| {
+                        NativeError::TypeError {
                             name: "Promise",
                             reason: format!("string allocation failed: {e}"),
-                        })?;
-                    finalize_settled(&slots, &remaining, &result, i, record, interp);
+                        }
+                    })?;
+                    finalize_settled(&slots, &result, i, record, ctx)?;
                     Ok(Value::Undefined)
                 },
             )?
         };
         let on_reject = {
             let slots = slots.clone();
-            let remaining = remaining.clone();
             let heap = heap.clone();
             let trace_slots = {
                 let slots = slots.clone();
-                std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-                    for value in slots.borrow().iter().flatten() {
-                        value.trace_value_slots(visitor);
-                    }
-                })
+                Rc::new(move |visitor: &mut SlotVisitor<'_>| slots.trace(visitor))
             };
             native_value_with_trace_unchecked(
                 interp.gc_heap_mut(),
@@ -502,14 +520,14 @@ fn static_all_settled(
                 smallvec![Value::Promise(result)],
                 trace_slots,
                 move |ctx, args, _captures| {
-                    let interp = ctx.interp_mut();
                     let r = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(false, r, &heap, interp.gc_heap_for_cx_mut())
-                        .map_err(|e| NativeError::TypeError {
+                    let record = build_settled_record(false, r, &heap, ctx).map_err(|e| {
+                        NativeError::TypeError {
                             name: "Promise",
                             reason: format!("string allocation failed: {e}"),
-                        })?;
-                    finalize_settled(&slots, &remaining, &result, i, record, interp);
+                        }
+                    })?;
+                    finalize_settled(&slots, &result, i, record, ctx)?;
                     Ok(Value::Undefined)
                 },
             )?
@@ -529,52 +547,40 @@ fn build_settled_record(
     fulfilled: bool,
     payload: Value,
     heap: &std::sync::Arc<crate::string::StringHeap>,
-    gc_heap: &mut otter_gc::GcHeap,
+    ctx: &mut NativeCtx<'_>,
 ) -> Result<Value, crate::string::StringError> {
     let status_text = if fulfilled { "fulfilled" } else { "rejected" };
     let status = crate::JsString::from_str(status_text, heap)?;
     let key = if fulfilled { "value" } else { "reason" };
-    let obj = crate::object::alloc_object(gc_heap).map_err(|_| {
-        crate::string::StringError::OutOfMemory {
+    let obj = ctx
+        .alloc_object()
+        .map_err(|_| crate::string::StringError::OutOfMemory {
             requested_bytes: 0,
             heap_limit_bytes: 0,
-        }
-    })?;
+        })?;
+    let gc_heap = ctx.heap_mut();
     crate::object::set(obj, gc_heap, "status", Value::String(status));
     crate::object::set(obj, gc_heap, key, payload);
     Ok(Value::Object(obj))
 }
 
 fn finalize_settled(
-    slots: &std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>>,
-    remaining: &std::rc::Rc<std::cell::Cell<usize>>,
+    slots: &PromiseSlots,
     result: &JsPromiseHandle,
     index: usize,
     record: Value,
-    interp: &mut Interpreter,
-) {
-    let mut s = slots.borrow_mut();
-    if s[index].is_some() {
-        return;
-    }
-    s[index] = Some(record);
-    let count = remaining.get().saturating_sub(1);
-    remaining.set(count);
-    if count == 0 {
-        let collected: Vec<Value> = s
-            .drain(..)
-            .map(|opt| opt.unwrap_or(Value::Undefined))
-            .collect();
-        drop(s);
-        let arr = match crate::array::from_elements(interp.gc_heap_mut(), collected) {
-            Ok(arr) => arr,
-            Err(_) => return,
-        };
+    ctx: &mut NativeCtx<'_>,
+) -> Result<(), NativeError> {
+    if slots.fill(index, record) {
+        let collected = slots.collect_values();
+        let arr = ctx.array_from_elements(collected)?;
+        let interp = ctx.interp_mut();
         let jobs = result.fulfill(interp.gc_heap_mut(), Value::Array(arr));
         for j in jobs.jobs {
             interp.microtasks_mut().enqueue(j);
         }
     }
+    Ok(())
 }
 
 /// §27.2.4.3 `Promise.any(iterable)` — short-circuits on the first
@@ -623,11 +629,7 @@ fn static_any(
         }
         return Ok(Value::Promise(result));
     }
-    let total = entries.len();
-    let errors: std::rc::Rc<std::cell::RefCell<Vec<Option<Value>>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(vec![None; total]));
-    let remaining: std::rc::Rc<std::cell::Cell<usize>> =
-        std::rc::Rc::new(std::cell::Cell::new(total));
+    let errors = PromiseSlots::new(entries.len());
     let heap = interp.string_heap_clone();
     let registry = interp.error_classes_clone();
     for (i, entry) in entries.into_iter().enumerate() {
@@ -654,16 +656,11 @@ fn static_any(
         };
         let on_reject = {
             let errors = errors.clone();
-            let remaining = remaining.clone();
             let heap = heap.clone();
             let registry = registry.clone();
             let trace_errors = {
                 let errors = errors.clone();
-                std::rc::Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-                    for value in errors.borrow().iter().flatten() {
-                        value.trace_value_slots(visitor);
-                    }
-                })
+                Rc::new(move |visitor: &mut SlotVisitor<'_>| errors.trace(visitor))
             };
             native_value_with_trace_unchecked(
                 interp.gc_heap_mut(),
@@ -671,32 +668,21 @@ fn static_any(
                 smallvec![Value::Promise(result)],
                 trace_errors,
                 move |ctx, args, _captures| {
-                    let interp = ctx.interp_mut();
                     let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                    let mut errs = errors.borrow_mut();
-                    if errs[i].is_some() {
-                        return Ok(Value::Undefined);
-                    }
-                    errs[i] = Some(reason);
-                    let count = remaining.get().saturating_sub(1);
-                    remaining.set(count);
-                    if count == 0 {
-                        let collected: Vec<Value> = errs
-                            .drain(..)
-                            .map(|opt| opt.unwrap_or(Value::Undefined))
-                            .collect();
-                        drop(errs);
+                    if errors.fill(i, reason) {
+                        let collected = errors.collect_values();
                         let agg = registry
                             .make_aggregate_instance(
                                 collected,
                                 Some("All promises were rejected"),
                                 &heap,
-                                interp.gc_heap_for_cx_mut(),
+                                ctx.heap_mut(),
                             )
                             .map_err(|e| NativeError::TypeError {
                                 name: "Promise",
                                 reason: format!("string allocation failed: {e}"),
                             })?;
+                        let interp = ctx.interp_mut();
                         let jobs = result.reject(interp.gc_heap_mut(), Value::Object(agg));
                         for j in jobs.jobs {
                             interp.microtasks_mut().enqueue(j);
@@ -727,11 +713,13 @@ fn static_with_resolvers(
     context: Option<ExecutionContext>,
 ) -> Result<Value, NativeError> {
     let cap = PromiseBuilder::with_optional_context(context).capability(interp.gc_heap_mut())?;
-    let gc_heap = interp.gc_heap_for_cx_mut();
-    let obj = match crate::object::alloc_object(gc_heap) {
+    let obj = match interp
+        .alloc_runtime_rooted_object_with_roots(&[&cap.promise, &cap.resolve, &cap.reject], &[])
+    {
         Ok(o) => o,
         Err(_) => return Ok(Value::Undefined),
     };
+    let gc_heap = interp.gc_heap_for_cx_mut();
     crate::object::set(obj, gc_heap, "promise", cap.promise);
     crate::object::set(obj, gc_heap, "resolve", cap.resolve);
     crate::object::set(obj, gc_heap, "reject", cap.reject);

@@ -107,7 +107,7 @@ fn require_number_format<'a>(
     }
 }
 
-fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_number_format(args)?;
     let n = match args.args.first() {
         Some(Value::Number(n)) => n.as_f64(),
@@ -126,7 +126,7 @@ fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     js_string(&rendered, args.string_heap).map_err(intl_to_intrinsic)
 }
 
-fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_number_format(args)?;
     let locale = js_string_value(&payload.locale, args)?;
     let style = js_string_value(&payload.style, args)?;
@@ -137,26 +137,26 @@ fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let min_fd = payload.minimum_fraction_digits as i32;
     let max_fd = payload.maximum_fraction_digits as i32;
     let use_grouping = payload.use_grouping;
-    let mut heap = args.gc_heap.borrow_mut();
-    let obj = crate::object::alloc_object(*heap)?;
-    crate::object::set(obj, *heap, "locale", locale);
-    crate::object::set(obj, *heap, "style", style);
+    let heap = &mut *args.gc_heap;
+    let obj = crate::object::alloc_object(heap)?;
+    crate::object::set(obj, heap, "locale", locale);
+    crate::object::set(obj, heap, "style", style);
     if let Some(c) = currency_val {
-        crate::object::set(obj, *heap, "currency", c);
+        crate::object::set(obj, heap, "currency", c);
     }
     crate::object::set(
         obj,
-        *heap,
+        heap,
         "minimumFractionDigits",
         Value::Number(NumberValue::from_i32(min_fd)),
     );
     crate::object::set(
         obj,
-        *heap,
+        heap,
         "maximumFractionDigits",
         Value::Number(NumberValue::from_i32(max_fd)),
     );
-    crate::object::set(obj, *heap, "useGrouping", Value::Boolean(use_grouping));
+    crate::object::set(obj, heap, "useGrouping", Value::Boolean(use_grouping));
     Ok(Value::Object(obj))
 }
 

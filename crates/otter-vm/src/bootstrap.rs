@@ -597,7 +597,7 @@ fn install_proxy(
             name: "Proxy.revocable",
             reason: "out of memory while creating revoke function".to_string(),
         })?;
-        let obj = object::alloc_object(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+        let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
             name: "Proxy.revocable",
             reason: "out of memory while creating result object".to_string(),
         })?;
@@ -1083,14 +1083,22 @@ fn install_array(
     // collects values verbatim.
     // <https://tc39.es/ecma262/#sec-array>
     fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let arr =
-            crate::array::alloc_array(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
-                name: "Array",
-                reason: "out of memory while allocating array".to_string(),
+        if !(args.len() == 1 && matches!(args.first(), Some(Value::Number(_)))) {
+            let arr = ctx.array_from_elements(args.iter().cloned()).map_err(|_| {
+                NativeError::TypeError {
+                    name: "Array",
+                    reason: "out of memory while allocating array".to_string(),
+                }
             })?;
-        if args.len() == 1
-            && let Value::Number(n) = &args[0]
-        {
+            return Ok(Value::Array(arr));
+        }
+        let arr =
+            ctx.array_from_elements(std::iter::empty())
+                .map_err(|_| NativeError::TypeError {
+                    name: "Array",
+                    reason: "out of memory while allocating array".to_string(),
+                })?;
+        if let Value::Number(n) = &args[0] {
             let raw = n.as_f64();
             let len = raw as u32;
             if !raw.is_finite() || raw < 0.0 || raw != f64::from(len) {
@@ -1104,24 +1112,15 @@ fn install_array(
                 // writing the trailing slot also fills every index
                 // in `[0, len-1)` with a hole.
                 let last = (len - 1) as usize;
-                crate::array::set(arr, ctx.heap_mut(), last, Value::Hole).map_err(|_| {
-                    NativeError::TypeError {
+                ctx.array_set(arr, last, Value::Hole)
+                    .map_err(|_| NativeError::TypeError {
                         name: "Array",
                         reason: "out of memory while sizing array".to_string(),
-                    }
-                })?;
+                    })?;
             }
             return Ok(Value::Array(arr));
         }
-        for v in args {
-            crate::array::push(arr, ctx.heap_mut(), v.clone()).map_err(|_| {
-                NativeError::TypeError {
-                    name: "Array",
-                    reason: "out of memory while populating array".to_string(),
-                }
-            })?;
-        }
-        Ok(Value::Array(arr))
+        unreachable!("non-numeric Array(...) arguments returned above")
     }
 
     let ctor_native = NativeFunction::new_static(heap, "Array", 1, array_ctor_call)
@@ -1632,11 +1631,10 @@ fn install_object(
     fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         match args.first() {
             None | Some(Value::Undefined | Value::Null) => {
-                let obj =
-                    object::alloc_object(ctx.heap_mut()).map_err(|_| NativeError::TypeError {
-                        name: "Object",
-                        reason: "object allocation failed".to_string(),
-                    })?;
+                let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
+                    name: "Object",
+                    reason: "object allocation failed".to_string(),
+                })?;
                 Ok(Value::Object(obj))
             }
             Some(value) => Ok(value.clone()),

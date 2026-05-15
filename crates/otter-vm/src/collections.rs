@@ -35,6 +35,7 @@ use indexmap::IndexMap;
 use crate::Value;
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
+use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`MapBody`].
@@ -232,6 +233,14 @@ pub fn alloc_map(heap: &mut otter_gc::GcHeap) -> Result<JsMap, otter_gc::OutOfMe
     heap.alloc_old(MapBody::default())
 }
 
+/// Allocate a fresh empty `Map` while exposing caller-owned roots.
+pub(crate) fn alloc_map_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsMap, otter_gc::OutOfMemory> {
+    heap.alloc_with_roots(MapBody::default(), external_visit)
+}
+
 /// Number of entries.
 #[must_use]
 pub fn map_len(map: JsMap, heap: &otter_gc::GcHeap) -> usize {
@@ -284,6 +293,45 @@ pub fn map_set(
         heap.record_write(map, &barrier_key);
     }
     heap.record_write(map, &barrier_value);
+    Ok(())
+}
+
+/// `Map.prototype.set` for stack-visible VM construction paths.
+pub(crate) fn map_set_with_roots(
+    map: &mut JsMap,
+    heap: &mut otter_gc::GcHeap,
+    key: Value,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let barrier_key = key.clone();
+    let barrier_value = value.clone();
+    let k = MapKey::from_value(&key);
+    let exists = heap.read_payload(*map, |body| body.entries.contains_key(&k));
+    if !exists {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            key.trace_value_slots(visitor);
+            value.trace_value_slots(visitor);
+        };
+        reserve_map_for_target_len_with_roots(
+            map,
+            heap,
+            map_len(*map, heap).saturating_add(1),
+            &mut reserve_roots,
+        )?;
+    }
+    heap.with_payload(*map, |body| {
+        if let Some(slot) = body.entries.get_mut(&k) {
+            slot.1 = value;
+        } else {
+            body.entries.insert(k, (key, value));
+        }
+    });
+    if !exists {
+        heap.record_write(*map, &barrier_key);
+    }
+    heap.record_write(*map, &barrier_value);
     Ok(())
 }
 
@@ -362,6 +410,14 @@ pub fn alloc_set(heap: &mut otter_gc::GcHeap) -> Result<JsSet, otter_gc::OutOfMe
     heap.alloc_old(SetBody::default())
 }
 
+/// Allocate a fresh empty `Set` while exposing caller-owned roots.
+pub(crate) fn alloc_set_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsSet, otter_gc::OutOfMemory> {
+    heap.alloc_with_roots(SetBody::default(), external_visit)
+}
+
 /// Number of unique entries.
 #[must_use]
 pub fn set_len(set: JsSet, heap: &otter_gc::GcHeap) -> usize {
@@ -400,6 +456,39 @@ pub fn set_add(
     });
     if !exists {
         heap.record_write(set, &barrier_value);
+    }
+    Ok(())
+}
+
+/// `Set.prototype.add` for stack-visible VM construction paths.
+pub(crate) fn set_add_with_roots(
+    set: &mut JsSet,
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let barrier_value = value.clone();
+    let k = MapKey::from_value(&value);
+    let exists = heap.read_payload(*set, |body| body.entries.contains_key(&k));
+    if !exists {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            value.trace_value_slots(visitor);
+        };
+        reserve_set_for_target_len_with_roots(
+            set,
+            heap,
+            set_len(*set, heap).saturating_add(1),
+            &mut reserve_roots,
+        )?;
+    }
+    heap.with_payload(*set, |body| {
+        if !body.entries.contains_key(&k) {
+            body.entries.insert(k, value);
+        }
+    });
+    if !exists {
+        heap.record_write(*set, &barrier_value);
     }
     Ok(())
 }
@@ -448,6 +537,16 @@ impl otter_gc::SafeTraceable for WeakMapBody {
 /// Allocate a fresh empty `WeakMap`.
 pub fn alloc_weak_map(heap: &mut otter_gc::GcHeap) -> Result<JsWeakMap, otter_gc::OutOfMemory> {
     let map = heap.alloc_old(WeakMapBody::default())?;
+    heap.register_ephemeron_table(map);
+    Ok(map)
+}
+
+/// Allocate a fresh empty `WeakMap` while exposing caller-owned roots.
+pub(crate) fn alloc_weak_map_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsWeakMap, otter_gc::OutOfMemory> {
+    let map = heap.alloc_with_roots(WeakMapBody::default(), external_visit)?;
     heap.register_ephemeron_table(map);
     Ok(map)
 }
@@ -516,6 +615,16 @@ impl otter_gc::SafeTraceable for WeakSetBody {
 /// Allocate a fresh empty `WeakSet`.
 pub fn alloc_weak_set(heap: &mut otter_gc::GcHeap) -> Result<JsWeakSet, otter_gc::OutOfMemory> {
     let set = heap.alloc_old(WeakSetBody::default())?;
+    heap.register_ephemeron_table(set);
+    Ok(set)
+}
+
+/// Allocate a fresh empty `WeakSet` while exposing caller-owned roots.
+pub(crate) fn alloc_weak_set_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsWeakSet, otter_gc::OutOfMemory> {
+    let set = heap.alloc_with_roots(WeakSetBody::default(), external_visit)?;
     heap.register_ephemeron_table(set);
     Ok(set)
 }
@@ -653,6 +762,32 @@ fn reserve_map_for_target_len(
     Ok(())
 }
 
+fn reserve_map_for_target_len_with_roots(
+    map: &mut JsMap,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let capacity = heap.read_payload(*map, |body| body.entries.capacity());
+    if target_len <= capacity {
+        return Ok(());
+    }
+    let before = map_capacity_bytes(capacity);
+    let after = map_capacity_bytes(target_len);
+    if after > before {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            visitor(std::ptr::addr_of_mut!(*map) as *mut RawGc);
+        };
+        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
+    }
+    heap.with_payload(*map, |body| {
+        body.entries
+            .reserve(target_len.saturating_sub(body.entries.len()));
+    });
+    Ok(())
+}
+
 fn reserve_set_for_target_len(
     set: JsSet,
     heap: &mut otter_gc::GcHeap,
@@ -668,6 +803,32 @@ fn reserve_set_for_target_len(
         heap.reserve_bytes((after - before) as u64)?;
     }
     heap.with_payload(set, |body| {
+        body.entries
+            .reserve(target_len.saturating_sub(body.entries.len()));
+    });
+    Ok(())
+}
+
+fn reserve_set_for_target_len_with_roots(
+    set: &mut JsSet,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let capacity = heap.read_payload(*set, |body| body.entries.capacity());
+    if target_len <= capacity {
+        return Ok(());
+    }
+    let before = set_capacity_bytes(capacity);
+    let after = set_capacity_bytes(target_len);
+    if after > before {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            visitor(std::ptr::addr_of_mut!(*set) as *mut RawGc);
+        };
+        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
+    }
+    heap.with_payload(*set, |body| {
         body.entries
             .reserve(target_len.saturating_sub(body.entries.len()));
     });

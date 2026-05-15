@@ -71,26 +71,26 @@ fn arg_signed_index(
     }
 }
 
-fn impl_push(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_push(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let mut new_len = array::len(arr, &heap);
-    for v in args.args {
-        new_len = array::push(arr, &mut heap, v.clone())?;
+    let mut new_len = array::len(arr, &*args.gc_heap);
+    let values: Vec<Value> = args.args.to_vec();
+    for v in values {
+        new_len = args.array_push_rooted(arr, v)?;
     }
     Ok(Value::Number(NumberValue::from_i32(new_len as i32)))
 }
 
-fn impl_pop(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_pop(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    Ok(array::pop(arr, &mut heap))
+    let heap = &mut *args.gc_heap;
+    Ok(array::pop(arr, heap))
 }
 
-fn impl_shift(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    Ok(array::with_elements_mut(arr, &mut heap, |elements| {
+    let heap = &mut *args.gc_heap;
+    Ok(array::with_elements_mut(arr, heap, |elements| {
         if elements.is_empty() {
             Value::Undefined
         } else {
@@ -103,61 +103,66 @@ fn impl_shift(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }))
 }
 
-fn impl_unshift(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let existing_len = array::len(arr, &heap);
+    let heap = &mut *args.gc_heap;
+    let existing_len = array::len(arr, heap);
     let mut values: Vec<Value> = args.args.to_vec();
-    array::with_elements(arr, &heap, |elements| {
+    array::with_elements(arr, heap, |elements| {
         values.extend(elements.iter().cloned())
     });
-    let replacement = array::from_elements(&mut heap, values)?;
-    let copied = array::with_elements(replacement, &heap, |elements| elements.to_vec());
-    array::with_elements_mut(arr, &mut heap, |elements| {
+    array::with_elements_mut(arr, heap, |elements| {
         elements.clear();
-        elements.extend(copied);
+        elements.extend(values);
     });
     Ok(Value::Number(NumberValue::from_i32(
         (existing_len + args.args.len()) as i32,
     )))
 }
 
-fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let len = array::len(arr, &heap);
+    let len = array::len(arr, &*args.gc_heap);
     let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
     let end_default = len as i64;
     let end_raw = arg_signed_index(args, 1, end_default)?;
     let end = clamp_index(end_raw, len);
-    let slice: Vec<Value> = array::with_elements(arr, &heap, |elements| {
+    let slice: Vec<Value> = array::with_elements(arr, &*args.gc_heap, |elements| {
         if start >= end {
             Vec::new()
         } else {
             elements[start..end].to_vec()
         }
     });
-    Ok(Value::Array(array::from_elements(&mut heap, slice)?))
+    Ok(Value::Array(args.array_from_elements_rooted(
+        slice.iter().cloned(),
+        &[],
+        &[slice.as_slice()],
+    )?))
 }
 
-fn impl_concat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
+    let heap = &*args.gc_heap;
     // Spec: result starts as a copy of the receiver; for each
     // argument, if it's an array, append its elements; otherwise
     // append the value itself.
-    let mut combined: Vec<Value> = array::with_elements(arr, &heap, |elements| elements.to_vec());
+    let mut combined: Vec<Value> = array::with_elements(arr, heap, |elements| elements.to_vec());
     for v in args.args {
         match v {
             Value::Array(other) => {
-                array::with_elements(*other, &heap, |elements| {
+                array::with_elements(*other, heap, |elements| {
                     combined.extend(elements.iter().cloned());
                 });
             }
             other => combined.push(other.clone()),
         }
     }
-    Ok(Value::Array(array::from_elements(&mut heap, combined)?))
+    Ok(Value::Array(args.array_from_elements_rooted(
+        combined.iter().cloned(),
+        &[],
+        &[combined.as_slice()],
+    )?))
 }
 
 /// §23.1.3.36 `Array.prototype.toString` — delegate to `join()` with
@@ -167,19 +172,19 @@ fn impl_concat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// callable. Foundation: always call our concrete join helper.
 ///
 /// <https://tc39.es/ecma262/#sec-array.prototype.tostring>
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     impl_join(args)
 }
 
-fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let heap = args.gc_heap.borrow();
+    let heap = &*args.gc_heap;
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => ",".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(),
     };
-    let parts: Vec<String> = array::with_elements(arr, &heap, |elements| {
+    let parts: Vec<String> = array::with_elements(arr, heap, |elements| {
         elements
             .iter()
             .map(|v| match v {
@@ -197,14 +202,14 @@ fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     )?))
 }
 
-fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     // §23.1.3.13: holes compare as if the slot held `undefined`
     // (SameValueZero), so `[,,].includes(undefined) === true`.
     let arr = receiver_array(args)?;
-    let heap = args.gc_heap.borrow();
+    let heap = &*args.gc_heap;
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
     let needle_is_undefined = matches!(needle, Value::Undefined);
-    let found = array::with_elements(arr, &heap, |elements| {
+    let found = array::with_elements(arr, heap, |elements| {
         elements.iter().any(|v| match v {
             Value::Hole => needle_is_undefined,
             other => other == &needle,
@@ -213,14 +218,14 @@ fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Boolean(found))
 }
 
-fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
     let from_raw = arg_signed_index(args, 1, 0)?;
-    let heap = args.gc_heap.borrow();
-    let len = array::len(arr, &heap);
+    let heap = &*args.gc_heap;
+    let len = array::len(arr, heap);
     let from = clamp_index(from_raw, len);
-    let found = array::with_elements(arr, &heap, |elements| {
+    let found = array::with_elements(arr, heap, |elements| {
         elements
             .iter()
             .enumerate()
@@ -235,24 +240,23 @@ fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 /// §23.1.3.1 `Array.prototype.at(index)` — clamp negative indexing.
 /// <https://tc39.es/ecma262/#sec-array.prototype.at>
-fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let heap = args.gc_heap.borrow();
-    let len = array::len(arr, &heap) as i64;
+    let len = array::len(arr, &*args.gc_heap) as i64;
     let raw = arg_signed_index(args, 0, 0)?;
     let idx = if raw < 0 { len + raw } else { raw };
     if idx < 0 || idx >= len {
         return Ok(Value::Undefined);
     }
-    Ok(array::get(arr, &heap, idx as usize))
+    let heap = &*args.gc_heap;
+    Ok(array::get(arr, heap, idx as usize))
 }
 
 /// §23.1.3.18 `Array.prototype.lastIndexOf(value, fromIndex?)`.
 /// <https://tc39.es/ecma262/#sec-array.prototype.lastindexof>
-fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let heap = args.gc_heap.borrow();
-    let len = array::len(arr, &heap);
+    let len = array::len(arr, &*args.gc_heap);
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
     let from_default = (len as i64).saturating_sub(1);
     let from_raw = arg_signed_index(args, 1, from_default)?;
@@ -267,7 +271,8 @@ fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     } else {
         from_raw as usize
     };
-    let found = array::with_elements(arr, &heap, |elements| {
+    let heap = &*args.gc_heap;
+    let found = array::with_elements(arr, heap, |elements| {
         if elements.is_empty() {
             return None;
         }
@@ -291,24 +296,24 @@ fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 
 /// §23.1.3.27 `Array.prototype.reverse()` — in-place.
 /// <https://tc39.es/ecma262/#sec-array.prototype.reverse>
-fn impl_reverse(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    array::with_elements_mut(arr, &mut heap, |elements| elements.reverse());
+    let heap = &mut *args.gc_heap;
+    array::with_elements_mut(arr, heap, |elements| elements.reverse());
     Ok(Value::Array(arr))
 }
 
 /// §23.1.3.7 `Array.prototype.fill(value, start?, end?)` — in-place.
 /// <https://tc39.es/ecma262/#sec-array.prototype.fill>
-fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let len = array::len(arr, &heap);
+    let len = array::len(arr, &*args.gc_heap);
     let value = args.args.first().cloned().unwrap_or(Value::Undefined);
     let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
     let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
     if start < end {
-        array::with_elements_mut(arr, &mut heap, |elements| {
+        let heap = &mut *args.gc_heap;
+        array::with_elements_mut(arr, heap, |elements| {
             for slot in elements.iter_mut().take(end).skip(start) {
                 *slot = value.clone();
             }
@@ -322,9 +327,9 @@ fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// arrays are dense, so the spec's `IsConcatSpreadable` short-circuit
 /// reduces to "is `Value::Array`".
 /// <https://tc39.es/ecma262/#sec-array.prototype.flat>
-fn impl_flat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
+    let heap = &*args.gc_heap;
     let depth = match args.args.first() {
         None | Some(Value::Undefined) => 1i64,
         Some(Value::Number(n)) => match n.as_smi() {
@@ -347,20 +352,21 @@ fn impl_flat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
         }
     }
-    let mut out: Vec<Value> = Vec::with_capacity(array::len(arr, &heap));
-    array::with_elements(arr, &heap, |elements| {
-        walk(&mut out, &heap, elements, depth)
-    });
-    Ok(Value::Array(array::from_elements(&mut heap, out)?))
+    let mut out: Vec<Value> = Vec::with_capacity(array::len(arr, heap));
+    array::with_elements(arr, heap, |elements| walk(&mut out, heap, elements, depth));
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
 }
 
 /// §23.1.3.31 `Array.prototype.splice(start, deleteCount?, ...items)`.
 /// Mutates the receiver in place; returns the removed elements.
 /// <https://tc39.es/ecma262/#sec-array.prototype.splice>
-fn impl_splice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    let len = array::len(arr, &heap);
+    let len = array::len(arr, &*args.gc_heap);
     let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
     // §23.1.3.31 step 6 — when `deleteCount` is omitted (foundation
     // accepts `undefined`), splice removes through the tail.
@@ -385,7 +391,8 @@ fn impl_splice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     // `SmallVec` lacks a `splice` API — perform the equivalent by
     // hand: drain the removed slice, then insert the new items at
     // `start`.
-    let removed = array::with_elements_mut(arr, &mut heap, |elements| {
+    let heap = &mut *args.gc_heap;
+    let removed = array::with_elements_mut(arr, heap, |elements| {
         let mut removed: Vec<Value> = Vec::with_capacity(delete_count);
         for _ in 0..delete_count {
             removed.push(elements.remove(start));
@@ -395,21 +402,25 @@ fn impl_splice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         removed
     });
-    Ok(Value::Array(array::from_elements(&mut heap, removed)?))
+    Ok(Value::Array(args.array_from_elements_rooted(
+        removed.iter().cloned(),
+        &[],
+        &[removed.as_slice()],
+    )?))
 }
 
 /// §23.1.3.30 `Array.prototype.sort()` — default lexicographic
 /// comparator (calls `String(a)` / `String(b)` and compares as
 /// UTF-16). Comparator-driven sort is interpreter-dispatched.
 /// <https://tc39.es/ecma262/#sec-array.prototype.sort>
-fn impl_sort_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
     if let Some(Value::Undefined) | None = args.args.first() {
-        let mut heap = args.gc_heap.borrow_mut();
+        let heap = &mut *args.gc_heap;
         // §23.1.3.30.2 SortCompare (no comparator) — undefined values
         // sort to the end; remaining values compare by their
         // ToString result.
-        array::with_elements_mut(arr, &mut heap, |elements| {
+        array::with_elements_mut(arr, heap, |elements| {
             elements.sort_by(|a, b| {
                 let a_undef = matches!(a, Value::Undefined);
                 let b_undef = matches!(b, Value::Undefined);
@@ -506,16 +517,20 @@ fn native_array_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
-    let string_heap = ctx.interp_mut().string_heap_clone();
+    let (string_heap, allocation_roots) = {
+        let interp = ctx.interp_mut();
+        (interp.string_heap_clone(), interp.collect_runtime_roots())
+    };
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Array.prototype method".to_string(),
     })?;
-    (entry.impl_fn)(&IntrinsicArgs {
+    (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
         args,
         string_heap: &string_heap,
-        gc_heap: std::cell::RefCell::new(ctx.heap_mut()),
+        gc_heap: ctx.heap_mut(),
+        allocation_roots: allocation_roots.as_slice(),
     })
     .map_err(|err| NativeError::TypeError {
         name,
@@ -568,11 +583,12 @@ mod tests {
     fn call(method: &str, recv: Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
         let heap = StringHeap::default();
         let entry = lookup(method).unwrap();
-        (entry.impl_fn)(&IntrinsicArgs {
+        (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args,
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(gc_heap),
+            gc_heap,
+            allocation_roots: &[],
         })
         .unwrap()
     }

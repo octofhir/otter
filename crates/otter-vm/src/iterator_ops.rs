@@ -63,54 +63,82 @@ enum IteratorStateSnapshot {
 impl Interpreter {
     pub(crate) fn run_get_iterator_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
         let value = read_register(frame, src)?.clone();
-        let state = match value {
-            Value::Array(array) => IteratorState::Array { array, index: 0 },
-            Value::String(string) => IteratorState::String { string, index: 0 },
+        let state = match &value {
+            Value::Array(array) => IteratorState::Array {
+                array: *array,
+                index: 0,
+            },
+            Value::String(string) => IteratorState::String {
+                string: string.clone(),
+                index: 0,
+            },
             // `for…of` over a `Map` yields `[key, value]` pairs (Spec
             // §24.1.3.12 — `@@iterator` aliases `entries`); over a `Set`
             // yields values (Spec §24.2.3.11). Snapshot at iteration start by
             // building a synthetic backing array.
             Value::Map(m) => {
-                let entries = crate::collections::map_entries(m, &self.gc_heap);
-                let mut snap: SmallVec<[Value; 4]> = SmallVec::with_capacity(entries.len());
+                let entries = crate::collections::map_entries(*m, &self.gc_heap);
+                let entries_len = entries.len();
+                let mut entry_values: Vec<Value> = Vec::with_capacity(entries_len * 2);
                 for (k, v) in entries {
-                    let mut pair: SmallVec<[Value; 4]> = SmallVec::new();
-                    pair.push(k);
-                    pair.push(v);
-                    let pair_array = crate::array::from_elements(&mut self.gc_heap, pair)?;
+                    entry_values.push(k);
+                    entry_values.push(v);
+                }
+                let mut snap: SmallVec<[Value; 4]> = SmallVec::with_capacity(entries_len);
+                for pair in entry_values.chunks_exact(2) {
+                    let pair_array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        pair.iter().cloned(),
+                        &[&value],
+                        &[entry_values.as_slice(), snap.as_slice()],
+                    )?;
                     snap.push(Value::Array(pair_array));
                 }
                 IteratorState::Array {
-                    array: crate::array::from_elements(&mut self.gc_heap, snap)?,
+                    array: self.alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        snap.iter().cloned(),
+                        &[&value],
+                        &[entry_values.as_slice(), snap.as_slice()],
+                    )?,
                     index: 0,
                 }
             }
             Value::Set(s) => {
-                let snap: SmallVec<[Value; 4]> = crate::collections::set_values(s, &self.gc_heap)
+                let snap: SmallVec<[Value; 4]> = crate::collections::set_values(*s, &self.gc_heap)
                     .into_iter()
                     .collect();
                 IteratorState::Array {
-                    array: crate::array::from_elements(&mut self.gc_heap, snap)?,
+                    array: self.alloc_stack_rooted_array_from_values(
+                        stack,
+                        snap.iter().cloned(),
+                        &[&value],
+                        snap.as_slice(),
+                    )?,
                     index: 0,
                 }
             }
             // §27.5 — generator objects are iterable; `[@@iterator]()` returns
             // the generator itself, and `next()` drives the suspended body.
-            Value::Generator(handle) => IteratorState::Generator { handle },
+            Value::Generator(handle) => IteratorState::Generator { handle: *handle },
             // Already-an-iterator should pass through unchanged.
             Value::Iterator(rc) => {
-                write_register(frame, dst, Value::Iterator(rc))?;
+                let frame = &mut stack[top_idx];
+                write_register(frame, dst, Value::Iterator(*rc))?;
                 frame.pc += 1;
                 return Ok(());
             }
             _ => return Err(VmError::TypeMismatch),
         };
-        let iter = alloc_iterator_state(&mut self.gc_heap, state)?;
+        let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[&value], &[])?;
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::Iterator(iter))?;
         frame.pc += 1;
         Ok(())
@@ -396,7 +424,7 @@ impl Interpreter {
             captures,
             move |ctx, args, captures| {
                 let receiver = captures.first().cloned().unwrap_or(Value::Undefined);
-                let Value::Iterator(iter_rc) = receiver else {
+                let Value::Iterator(iter_rc) = receiver.clone() else {
                     return Err(NativeError::TypeError {
                         name: method_name,
                         reason: "receiver is not an Iterator".to_string(),
@@ -417,14 +445,30 @@ impl Interpreter {
                                     reason: e.to_string(),
                                 }
                             })?;
-                        let obj = crate::object::alloc_object(&mut interp.gc_heap)?;
+                        let obj = interp
+                            .alloc_runtime_rooted_object_with_roots(
+                                &[&receiver, &v],
+                                &[small_args.as_slice()],
+                            )
+                            .map_err(|e| NativeError::TypeError {
+                                name: method_name,
+                                reason: e.to_string(),
+                            })?;
                         crate::object::set(obj, &mut interp.gc_heap, "value", v);
                         crate::object::set(obj, &mut interp.gc_heap, "done", Value::Boolean(done));
                         Ok(Value::Object(obj))
                     }
                     "return" => {
                         let arg = small_args.first().cloned().unwrap_or(Value::Undefined);
-                        let obj = crate::object::alloc_object(&mut interp.gc_heap)?;
+                        let obj = interp
+                            .alloc_runtime_rooted_object_with_roots(
+                                &[&receiver, &arg],
+                                &[small_args.as_slice()],
+                            )
+                            .map_err(|e| NativeError::TypeError {
+                                name: method_name,
+                                reason: e.to_string(),
+                            })?;
                         crate::object::set(obj, &mut interp.gc_heap, "value", arg);
                         crate::object::set(obj, &mut interp.gc_heap, "done", Value::Boolean(true));
                         Ok(Value::Object(obj))
@@ -460,56 +504,75 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         // Lazy helpers wrap the source in a new IteratorState; the
         // eager terminals drain via `iterator_next_full`.
+        let iter_value = Value::Iterator(*iter_rc);
         let result = match name {
             "map" => {
                 let mapper = require_callable(args.first())?;
-                Value::Iterator(alloc_iterator_state(
-                    &mut self.gc_heap,
-                    IteratorState::Map {
-                        source: *iter_rc,
-                        mapper,
-                    },
+                let mapper_root = mapper.clone();
+                let state = IteratorState::Map {
+                    source: *iter_rc,
+                    mapper,
+                };
+                Value::Iterator(self.alloc_stack_rooted_iterator_state(
+                    stack,
+                    state,
+                    &[&iter_value, &mapper_root],
+                    &[],
                 )?)
             }
             "filter" => {
                 let predicate = require_callable(args.first())?;
-                Value::Iterator(alloc_iterator_state(
-                    &mut self.gc_heap,
-                    IteratorState::Filter {
-                        source: *iter_rc,
-                        predicate,
-                    },
+                let predicate_root = predicate.clone();
+                let state = IteratorState::Filter {
+                    source: *iter_rc,
+                    predicate,
+                };
+                Value::Iterator(self.alloc_stack_rooted_iterator_state(
+                    stack,
+                    state,
+                    &[&iter_value, &predicate_root],
+                    &[],
                 )?)
             }
             "take" => {
                 let n = take_drop_count(args.first())?;
-                Value::Iterator(alloc_iterator_state(
-                    &mut self.gc_heap,
-                    IteratorState::Take {
-                        source: *iter_rc,
-                        remaining: n,
-                    },
+                let state = IteratorState::Take {
+                    source: *iter_rc,
+                    remaining: n,
+                };
+                Value::Iterator(self.alloc_stack_rooted_iterator_state(
+                    stack,
+                    state,
+                    &[&iter_value],
+                    &[],
                 )?)
             }
             "drop" => {
                 let n = take_drop_count(args.first())?;
-                Value::Iterator(alloc_iterator_state(
-                    &mut self.gc_heap,
-                    IteratorState::Drop {
-                        source: *iter_rc,
-                        to_drop: n,
-                    },
+                let state = IteratorState::Drop {
+                    source: *iter_rc,
+                    to_drop: n,
+                };
+                Value::Iterator(self.alloc_stack_rooted_iterator_state(
+                    stack,
+                    state,
+                    &[&iter_value],
+                    &[],
                 )?)
             }
             "flatMap" => {
                 let mapper = require_callable(args.first())?;
-                Value::Iterator(alloc_iterator_state(
-                    &mut self.gc_heap,
-                    IteratorState::FlatMap {
-                        source: *iter_rc,
-                        mapper,
-                        inner: None,
-                    },
+                let mapper_root = mapper.clone();
+                let state = IteratorState::FlatMap {
+                    source: *iter_rc,
+                    mapper,
+                    inner: None,
+                };
+                Value::Iterator(self.alloc_stack_rooted_iterator_state(
+                    stack,
+                    state,
+                    &[&iter_value, &mapper_root],
+                    &[],
                 )?)
             }
             "toArray" => {
@@ -564,7 +627,8 @@ impl Interpreter {
             // <https://tc39.es/ecma262/#sec-iteratorprototype>
             "next" => {
                 let (v, done) = self.iterator_next_full(context, iter_rc)?;
-                let obj = crate::object::alloc_object(&mut self.gc_heap)?;
+                let obj =
+                    self.alloc_stack_rooted_object_with_extra_roots(stack, &[&iter_value, &v])?;
                 crate::object::set(obj, &mut self.gc_heap, "value", v);
                 crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(done));
                 Value::Object(obj)
@@ -576,7 +640,8 @@ impl Interpreter {
             // `Value::Generator` dispatch above.
             "return" => {
                 let arg = args.first().cloned().unwrap_or(Value::Undefined);
-                let obj = crate::object::alloc_object(&mut self.gc_heap)?;
+                let obj =
+                    self.alloc_stack_rooted_object_with_extra_roots(stack, &[&iter_value, &arg])?;
                 crate::object::set(obj, &mut self.gc_heap, "value", arg);
                 crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(true));
                 Value::Object(obj)
@@ -1069,8 +1134,11 @@ impl Interpreter {
                 stack[top_idx].pending_get_iterator = None;
                 return Err(VmError::TypeMismatch);
             }
-            let iter_state = IteratorState::User { iterator: produced };
-            let iter = alloc_iterator_state(&mut self.gc_heap, iter_state)?;
+            let iter_state = IteratorState::User {
+                iterator: produced.clone(),
+            };
+            let iter =
+                self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
             write_register(&mut stack[top_idx], dst, Value::Iterator(iter))?;
             stack[top_idx].pending_get_iterator = None;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;

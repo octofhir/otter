@@ -55,8 +55,8 @@ fn receiver_number(args: &IntrinsicArgs<'_>) -> Result<NumberValue, IntrinsicErr
         Value::Object(obj) => {
             // Per ECMA-262 `thisNumberValue`: if `this` has a
             // `[[NumberData]]` internal slot, use it.
-            let gc = args.gc_heap.borrow();
-            crate::object::number_data(*obj, &gc)
+            let gc = &*args.gc_heap;
+            crate::object::number_data(*obj, gc)
                 .ok_or(IntrinsicError::BadReceiver { expected: "number" })
         }
         _ => Err(IntrinsicError::BadReceiver { expected: "number" }),
@@ -64,7 +64,7 @@ fn receiver_number(args: &IntrinsicArgs<'_>) -> Result<NumberValue, IntrinsicErr
 }
 
 /// `Number.prototype.toString(radix = 10)`.
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_number(args)?;
     let radix: u32 = match args.args.first() {
         None | Some(Value::Undefined) => 10,
@@ -101,7 +101,7 @@ fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 /// `Number.prototype.toFixed(digits = 0)`.
-fn impl_to_fixed(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_fixed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_number(args)?;
     // §21.1.3.3 step 2: `f = ToIntegerOrInfinity(fractionDigits)`.
     let f_arg = coerce_digits_arg(args.args.first(), 0.0)?;
@@ -125,7 +125,7 @@ fn impl_to_fixed(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-number.prototype.toexponential>
-fn impl_to_exponential(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_number(args)?;
     let value = recv.as_f64();
     // §21.1.3.2 step 3: non-finite returns ToString(x) regardless
@@ -165,7 +165,7 @@ fn impl_to_exponential(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-number.prototype.toprecision>
-fn impl_to_precision(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_number(args)?;
     let value = recv.as_f64();
     // §21.1.3.5 step 2: undefined precision is plain ToString.
@@ -207,7 +207,7 @@ fn impl_to_precision(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-number.prototype.valueof>
-fn impl_value_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Number(receiver_number(args)?))
 }
 
@@ -263,16 +263,20 @@ fn native_number_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
-    let string_heap = ctx.interp_mut().string_heap_clone();
+    let (string_heap, allocation_roots) = {
+        let interp = ctx.interp_mut();
+        (interp.string_heap_clone(), interp.collect_runtime_roots())
+    };
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Number.prototype method".to_string(),
     })?;
-    (entry.impl_fn)(&IntrinsicArgs {
+    (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
         args,
         string_heap: &string_heap,
-        gc_heap: std::cell::RefCell::new(ctx.heap_mut()),
+        gc_heap: ctx.heap_mut(),
+        allocation_roots: allocation_roots.as_slice(),
     })
     .map_err(|err| match err {
         // Preserve the spec error class when the intrinsic surfaces
@@ -324,8 +328,9 @@ mod tests {
         IntrinsicArgs {
             receiver: recv,
             args,
-            string_heap: heap,
-            gc_heap: std::cell::RefCell::new(gc_heap),
+            string_heap: &heap,
+            gc_heap,
+            allocation_roots: &[],
         }
     }
 
@@ -335,7 +340,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::Number(NumberValue::Smi(255));
         let entry = lookup("toString").unwrap();
-        let out = (entry.impl_fn)(&args(&recv, &[], &heap, &mut gc_heap)).unwrap();
+        let out = (entry.impl_fn)(&mut args(&recv, &[], &heap, &mut gc_heap)).unwrap();
         assert_eq!(out.display_string(), "255");
     }
 
@@ -346,7 +351,7 @@ mod tests {
         let recv = Value::Number(NumberValue::Smi(255));
         let radix = Value::Number(NumberValue::Smi(16));
         let entry = lookup("toString").unwrap();
-        let out = (entry.impl_fn)(&args(
+        let out = (entry.impl_fn)(&mut args(
             &recv,
             std::slice::from_ref(&radix),
             &heap,
@@ -366,7 +371,7 @@ mod tests {
         let recv = Value::Number(NumberValue::Double(1.75));
         let two = Value::Number(NumberValue::Smi(2));
         let entry = lookup("toFixed").unwrap();
-        let out = (entry.impl_fn)(&args(
+        let out = (entry.impl_fn)(&mut args(
             &recv,
             std::slice::from_ref(&two),
             &heap,

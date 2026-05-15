@@ -19,12 +19,14 @@
 //! - [`crate::executable`]
 
 use crate::{ExecutionContext, Frame, Interpreter, Value, VmError, read_register, write_register};
+use smallvec::SmallVec;
 
 impl Interpreter {
     pub(crate) fn run_new_collection_regs(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
         kind_idx: u32,
         iter_reg: u16,
@@ -32,86 +34,139 @@ impl Interpreter {
         let kind = context
             .string_constant_str(kind_idx)
             .ok_or(VmError::InvalidOperand)?;
+        let frame = &stack[top_idx];
         let seed = read_register(frame, iter_reg)?.clone();
-        let value = build_collection(kind, &seed, &mut self.gc_heap)?;
+        let value = self.build_collection_with_stack_roots(kind, &seed, stack)?;
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())
     }
-}
 
-fn build_collection(
-    kind: &str,
-    seed: &Value,
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, VmError> {
-    match kind {
-        "Map" => {
-            let m = crate::collections::alloc_map(gc_heap)?;
-            if seed_is_present(seed) {
-                let entries = seed_array(seed, gc_heap)?;
-                for entry in entries {
+    fn build_collection_with_stack_roots(
+        &mut self,
+        kind: &str,
+        seed: &Value,
+        stack: &SmallVec<[Frame; 8]>,
+    ) -> Result<Value, VmError> {
+        let roots = self.collect_allocation_roots(stack);
+        let seed_entries = if seed_is_present(seed) {
+            seed_array(seed, &self.gc_heap)?
+        } else {
+            Vec::new()
+        };
+        match kind {
+            "Map" => {
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    seed.trace_value_slots(visitor);
+                    for entry in &seed_entries {
+                        entry.trace_value_slots(visitor);
+                    }
+                };
+                let mut m = crate::collections::alloc_map_with_roots(
+                    &mut self.gc_heap,
+                    &mut external_visit,
+                )?;
+                for entry in &seed_entries {
                     let pair = match entry {
-                        Value::Array(a) => a,
+                        Value::Array(a) => *a,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    if crate::array::len(pair, gc_heap) < 2 {
+                    if crate::array::len(pair, &self.gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
-                    crate::collections::map_set(
-                        m,
-                        gc_heap,
-                        crate::array::get(pair, gc_heap, 0),
-                        crate::array::get(pair, gc_heap, 1),
+                    let key = crate::array::get(pair, &self.gc_heap, 0);
+                    let value = crate::array::get(pair, &self.gc_heap, 1);
+                    crate::collections::map_set_with_roots(
+                        &mut m,
+                        &mut self.gc_heap,
+                        key,
+                        value,
+                        &mut external_visit,
                     )?;
                 }
+                Ok(Value::Map(m))
             }
-            Ok(Value::Map(m))
-        }
-        "Set" => {
-            let s = crate::collections::alloc_set(gc_heap)?;
-            if seed_is_present(seed) {
-                for v in seed_array(seed, gc_heap)? {
-                    crate::collections::set_add(s, gc_heap, v)?;
+            "Set" => {
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    seed.trace_value_slots(visitor);
+                    for entry in &seed_entries {
+                        entry.trace_value_slots(visitor);
+                    }
+                };
+                let mut s = crate::collections::alloc_set_with_roots(
+                    &mut self.gc_heap,
+                    &mut external_visit,
+                )?;
+                for v in &seed_entries {
+                    crate::collections::set_add_with_roots(
+                        &mut s,
+                        &mut self.gc_heap,
+                        v.clone(),
+                        &mut external_visit,
+                    )?;
                 }
+                Ok(Value::Set(s))
             }
-            Ok(Value::Set(s))
-        }
-        "WeakMap" => {
-            let m = crate::collections::alloc_weak_map(gc_heap)?;
-            if seed_is_present(seed) {
-                for entry in seed_array(seed, gc_heap)? {
+            "WeakMap" => {
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    seed.trace_value_slots(visitor);
+                    for entry in &seed_entries {
+                        entry.trace_value_slots(visitor);
+                    }
+                };
+                let m = crate::collections::alloc_weak_map_with_roots(
+                    &mut self.gc_heap,
+                    &mut external_visit,
+                )?;
+                for entry in &seed_entries {
                     let pair = match entry {
-                        Value::Array(a) => a,
+                        Value::Array(a) => *a,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    if crate::array::len(pair, gc_heap) < 2 {
+                    if crate::array::len(pair, &self.gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
-                    crate::collections::weak_map_set(
-                        m,
-                        gc_heap,
-                        crate::array::get(pair, gc_heap, 0),
-                        crate::array::get(pair, gc_heap, 1),
-                    )
-                    .map_err(|_| VmError::TypeMismatch)?;
-                }
-            }
-            Ok(Value::WeakMap(m))
-        }
-        "WeakSet" => {
-            let s = crate::collections::alloc_weak_set(gc_heap)?;
-            if seed_is_present(seed) {
-                for v in seed_array(seed, gc_heap)? {
-                    crate::collections::weak_set_add(s, gc_heap, v)
+                    let key = crate::array::get(pair, &self.gc_heap, 0);
+                    let value = crate::array::get(pair, &self.gc_heap, 1);
+                    crate::collections::weak_map_set(m, &mut self.gc_heap, key, value)
                         .map_err(|_| VmError::TypeMismatch)?;
                 }
+                Ok(Value::WeakMap(m))
             }
-            Ok(Value::WeakSet(s))
+            "WeakSet" => {
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    seed.trace_value_slots(visitor);
+                    for entry in &seed_entries {
+                        entry.trace_value_slots(visitor);
+                    }
+                };
+                let s = crate::collections::alloc_weak_set_with_roots(
+                    &mut self.gc_heap,
+                    &mut external_visit,
+                )?;
+                for v in seed_entries {
+                    crate::collections::weak_set_add(s, &mut self.gc_heap, v)
+                        .map_err(|_| VmError::TypeMismatch)?;
+                }
+                Ok(Value::WeakSet(s))
+            }
+            _ => Err(VmError::UnknownIntrinsic {
+                name: format!("new {kind}"),
+            }),
         }
-        _ => Err(VmError::UnknownIntrinsic {
-            name: format!("new {kind}"),
-        }),
     }
 }
 

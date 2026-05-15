@@ -113,7 +113,7 @@ fn build_new_typed_array(kind: TypedArrayKind, values: &[Value]) -> Value {
 
 // ---- pure-functional methods --------------------------------------------
 
-fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -134,7 +134,7 @@ fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(t.get(resolved as usize))
 }
 
-fn impl_subarray(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_subarray(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     let len = t.length() as i64;
     let start = relative_index(args.args.first(), 0, len);
@@ -145,7 +145,7 @@ fn impl_subarray(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(build_subarray(&t, final_start, new_len))
 }
 
-fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -170,7 +170,7 @@ fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     )))
 }
 
-fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -197,7 +197,7 @@ fn impl_fill(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::TypedArray(t))
 }
 
-fn impl_copy_within(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -222,7 +222,7 @@ fn impl_copy_within(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::TypedArray(t.clone()))
 }
 
-fn impl_reverse(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
@@ -241,7 +241,7 @@ fn impl_reverse(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::TypedArray(t))
 }
 
-fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -263,7 +263,7 @@ fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(smi(-1))
 }
 
-fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -287,7 +287,7 @@ fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     Ok(smi(-1))
 }
 
-fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -306,7 +306,7 @@ fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Boolean(false))
 }
 
-fn impl_join(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let separator = match args.args.first() {
@@ -337,19 +337,19 @@ fn join_into_string(
     Ok(Value::String(JsString::from_str(&out, string_heap)?))
 }
 
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     join_into_string(&t, ",", args.string_heap)
 }
 
-fn impl_to_locale_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_locale_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     // Foundation simplification: locale-aware rendering deferred to
     // Intl integration. Falls through to `toString`.
     impl_to_string(args)
 }
 
-fn impl_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let offset = integer_arg(args.args.get(1), 0);
@@ -377,8 +377,8 @@ fn impl_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
         }
         Value::Array(arr) => {
-            let heap = args.gc_heap.borrow();
-            let src_len = crate::array::len(arr, &heap);
+            let heap = &*args.gc_heap;
+            let src_len = crate::array::len(arr, heap);
             if off + src_len > t.length() {
                 return Err(IntrinsicError::BadArgument {
                     index: 0,
@@ -386,7 +386,7 @@ fn impl_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
             for i in 0..src_len {
-                t.set(off + i, &crate::array::get(arr, &heap, i));
+                t.set(off + i, &crate::array::get(arr, heap, i));
             }
         }
         _ => {
@@ -399,7 +399,7 @@ fn impl_set(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Undefined)
 }
 
-fn impl_to_reversed(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let mut snapshot = copy_view(&t);
@@ -407,7 +407,7 @@ fn impl_to_reversed(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(build_new_typed_array(t.kind(), &snapshot))
 }
 
-fn impl_to_sorted_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_sorted_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let mut snapshot = copy_view(&t);
@@ -415,7 +415,7 @@ fn impl_to_sorted_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     Ok(build_new_typed_array(t.kind(), &snapshot))
 }
 
-fn impl_sort_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let mut snapshot = copy_view(&t);
@@ -426,7 +426,7 @@ fn impl_sort_default(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     Ok(Value::TypedArray(t))
 }
 
-fn impl_with(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length() as i64;
@@ -463,32 +463,32 @@ fn wrap_iterator(
     Ok(Value::Iterator(crate::alloc_iterator_state(heap, state)?))
 }
 
-fn impl_keys(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_keys(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
-    let mut heap = args.gc_heap.borrow_mut();
-    Ok(wrap_iterator(&mut heap, (0..len).map(|i| smi(i as i32)))?)
+    let heap = &mut *args.gc_heap;
+    Ok(wrap_iterator(heap, (0..len).map(|i| smi(i as i32)))?)
 }
 
-fn impl_values(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_values(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    let mut heap = args.gc_heap.borrow_mut();
-    Ok(wrap_iterator(&mut heap, copy_view(&t))?)
+    let heap = &mut *args.gc_heap;
+    Ok(wrap_iterator(heap, copy_view(&t))?)
 }
 
-fn impl_entries(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
-    let mut heap = args.gc_heap.borrow_mut();
+    let heap = &mut *args.gc_heap;
     let mut pairs: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
-        let pair = crate::array::from_elements(&mut heap, [smi(i as i32), t.get(i)])?;
+        let pair = crate::array::from_elements(heap, [smi(i as i32), t.get(i)])?;
         pairs.push(Value::Array(pair));
     }
-    Ok(wrap_iterator(&mut heap, pairs)?)
+    Ok(wrap_iterator(heap, pairs)?)
 }
 
 // ---- comparison helpers -------------------------------------------------

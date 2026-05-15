@@ -17,31 +17,32 @@
 //! - [`crate::error_classes`]
 //! - [`crate::executable`]
 
+use smallvec::SmallVec;
+
 use crate::{
     ErrorKind, ExecutionContext, Frame, Interpreter, IntrinsicError, JsString, NativeError,
-    StackFrameSnapshot, Value, VmError, error_classes, json, math, read_register, symbol_dispatch,
-    temporal, write_register,
+    StackFrameSnapshot, Value, VmError, error_classes, json, math, object, read_register,
+    symbol_dispatch, temporal, write_register,
 };
 
 impl Interpreter {
     pub(crate) fn run_new_error_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
         msg_reg: u16,
     ) -> Result<(), VmError> {
+        let frame = &stack[top_idx];
         let value = read_register(frame, msg_reg)?.clone();
-        let owned_message = error_message_from_value(value);
-        let obj = {
-            let string_heap = self.string_heap.clone();
-            let registry = self.error_classes.clone();
-            registry.make_instance(
-                ErrorKind::Error,
-                owned_message.as_deref(),
-                &string_heap,
-                &mut self.gc_heap,
-            )?
-        };
+        let owned_message = error_message_from_value(&value);
+        let obj = self.make_error_instance_with_stack_roots(
+            stack,
+            ErrorKind::Error,
+            owned_message,
+            &value,
+        )?;
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::Object(obj))?;
         frame.pc += 1;
         Ok(())
@@ -50,7 +51,8 @@ impl Interpreter {
     pub(crate) fn run_new_builtin_error_regs(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
         kind_idx: u32,
         msg_reg: u16,
@@ -59,21 +61,33 @@ impl Interpreter {
             .string_constant_str(kind_idx)
             .ok_or(VmError::InvalidOperand)?;
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
+        let frame = &stack[top_idx];
         let value = read_register(frame, msg_reg)?.clone();
-        let owned_message = error_message_from_value(value);
-        let obj = {
-            let string_heap = self.string_heap.clone();
-            let registry = self.error_classes.clone();
-            registry.make_instance(
-                kind,
-                owned_message.as_deref(),
-                &string_heap,
-                &mut self.gc_heap,
-            )?
-        };
+        let owned_message = error_message_from_value(&value);
+        let obj = self.make_error_instance_with_stack_roots(stack, kind, owned_message, &value)?;
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::Object(obj))?;
         frame.pc += 1;
         Ok(())
+    }
+
+    fn make_error_instance_with_stack_roots(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        kind: ErrorKind,
+        message: Option<String>,
+        message_value: &Value,
+    ) -> Result<object::JsObject, VmError> {
+        let proto = self.error_classes.prototype(kind);
+        let proto_value = Value::Object(proto);
+        let obj =
+            self.alloc_stack_rooted_object_with_extra_roots(stack, &[message_value, &proto_value])?;
+        object::set_prototype(obj, &mut self.gc_heap, Some(proto));
+        if let Some(text) = message {
+            let s = JsString::from_str(&text, &self.string_heap)?;
+            object::set(obj, &mut self.gc_heap, "message", Value::String(s));
+        }
+        Ok(obj)
     }
 
     pub(crate) fn run_load_builtin_error_reg(
@@ -205,7 +219,7 @@ impl Interpreter {
     }
 }
 
-fn error_message_from_value(value: Value) -> Option<String> {
+fn error_message_from_value(value: &Value) -> Option<String> {
     match value {
         Value::Undefined => None,
         Value::String(s) => Some(s.to_lossy_string()),

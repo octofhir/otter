@@ -73,7 +73,7 @@ fn require_date_time<'a>(
     }
 }
 
-fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_date_time(args)?;
     let formatted = match args.args.first() {
         Some(Value::Number(n)) => format_epoch_ms(n.as_f64() as i64, payload),
@@ -106,7 +106,7 @@ fn impl_format(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     js_string(&formatted, args.string_heap).map_err(intl_to_intrinsic)
 }
 
-fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_date_time(args)?;
     let component = |present: bool| {
         if present {
@@ -150,28 +150,28 @@ fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
         "iso8601",
         args.string_heap,
     )?);
-    let mut heap = args.gc_heap.borrow_mut();
-    let obj = crate::object::alloc_object(*heap)?;
-    crate::object::set(obj, *heap, "locale", locale_value);
+    let heap = &mut *args.gc_heap;
+    let obj = crate::object::alloc_object(heap)?;
+    crate::object::set(obj, heap, "locale", locale_value);
     if let Some(v) = yr {
-        crate::object::set(obj, *heap, "year", v);
+        crate::object::set(obj, heap, "year", v);
     }
     if let Some(v) = mo {
-        crate::object::set(obj, *heap, "month", v);
+        crate::object::set(obj, heap, "month", v);
     }
     if let Some(v) = da {
-        crate::object::set(obj, *heap, "day", v);
+        crate::object::set(obj, heap, "day", v);
     }
     if let Some(v) = hr {
-        crate::object::set(obj, *heap, "hour", v);
+        crate::object::set(obj, heap, "hour", v);
     }
     if let Some(v) = mi {
-        crate::object::set(obj, *heap, "minute", v);
+        crate::object::set(obj, heap, "minute", v);
     }
     if let Some(v) = se {
-        crate::object::set(obj, *heap, "second", v);
+        crate::object::set(obj, heap, "second", v);
     }
-    crate::object::set(obj, *heap, "calendar", calendar);
+    crate::object::set(obj, heap, "calendar", calendar);
     let _ = NumberValue::from_i32; // keep import live
     Ok(Value::Object(obj))
 }

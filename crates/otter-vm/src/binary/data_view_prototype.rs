@@ -67,7 +67,7 @@ fn ensure_within(
 }
 
 fn read_bytes<F, R>(
-    args: &IntrinsicArgs<'_>,
+    args: &mut IntrinsicArgs<'_>,
     byte_count: usize,
     le_arg: usize,
     f: F,
@@ -88,7 +88,7 @@ where
 }
 
 fn write_bytes<F>(
-    args: &IntrinsicArgs<'_>,
+    args: &mut IntrinsicArgs<'_>,
     byte_count: usize,
     f: F,
 ) -> Result<Value, IntrinsicError>
@@ -113,15 +113,15 @@ where
 
 // ---- getX implementations -----------------------------------------------
 
-fn impl_get_int8(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_int8(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 1, 1, |s, _| smi(i8::from_le_bytes([s[0]]) as i32))
 }
 
-fn impl_get_uint8(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_uint8(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 1, 1, |s, _| smi(s[0] as i32))
 }
 
-fn impl_get_int16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_int16(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 2, 1, |s, le| {
         let v = if le {
             i16::from_le_bytes([s[0], s[1]])
@@ -132,7 +132,7 @@ fn impl_get_int16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_get_uint16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_uint16(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 2, 1, |s, le| {
         let v = if le {
             u16::from_le_bytes([s[0], s[1]])
@@ -143,7 +143,7 @@ fn impl_get_uint16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_get_int32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_int32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 4, 1, |s, le| {
         let buf = [s[0], s[1], s[2], s[3]];
         let v = if le {
@@ -155,7 +155,7 @@ fn impl_get_int32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_get_uint32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_uint32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 4, 1, |s, le| {
         let buf = [s[0], s[1], s[2], s[3]];
         let v = if le {
@@ -167,7 +167,7 @@ fn impl_get_uint32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_get_float32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_float32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 4, 1, |s, le| {
         let buf = [s[0], s[1], s[2], s[3]];
         let v = if le {
@@ -179,7 +179,7 @@ fn impl_get_float32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_get_float64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_float64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 8, 1, |s, le| {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(s);
@@ -192,7 +192,7 @@ fn impl_get_float64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_get_bigint64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_bigint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 8, 1, |s, le| {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(s);
@@ -205,7 +205,7 @@ fn impl_get_bigint64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     })
 }
 
-fn impl_get_biguint64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_biguint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     read_bytes(args, 8, 1, |s, le| {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(s);
@@ -273,21 +273,21 @@ fn coerce_biguint64(value: &Value) -> u64 {
     wrapped.to_u64().unwrap_or(0)
 }
 
-fn impl_set_int8(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_int8(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 1, |b, v, _| {
         let n = coerce_int(v) as i8;
         b[0] = n as u8;
     })
 }
 
-fn impl_set_uint8(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_uint8(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 1, |b, v, _| {
         let n = coerce_int(v) as u8;
         b[0] = n;
     })
 }
 
-fn impl_set_int16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_int16(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 2, |b, v, le| {
         let n = coerce_int(v) as i16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -295,7 +295,7 @@ fn impl_set_int16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_set_uint16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_uint16(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 2, |b, v, le| {
         let n = coerce_int(v) as u16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -303,7 +303,7 @@ fn impl_set_uint16(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_set_int32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_int32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 4, |b, v, le| {
         let n = crate::number::bitwise::to_int32(coerce_number(v));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -311,7 +311,7 @@ fn impl_set_int32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_set_uint32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_uint32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 4, |b, v, le| {
         let n = crate::number::bitwise::to_uint32(coerce_number(v));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -319,7 +319,7 @@ fn impl_set_uint32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_set_float32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_float32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 4, |b, v, le| {
         let n = coerce_number(v).as_f64() as f32;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -327,7 +327,7 @@ fn impl_set_float32(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_set_float64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_float64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 8, |b, v, le| {
         let n = coerce_number(v).as_f64();
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -335,7 +335,7 @@ fn impl_set_float64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })
 }
 
-fn impl_set_bigint64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_bigint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 8, |b, v, le| {
         let n = coerce_bigint64(v);
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -343,7 +343,7 @@ fn impl_set_bigint64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     })
 }
 
-fn impl_set_biguint64(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_set_biguint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     write_bytes(args, 8, |b, v, le| {
         let n = coerce_biguint64(v);
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };

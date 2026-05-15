@@ -34,29 +34,12 @@ use crate::regexp::JsRegExp;
 use crate::string::Interrupted;
 use crate::string::JsString;
 
-enum ReceiverString<'a> {
-    Borrowed(&'a JsString),
-    Owned(JsString),
-}
-
-impl std::ops::Deref for ReceiverString<'_> {
-    type Target = JsString;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Borrowed(value) => value,
-            Self::Owned(value) => value,
-        }
-    }
-}
-
-fn receiver_string<'a>(args: &'a IntrinsicArgs<'_>) -> Result<ReceiverString<'a>, IntrinsicError> {
+fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError> {
     match args.receiver {
-        Value::String(s) => Ok(ReceiverString::Borrowed(s)),
+        Value::String(s) => Ok(s.clone()),
         Value::Object(obj) => {
-            let gc = args.gc_heap.borrow();
-            crate::object::string_data(*obj, &gc)
-                .map(ReceiverString::Owned)
+            let gc = &*args.gc_heap;
+            crate::object::string_data(*obj, gc)
                 .ok_or(IntrinsicError::BadReceiver { expected: "string" })
         }
         _ => Err(IntrinsicError::BadReceiver { expected: "string" }),
@@ -269,12 +252,12 @@ fn find_substr(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
     None
 }
 
-fn impl_length(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     Ok(Value::Number(NumberValue::from_i32(recv.len() as i32)))
 }
 
-fn impl_char_code_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_char_code_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let idx = arg_u32_or(args, 0, 0)?;
     let value = match recv.char_code_at(idx) {
@@ -284,7 +267,7 @@ fn impl_char_code_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     Ok(Value::Number(value))
 }
 
-fn impl_char_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_char_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let idx = arg_u32_or(args, 0, 0)?;
     let unit = recv.char_code_at(idx);
@@ -297,7 +280,7 @@ fn impl_char_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
 }
 
-fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let total = recv.len();
     let start = arg_u32_or(args, 0, 0)?.min(total);
@@ -310,7 +293,7 @@ fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(out))
 }
 
-fn impl_substring(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_substring(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let total = recv.len();
     let mut start = arg_u32_or(args, 0, 0)?.min(total);
@@ -327,7 +310,7 @@ fn impl_substring(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(out))
 }
 
-fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let needle = arg_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
@@ -344,21 +327,21 @@ fn impl_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Number(value))
 }
 
-fn impl_starts_with(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_starts_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let needle = arg_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
     Ok(Value::Boolean(recv.starts_with(needle, from)))
 }
 
-fn impl_ends_with(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_ends_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let needle = arg_string(args, 0)?;
     let end_pos = arg_u32_or(args, 1, recv.len())?;
     Ok(Value::Boolean(recv.ends_with(needle, end_pos)))
 }
 
-fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let needle = arg_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
@@ -371,7 +354,7 @@ fn impl_includes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Boolean(pos.is_some()))
 }
 
-fn impl_concat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let mut result = recv.clone();
     for (i, v) in args.args.iter().enumerate() {
@@ -390,7 +373,7 @@ fn impl_concat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(result))
 }
 
-fn impl_repeat(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_repeat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let count = arg_int_or(args, 0, 0)?;
     if count < 0 {
@@ -468,11 +451,11 @@ fn pad_impl(args: &IntrinsicArgs<'_>, side: PadSide) -> Result<Value, IntrinsicE
     )?))
 }
 
-fn impl_pad_start(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_pad_start(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     pad_impl(args, PadSide::Start)
 }
 
-fn impl_pad_end(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_pad_end(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     pad_impl(args, PadSide::End)
 }
 
@@ -512,19 +495,19 @@ fn trim_impl(args: &IntrinsicArgs<'_>, side: TrimSide) -> Result<Value, Intrinsi
     )?))
 }
 
-fn impl_trim(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_trim(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     trim_impl(args, TrimSide::Both)
 }
 
-fn impl_trim_start(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_trim_start(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     trim_impl(args, TrimSide::Start)
 }
 
-fn impl_trim_end(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_trim_end(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     trim_impl(args, TrimSide::End)
 }
 
-fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let raw = arg_int_or(args, 0, 0)?;
     let len = recv.len() as i64;
@@ -545,7 +528,7 @@ fn impl_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     )?))
 }
 
-fn impl_code_point_at(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_code_point_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let raw = arg_int_or(args, 0, 0)?;
     let len = recv.len() as i64;
@@ -568,7 +551,7 @@ fn map_ascii<F: Fn(u16) -> u16>(units: &[u16], f: F) -> Vec<u16> {
     units.iter().map(|&u| f(u)).collect()
 }
 
-fn impl_to_lower_case(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_lower_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let units = recv.to_utf16_vec();
     let lowered = map_ascii(&units, |u| {
@@ -584,7 +567,7 @@ fn impl_to_lower_case(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     )?))
 }
 
-fn impl_to_upper_case(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_upper_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let units = recv.to_utf16_vec();
     let upper = map_ascii(&units, |u| {
@@ -600,15 +583,15 @@ fn impl_to_upper_case(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     )?))
 }
 
-fn impl_replace(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     if let Some(Value::RegExp(re)) = args.args.first() {
         let replacement = arg_string(args, 1)?;
-        let heap = args.gc_heap.borrow();
+        let heap = &*args.gc_heap;
         return regex_replace(
             &recv,
             re,
-            &heap,
+            heap,
             &replacement.to_utf16_vec(),
             args.string_heap,
         );
@@ -643,12 +626,12 @@ fn impl_replace(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     )?))
 }
 
-fn impl_replace_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     if let Some(Value::RegExp(re)) = args.args.first() {
         // Spec: `replaceAll` requires the `g` flag for regex args.
-        let heap = args.gc_heap.borrow();
-        if !re.flags(&heap).global {
+        let heap = &*args.gc_heap;
+        if !re.flags(heap).global {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
                 reason: "must be a global regular expression",
@@ -658,7 +641,7 @@ fn impl_replace_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         return regex_replace(
             &recv,
             re,
-            &heap,
+            heap,
             &replacement.to_utf16_vec(),
             args.string_heap,
         );
@@ -705,23 +688,24 @@ fn impl_replace_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     )?))
 }
 
-fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
 
     // Regex separator → defer to the dedicated walker.
     if let Some(Value::RegExp(re)) = args.args.first() {
+        let re = *re;
         let limit = parse_split_limit(args)?;
-        let mut heap = args.gc_heap.borrow_mut();
-        return regex_split(&recv, re, limit, args.string_heap, *heap);
+        return regex_split(&recv, &re, limit, args);
     }
 
     // Resolve separator: missing or `undefined` → caller-as-only-element.
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => {
-            let mut heap = args.gc_heap.borrow_mut();
-            return Ok(Value::Array(crate::array::from_elements(
-                *heap,
-                [Value::String(recv.clone())],
+            let singleton = [Value::String(recv.clone())];
+            return Ok(Value::Array(args.array_from_elements_rooted(
+                singleton.iter().cloned(),
+                &[],
+                &[singleton.as_slice()],
             )?));
         }
         Some(Value::String(s)) => s,
@@ -735,8 +719,11 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
     let limit = parse_split_limit(args)?;
     if limit == 0 {
-        let mut heap = args.gc_heap.borrow_mut();
-        return Ok(Value::Array(crate::array::alloc_array(*heap)?));
+        return Ok(Value::Array(args.array_from_elements_rooted(
+            std::iter::empty(),
+            &[],
+            &[],
+        )?));
     }
 
     let recv_units = recv.to_utf16_vec();
@@ -751,8 +738,11 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 args.string_heap,
             )?));
         }
-        let mut heap = args.gc_heap.borrow_mut();
-        return Ok(Value::Array(crate::array::from_elements(*heap, out)?));
+        return Ok(Value::Array(args.array_from_elements_rooted(
+            out.iter().cloned(),
+            &[],
+            &[out.as_slice()],
+        )?));
     }
 
     let mut out: Vec<Value> = Vec::new();
@@ -771,8 +761,11 @@ fn impl_split(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let part = JsString::from_utf16_units(&recv_units[start..], args.string_heap)?;
         out.push(Value::String(part));
     }
-    let mut heap = args.gc_heap.borrow_mut();
-    Ok(Value::Array(crate::array::from_elements(*heap, out)?))
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
 }
 
 /// Common limit-arg parser shared by string-separator and
@@ -830,16 +823,21 @@ fn regex_split(
     recv: &JsString,
     re: &JsRegExp,
     limit: u32,
-    string_heap: &crate::string::StringHeap,
-    gc_heap: &mut otter_gc::GcHeap,
+    args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     if limit == 0 {
-        return Ok(Value::Array(crate::array::alloc_array(gc_heap)?));
+        return Ok(Value::Array(args.array_from_elements_rooted(
+            std::iter::empty(),
+            &[],
+            &[],
+        )?));
     }
     let recv_units = recv.to_utf16_vec();
     let mut out: Vec<Value> = Vec::new();
     let mut cursor: usize = 0;
-    let mut iter = re.find_from_utf16(gc_heap, &recv_units, 0).into_iter();
+    let mut iter = re
+        .find_from_utf16(&*args.gc_heap, &recv_units, 0)
+        .into_iter();
     while (out.len() as u32) < limit {
         let m = match iter.next() {
             Some(m) => m,
@@ -855,18 +853,25 @@ fn regex_split(
             // Drop the iterator and resume after the cursor advance.
             drop(iter);
             cursor += 1;
-            iter = re.find_from_utf16(gc_heap, &recv_units, cursor).into_iter();
+            iter = re
+                .find_from_utf16(&*args.gc_heap, &recv_units, cursor)
+                .into_iter();
             continue;
         }
-        let part = JsString::from_utf16_units(&recv_units[cursor..m.range.start], string_heap)?;
+        let part =
+            JsString::from_utf16_units(&recv_units[cursor..m.range.start], args.string_heap)?;
         out.push(Value::String(part));
         cursor = m.range.end;
     }
     if (out.len() as u32) < limit {
-        let part = JsString::from_utf16_units(&recv_units[cursor..], string_heap)?;
+        let part = JsString::from_utf16_units(&recv_units[cursor..], args.string_heap)?;
         out.push(Value::String(part));
     }
-    Ok(Value::Array(crate::array::from_elements(gc_heap, out)?))
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
 }
 
 /// §7.2.8 [`IsRegExp`](https://tc39.es/ecma262/#sec-isregexp): the
@@ -904,7 +909,7 @@ fn coerce_pattern_to_regexp(
     })
 }
 
-fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let coerced;
     let re = if is_regexp_arg(args.args.first()) {
@@ -914,15 +919,14 @@ fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     } else {
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        let mut heap = args.gc_heap.borrow_mut();
-        coerced = coerce_pattern_to_regexp(arg0, "", *heap)?;
+        let heap = &mut *args.gc_heap;
+        coerced = coerce_pattern_to_regexp(arg0, "", heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
-    let mut heap = args.gc_heap.borrow_mut();
-    if re.flags(*heap).global {
+    if re.flags(&*args.gc_heap).global {
         // `g` flag → return array of full matches only (no captures).
-        let matches = collect_regex_matches(re, *heap, &recv_units);
+        let matches = collect_regex_matches(re, &*args.gc_heap, &recv_units);
         if matches.is_empty() {
             return Ok(Value::Null);
         }
@@ -931,28 +935,37 @@ fn impl_match(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let s = JsString::from_utf16_units(&recv_units[m.range.clone()], args.string_heap)?;
             out.push(Value::String(s));
         }
-        return Ok(Value::Array(crate::array::from_elements(*heap, out)?));
+        return Ok(Value::Array(args.array_from_elements_rooted(
+            out.iter().cloned(),
+            &[],
+            &[out.as_slice()],
+        )?));
     }
     // Non-global → mirror `RegExp.prototype.exec` (carries
     // `index` / `input` / `groups` per §22.2.7.2).
-    let m = match re.find_from_utf16(*heap, &recv_units, 0).into_iter().next() {
+    let m = match re
+        .find_from_utf16(&*args.gc_heap, &recv_units, 0)
+        .into_iter()
+        .next()
+    {
         Some(m) => m,
         None => return Ok(Value::Null),
     };
     let recv_clone = recv.clone();
-    let has_indices = re.flags(*heap).has_indices;
+    let has_indices = re.flags(&*args.gc_heap).has_indices;
+    let heap = &mut *args.gc_heap;
     let arr = crate::regexp_prototype::build_match_result(
         &m,
         &recv_units,
         &recv_clone,
         has_indices,
         args.string_heap,
-        *heap,
+        heap,
     )?;
     Ok(Value::Array(arr))
 }
 
-fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let coerced;
     let re = if is_regexp_arg(args.args.first()) {
@@ -962,8 +975,8 @@ fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         };
         // §22.1.3.14 step 5.b: matchAll requires the global flag on
         // a RegExp arg; non-global is a TypeError.
-        let heap = args.gc_heap.borrow();
-        if !r.flags(&heap).global {
+        let heap = &*args.gc_heap;
+        if !r.flags(heap).global {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
                 reason: "must be a global regular expression",
@@ -975,31 +988,35 @@ fn impl_match_all(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         // synthesised regex always has `g` set so the iteration
         // sweep visits every match.
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        let mut heap = args.gc_heap.borrow_mut();
-        coerced = coerce_pattern_to_regexp(arg0, "g", *heap)?;
+        let heap = &mut *args.gc_heap;
+        coerced = coerce_pattern_to_regexp(arg0, "g", heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
-    let mut heap = args.gc_heap.borrow_mut();
-    let matches = collect_regex_matches(re, *heap, &recv_units);
-    let has_indices = re.flags(*heap).has_indices;
+    let matches = collect_regex_matches(re, &*args.gc_heap, &recv_units);
+    let has_indices = re.flags(&*args.gc_heap).has_indices;
     let recv_clone = recv.clone();
     let mut out: Vec<Value> = Vec::with_capacity(matches.len());
     for m in &matches {
+        let heap = &mut *args.gc_heap;
         let arr = crate::regexp_prototype::build_match_result(
             m,
             &recv_units,
             &recv_clone,
             has_indices,
             args.string_heap,
-            *heap,
+            heap,
         )?;
         out.push(Value::Array(arr));
     }
-    Ok(Value::Array(crate::array::from_elements(*heap, out)?))
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
 }
 
-fn impl_search(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let coerced;
     let re = if is_regexp_arg(args.args.first()) {
@@ -1009,16 +1026,16 @@ fn impl_search(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     } else {
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        let mut heap = args.gc_heap.borrow_mut();
-        coerced = coerce_pattern_to_regexp(arg0, "", *heap)?;
+        let heap = &mut *args.gc_heap;
+        coerced = coerce_pattern_to_regexp(arg0, "", heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
     // `search` always starts at index 0 — `lastIndex` is ignored
     // and not mutated per spec §22.1.3.13.
-    let heap = args.gc_heap.borrow();
+    let heap = &*args.gc_heap;
     let pos = re
-        .find_from_utf16(&heap, &recv_units, 0)
+        .find_from_utf16(heap, &recv_units, 0)
         .into_iter()
         .next()
         .map_or(-1, |m| m.range.start as i32);
@@ -1070,7 +1087,7 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
     });
 
 /// §22.1.3.10 String.prototype.lastIndexOf(search, fromIndex?).
-fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let needle = arg_string(args, 0)?;
     // ECMA-262 §22.1.3.11: `position` defaults to +∞, then
@@ -1093,7 +1110,7 @@ fn impl_last_index_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// §22.1.3.12 String.prototype.localeCompare. Foundation falls
 /// back to spec-default Unicode code-point comparison; locale-
 /// aware ordering ships through `Intl.Collator`.
-fn impl_locale_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?.to_lossy_string();
     let other = match args.args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
@@ -1115,7 +1132,7 @@ fn impl_locale_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
 /// surface so call sites that depend on the method existing keep
 /// working. Real normalisation lands alongside the ICU integration
 /// follow-up.
-fn impl_normalize(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_normalize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let form = match args.args.first() {
         None | Some(Value::Undefined) => "NFC".to_string(),
@@ -1133,13 +1150,13 @@ fn impl_normalize(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             reason: "must be one of NFC / NFD / NFKC / NFKD",
         });
     }
-    Ok(Value::String((*recv).clone()))
+    Ok(Value::String(recv.clone()))
 }
 
 /// §22.1.3.27 String.prototype.toString — returns the primitive.
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    Ok(Value::String((*recv).clone()))
+    Ok(Value::String(recv.clone()))
 }
 
 /// Convenience accessor used by the dispatcher.
@@ -1169,11 +1186,12 @@ mod tests {
             })
             .collect();
         let entry = lookup(method).unwrap();
-        let result = (entry.impl_fn)(&IntrinsicArgs {
+        let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv_v,
             args: &arg_vs,
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap();
         result.display_string()
@@ -1227,11 +1245,12 @@ mod tests {
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = lookup("length").unwrap();
-        let err = (entry.impl_fn)(&IntrinsicArgs {
+        let err = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &Value::Undefined,
             args: &[],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadReceiver { .. }));
@@ -1259,20 +1278,21 @@ mod tests {
         heap: &StringHeap,
         gc_heap: &mut otter_gc::GcHeap,
     ) -> Value {
-        let recv_v = Value::String(JsString::from_str(recv, heap).unwrap());
+        let recv_v = Value::String(JsString::from_str(recv, &heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|a| match a {
                 A::N(n) => Value::Number(NumberValue::from_i32(*n)),
-                A::S(s) => Value::String(JsString::from_str(s, heap).unwrap()),
+                A::S(s) => Value::String(JsString::from_str(s, &heap).unwrap()),
             })
             .collect();
         let entry = lookup(method).unwrap();
-        (entry.impl_fn)(&IntrinsicArgs {
+        (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv_v,
             args: &arg_vs,
-            string_heap: heap,
-            gc_heap: std::cell::RefCell::new(gc_heap),
+            string_heap: &heap,
+            gc_heap,
+            allocation_roots: &[],
         })
         .unwrap()
     }
@@ -1310,11 +1330,12 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("a", &heap).unwrap());
         let entry = lookup("concat").unwrap();
-        let err = (entry.impl_fn)(&IntrinsicArgs {
+        let err = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(3))],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadArgument { .. }));
@@ -1333,11 +1354,12 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("abc", &heap).unwrap());
         let entry = lookup("repeat").unwrap();
-        let err = (entry.impl_fn)(&IntrinsicArgs {
+        let err = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(-1))],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadArgument { .. }));
@@ -1399,20 +1421,22 @@ mod tests {
         let units: [u16; 3] = [0xD800, 0xDC00, b'a' as u16];
         let recv = Value::String(JsString::from_utf16_units(&units, &heap).unwrap());
         let entry = lookup("codePointAt").unwrap();
-        let r = (entry.impl_fn)(&IntrinsicArgs {
+        let r = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(0))],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap();
         assert_eq!(r.display_string(), "65536");
         // Index 1 is the trailing surrogate alone.
-        let r2 = (entry.impl_fn)(&IntrinsicArgs {
+        let r2 = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(1))],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap();
         assert_eq!(r2.display_string(), "56320");
@@ -1430,11 +1454,12 @@ mod tests {
         let recv = Value::String(JsString::from_utf16_units(&units, &heap).unwrap());
         let entry = lookup("toLowerCase").unwrap();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let r = (entry.impl_fn)(&IntrinsicArgs {
+        let r = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap();
         // 'É' should stay (ASCII-only fold), 'a','b' lowercase.
@@ -1587,11 +1612,12 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("abc", &heap).unwrap());
         let entry = lookup("split").unwrap();
-        let r = (entry.impl_fn)(&IntrinsicArgs {
+        let r = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap();
         match r {

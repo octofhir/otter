@@ -29,7 +29,7 @@ fn receiver_bigint(args: &IntrinsicArgs<'_>) -> Result<BigIntValue, IntrinsicErr
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-bigint.prototype.tostring>
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_bigint(args)?;
     let radix: u32 = match args.args.first() {
         None | Some(Value::Undefined) => 10,
@@ -65,7 +65,7 @@ fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-bigint.prototype.valueof>
-fn impl_value_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::BigInt(receiver_bigint(args)?))
 }
 

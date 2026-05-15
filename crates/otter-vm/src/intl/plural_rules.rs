@@ -68,7 +68,7 @@ fn require_payload<'a>(
 }
 
 /// §15.5.4 — `Intl.PluralRules.prototype.select(value)`.
-fn impl_select(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_select(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let n = match args.args.first() {
         Some(Value::Number(n)) => n.as_f64(),
@@ -83,32 +83,32 @@ fn impl_select(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 /// §15.5.5 — `Intl.PluralRules.prototype.resolvedOptions()`.
-fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
     let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
     let mid = payload.minimum_integer_digits as i32;
     let mfd = payload.minimum_fraction_digits as i32;
     let xfd = payload.maximum_fraction_digits as i32;
-    let mut heap = args.gc_heap.borrow_mut();
-    let obj = crate::object::alloc_object(*heap)?;
-    crate::object::set(obj, *heap, "locale", locale);
-    crate::object::set(obj, *heap, "type", kind);
+    let heap = &mut *args.gc_heap;
+    let obj = crate::object::alloc_object(heap)?;
+    crate::object::set(obj, heap, "locale", locale);
+    crate::object::set(obj, heap, "type", kind);
     crate::object::set(
         obj,
-        *heap,
+        heap,
         "minimumIntegerDigits",
         Value::Number(crate::number::NumberValue::from_i32(mid)),
     );
     crate::object::set(
         obj,
-        *heap,
+        heap,
         "minimumFractionDigits",
         Value::Number(crate::number::NumberValue::from_i32(mfd)),
     );
     crate::object::set(
         obj,
-        *heap,
+        heap,
         "maximumFractionDigits",
         Value::Number(crate::number::NumberValue::from_i32(xfd)),
     );

@@ -24,8 +24,8 @@ fn receiver_bool(args: &IntrinsicArgs<'_>) -> Result<bool, IntrinsicError> {
     match args.receiver {
         Value::Boolean(b) => Ok(*b),
         Value::Object(obj) => {
-            let gc = args.gc_heap.borrow();
-            crate::object::boolean_data(*obj, &gc).ok_or(IntrinsicError::BadReceiver {
+            let gc = &*args.gc_heap;
+            crate::object::boolean_data(*obj, gc).ok_or(IntrinsicError::BadReceiver {
                 expected: "boolean",
             })
         }
@@ -36,7 +36,7 @@ fn receiver_bool(args: &IntrinsicArgs<'_>) -> Result<bool, IntrinsicError> {
 }
 
 /// §20.3.3.2 Boolean.prototype.toString — `"true"` / `"false"`.
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = if receiver_bool(args)? {
         "true"
     } else {
@@ -46,7 +46,7 @@ fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 /// §20.3.3.3 Boolean.prototype.valueOf — returns the receiver.
-fn impl_value_of(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Boolean(receiver_bool(args)?))
 }
 
@@ -93,16 +93,20 @@ fn native_boolean_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
-    let string_heap = ctx.interp_mut().string_heap_clone();
+    let (string_heap, allocation_roots) = {
+        let interp = ctx.interp_mut();
+        (interp.string_heap_clone(), interp.collect_runtime_roots())
+    };
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Boolean.prototype method".to_string(),
     })?;
-    (entry.impl_fn)(&IntrinsicArgs {
+    (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
         args,
         string_heap: &string_heap,
-        gc_heap: std::cell::RefCell::new(ctx.heap_mut()),
+        gc_heap: ctx.heap_mut(),
+        allocation_roots: allocation_roots.as_slice(),
     })
     .map_err(|err| NativeError::TypeError {
         name,

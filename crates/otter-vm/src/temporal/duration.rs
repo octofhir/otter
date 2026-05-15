@@ -233,7 +233,7 @@ pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
 
 // ── Prototype table ──────────────────────────────────────────────
 
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let dur = require_duration(args)?;
     let s = dur
         .as_temporal_string(temporal_rs::options::ToStringRoundingOptions::default())
@@ -241,31 +241,31 @@ fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     js_string_value(s, args)
 }
 
-fn impl_add(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let lhs = require_duration(args)?;
     let rhs = duration_arg(args, 0)?;
     let result = lhs.add(&rhs).map_err(temporal_err)?;
     Ok(make_temporal(TemporalPayload::Duration(result)))
 }
 
-fn impl_subtract(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let lhs = require_duration(args)?;
     let rhs = duration_arg(args, 0)?;
     let result = lhs.subtract(&rhs).map_err(temporal_err)?;
     Ok(make_temporal(TemporalPayload::Duration(result)))
 }
 
-fn impl_negated(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_negated(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let dur = require_duration(args)?;
     Ok(make_temporal(TemporalPayload::Duration(dur.negated())))
 }
 
-fn impl_abs(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_abs(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let dur = require_duration(args)?;
     Ok(make_temporal(TemporalPayload::Duration(dur.abs())))
 }
 
-fn impl_total(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_total(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let dur = require_duration(args)?;
     let opts = optional_object_arg(args, 0).ok_or(IntrinsicError::BadArgument {
         index: 0,
@@ -273,8 +273,8 @@ fn impl_total(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     })?;
     let _ = read_i64_field;
     let unit_name = {
-        let heap = args.gc_heap.borrow();
-        read_string_field(opts, "unit", &heap)
+        let heap = &*args.gc_heap;
+        read_string_field(opts, "unit", heap)
     }
     .ok_or(IntrinsicError::BadArgument {
         index: 0,
@@ -305,8 +305,8 @@ fn duration_arg(
             }),
         },
         Some(Value::Object(obj)) => {
-            let heap = args.gc_heap.borrow();
-            partial_from_object(obj, &heap).map_err(|_| IntrinsicError::BadArgument {
+            let heap = &*args.gc_heap;
+            partial_from_object(obj, heap).map_err(|_| IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration partial",
             })

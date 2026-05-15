@@ -54,7 +54,7 @@ fn require_collator<'a>(
     }
 }
 
-fn impl_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_collator(args)?;
     let x = match args.args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
@@ -72,7 +72,7 @@ fn impl_compare(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Number(NumberValue::from_i32(n)))
 }
 
-fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_collator(args)?;
     let locale = js_string_value(&payload.locale, args)?;
     let usage = js_string_value(&payload.usage, args)?;
@@ -80,19 +80,19 @@ fn impl_resolved_options(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let case_first = js_string_value(&payload.case_first, args)?;
     let ignore_punctuation = payload.ignore_punctuation;
     let numeric = payload.numeric;
-    let mut heap = args.gc_heap.borrow_mut();
-    let obj = crate::object::alloc_object(*heap)?;
-    crate::object::set(obj, *heap, "locale", locale);
-    crate::object::set(obj, *heap, "usage", usage);
-    crate::object::set(obj, *heap, "sensitivity", sensitivity);
+    let heap = &mut *args.gc_heap;
+    let obj = crate::object::alloc_object(heap)?;
+    crate::object::set(obj, heap, "locale", locale);
+    crate::object::set(obj, heap, "usage", usage);
+    crate::object::set(obj, heap, "sensitivity", sensitivity);
     crate::object::set(
         obj,
-        *heap,
+        heap,
         "ignorePunctuation",
         Value::Boolean(ignore_punctuation),
     );
-    crate::object::set(obj, *heap, "numeric", Value::Boolean(numeric));
-    crate::object::set(obj, *heap, "caseFirst", case_first);
+    crate::object::set(obj, heap, "numeric", Value::Boolean(numeric));
+    crate::object::set(obj, heap, "caseFirst", case_first);
     Ok(Value::Object(obj))
 }
 

@@ -266,6 +266,56 @@ pub fn set(
     Ok(())
 }
 
+/// Write an indexed element while exposing caller-owned roots during any
+/// dense-storage reservation.
+///
+/// This mirrors [`set`] for VM stack-owned mutation sites. Sparse writes do
+/// not reserve dense backing storage and therefore keep the ordinary path; low
+/// dense writes trace the receiver handle plus pending value before a possible
+/// reservation-triggered emergency collection.
+pub(crate) fn set_with_roots(
+    mut arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    idx: usize,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let barrier_value = value.clone();
+    let target_len = idx.saturating_add(1);
+    if should_store_sparse(arr, heap, idx) {
+        heap.with_payload(arr, |body| {
+            let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
+            sparse.insert(idx, value);
+            body.dirty = true;
+        });
+        heap.record_write(arr, &barrier_value);
+        return Ok(());
+    }
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            value.trace_value_slots(visitor);
+        };
+        reserve_for_target_len_with_roots(&mut arr, heap, target_len, &mut reserve_roots)?;
+    }
+    heap.with_payload(arr, |body| {
+        if idx < body.elements.len() {
+            body.elements[idx] = value;
+            body.dirty = true;
+            return;
+        }
+        body.elements
+            .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        while body.elements.len() < idx {
+            body.elements.push(Value::Hole);
+        }
+        body.elements.push(value);
+        body.dirty = true;
+    });
+    heap.record_write(arr, &barrier_value);
+    Ok(())
+}
+
 /// Push to the tail. Returns the new length.
 ///
 /// # Errors
@@ -280,6 +330,39 @@ pub fn push(
     let barrier_value = value.clone();
     let target_len = len(arr, heap).saturating_add(1);
     reserve_for_target_len(arr, heap, target_len)?;
+    let new_len = heap.with_payload(arr, |body| {
+        body.elements
+            .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        body.elements.push(value);
+        body.dirty = true;
+        body.elements.len()
+    });
+    heap.record_write(arr, &barrier_value);
+    Ok(new_len)
+}
+
+/// Push to the tail while exposing caller-owned roots during any
+/// off-slot dense-storage reservation.
+///
+/// This mirrors [`push`] but is reserved for VM stack-owned mutation
+/// sites. The pending value and the receiver handle are traced along
+/// with the caller-provided roots if reservation-triggered emergency
+/// collection runs before the dense vector grows.
+pub(crate) fn push_with_roots(
+    mut arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<usize, otter_gc::OutOfMemory> {
+    let barrier_value = value.clone();
+    let target_len = len(arr, heap).saturating_add(1);
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            value.trace_value_slots(visitor);
+        };
+        reserve_for_target_len_with_roots(&mut arr, heap, target_len, &mut reserve_roots)?;
+    }
     let new_len = heap.with_payload(arr, |body| {
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
@@ -538,6 +621,31 @@ fn reserve_for_target_len(
     let after = spilled_capacity_bytes(target_len);
     if after > before {
         heap.reserve_bytes_no_collect((after - before) as u64)?;
+    }
+    // The actual reserve is performed under `with_payload` after the
+    // cap check succeeds; keep this helper allocation-free.
+    Ok(())
+}
+
+fn reserve_for_target_len_with_roots(
+    arr: &mut JsArray,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let current_capacity = heap.read_payload(*arr, |body| body.elements.capacity());
+    if target_len <= current_capacity {
+        return Ok(());
+    }
+
+    let before = spilled_capacity_bytes(current_capacity);
+    let after = spilled_capacity_bytes(target_len);
+    if after > before {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            visitor(std::ptr::addr_of_mut!(*arr) as *mut RawGc);
+        };
+        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
     }
     // The actual reserve is performed under `with_payload` after the
     // cap check succeeds; keep this helper allocation-free.

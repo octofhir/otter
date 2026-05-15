@@ -25,7 +25,7 @@ fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsArrayBuffer, IntrinsicError> {
 
 /// §25.1.5.4 `slice(start, end)` — half-open range, clamps to
 /// `[0, byteLength]`, returns a fresh fixed-length buffer.
-fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let buf = receiver(args)?;
     if buf.is_detached() {
         return Err(IntrinsicError::BadReceiver {
@@ -45,7 +45,7 @@ fn impl_slice(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// §25.1.5.6 `resize(newByteLength)` — only valid for resizable
 /// buffers; otherwise raises `TypeError`. Throws `RangeError` when
 /// `newByteLength > maxByteLength`.
-fn impl_resize(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_resize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let buf = receiver(args)?;
     if !buf.is_resizable() || buf.is_detached() {
         return Err(IntrinsicError::BadReceiver {
@@ -73,13 +73,13 @@ fn impl_resize(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// §25.1.5.8 `transfer(newLength?)` — copy + detach. The new buffer
 /// is resizable iff this one was; the new `maxByteLength` carries
 /// over.
-fn impl_transfer(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_transfer(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     transfer_inner(args, /* fixed = */ false)
 }
 
 /// §25.1.5.9 `transferToFixedLength(newLength?)` — same as
 /// [`impl_transfer`] but the resulting buffer is fixed-length.
-fn impl_transfer_to_fixed_length(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_transfer_to_fixed_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     transfer_inner(args, /* fixed = */ true)
 }
 
@@ -146,7 +146,7 @@ fn clamp_relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
 }
 
 /// §25.2.5.4 — `SharedArrayBuffer.prototype.grow(newByteLength)`.
-fn impl_grow(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_grow(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let buf = receiver(args)?;
     if !buf.is_shared() {
         return Err(IntrinsicError::BadReceiver {

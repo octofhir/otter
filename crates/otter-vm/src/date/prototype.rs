@@ -37,53 +37,53 @@ fn smi(n: i32) -> Value {
 
 /// §21.4.4.10 / §21.4.4.44 — `getTime()` / `valueOf()` return the
 /// raw time value.
-fn impl_get_time(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::Number(NumberValue::from_f64(receiver(args)?.time())))
 }
 
-fn impl_get_full_year(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.year))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_month(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.month as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_date(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_date(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.day as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_day(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_day(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.weekday as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_hours(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.hour as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_minutes(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.minute as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_seconds(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.second as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_milliseconds(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(broken_down(receiver(args)?.time())
         .map(|bd| smi(bd.millisecond as i32))
         .unwrap_or_else(nan))
@@ -91,13 +91,13 @@ fn impl_get_milliseconds(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 
 /// §21.4.4.21 — `getTimezoneOffset()`. Foundation treats local time
 /// as UTC, so the offset is always `0`.
-fn impl_get_timezone_offset(_args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_timezone_offset(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(smi(0))
 }
 
 /// §21.4.4.36 — `toISOString()`. Throws RangeError on Invalid Date
 /// per spec; the foundation surfaces that via `BadArgument`.
-fn impl_to_iso_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let date = receiver(args)?;
     let s = to_iso_string(date.time()).ok_or(IntrinsicError::BadArgument {
         index: 0,
@@ -108,7 +108,7 @@ fn impl_to_iso_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 
 /// §21.4.4.41 — `toJSON()`. Returns `toISOString()` for finite
 /// dates and `null` for Invalid Date.
-fn impl_to_json(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let date = receiver(args)?;
     match to_iso_string(date.time()) {
         Some(s) => Ok(Value::String(JsString::from_str(&s, args.string_heap)?)),
@@ -119,7 +119,7 @@ fn impl_to_json(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// §21.4.4.42 — `toString()`. Foundation returns the ISO string
 /// (matching `toISOString` shape; spec uses a locale-friendly
 /// rendering that requires host integration).
-fn impl_to_string(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let date = receiver(args)?;
     let s = to_iso_string(date.time()).unwrap_or_else(|| "Invalid Date".to_string());
     Ok(Value::String(JsString::from_str(&s, args.string_heap)?))

@@ -283,6 +283,16 @@ impl GcHeap {
         ExternalMemory::new(self, bytes)
     }
 
+    /// Reserve native / backing-store bytes while exposing caller-owned roots
+    /// to any emergency collection.
+    pub fn reserve_external_with_roots(
+        &mut self,
+        bytes: u64,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<ExternalMemory, OutOfMemory> {
+        ExternalMemory::new_with_roots(self, bytes, external_visit)
+    }
+
     /// Reserve off-slot bytes without running an emergency
     /// collection.
     ///

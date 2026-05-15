@@ -847,7 +847,8 @@ fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     let s = receiver_set(ctx, "Set.prototype.values")?;
     let snapshot: SmallVec<[Value; 4]> =
         collections::set_values(s, ctx.heap()).into_iter().collect();
-    let array = crate::array::from_elements(ctx.heap_mut(), snapshot)
+    let array = ctx
+        .array_from_elements(snapshot)
         .map_err(|_| oom("Set.prototype.values"))?;
     let iter = crate::alloc_iterator_state(
         ctx.heap_mut(),
@@ -862,11 +863,13 @@ fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
     let values: Vec<Value> = collections::set_values(s, ctx.heap());
     let mut snap: SmallVec<[Value; 4]> = SmallVec::new();
     for v in values {
-        let pair = crate::array::from_elements(ctx.heap_mut(), [v.clone(), v])
+        let pair = ctx
+            .array_from_elements([v.clone(), v])
             .map_err(|_| oom("Set.prototype.entries"))?;
         snap.push(Value::Array(pair));
     }
-    let array = crate::array::from_elements(ctx.heap_mut(), snap)
+    let array = ctx
+        .array_from_elements(snap)
         .map_err(|_| oom("Set.prototype.entries"))?;
     let iter = crate::alloc_iterator_state(
         ctx.heap_mut(),
@@ -1056,15 +1059,17 @@ fn make_map_iterator(
             MapIterKind::Keys => k,
             MapIterKind::Values => v,
             MapIterKind::Entries => {
-                let pair = crate::array::from_elements(ctx.heap_mut(), [k, v])
+                let pair = ctx
+                    .array_from_elements([k, v])
                     .map_err(|_| oom("Map.prototype.entries"))?;
                 Value::Array(pair)
             }
         };
         snapshot.push(element);
     }
-    let array =
-        crate::array::from_elements(ctx.heap_mut(), snapshot).map_err(|_| oom("Map iterator"))?;
+    let array = ctx
+        .array_from_elements(snapshot)
+        .map_err(|_| oom("Map iterator"))?;
     let iter = crate::alloc_iterator_state(
         ctx.heap_mut(),
         crate::IteratorState::Array { array, index: 0 },

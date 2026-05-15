@@ -37,8 +37,10 @@
 //! # See also
 //! - [Architecture](../../../docs/book/src/engine/architecture.md)
 
-use crate::Value;
+use crate::array::{self, JsArray};
 use crate::string::StringHeap;
+use crate::{IteratorHandle, IteratorState, Value};
+use otter_gc::raw::RawGc;
 
 /// Receiver type a [`IntrinsicEntry`] is registered against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -154,23 +156,124 @@ pub struct IntrinsicArgs<'a> {
     pub args: &'a [Value],
     /// String heap for any allocation an intrinsic performs.
     pub string_heap: &'a StringHeap,
-    /// GC heap for object allocations the intrinsic must perform
-    /// (RegExp `groups` / `indices` accessor objects in §22.2.7.7
-    /// MakeMatchIndicesIndexPairArray, JSON reviver wrappers,
-    /// boxed-primitive method receivers, …). Wrapped in
-    /// [`std::cell::RefCell`] so a `fn(&IntrinsicArgs)` impl can
-    /// upgrade to a unique borrow for the duration of an
-    /// allocation; the underlying `&'a mut GcHeap` itself is the
-    /// one and only mutator. The dispatch site is single-threaded
-    /// and the runtime borrow is scoped to a single
-    /// `[[Call]]`-shaped intrinsic body so re-entrancy can't strike
-    /// here. Threaded explicitly through the active mutator context:
-    /// no thread-local heap lookup.
-    pub gc_heap: std::cell::RefCell<&'a mut otter_gc::GcHeap>,
+    /// GC heap for object allocations the intrinsic must perform.
+    /// The intrinsic entry receives `&mut IntrinsicArgs`, so helper
+    /// implementations borrow this directly without interior
+    /// mutability or thread-local heap lookup.
+    pub gc_heap: &'a mut otter_gc::GcHeap,
+    /// External roots supplied by the caller when the intrinsic is
+    /// invoked from a native/runtime path that has no visible VM
+    /// frame stack. Intrinsics must combine these with their
+    /// receiver, argument slice, and local buffers before any
+    /// allocation that may trigger GC.
+    pub allocation_roots: &'a [*mut RawGc],
+}
+
+impl IntrinsicArgs<'_> {
+    /// Allocate an array while exposing the intrinsic receiver, call
+    /// arguments, caller-provided roots, and local pre-publish buffers.
+    pub fn array_from_elements_rooted<I>(
+        &mut self,
+        elements: I,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<JsArray, otter_gc::OutOfMemory>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let elements: Vec<Value> = elements.into_iter().collect();
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(
+                visitor,
+                allocation_roots,
+                receiver,
+                args,
+                value_roots,
+                slice_roots,
+            );
+        };
+        array::from_elements_with_roots(self.gc_heap, elements, &mut external_visit)
+    }
+
+    /// Push into a receiver array while exposing the intrinsic root
+    /// contract to any backing-storage growth.
+    pub fn array_push_rooted(
+        &mut self,
+        array: JsArray,
+        value: Value,
+    ) -> Result<usize, otter_gc::OutOfMemory> {
+        let value_root = value.clone();
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(
+                visitor,
+                allocation_roots,
+                receiver,
+                args,
+                &[&value_root],
+                &[],
+            );
+        };
+        array::push_with_roots(array, self.gc_heap, value, &mut external_visit)
+    }
+
+    /// Allocate iterator state through the same root contract as
+    /// intrinsic array/object allocation.
+    pub fn alloc_iterator_state_rooted(
+        &mut self,
+        state: IteratorState,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<IteratorHandle, otter_gc::OutOfMemory> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(
+                visitor,
+                allocation_roots,
+                receiver,
+                args,
+                value_roots,
+                slice_roots,
+            );
+        };
+        self.gc_heap.alloc_with_roots(state, &mut external_visit)
+    }
 }
 
 /// The intrinsic implementation function pointer.
-pub type IntrinsicFn = fn(&IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>;
+pub type IntrinsicFn = fn(&mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>;
+
+fn visit_intrinsic_allocation_roots(
+    visitor: &mut dyn FnMut(*mut RawGc),
+    allocation_roots: &[*mut RawGc],
+    receiver: &Value,
+    args: &[Value],
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) {
+    for &slot in allocation_roots {
+        visitor(slot);
+    }
+    receiver.trace_value_slots(visitor);
+    for value in args {
+        value.trace_value_slots(visitor);
+    }
+    for value in value_roots {
+        value.trace_value_slots(visitor);
+    }
+    for slice in slice_roots {
+        for value in *slice {
+            value.trace_value_slots(visitor);
+        }
+    }
+}
 
 /// One row in the intrinsic table.
 #[derive(Clone, Copy)]
@@ -309,7 +412,7 @@ impl From<otter_gc::OutOfMemory> for IntrinsicError {
 /// ```ignore
 /// use otter_vm::intrinsics;
 ///
-/// fn impl_starts_with(args: &intrinsics::IntrinsicArgs<'_>)
+/// fn impl_starts_with(args: &mut intrinsics::IntrinsicArgs<'_>)
 ///     -> Result<otter_vm::Value, intrinsics::IntrinsicError> { ... }
 ///
 /// pub static TABLE: otter_vm::intrinsics::IntrinsicTable =
@@ -346,7 +449,7 @@ mod tests {
     use super::*;
     use crate::string::{JsString, StringHeap};
 
-    fn impl_length(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    fn impl_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let recv = match args.receiver {
             Value::String(s) => s,
             _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
@@ -358,7 +461,7 @@ mod tests {
         )?))
     }
 
-    fn impl_concat_with(args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    fn impl_concat_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let recv = match args.receiver {
             Value::String(s) => s,
             _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
@@ -399,11 +502,12 @@ mod tests {
         let entry = STRING_TABLE
             .lookup(IntrinsicReceiver::String, "concatWith")
             .unwrap();
-        let result = (entry.impl_fn)(&IntrinsicArgs {
+        let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[arg],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap();
         assert_eq!(result.display_string(), "abcd");
@@ -416,11 +520,12 @@ mod tests {
         let entry = STRING_TABLE
             .lookup(IntrinsicReceiver::String, "length")
             .unwrap();
-        let err = (entry.impl_fn)(&IntrinsicArgs {
+        let err = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &Value::Undefined,
             args: &[],
             string_heap: &heap,
-            gc_heap: std::cell::RefCell::new(&mut gc_heap),
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
         })
         .unwrap_err();
         assert!(matches!(err, IntrinsicError::BadReceiver { .. }));

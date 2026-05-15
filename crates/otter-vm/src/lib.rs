@@ -3710,8 +3710,7 @@ impl Interpreter {
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_collect_rest_reg(frame, dst)?;
+                    self.run_collect_rest_reg(&mut *stack, top_idx, dst)?;
                     continue;
                 }
                 Op::CollectArguments => {
@@ -3752,8 +3751,7 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_store_property_reg(context, frame, obj_reg, key, src)?;
+                    self.run_store_property_reg(context, &mut *stack, top_idx, obj_reg, key, src)?;
                     continue;
                 }
                 Op::LoadElement => {
@@ -3774,8 +3772,14 @@ impl Interpreter {
                     let src_reg = context
                         .exec_register(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_store_element_regs(context, frame, recv_reg, idx_reg, src_reg)?;
+                    self.run_store_element_regs(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        recv_reg,
+                        idx_reg,
+                        src_reg,
+                    )?;
                     continue;
                 }
                 Op::GetIterator => {
@@ -3785,8 +3789,7 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_get_iterator_regs(frame, dst, src)?;
+                    self.run_get_iterator_regs(&mut *stack, top_idx, dst, src)?;
                     continue;
                 }
                 Op::IteratorNext => {
@@ -3838,8 +3841,7 @@ impl Interpreter {
                     let msg_reg = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_new_error_regs(frame, dst, msg_reg)?;
+                    self.run_new_error_regs(&mut *stack, top_idx, dst, msg_reg)?;
                     continue;
                 }
                 Op::NewBuiltinError => {
@@ -3852,8 +3854,14 @@ impl Interpreter {
                     let msg_reg = context
                         .exec_register(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_new_builtin_error_regs(context, frame, dst, kind_idx, msg_reg)?;
+                    self.run_new_builtin_error_regs(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        dst,
+                        kind_idx,
+                        msg_reg,
+                    )?;
                     continue;
                 }
                 Op::LoadBuiltinError => {
@@ -3937,8 +3945,7 @@ impl Interpreter {
                     let value_reg = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_array_push_regs(frame, arr_reg, value_reg)?;
+                    self.run_array_push_regs(&mut *stack, top_idx, arr_reg, value_reg)?;
                     continue;
                 }
                 Op::NewWeakRef => {
@@ -3948,8 +3955,7 @@ impl Interpreter {
                     let target_reg = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_new_weak_ref_regs(frame, dst, target_reg)?;
+                    self.run_new_weak_ref_regs(&mut *stack, top_idx, dst, target_reg)?;
                     continue;
                 }
                 Op::NewFinalizationRegistry => {
@@ -3959,8 +3965,13 @@ impl Interpreter {
                     let callback_reg = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_new_finalization_registry_regs(context, frame, dst, callback_reg)?;
+                    self.run_new_finalization_registry_regs(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        dst,
+                        callback_reg,
+                    )?;
                     continue;
                 }
                 Op::NewCollection => {
@@ -3973,8 +3984,14 @@ impl Interpreter {
                     let iter_reg = context
                         .exec_register(instr, 2)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_new_collection_regs(context, frame, dst, kind_idx, iter_reg)?;
+                    self.run_new_collection_regs(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        dst,
+                        kind_idx,
+                        iter_reg,
+                    )?;
                     continue;
                 }
                 Op::NewIntl => {
@@ -5712,9 +5729,11 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module);
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let Value::Array(rest) = interp.run(&context).unwrap() else {
             panic!("expected rest array");
         };
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
         let elements = array::with_elements(rest, interp.gc_heap(), |elements| elements.to_vec());
         assert_eq!(
             elements,
@@ -5722,6 +5741,464 @@ mod tests {
                 Value::Number(NumberValue::Smi(13)),
                 Value::Number(NumberValue::Smi(8))
             ]
+        );
+        assert!(
+            after > before,
+            "CollectRest should allocate the rest array in young space"
+        );
+    }
+
+    #[test]
+    fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots() {
+        let callee = test_function(1, "callee", 0, 0, Vec::new());
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(1), Operand::Imm32(42)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::StoreProperty,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 3,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 3, main_code), callee],
+            constants: vec![
+                Constant::FunctionId { index: 1 },
+                Constant::String {
+                    utf16: "custom".encode_utf16().collect(),
+                },
+            ],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(
+            interp.run(&context).unwrap(),
+            Value::Function { .. }
+        ));
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "StoreProperty should allocate function user props in young space"
+        );
+        let desc = interp
+            .ordinary_function_own_property_descriptor(Some(&context), 1, "custom")
+            .unwrap()
+            .expect("custom property descriptor");
+        assert_eq!(
+            descriptor_value(&desc),
+            Value::Number(NumberValue::from_i32(42))
+        );
+    }
+
+    #[test]
+    fn get_iterator_map_snapshot_uses_young_allocation_with_frame_roots() {
+        let module = module_with(Vec::new(), 5);
+        let mut interp = Interpreter::new();
+        let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
+        crate::collections::map_set(
+            map,
+            interp.gc_heap_mut(),
+            Value::Number(NumberValue::from_i32(1)),
+            Value::Number(NumberValue::from_i32(10)),
+        )
+        .unwrap();
+        crate::collections::map_set(
+            map,
+            interp.gc_heap_mut(),
+            Value::Number(NumberValue::from_i32(2)),
+            Value::Number(NumberValue::from_i32(20)),
+        )
+        .unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Map(map);
+        stack.push(frame);
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "GetIterator over Map should allocate snapshot arrays and iterator state in young space"
+        );
+
+        interp
+            .run_iterator_next_regs(&mut stack[0], 2, 3, 1)
+            .unwrap();
+        assert_eq!(stack[0].registers[3], Value::Boolean(false));
+        let Value::Array(pair) = stack[0].registers[2] else {
+            panic!("Map iterator should yield entry arrays");
+        };
+        let values =
+            crate::array::with_elements(pair, interp.gc_heap(), |elements| elements.to_vec());
+        assert_eq!(
+            values,
+            vec![
+                Value::Number(NumberValue::from_i32(1)),
+                Value::Number(NumberValue::from_i32(10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_iterator_user_resume_uses_young_allocation_with_frame_roots() {
+        let module = module_with(Vec::new(), 4);
+        let mut interp = Interpreter::new();
+        let iterator_obj = object::alloc_object(interp.gc_heap_mut()).unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.pc = 0;
+        frame.pending_get_iterator = Some(PendingGetIterator { pc: 0, dst: 1 });
+        frame.registers[1] = Value::Object(iterator_obj);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![Operand::Register(1), Operand::Register(0)];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            interp
+                .drive_get_iterator(&mut stack, &context, &operands)
+                .unwrap()
+        );
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        assert!(
+            after > before,
+            "GetIterator resume should allocate user iterator state in young space"
+        );
+        assert!(matches!(stack[0].registers[1], Value::Iterator(_)));
+        assert!(stack[0].pending_get_iterator.is_none());
+        assert_eq!(stack[0].pc, 1);
+    }
+
+    #[test]
+    fn iterator_helper_next_uses_young_allocation_with_frame_roots() {
+        let module = module_with(Vec::new(), 4);
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(7))],
+        )
+        .unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Array(source);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+
+        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
+        let iter = match stack[0].registers[1].clone() {
+            Value::Iterator(iter) => iter,
+            _ => panic!("GetIterator should produce an iterator handle"),
+        };
+        let args: SmallVec<[Value; 8]> = SmallVec::new();
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            interp
+                .iterator_helper_dispatch(&mut stack, &context, &iter, "next", &args, 2)
+                .unwrap()
+        );
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Iterator helper next() should allocate its result object in young space"
+        );
+
+        let Value::Object(record) = stack[0].registers[2] else {
+            panic!("Iterator helper next() should write a result object");
+        };
+        assert_eq!(
+            object::get(record, interp.gc_heap(), "value"),
+            Some(Value::Number(NumberValue::from_i32(7)))
+        );
+        assert_eq!(
+            object::get(record, interp.gc_heap(), "done"),
+            Some(Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn iterator_helper_map_uses_young_allocation_with_frame_roots() {
+        fn identity_mapper(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+        }
+
+        let module = module_with(Vec::new(), 4);
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(5))],
+        )
+        .unwrap();
+        let mapper =
+            native_value_static(interp.gc_heap_mut(), "identityMapper", 1, identity_mapper)
+                .unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Array(source);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+
+        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
+        let iter = match stack[0].registers[1].clone() {
+            Value::Iterator(iter) => iter,
+            _ => panic!("GetIterator should produce an iterator handle"),
+        };
+        let args: SmallVec<[Value; 8]> = smallvec::smallvec![mapper];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            interp
+                .iterator_helper_dispatch(&mut stack, &context, &iter, "map", &args, 2)
+                .unwrap()
+        );
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Iterator helper map() should allocate its wrapper state in young space"
+        );
+        assert!(matches!(stack[0].registers[2], Value::Iterator(_)));
+    }
+
+    #[test]
+    fn synthesized_iterator_next_uses_runtime_rooted_young_allocation() {
+        let module = module_with(Vec::new(), 4);
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(17))],
+        )
+        .unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Array(source);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+
+        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
+        let iterator_value = stack[0].registers[1].clone();
+        let method = interp
+            .synthesize_iterator_method("next", iterator_value)
+            .unwrap();
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let result = interp
+            .run_callable_sync(&context, &method, Value::Undefined, SmallVec::new())
+            .unwrap();
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "synthesized iterator next() should allocate its result object in young space"
+        );
+
+        let Value::Object(record) = result else {
+            panic!("synthesized iterator next() should return a result object");
+        };
+        assert_eq!(
+            object::get(record, interp.gc_heap(), "value"),
+            Some(Value::Number(NumberValue::from_i32(17)))
+        );
+        assert_eq!(
+            object::get(record, interp.gc_heap(), "done"),
+            Some(Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
+        let mut interp = Interpreter::new();
+        let pair = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [
+                Value::Number(NumberValue::from_i32(1)),
+                Value::Number(NumberValue::from_i32(10)),
+            ],
+        )
+        .unwrap();
+        let seed = crate::array::from_elements(interp.gc_heap_mut(), [Value::Array(pair)]).unwrap();
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 3, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "Map".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[1] = Value::Array(seed);
+        stack.push(frame);
+
+        let before_alloc = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let before_reserved = interp.gc_heap_mut().stats().reserved_bytes;
+        interp
+            .run_new_collection_regs(&context, &mut stack, 0, 0, 0, 1)
+            .unwrap();
+        let after_alloc = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let after_reserved = interp.gc_heap_mut().stats().reserved_bytes;
+
+        assert!(
+            after_alloc > before_alloc,
+            "NewCollection Map should allocate the map body in young space"
+        );
+        assert!(
+            after_reserved > before_reserved,
+            "NewCollection Map should reserve backing storage through the root-aware path"
+        );
+        let Value::Map(map) = stack[0].registers[0] else {
+            panic!("NewCollection Map should write a Map");
+        };
+        assert_eq!(
+            crate::collections::map_get(
+                map,
+                interp.gc_heap(),
+                &Value::Number(NumberValue::from_i32(1))
+            ),
+            Some(Value::Number(NumberValue::from_i32(10)))
+        );
+    }
+
+    #[test]
+    fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadUndefined,
+                    operands: vec![Operand::Register(1)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::NewError,
+                    operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+                },
+                Instruction {
+                    pc: 2,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+            2,
+        );
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        let Value::Object(obj) = interp.run(&context).unwrap() else {
+            panic!("NewError should return an object");
+        };
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NewError should allocate the error instance in young space"
+        );
+        assert!(crate::object::get_own_descriptor(obj, interp.gc_heap(), "message").is_none());
+    }
+
+    #[test]
+    fn bytecode_new_weak_ref_uses_young_allocation_with_frame_roots() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::NewObject,
+                    operands: vec![Operand::Register(1)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::NewWeakRef,
+                    operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+                },
+                Instruction {
+                    pc: 2,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+            2,
+        );
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(interp.run(&context).unwrap(), Value::WeakRef(_)));
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NewWeakRef should allocate the weak-ref body in young space"
+        );
+    }
+
+    #[test]
+    fn bytecode_new_finalization_registry_uses_young_allocation_with_frame_roots() {
+        let cleanup = test_function(1, "cleanup", 1, 1, Vec::new());
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::NewFinalizationRegistry,
+                operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, main_code), cleanup],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(
+            interp.run(&context).unwrap(),
+            Value::FinalizationRegistry(_)
+        ));
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NewFinalizationRegistry should allocate the registry body in young space"
         );
     }
 
@@ -5926,6 +6403,83 @@ mod tests {
     }
 
     #[test]
+    fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
+        let ctor = test_function(
+            1,
+            "Ctor",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadThis,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadUndefined,
+                operands: vec![Operand::Register(2)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::BindFunction,
+                operands: vec![
+                    Operand::Register(3),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::ConstIndex(0),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 3,
+                op: Op::New,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(3),
+                    Operand::ConstIndex(0),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 4,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 4, main_code), ctor],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert!(matches!(interp.run(&context).unwrap(), Value::Object(_)));
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "bound bytecode constructor receiver should allocate in young space"
+        );
+    }
+
+    #[test]
     fn runtime_budget_stats_record_reductions_and_budget_observations() {
         let module = module_with(
             vec![
@@ -6079,6 +6633,163 @@ mod tests {
         assert!(
             after > before,
             "NewArray should allocate the array body in young space"
+        );
+    }
+
+    #[test]
+    fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(0), Operand::Imm32(1)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(1), Operand::Imm32(2)].into(),
+                },
+                Instruction {
+                    pc: 2,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(2), Operand::Imm32(3)].into(),
+                },
+                Instruction {
+                    pc: 3,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(3), Operand::Imm32(4)].into(),
+                },
+                Instruction {
+                    pc: 4,
+                    op: Op::NewArray,
+                    operands: vec![
+                        Operand::Register(4),
+                        Operand::ConstIndex(4),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 5,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(5), Operand::Imm32(5)].into(),
+                },
+                Instruction {
+                    pc: 6,
+                    op: Op::ArrayPush,
+                    operands: vec![Operand::Register(4), Operand::Register(5)].into(),
+                },
+                Instruction {
+                    pc: 7,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(4)].into(),
+                },
+            ],
+            6,
+        );
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().reserved_bytes;
+        let context = ExecutionContext::from_module(module);
+        let result = interp.run(&context).unwrap();
+        let Value::Array(array) = result else {
+            panic!("ArrayPush program should return the grown array");
+        };
+        let values =
+            crate::array::with_elements(array, interp.gc_heap_mut(), |elements| elements.to_vec());
+        assert_eq!(values.len(), 5);
+        assert_eq!(values[4], Value::Number(NumberValue::from_i32(5)));
+        let after = interp.gc_heap_mut().stats().reserved_bytes;
+        assert!(
+            after > before,
+            "ArrayPush should reserve dense backing storage through the root-aware path"
+        );
+    }
+
+    #[test]
+    fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
+        let module = module_with(
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(0), Operand::Imm32(1)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(1), Operand::Imm32(2)].into(),
+                },
+                Instruction {
+                    pc: 2,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(2), Operand::Imm32(3)].into(),
+                },
+                Instruction {
+                    pc: 3,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(3), Operand::Imm32(4)].into(),
+                },
+                Instruction {
+                    pc: 4,
+                    op: Op::NewArray,
+                    operands: vec![
+                        Operand::Register(4),
+                        Operand::ConstIndex(4),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 5,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(5), Operand::Imm32(4)].into(),
+                },
+                Instruction {
+                    pc: 6,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(6), Operand::Imm32(99)].into(),
+                },
+                Instruction {
+                    pc: 7,
+                    op: Op::StoreElement,
+                    operands: vec![
+                        Operand::Register(4),
+                        Operand::Register(5),
+                        Operand::Register(6),
+                        Operand::Register(7),
+                    ]
+                    .into(),
+                },
+                Instruction {
+                    pc: 8,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(4)].into(),
+                },
+            ],
+            8,
+        );
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().reserved_bytes;
+        let context = ExecutionContext::from_module(module);
+        let result = interp.run(&context).unwrap();
+        let Value::Array(array) = result else {
+            panic!("StoreElement program should return the grown array");
+        };
+        let values =
+            crate::array::with_elements(array, interp.gc_heap_mut(), |elements| elements.to_vec());
+        assert_eq!(values.len(), 5);
+        assert_eq!(values[4], Value::Number(NumberValue::from_i32(99)));
+        let after = interp.gc_heap_mut().stats().reserved_bytes;
+        assert!(
+            after > before,
+            "StoreElement should reserve dense backing storage through the root-aware path"
         );
     }
 
@@ -6311,6 +7022,280 @@ mod tests {
         interp.do_call(&mut stack, &context, &operands).unwrap();
 
         assert_eq!(stack[0].registers[3], Value::Number(NumberValue::Smi(21)));
+    }
+
+    #[test]
+    fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
+        fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args.get(2).cloned().unwrap_or(Value::Undefined))
+        }
+
+        fn target_noop(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::Undefined)
+        }
+
+        let module = module_with(vec![], 4);
+        let mut interp = Interpreter::new();
+        let apply =
+            native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
+        let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
+        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(handler, interp.gc_heap_mut(), "apply", apply);
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, handler));
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = proxy;
+        frame.registers[1] = Value::Number(NumberValue::Smi(7));
+        frame.registers[2] = Value::Number(NumberValue::Smi(11));
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module.clone());
+        let operands = vec![
+            Operand::Register(3),
+            Operand::Register(0),
+            Operand::ConstIndex(2),
+            Operand::Register(1),
+            Operand::Register(2),
+        ];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        interp.do_call(&mut stack, &context, &operands).unwrap();
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let Value::Array(argv) = stack[0].registers[3] else {
+            panic!("expected proxy apply argv array");
+        };
+        let elements = array::with_elements(argv, interp.gc_heap(), |elements| elements.to_vec());
+        assert_eq!(
+            elements,
+            vec![
+                Value::Number(NumberValue::Smi(7)),
+                Value::Number(NumberValue::Smi(11)),
+            ]
+        );
+        assert!(
+            after > before,
+            "proxy apply argv array should allocate in young space"
+        );
+    }
+
+    #[test]
+    fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
+        fn return_proxy_arg(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args.get(2).cloned().unwrap_or(Value::Undefined))
+        }
+
+        let ctor = test_function(
+            1,
+            "Ctor",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadThis,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, vec![]), ctor],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let construct =
+            native_value_static(interp.gc_heap_mut(), "construct", 3, return_proxy_arg).unwrap();
+        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(handler, interp.gc_heap_mut(), "construct", construct);
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(
+            Value::Function { function_id: 1 },
+            handler,
+        ));
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[1] = proxy;
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module.clone());
+        let operands = vec![
+            Operand::Register(0),
+            Operand::Register(1),
+            Operand::ConstIndex(0),
+        ];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        interp
+            .do_construct(&mut stack, &context, &operands)
+            .unwrap();
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        assert!(matches!(stack[0].registers[0], Value::Proxy(_)));
+        assert!(
+            after > before,
+            "proxy construct argv array should allocate in young space"
+        );
+    }
+
+    #[test]
+    fn run_callable_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
+        fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args.get(2).cloned().unwrap_or(Value::Undefined))
+        }
+
+        fn target_noop(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::Undefined)
+        }
+
+        let module = module_with(Vec::new(), 1);
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let apply =
+            native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
+        let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
+        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(handler, interp.gc_heap_mut(), "apply", apply);
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, handler));
+        let args: SmallVec<[Value; 8]> = smallvec::smallvec![
+            Value::Number(NumberValue::Smi(3)),
+            Value::Number(NumberValue::Smi(5)),
+        ];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let result = interp
+            .run_callable_sync(&context, &proxy, Value::Undefined, args)
+            .unwrap();
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let Value::Array(argv) = result else {
+            panic!("proxy apply trap should return the synthesized argv array");
+        };
+        let elements = array::with_elements(argv, interp.gc_heap(), |elements| elements.to_vec());
+        assert_eq!(
+            elements,
+            vec![
+                Value::Number(NumberValue::Smi(3)),
+                Value::Number(NumberValue::Smi(5)),
+            ]
+        );
+        assert!(
+            after > before,
+            "run_callable_sync proxy argv array should allocate in young space"
+        );
+    }
+
+    #[test]
+    fn run_construct_sync_receiver_uses_runtime_rooted_young_allocation() {
+        let ctor = test_function(
+            1,
+            "Ctor",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadThis,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 1, Vec::new()), ctor],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let target = Value::Function { function_id: 1 };
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let result = interp
+            .run_construct_sync(&context, &target, target.clone(), SmallVec::new())
+            .unwrap();
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        assert!(matches!(result, Value::Object(_)));
+        assert!(
+            after > before,
+            "run_construct_sync should allocate the receiver in young space"
+        );
+    }
+
+    #[test]
+    fn run_construct_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
+        fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args.get(1).cloned().unwrap_or(Value::Undefined))
+        }
+
+        let ctor = test_function(
+            1,
+            "Ctor",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadThis,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 1, Vec::new()), ctor],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let construct =
+            native_value_static(interp.gc_heap_mut(), "construct", 3, return_argv_array).unwrap();
+        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(handler, interp.gc_heap_mut(), "construct", construct);
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(
+            Value::Function { function_id: 1 },
+            handler,
+        ));
+        let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::Number(NumberValue::Smi(13))];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let result = interp
+            .run_construct_sync(&context, &proxy, proxy.clone(), args)
+            .unwrap();
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let Value::Array(argv) = result else {
+            panic!("proxy construct trap should return the synthesized argv array");
+        };
+        let elements = array::with_elements(argv, interp.gc_heap(), |elements| elements.to_vec());
+        assert_eq!(elements, vec![Value::Number(NumberValue::Smi(13))]);
+        assert!(
+            after > before,
+            "run_construct_sync proxy argv array should allocate in young space"
+        );
     }
 
     #[test]

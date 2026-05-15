@@ -85,13 +85,16 @@ impl Interpreter {
 
     pub(crate) fn run_collect_rest_reg(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
         // Drain rather than clone: the rest array is built once per call and
         // CollectRest is the single consumer.
+        let frame = &mut stack[top_idx];
         let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
-        let array = crate::array::from_elements(&mut self.gc_heap, elements)?;
+        let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::Array(array))?;
         frame.pc += 1;
         Ok(())

@@ -60,6 +60,19 @@ impl ExternalMemory {
         })
     }
 
+    pub(crate) fn new_with_roots(
+        heap: &mut GcHeap,
+        bytes: u64,
+        external_visit: &mut crate::heap::RootSlotVisitor<'_>,
+    ) -> Result<Self, OutOfMemory> {
+        heap.reserve_bytes_with_roots(bytes, external_visit)?;
+        Ok(Self {
+            heap,
+            bytes,
+            _not_send: PhantomData,
+        })
+    }
+
     /// Currently reserved byte count.
     #[must_use]
     pub const fn bytes(&self) -> u64 {

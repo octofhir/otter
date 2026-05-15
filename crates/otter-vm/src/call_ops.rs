@@ -580,8 +580,12 @@ impl Interpreter {
         // target as a function.
         if let Value::Proxy(p) = &current {
             let proxy = p.clone();
-            let argv_array =
-                crate::array::from_elements(&mut self.gc_heap, effective_args.iter().cloned())?;
+            let argv_array = self.alloc_stack_rooted_array_from_values(
+                stack,
+                effective_args.iter().cloned(),
+                &[&current, &effective_this],
+                effective_args.as_slice(),
+            )?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(),
                 effective_this.clone(),
@@ -769,7 +773,12 @@ impl Interpreter {
         // otherwise delegates to the target.
         if let Value::Proxy(p) = &callee {
             let proxy = p.clone();
-            let argv_array = crate::array::from_elements(&mut self.gc_heap, args.iter().cloned())?;
+            let argv_array = self.alloc_stack_rooted_array_from_values(
+                stack,
+                args.iter().cloned(),
+                &[&callee, &new_target],
+                args.as_slice(),
+            )?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(),
                 Value::Array(argv_array),
@@ -803,7 +812,13 @@ impl Interpreter {
         // immediately, so the prototype link must already be in
         // place.
         let proto = self.construct_prototype_for_callee(context, &new_target)?;
-        let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
+        let receiver = {
+            let mut value_roots: SmallVec<[&Value; 4]> = smallvec::smallvec![&callee, &new_target];
+            if let Some(proto_value) = proto.as_ref() {
+                value_roots.push(proto_value);
+            }
+            self.alloc_stack_rooted_object_with_value_roots(stack, value_roots.as_slice(), &args)?
+        };
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         }
@@ -1052,7 +1067,7 @@ impl Interpreter {
                 // absent. Target may itself be a Proxy, hence the
                 // surrounding loop. §10.5.1 revocation check.
                 // <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-call-thisargument-argumentslist>
-                Value::Proxy(proxy) => {
+                Value::Proxy(ref proxy) => {
                     if proxy.is_revoked() {
                         return Err(VmError::TypeError {
                             message: "Cannot perform 'apply' on a proxy that has been revoked"
@@ -1064,9 +1079,10 @@ impl Interpreter {
                     let trap_value = crate::object::get(handler, &self.gc_heap, "apply");
                     match trap_value {
                         Some(trap) if self.is_callable_runtime(&trap) => {
-                            let argv_array = crate::array::from_elements(
-                                &mut self.gc_heap,
+                            let argv_array = self.alloc_runtime_rooted_array_from_values(
                                 effective_args.iter().cloned(),
+                                &[&current, &effective_this, &trap],
+                                &[effective_args.as_slice()],
                             )?;
                             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                                 proxy.target(),
@@ -1197,9 +1213,10 @@ impl Interpreter {
                     match trap_value {
                         Some(trap) if self.is_callable_runtime(&trap) => {
                             let target_value = proxy.target();
-                            let argv_array = crate::array::from_elements(
-                                &mut self.gc_heap,
+                            let argv_array = self.alloc_runtime_rooted_array_from_values(
                                 effective_args.iter().cloned(),
+                                &[&current, &target_value, &effective_new_target, &trap],
+                                &[effective_args.as_slice()],
                             )?;
                             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                                 target_value,
@@ -1234,7 +1251,17 @@ impl Interpreter {
         }
 
         let proto = self.construct_prototype_for_callee(context, &effective_new_target)?;
-        let receiver = crate::object::alloc_object(&mut self.gc_heap)?;
+        let receiver = {
+            let mut value_roots: SmallVec<[&Value; 4]> =
+                smallvec::smallvec![&current, &effective_new_target];
+            if let Some(proto_value) = proto.as_ref() {
+                value_roots.push(proto_value);
+            }
+            self.alloc_runtime_rooted_object_with_roots(
+                value_roots.as_slice(),
+                &[effective_args.as_slice()],
+            )?
+        };
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         }

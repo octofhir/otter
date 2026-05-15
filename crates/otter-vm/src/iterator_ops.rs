@@ -27,9 +27,8 @@ use otter_bytecode::Operand;
 use crate::{
     ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IteratorHandle, IteratorState,
     JsString, NativeError, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
-    VmPropertyKey, alloc_iterator_state, array, is_callable, make_iter_result,
-    operand_decode::register_operand, read_register, require_callable, step_iterator, symbol,
-    take_drop_count, value_kind_name, write_register,
+    VmPropertyKey, array, is_callable, operand_decode::register_operand, read_register,
+    require_callable, step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
 
 /// Cloned snapshot of an [`IteratorState`] taken before driving a
@@ -391,7 +390,14 @@ impl Interpreter {
                     }
                     other => return Ok((other, false)),
                 };
-                let new_inner = alloc_iterator_state(&mut self.gc_heap, inner_state)?;
+                let iter_root = Value::Iterator(*iter);
+                let source_root = Value::Iterator(source);
+                let mapper_root = mapper.clone();
+                let new_inner = self.alloc_runtime_rooted_iterator_state(
+                    inner_state,
+                    &[&iter_root, &source_root, &mapper_root],
+                    &[],
+                )?;
                 self.gc_heap.with_payload(*iter, |state| {
                     if let IteratorState::FlatMap { inner: slot, .. } = state {
                         *slot = Some(new_inner);
@@ -577,7 +583,13 @@ impl Interpreter {
             }
             "toArray" => {
                 let collected = self.drain_iterator(context, iter_rc)?;
-                Value::Array(crate::array::from_elements(&mut self.gc_heap, collected)?)
+                let result = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    collected.iter().cloned(),
+                    &[&iter_value],
+                    &[args.as_slice(), collected.as_slice()],
+                )?;
+                Value::Array(result)
             }
             "forEach" => {
                 let callback = require_callable(args.first())?;
@@ -888,7 +900,11 @@ impl Interpreter {
                 let pairs = crate::collections::map_entries(*m, &mut self.gc_heap);
                 let mut out = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
-                    let entry = array::from_elements(&mut self.gc_heap, vec![k, v])?;
+                    let entry = self.alloc_runtime_rooted_array_from_values(
+                        [k.clone(), v.clone()],
+                        &[iterable, &k, &v],
+                        &[out.as_slice()],
+                    )?;
                     out.push(Value::Array(entry));
                 }
                 return Ok(out);
@@ -967,12 +983,12 @@ impl Interpreter {
             handle.resume_dst(&self.gc_heap),
         );
         if !frame_opt {
-            return make_iter_result(Value::Undefined, true, &mut self.gc_heap);
+            return self.make_runtime_rooted_iter_result(Value::Undefined, true, &[], &[]);
         }
         // Pull the frame out of the gen body so we can mutate it.
         let mut frame = match handle.take_frame(&mut self.gc_heap) {
             Some(f) => f,
-            None => return make_iter_result(Value::Undefined, true, &mut self.gc_heap),
+            None => return self.make_runtime_rooted_iter_result(Value::Undefined, true, &[], &[]),
         };
         // Apply the resume operation to the frame before re-entering
         // dispatch.
@@ -989,7 +1005,7 @@ impl Interpreter {
                 // Foundation: mark done and surface arg without
                 // running the body further.
                 handle.mark_done(&mut self.gc_heap);
-                return make_iter_result(arg.clone(), true, &mut self.gc_heap);
+                return self.make_runtime_rooted_iter_result(arg.clone(), true, &[], &[]);
             }
             GeneratorResumeKind::Throw(reason) => {
                 throw_value = Some(reason.clone());
@@ -1035,7 +1051,7 @@ impl Interpreter {
                     if is_async {
                         return Ok(Value::Undefined);
                     }
-                    return make_iter_result(v, false, &mut self.gc_heap);
+                    return self.make_runtime_rooted_iter_result(v, false, &[], &[]);
                 }
                 // Body ran to completion or `Op::Await` parked the
                 // frame. Distinguish by whether the gen still owns
@@ -1062,7 +1078,12 @@ impl Interpreter {
                 handle.mark_done(&mut self.gc_heap);
                 if is_async {
                     if let Some(req) = handle.take_pending_request(&mut self.gc_heap) {
-                        let record = make_iter_result(value, true, &mut self.gc_heap)?;
+                        let record = self.make_runtime_rooted_iter_result(
+                            value,
+                            true,
+                            &[&req.resolve],
+                            &[],
+                        )?;
                         self.run_callable_sync(
                             context,
                             &req.resolve,
@@ -1072,7 +1093,7 @@ impl Interpreter {
                     }
                     return Ok(Value::Undefined);
                 }
-                make_iter_result(value, true, &mut self.gc_heap)
+                self.make_runtime_rooted_iter_result(value, true, &[], &[])
             }
             Err(err) => {
                 handle.mark_done(&mut self.gc_heap);

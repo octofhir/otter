@@ -2309,87 +2309,183 @@ impl Interpreter {
         }
     }
 
-    fn box_sloppy_this_primitive(&mut self, this_value: Value) -> Result<Value, VmError> {
-        match this_value {
+    fn box_sloppy_this_primitive_runtime_rooted(
+        &mut self,
+        this_value: Value,
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let object = match &this_value {
             Value::Boolean(value) => {
                 let proto = self.primitive_wrapper_prototype("Boolean")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
-                object::set_boolean_data(obj, &mut self.gc_heap, value);
-                Ok(Value::Object(obj))
+                let obj = self.alloc_runtime_rooted_object_with_proto(
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?;
+                object::set_boolean_data(obj, &mut self.gc_heap, *value);
+                obj
             }
             Value::Number(value) => {
                 let proto = self.primitive_wrapper_prototype("Number")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
-                object::set_number_data(obj, &mut self.gc_heap, value);
-                Ok(Value::Object(obj))
+                let obj = self.alloc_runtime_rooted_object_with_proto(
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?;
+                object::set_number_data(obj, &mut self.gc_heap, *value);
+                obj
             }
             Value::String(value) => {
                 let proto = self.primitive_wrapper_prototype("String")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
-                object::set_string_data(obj, &mut self.gc_heap, value);
-                Ok(Value::Object(obj))
+                let obj = self.alloc_runtime_rooted_object_with_proto(
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?;
+                object::set_string_data(obj, &mut self.gc_heap, value.clone());
+                obj
             }
             Value::Symbol(_) => {
                 let proto = self.primitive_wrapper_prototype("Symbol")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
-                Ok(Value::Object(obj))
+                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?
             }
             Value::BigInt(_) => {
                 let proto = self.primitive_wrapper_prototype("BigInt")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
-                Ok(Value::Object(obj))
+                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?
             }
-            other => Ok(other),
-        }
+            _ => return Ok(this_value),
+        };
+        Ok(Value::Object(object))
     }
 
-    fn object_for_primitive_property_base(
+    fn box_sloppy_this_primitive_stack_rooted(
         &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        this_value: Value,
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let object = match &this_value {
+            Value::Boolean(value) => {
+                let proto = self.primitive_wrapper_prototype("Boolean")?;
+                let obj = self.alloc_stack_rooted_object_with_proto(
+                    stack,
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?;
+                object::set_boolean_data(obj, &mut self.gc_heap, *value);
+                obj
+            }
+            Value::Number(value) => {
+                let proto = self.primitive_wrapper_prototype("Number")?;
+                let obj = self.alloc_stack_rooted_object_with_proto(
+                    stack,
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?;
+                object::set_number_data(obj, &mut self.gc_heap, *value);
+                obj
+            }
+            Value::String(value) => {
+                let proto = self.primitive_wrapper_prototype("String")?;
+                let obj = self.alloc_stack_rooted_object_with_proto(
+                    stack,
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?;
+                object::set_string_data(obj, &mut self.gc_heap, value.clone());
+                obj
+            }
+            Value::Symbol(_) => {
+                let proto = self.primitive_wrapper_prototype("Symbol")?;
+                self.alloc_stack_rooted_object_with_proto(
+                    stack,
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?
+            }
+            Value::BigInt(_) => {
+                let proto = self.primitive_wrapper_prototype("BigInt")?;
+                self.alloc_stack_rooted_object_with_proto(
+                    stack,
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?
+            }
+            _ => return Ok(this_value),
+        };
+        Ok(Value::Object(object))
+    }
+
+    fn object_for_primitive_property_base_stack_rooted(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
         value: &Value,
     ) -> Result<Option<JsObject>, VmError> {
         let object = match value {
             Value::Boolean(v) => {
                 let proto = self.primitive_wrapper_prototype("Boolean")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
+                let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
                 object::set_boolean_data(obj, &mut self.gc_heap, *v);
                 obj
             }
             Value::Number(v) => {
                 let proto = self.primitive_wrapper_prototype("Number")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
+                let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
                 object::set_number_data(obj, &mut self.gc_heap, *v);
                 obj
             }
             Value::String(v) => {
                 let proto = self.primitive_wrapper_prototype("String")?;
-                let obj = object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?;
+                let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
                 object::set_string_data(obj, &mut self.gc_heap, v.clone());
                 obj
             }
             Value::Symbol(_) => {
                 let proto = self.primitive_wrapper_prototype("Symbol")?;
-                object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?
+                self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
             }
             Value::BigInt(_) => {
                 let proto = self.primitive_wrapper_prototype("BigInt")?;
-                object::alloc_object_with_proto(&mut self.gc_heap, Some(proto))?
+                self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
             }
             _ => return Ok(None),
         };
         Ok(Some(object))
     }
 
-    fn this_for_bytecode_call(
+    fn this_for_bytecode_call_runtime_rooted(
         &mut self,
         function: &ExecutableFunction,
         this_value: Value,
+        slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         if function.is_strict || function.is_arrow {
             return Ok(this_value);
         }
         match this_value {
             Value::Undefined | Value::Null => Ok(Value::Object(self.global_this)),
-            other => self.box_sloppy_this_primitive(other),
+            other => self.box_sloppy_this_primitive_runtime_rooted(other, slice_roots),
+        }
+    }
+
+    fn this_for_bytecode_call_stack_rooted(
+        &mut self,
+        function: &ExecutableFunction,
+        stack: &SmallVec<[Frame; 8]>,
+        this_value: Value,
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        if function.is_strict || function.is_arrow {
+            return Ok(this_value);
+        }
+        match this_value {
+            Value::Undefined | Value::Null => Ok(Value::Object(self.global_this)),
+            other => self.box_sloppy_this_primitive_stack_rooted(stack, other, slice_roots),
         }
     }
 
@@ -2816,7 +2912,11 @@ impl Interpreter {
                     });
                 }
             };
-        let this_for_callee = match self.this_for_bytecode_call(function, this_for_callee) {
+        let this_for_callee = match self.this_for_bytecode_call_runtime_rooted(
+            function,
+            this_for_callee,
+            &[effective_args.as_slice()],
+        ) {
             Ok(value) => value,
             Err(error) => {
                 return Err(RunError {
@@ -2918,24 +3018,28 @@ impl Interpreter {
         } else {
             Value::Object(self.global_this)
         };
-        let mut entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let entry_is_async = main.is_async;
+        stack.push(entry);
         // §16.2.1.7 ModuleDeclarationInstantiation step 5 — when the
         // entry function carries top-level await, wire up an async
         // result promise so `Op::Await` can park / resume normally.
         // The dispatch loop's exit returns the result promise's
         // resolved value once microtasks drain.
-        let entry_promise = if main.is_async {
+        let entry_promise = if entry_is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending(&mut self.gc_heap)
+                .pending_stack_rooted(self, &stack, &[], &[])
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
-            entry.async_state = Some(AsyncFrameState {
+            stack
+                .last_mut()
+                .expect("entry frame was just pushed")
+                .async_state = Some(AsyncFrameState {
                 result_promise: result,
             });
             Some(result)
         } else {
             None
         };
-        stack.push(entry);
 
         let dispatch_result = self.dispatch_loop(context, &mut stack);
         match dispatch_result {
@@ -3199,7 +3303,12 @@ impl Interpreter {
                     // the yielded value out so the `resume_generator`
                     // caller can shape it.
                     if let Some(cap) = pending_request {
-                        let record = make_iter_result(yielded.clone(), false, &mut self.gc_heap)?;
+                        let record = self.make_runtime_rooted_iter_result(
+                            yielded.clone(),
+                            false,
+                            &[&cap.resolve],
+                            &[],
+                        )?;
                         let capability_context =
                             cap.context.clone().unwrap_or_else(|| context.clone());
                         self.run_callable_sync(
@@ -3934,8 +4043,7 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_promise_fulfilled_of_regs(context, frame, dst, src)?;
+                    self.run_promise_fulfilled_of_regs(context, stack, top_idx, dst, src)?;
                     continue;
                 }
                 Op::ArrayPush => {
@@ -4494,10 +4602,16 @@ impl Interpreter {
                 | Op::ArrayBufferCall
                 | Op::DataViewCall
                 | Op::TypedArrayCall
-                | Op::IteratorCall
-                | Op::SharedArrayBufferCall
-                | Op::ProxyCall => {
+                | Op::SharedArrayBufferCall => {
                     self.run_static_call_operands(op, context, frame, operands)?;
+                }
+                Op::ProxyCall => {
+                    self.run_proxy_static_call_operands(stack, operands)?;
+                    continue;
+                }
+                Op::IteratorCall => {
+                    self.run_iterator_static_call_operands(stack, operands)?;
+                    continue;
                 }
                 // §28.1 Reflect static surface — single dispatcher
                 // covering every spec method.
@@ -4531,7 +4645,8 @@ impl Interpreter {
                     self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 Op::ImportNamespaceDynamic => {
-                    self.run_import_namespace_dynamic_operands(context, frame, operands)?;
+                    self.run_import_namespace_dynamic_operands(context, stack, top_idx, operands)?;
+                    continue;
                 }
                 Op::BindFunction => {
                     self.drive_bind_function(stack, context, &operands)?;
@@ -4971,7 +5086,6 @@ fn make_array_iterator_factory(
         "Array[Symbol.iterator]",
         smallvec::smallvec![Value::Array(array)],
         |ctx, _, captures| {
-            let vm = ctx.interp_mut();
             let array = match captures.first() {
                 Some(Value::Array(array)) => *array,
                 _ => {
@@ -4982,9 +5096,10 @@ fn make_array_iterator_factory(
                 }
             };
             let state = IteratorState::Array { array, index: 0 };
-            Ok(Value::Iterator(alloc_iterator_state(
-                vm.gc_heap_mut(),
+            Ok(Value::Iterator(ctx.alloc_iterator_state(
                 state,
+                &[],
+                &[],
             )?))
         },
     )
@@ -5000,143 +5115,6 @@ pub enum GeneratorResumeKind {
     Return(Value),
     /// `gen.throw(reason)` — re-enters the body and unwinds.
     Throw(Value),
-}
-
-/// Build an `IteratorResult { value, done }` plain object per
-/// §7.4.6 `CreateIterResultObject`.
-fn make_iter_result(
-    value: Value,
-    done: bool,
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, VmError> {
-    let obj = crate::object::alloc_object(gc_heap)?;
-    crate::object::set(obj, gc_heap, "value", value);
-    crate::object::set(obj, gc_heap, "done", Value::Boolean(done));
-    Ok(Value::Object(obj))
-}
-
-/// Coerce a `new Proxy(target, ...)` first argument to a
-/// [`JsObject`]. Plain objects pass through; callables (Function /
-/// Closure / NativeFunction / BoundFunction / ClassConstructor)
-/// are wrapped in a fresh JsObject that stashes the callable in a
-/// hidden `__callable` slot so the apply / construct trap fallback
-/// can re-invoke it through `run_callable_sync`.
-fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
-    match arg {
-        Some(v) if constructor_return_is_object(v) || abstract_ops::is_callable(v) => Ok(v.clone()),
-        _ => Err(VmError::TypeMismatch),
-    }
-}
-
-/// §28.2 Proxy static dispatcher via the typed [`ProxyMethod`].
-fn proxy_static_call(
-    method: otter_bytecode::method_id::ProxyMethod,
-    args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, VmError> {
-    use otter_bytecode::method_id::ProxyMethod as M;
-    match method {
-        // §28.2.1.1 — `new Proxy(target, handler)`. Target may be
-        // any object — including callables — wrapped here in a
-        // synthetic JsObject that carries the original value as
-        // `[[ProxyTarget]]`. Foundation simplification: use a
-        // dedicated `__callable` slot when the target is a
-        // function so the apply trap's fallback can re-invoke it.
-        M::Construct => {
-            let target = coerce_proxy_target(args.first())?;
-            let handler = match args.get(1) {
-                Some(Value::Object(o)) => *o,
-                _ => return Err(VmError::TypeMismatch),
-            };
-            Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
-        }
-        // §28.2.2.1 — `Proxy.revocable(target, handler)` returns
-        // `{proxy, revoke}`.
-        M::Revocable => {
-            let target = coerce_proxy_target(args.first())?;
-            let handler = match args.get(1) {
-                Some(Value::Object(o)) => *o,
-                _ => return Err(VmError::TypeMismatch),
-            };
-            let proxy = crate::proxy::JsProxy::new(target, handler);
-            let proxy_handle = proxy.clone();
-            let revoke =
-                native_function::native_value_unchecked(gc_heap, "revoke", move |_, _, _| {
-                    proxy_handle.revoke();
-                    Ok(Value::Undefined)
-                })?;
-            let obj = crate::object::alloc_object(gc_heap)?;
-            crate::object::set(obj, gc_heap, "proxy", Value::Proxy(proxy));
-            crate::object::set(obj, gc_heap, "revoke", revoke);
-            Ok(Value::Object(obj))
-        }
-    }
-}
-
-/// Iterator-helpers proposal §sec-iterator.from — coerce any
-/// iterable / iterator-like value into a [`Value::Iterator`].
-///
-/// Foundation surface accepts `Array` / `String` / `Set` / `Map`
-/// (via their dense iteration form) and existing
-/// [`Value::Iterator`] handles directly. Non-iterable inputs raise
-/// a `TypeMismatch` (surfaced upstream as a `TypeError`).
-///
-/// # See also
-/// - <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
-fn iterator_static_call(
-    method: otter_bytecode::method_id::IteratorMethod,
-    args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, VmError> {
-    use otter_bytecode::method_id::IteratorMethod as M;
-    match method {
-        // Reserved spec form — the constructor itself isn't
-        // user-callable.
-        M::Construct => Err(VmError::TypeMismatch),
-        M::From => {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
-            let state = match value {
-                Value::Iterator(rc) => return Ok(Value::Iterator(rc)),
-                Value::Generator(handle) => IteratorState::Generator { handle },
-                Value::Array(arr) => IteratorState::Array {
-                    array: arr,
-                    index: 0,
-                },
-                Value::String(s) => IteratorState::String {
-                    string: s,
-                    index: 0,
-                },
-                Value::Set(s) => {
-                    let snap: SmallVec<[Value; 4]> = crate::collections::set_values(s, gc_heap)
-                        .into_iter()
-                        .collect();
-                    IteratorState::Array {
-                        array: crate::array::from_elements(gc_heap, snap)?,
-                        index: 0,
-                    }
-                }
-                Value::Map(m) => {
-                    let mut entries: Vec<Value> = Vec::new();
-                    for (k, v) in crate::collections::map_entries(m, gc_heap) {
-                        let pair = crate::array::from_elements(gc_heap, [k, v])?;
-                        entries.push(Value::Array(pair));
-                    }
-                    IteratorState::Array {
-                        array: crate::array::from_elements(gc_heap, entries)?,
-                        index: 0,
-                    }
-                }
-                Value::Object(_) => {
-                    // Foundation: object-shaped iterables go through
-                    // the user-iterator protocol; the value handed in
-                    // is treated as the iterator object itself.
-                    IteratorState::User { iterator: value }
-                }
-                _ => return Err(VmError::TypeMismatch),
-            };
-            Ok(Value::Iterator(alloc_iterator_state(gc_heap, state)?))
-        }
-    }
 }
 
 /// Coerce `take(n)` / `drop(n)` argument to a non-negative integer.
@@ -5866,6 +5844,57 @@ mod tests {
     }
 
     #[test]
+    fn iterator_from_map_uses_stack_rooted_snapshot_and_state_allocation() {
+        let module = module_with(Vec::new(), 5);
+        let mut interp = Interpreter::new();
+        let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
+        crate::collections::map_set(
+            map,
+            interp.gc_heap_mut(),
+            Value::Number(NumberValue::from_i32(4)),
+            Value::Number(NumberValue::from_i32(40)),
+        )
+        .unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Map(map);
+        stack.push(frame);
+        let operands = vec![
+            Operand::Register(1),
+            Operand::ConstIndex(1),
+            Operand::ConstIndex(1),
+            Operand::Register(0),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_iterator_static_call_operands(&mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Iterator.from(Map) should allocate pair arrays, snapshot array, and iterator state through stack roots"
+        );
+        interp
+            .run_iterator_next_regs(&mut stack[0], 2, 3, 1)
+            .unwrap();
+        assert_eq!(stack[0].registers[3], Value::Boolean(false));
+        let Value::Array(pair) = stack[0].registers[2] else {
+            panic!("Iterator.from(Map) should yield entry arrays");
+        };
+        assert_eq!(
+            crate::array::get(pair, interp.gc_heap(), 0),
+            Value::Number(NumberValue::from_i32(4))
+        );
+        assert_eq!(
+            crate::array::get(pair, interp.gc_heap(), 1),
+            Value::Number(NumberValue::from_i32(40))
+        );
+    }
+
+    #[test]
     fn get_iterator_user_resume_uses_young_allocation_with_frame_roots() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
@@ -5990,6 +6019,245 @@ mod tests {
     }
 
     #[test]
+    fn iterator_flat_map_inner_array_uses_runtime_rooted_iterator_allocation() {
+        let module = module_with(Vec::new(), 4);
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(1))],
+        )
+        .unwrap();
+        let mapped = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(99))],
+        )
+        .unwrap();
+        let mapper = native_value_with_captures(
+            interp.gc_heap_mut(),
+            "returnCapturedArray",
+            smallvec::smallvec![Value::Array(mapped)],
+            |_ctx, _args, captures| Ok(captures.first().cloned().unwrap_or(Value::Undefined)),
+        )
+        .unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Array(source);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+
+        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
+        let iter = match stack[0].registers[1].clone() {
+            Value::Iterator(iter) => iter,
+            _ => panic!("GetIterator should produce an iterator handle"),
+        };
+        let args: SmallVec<[Value; 8]> = smallvec::smallvec![mapper];
+        assert!(
+            interp
+                .iterator_helper_dispatch(&mut stack, &context, &iter, "flatMap", &args, 2)
+                .unwrap()
+        );
+        let flat_iter = match stack[0].registers[2].clone() {
+            Value::Iterator(iter) => iter,
+            _ => panic!("flatMap should return an iterator"),
+        };
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let (value, done) = interp
+            .iterator_next_full(&context, &flat_iter)
+            .expect("flatMap next");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "flatMap should allocate adopted inner array iterator state through runtime roots"
+        );
+        assert_eq!(value, Value::Number(NumberValue::from_i32(99)));
+        assert!(!done);
+    }
+
+    #[test]
+    fn array_callback_map_uses_stack_rooted_result_allocation() {
+        fn identity_mapper(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+        }
+
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 3, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "map".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(12))],
+        )
+        .unwrap();
+        let mapper =
+            native_value_static(interp.gc_heap_mut(), "identityMapper", 1, identity_mapper)
+                .unwrap();
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Array(source);
+        frame.registers[1] = mapper;
+        stack.push(frame);
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ],
+            )
+            .expect("array map");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Array.prototype.map should allocate its result through stack roots"
+        );
+        let Value::Array(result) = stack[0].registers[2] else {
+            panic!("map should return an array");
+        };
+        assert_eq!(
+            crate::array::get(result, interp.gc_heap(), 0),
+            Value::Number(NumberValue::from_i32(12))
+        );
+    }
+
+    #[test]
+    fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
+        let module = module_with(Vec::new(), 4);
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(21))],
+        )
+        .unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Array(source);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+
+        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
+        let iter = match stack[0].registers[1].clone() {
+            Value::Iterator(iter) => iter,
+            _ => panic!("GetIterator should produce an iterator handle"),
+        };
+        let args: SmallVec<[Value; 8]> = SmallVec::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        assert!(
+            interp
+                .iterator_helper_dispatch(&mut stack, &context, &iter, "toArray", &args, 2)
+                .unwrap()
+        );
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Iterator helper toArray() should allocate its result through stack roots"
+        );
+        let Value::Array(result) = stack[0].registers[2] else {
+            panic!("toArray should return an array");
+        };
+        assert_eq!(
+            crate::array::get(result, interp.gc_heap(), 0),
+            Value::Number(NumberValue::from_i32(21))
+        );
+    }
+
+    #[test]
+    fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
+        let module = module_with(Vec::new(), 2);
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(NumberValue::from_i32(21))],
+        )
+        .unwrap();
+        let factory = make_array_iterator_factory(source, interp.gc_heap_mut()).unwrap();
+        let Value::NativeFunction(native) = factory else {
+            panic!("Array iterator factory should be native");
+        };
+        let call = native.call_target(interp.gc_heap());
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let call_info = NativeCallInfo::call(Value::Undefined);
+        let mut ctx =
+            NativeCtx::new_with_call_info_and_context(&mut interp, call_info, Some(context));
+
+        let result = call.invoke(&mut ctx, &[]).expect("invoke iterator factory");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Array[Symbol.iterator] factory should allocate iterator state through native roots"
+        );
+        let Value::Iterator(iter) = result else {
+            panic!("factory should return an iterator");
+        };
+        let (array, index) = interp.gc_heap().read_payload(iter, |state| match state {
+            IteratorState::Array { array, index } => (*array, *index),
+            _ => panic!("factory should create an array iterator"),
+        });
+        assert_eq!(array, source);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn iterator_to_list_map_pairs_use_runtime_rooted_array_allocation() {
+        let module = module_with(Vec::new(), 4);
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
+        crate::collections::map_set(
+            map,
+            interp.gc_heap_mut(),
+            Value::Number(NumberValue::from_i32(3)),
+            Value::Number(NumberValue::from_i32(30)),
+        )
+        .unwrap();
+        let map_value = Value::Map(map);
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let entries = interp
+            .iterator_to_list_sync(&context, &map_value)
+            .expect("map entries");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "iterator_to_list_sync Map fast path should allocate pair arrays through runtime roots"
+        );
+        let Some(Value::Array(pair)) = entries.first() else {
+            panic!("expected pair array");
+        };
+        assert_eq!(
+            crate::array::get(*pair, interp.gc_heap(), 0),
+            Value::Number(NumberValue::from_i32(3))
+        );
+        assert_eq!(
+            crate::array::get(*pair, interp.gc_heap(), 1),
+            Value::Number(NumberValue::from_i32(30))
+        );
+    }
+
+    #[test]
     fn synthesized_iterator_next_uses_runtime_rooted_young_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
@@ -6031,6 +6299,31 @@ mod tests {
         assert_eq!(
             object::get(record, interp.gc_heap(), "done"),
             Some(Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn iterator_result_record_uses_runtime_rooted_young_allocation() {
+        let mut interp = Interpreter::new();
+        let value = Value::Number(NumberValue::from_i32(44));
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let result = interp
+            .make_runtime_rooted_iter_result(value.clone(), true, &[], &[])
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "IteratorResult records should allocate through runtime roots"
+        );
+        let Value::Object(record) = result else {
+            panic!("IteratorResult should be an object");
+        };
+        assert_eq!(object::get(record, interp.gc_heap(), "value"), Some(value));
+        assert_eq!(
+            object::get(record, interp.gc_heap(), "done"),
+            Some(Value::Boolean(true))
         );
     }
 
@@ -6253,14 +6546,318 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let context = ExecutionContext::from_module(module);
         let Value::Promise(promise) = interp.run(&context).unwrap() else {
             panic!("expected async function call to return a promise");
         };
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "async bytecode calls should allocate their result promise in young space"
+        );
         assert_eq!(
             promise.state(interp.gc_heap()),
             crate::promise::PromiseState::Fulfilled(Value::Number(NumberValue::Smi(144)))
         );
+    }
+
+    #[test]
+    fn async_generator_method_uses_stack_rooted_capability_allocation() {
+        let main = test_function(0, "<main>", 0, 1, Vec::new());
+        let generator_body = test_function(
+            1,
+            "async_generator_body",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(0), Operand::Imm32(91)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![main.clone(), generator_body.clone()],
+            constants: vec![Constant::String {
+                utf16: "next".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let body_frame = Frame::for_function(&generator_body);
+        let generator =
+            crate::generator::JsGenerator::new(interp.gc_heap_mut(), body_frame).expect("gen");
+        generator.set_async(interp.gc_heap_mut(), true);
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&main);
+        frame.registers[0] = Value::Generator(generator);
+        stack.push(frame);
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect("async generator next");
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        assert!(
+            after > before,
+            "async generator method should allocate its pending capability through stack roots"
+        );
+        assert!(matches!(stack[0].registers[0], Value::Promise(_)));
+    }
+
+    #[test]
+    fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
+        let main = test_function(0, "<main>", 0, 1, Vec::new());
+        let callee = test_function(1, "sloppy_callee", 0, 1, Vec::new());
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![main.clone(), callee],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(&main));
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let boxed_this = interp
+            .this_for_bytecode_call_stack_rooted(
+                context.exec_function(1).expect("callee"),
+                &stack,
+                Value::Number(NumberValue::from_i32(33)),
+                &[],
+            )
+            .expect("boxed this");
+        let primitive_string =
+            Value::String(crate::JsString::from_str("abc", &interp.string_heap).unwrap());
+        let property_base = interp
+            .object_for_primitive_property_base_stack_rooted(&stack, &primitive_string)
+            .expect("property base")
+            .expect("primitive base");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "primitive wrapper boxing should allocate through stack-rooted young allocation"
+        );
+        assert!(matches!(boxed_this, Value::Object(_)));
+        assert!(matches!(Value::Object(property_base), Value::Object(_)));
+    }
+
+    #[test]
+    fn top_level_async_entry_uses_stack_rooted_result_promise_allocation() {
+        let mut main = test_function(
+            0,
+            "<main>",
+            0,
+            1,
+            vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(0), Operand::Imm32(512)].into(),
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)].into(),
+                },
+            ],
+        );
+        main.is_async = true;
+        main.is_module = true;
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![main],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        assert_eq!(
+            interp.run(&context).unwrap(),
+            Value::Number(NumberValue::Smi(512))
+        );
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "async entry promise should allocate through stack-rooted young allocation"
+        );
+    }
+
+    #[test]
+    fn promise_fulfilled_of_uses_young_allocation_with_frame_roots() {
+        let main_code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(1), Operand::Imm32(211)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::PromiseFulfilledOf,
+                operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, main_code)],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let context = ExecutionContext::from_module(module);
+        let Value::Promise(promise) = interp.run(&context).unwrap() else {
+            panic!("expected promise");
+        };
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "PromiseFulfilledOf should allocate the promise body in young space"
+        );
+        assert_eq!(
+            promise.state(interp.gc_heap()),
+            crate::promise::PromiseState::Fulfilled(Value::Number(NumberValue::Smi(211)))
+        );
+    }
+
+    #[test]
+    fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
+        let mut function = test_function(0, "async_body", 0, 1, Vec::new());
+        function.is_async = true;
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![function],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let result_promise = promise_dispatch::PromiseBuilder::new()
+            .pending(interp.gc_heap_mut())
+            .expect("result promise");
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.async_state = Some(AsyncFrameState { result_promise });
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .do_await(
+                &mut stack,
+                &context,
+                0,
+                Value::Number(NumberValue::Smi(307)),
+            )
+            .expect("await");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Await of a non-promise should wrap through stack-rooted young allocation"
+        );
+        assert!(stack.is_empty(), "await should park the active frame");
+    }
+
+    #[test]
+    fn promise_new_uses_stack_rooted_capability_allocation() {
+        fn executor(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::Undefined)
+        }
+
+        let module = module_with(Vec::new(), 3);
+        let context = ExecutionContext::from_module(module.clone());
+        let mut interp = Interpreter::new();
+        let executor_value =
+            native_value_static(interp.gc_heap_mut(), "executor", 2, executor).expect("executor");
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[1] = executor_value;
+        stack.push(frame);
+        let operands = vec![
+            Operand::Register(0),
+            Operand::Register(1),
+            Operand::Register(2),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_promise_new_operands(&context, &mut stack, operands.as_slice())
+            .expect("PromiseNew");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "PromiseNew should allocate its promise/capability through stack-rooted young allocation"
+        );
+        assert!(matches!(stack[0].registers[0], Value::Promise(_)));
+    }
+
+    #[test]
+    fn dynamic_import_rejection_uses_stack_rooted_promise_allocation() {
+        let module = module_with(Vec::new(), 2);
+        let context = ExecutionContext::from_module(module.clone());
+        let mut interp = Interpreter::new();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[1] = Value::Number(NumberValue::Smi(12));
+        stack.push(frame);
+        let operands = vec![Operand::Register(0), Operand::Register(1)];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_import_namespace_dynamic_operands(&context, &mut stack, 0, operands.as_slice())
+            .expect("dynamic import");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "dynamic import rejection should allocate the promise body in young space"
+        );
+        let Value::Promise(promise) = stack[0].registers[0] else {
+            panic!("expected promise");
+        };
+        assert!(matches!(
+            promise.state(interp.gc_heap()),
+            crate::promise::PromiseState::Rejected(_)
+        ));
     }
 
     #[test]
@@ -7022,6 +7619,49 @@ mod tests {
         interp.do_call(&mut stack, &context, &operands).unwrap();
 
         assert_eq!(stack[0].registers[3], Value::Number(NumberValue::Smi(21)));
+    }
+
+    #[test]
+    fn proxy_revocable_uses_stack_rooted_result_allocation() {
+        let module = module_with(vec![], 4);
+        let mut interp = Interpreter::new();
+        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Object(target);
+        frame.registers[1] = Value::Object(handler);
+        stack.push(frame);
+        let operands = vec![
+            Operand::Register(2),
+            Operand::ConstIndex(1),
+            Operand::ConstIndex(2),
+            Operand::Register(0),
+            Operand::Register(1),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_proxy_static_call_operands(&mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Proxy.revocable should allocate revoke function and result object through stack roots"
+        );
+        let Value::Object(record) = stack[0].registers[2] else {
+            panic!("Proxy.revocable should return an object");
+        };
+        assert!(matches!(
+            object::get(record, interp.gc_heap(), "proxy"),
+            Some(Value::Proxy(_))
+        ));
+        assert!(matches!(
+            object::get(record, interp.gc_heap(), "revoke"),
+            Some(Value::NativeFunction(_))
+        ));
     }
 
     #[test]

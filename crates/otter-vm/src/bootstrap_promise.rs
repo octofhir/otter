@@ -195,7 +195,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
             reason: "no active execution context".to_string(),
         })?;
     let (handle, resolve, reject) = PromiseBuilder::with_context(context.clone())
-        .construct(ctx.heap_mut())
+        .construct_native_rooted(ctx, &[&executor], &[args])
         .map_err(|_| oom("Promise"))?;
     let promise_value = Value::Promise(handle);
     let invoke_args: SmallVec<[Value; 8]> = smallvec::smallvec![resolve, reject.clone()];

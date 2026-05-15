@@ -21,11 +21,12 @@ use otter_bytecode::{Op, Operand, method_id};
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, bigint, binary, date, global_functions,
-    iterator_static_call, json, json_to_vm_error, math, math_to_vm_error, object_statics,
+    ExecutionContext, Frame, Interpreter, IteratorState, Value, VmError, abstract_ops, bigint,
+    binary, collections, constructor_return_is_object, date, global_functions, json,
+    json_to_vm_error, math, math_to_vm_error, native_function, object, object_statics,
     operand_decode::{const_operand, register_operand},
-    proxy_static_call, read_register, symbol_dispatch, symbol_to_vm_error, temporal,
-    temporal_to_vm_error, write_register,
+    read_register, symbol_dispatch, symbol_to_vm_error, temporal, temporal_to_vm_error,
+    write_register,
 };
 
 impl Interpreter {
@@ -93,26 +94,12 @@ impl Interpreter {
                     binary::dispatch::typed_array_call(kind, method, &args, &self.gc_heap)?;
                 finish_static_call(frame, dst, result)
             }
-            Op::IteratorCall => {
-                let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
-                let method = method_id::IteratorMethod::from_u32(method_idx)
-                    .ok_or(VmError::InvalidOperand)?;
-                let result = iterator_static_call(method, &args, &mut self.gc_heap)?;
-                finish_static_call(frame, dst, result)
-            }
             Op::SharedArrayBufferCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method = method_id::SharedArrayBufferMethod::from_u32(method_idx)
                     .ok_or(VmError::InvalidOperand)?;
                 let result =
                     binary::dispatch::shared_array_buffer_call(method, &args, &self.gc_heap)?;
-                finish_static_call(frame, dst, result)
-            }
-            Op::ProxyCall => {
-                let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
-                let method =
-                    method_id::ProxyMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result = proxy_static_call(method, &args, &mut self.gc_heap)?;
                 finish_static_call(frame, dst, result)
             }
             Op::ObjectCall => {
@@ -163,6 +150,165 @@ impl Interpreter {
             }
             _ => Err(VmError::InvalidOperand),
         }
+    }
+
+    pub(crate) fn run_iterator_static_call_operands(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        let (dst, method_idx, args) = {
+            let frame = &stack[top_idx];
+            decode_static_call(frame, operands, 1, 2, 3)?
+        };
+        let method =
+            method_id::IteratorMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
+        let result = self.iterator_static_call_stack_rooted(stack, method, &args)?;
+        finish_static_call(&mut stack[top_idx], dst, result)
+    }
+
+    pub(crate) fn run_proxy_static_call_operands(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        let (dst, method_idx, args) = {
+            let frame = &stack[top_idx];
+            decode_static_call(frame, operands, 1, 2, 3)?
+        };
+        let method = method_id::ProxyMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
+        let result = self.proxy_static_call_stack_rooted(stack, method, &args)?;
+        finish_static_call(&mut stack[top_idx], dst, result)
+    }
+
+    fn proxy_static_call_stack_rooted(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        method: method_id::ProxyMethod,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        use method_id::ProxyMethod as M;
+        match method {
+            M::Construct => {
+                let target = coerce_proxy_target(args.first())?;
+                let handler = match args.get(1) {
+                    Some(Value::Object(o)) => *o,
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
+            }
+            M::Revocable => {
+                let target = coerce_proxy_target(args.first())?;
+                let handler = match args.get(1) {
+                    Some(Value::Object(o)) => *o,
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                let proxy = crate::proxy::JsProxy::new(target.clone(), handler);
+                let proxy_value = Value::Proxy(proxy.clone());
+                let target_root = target;
+                let handler_root = Value::Object(handler);
+                let roots = self.collect_allocation_roots(stack);
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    target_root.trace_value_slots(visitor);
+                    handler_root.trace_value_slots(visitor);
+                    for value in args {
+                        value.trace_value_slots(visitor);
+                    }
+                };
+                let revoke = native_function::native_value_with_captures_unchecked_with_roots(
+                    &mut self.gc_heap,
+                    "revoke",
+                    smallvec::smallvec![proxy_value.clone()],
+                    &mut external_visit,
+                    move |_, _, captures| {
+                        if let Some(Value::Proxy(proxy)) = captures.first() {
+                            proxy.revoke();
+                        }
+                        Ok(Value::Undefined)
+                    },
+                )?;
+                let obj = object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
+                object::set(obj, &mut self.gc_heap, "proxy", Value::Proxy(proxy));
+                object::set(obj, &mut self.gc_heap, "revoke", revoke);
+                Ok(Value::Object(obj))
+            }
+        }
+    }
+
+    fn iterator_static_call_stack_rooted(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        method: method_id::IteratorMethod,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        use method_id::IteratorMethod as M;
+        match method {
+            M::Construct => Err(VmError::TypeMismatch),
+            M::From => {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                let state = match value {
+                    Value::Iterator(rc) => return Ok(Value::Iterator(rc)),
+                    Value::Generator(handle) => IteratorState::Generator { handle },
+                    Value::Array(arr) => IteratorState::Array {
+                        array: arr,
+                        index: 0,
+                    },
+                    Value::String(s) => IteratorState::String {
+                        string: s,
+                        index: 0,
+                    },
+                    Value::Set(s) => {
+                        let value_root = Value::Set(s);
+                        let snap: SmallVec<[Value; 4]> = collections::set_values(s, self.gc_heap())
+                            .into_iter()
+                            .collect();
+                        let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                            stack,
+                            snap,
+                            &[&value_root],
+                            &[args],
+                        )?;
+                        IteratorState::Array { array, index: 0 }
+                    }
+                    Value::Map(m) => {
+                        let value_root = Value::Map(m);
+                        let mut entries: Vec<Value> = Vec::new();
+                        for (k, v) in collections::map_entries(m, self.gc_heap()) {
+                            let pair = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                                stack,
+                                [k, v],
+                                &[&value_root],
+                                &[args, entries.as_slice()],
+                            )?;
+                            entries.push(Value::Array(pair));
+                        }
+                        let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                            stack,
+                            entries,
+                            &[&value_root],
+                            &[args],
+                        )?;
+                        IteratorState::Array { array, index: 0 }
+                    }
+                    Value::Object(_) => IteratorState::User { iterator: value },
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[], &[args])?;
+                Ok(Value::Iterator(iter))
+            }
+        }
+    }
+}
+
+fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
+    match arg {
+        Some(v) if constructor_return_is_object(v) || abstract_ops::is_callable(v) => Ok(v.clone()),
+        _ => Err(VmError::TypeMismatch),
     }
 }
 

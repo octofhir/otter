@@ -127,11 +127,19 @@ pub fn call(
                 None => Ok(Value::Undefined),
                 Some(desc) => {
                     let flags = desc.flags;
+                    let descriptor_roots: Vec<Value> = match &desc.kind {
+                        crate::object::DescriptorKind::Data { value } => vec![value.clone()],
+                        crate::object::DescriptorKind::Accessor { getter, setter } => vec![
+                            getter.clone().unwrap_or(Value::Undefined),
+                            setter.clone().unwrap_or(Value::Undefined),
+                        ],
+                    };
+                    let obj =
+                        interp.alloc_runtime_rooted_object_with_roots(&[], &[&descriptor_roots])?;
                     let heap = interp.gc_heap_mut();
-                    let obj = crate::object::alloc_object(heap).map_err(VmError::from)?;
                     match &desc.kind {
-                        crate::object::DescriptorKind::Data { value } => {
-                            crate::object::set(obj, heap, "value", value.clone());
+                        crate::object::DescriptorKind::Data { .. } => {
+                            crate::object::set(obj, heap, "value", descriptor_roots[0].clone());
                             crate::object::set(
                                 obj,
                                 heap,
@@ -139,19 +147,9 @@ pub fn call(
                                 Value::Boolean(flags.writable()),
                             );
                         }
-                        crate::object::DescriptorKind::Accessor { getter, setter } => {
-                            crate::object::set(
-                                obj,
-                                heap,
-                                "get",
-                                getter.clone().unwrap_or(Value::Undefined),
-                            );
-                            crate::object::set(
-                                obj,
-                                heap,
-                                "set",
-                                setter.clone().unwrap_or(Value::Undefined),
-                            );
+                        crate::object::DescriptorKind::Accessor { .. } => {
+                            crate::object::set(obj, heap, "get", descriptor_roots[0].clone());
+                            crate::object::set(obj, heap, "set", descriptor_roots[1].clone());
                         }
                     }
                     crate::object::set(obj, heap, "enumerable", Value::Boolean(flags.enumerable()));
@@ -191,10 +189,9 @@ pub fn call(
         M::OwnKeys => {
             let target = expect_object_value(args.first())?;
             let keys = interp.own_property_keys_value(context, &target, string_heap)?;
-            Ok(Value::Array(crate::array::from_elements(
-                interp.gc_heap_mut(),
-                keys,
-            )?))
+            Ok(Value::Array(
+                interp.alloc_runtime_rooted_array_from_values(keys, &[&target], &[])?,
+            ))
         }
         // §28.1.12 Reflect.preventExtensions(target)
         // <https://tc39.es/ecma262/#sec-reflect.preventextensions>
@@ -611,5 +608,104 @@ fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc::Gc
             Some(Value::NativeFunction(_))
         ),
         _ => crate::abstract_ops::is_constructor(value, context, heap),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_bytecode::{
+        BytecodeModule, Function, Instruction, SourceKind as BcSourceKind, SpanEntry,
+        method_id::ReflectMethod,
+    };
+
+    fn empty_context() -> ExecutionContext {
+        ExecutionContext::from_module(BytecodeModule {
+            module: "reflect-test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                span: (0, 0),
+                locals: 0,
+                scratch: 0,
+                param_count: 0,
+                own_upvalue_count: 0,
+                is_strict: false,
+                is_arrow: false,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_async_generator: false,
+                is_module: false,
+                needs_arguments: false,
+                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
+                mapped_argument_bindings: Vec::new(),
+                module_url: String::new(),
+                code: Vec::<Instruction>::new(),
+                spans: Vec::<SpanEntry>::new(),
+            }],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn get_own_property_descriptor_uses_runtime_rooted_object_allocation() {
+        let mut interp = Interpreter::new();
+        let target = crate::object::alloc_object(interp.gc_heap_mut()).expect("target");
+        crate::object::set(
+            target,
+            interp.gc_heap_mut(),
+            "answer",
+            Value::Number(crate::NumberValue::from_i32(42)),
+        );
+        let context = empty_context();
+        let strings = interp.string_heap_clone();
+        let key = Value::String(crate::JsString::from_str("answer", &strings).expect("key"));
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+
+        let result = call(
+            &mut interp,
+            &context,
+            ReflectMethod::GetOwnPropertyDescriptor,
+            &[Value::Object(target), key],
+            &strings,
+        )
+        .expect("descriptor");
+
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Reflect.getOwnPropertyDescriptor should allocate descriptor objects in young space"
+        );
+        assert!(matches!(result, Value::Object(_)));
+    }
+
+    #[test]
+    fn own_keys_uses_runtime_rooted_array_allocation() {
+        let mut interp = Interpreter::new();
+        let target = crate::object::alloc_object(interp.gc_heap_mut()).expect("target");
+        crate::object::set(target, interp.gc_heap_mut(), "a", Value::Boolean(true));
+        let context = empty_context();
+        let strings = interp.string_heap_clone();
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+
+        let result = call(
+            &mut interp,
+            &context,
+            ReflectMethod::OwnKeys,
+            &[Value::Object(target)],
+            &strings,
+        )
+        .expect("ownKeys");
+
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Reflect.ownKeys should allocate the key array in young space"
+        );
+        assert!(matches!(result, Value::Array(_)));
     }
 }

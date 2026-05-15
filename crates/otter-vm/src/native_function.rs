@@ -17,7 +17,9 @@
 //!   `VmError`.
 //!
 //! # Invariants
-//! - Every allocation receives an explicit [`otter_gc::GcHeap`].
+//! - Every allocation receives an explicit [`otter_gc::GcHeap`]; active
+//!   VM-owned dynamic closures use the root-aware helper when caller roots are
+//!   available.
 //! - The call signature receives an explicit [`crate::NativeCtx`].
 //!   Host async work must copy owned, non-GC data out before any
 //!   `.await`; `NativeCtx`, `Value`, and GC handles are
@@ -44,6 +46,7 @@ use smallvec::SmallVec;
 use crate::object::{DescriptorKind, JsObject, PropertyDescriptor};
 use crate::string::{JsString, StringError, StringHeap};
 use crate::{NativeCtx, Value};
+use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
@@ -816,29 +819,79 @@ where
     }))
 }
 
-pub(crate) fn native_value_with_trace_unchecked<F>(
+pub(crate) fn native_value_with_captures_unchecked_with_roots<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     captures: SmallVec<[Value; 4]>,
-    trace: Rc<NativeTraceFn>,
+    external_visit: &mut RootSlotVisitor<'_>,
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    let own_properties = crate::object::alloc_object(heap)?;
+    let own_properties = {
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            for value in &captures {
+                value.trace_value_slots(visitor);
+            }
+        };
+        crate::object::alloc_object_with_roots(heap, &mut visit)?
+    };
     Ok(Value::NativeFunction(NativeFunction {
-        inner: heap.alloc_old(NativeFunctionBody {
-            name,
-            length: 0,
-            call: NativeCallStorage::LocalDynamic(Rc::new(call)),
-            captures,
-            trace: Some(trace),
-            name_property: default_name_property(),
-            length_property: default_length_property(),
-            metadata: NativeFunctionMetadata::BUILTIN,
-            own_properties,
-        })?,
+        inner: heap.alloc_with_roots(
+            NativeFunctionBody {
+                name,
+                length: 0,
+                call: NativeCallStorage::LocalDynamic(Rc::new(call)),
+                captures,
+                trace: None,
+                name_property: default_name_property(),
+                length_property: default_length_property(),
+                metadata: NativeFunctionMetadata::BUILTIN,
+                own_properties,
+            },
+            external_visit,
+        )?,
+    }))
+}
+
+pub(crate) fn native_value_with_trace_unchecked_with_roots<F>(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    captures: SmallVec<[Value; 4]>,
+    trace: Rc<NativeTraceFn>,
+    external_visit: &mut RootSlotVisitor<'_>,
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    let own_properties = {
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            for value in &captures {
+                value.trace_value_slots(visitor);
+            }
+            trace(visitor);
+        };
+        crate::object::alloc_object_with_roots(heap, &mut visit)?
+    };
+    Ok(Value::NativeFunction(NativeFunction {
+        inner: heap.alloc_with_roots(
+            NativeFunctionBody {
+                name,
+                length: 0,
+                call: NativeCallStorage::LocalDynamic(Rc::new(call)),
+                captures,
+                trace: Some(trace),
+                name_property: default_name_property(),
+                length_property: default_length_property(),
+                metadata: NativeFunctionMetadata::BUILTIN,
+                own_properties,
+            },
+            external_visit,
+        )?,
     }))
 }
 

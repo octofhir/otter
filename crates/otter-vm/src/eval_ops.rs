@@ -89,18 +89,22 @@ impl Interpreter {
         } else {
             Value::Object(self.global_this)
         };
-        let mut entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
-        let entry_promise = if main.is_async {
+        let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let entry_is_async = main.is_async;
+        stack.push(entry);
+        let entry_promise = if entry_is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending(&mut self.gc_heap)?;
-            entry.async_state = Some(AsyncFrameState {
+                .pending_stack_rooted(self, &stack, &[], &[])?;
+            stack
+                .last_mut()
+                .expect("entry frame was just pushed")
+                .async_state = Some(AsyncFrameState {
                 result_promise: result,
             });
             Some(result)
         } else {
             None
         };
-        stack.push(entry);
         let value = self.dispatch_loop(&context, &mut stack)?;
         if let Some(promise) = entry_promise {
             // Drain microtasks attached to top-level await so the

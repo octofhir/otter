@@ -38,6 +38,8 @@
 //! - [Architecture](../../../docs/book/src/engine/architecture.md)
 
 use crate::array::{self, JsArray};
+use crate::collections::{self, JsMap, JsSet};
+use crate::object::{self, JsObject};
 use crate::string::StringHeap;
 use crate::{IteratorHandle, IteratorState, Value};
 use otter_gc::raw::RawGc;
@@ -170,6 +172,63 @@ pub struct IntrinsicArgs<'a> {
 }
 
 impl IntrinsicArgs<'_> {
+    /// Allocate an ordinary object while exposing the intrinsic
+    /// receiver, call arguments, caller-provided roots, and local
+    /// values that have not yet been published into the object.
+    pub fn alloc_object_rooted(
+        &mut self,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<JsObject, otter_gc::OutOfMemory> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(
+                visitor,
+                allocation_roots,
+                receiver,
+                args,
+                value_roots,
+                slice_roots,
+            );
+        };
+        object::alloc_object_with_roots(self.gc_heap, &mut external_visit)
+    }
+
+    /// Insert into a `Map` while exposing the intrinsic receiver,
+    /// call arguments, caller-provided roots, and pending key/value.
+    pub fn map_set_rooted(
+        &mut self,
+        map: &mut JsMap,
+        key: Value,
+        value: Value,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(visitor, allocation_roots, receiver, args, &[], &[]);
+        };
+        collections::map_set_with_roots(map, self.gc_heap, key, value, &mut external_visit)
+    }
+
+    /// Insert into a `Set` while exposing the intrinsic receiver,
+    /// call arguments, caller-provided roots, and pending value.
+    pub fn set_add_rooted(
+        &mut self,
+        set: &mut JsSet,
+        value: Value,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(visitor, allocation_roots, receiver, args, &[], &[]);
+        };
+        collections::set_add_with_roots(set, self.gc_heap, value, &mut external_visit)
+    }
+
     /// Allocate an array while exposing the intrinsic receiver, call
     /// arguments, caller-provided roots, and local pre-publish buffers.
     pub fn array_from_elements_rooted<I>(

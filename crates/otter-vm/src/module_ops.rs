@@ -23,6 +23,7 @@ use crate::{
     write_register,
 };
 use otter_bytecode::Operand;
+use smallvec::SmallVec;
 
 impl Interpreter {
     pub(crate) fn run_import_namespace_reg(
@@ -68,13 +69,14 @@ impl Interpreter {
     pub(crate) fn run_import_namespace_dynamic_operands(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let spec_reg = register_operand(operands.get(1))?;
-        let spec_value = read_register(frame, spec_reg)?.clone();
-        let referrer = frame.module_url.clone();
+        let spec_value = read_register(&stack[top_idx], spec_reg)?.clone();
+        let referrer = stack[top_idx].module_url.clone();
         let import_context = context.clone();
         let promise = match spec_value {
             Value::String(s) => {
@@ -82,12 +84,13 @@ impl Interpreter {
                 if let Some(ns) =
                     self.resolve_module_namespace(context, referrer.as_ref(), &specifier)
                 {
+                    let namespace_value = Value::Object(ns);
                     promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                        .fulfilled(&mut self.gc_heap, Value::Object(ns))?
+                        .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])?
                 } else if let Some(loader) = self.dynamic_import_loader.clone() {
                     let pending =
                         promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                            .pending(&mut self.gc_heap)?;
+                            .pending_stack_rooted(self, stack, &[], &[])?;
                     let token = self
                         .dynamic_import_registry
                         .insert(pending, import_context.clone());
@@ -99,17 +102,17 @@ impl Interpreter {
                         "dynamic import: module not resolvable: \"{specifier}\""
                     ))?;
                     promise_dispatch::PromiseBuilder::with_context(import_context.clone())
-                        .rejected(&mut self.gc_heap, reason)?
+                        .rejected_stack_rooted(self, stack, reason, &[], &[])?
                 }
             }
             _ => {
                 let reason = self.make_type_error("dynamic import: specifier must be a string")?;
                 promise_dispatch::PromiseBuilder::with_context(import_context)
-                    .rejected(&mut self.gc_heap, reason)?
+                    .rejected_stack_rooted(self, stack, reason, &[], &[])?
             }
         };
-        write_register(frame, dst, Value::Promise(promise))?;
-        frame.pc += 1;
+        write_register(&mut stack[top_idx], dst, Value::Promise(promise))?;
+        stack[top_idx].pc += 1;
         Ok(())
     }
 }

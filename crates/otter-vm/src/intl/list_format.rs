@@ -120,13 +120,16 @@ fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsic
         "literal",
         args.string_heap,
     )?);
-    let heap = &mut *args.gc_heap;
-    let part = crate::object::alloc_object(heap)?;
-    crate::object::set(part, heap, "type", literal);
-    crate::object::set(part, heap, "value", s);
-    Ok(Value::Array(crate::array::from_elements(
-        heap,
+    let part = args.alloc_object_rooted(&[&literal, &s], &[])?;
+    {
+        let heap = &mut *args.gc_heap;
+        crate::object::set(part, heap, "type", literal);
+        crate::object::set(part, heap, "value", s);
+    }
+    Ok(Value::Array(args.array_from_elements_rooted(
         [Value::Object(part)],
+        &[],
+        &[],
     )?))
 }
 
@@ -135,8 +138,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
     let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
     let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
+    let obj = args.alloc_object_rooted(&[&locale, &kind, &style], &[])?;
     let heap = &mut *args.gc_heap;
-    let obj = crate::object::alloc_object(heap)?;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
     crate::object::set(obj, heap, "style", style);

@@ -90,8 +90,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let mid = payload.minimum_integer_digits as i32;
     let mfd = payload.minimum_fraction_digits as i32;
     let xfd = payload.maximum_fraction_digits as i32;
+    let obj = args.alloc_object_rooted(&[&locale, &kind], &[])?;
     let heap = &mut *args.gc_heap;
-    let obj = crate::object::alloc_object(heap)?;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
     crate::object::set(

@@ -136,10 +136,13 @@ impl Interpreter {
                     // `pending_request` so `Op::Yield` /
                     // `resume_generator` / the await-resume native
                     // can settle it from inside the dispatch loop.
-                    let cap = promise_dispatch::make_capability_with_context(
-                        &mut self.gc_heap,
-                        context.clone(),
-                    )?;
+                    let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                        .capability_stack_rooted(
+                            self,
+                            stack,
+                            &[&recv_value],
+                            &[arg_values.as_slice()],
+                        )?;
                     let promise = cap.promise.clone();
                     g.set_pending_request(&mut self.gc_heap, cap.clone());
                     let outcome = self.resume_generator(context, &g, kind);
@@ -622,7 +625,13 @@ impl Interpreter {
                         cb_args,
                     )?);
                 }
-                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
+                let result = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    out.iter().cloned(),
+                    &[&arr_value, &callee],
+                    &[args.as_slice(), out.as_slice()],
+                )?;
+                Value::Array(result)
             }
             "filter" => {
                 let callee = require_callable(args.first())?;
@@ -638,7 +647,13 @@ impl Interpreter {
                         out.push(crate::array::get(*arr, &self.gc_heap, i));
                     }
                 }
-                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
+                let result = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    out.iter().cloned(),
+                    &[&arr_value, &callee],
+                    &[args.as_slice(), out.as_slice()],
+                )?;
+                Value::Array(result)
             }
             "reduce" | "reduceRight" => {
                 // §23.1.3.24 / §23.1.3.25: skip holes; if no
@@ -798,7 +813,13 @@ impl Interpreter {
                         other => out.push(other),
                     }
                 }
-                Value::Array(crate::array::from_elements(&mut self.gc_heap, out)?)
+                let result = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    out.iter().cloned(),
+                    &[&arr_value, &callee],
+                    &[args.as_slice(), out.as_slice()],
+                )?;
+                Value::Array(result)
             }
             "sort" => {
                 // §23.1.3.30: SortIndexedProperties sorts only

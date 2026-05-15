@@ -54,11 +54,10 @@ fn impl_map_get(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 fn impl_map_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let m = receiver_map(args)?;
+    let mut m = receiver_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
     let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
-    let heap = &mut *args.gc_heap;
-    collections::map_set(m, heap, key, value)?;
+    args.map_set_rooted(&mut m, key, value)?;
     Ok(Value::Map(m))
 }
 
@@ -159,10 +158,9 @@ fn receiver_set(args: &IntrinsicArgs<'_>) -> Result<JsSet, IntrinsicError> {
 }
 
 fn impl_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let s = receiver_set(args)?;
+    let mut s = receiver_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let heap = &mut *args.gc_heap;
-    collections::set_add(s, heap, v)?;
+    args.set_add_rooted(&mut s, v)?;
     Ok(Value::Set(s))
 }
 
@@ -532,4 +530,66 @@ fn make_native_iter_value(
         &[],
         &[],
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::number::NumberValue;
+    use crate::string::StringHeap;
+
+    #[test]
+    fn map_set_uses_intrinsic_rooted_reservation() {
+        let strings = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let map = collections::alloc_map(&mut gc_heap).expect("map");
+        let receiver = Value::Map(map);
+        let args = [
+            Value::Number(NumberValue::from_i32(1)),
+            Value::Number(NumberValue::from_i32(2)),
+        ];
+        let before = gc_heap.stats().reserved_bytes;
+
+        let result = impl_map_set(&mut IntrinsicArgs {
+            receiver: &receiver,
+            args: &args,
+            string_heap: &strings,
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
+        })
+        .expect("map set");
+
+        let after = gc_heap.stats().reserved_bytes;
+        assert!(
+            after > before,
+            "Map.prototype.set should reserve backing storage through intrinsic roots"
+        );
+        assert!(matches!(result, Value::Map(_)));
+    }
+
+    #[test]
+    fn set_add_uses_intrinsic_rooted_reservation() {
+        let strings = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let set = collections::alloc_set(&mut gc_heap).expect("set");
+        let receiver = Value::Set(set);
+        let args = [Value::Number(NumberValue::from_i32(3))];
+        let before = gc_heap.stats().reserved_bytes;
+
+        let result = impl_set_add(&mut IntrinsicArgs {
+            receiver: &receiver,
+            args: &args,
+            string_heap: &strings,
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
+        })
+        .expect("set add");
+
+        let after = gc_heap.stats().reserved_bytes;
+        assert!(
+            after > before,
+            "Set.prototype.add should reserve backing storage through intrinsic roots"
+        );
+        assert!(matches!(result, Value::Set(_)));
+    }
 }

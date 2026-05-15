@@ -80,8 +80,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let case_first = js_string_value(&payload.case_first, args)?;
     let ignore_punctuation = payload.ignore_punctuation;
     let numeric = payload.numeric;
+    let obj = args.alloc_object_rooted(&[&locale, &usage, &sensitivity, &case_first], &[])?;
     let heap = &mut *args.gc_heap;
-    let obj = crate::object::alloc_object(heap)?;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "usage", usage);
     crate::object::set(obj, heap, "sensitivity", sensitivity);

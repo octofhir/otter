@@ -24,8 +24,8 @@ use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
-    ExecutionContext, Frame, Interpreter, RunError, Value, VmError, make_iter_result,
-    promise_dispatch, render_thrown_value, snapshot_frames,
+    ExecutionContext, Frame, Interpreter, RunError, Value, VmError, promise_dispatch,
+    render_thrown_value, snapshot_frames,
 };
 
 impl Interpreter {
@@ -93,15 +93,16 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        let parked = stack.pop().expect("top frame existed");
         let promise = match awaited {
             Value::Promise(p) => p,
             other => promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .fulfilled(&mut self.gc_heap, other)?,
+                .fulfilled_stack_rooted(self, stack, other, &[], &[])?,
         };
+        let promise_value = Value::Promise(promise);
+        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
+        let parked = stack.pop().expect("top frame existed");
         let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
-        let capability =
-            promise_dispatch::make_capability_with_context(&mut self.gc_heap, context.clone())?;
         let outcome = promise.perform_async_resume_then_with_context(
             &mut self.gc_heap,
             parked,
@@ -134,15 +135,16 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        let parked = stack.pop().expect("top frame existed");
         let promise = match awaited {
             Value::Promise(p) => p,
             other => promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .fulfilled(&mut self.gc_heap, other)?,
+                .fulfilled_stack_rooted(self, stack, other, &[], &[])?,
         };
+        let promise_value = Value::Promise(promise);
+        let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
+        let parked = stack.pop().expect("top frame existed");
         let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
-        let capability =
-            promise_dispatch::make_capability_with_context(&mut self.gc_heap, context.clone())?;
         let outcome = promise.perform_async_resume_then_with_context(
             &mut self.gc_heap,
             parked,
@@ -222,8 +224,9 @@ impl Interpreter {
                 // the final return value as `done: true`.
                 let req = owner.take_pending_request(&mut self.gc_heap);
                 if let Some(req) = req {
-                    let record =
-                        make_iter_result(value, true, &mut self.gc_heap).map_err(RunError::bare)?;
+                    let record = self
+                        .make_runtime_rooted_iter_result(value, true, &[&req.resolve], &[])
+                        .map_err(RunError::bare)?;
                     let request_context = req.context.clone().unwrap_or_else(|| context.clone());
                     if let Err(error) = self.run_callable_sync(
                         &request_context,

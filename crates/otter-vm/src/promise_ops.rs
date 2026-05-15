@@ -34,15 +34,16 @@ impl Interpreter {
     pub(crate) fn run_promise_fulfilled_of_regs(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let value = read_register(frame, src)?.clone();
+        let value = read_register(&stack[top_idx], src)?.clone();
         let promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .fulfilled(&mut self.gc_heap, value)?;
-        write_register(frame, dst, Value::Promise(promise))?;
-        frame.pc += 1;
+            .fulfilled_stack_rooted(self, stack, value, &[], &[])?;
+        write_register(&mut stack[top_idx], dst, Value::Promise(promise))?;
+        stack[top_idx].pc += 1;
         Ok(())
     }
 
@@ -86,7 +87,7 @@ impl Interpreter {
         }
         let (handle, resolve, reject) =
             promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .construct(&mut self.gc_heap)?;
+                .construct_stack_rooted(self, stack, &[&executor], &[])?;
         write_register(&mut stack[top_idx], dst, Value::Promise(handle))?;
         stack[top_idx].pc += 1;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();

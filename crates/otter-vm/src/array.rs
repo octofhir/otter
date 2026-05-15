@@ -98,6 +98,14 @@ pub fn alloc_array(heap: &mut GcHeap) -> Result<JsArray, otter_gc::OutOfMemory> 
     heap.alloc_old(ArrayBody::default())
 }
 
+/// Allocate a fresh empty array while exposing caller-owned roots.
+pub(crate) fn alloc_array_with_roots(
+    heap: &mut GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
+    heap.alloc_with_roots(ArrayBody::default(), external_visit)
+}
+
 /// Construct an array from initial elements.
 ///
 /// # Errors

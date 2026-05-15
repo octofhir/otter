@@ -169,8 +169,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
     let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
     let fallback = js_string(&payload.fallback, args.string_heap).map_err(intl_to_intrinsic)?;
+    let obj = args.alloc_object_rooted(&[&locale, &kind, &style, &fallback], &[])?;
     let heap = &mut *args.gc_heap;
-    let obj = crate::object::alloc_object(heap)?;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
     crate::object::set(obj, heap, "style", style);

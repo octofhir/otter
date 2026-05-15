@@ -22,8 +22,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, array,
-    array_statics, number, operand_decode::register_operand, read_register, symbol, to_length,
-    write_register,
+    number, operand_decode::register_operand, read_register, symbol, to_length, write_register,
 };
 
 impl Interpreter {
@@ -41,14 +40,70 @@ impl Interpreter {
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let result = match op {
-            Op::ArrayConstruct => array_statics::construct(&args, &mut self.gc_heap)?,
+            Op::ArrayConstruct => self.array_construct_stack_rooted(stack, &args)?,
             Op::ArrayFrom => self.array_from_sync(context, &args)?,
-            Op::ArrayOf => array_statics::of(&args, &mut self.gc_heap)?,
+            Op::ArrayOf => self.array_of_stack_rooted(stack, &args)?,
             _ => return Err(VmError::InvalidOperand),
         };
 
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)
+    }
+
+    /// §23.1.1.1 `Array(...values)`.
+    fn array_construct_stack_rooted(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        if args.len() == 1
+            && let Value::Number(n) = &args[0]
+        {
+            let raw = n.as_f64();
+            let len = raw as u32;
+            if !raw.is_finite() || raw < 0.0 || raw != f64::from(len) {
+                return Err(VmError::TypeError {
+                    message: "Invalid array length".to_string(),
+                });
+            }
+            let arr = self.alloc_stack_rooted_array(stack, &[], &[args])?;
+            if len > 0 {
+                let roots = self.collect_allocation_roots(stack);
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    for value in args {
+                        value.trace_value_slots(visitor);
+                    }
+                };
+                array::set_with_roots(
+                    arr,
+                    &mut self.gc_heap,
+                    (len - 1) as usize,
+                    Value::Hole,
+                    &mut external_visit,
+                )?;
+            }
+            return Ok(Value::Array(arr));
+        }
+        self.array_of_stack_rooted(stack, args)
+    }
+
+    /// §23.1.2.3 `Array.of(...items)`.
+    fn array_of_stack_rooted(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        Ok(Value::Array(
+            self.alloc_stack_rooted_array_from_values_with_root_slices(
+                stack,
+                args.iter().cloned(),
+                &[],
+                &[args],
+            )?,
+        ))
     }
 
     /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)`.
@@ -177,9 +232,10 @@ impl Interpreter {
                 mapped.push(value);
             }
         }
-        Ok(Value::Array(array::from_elements(
-            &mut self.gc_heap,
+        Ok(Value::Array(self.alloc_runtime_rooted_array_from_values(
             mapped,
+            &[&items, &map_fn, &this_arg],
+            &[],
         )?))
     }
 }
@@ -198,4 +254,159 @@ fn collect_array_args(
         args.push(read_register(frame, r)?.clone());
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_bytecode::{
+        BytecodeModule, Function, Instruction, SourceKind as BcSourceKind, SpanEntry,
+    };
+
+    fn empty_context() -> ExecutionContext {
+        ExecutionContext::from_module(BytecodeModule {
+            module: "array-ops-test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                span: (0, 0),
+                locals: 0,
+                scratch: 0,
+                param_count: 0,
+                own_upvalue_count: 0,
+                is_strict: false,
+                is_arrow: false,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_async_generator: false,
+                is_module: false,
+                needs_arguments: false,
+                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
+                mapped_argument_bindings: Vec::new(),
+                module_url: String::new(),
+                code: Vec::<Instruction>::new(),
+                spans: Vec::<SpanEntry>::new(),
+            }],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    fn empty_module() -> BytecodeModule {
+        BytecodeModule {
+            module: "array-ops-test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![Function {
+                id: 0,
+                name: "<main>".to_string(),
+                span: (0, 0),
+                locals: 0,
+                scratch: 1,
+                param_count: 0,
+                own_upvalue_count: 0,
+                is_strict: false,
+                is_arrow: false,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_async_generator: false,
+                is_module: false,
+                needs_arguments: false,
+                arguments_object_kind: crate::ArgumentsObjectKind::Unmapped,
+                mapped_argument_bindings: Vec::new(),
+                module_url: String::new(),
+                code: Vec::<Instruction>::new(),
+                spans: Vec::<SpanEntry>::new(),
+            }],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn array_from_sync_uses_runtime_rooted_result_allocation() {
+        let mut interp = Interpreter::new();
+        let source = crate::array::from_elements(
+            interp.gc_heap_mut(),
+            [Value::Number(crate::NumberValue::from_i32(7))],
+        )
+        .expect("source");
+        let context = empty_context();
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+
+        let result = interp
+            .array_from_sync(&context, &[Value::Array(source)])
+            .expect("Array.from");
+
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Array.from should allocate its result array in young space"
+        );
+        assert!(matches!(result, Value::Array(_)));
+    }
+
+    #[test]
+    fn array_of_uses_stack_rooted_result_allocation() {
+        let mut interp = Interpreter::new();
+        let module = empty_module();
+        let mut stack: smallvec::SmallVec<[Frame; 8]> = smallvec::SmallVec::new();
+        stack.push(Frame::for_function(&module.functions[0]));
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+
+        let result = interp
+            .array_of_stack_rooted(
+                &stack,
+                &[
+                    Value::Number(crate::NumberValue::from_i32(1)),
+                    Value::Number(crate::NumberValue::from_i32(2)),
+                ],
+            )
+            .expect("Array.of");
+
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Array.of should allocate its result array in young space"
+        );
+        let Value::Array(array) = result else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(array, interp.gc_heap()), 2);
+    }
+
+    #[test]
+    fn array_construct_length_uses_stack_rooted_shell_and_growth() {
+        let mut interp = Interpreter::new();
+        let module = empty_module();
+        let mut stack: smallvec::SmallVec<[Frame; 8]> = smallvec::SmallVec::new();
+        stack.push(Frame::for_function(&module.functions[0]));
+        let before_alloc = interp.gc_heap().stats().new_allocated_bytes;
+        let before_reserved = interp.gc_heap().stats().reserved_bytes;
+
+        let result = interp
+            .array_construct_stack_rooted(&stack, &[Value::Number(crate::NumberValue::from_i32(8))])
+            .expect("Array constructor");
+
+        let after_alloc = interp.gc_heap().stats().new_allocated_bytes;
+        let after_reserved = interp.gc_heap().stats().reserved_bytes;
+        assert!(
+            after_alloc > before_alloc,
+            "Array(length) should allocate the array shell in young space"
+        );
+        assert!(
+            after_reserved > before_reserved,
+            "Array(length) should grow backing storage through root-aware reservation"
+        );
+        let Value::Array(array) = result else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(array, interp.gc_heap()), 8);
+        assert!(!crate::array::has_own_element(array, interp.gc_heap(), 0));
+        assert!(!crate::array::has_own_element(array, interp.gc_heap(), 7));
+    }
 }

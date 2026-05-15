@@ -198,7 +198,12 @@ impl Interpreter {
         // settles the promise instead of writing back.
         let (return_register, async_state) = if function.is_async {
             let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending(&mut self.gc_heap)?;
+                .pending_stack_rooted(
+                    self,
+                    stack,
+                    &[&this_for_callee],
+                    &[effective_args.as_slice()],
+                )?;
             let promise_value = Value::Promise(result_promise);
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, promise_value)?;
@@ -208,7 +213,12 @@ impl Interpreter {
         };
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
+        let this_for_callee = self.this_for_bytecode_call_stack_rooted(
+            function,
+            stack,
+            this_for_callee,
+            &[effective_args.as_slice()],
+        )?;
         let mut new_frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
@@ -240,6 +250,7 @@ impl Interpreter {
     fn prepare_bytecode_call_frame_from_window(
         &mut self,
         context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
         function_id: u32,
         parent_upvalues: std::rc::Rc<[UpvalueCell]>,
         this_for_callee: Value,
@@ -252,7 +263,8 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
+        let this_for_callee =
+            self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
@@ -338,7 +350,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let (return_register, async_state) = if function.is_async {
             let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending(&mut self.gc_heap)?;
+                .pending_stack_rooted(self, stack, &[&this_for_callee], &[])?;
             let promise_value = Value::Promise(result_promise);
             write_register(&mut stack[top_idx], dst, promise_value)?;
             (None, Some(AsyncFrameState { result_promise }))
@@ -350,6 +362,7 @@ impl Interpreter {
             let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
             self.prepare_bytecode_call_frame_from_window(
                 context,
+                stack,
                 function_id,
                 parent_upvalues,
                 this_for_callee,
@@ -1147,7 +1160,11 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call(function, this_for_callee)?;
+        let this_for_callee = self.this_for_bytecode_call_runtime_rooted(
+            function,
+            this_for_callee,
+            &[effective_args.as_slice()],
+        )?;
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);

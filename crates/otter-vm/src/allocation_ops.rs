@@ -70,6 +70,34 @@ impl Interpreter {
             .map_err(VmError::from)
     }
 
+    pub(crate) fn alloc_runtime_rooted_object_with_proto(
+        &mut self,
+        proto: crate::object::JsObject,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::object::JsObject, VmError> {
+        let proto_value = Value::Object(proto);
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            proto_value.trace_value_slots(visitor);
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        let object = crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
+            .map_err(VmError::from)?;
+        crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
+        Ok(object)
+    }
+
     pub(crate) fn alloc_runtime_rooted_array_from_values<I>(
         &mut self,
         elements: I,
@@ -96,6 +124,47 @@ impl Interpreter {
         };
         crate::array::from_elements_with_roots(&mut self.gc_heap, elements, &mut external_visit)
             .map_err(VmError::from)
+    }
+
+    pub(crate) fn alloc_runtime_rooted_iterator_state(
+        &mut self,
+        state: IteratorState,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<IteratorHandle, VmError> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        self.gc_heap
+            .alloc_with_roots(state, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
+    pub(crate) fn make_runtime_rooted_iter_result(
+        &mut self,
+        value: Value,
+        done: bool,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let mut roots = Vec::with_capacity(value_roots.len() + 1);
+        roots.push(&value);
+        roots.extend_from_slice(value_roots);
+        let obj = self.alloc_runtime_rooted_object_with_roots(&roots, slice_roots)?;
+        crate::object::set(obj, &mut self.gc_heap, "value", value);
+        crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(done));
+        Ok(Value::Object(obj))
     }
 
     pub(crate) fn alloc_stack_rooted_object(
@@ -132,6 +201,59 @@ impl Interpreter {
             }
         };
         crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
+    pub(crate) fn alloc_stack_rooted_object_with_proto(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        proto: crate::object::JsObject,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::object::JsObject, VmError> {
+        let proto_value = Value::Object(proto);
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            proto_value.trace_value_slots(visitor);
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        let object = crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
+            .map_err(VmError::from)?;
+        crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
+        Ok(object)
+    }
+
+    pub(crate) fn alloc_stack_rooted_array(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::array::JsArray, VmError> {
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
             .map_err(VmError::from)
     }
 

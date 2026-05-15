@@ -150,8 +150,27 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         "iso8601",
         args.string_heap,
     )?);
+    let mut value_roots = vec![&locale_value, &calendar];
+    if let Some(v) = &yr {
+        value_roots.push(v);
+    }
+    if let Some(v) = &mo {
+        value_roots.push(v);
+    }
+    if let Some(v) = &da {
+        value_roots.push(v);
+    }
+    if let Some(v) = &hr {
+        value_roots.push(v);
+    }
+    if let Some(v) = &mi {
+        value_roots.push(v);
+    }
+    if let Some(v) = &se {
+        value_roots.push(v);
+    }
+    let obj = args.alloc_object_rooted(&value_roots, &[])?;
     let heap = &mut *args.gc_heap;
-    let obj = crate::object::alloc_object(heap)?;
     crate::object::set(obj, heap, "locale", locale_value);
     if let Some(v) = yr {
         crate::object::set(obj, heap, "year", v);

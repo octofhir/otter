@@ -1047,7 +1047,8 @@ impl Interpreter {
                 | Value::Symbol(_)
                 | Value::BigInt(_)
         ) {
-            let boxed = self.box_sloppy_this_primitive(receiver.clone())?;
+            let boxed =
+                self.box_sloppy_this_primitive_stack_rooted(stack, receiver.clone(), &[])?;
             let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -1457,7 +1458,9 @@ impl Interpreter {
         value: Value,
         scratch_reg: u16,
     ) -> Result<bool, VmError> {
-        let Some(base_object) = self.object_for_primitive_property_base(&receiver)? else {
+        let Some(base_object) =
+            self.object_for_primitive_property_base_stack_rooted(stack, &receiver)?
+        else {
             return Ok(false);
         };
         let strict = Self::current_frame_is_strict(stack, context);

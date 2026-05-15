@@ -137,8 +137,12 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let min_fd = payload.minimum_fraction_digits as i32;
     let max_fd = payload.maximum_fraction_digits as i32;
     let use_grouping = payload.use_grouping;
+    let mut value_roots = vec![&locale, &style];
+    if let Some(c) = &currency_val {
+        value_roots.push(c);
+    }
+    let obj = args.alloc_object_rooted(&value_roots, &[])?;
     let heap = &mut *args.gc_heap;
-    let obj = crate::object::alloc_object(heap)?;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "style", style);
     if let Some(c) = currency_val {

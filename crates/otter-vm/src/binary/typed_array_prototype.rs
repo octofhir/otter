@@ -452,43 +452,45 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// op produces an Iterator over the typed array's index range.
 /// <https://tc39.es/ecma262/#sec-createarrayiterator>
 fn wrap_iterator(
-    heap: &mut otter_gc::GcHeap,
+    args: &mut IntrinsicArgs<'_>,
     snapshot: impl IntoIterator<Item = Value>,
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    let arr = crate::array::from_elements(heap, snapshot)?;
+    let arr = args.array_from_elements_rooted(snapshot, &[], &[])?;
+    let arr_value = Value::Array(arr);
     let state = crate::IteratorState::Array {
         array: arr,
         index: 0,
     };
-    Ok(Value::Iterator(crate::alloc_iterator_state(heap, state)?))
+    Ok(Value::Iterator(args.alloc_iterator_state_rooted(
+        state,
+        &[&arr_value],
+        &[],
+    )?))
 }
 
 fn impl_keys(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
-    let heap = &mut *args.gc_heap;
-    Ok(wrap_iterator(heap, (0..len).map(|i| smi(i as i32)))?)
+    Ok(wrap_iterator(args, (0..len).map(|i| smi(i as i32)))?)
 }
 
 fn impl_values(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    let heap = &mut *args.gc_heap;
-    Ok(wrap_iterator(heap, copy_view(&t))?)
+    Ok(wrap_iterator(args, copy_view(&t))?)
 }
 
 fn impl_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
     let len = t.length();
-    let heap = &mut *args.gc_heap;
     let mut pairs: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
-        let pair = crate::array::from_elements(heap, [smi(i as i32), t.get(i)])?;
+        let pair = args.array_from_elements_rooted([smi(i as i32), t.get(i)], &[], &[&pairs])?;
         pairs.push(Value::Array(pair));
     }
-    Ok(wrap_iterator(heap, pairs)?)
+    Ok(wrap_iterator(args, pairs)?)
 }
 
 // ---- comparison helpers -------------------------------------------------
@@ -605,4 +607,35 @@ pub fn load_property(t: &JsTypedArray, name: &str) -> Value {
 #[must_use]
 pub fn from_values(kind: TypedArrayKind, values: &[Value]) -> Value {
     build_new_typed_array(kind, values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::string::StringHeap;
+
+    #[test]
+    fn typed_array_entries_uses_intrinsic_rooted_young_allocation() {
+        let strings = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let buffer = JsArrayBuffer::new(2);
+        let receiver = Value::TypedArray(JsTypedArray::new(buffer, TypedArrayKind::Int8, 0, 2));
+        let before = gc_heap.stats().new_allocated_bytes;
+
+        let result = impl_entries(&mut IntrinsicArgs {
+            receiver: &receiver,
+            args: &[],
+            string_heap: &strings,
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
+        })
+        .expect("entries");
+
+        let after = gc_heap.stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "TypedArray.prototype.entries should allocate pair arrays, snapshot array, and iterator state in young space"
+        );
+        assert!(matches!(result, Value::Iterator(_)));
+    }
 }

@@ -487,16 +487,14 @@ fn construct_collection(
 fn alloc_collection(ctx: &mut NativeCtx<'_>, kind: CollectionKind) -> Result<Value, NativeError> {
     let name = kind.name();
     match kind {
-        CollectionKind::Map => collections::alloc_map(ctx.heap_mut())
-            .map(Value::Map)
-            .map_err(|_| oom(name)),
-        CollectionKind::Set => collections::alloc_set(ctx.heap_mut())
-            .map(Value::Set)
-            .map_err(|_| oom(name)),
-        CollectionKind::WeakMap => collections::alloc_weak_map(ctx.heap_mut())
+        CollectionKind::Map => ctx.alloc_map().map(Value::Map).map_err(|_| oom(name)),
+        CollectionKind::Set => ctx.alloc_set().map(Value::Set).map_err(|_| oom(name)),
+        CollectionKind::WeakMap => ctx
+            .alloc_weak_map()
             .map(Value::WeakMap)
             .map_err(|_| oom(name)),
-        CollectionKind::WeakSet => collections::alloc_weak_set(ctx.heap_mut())
+        CollectionKind::WeakSet => ctx
+            .alloc_weak_set()
             .map(Value::WeakSet)
             .map_err(|_| oom(name)),
     }
@@ -721,10 +719,11 @@ fn map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let m = receiver_map(ctx, "Map.prototype.set")?;
+    let mut m = receiver_map(ctx, "Map.prototype.set")?;
     let key = args.first().cloned().unwrap_or(Value::Undefined);
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    collections::map_set(m, ctx.heap_mut(), key, value).map_err(|_| oom("Map.prototype.set"))?;
+    ctx.map_set(&mut m, key, value)
+        .map_err(|_| oom("Map.prototype.set"))?;
     Ok(Value::Map(m))
 }
 
@@ -811,9 +810,10 @@ fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 // ---------------------------------------------------------------
 
 fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let s = receiver_set(ctx, "Set.prototype.add")?;
+    let mut s = receiver_set(ctx, "Set.prototype.add")?;
     let v = args.first().cloned().unwrap_or(Value::Undefined);
-    collections::set_add(s, ctx.heap_mut(), v).map_err(|_| oom("Set.prototype.add"))?;
+    ctx.set_add(&mut s, v)
+        .map_err(|_| oom("Set.prototype.add"))?;
     Ok(Value::Set(s))
 }
 
@@ -850,11 +850,14 @@ fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     let array = ctx
         .array_from_elements(snapshot)
         .map_err(|_| oom("Set.prototype.values"))?;
-    let iter = crate::alloc_iterator_state(
-        ctx.heap_mut(),
-        crate::IteratorState::Array { array, index: 0 },
-    )
-    .map_err(|_| oom("Set.prototype.values"))?;
+    let array_value = Value::Array(array);
+    let iter = ctx
+        .alloc_iterator_state(
+            crate::IteratorState::Array { array, index: 0 },
+            &[&array_value],
+            &[],
+        )
+        .map_err(|_| oom("Set.prototype.values"))?;
     Ok(Value::Iterator(iter))
 }
 
@@ -871,11 +874,14 @@ fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
     let array = ctx
         .array_from_elements(snap)
         .map_err(|_| oom("Set.prototype.entries"))?;
-    let iter = crate::alloc_iterator_state(
-        ctx.heap_mut(),
-        crate::IteratorState::Array { array, index: 0 },
-    )
-    .map_err(|_| oom("Set.prototype.entries"))?;
+    let array_value = Value::Array(array);
+    let iter = ctx
+        .alloc_iterator_state(
+            crate::IteratorState::Array { array, index: 0 },
+            &[&array_value],
+            &[],
+        )
+        .map_err(|_| oom("Set.prototype.entries"))?;
     Ok(Value::Iterator(iter))
 }
 
@@ -1070,11 +1076,14 @@ fn make_map_iterator(
     let array = ctx
         .array_from_elements(snapshot)
         .map_err(|_| oom("Map iterator"))?;
-    let iter = crate::alloc_iterator_state(
-        ctx.heap_mut(),
-        crate::IteratorState::Array { array, index: 0 },
-    )
-    .map_err(|_| oom("Map iterator"))?;
+    let array_value = Value::Array(array);
+    let iter = ctx
+        .alloc_iterator_state(
+            crate::IteratorState::Array { array, index: 0 },
+            &[&array_value],
+            &[],
+        )
+        .map_err(|_| oom("Map iterator"))?;
     Ok(Value::Iterator(iter))
 }
 
@@ -1163,5 +1172,64 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
             name,
             reason: other.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Interpreter, NativeCallInfo, NumberValue};
+
+    #[test]
+    fn native_set_iterator_uses_rooted_iterator_state_allocation() {
+        let mut interp = Interpreter::new();
+        let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
+        collections::set_add(
+            set,
+            interp.gc_heap_mut(),
+            Value::Number(NumberValue::from_i32(1)),
+        )
+        .expect("seed");
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+
+        let result = {
+            let mut ctx =
+                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::Set(set)));
+            set_proto_values(&mut ctx, &[]).expect("set values")
+        };
+
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Set iterator native path should allocate snapshot array and iterator state in young space"
+        );
+        assert!(matches!(result, Value::Iterator(_)));
+    }
+
+    #[test]
+    fn native_map_iterator_uses_rooted_iterator_state_allocation() {
+        let mut interp = Interpreter::new();
+        let map = collections::alloc_map(interp.gc_heap_mut()).expect("map");
+        collections::map_set(
+            map,
+            interp.gc_heap_mut(),
+            Value::Number(NumberValue::from_i32(1)),
+            Value::Number(NumberValue::from_i32(2)),
+        )
+        .expect("seed");
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+
+        let result = {
+            let mut ctx =
+                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::Map(map)));
+            make_map_iterator(&mut ctx, map, MapIterKind::Entries).expect("map entries")
+        };
+
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Map iterator native path should allocate snapshot arrays and iterator state in young space"
+        );
+        assert!(matches!(result, Value::Iterator(_)));
     }
 }

@@ -38,7 +38,9 @@ use std::marker::PhantomData;
 
 use otter_gc::raw::RawGc;
 
-use crate::{ExecutionContext, Interpreter, IteratorHandle, IteratorState, Value, array, object};
+use crate::{
+    ExecutionContext, Interpreter, IteratorHandle, IteratorState, Value, array, collections, object,
+};
 
 /// Internal VM context. Carried explicitly through the dispatch
 /// loop and built-in helper signatures so every algorithm sees the
@@ -292,13 +294,104 @@ impl<'rt> NativeCtx<'rt> {
 
     /// Allocate an ordinary object through the native root contract.
     pub fn alloc_object(&mut self) -> Result<object::JsObject, otter_gc::OutOfMemory> {
+        self.alloc_object_with_roots(&[], &[])
+    }
+
+    /// Allocate an ordinary object while keeping additional local values alive.
+    pub fn alloc_object_with_roots(
+        &mut self,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        object::alloc_object_with_roots(self.heap_mut(), &mut external_visit)
+    }
+
+    /// Allocate a `Map` body through the native root contract.
+    pub fn alloc_map(&mut self) -> Result<collections::JsMap, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value.clone();
         let new_target = self.call_info.new_target.clone();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
-        object::alloc_object_with_roots(self.heap_mut(), &mut external_visit)
+        collections::alloc_map_with_roots(self.heap_mut(), &mut external_visit)
+    }
+
+    /// Allocate a `Set` body through the native root contract.
+    pub fn alloc_set(&mut self) -> Result<collections::JsSet, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        collections::alloc_set_with_roots(self.heap_mut(), &mut external_visit)
+    }
+
+    /// Allocate a `WeakMap` body through the native root contract.
+    pub fn alloc_weak_map(&mut self) -> Result<collections::JsWeakMap, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        collections::alloc_weak_map_with_roots(self.heap_mut(), &mut external_visit)
+    }
+
+    /// Allocate a `WeakSet` body through the native root contract.
+    pub fn alloc_weak_set(&mut self) -> Result<collections::JsWeakSet, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        collections::alloc_weak_set_with_roots(self.heap_mut(), &mut external_visit)
+    }
+
+    /// Insert into a `Map` through the native root contract.
+    pub fn map_set(
+        &mut self,
+        map: &mut collections::JsMap,
+        key: Value,
+        value: Value,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        collections::map_set_with_roots(map, self.heap_mut(), key, value, &mut external_visit)
+    }
+
+    /// Insert into a `Set` through the native root contract.
+    pub fn set_add(
+        &mut self,
+        set: &mut collections::JsSet,
+        value: Value,
+    ) -> Result<(), otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        collections::set_add_with_roots(set, self.heap_mut(), value, &mut external_visit)
     }
 
     /// Allocate an array through the native root contract.
@@ -429,7 +522,7 @@ impl<'rt> NativeCtx<'rt> {
         self.cx.interp
     }
 
-    fn collect_native_roots(&self) -> Vec<*mut RawGc> {
+    pub(crate) fn collect_native_roots(&self) -> Vec<*mut RawGc> {
         self.cx.interp.collect_runtime_roots()
     }
 
@@ -467,7 +560,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 }
 
-fn visit_native_roots(
+pub(crate) fn visit_native_roots(
     visitor: &mut dyn FnMut(*mut RawGc),
     runtime_roots: &[*mut RawGc],
     this_value: &Value,
@@ -531,6 +624,38 @@ mod tests {
         assert!(
             after > before,
             "NativeCtx::array_from_elements should allocate through root-aware young allocation"
+        );
+    }
+
+    #[test]
+    fn native_ctx_collection_allocation_uses_young_space() {
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+        {
+            let mut ctx = NativeCtx::new_with_call_info(
+                &mut interp,
+                NativeCallInfo::construct(
+                    Value::Undefined,
+                    Some(Value::Number(NumberValue::from_i32(1))),
+                ),
+            );
+            let mut map = ctx.alloc_map().expect("native map allocation");
+            ctx.map_set(
+                &mut map,
+                Value::Number(NumberValue::from_i32(1)),
+                Value::Number(NumberValue::from_i32(2)),
+            )
+            .expect("native map insert");
+            let mut set = ctx.alloc_set().expect("native set allocation");
+            ctx.set_add(&mut set, Value::Number(NumberValue::from_i32(3)))
+                .expect("native set insert");
+            let _weak_map = ctx.alloc_weak_map().expect("native weak map allocation");
+            let _weak_set = ctx.alloc_weak_set().expect("native weak set allocation");
+        }
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NativeCtx collection helpers should allocate through root-aware young allocation"
         );
     }
 }

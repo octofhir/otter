@@ -120,24 +120,30 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let wordlike = granularity_word && seg.chars().any(char::is_alphanumeric);
         prepared.push((seg_str, idx as i32, wordlike));
     }
-    let heap = &mut *args.gc_heap;
+    let prepared_values: Vec<Value> = prepared.iter().map(|(value, _, _)| value.clone()).collect();
     let mut elements: Vec<Value> = Vec::with_capacity(prepared.len());
-    for (seg_str, idx, wordlike) in prepared {
-        let obj = crate::object::alloc_object(heap)?;
-        crate::object::set(obj, heap, "segment", seg_str);
+    for (seg_str, idx, wordlike) in &prepared {
+        let obj =
+            args.alloc_object_rooted(&[seg_str, &input_value], &[&prepared_values, &elements])?;
+        let heap = &mut *args.gc_heap;
+        crate::object::set(obj, heap, "segment", seg_str.clone());
         crate::object::set(
             obj,
             heap,
             "index",
-            Value::Number(crate::number::NumberValue::from_i32(idx)),
+            Value::Number(crate::number::NumberValue::from_i32(*idx)),
         );
         crate::object::set(obj, heap, "input", input_value.clone());
         if granularity_word {
-            crate::object::set(obj, heap, "isWordLike", Value::Boolean(wordlike));
+            crate::object::set(obj, heap, "isWordLike", Value::Boolean(*wordlike));
         }
         elements.push(Value::Object(obj));
     }
-    Ok(Value::Array(crate::array::from_elements(heap, elements)?))
+    Ok(Value::Array(args.array_from_elements_rooted(
+        elements,
+        &[&input_value],
+        &[&prepared_values],
+    )?))
 }
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -145,8 +151,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
     let granularity =
         js_string(&payload.granularity, args.string_heap).map_err(intl_to_intrinsic)?;
+    let obj = args.alloc_object_rooted(&[&locale, &granularity], &[])?;
     let heap = &mut *args.gc_heap;
-    let obj = crate::object::alloc_object(heap)?;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "granularity", granularity);
     Ok(Value::Object(obj))
@@ -180,4 +186,40 @@ pub static SEGMENTER_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|
 /// Convenience accessor used by [`super::lookup_prototype`].
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     SEGMENTER_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intl::payload::JsIntl;
+    use crate::string::{JsString, StringHeap};
+
+    #[test]
+    fn segment_uses_intrinsic_rooted_young_allocation() {
+        let strings = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let receiver = Value::Intl(JsIntl::new(IntlPayload::Segmenter(SegmenterPayload {
+            locale: "en-US".to_string(),
+            granularity: "word".to_string(),
+        })));
+        let input = Value::String(JsString::from_str("alpha beta", &strings).expect("input"));
+        let args = [input];
+        let before = gc_heap.stats().new_allocated_bytes;
+
+        let result = impl_segment(&mut IntrinsicArgs {
+            receiver: &receiver,
+            args: &args,
+            string_heap: &strings,
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
+        })
+        .expect("segment");
+
+        let after = gc_heap.stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Intl.Segmenter.prototype.segment should allocate segment objects and result array in young space"
+        );
+        assert!(matches!(result, Value::Array(_)));
+    }
 }

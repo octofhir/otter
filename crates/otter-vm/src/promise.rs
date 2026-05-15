@@ -1,9 +1,10 @@
 //! ECMA-262 promise state for the new-engine VM.
 //!
 //! Promises are heap-shared JavaScript objects with a small state
-//! machine and reaction queues. The active engine stores pure promise
-//! state in old-space GC bodies; all reads and writes take an explicit
-//! [`otter_gc::GcHeap`] so there is no hidden thread-local heap lookup.
+//! machine and reaction queues. Active VM/runtime paths can allocate pure
+//! promise state through root-aware young-generation helpers; legacy external
+//! helpers still take an explicit [`otter_gc::GcHeap`] so there is no hidden
+//! thread-local heap lookup.
 //!
 //! # Contents
 //!
@@ -34,6 +35,7 @@
 use crate::Value;
 use crate::execution_context::ExecutionContext;
 use crate::microtask::{Microtask, MicrotaskKind};
+use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`PurePromiseBody`].
@@ -305,6 +307,24 @@ impl PurePromise {
         })
     }
 
+    /// Construct a fresh pending promise while exposing caller-owned roots.
+    pub(crate) fn pending_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_with_roots(
+                PurePromiseBody {
+                    state: PromiseState::Pending,
+                    fulfill_reactions: Vec::new(),
+                    reject_reactions: Vec::new(),
+                    is_handled: false,
+                },
+                external_visit,
+            )?,
+        })
+    }
+
     /// Construct a pre-fulfilled promise.
     pub fn fulfilled(
         heap: &mut otter_gc::GcHeap,
@@ -320,6 +340,25 @@ impl PurePromise {
         })
     }
 
+    /// Construct a pre-fulfilled promise while exposing caller-owned roots.
+    pub(crate) fn fulfilled_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        value: Value,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_with_roots(
+                PurePromiseBody {
+                    state: PromiseState::Fulfilled(value),
+                    fulfill_reactions: Vec::new(),
+                    reject_reactions: Vec::new(),
+                    is_handled: false,
+                },
+                external_visit,
+            )?,
+        })
+    }
+
     /// Construct a pre-rejected promise.
     pub fn rejected(
         heap: &mut otter_gc::GcHeap,
@@ -332,6 +371,25 @@ impl PurePromise {
                 reject_reactions: Vec::new(),
                 is_handled: false,
             })?,
+        })
+    }
+
+    /// Construct a pre-rejected promise while exposing caller-owned roots.
+    pub(crate) fn rejected_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        reason: Value,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            inner: heap.alloc_with_roots(
+                PurePromiseBody {
+                    state: PromiseState::Rejected(reason),
+                    fulfill_reactions: Vec::new(),
+                    reject_reactions: Vec::new(),
+                    is_handled: false,
+                },
+                external_visit,
+            )?,
         })
     }
 
@@ -566,6 +624,17 @@ impl JsPromiseHandle {
         Ok(Self::from_pure(PurePromise::pending(heap)?))
     }
 
+    /// Convenience: pending pure promise with caller-owned roots.
+    pub(crate) fn pending_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self::from_pure(PurePromise::pending_with_roots(
+            heap,
+            external_visit,
+        )?))
+    }
+
     /// Convenience: pre-fulfilled pure promise.
     pub fn fulfilled(
         heap: &mut otter_gc::GcHeap,
@@ -574,12 +643,38 @@ impl JsPromiseHandle {
         Ok(Self::from_pure(PurePromise::fulfilled(heap, value)?))
     }
 
+    /// Convenience: pre-fulfilled pure promise with caller-owned roots.
+    pub(crate) fn fulfilled_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        value: Value,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self::from_pure(PurePromise::fulfilled_with_roots(
+            heap,
+            value,
+            external_visit,
+        )?))
+    }
+
     /// Convenience: pre-rejected pure promise.
     pub fn rejected(
         heap: &mut otter_gc::GcHeap,
         reason: Value,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self::from_pure(PurePromise::rejected(heap, reason)?))
+    }
+
+    /// Convenience: pre-rejected pure promise with caller-owned roots.
+    pub(crate) fn rejected_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        reason: Value,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self::from_pure(PurePromise::rejected_with_roots(
+            heap,
+            reason,
+            external_visit,
+        )?))
     }
 
     /// Borrow the underlying pure promise.

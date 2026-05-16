@@ -80,12 +80,7 @@ impl Interpreter {
             }
             Op::TypedArrayCall => unreachable!("TypedArrayCall requires stack-rooted dispatch"),
             Op::SharedArrayBufferCall => {
-                let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
-                let method = method_id::SharedArrayBufferMethod::from_u32(method_idx)
-                    .ok_or(VmError::InvalidOperand)?;
-                let result =
-                    binary::dispatch::shared_array_buffer_call(method, &args, &self.gc_heap)?;
-                finish_static_call(frame, dst, result)
+                unreachable!("SharedArrayBufferCall requires stack-rooted dispatch")
             }
             Op::GlobalCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
@@ -209,6 +204,36 @@ impl Interpreter {
         };
         let result = binary::dispatch::typed_array_call_with_roots(
             kind,
+            method,
+            &args,
+            &mut self.gc_heap,
+            &mut external_visit,
+        )?;
+        finish_static_call(&mut stack[top_idx], dst, result)
+    }
+
+    pub(crate) fn run_shared_array_buffer_static_call_operands(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        let (dst, method_idx, args) = {
+            let frame = &stack[top_idx];
+            decode_static_call(frame, operands, 1, 2, 3)?
+        };
+        let method = method_id::SharedArrayBufferMethod::from_u32(method_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for arg in &args {
+                arg.trace_value_slots(visitor);
+            }
+        };
+        let result = binary::dispatch::shared_array_buffer_call_with_roots(
             method,
             &args,
             &mut self.gc_heap,

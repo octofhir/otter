@@ -405,6 +405,10 @@ impl PurePromise {
         self.inner.as_header_ptr() as *const ()
     }
 
+    pub(crate) fn debug_fulfill_reactions(&self, heap: &otter_gc::GcHeap) -> Vec<PromiseReaction> {
+        heap.read_payload(self.inner, |body| body.fulfill_reactions.clone())
+    }
+
     /// Attach explicit parked-frame reactions for `await`.
     pub fn perform_async_resume_then(
         &self,
@@ -698,6 +702,12 @@ impl JsPromiseHandle {
     pub fn identity_addr(&self) -> *const () {
         match self.inner {
             PromiseRepr::Pure(p) => p.identity_addr(),
+        }
+    }
+
+    pub(crate) fn debug_fulfill_reactions(&self, heap: &otter_gc::GcHeap) -> Vec<PromiseReaction> {
+        match self.inner {
+            PromiseRepr::Pure(p) => p.debug_fulfill_reactions(heap),
         }
     }
 

@@ -335,7 +335,7 @@ async fn dynamic_import_loads_new_module_on_demand() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("on_demand.ts"),
-        "export const greeting = \"on-demand\";\n",
+        "export const greeting = \"on-demand\";\nexport const metaUrl = import.meta.url;\n",
     )
     .unwrap();
     std::fs::write(
@@ -348,6 +348,9 @@ async fn dynamic_import_loads_new_module_on_demand() {
             const mod = await import(path);
             if (mod.greeting !== "on-demand") {
                 throw new Error("bad namespace: " + mod.greeting);
+            }
+            if (!mod.metaUrl.endsWith("/on_demand.ts")) {
+                throw new Error("bad dynamic import.meta.url: " + mod.metaUrl);
             }
         "#,
     )
@@ -437,7 +440,8 @@ async fn dynamic_import_forwards_original_throw_value_from_module_init() {
 /// (covered by sibling tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dynamic_import_fetches_https_module_with_net_capability() {
-    let body = "export const greeting = \"http-served\";\n";
+    let body =
+        "export const greeting = \"http-served\";\nexport const metaUrl = import.meta.url;\n";
     let addr = spawn_one_shot_http_server(body.to_string()).await;
     let host = format!("{}", addr);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -450,6 +454,9 @@ async fn dynamic_import_fetches_https_module_with_net_capability() {
             const mod = await import(url);
             if (mod.greeting !== "http-served") {{
                 throw new Error("bad HTTP namespace: " + mod.greeting);
+            }}
+            if (mod.metaUrl !== url) {{
+                throw new Error("bad HTTP import.meta.url: " + mod.metaUrl);
             }}
             "#
         ),

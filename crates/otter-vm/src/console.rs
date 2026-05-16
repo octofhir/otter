@@ -126,7 +126,10 @@ pub(crate) fn install(
     global_this: crate::JsObject,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<(), JsSurfaceError> {
-    let console = NamespaceBuilder::from_spec(gc_heap, &CONSOLE_SPEC)?.build()?;
+    let global_root = Value::Object(global_this);
+    let console =
+        NamespaceBuilder::from_spec_with_value_roots(gc_heap, &CONSOLE_SPEC, vec![global_root])?
+            .build()?;
     if !object::define_own_property(
         global_this,
         gc_heap,

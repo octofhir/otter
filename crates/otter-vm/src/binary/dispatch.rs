@@ -110,20 +110,22 @@ pub fn array_buffer_call_with_roots(
     }
 }
 
-/// Dispatch `new SharedArrayBuffer(length [, options])` per
-/// §25.2.1. Only the `maxByteLength` option (growable SAB) is
-/// honoured; arbitrary key options are ignored.
+/// Root-aware dispatch for `new SharedArrayBuffer(length [, options])` per
+/// §25.2.1. Only the `maxByteLength` option (growable SAB) is honoured;
+/// arbitrary key options are ignored.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
-pub fn shared_array_buffer_call(
+pub fn shared_array_buffer_call_with_roots(
     method: otter_bytecode::method_id::SharedArrayBufferMethod,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::SharedArrayBufferMethod as M;
     match method {
         M::Construct => {
+            external_visit(&mut |_| {});
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
                 Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
@@ -145,13 +147,26 @@ pub fn shared_array_buffer_call(
                     if max < len {
                         return Err(VmError::TypeMismatch);
                     }
-                    JsArrayBuffer::new_shared_growable(len, max)
+                    JsArrayBuffer::new_shared_growable_with_roots(
+                        len,
+                        max,
+                        gc_heap,
+                        external_visit,
+                    )
+                    .map_err(oom_to_vm)?
+                    .ok_or_else(|| VmError::RangeError {
+                        message: format!(
+                            "SharedArrayBuffer allocation of {max} bytes exceeds the available heap"
+                        ),
+                    })?
                 }
-                None => JsArrayBuffer::try_new_shared(len).ok_or_else(|| VmError::RangeError {
-                    message: format!(
-                        "SharedArrayBuffer allocation of {len} bytes exceeds the available heap"
-                    ),
-                })?,
+                None => JsArrayBuffer::try_new_shared_with_roots(len, gc_heap, external_visit)
+                    .map_err(oom_to_vm)?
+                    .ok_or_else(|| VmError::RangeError {
+                        message: format!(
+                            "SharedArrayBuffer allocation of {len} bytes exceeds the available heap"
+                        ),
+                    })?,
             };
             Ok(Value::ArrayBuffer(buf))
         }
@@ -493,7 +508,7 @@ pub fn snapshot_elements(t: &JsTypedArray) -> Vec<Value> {
 mod tests {
     use super::*;
     use crate::NumberValue;
-    use otter_bytecode::method_id::{ArrayBufferMethod, TypedArrayMethod};
+    use otter_bytecode::method_id::{ArrayBufferMethod, SharedArrayBufferMethod, TypedArrayMethod};
 
     #[test]
     fn array_buffer_constructor_with_roots_accounts_backing_store() {
@@ -535,6 +550,71 @@ mod tests {
         assert!(matches!(value, Value::TypedArray(_)));
         assert_eq!(heap.tracked_bytes() - before, 8);
         drop(value);
+        assert_eq!(heap.tracked_bytes(), before);
+    }
+
+    #[test]
+    fn shared_array_buffer_constructor_uses_rooted_dispatch_boundary() {
+        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
+        let args = [Value::Number(NumberValue::from_i32(64))];
+        let mut visited_roots = false;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            visited_roots = true;
+            visitor(std::ptr::null_mut());
+        };
+
+        let value = shared_array_buffer_call_with_roots(
+            SharedArrayBufferMethod::Construct,
+            &args,
+            &mut heap,
+            &mut external_visit,
+        )
+        .expect("shared array buffer");
+
+        assert!(visited_roots);
+        let Value::ArrayBuffer(buffer) = value else {
+            panic!("expected array buffer");
+        };
+        assert!(buffer.is_shared());
+        assert_eq!(buffer.shared_external_bytes_for_test(), Some(64));
+        assert_eq!(heap.tracked_bytes(), 64);
+        drop(buffer);
+        assert_eq!(heap.tracked_bytes(), 0);
+    }
+
+    #[test]
+    fn shared_array_buffer_growable_accounts_max_backing_store() {
+        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
+        let options = crate::object::alloc_object(&mut heap).expect("options");
+        crate::object::set(
+            options,
+            &mut heap,
+            "maxByteLength",
+            Value::Number(NumberValue::from_i32(128)),
+        );
+        let args = [
+            Value::Number(NumberValue::from_i32(64)),
+            Value::Object(options),
+        ];
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+
+        let before = heap.tracked_bytes();
+        let value = shared_array_buffer_call_with_roots(
+            SharedArrayBufferMethod::Construct,
+            &args,
+            &mut heap,
+            &mut external_visit,
+        )
+        .expect("shared array buffer");
+
+        let Value::ArrayBuffer(buffer) = value else {
+            panic!("expected array buffer");
+        };
+        assert!(buffer.is_shared());
+        assert!(buffer.is_growable());
+        assert_eq!(buffer.shared_external_bytes_for_test(), Some(128));
+        assert_eq!(heap.tracked_bytes() - before, 128);
+        drop(buffer);
         assert_eq!(heap.tracked_bytes(), before);
     }
 }

@@ -253,12 +253,17 @@ fn native_keys_rooted(
                     Value::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let desc = ctx.cx.interp.ordinary_get_own_property_descriptor_value(
-                    context,
-                    target.clone(),
-                    &vm_key,
-                    0,
-                )?;
+                let desc = ctx
+                    .cx
+                    .interp
+                    .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                        context,
+                        target.clone(),
+                        &vm_key,
+                        0,
+                        &[&target],
+                        &[args],
+                    )?;
                 if desc.as_ref().is_some_and(PropertyDescriptor::enumerable) {
                     values.push(key);
                 }
@@ -972,7 +977,7 @@ pub fn call(
                 Value::Null => None,
                 _ => return Err(VmError::TypeMismatch),
             };
-            let obj = crate::object::alloc_object(gc_heap)?;
+            let obj = rooted_object(gc_heap, &[&proto], &[args])?;
             crate::object::set_prototype(obj, gc_heap, proto_obj);
             if let Some(props_arg) = args.get(1)
                 && !matches!(props_arg, Value::Undefined)
@@ -1108,13 +1113,23 @@ pub fn call(
                 Some(Value::Object(target)) => match &key {
                     PropertyKey::String(key) => {
                         match crate::object::get_own_descriptor(*target, gc_heap, key) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
+                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                                &desc,
+                                gc_heap,
+                                &[],
+                                &[args],
+                            )?)),
                             None => Ok(Value::Undefined),
                         }
                     }
                     PropertyKey::Symbol(sym) => {
                         match crate::object::get_own_symbol_descriptor(*target, gc_heap, sym) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
+                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                                &desc,
+                                gc_heap,
+                                &[],
+                                &[args],
+                            )?)),
                             None => Ok(Value::Undefined),
                         }
                     }
@@ -1126,7 +1141,12 @@ pub fn call(
                             gc_heap,
                             key,
                         ) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
+                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                                &desc,
+                                gc_heap,
+                                &[],
+                                &[args],
+                            )?)),
                             None => Ok(Value::Undefined),
                         }
                     }
@@ -1136,7 +1156,12 @@ pub fn call(
                             gc_heap,
                             sym,
                         ) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
+                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                                &desc,
+                                gc_heap,
+                                &[],
+                                &[args],
+                            )?)),
                             None => Ok(Value::Undefined),
                         }
                     }
@@ -1146,7 +1171,12 @@ pub fn call(
                         return Ok(Value::Undefined);
                     };
                     match native.own_property_descriptor(gc_heap, string_heap, key)? {
-                        Some(desc) => Ok(Value::Object(descriptor_to_object(&desc, gc_heap)?)),
+                        Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                            &desc,
+                            gc_heap,
+                            &[],
+                            &[args],
+                        )?)),
                         None => Ok(Value::Undefined),
                     }
                 }
@@ -1159,7 +1189,9 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptors>
         M::GetOwnPropertyDescriptors => {
             let target = expect_object(args.first())?;
-            let result = crate::object::alloc_object(gc_heap)?;
+            let target_root = Value::Object(target);
+            let result = rooted_object(gc_heap, &[&target_root], &[args])?;
+            let result_root = Value::Object(result);
             let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
                 crate::object::with_properties(target, gc_heap, |p| {
                     (
@@ -1169,14 +1201,24 @@ pub fn call(
                 });
             for key in keys {
                 if let Some(desc) = crate::object::get_own_descriptor(target, gc_heap, &key) {
-                    let value = Value::Object(descriptor_to_object(&desc, gc_heap)?);
+                    let value = Value::Object(descriptor_to_object_with_roots(
+                        &desc,
+                        gc_heap,
+                        &[&target_root, &result_root],
+                        &[args],
+                    )?);
                     crate::object::set(result, gc_heap, &key, value);
                 }
             }
             for sym in symbols {
                 if let Some(desc) = crate::object::get_own_symbol_descriptor(target, gc_heap, &sym)
                 {
-                    let value = Value::Object(descriptor_to_object(&desc, gc_heap)?);
+                    let value = Value::Object(descriptor_to_object_with_roots(
+                        &desc,
+                        gc_heap,
+                        &[&target_root, &result_root],
+                        &[args],
+                    )?);
                     if !crate::object::set_symbol(result, gc_heap, sym, value) {
                         return Err(VmError::TypeMismatch);
                     }
@@ -1269,7 +1311,12 @@ pub fn call(
             for k in owned {
                 names.push(string_value(&k, string_heap)?);
             }
-            Ok(Value::Array(crate::array::from_elements(gc_heap, names)?))
+            Ok(Value::Array(rooted_array_from_elements(
+                gc_heap,
+                names,
+                &[],
+                &[args],
+            )?))
         }
         // §20.1.2.22 Object.values(O) — enumerable own data values.
         // <https://tc39.es/ecma262/#sec-object.values>
@@ -1278,7 +1325,13 @@ pub fn call(
             let values: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.enumerable_data_iter().map(|(_, v)| v).collect()
             });
-            Ok(Value::Array(crate::array::from_elements(gc_heap, values)?))
+            let target_root = Value::Object(target);
+            Ok(Value::Array(rooted_array_from_elements(
+                gc_heap,
+                values,
+                &[&target_root],
+                &[args],
+            )?))
         }
         // §20.1.2.5 Object.entries(O) — `[key, value]` pairs in
         // insertion order.
@@ -1294,9 +1347,21 @@ pub fn call(
             for (k, v) in raw {
                 let key = string_value(&k, string_heap)?;
                 let pair: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![key, v];
-                pairs.push(Value::Array(crate::array::from_elements(gc_heap, pair)?));
+                let target_root = Value::Object(target);
+                pairs.push(Value::Array(rooted_array_from_elements(
+                    gc_heap,
+                    pair,
+                    &[&target_root],
+                    &[args, pairs.as_slice()],
+                )?));
             }
-            Ok(Value::Array(crate::array::from_elements(gc_heap, pairs)?))
+            let target_root = Value::Object(target);
+            Ok(Value::Array(rooted_array_from_elements(
+                gc_heap,
+                pairs,
+                &[&target_root],
+                &[args],
+            )?))
         }
         // §20.1.2.1 Object.assign(target, ...sources). Copies own
         // enumerable string-keyed data properties from each source
@@ -1337,7 +1402,8 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.fromentries>
         M::FromEntries => {
             let iter = args.first().cloned().unwrap_or(Value::Undefined);
-            let result = crate::object::alloc_object(gc_heap)?;
+            let iter_root = iter.clone();
+            let result = rooted_object(gc_heap, &[&iter_root], &[args])?;
             match iter {
                 Value::Array(arr) => {
                     // Snapshot to avoid holding the array's RefCell
@@ -1408,7 +1474,12 @@ pub fn call(
             for k in owned {
                 names.push(string_value(&k, string_heap)?);
             }
-            Ok(Value::Array(crate::array::from_elements(gc_heap, names)?))
+            Ok(Value::Array(rooted_array_from_elements(
+                gc_heap,
+                names,
+                &[],
+                &[args],
+            )?))
         }
         // §20.1.2.13 Object.getOwnPropertySymbols(O) — every own
         // symbol-keyed property. Foundation property bag is
@@ -1420,7 +1491,13 @@ pub fn call(
             let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.symbol_keys().map(Value::Symbol).collect()
             });
-            Ok(Value::Array(crate::array::from_elements(gc_heap, syms)?))
+            let target_root = Value::Object(target);
+            Ok(Value::Array(rooted_array_from_elements(
+                gc_heap,
+                syms,
+                &[&target_root],
+                &[args],
+            )?))
         }
     }
 }
@@ -1491,17 +1568,67 @@ pub fn coerce_to_descriptor(
     Ok(descriptor)
 }
 
-/// Inverse of [`coerce_to_descriptor`] — returns a fresh
-/// `{ value / writable / enumerable / configurable }` or
-/// `{ get / set / enumerable / configurable }` object.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-frompropertydescriptor>
-pub(crate) fn descriptor_to_object(
+fn rooted_object(
+    gc_heap: &mut otter_gc::GcHeap,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<JsObject, VmError> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in value_roots {
+            value.trace_value_slots(visitor);
+        }
+        for slice in slice_roots {
+            for value in *slice {
+                value.trace_value_slots(visitor);
+            }
+        }
+    };
+    crate::object::alloc_object_with_roots(gc_heap, &mut external_visit).map_err(VmError::from)
+}
+
+fn rooted_array_from_elements<I>(
+    gc_heap: &mut otter_gc::GcHeap,
+    values: I,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<crate::array::JsArray, VmError>
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in value_roots {
+            value.trace_value_slots(visitor);
+        }
+        for slice in slice_roots {
+            for value in *slice {
+                value.trace_value_slots(visitor);
+            }
+        }
+    };
+    crate::array::from_elements_with_roots(gc_heap, values, &mut external_visit)
+        .map_err(VmError::from)
+}
+
+fn descriptor_to_object_with_roots(
     desc: &PropertyDescriptor,
     gc_heap: &mut otter_gc::GcHeap,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
 ) -> Result<JsObject, VmError> {
-    let result = crate::object::alloc_object(gc_heap)?;
+    let mut roots = Vec::with_capacity(value_roots.len() + 2);
+    roots.extend_from_slice(value_roots);
+    match &desc.kind {
+        DescriptorKind::Data { value } => roots.push(value),
+        DescriptorKind::Accessor { getter, setter } => {
+            if let Some(getter) = getter {
+                roots.push(getter);
+            }
+            if let Some(setter) = setter {
+                roots.push(setter);
+            }
+        }
+    }
+    let result = rooted_object(gc_heap, &roots, slice_roots)?;
     match &desc.kind {
         DescriptorKind::Data { value } => {
             crate::object::set(result, gc_heap, "value", value.clone());

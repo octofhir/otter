@@ -255,11 +255,11 @@ fn impl_weak_map_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 }
 
 fn impl_weak_map_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let m = receiver_weak_map(args)?;
+    let mut m = receiver_weak_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::Undefined);
     let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
-    let heap = &mut *args.gc_heap;
-    collections::weak_map_set(m, heap, key, value).map_err(weak_collection_to_intrinsic)?;
+    args.weak_map_set_rooted(&mut m, key, value)
+        .map_err(weak_collection_to_intrinsic)?;
     Ok(Value::WeakMap(m))
 }
 
@@ -288,10 +288,10 @@ fn receiver_weak_set(args: &IntrinsicArgs<'_>) -> Result<JsWeakSet, IntrinsicErr
 }
 
 fn impl_weak_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let s = receiver_weak_set(args)?;
+    let mut s = receiver_weak_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let heap = &mut *args.gc_heap;
-    collections::weak_set_add(s, heap, v).map_err(weak_collection_to_intrinsic)?;
+    args.weak_set_add_rooted(&mut s, v)
+        .map_err(weak_collection_to_intrinsic)?;
     Ok(Value::WeakSet(s))
 }
 
@@ -323,6 +323,13 @@ fn weak_collection_to_intrinsic(err: CollectionError) -> IntrinsicError {
         CollectionError::NonObjectKey => IntrinsicError::BadArgument {
             index: 0,
             reason: "must be an object",
+        },
+        CollectionError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => IntrinsicError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
         },
     }
 }

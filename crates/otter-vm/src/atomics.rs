@@ -41,7 +41,6 @@ use crate::binary::{JsTypedArray, TypedArrayKind};
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
 use crate::number::NumberValue;
 use crate::number::parse::to_integer_or_infinity;
-use crate::promise::JsPromiseHandle;
 use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError, Value, VmError};
 use std::time::Duration;
@@ -646,13 +645,17 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     let label_str = JsString::from_str(label, &string_heap)
         .map_err(|e| type_err(method_name, format!("string allocation failed: {e}")))?;
     if is_async {
-        let heap = ctx.heap_mut();
-        let promise = JsPromiseHandle::fulfilled(heap, Value::String(label_str))
+        let label_value = Value::String(label_str);
+        let promise = ctx
+            .fulfilled_promise_with_roots(label_value.clone(), &[], &[args])
             .map_err(|e| type_err(method_name, format!("promise allocation failed: {e}")))?;
-        let result = crate::object::alloc_object(heap)
+        let promise_value = Value::Promise(promise);
+        let result = ctx
+            .alloc_object_with_roots(&[&label_value, &promise_value], &[args])
             .map_err(|e| type_err(method_name, format!("object allocation failed: {e}")))?;
+        let heap = ctx.heap_mut();
         crate::object::set(result, heap, "async", Value::Boolean(false));
-        crate::object::set(result, heap, "value", Value::Promise(promise));
+        crate::object::set(result, heap, "value", promise_value);
         Ok(Value::Object(result))
     } else {
         Ok(Value::String(label_str))

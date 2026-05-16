@@ -8,6 +8,8 @@
 //! # Contents
 //!
 //! - [`ExternalMemory`] — non-send RAII reservation token.
+//! - [`SharedExternalMemory`] — thread-safe release token for shared backing
+//!   stores.
 //!
 //! # Invariants
 //!
@@ -23,9 +25,34 @@
 //! - [Startup performance](../../../docs/book/src/performance/startup.md)
 
 use std::marker::PhantomData;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::heap::GcHeap;
 use crate::oom::OutOfMemory;
+
+/// Heap-owned state for external reservations whose owner may be
+/// dropped away from the mutator thread.
+#[derive(Debug, Default)]
+pub(crate) struct SharedExternalState {
+    released_bytes: AtomicU64,
+}
+
+impl SharedExternalState {
+    pub(crate) fn release(&self, bytes: u64) {
+        self.released_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    pub(crate) fn released_bytes(&self) -> u64 {
+        self.released_bytes.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_released_bytes(&self) -> u64 {
+        self.released_bytes.swap(0, Ordering::AcqRel)
+    }
+}
 
 /// RAII reservation for memory outside GC cell payloads.
 ///
@@ -129,5 +156,39 @@ impl std::fmt::Debug for ExternalMemory {
         f.debug_struct("ExternalMemory")
             .field("bytes", &self.bytes)
             .finish_non_exhaustive()
+    }
+}
+
+/// RAII reservation for backing stores shared outside the mutator thread.
+///
+/// Dropping this token does not touch [`GcHeap`] directly. Instead it records
+/// the released byte count in heap-owned atomic state; the owning heap drains
+/// those releases on the next accounting operation or stats query. This keeps
+/// cross-thread `Arc` payload drops from mutating isolate-local heap state.
+#[derive(Debug)]
+pub struct SharedExternalMemory {
+    state: Arc<SharedExternalState>,
+    bytes: u64,
+}
+
+impl SharedExternalMemory {
+    pub(crate) fn new(state: Arc<SharedExternalState>, bytes: u64) -> Self {
+        Self { state, bytes }
+    }
+
+    /// Currently reserved byte count.
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for SharedExternalMemory {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        self.state.release(self.bytes);
+        self.bytes = 0;
     }
 }

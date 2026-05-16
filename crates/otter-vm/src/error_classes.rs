@@ -160,6 +160,72 @@ struct ClassEntry {
     constructor: JsObject,
 }
 
+fn oom() -> StringError {
+    StringError::OutOfMemory {
+        requested_bytes: 0,
+        heap_limit_bytes: 0,
+    }
+}
+
+fn trace_value_roots(roots: &[&Value], visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+    for value in roots {
+        value.trace_value_slots(visitor);
+    }
+}
+
+fn alloc_registry_object(
+    gc_heap: &mut otter_gc::GcHeap,
+    roots: &[&Value],
+) -> Result<JsObject, StringError> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        trace_value_roots(roots, visitor);
+    };
+    crate::object::alloc_object_with_roots(gc_heap, &mut external_visit).map_err(|_| oom())
+}
+
+fn native_static_with_roots(
+    gc_heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeFastFn,
+    roots: &[&Value],
+) -> Result<NativeFunction, StringError> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        trace_value_roots(roots, visitor);
+    };
+    NativeFunction::new_static_with_roots(gc_heap, name, length, call, &mut external_visit)
+        .map_err(|_| oom())
+}
+
+fn native_constructor_static_with_roots(
+    gc_heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeFastFn,
+    roots: &[&Value],
+) -> Result<NativeFunction, StringError> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        trace_value_roots(roots, visitor);
+    };
+    NativeFunction::new_constructor_static_with_roots(
+        gc_heap,
+        name,
+        length,
+        call,
+        &mut external_visit,
+    )
+    .map_err(|_| oom())
+}
+
+fn class_entry_roots(entries: &[(ErrorKind, ClassEntry)]) -> Vec<Value> {
+    let mut roots = Vec::with_capacity(entries.len() * 2);
+    for (_, entry) in entries {
+        roots.push(Value::Object(entry.prototype));
+        roots.push(Value::Object(entry.constructor));
+    }
+    roots
+}
+
 /// Per-interpreter registry of the seven canonical error classes.
 ///
 /// Constructed once at interpreter startup and threaded through
@@ -265,11 +331,8 @@ impl ErrorClassRegistry {
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
     pub fn new(heap: &StringHeap, gc_heap: &mut otter_gc::GcHeap) -> Result<Self, StringError> {
-        let error_proto =
-            crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
-                requested_bytes: 0,
-                heap_limit_bytes: 0,
-            })?;
+        let error_proto = alloc_registry_object(gc_heap, &[])?;
+        let error_proto_root = Value::Object(error_proto);
         // §20.5.3.{4,5} — `Error.prototype.name = "Error"` and
         // `Error.prototype.message = ""` are data properties with
         // attributes `{ writable: true, enumerable: false,
@@ -318,18 +381,19 @@ impl ErrorClassRegistry {
             })?;
             Ok(Value::String(s))
         }
-        let to_string_native =
-            NativeFunction::new_static(gc_heap, "toString", 0, error_prototype_to_string).map_err(
-                |_| StringError::OutOfMemory {
-                    requested_bytes: 0,
-                    heap_limit_bytes: 0,
-                },
-            )?;
+        let to_string_native = native_static_with_roots(
+            gc_heap,
+            "toString",
+            0,
+            error_prototype_to_string,
+            &[&error_proto_root],
+        )?;
+        let to_string_root = Value::NativeFunction(to_string_native);
         let _ = object::define_own_property(
             error_proto,
             gc_heap,
             "toString",
-            PropertyDescriptor::data(Value::NativeFunction(to_string_native), true, false, true),
+            PropertyDescriptor::data(to_string_root.clone(), true, false, true),
         );
         // §20.5.3.4 Error.prototype.toString is intercepted by
         // `object_prototype_intercept` in the dispatcher when the
@@ -564,11 +628,8 @@ impl ErrorClassRegistry {
         // is the Error constructor, with attribute
         // `[[Configurable]]: true`, `[[Writable]]: true`,
         // `[[Enumerable]]: false`.
-        let error_ctor =
-            crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
-                requested_bytes: 0,
-                heap_limit_bytes: 0,
-            })?;
+        let error_ctor = alloc_registry_object(gc_heap, &[&error_proto_root, &to_string_root])?;
+        let error_ctor_root = Value::Object(error_ctor);
         // §20.5.2 — `Error.prototype` lives on the constructor as
         // `{ writable: false, enumerable: false, configurable: false }`.
         // §20.5.3 — `Error.prototype.constructor` is
@@ -585,11 +646,13 @@ impl ErrorClassRegistry {
             "constructor",
             PropertyDescriptor::data(Value::Object(error_ctor), true, false, true),
         );
-        let error_call = NativeFunction::new_constructor_static(gc_heap, "Error", 1, ctor_error)
-            .map_err(|_| StringError::OutOfMemory {
-                requested_bytes: 0,
-                heap_limit_bytes: 0,
-            })?;
+        let error_call = native_constructor_static_with_roots(
+            gc_heap,
+            "Error",
+            1,
+            ctor_error,
+            &[&error_proto_root, &error_ctor_root],
+        )?;
         object::set_constructor_native(error_ctor, gc_heap, Value::NativeFunction(error_call));
         install_ctor_metadata(error_ctor, "Error", 1, heap, gc_heap)?;
         entries.push((
@@ -612,11 +675,11 @@ impl ErrorClassRegistry {
             ErrorKind::EvalError,
             ErrorKind::AggregateError,
         ] {
-            let proto =
-                crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
-                    requested_bytes: 0,
-                    heap_limit_bytes: 0,
-                })?;
+            let mut roots = class_entry_roots(&entries);
+            roots.push(Value::Object(error_proto));
+            let root_refs: Vec<&Value> = roots.iter().collect();
+            let proto = alloc_registry_object(gc_heap, root_refs.as_slice())?;
+            let proto_root = Value::Object(proto);
             object::set_prototype(proto, gc_heap, Some(error_proto));
             // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
             // share the same descriptor shape as `Error.prototype`'s.
@@ -634,11 +697,12 @@ impl ErrorClassRegistry {
                 "message",
                 PropertyDescriptor::data(Value::String(empty), true, false, true),
             );
-            let ctor =
-                crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
-                    requested_bytes: 0,
-                    heap_limit_bytes: 0,
-                })?;
+            let mut roots = class_entry_roots(&entries);
+            roots.push(Value::Object(error_proto));
+            roots.push(proto_root.clone());
+            let root_refs: Vec<&Value> = roots.iter().collect();
+            let ctor = alloc_registry_object(gc_heap, root_refs.as_slice())?;
+            let ctor_root = Value::Object(ctor);
             // §20.5.6.{2,3} — same prototype/constructor shape.
             let _ = object::define_own_property(
                 ctor,
@@ -669,16 +733,18 @@ impl ErrorClassRegistry {
                 ErrorKind::EvalError => ctor_eval,
                 ErrorKind::AggregateError => ctor_aggregate,
             };
-            let native = NativeFunction::new_constructor_static(
+            let mut roots = class_entry_roots(&entries);
+            roots.push(Value::Object(error_proto));
+            roots.push(proto_root);
+            roots.push(ctor_root);
+            let root_refs: Vec<&Value> = roots.iter().collect();
+            let native = native_constructor_static_with_roots(
                 gc_heap,
                 kind.class_name(),
                 length as u8,
                 dispatcher,
-            )
-            .map_err(|_| StringError::OutOfMemory {
-                requested_bytes: 0,
-                heap_limit_bytes: 0,
-            })?;
+                root_refs.as_slice(),
+            )?;
             object::set_constructor_native(ctor, gc_heap, Value::NativeFunction(native));
             install_ctor_metadata(ctor, kind.class_name(), length, heap, gc_heap)?;
             entries.push((

@@ -364,13 +364,9 @@ fn weak_collections_root_survives_force_gc() {
 /// collection after the transient host handles are gone.
 #[test]
 fn promise_resolution_root_survives_force_gc() {
-    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
     use otter_vm::promise::{JsPromise, PromiseState};
 
     let mut interp = Interpreter::new();
-    interp.force_gc();
-    let baseline =
-        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
 
     let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
@@ -388,12 +384,6 @@ fn promise_resolution_root_survives_force_gc() {
     let _ = promise;
     interp.force_gc();
 
-    let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    assert!(
-        after > baseline,
-        "rooted fulfilled promise must retain its object value"
-    );
-
     let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__promise_root")
         .expect("promise root survives force_gc");
     match rooted {
@@ -410,12 +400,7 @@ fn promise_resolution_root_survives_force_gc() {
 /// must be traced while the job is pending.
 #[test]
 fn microtask_payload_root_survives_force_gc() {
-    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
-
     let mut interp = Interpreter::new();
-    interp.force_gc();
-    let baseline =
-        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
 
     let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
     interp.microtasks_mut().enqueue(otter_vm::Microtask {
@@ -429,11 +414,6 @@ fn microtask_payload_root_survives_force_gc() {
 
     let _ = object;
     interp.force_gc();
-    let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    assert!(
-        after > baseline,
-        "pending microtask payload must retain its object argument"
-    );
 
     let mut batch = interp
         .microtasks_mut()

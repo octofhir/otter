@@ -1587,15 +1587,7 @@ impl Runtime {
                 continue;
             }
             otter_vm_init_marker_install(&mut self.interp, env);
-            let env_root = otter_vm::Value::Object(env);
-            let import_meta = self
-                .interp
-                .alloc_host_object_with_roots(&[&env_root], &[])
-                .map_err(|e| {
-                    DynLoadError::Diagnostic(format!(
-                        "dynamic import: alloc import_meta failed: {e}"
-                    ))
-                })?;
+            let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, &url)?;
             let callee = otter_vm::Value::Function { function_id };
             let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
                 otter_vm::Value::Object(env),
@@ -1693,13 +1685,7 @@ impl Runtime {
         self.interp
             .register_module_env(std::rc::Rc::from(target_url), env);
         otter_vm_init_marker_install(&mut self.interp, env);
-        let env_root = otter_vm::Value::Object(env);
-        let import_meta = self
-            .interp
-            .alloc_host_object_with_roots(&[&env_root], &[])
-            .map_err(|e| {
-                DynLoadError::Diagnostic(format!("dynamic import: alloc import_meta failed: {e}"))
-            })?;
+        let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, target_url)?;
         let callee = otter_vm::Value::Function { function_id: 0 };
         let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
             otter_vm::Value::Object(env),
@@ -2963,6 +2949,32 @@ fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, env: otter_v
         DYNAMIC_INIT_MARKER,
         otter_vm::Value::Boolean(true),
     );
+}
+
+fn alloc_dynamic_import_meta(
+    interp: &mut otter_vm::Interpreter,
+    env: otter_vm::JsObject,
+    url: &str,
+) -> Result<otter_vm::JsObject, DynLoadError> {
+    let env_root = otter_vm::Value::Object(env);
+    let import_meta = interp
+        .alloc_host_object_with_roots(&[&env_root], &[])
+        .map_err(|e| {
+            DynLoadError::Diagnostic(format!("dynamic import: alloc import_meta failed: {e}"))
+        })?;
+    let string_heap = interp.string_heap_clone();
+    let url_string = otter_vm::JsString::from_str(url, &string_heap).map_err(|err| {
+        DynLoadError::Diagnostic(format!(
+            "dynamic import: alloc import_meta.url failed: {err}"
+        ))
+    })?;
+    otter_vm::object::set(
+        import_meta,
+        interp.gc_heap_mut(),
+        "url",
+        otter_vm::Value::String(url_string),
+    );
+    Ok(import_meta)
 }
 
 /// `true` when the bytecode fragment contains any

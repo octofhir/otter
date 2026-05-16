@@ -104,6 +104,10 @@ pub struct SharedBody {
     bytes: Mutex<Vec<u8>>,
     /// `Some(n)` for a growable shared buffer (§25.2.5.4).
     max_byte_length: Option<usize>,
+    /// GC-budget reservation for the shared backing store. Active
+    /// constructors install a thread-safe token so the bytes remain
+    /// accounted until the final `Arc<SharedBody>` drops.
+    _external: Option<otter_gc::SharedExternalMemory>,
 }
 
 impl SharedBody {
@@ -326,6 +330,7 @@ impl JsArrayBuffer {
                 id: allocate_shared_id(),
                 bytes: Mutex::new(Vec::new()),
                 max_byte_length: None,
+                _external: None,
             })
         })
     }
@@ -342,7 +347,29 @@ impl JsArrayBuffer {
             id: allocate_shared_id(),
             bytes: Mutex::new(bytes),
             max_byte_length: None,
+            _external: None,
         }))
+    }
+
+    /// Accounted fixed-length shared allocation. Release is tied to the
+    /// `Arc<SharedBody>` lifetime so clones keep the backing store booked.
+    pub fn try_new_shared_with_roots(
+        len: usize,
+        heap: &mut otter_gc::GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
+        let external = heap.reserve_shared_external_with_roots(len as u64, external_visit)?;
+        let mut bytes: Vec<u8> = Vec::new();
+        if bytes.try_reserve_exact(len).is_err() {
+            return Ok(None);
+        }
+        bytes.resize(len, 0u8);
+        Ok(Some(Self::shared(SharedBody {
+            id: allocate_shared_id(),
+            bytes: Mutex::new(bytes),
+            max_byte_length: None,
+            _external: Some(external),
+        })))
     }
 
     /// Allocate a growable shared buffer per §25.2.5 — `length`
@@ -355,7 +382,43 @@ impl JsArrayBuffer {
             id: allocate_shared_id(),
             bytes: Mutex::new(bytes),
             max_byte_length: Some(max_byte_length),
+            _external: None,
         })
+    }
+
+    /// Accounted growable shared allocation. The reservation covers
+    /// `max_byte_length`, matching the capacity reserved up front.
+    pub fn new_shared_growable_with_roots(
+        len: usize,
+        max_byte_length: usize,
+        heap: &mut otter_gc::GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
+        let external =
+            heap.reserve_shared_external_with_roots(max_byte_length as u64, external_visit)?;
+        let mut bytes: Vec<u8> = Vec::new();
+        if bytes.try_reserve_exact(max_byte_length).is_err() {
+            return Ok(None);
+        }
+        bytes.resize(len, 0u8);
+        Ok(Some(Self::shared(SharedBody {
+            id: allocate_shared_id(),
+            bytes: Mutex::new(bytes),
+            max_byte_length: Some(max_byte_length),
+            _external: Some(external),
+        })))
+    }
+
+    /// Accounted external byte count for focused tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn shared_external_bytes_for_test(&self) -> Option<u64> {
+        let BufferStorage::Shared(body) = &self.storage else {
+            return None;
+        };
+        body._external
+            .as_ref()
+            .map(otter_gc::SharedExternalMemory::bytes)
     }
 
     /// `true` for a `SharedArrayBuffer`.

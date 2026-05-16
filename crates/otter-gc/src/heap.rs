@@ -38,7 +38,7 @@ use std::time::Instant;
 
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::ephemeron::EphemeronRegistry;
-use crate::external::ExternalMemory;
+use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
 use crate::finalize::WeakFinalizationRegistry;
 use crate::handle::{GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
@@ -143,6 +143,7 @@ pub struct GcHeap {
     global_handles: Box<GlobalHandleTable>,
     ephemerons: EphemeronRegistry,
     weak_finalization: WeakFinalizationRegistry,
+    shared_external: Arc<SharedExternalState>,
     stats: HeapStats,
     gc_stats: GcStats,
     /// Cooperative-cancellation flag; flipped to `true` when the
@@ -192,6 +193,7 @@ impl GcHeap {
             global_handles: Box::new(GlobalHandleTable::new()),
             ephemerons: EphemeronRegistry::default(),
             weak_finalization: WeakFinalizationRegistry::default(),
+            shared_external: Arc::new(SharedExternalState::default()),
             stats: HeapStats::default(),
             gc_stats: GcStats::default(),
             max_heap_bytes: cap,
@@ -209,7 +211,38 @@ impl GcHeap {
     /// Bytes currently tracked against the cap (slot allocations
     /// + outstanding [`Self::reserve_bytes`] reservations).
     pub fn tracked_bytes(&self) -> u64 {
+        self.effective_tracked_bytes()
+    }
+
+    fn pending_shared_external_releases(&self) -> u64 {
+        self.shared_external
+            .released_bytes()
+            .min(self.reserved_bytes)
+    }
+
+    fn effective_reserved_bytes(&self) -> u64 {
+        self.reserved_bytes
+            .saturating_sub(self.pending_shared_external_releases())
+    }
+
+    fn effective_tracked_bytes(&self) -> u64 {
+        if self.max_heap_bytes == 0 {
+            return self.tracked_bytes;
+        }
         self.tracked_bytes
+            .saturating_sub(self.pending_shared_external_releases())
+    }
+
+    fn drain_shared_external_releases(&mut self) {
+        let released = self.shared_external.take_released_bytes();
+        if released == 0 {
+            return;
+        }
+        let actual = released.min(self.reserved_bytes);
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(actual);
+        if self.max_heap_bytes != 0 {
+            self.tracked_bytes = self.tracked_bytes.saturating_sub(actual);
+        }
     }
 
     /// Cooperative-cancellation OOM flag. Cloned cheaply; safe to
@@ -233,6 +266,7 @@ impl GcHeap {
     /// and the reservation cannot be satisfied even after an
     /// emergency full GC.
     pub fn reserve_bytes(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+        self.drain_shared_external_releases();
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
@@ -260,6 +294,7 @@ impl GcHeap {
         bytes: u64,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        self.drain_shared_external_releases();
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
@@ -293,6 +328,23 @@ impl GcHeap {
         ExternalMemory::new_with_roots(self, bytes, external_visit)
     }
 
+    /// Reserve shared native / backing-store bytes while exposing caller-owned
+    /// roots to any emergency collection.
+    ///
+    /// The returned token may be dropped from any thread; release accounting is
+    /// reconciled by the owning heap on later accounting/stat calls.
+    pub fn reserve_shared_external_with_roots(
+        &mut self,
+        bytes: u64,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<SharedExternalMemory, OutOfMemory> {
+        self.reserve_bytes_with_roots(bytes, external_visit)?;
+        Ok(SharedExternalMemory::new(
+            Arc::clone(&self.shared_external),
+            bytes,
+        ))
+    }
+
     /// Reserve off-slot bytes without running an emergency
     /// collection.
     ///
@@ -307,6 +359,7 @@ impl GcHeap {
     /// [`OutOfMemory::HeapCapExceeded`] when `bytes` would exceed
     /// the configured cap.
     pub fn reserve_bytes_no_collect(&mut self, bytes: u64) -> Result<(), OutOfMemory> {
+        self.drain_shared_external_releases();
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
@@ -329,6 +382,7 @@ impl GcHeap {
     /// keeps the counter monotone-correct under arithmetic edge
     /// cases.
     pub fn release_bytes(&mut self, bytes: u64) {
+        self.drain_shared_external_releases();
         let actual = bytes.min(self.reserved_bytes);
         self.reserved_bytes = self.reserved_bytes.saturating_sub(actual);
         if self.max_heap_bytes != 0 {
@@ -351,6 +405,7 @@ impl GcHeap {
         bytes: u64,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        self.drain_shared_external_releases();
         let cap = self.max_heap_bytes;
         let projected = self.tracked_bytes.saturating_add(bytes);
         if projected <= cap {
@@ -516,8 +571,8 @@ impl GcHeap {
         s.page_count = self.new_space.from_page_count() * 2
             + self.old_space.page_count()
             + self.large_space.page_count();
-        s.tracked_bytes = self.tracked_bytes;
-        s.reserved_bytes = self.reserved_bytes;
+        s.tracked_bytes = self.effective_tracked_bytes();
+        s.reserved_bytes = self.effective_reserved_bytes();
         s.max_heap_bytes = self.max_heap_bytes;
         s
     }
@@ -699,6 +754,7 @@ impl GcHeap {
     pub fn alloc_old_diagnostic<T: Traceable>(&mut self, value: T) -> Result<Gc<T>, OutOfMemory> {
         let out = self.alloc_old_inner(value, false)?;
         if self.max_heap_bytes != 0 {
+            self.drain_shared_external_releases();
             self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
             self.oom_flag.store(true, Ordering::Relaxed);
         }
@@ -829,6 +885,8 @@ impl GcHeap {
             }
             external_visit(visitor);
         };
+        let mut weak_registry_slots = self.ephemerons.handle_slots();
+        weak_registry_slots.extend(self.weak_finalization.handle_slots());
         // SAFETY: STW pause for the duration of the call;
         // every type tag in from-space is registered.
         let stats = unsafe {
@@ -838,8 +896,11 @@ impl GcHeap {
                 &self.trace_table,
                 &[],
                 &mut combined,
+                &weak_registry_slots,
             )
         };
+        self.ephemerons.retain_non_null();
+        self.weak_finalization.retain_non_null();
         self.stats.last_scavenge = stats;
         // Per-tag counters drift between scavenges (young
         // allocations counted at alloc-time but never

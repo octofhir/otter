@@ -25,7 +25,7 @@ use crate::binary::data_view_prototype;
 use crate::bootstrap::BootstrapEntry;
 use crate::intrinsics::IntrinsicArgs;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::native_function::{NativeCall, NativeFunction};
+use crate::native_function::NativeCall;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
 
@@ -58,14 +58,16 @@ pub(crate) fn install_data_view(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         for (name, length, call) in DATA_VIEW_METHODS {
             builder.method(
                 name,
@@ -76,12 +78,32 @@ pub(crate) fn install_data_view(
         }
     }
     // Accessor properties: buffer / byteLength / byteOffset.
-    install_accessor(heap, prototype, "buffer", dv_get_buffer)?;
-    install_accessor(heap, prototype, "byteLength", dv_get_byte_length)?;
-    install_accessor(heap, prototype, "byteOffset", dv_get_byte_offset)?;
+    let accessor_roots = vec![global_root.clone()];
+    install_accessor(heap, prototype, "buffer", dv_get_buffer, &accessor_roots)?;
+    install_accessor(
+        heap,
+        prototype,
+        "byteLength",
+        dv_get_byte_length,
+        &accessor_roots,
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "byteOffset",
+        dv_get_byte_offset,
+        &accessor_roots,
+    )?;
 
-    let ctor = NativeFunction::new_constructor_static(heap, "DataView", 1, data_view_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
+        heap,
+        "DataView",
+        1,
+        data_view_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
@@ -253,9 +275,15 @@ fn install_accessor(
     prototype: JsObject,
     name: &'static str,
     call: crate::native_function::NativeFastFn,
+    value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
+    let prototype_root = Value::Object(prototype);
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&prototype_root);
+    roots.extend(value_roots.iter());
     let getter =
-        NativeFunction::new_static(heap, name, 0, call).map_err(|_| JsSurfaceError::OutOfMemory)?;
+        crate::bootstrap::native_static_with_value_roots(heap, name, 0, call, roots.as_slice())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));

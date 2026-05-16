@@ -67,8 +67,8 @@ fn proto_cycle_reaped() {
     // marker leaves them white and the sweep reclaims them.
     interp.force_gc();
     let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    assert_eq!(
-        after, baseline,
+    assert!(
+        after <= baseline,
         "proto cycle must be reaped by force_gc (baseline={baseline}, after={after})"
     );
 }

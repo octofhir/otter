@@ -34,6 +34,60 @@ use crate::{
     object_statics, reflect,
 };
 
+pub(crate) fn alloc_object_with_value_roots(
+    heap: &mut otter_gc::GcHeap,
+    value_roots: &[&Value],
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in value_roots {
+            value.trace_value_slots(visitor);
+        }
+    };
+    object::alloc_object_with_roots(heap, &mut external_visit)
+}
+
+pub(crate) fn native_constructor_static_with_value_roots(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeFastFn,
+    value_roots: &[&Value],
+) -> Result<crate::native_function::NativeFunction, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in value_roots {
+            value.trace_value_slots(visitor);
+        }
+    };
+    crate::native_function::NativeFunction::new_constructor_static_with_roots(
+        heap,
+        name,
+        length,
+        call,
+        &mut external_visit,
+    )
+}
+
+pub(crate) fn native_static_with_value_roots(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeFastFn,
+    value_roots: &[&Value],
+) -> Result<crate::native_function::NativeFunction, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in value_roots {
+            value.trace_value_slots(visitor);
+        }
+    };
+    crate::native_function::NativeFunction::new_static_with_roots(
+        heap,
+        name,
+        length,
+        call,
+        &mut external_visit,
+    )
+}
+
 /// Bootstrap feature/capability bitset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootstrapFeatures(u32);
@@ -453,7 +507,7 @@ fn build_global_this_impl(
         allocation_snapshot(heap)
     });
 
-    let global = object::alloc_object(heap)?;
+    let global = alloc_object_with_value_roots(heap, &[])?;
     object::set(global, heap, "globalThis", Value::Object(global));
     if let Some(t) = telemetry.as_deref_mut() {
         t.record_global_this();
@@ -503,8 +557,10 @@ fn install_placeholder(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let placeholder = object::alloc_object(heap)?;
-    let proto = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let placeholder = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let placeholder_root = Value::Object(placeholder);
+    let proto = alloc_object_with_value_roots(heap, &[&global_root, &placeholder_root])?;
     object::set(placeholder, heap, "prototype", Value::Object(proto));
     define_global(global, heap, entry.name, Value::Object(placeholder));
     Ok(())
@@ -515,7 +571,6 @@ fn install_proxy(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{NativeCtx, NativeError};
 
     fn proxy_target_is_object(value: &Value) -> bool {
@@ -584,32 +639,53 @@ fn install_proxy(
         let target = proxy_target_arg(args)?;
         let handler = proxy_handler_arg(args)?;
         let proxy = crate::proxy::JsProxy::new(target, handler);
-        let proxy_handle = proxy.clone();
-        let revoke = crate::native_function::native_value_unchecked(
-            ctx.heap_mut(),
-            "revoke",
-            move |_, _, _| {
-                proxy_handle.revoke();
-                Ok(Value::Undefined)
-            },
-        )
-        .map_err(|_| NativeError::TypeError {
-            name: "Proxy.revocable",
-            reason: "out of memory while creating revoke function".to_string(),
-        })?;
-        let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
-            name: "Proxy.revocable",
-            reason: "out of memory while creating result object".to_string(),
-        })?;
+        let proxy_value = Value::Proxy(proxy.clone());
+        let revoke = ctx
+            .native_value_with_captures(
+                "revoke",
+                smallvec::smallvec![proxy_value.clone()],
+                &[],
+                &[args],
+                move |_, _, captures| {
+                    if let Some(Value::Proxy(proxy)) = captures.first() {
+                        proxy.revoke();
+                    }
+                    Ok(Value::Undefined)
+                },
+            )
+            .map_err(|_| NativeError::TypeError {
+                name: "Proxy.revocable",
+                reason: "out of memory while creating revoke function".to_string(),
+            })?;
+        let obj = ctx
+            .alloc_object_with_roots(&[&proxy_value, &revoke], &[args])
+            .map_err(|_| NativeError::TypeError {
+                name: "Proxy.revocable",
+                reason: "out of memory while creating result object".to_string(),
+            })?;
         object::set(obj, ctx.heap_mut(), "proxy", Value::Proxy(proxy));
         object::set(obj, ctx.heap_mut(), "revoke", revoke);
         Ok(Value::Object(obj))
     }
 
-    let proxy_ctor = NativeFunction::new_constructor_static(heap, "Proxy", 2, proxy_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let revocable = NativeFunction::new_static(heap, "revocable", 2, proxy_revocable_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let global_root = Value::Object(global);
+    let proxy_ctor = native_constructor_static_with_value_roots(
+        heap,
+        "Proxy",
+        2,
+        proxy_ctor_call,
+        &[&global_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let proxy_ctor_root = Value::NativeFunction(proxy_ctor);
+    let revocable = native_static_with_value_roots(
+        heap,
+        "revocable",
+        2,
+        proxy_revocable_call,
+        &[&global_root, &proxy_ctor_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let revocable_desc =
         PropertyDescriptor::data(Value::NativeFunction(revocable), true, false, true);
     let string_heap = crate::string::StringHeap::default();
@@ -631,7 +707,6 @@ fn install_symbol(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::symbol::WellKnown;
     use crate::{NativeCtx, NativeError};
 
@@ -763,11 +838,14 @@ fn install_symbol(
     }
 
     // The Symbol constructor itself is a callable NativeFunction.
-    let symbol_ctor = NativeFunction::new_static(heap, "Symbol", 0, symbol_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let global_root = Value::Object(global);
+    let symbol_ctor =
+        native_static_with_value_roots(heap, "Symbol", 0, symbol_ctor_call, &[&global_root])
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
 
     // §20.4.3 Symbol.prototype — ordinary object linked to %Object.prototype%.
-    let prototype = object::alloc_object(heap)?;
+    let symbol_ctor_root = Value::NativeFunction(symbol_ctor);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &symbol_ctor_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
@@ -790,7 +868,11 @@ fn install_symbol(
     }
 
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            prototype,
+            vec![global_root.clone(), symbol_ctor_root.clone()],
+        );
         builder.method(
             "toString",
             0,
@@ -804,9 +886,15 @@ fn install_symbol(
             Attr::builtin_function(),
         )?;
         // §20.4.3.2 Symbol.prototype.description — accessor.
-        let getter =
-            NativeFunction::new_static(heap, "get description", 0, symbol_proto_description_get)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let prototype_root = Value::Object(prototype);
+        let getter = native_static_with_value_roots(
+            heap,
+            "get description",
+            0,
+            symbol_proto_description_get,
+            &[&global_root, &symbol_ctor_root, &prototype_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let desc_desc =
             PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
         if !object::define_own_property(prototype, heap, "description", desc_desc) {
@@ -824,10 +912,29 @@ fn install_symbol(
     // [`install_symbol_well_knowns_post_bootstrap`] once the
     // per-interpreter `WellKnownSymbols` singleton table exists.
     // `for` / `keyFor` methods.
-    let symbol_for_fn = NativeFunction::new_static(heap, "for", 1, symbol_for_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let symbol_key_for_fn = NativeFunction::new_static(heap, "keyFor", 1, symbol_key_for_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let symbol_for_fn = native_static_with_value_roots(
+        heap,
+        "for",
+        1,
+        symbol_for_call,
+        &[&global_root, &symbol_ctor_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let symbol_for_root = Value::NativeFunction(symbol_for_fn);
+    let symbol_key_for_fn = native_static_with_value_roots(
+        heap,
+        "keyFor",
+        1,
+        symbol_key_for_call,
+        &[
+            &global_root,
+            &symbol_ctor_root,
+            &prototype_root,
+            &symbol_for_root,
+        ],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let for_desc =
         PropertyDescriptor::data(Value::NativeFunction(symbol_for_fn), true, false, true);
     let key_for_desc =
@@ -870,7 +977,6 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::symbol::WellKnown;
 
     fn symbol_proto_to_primitive(
@@ -930,9 +1036,16 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let to_prim_fn =
-        NativeFunction::new_static(heap, "[Symbol.toPrimitive]", 1, symbol_proto_to_primitive)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let symbol_ctor_root = Value::NativeFunction(symbol_ctor);
+    let prototype_root = Value::Object(prototype);
+    let to_prim_fn = native_static_with_value_roots(
+        heap,
+        "[Symbol.toPrimitive]",
+        1,
+        symbol_proto_to_primitive,
+        &[&symbol_ctor_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
     object::set_symbol(
         prototype,
@@ -1044,11 +1157,12 @@ fn install_array(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{NativeCtx, NativeError};
 
-    let array = object::alloc_object(heap)?;
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let array = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let array_root = Value::Object(array);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &array_root])?;
     // §23.1 — `Array.prototype` is itself an Array exotic object whose
     // `[[Prototype]]` is `%Object.prototype%`. Bootstrap order installs
     // `Object` first, so the realm's Object.prototype is reachable at
@@ -1065,13 +1179,21 @@ fn install_array(
     }
     object::set(array, heap, "prototype", Value::Object(prototype));
     {
-        let mut builder = ObjectBuilder::from_object(heap, array);
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            array,
+            vec![global_root.clone(), Value::Object(prototype)],
+        );
         for method in array_statics::ARRAY_STATIC_METHODS {
             builder.method_from_spec(method)?;
         }
     }
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            prototype,
+            vec![global_root.clone(), array_root.clone()],
+        );
         for method in array_prototype::ARRAY_PROTOTYPE_METHODS {
             builder.method_from_spec(method)?;
         }
@@ -1123,8 +1245,14 @@ fn install_array(
         unreachable!("non-numeric Array(...) arguments returned above")
     }
 
-    let ctor_native = NativeFunction::new_static(heap, "Array", 1, array_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_native = native_static_with_value_roots(
+        heap,
+        "Array",
+        1,
+        array_ctor_call,
+        &[&global_root, &array_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     // Wire the callable+constructable bridge as an internal object
     // slot. This must not appear in JS own-property reflection.
     object::set_constructor_native(array, heap, Value::NativeFunction(ctor_native));
@@ -1138,15 +1266,16 @@ fn install_number(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{NativeCall, NativeCtx, NativeError};
 
+    let global_root = Value::Object(global);
     // Number.prototype with all the formatter methods + the
     // hidden `[[NumberData]]` slot (= +0 per §21.1.3) so
     // `Number.prototype.toString()` recovers the value.
-    let prototype = object::alloc_object(heap)?;
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         for method in crate::number::prototype::NUMBER_PROTOTYPE_METHODS {
             builder.method_from_spec(method)?;
         }
@@ -1181,14 +1310,23 @@ fn install_number(
         }
     }
 
-    let ctor_native = NativeFunction::new_static(heap, "Number", 1, number_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor_native = native_static_with_value_roots(
+        heap,
+        "Number",
+        1,
+        number_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_native_root = Value::NativeFunction(ctor_native);
     // The `Number` global itself is a GC-managed JsObject. Both the
     // constants/static methods and the `prototype` link sit on it
     // as ordinary properties; the callable+constructable surface is
     // wired through the dispatch path's internal native-constructor
     // slot.
-    let statics = object::alloc_object(heap)?;
+    let statics =
+        alloc_object_with_value_roots(heap, &[&global_root, &prototype_root, &ctor_native_root])?;
     // Chain `Number`'s statics to `Object.prototype` so the
     // prototype-resident methods (hasOwnProperty, toString,
     // isPrototypeOf, etc.) resolve through ordinary property
@@ -1209,7 +1347,7 @@ fn install_number(
     // Wire the callable+constructable bridge: stash the native
     // ctor on the Number object under a reserved key the dispatch
     // path looks up before falling back to ordinary property load.
-    object::set_constructor_native(statics, heap, Value::NativeFunction(ctor_native));
+    object::set_constructor_native(statics, heap, ctor_native_root);
     // `Number.prototype` lives as an own property on the
     // constructor object (per §21.1.2.5). Spec posture is
     // `[[Writable]]: false, [[Enumerable]]: false,
@@ -1235,7 +1373,11 @@ fn install_number(
         ("NaN", f64::NAN),
     ];
     {
-        let mut builder = ObjectBuilder::from_object(heap, statics);
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            statics,
+            vec![global_root.clone(), prototype_root.clone()],
+        );
         for (name, value) in constants {
             builder.property(
                 name,
@@ -1313,7 +1455,11 @@ fn install_number(
     }
 
     {
-        let mut builder = ObjectBuilder::from_object(heap, statics);
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            statics,
+            vec![global_root, prototype_root],
+        );
         let methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
             ("isNaN", 1, number_is_nan_native),
             ("isFinite", 1, number_is_finite_native),
@@ -1345,11 +1491,12 @@ fn install_string(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{NativeCtx, NativeError};
 
-    let constructor = object::alloc_object(heap)?;
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let constructor_root = Value::Object(constructor);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
@@ -1435,8 +1582,15 @@ fn install_string(
         }
     }
 
-    let ctor_native = NativeFunction::new_static(heap, "String", 1, string_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor_native = native_static_with_value_roots(
+        heap,
+        "String",
+        1,
+        string_ctor_call,
+        &[&global_root, &constructor_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
     object::set(constructor, heap, "prototype", Value::Object(prototype));
     let string_value = Value::Object(constructor);
@@ -1450,12 +1604,13 @@ fn install_boolean(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{NativeCtx, NativeError};
 
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         for method in crate::boolean_prototype::BOOLEAN_PROTOTYPE_METHODS {
             builder.method_from_spec(method)?;
         }
@@ -1485,15 +1640,24 @@ fn install_boolean(
         }
     }
 
-    let ctor_native = NativeFunction::new_static(heap, "Boolean", 1, boolean_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let statics = object::alloc_object(heap)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor_native = native_static_with_value_roots(
+        heap,
+        "Boolean",
+        1,
+        boolean_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_native_root = Value::NativeFunction(ctor_native);
+    let statics =
+        alloc_object_with_value_roots(heap, &[&global_root, &prototype_root, &ctor_native_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(statics, heap, Some(object_proto));
     }
-    object::set_constructor_native(statics, heap, Value::NativeFunction(ctor_native));
+    object::set_constructor_native(statics, heap, ctor_native_root);
     object::set(statics, heap, "prototype", Value::Object(prototype));
     let boolean_value = Value::Object(statics);
     object::set(prototype, heap, "constructor", boolean_value.clone());
@@ -1506,7 +1670,6 @@ fn install_function(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{NativeCtx, NativeError};
 
     fn function_prototype_call(
@@ -1541,20 +1704,40 @@ fn install_function(
             })
     }
 
-    let function = object::alloc_object(heap)?;
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let function = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let function_root = Value::Object(function);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &function_root])?;
+    let prototype_root = Value::Object(prototype);
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
     object::set_prototype(function, heap, Some(prototype));
-    let ctor_native =
-        NativeFunction::new_constructor_static(heap, "Function", 1, function_ctor_call)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_constructor_native(function, heap, Value::NativeFunction(ctor_native));
-    let prototype_call = NativeFunction::new_static(heap, "", 0, function_prototype_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_native = native_constructor_static_with_value_roots(
+        heap,
+        "Function",
+        1,
+        function_ctor_call,
+        &[&global_root, &function_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_native_root = Value::NativeFunction(ctor_native);
+    object::set_constructor_native(function, heap, ctor_native_root.clone());
+    let prototype_call = native_static_with_value_roots(
+        heap,
+        "",
+        0,
+        function_prototype_call,
+        &[
+            &global_root,
+            &function_root,
+            &prototype_root,
+            &ctor_native_root,
+        ],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_call_native(prototype, heap, Value::NativeFunction(prototype_call));
     let length = PropertyDescriptor::data(
         Value::Number(crate::number::NumberValue::from_i32(1)),
@@ -1586,12 +1769,20 @@ fn install_function(
     let prototype_name = PropertyDescriptor::data(prototype_name_value, false, false, true);
     let _ = object::define_own_property(prototype, heap, "name", prototype_name);
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            prototype,
+            vec![global_root.clone(), function_root.clone()],
+        );
         for method in function_prototype::FUNCTION_PROTOTYPE_METHODS {
             builder.method_from_spec(method)?;
         }
     }
-    function_prototype::install_restricted_accessors(heap, prototype)?;
+    function_prototype::install_restricted_accessors(
+        heap,
+        prototype,
+        &[&global_root, &function_root],
+    )?;
     let constructor = PropertyDescriptor::data(Value::Object(function), true, false, true);
     let _ = object::define_own_property(prototype, heap, "constructor", constructor);
     define_global(global, heap, entry.name, Value::Object(function));
@@ -1603,9 +1794,14 @@ fn install_math(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let namespace = NamespaceBuilder::from_spec(heap, &math::MATH_SPEC)
-        .map_err(JsSurfaceError::from)?
-        .build()?;
+    let global_root = Value::Object(global);
+    let namespace = NamespaceBuilder::from_spec_with_value_roots(
+        heap,
+        &math::MATH_SPEC,
+        vec![global_root.clone()],
+    )
+    .map_err(JsSurfaceError::from)?
+    .build()?;
     define_global(global, heap, entry.name, Value::Object(namespace));
     Ok(())
 }
@@ -1615,7 +1811,10 @@ fn install_json(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let namespace = NamespaceBuilder::from_spec(heap, &json::JSON_SPEC)?.build()?;
+    let global_root = Value::Object(global);
+    let namespace =
+        NamespaceBuilder::from_spec_with_value_roots(heap, &json::JSON_SPEC, vec![global_root])?
+            .build()?;
     define_global(global, heap, entry.name, Value::Object(namespace));
     Ok(())
 }
@@ -1625,7 +1824,6 @@ fn install_object(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{NativeCtx, NativeError};
 
     fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1641,20 +1839,34 @@ fn install_object(
         }
     }
 
-    let object = object::alloc_object(heap)?;
-    let prototype = object::alloc_object(heap)?;
-    let ctor_native = NativeFunction::new_static(heap, "Object", 1, object_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let global_root = Value::Object(global);
+    let object = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let object_root = Value::Object(object);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &object_root])?;
+    let prototype_root = Value::Object(prototype);
+    let ctor_native = native_static_with_value_roots(
+        heap,
+        "Object",
+        1,
+        object_ctor_call,
+        &[&global_root, &object_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(object, heap, Value::NativeFunction(ctor_native));
     object::set(object, heap, "prototype", Value::Object(prototype));
     {
-        let mut builder = ObjectBuilder::from_object(heap, object);
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            object,
+            vec![global_root.clone(), prototype_root],
+        );
         for method in object_statics::OBJECT_SPEC.methods {
             builder.method_from_spec(method)?;
         }
     }
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         for method in object_statics::OBJECT_PROTOTYPE_METHODS {
             builder.method_from_spec(method)?;
         }
@@ -1669,7 +1881,6 @@ fn install_date(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeFunction;
     use crate::{JsString, NativeCtx, NativeError};
 
     fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1697,16 +1908,25 @@ fn install_date(
         Ok(Value::String(value))
     }
 
-    let constructor = object::alloc_object(heap)?;
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let constructor_root = Value::Object(constructor);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(constructor, heap, Some(object_proto));
         object::set_prototype(prototype, heap, Some(object_proto));
     }
-    let ctor_native = NativeFunction::new_static(heap, "Date", 7, date_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor_native = native_static_with_value_roots(
+        heap,
+        "Date",
+        7,
+        date_ctor_call,
+        &[&global_root, &constructor_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
     object::set(constructor, heap, "prototype", Value::Object(prototype));
     let date_value = Value::Object(constructor);
@@ -1720,7 +1940,13 @@ fn install_atomics(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let namespace = NamespaceBuilder::from_spec(heap, &atomics::ATOMICS_SPEC)?.build()?;
+    let global_root = Value::Object(global);
+    let namespace = NamespaceBuilder::from_spec_with_value_roots(
+        heap,
+        &atomics::ATOMICS_SPEC,
+        vec![global_root],
+    )?
+    .build()?;
     // §25.4 — the `Atomics` object's [[Prototype]] is
     // %Object.prototype%, mirroring the other namespace builtins.
     // <https://tc39.es/ecma262/#sec-atomics-object>
@@ -1743,7 +1969,13 @@ fn install_reflect(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let namespace = NamespaceBuilder::from_spec(heap, &reflect::REFLECT_SPEC)?.build()?;
+    let global_root = Value::Object(global);
+    let namespace = NamespaceBuilder::from_spec_with_value_roots(
+        heap,
+        &reflect::REFLECT_SPEC,
+        vec![global_root],
+    )?
+    .build()?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {

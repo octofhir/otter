@@ -725,7 +725,9 @@ pub(crate) fn alloc_object_with_roots(
 /// # Spec
 ///
 /// - <https://tc39.es/ecma262/#sec-error-objects>
-pub fn alloc_diagnostic_object(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+pub(crate) fn alloc_diagnostic_object(
+    heap: &mut GcHeap,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
     heap.alloc_old_diagnostic(empty_object_body())
 }
 
@@ -735,25 +737,30 @@ pub fn alloc_diagnostic_object(heap: &mut GcHeap) -> Result<JsObject, otter_gc::
 /// JS `Value` / `Gc` handles. Native methods should access it through
 /// [`with_host_data`] / [`with_host_data_mut`] using the receiver from
 /// [`crate::NativeCtx::this_value`].
-pub fn alloc_host_object<T: HostObjectData>(
+/// Allocate a fresh host-data object while exposing caller-owned roots.
+pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     heap: &mut otter_gc::GcHeap,
     data: T,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let shape = ROOT_SHAPE.with(Rc::clone);
-    heap.alloc_old(ObjectBody {
-        shape,
-        shape_cache_mode: ShapeCacheMode::Fast,
-        slots: SmallVec::new(),
-        prototype: ObjectPrototype::Null,
-        symbol_props: Vec::new(),
-        host_data: Some(Box::new(data)),
-        call_native: None,
-        constructor_native: None,
-        boolean_data: None,
-        number_data: None,
-        string_data: None,
-        extensible: true,
-    })
+    heap.alloc_with_roots(
+        ObjectBody {
+            shape,
+            shape_cache_mode: ShapeCacheMode::Fast,
+            slots: SmallVec::new(),
+            prototype: ObjectPrototype::Null,
+            symbol_props: Vec::new(),
+            host_data: Some(Box::new(data)),
+            call_native: None,
+            constructor_native: None,
+            boolean_data: None,
+            number_data: None,
+            string_data: None,
+            extensible: true,
+        },
+        external_visit,
+    )
 }
 
 /// Allocate a fresh empty object whose prototype is `proto`.
@@ -2551,7 +2558,9 @@ mod tests {
     #[test]
     fn host_object_data_downcasts_and_mutates() {
         let mut heap = fresh_heap();
-        let object = alloc_host_object(&mut heap, Counter { value: 1 }).unwrap();
+        let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let object =
+            alloc_host_object_with_roots(&mut heap, Counter { value: 1 }, &mut roots).unwrap();
 
         assert_eq!(
             with_host_data::<Counter, _>(object, &heap, |counter| counter.value).unwrap(),
@@ -2576,7 +2585,10 @@ mod tests {
             HostObjectError::Missing
         );
 
-        let object = alloc_host_object(&mut heap, "not a counter".to_string()).unwrap();
+        let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        let object =
+            alloc_host_object_with_roots(&mut heap, "not a counter".to_string(), &mut roots)
+                .unwrap();
         let err = with_host_data::<Counter, _>(object, &heap, |_| ()).unwrap_err();
         assert!(matches!(err, HostObjectError::TypeMismatch { .. }));
     }

@@ -34,7 +34,7 @@
 
 use crate::bootstrap::BootstrapEntry;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::native_function::{NativeCall, NativeFunction};
+use crate::native_function::NativeCall;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::regexp::{JsRegExp, RegExpFlags};
 use crate::string::JsString;
@@ -46,18 +46,26 @@ pub(crate) fn install_regexp(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
 
-    install_prototype_methods(heap, prototype)?;
-    install_prototype_accessors(heap, prototype)?;
+    install_prototype_methods(heap, prototype, vec![global_root.clone()])?;
+    install_prototype_accessors(heap, prototype, vec![global_root.clone()])?;
 
-    let ctor = NativeFunction::new_constructor_static(heap, "RegExp", 2, regexp_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
+        heap,
+        "RegExp",
+        2,
+        regexp_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
@@ -189,8 +197,9 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 fn install_prototype_methods(
     heap: &mut otter_gc::GcHeap,
     prototype: JsObject,
+    value_roots: Vec<Value>,
 ) -> Result<(), JsSurfaceError> {
-    let mut builder = ObjectBuilder::from_object(heap, prototype);
+    let mut builder = ObjectBuilder::from_object_with_value_roots(heap, prototype, value_roots);
     builder.method(
         "exec",
         1,
@@ -244,17 +253,42 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 fn install_prototype_accessors(
     heap: &mut otter_gc::GcHeap,
     prototype: JsObject,
+    value_roots: Vec<Value>,
 ) -> Result<(), JsSurfaceError> {
-    install_accessor(heap, prototype, "source", accessor_source)?;
-    install_accessor(heap, prototype, "flags", accessor_flags)?;
-    install_accessor(heap, prototype, "global", accessor_global)?;
-    install_accessor(heap, prototype, "ignoreCase", accessor_ignore_case)?;
-    install_accessor(heap, prototype, "multiline", accessor_multiline)?;
-    install_accessor(heap, prototype, "dotAll", accessor_dot_all)?;
-    install_accessor(heap, prototype, "unicode", accessor_unicode)?;
-    install_accessor(heap, prototype, "sticky", accessor_sticky)?;
-    install_accessor(heap, prototype, "hasIndices", accessor_has_indices)?;
-    install_accessor(heap, prototype, "unicodeSets", accessor_unicode_sets)?;
+    install_accessor(heap, prototype, "source", accessor_source, &value_roots)?;
+    install_accessor(heap, prototype, "flags", accessor_flags, &value_roots)?;
+    install_accessor(heap, prototype, "global", accessor_global, &value_roots)?;
+    install_accessor(
+        heap,
+        prototype,
+        "ignoreCase",
+        accessor_ignore_case,
+        &value_roots,
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "multiline",
+        accessor_multiline,
+        &value_roots,
+    )?;
+    install_accessor(heap, prototype, "dotAll", accessor_dot_all, &value_roots)?;
+    install_accessor(heap, prototype, "unicode", accessor_unicode, &value_roots)?;
+    install_accessor(heap, prototype, "sticky", accessor_sticky, &value_roots)?;
+    install_accessor(
+        heap,
+        prototype,
+        "hasIndices",
+        accessor_has_indices,
+        &value_roots,
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "unicodeSets",
+        accessor_unicode_sets,
+        &value_roots,
+    )?;
     Ok(())
 }
 
@@ -263,9 +297,15 @@ fn install_accessor(
     prototype: JsObject,
     name: &'static str,
     call: crate::native_function::NativeFastFn,
+    value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
+    let prototype_root = Value::Object(prototype);
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&prototype_root);
+    roots.extend(value_roots.iter());
     let getter =
-        NativeFunction::new_static(heap, name, 0, call).map_err(|_| JsSurfaceError::OutOfMemory)?;
+        crate::bootstrap::native_static_with_value_roots(heap, name, 0, call, roots.as_slice())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));

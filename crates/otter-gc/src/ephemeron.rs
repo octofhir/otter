@@ -46,6 +46,23 @@ impl EphemeronRegistry {
         self.tables.retain(|raw| is_marked(*raw));
     }
 
+    /// Mutable raw slots for young-generation relocation.
+    ///
+    /// These slots are not roots. The scavenger rewrites a slot only when the
+    /// table was already forwarded through an ordinary strong root; otherwise
+    /// it nulls the entry so the registry can prune it.
+    pub fn handle_slots(&mut self) -> Vec<*mut RawGc> {
+        self.tables
+            .iter_mut()
+            .map(|raw| raw as *mut RawGc)
+            .collect()
+    }
+
+    /// Drop entries nulled by a young-generation collection.
+    pub fn retain_non_null(&mut self) {
+        self.tables.retain(|raw| !raw.is_null());
+    }
+
     /// Number of registered tables.
     #[must_use]
     pub fn len(&self) -> usize {

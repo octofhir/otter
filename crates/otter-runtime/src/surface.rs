@@ -269,7 +269,7 @@ impl<'rt> RuntimeObjectBuilder<'rt> {
         interp: &'rt mut otter_vm::Interpreter,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
-            inner: otter_vm::ObjectBuilder::new(interp.gc_heap_mut())?,
+            inner: otter_vm::ObjectBuilder::new_runtime_rooted(interp)?,
         })
     }
 
@@ -296,7 +296,7 @@ impl<'rt> RuntimeObjectBuilder<'rt> {
         ctx: &'a mut RuntimeNativeCtx<'_>,
         data: T,
     ) -> Result<RuntimeObjectBuilder<'a>, otter_gc::OutOfMemory> {
-        let object = otter_vm::object::alloc_host_object(ctx.interp_mut().gc_heap_mut(), data)?;
+        let object = ctx.alloc_host_object(data)?;
         Ok(Self::from_object(ctx, object))
     }
 
@@ -307,7 +307,7 @@ impl<'rt> RuntimeObjectBuilder<'rt> {
         object: RuntimeJsObject,
     ) -> RuntimeObjectBuilder<'a> {
         RuntimeObjectBuilder {
-            inner: otter_vm::ObjectBuilder::from_object(ctx.interp_mut().gc_heap_mut(), object),
+            inner: otter_vm::ObjectBuilder::from_object_in_ctx(ctx, object),
         }
     }
 
@@ -387,7 +387,7 @@ impl<'rt> RuntimeObjectBuilder<'rt> {
 pub fn runtime_alloc_object(
     ctx: &mut RuntimeNativeCtx<'_>,
 ) -> Result<RuntimeJsObject, otter_gc::OutOfMemory> {
-    otter_vm::object::alloc_object(ctx.interp_mut().gc_heap_mut())
+    ctx.alloc_object()
 }
 
 /// Read typed host data from a receiver object.
@@ -430,5 +430,5 @@ pub fn runtime_array_from_elements(
     ctx: &mut RuntimeNativeCtx<'_>,
     values: Vec<RuntimeValue>,
 ) -> Result<otter_vm::JsArray, otter_gc::OutOfMemory> {
-    otter_vm::array::from_elements(ctx.interp_mut().gc_heap_mut(), values)
+    ctx.array_from_elements(values)
 }

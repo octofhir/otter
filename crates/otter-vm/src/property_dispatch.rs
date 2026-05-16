@@ -326,7 +326,7 @@ impl Interpreter {
             Value::Symbol(s) => symbol_prototype::load_property(s, name),
             Value::Iterator(_) => match name {
                 "next" | "return" | "throw" => {
-                    self.synthesize_iterator_method(name, receiver.clone())?
+                    self.synthesize_iterator_method(stack, name, receiver.clone())?
                 }
                 _ => Value::Undefined,
             },
@@ -733,7 +733,11 @@ impl Interpreter {
                         )?;
                     }
                     _ => {
-                        let bag = self.function_user_bag(*function_id)?;
+                        let bag = self.function_user_bag_stack_rooted(
+                            stack,
+                            *function_id,
+                            &[&recv, &idx_value, &value],
+                        )?;
                         crate::object::set(bag, &mut self.gc_heap, &key, value);
                         if let Some(metadata_key) =
                             function_metadata::ordinary_function_metadata_key(&key)
@@ -1830,7 +1834,7 @@ impl Interpreter {
                         format!("Cannot assign to read-only property '{key}' of function"),
                     );
                 }
-                self.function_user_bag(*function_id)?
+                self.function_user_bag_stack_rooted(stack, *function_id, &[&receiver, &value])?
             }
             _ => return Ok(false),
         };
@@ -1974,12 +1978,14 @@ impl Interpreter {
                     // success, ensure target descriptor admits the
                     // value.
                     let target_value = proxy.target();
-                    let target_desc = self.ordinary_get_own_property_descriptor_value(
-                        context,
-                        target_value.clone(),
-                        &key_vm,
-                        0,
-                    )?;
+                    let target_desc = self
+                        .ordinary_get_own_property_descriptor_value_stack_rooted(
+                            context,
+                            stack,
+                            target_value.clone(),
+                            &key_vm,
+                            0,
+                        )?;
                     if let Some(desc) = target_desc.as_ref()
                         && !desc.configurable()
                     {

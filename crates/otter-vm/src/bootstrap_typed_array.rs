@@ -40,10 +40,12 @@ use smallvec::SmallVec;
 
 use crate::binary::typed_array::TypedArrayKind;
 use crate::binary::{dispatch, typed_array_prototype};
-use crate::bootstrap::BootstrapEntry;
+use crate::bootstrap::{
+    BootstrapEntry, alloc_object_with_value_roots, native_constructor_static_with_value_roots,
+};
 use crate::intrinsics::IntrinsicArgs;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::native_function::{NativeCall, NativeFunction};
+use crate::native_function::NativeCall;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -98,6 +100,7 @@ pub(crate) fn install_typed_array_entry(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
+    let global_root = Value::Object(global);
     // Look up this entry's kind + ctor fn from the static table.
     let (_, kind, ctor_call) = TYPED_ARRAY_CTORS
         .iter()
@@ -108,9 +111,11 @@ pub(crate) fn install_typed_array_entry(
     // Ensure %TypedArray%.prototype exists on the realm (allocated
     // lazily the first time we install a concrete TypedArray).
     let abstract_proto = ensure_abstract_typed_array_prototype(heap, global)?;
+    let abstract_proto_root = Value::Object(abstract_proto);
 
     // Per-kind prototype linked to the abstract.
-    let prototype = object::alloc_object(heap)?;
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &abstract_proto_root])?;
+    let prototype_root = Value::Object(prototype);
     object::set_prototype(prototype, heap, Some(abstract_proto));
 
     // BYTES_PER_ELEMENT (read-only) on the per-kind prototype.
@@ -127,8 +132,15 @@ pub(crate) fn install_typed_array_entry(
         ),
     );
 
-    let ctor = NativeFunction::new_constructor_static(heap, entry.name, 3, ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor = native_constructor_static_with_value_roots(
+        heap,
+        entry.name,
+        3,
+        ctor_call,
+        &[&global_root, &abstract_proto_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_root = Value::NativeFunction(ctor);
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
@@ -147,10 +159,10 @@ pub(crate) fn install_typed_array_entry(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(ctor_root.clone(), true, false, true),
     );
 
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(global, heap, entry.name, ctor_root);
     Ok(())
 }
 
@@ -223,7 +235,8 @@ fn ensure_abstract_typed_array_prototype(
     if let Some(Value::Object(obj)) = object::get(global, heap, ABSTRACT_PROTO_SLOT) {
         return Ok(obj);
     }
-    let proto = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
     // Chain to %Object.prototype% per §23.2.3.
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -231,7 +244,8 @@ fn ensure_abstract_typed_array_prototype(
         object::set_prototype(proto, heap, Some(object_proto));
     }
     {
-        let mut builder = ObjectBuilder::from_object(heap, proto);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, proto, vec![global_root.clone()]);
         for (name, length, call) in TYPED_ARRAY_METHODS {
             builder.method(
                 name,

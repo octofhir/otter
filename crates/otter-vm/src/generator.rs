@@ -27,7 +27,7 @@
 //! - <https://tc39.es/ecma262/#await>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
-use crate::Frame;
+use crate::{Frame, Value};
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`GeneratorBody`].
@@ -267,6 +267,19 @@ pub fn alloc_parked_frame(
 ) -> Result<ParkedFrame, otter_gc::OutOfMemory> {
     heap.alloc_old(ParkedFrameBody {
         frame: Some(Box::new(frame)),
+    })
+}
+
+pub(crate) fn parked_frame_register_is_object(
+    parked: ParkedFrame,
+    heap: &otter_gc::GcHeap,
+    register: usize,
+) -> bool {
+    heap.read_payload(parked, |body| {
+        body.frame
+            .as_ref()
+            .and_then(|frame| frame.registers.get(register))
+            .is_some_and(|value| matches!(value, Value::Object(_)))
     })
 }
 

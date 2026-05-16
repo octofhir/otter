@@ -86,7 +86,7 @@ pub mod trace;
 
 pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
 pub use compressed::{CageStats, Gc, cage_base, cage_size, cage_stats, init_cage_with_size};
-pub use external::ExternalMemory;
+pub use external::{ExternalMemory, SharedExternalMemory};
 pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
 pub use heap::{EmptyRoots, GcHeap, HeapStats, Roots};

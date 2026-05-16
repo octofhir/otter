@@ -69,22 +69,6 @@ impl JsProxy {
         self.inner.target.clone()
     }
 
-    /// Target object — convenience for trap dispatchers that want
-    /// the JsObject form (panics-free: returns a synthetic empty
-    /// object when the target is a non-object callable, mirroring
-    /// the spec's `[[ProxyTarget]]` slot which always holds an
-    /// Object).
-    #[must_use]
-    pub fn target_object(&self, gc_heap: &mut otter_gc::GcHeap) -> JsObject {
-        match &self.inner.target {
-            Value::Object(o) => *o,
-            // Fallback empty sentinel when target is a callable
-            // non-object — never JS-visible because the dispatcher
-            // routes those through their own [[Call]] paths first.
-            _ => crate::object::alloc_object(gc_heap).unwrap_or_else(|_| otter_gc::Gc::null()),
-        }
-    }
-
     /// Handler object.
     #[must_use]
     pub fn handler(&self) -> JsObject {

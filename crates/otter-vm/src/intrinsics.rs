@@ -39,7 +39,7 @@
 
 use crate::array::{self, JsArray};
 use crate::binary::JsArrayBuffer;
-use crate::collections::{self, JsMap, JsSet};
+use crate::collections::{self, CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet};
 use crate::object::{self, JsObject};
 use crate::string::StringHeap;
 use crate::{IteratorHandle, IteratorState, Value};
@@ -228,6 +228,39 @@ impl IntrinsicArgs<'_> {
             visit_intrinsic_allocation_roots(visitor, allocation_roots, receiver, args, &[], &[]);
         };
         collections::set_add_with_roots(set, self.gc_heap, value, &mut external_visit)
+    }
+
+    /// Insert into a `WeakMap` while exposing intrinsic roots and pending
+    /// key/value across storage reservation.
+    pub fn weak_map_set_rooted(
+        &mut self,
+        map: &mut JsWeakMap,
+        key: Value,
+        value: Value,
+    ) -> Result<(), CollectionError> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(visitor, allocation_roots, receiver, args, &[], &[]);
+        };
+        collections::weak_map_set_with_roots(map, self.gc_heap, key, value, &mut external_visit)
+    }
+
+    /// Insert into a `WeakSet` while exposing intrinsic roots and pending
+    /// value across storage reservation.
+    pub fn weak_set_add_rooted(
+        &mut self,
+        set: &mut JsWeakSet,
+        value: Value,
+    ) -> Result<(), CollectionError> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(visitor, allocation_roots, receiver, args, &[], &[]);
+        };
+        collections::weak_set_add_with_roots(set, self.gc_heap, value, &mut external_visit)
     }
 
     /// Allocate an array while exposing the intrinsic receiver, call

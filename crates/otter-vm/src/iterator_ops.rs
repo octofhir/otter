@@ -414,6 +414,7 @@ impl Interpreter {
     /// invocation (`const f = it.next; f();`) both work.
     pub(crate) fn synthesize_iterator_method(
         &mut self,
+        stack: &SmallVec<[Frame; 8]>,
         name: &str,
         receiver: Value,
     ) -> Result<Value, VmError> {
@@ -424,10 +425,12 @@ impl Interpreter {
             _ => return Ok(Value::Undefined),
         };
         let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![receiver];
-        let value = crate::native_value_with_captures(
-            &mut self.gc_heap,
+        let value = self.native_value_with_captures_stack_rooted(
+            stack,
             method_name,
             captures,
+            &[],
+            &[],
             move |ctx, args, captures| {
                 let receiver = captures.first().cloned().unwrap_or(Value::Undefined);
                 let Value::Iterator(iter_rc) = receiver.clone() else {

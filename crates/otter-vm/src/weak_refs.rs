@@ -110,24 +110,13 @@ pub struct FinalizationJob {
     pub held_value: Value,
 }
 
-/// Allocate a fresh `WeakRef`.
+/// Allocate a fresh `WeakRef` while exposing caller-owned roots.
 ///
 /// # Errors
 ///
 /// Returns [`crate::VmError::TypeMismatch`] when `target` cannot be
 /// held weakly by the currently migrated GC value model, or
 /// [`crate::VmError::OutOfMemory`] if the heap allocation fails.
-pub fn alloc_weak_ref(
-    heap: &mut otter_gc::GcHeap,
-    target: &Value,
-) -> Result<JsWeakRef, crate::VmError> {
-    let target = weak_target_raw(target)?;
-    let weak_ref = heap.alloc_old(WeakRefBody { target })?;
-    heap.register_weak_ref(weak_ref);
-    Ok(weak_ref)
-}
-
-/// Allocate a fresh `WeakRef` while exposing caller-owned roots.
 pub(crate) fn alloc_weak_ref_with_roots(
     heap: &mut otter_gc::GcHeap,
     target: &Value,
@@ -152,6 +141,16 @@ pub(crate) fn alloc_weak_ref_with_roots(
     Ok(weak_ref)
 }
 
+pub(crate) fn alloc_weak_ref_for_mark_sweep_fixture(
+    heap: &mut otter_gc::GcHeap,
+    target: &Value,
+) -> Result<JsWeakRef, crate::VmError> {
+    let target = weak_target_raw(target)?;
+    let weak_ref = heap.alloc_old(WeakRefBody { target })?;
+    heap.register_weak_ref(weak_ref);
+    Ok(weak_ref)
+}
+
 /// Return the target while live, otherwise `undefined`.
 #[must_use]
 pub fn weak_ref_deref(weak_ref: JsWeakRef, heap: &otter_gc::GcHeap) -> Value {
@@ -162,34 +161,10 @@ pub fn weak_ref_deref(weak_ref: JsWeakRef, heap: &otter_gc::GcHeap) -> Value {
     raw_to_value(heap, target).unwrap_or(Value::Undefined)
 }
 
-/// Allocate a fresh `FinalizationRegistry`.
-pub fn alloc_finalization_registry(
-    heap: &mut otter_gc::GcHeap,
-    cleanup_callback: Value,
-) -> Result<JsFinalizationRegistry, crate::VmError> {
-    alloc_finalization_registry_with_context(heap, cleanup_callback, None)
-}
-
-/// Allocate a fresh `FinalizationRegistry` with an owning VM
-/// execution context for later cleanup jobs.
-pub fn alloc_finalization_registry_with_context(
-    heap: &mut otter_gc::GcHeap,
-    cleanup_callback: Value,
-    cleanup_context: Option<ExecutionContext>,
-) -> Result<JsFinalizationRegistry, crate::VmError> {
-    if !is_callable(&cleanup_callback) {
-        return Err(crate::VmError::NotCallable);
-    }
-    let registry = heap.alloc_old(FinalizationRegistryBody {
-        cleanup_callback,
-        cleanup_context,
-        cells: Vec::new(),
-    })?;
-    heap.register_finalization_registry(registry);
-    Ok(registry)
-}
-
 /// Allocate a fresh `FinalizationRegistry` while exposing caller-owned roots.
+///
+/// `cleanup_callback` is traced explicitly across allocation because it is not
+/// reachable from the heap until the registry body has been installed.
 pub(crate) fn alloc_finalization_registry_with_context_and_roots(
     heap: &mut otter_gc::GcHeap,
     cleanup_callback: Value,
@@ -199,8 +174,10 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
     if !is_callable(&cleanup_callback) {
         return Err(crate::VmError::NotCallable);
     }
+    let cleanup_callback_root = cleanup_callback.clone();
     let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
+        cleanup_callback_root.trace_value_slots(visitor);
     };
     let registry = heap.alloc_with_roots(
         FinalizationRegistryBody {
@@ -211,6 +188,25 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
         &mut allocation_roots,
     )?;
     heap.register_finalization_registry(registry);
+    Ok(registry)
+}
+
+pub(crate) fn alloc_finalization_registry_for_mark_sweep_fixture(
+    heap: &mut otter_gc::GcHeap,
+    cleanup_callback: Value,
+    cleanup_context: Option<ExecutionContext>,
+) -> Result<JsFinalizationRegistry, crate::VmError> {
+    if !is_callable(&cleanup_callback) {
+        return Err(crate::VmError::NotCallable);
+    }
+    let barrier_cleanup_callback = cleanup_callback.clone();
+    let registry = heap.alloc_old(FinalizationRegistryBody {
+        cleanup_callback,
+        cleanup_context,
+        cells: Vec::new(),
+    })?;
+    heap.register_finalization_registry(registry);
+    heap.record_write(registry, &barrier_cleanup_callback);
     Ok(registry)
 }
 

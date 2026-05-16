@@ -34,14 +34,16 @@ pub(crate) fn install_bigint(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         builder.method(
             "toString",
             0,
@@ -58,15 +60,30 @@ pub(crate) fn install_bigint(
     // BigInt is callable-only — use `new_static`, not
     // `new_constructor_static`, so `new BigInt(x)` triggers the
     // §10.1.10 [[Construct]]-missing path (TypeError).
-    let ctor = NativeFunction::new_static(heap, "BigInt", 1, bigint_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "BigInt",
+        1,
+        bigint_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
-    define_static(heap, ctor, "asIntN", 2, bigint_static_as_int_n)?;
-    define_static(heap, ctor, "asUintN", 2, bigint_static_as_uint_n)?;
+    let ctor_roots = vec![global_root.clone(), Value::Object(prototype)];
+    define_static(heap, ctor, "asIntN", 2, bigint_static_as_int_n, &ctor_roots)?;
+    define_static(
+        heap,
+        ctor,
+        "asUintN",
+        2,
+        bigint_static_as_uint_n,
+        &ctor_roots,
+    )?;
     object::define_own_property(
         prototype,
         heap,
@@ -203,9 +220,20 @@ fn define_static(
     name: &'static str,
     length: u8,
     call: crate::native_function::NativeFastFn,
+    value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
-    let func = NativeFunction::new_static(heap, name, length, call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_root = Value::NativeFunction(ctor);
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&ctor_root);
+    roots.extend(value_roots.iter());
+    let func = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        name,
+        length,
+        call,
+        roots.as_slice(),
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let attrs = Attr::builtin_function();
     let desc = PropertyDescriptor::data(

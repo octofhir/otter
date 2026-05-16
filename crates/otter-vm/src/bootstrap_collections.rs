@@ -37,7 +37,6 @@ use smallvec::SmallVec;
 use crate::bootstrap::BootstrapEntry;
 use crate::collections::{self, CollectionError};
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::native_function::NativeFunction;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
 
@@ -215,14 +214,15 @@ fn install_collection(
 ) -> Result<(), JsSurfaceError> {
     // §24.*.2 Properties of the *Map* / *Set* / *WeakMap* / *WeakSet*
     // Prototype Object — ordinary object linked to %Object.prototype%.
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
 
-    install_prototype_methods(heap, prototype, kind)?;
+    install_prototype_methods(heap, prototype, kind, vec![global_root.clone()])?;
 
     // §24.1.1 / §24.2.1 / §24.3.1 / §24.4.1 — constructor proper.
     let ctor_name = kind.name();
@@ -232,8 +232,15 @@ fn install_collection(
         CollectionKind::WeakMap => weak_map_ctor_call,
         CollectionKind::WeakSet => weak_set_ctor_call,
     };
-    let ctor = NativeFunction::new_constructor_static(heap, ctor_name, 0, ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
+        heap,
+        ctor_name,
+        0,
+        ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
 
     // §24.1.2.1 / §24.2.2.1 — `prototype` own data property:
@@ -259,10 +266,12 @@ fn install_prototype_methods(
     heap: &mut otter_gc::GcHeap,
     prototype: JsObject,
     kind: CollectionKind,
+    value_roots: Vec<Value>,
 ) -> Result<(), JsSurfaceError> {
     use crate::native_function::NativeCall;
 
-    let mut builder = ObjectBuilder::from_object(heap, prototype);
+    let extra_roots = value_roots.clone();
+    let mut builder = ObjectBuilder::from_object_with_value_roots(heap, prototype, value_roots);
     match kind {
         CollectionKind::Map => {
             builder.method(
@@ -426,8 +435,18 @@ fn install_prototype_methods(
                 CollectionKind::Set => set_size_get,
                 _ => unreachable!(),
             };
-            let getter = NativeFunction::new_static(heap, "get size", 0, getter_call)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+            let prototype_root = Value::Object(prototype);
+            let mut roots = Vec::with_capacity(extra_roots.len() + 1);
+            roots.push(&prototype_root);
+            roots.extend(extra_roots.iter());
+            let getter = crate::bootstrap::native_static_with_value_roots(
+                heap,
+                "get size",
+                0,
+                getter_call,
+                roots.as_slice(),
+            )
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
             let desc = PropertyDescriptor::accessor(
                 Some(Value::NativeFunction(getter)),
                 None,
@@ -940,10 +959,10 @@ fn weak_map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 }
 
 fn weak_map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let m = receiver_weak_map(ctx, "WeakMap.prototype.set")?;
+    let mut m = receiver_weak_map(ctx, "WeakMap.prototype.set")?;
     let key = args.first().cloned().unwrap_or(Value::Undefined);
     let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-    collections::weak_map_set(m, ctx.heap_mut(), key, value)
+    ctx.weak_map_set(&mut m, key, value)
         .map_err(|e| collection_to_native(e, "WeakMap.prototype.set"))?;
     Ok(Value::WeakMap(m))
 }
@@ -971,9 +990,9 @@ fn weak_map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 // ---------------------------------------------------------------
 
 fn weak_set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let s = receiver_weak_set(ctx, "WeakSet.prototype.add")?;
+    let mut s = receiver_weak_set(ctx, "WeakSet.prototype.add")?;
     let v = args.first().cloned().unwrap_or(Value::Undefined);
-    collections::weak_set_add(s, ctx.heap_mut(), v)
+    ctx.weak_set_add(&mut s, v)
         .map_err(|e| collection_to_native(e, "WeakSet.prototype.add"))?;
     Ok(Value::WeakSet(s))
 }
@@ -1134,6 +1153,7 @@ fn collection_to_native(err: CollectionError, name: &'static str) -> NativeError
             name,
             reason: "key must be an object".to_string(),
         },
+        CollectionError::OutOfMemory { .. } => oom(name),
     }
 }
 

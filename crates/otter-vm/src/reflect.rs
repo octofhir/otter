@@ -123,7 +123,14 @@ pub fn call(
         M::GetOwnPropertyDescriptor => {
             let target = expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
-            match interp.ordinary_get_own_property_descriptor_value(context, target, &key, 0)? {
+            match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                context,
+                target.clone(),
+                &key,
+                0,
+                &[&target],
+                &[args],
+            )? {
                 None => Ok(Value::Undefined),
                 Some(desc) => {
                     let flags = desc.flags;

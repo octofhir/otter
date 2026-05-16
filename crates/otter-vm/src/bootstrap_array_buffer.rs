@@ -17,10 +17,13 @@ use otter_bytecode::method_id::{ArrayBufferMethod, SharedArrayBufferMethod};
 use smallvec::SmallVec;
 
 use crate::binary::{array_buffer_prototype, dispatch};
-use crate::bootstrap::BootstrapEntry;
+use crate::bootstrap::{
+    BootstrapEntry, alloc_object_with_value_roots, native_constructor_static_with_value_roots,
+    native_static_with_value_roots,
+};
 use crate::intrinsics::IntrinsicArgs;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::native_function::{NativeCall, NativeFunction};
+use crate::native_function::NativeCall;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -38,14 +41,17 @@ pub(crate) fn install_array_buffer(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let prototype_root = Value::Object(prototype);
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         for (name, length, call) in AB_METHODS {
             builder.method(
                 name,
@@ -55,21 +61,58 @@ pub(crate) fn install_array_buffer(
             )?;
         }
     }
-    install_accessor(heap, prototype, "byteLength", ab_byte_length)?;
-    install_accessor(heap, prototype, "maxByteLength", ab_max_byte_length)?;
-    install_accessor(heap, prototype, "resizable", ab_resizable)?;
-    install_accessor(heap, prototype, "detached", ab_detached)?;
+    install_accessor(
+        heap,
+        prototype,
+        "byteLength",
+        ab_byte_length,
+        &[&global_root, &prototype_root],
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "maxByteLength",
+        ab_max_byte_length,
+        &[&global_root, &prototype_root],
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "resizable",
+        ab_resizable,
+        &[&global_root, &prototype_root],
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "detached",
+        ab_detached,
+        &[&global_root, &prototype_root],
+    )?;
 
-    let ctor = NativeFunction::new_constructor_static(heap, "ArrayBuffer", 1, ab_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor = native_constructor_static_with_value_roots(
+        heap,
+        "ArrayBuffer",
+        1,
+        ab_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_root = Value::NativeFunction(ctor);
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     // §25.1.3.1 ArrayBuffer.isView(arg).
-    let is_view_fn = NativeFunction::new_static(heap, "isView", 1, ab_is_view)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let is_view_fn = native_static_with_value_roots(
+        heap,
+        "isView",
+        1,
+        ab_is_view,
+        &[&global_root, &prototype_root, &ctor_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let attrs = Attr::builtin_function();
     let _ = ctor.define_own_property(
         heap,
@@ -86,9 +129,9 @@ pub(crate) fn install_array_buffer(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(ctor_root.clone(), true, false, true),
     );
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(global, heap, entry.name, ctor_root);
     Ok(())
 }
 
@@ -100,14 +143,17 @@ pub(crate) fn install_shared_array_buffer(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
+    let prototype_root = Value::Object(prototype);
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         // `slice` + `grow` are the spec methods on SAB. `transfer`
         // / `transferToFixedLength` belong to ArrayBuffer only.
         builder.method(
@@ -123,12 +169,37 @@ pub(crate) fn install_shared_array_buffer(
             Attr::builtin_function(),
         )?;
     }
-    install_accessor(heap, prototype, "byteLength", ab_byte_length)?;
-    install_accessor(heap, prototype, "maxByteLength", ab_max_byte_length)?;
-    install_accessor(heap, prototype, "growable", sab_growable)?;
+    install_accessor(
+        heap,
+        prototype,
+        "byteLength",
+        ab_byte_length,
+        &[&global_root, &prototype_root],
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "maxByteLength",
+        ab_max_byte_length,
+        &[&global_root, &prototype_root],
+    )?;
+    install_accessor(
+        heap,
+        prototype,
+        "growable",
+        sab_growable,
+        &[&global_root, &prototype_root],
+    )?;
 
-    let ctor = NativeFunction::new_constructor_static(heap, "SharedArrayBuffer", 1, sab_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor = native_constructor_static_with_value_roots(
+        heap,
+        "SharedArrayBuffer",
+        1,
+        sab_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_root = Value::NativeFunction(ctor);
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
@@ -138,9 +209,9 @@ pub(crate) fn install_shared_array_buffer(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(ctor_root.clone(), true, false, true),
     );
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(global, heap, entry.name, ctor_root);
     Ok(())
 }
 
@@ -151,8 +222,26 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    dispatch::shared_array_buffer_call(SharedArrayBufferMethod::Construct, args, ctx.heap())
-        .map_err(|e| vm_to_native(e, "SharedArrayBuffer"))
+    let roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let new_target = ctx.new_target().cloned();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        crate::runtime_cx::visit_native_roots(
+            visitor,
+            &roots,
+            &this_value,
+            new_target.as_ref(),
+            &[],
+            &[args],
+        );
+    };
+    dispatch::shared_array_buffer_call_with_roots(
+        SharedArrayBufferMethod::Construct,
+        args,
+        ctx.heap_mut(),
+        &mut external_visit,
+    )
+    .map_err(|e| vm_to_native(e, "SharedArrayBuffer"))
 }
 
 fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -345,9 +434,14 @@ fn install_accessor(
     prototype: JsObject,
     name: &'static str,
     call: crate::native_function::NativeFastFn,
+    value_roots: &[&Value],
 ) -> Result<(), JsSurfaceError> {
-    let getter =
-        NativeFunction::new_static(heap, name, 0, call).map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&prototype_root);
+    roots.extend_from_slice(value_roots);
+    let getter = native_static_with_value_roots(heap, name, 0, call, roots.as_slice())
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));

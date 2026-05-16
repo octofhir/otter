@@ -193,7 +193,11 @@ pub(crate) fn install_timer_globals(
     global_this: JsObject,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<(), JsSurfaceError> {
-    let mut builder = ObjectBuilder::from_object(heap, global_this);
+    let mut builder = ObjectBuilder::from_object_with_value_roots(
+        heap,
+        global_this,
+        vec![Value::Object(global_this)],
+    );
     for (name, length, call) in TIMER_NATIVES {
         builder.method(
             name,

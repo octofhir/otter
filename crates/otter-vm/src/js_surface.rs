@@ -11,9 +11,8 @@
 //! - [`PropertySpec`], [`MethodSpec`], [`AccessorSpec`],
 //!   [`ConstructorSpec`], [`ClassSpec`], and [`NamespaceSpec`] —
 //!   static surface records.
-//! - [`ObjectBuilder`], [`FunctionBuilder`],
-//!   [`ConstructorBuilder`], [`ClassBuilder`], and
-//!   [`NamespaceBuilder`] — mutator-bound installers.
+//! - [`ObjectBuilder`], [`ConstructorBuilder`], [`ClassBuilder`],
+//!   and [`NamespaceBuilder`] — mutator-bound installers.
 //!
 //! # Invariants
 //! - Spec records contain only static metadata and native call
@@ -200,29 +199,144 @@ pub struct NamespaceSpec {
     pub attrs: Attr,
 }
 
+fn visit_value_roots(
+    visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) {
+    for value in value_roots {
+        value.trace_value_slots(visitor);
+    }
+    for slice in slice_roots {
+        for value in *slice {
+            value.trace_value_slots(visitor);
+        }
+    }
+}
+
+fn visit_raw_and_value_roots(
+    visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    raw_roots: &[*mut otter_gc::raw::RawGc],
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) {
+    for &slot in raw_roots {
+        visitor(slot);
+    }
+    visit_value_roots(visitor, value_roots, slice_roots);
+}
+
+fn alloc_object_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        visit_value_roots(visitor, value_roots, slice_roots);
+    };
+    object::alloc_object_with_roots(heap, &mut external_visit)
+}
+
+fn alloc_object_with_raw_roots(
+    heap: &mut otter_gc::GcHeap,
+    raw_roots: &[*mut otter_gc::raw::RawGc],
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        visit_raw_and_value_roots(visitor, raw_roots, value_roots, slice_roots);
+    };
+    object::alloc_object_with_roots(heap, &mut external_visit)
+}
+
+fn native_from_call_with_raw_roots(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: NativeCall,
+    raw_roots: &[*mut otter_gc::raw::RawGc],
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<NativeFunction, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        visit_raw_and_value_roots(visitor, raw_roots, value_roots, slice_roots);
+    };
+    NativeFunction::from_call_with_roots(heap, name, length, call, &mut external_visit)
+}
+
 /// Mutator-bound builder for an ordinary object.
 pub struct ObjectBuilder<'rt> {
     heap: &'rt mut otter_gc::GcHeap,
     object: JsObject,
+    raw_roots: Vec<*mut otter_gc::raw::RawGc>,
+    value_roots: Vec<Value>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
 impl<'rt> ObjectBuilder<'rt> {
     /// Allocate a fresh object and bind the builder to `heap`.
     pub fn new(heap: &'rt mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
-        let object = object::alloc_object(heap)?;
+        let object = alloc_object_with_roots(heap, &[], &[])?;
         Ok(Self {
             heap,
             object,
+            raw_roots: Vec::new(),
+            value_roots: Vec::new(),
             _not_send_sync: PhantomData,
         })
+    }
+
+    /// Allocate a fresh host/runtime-owned object through interpreter runtime
+    /// roots and bind a builder to it.
+    pub fn new_runtime_rooted(
+        interp: &'rt mut crate::Interpreter,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let raw_roots = interp.collect_runtime_roots();
+        let object = interp.alloc_host_object_with_roots(&[], &[])?;
+        Ok(ObjectBuilder::<'rt>::from_object_with_raw_and_value_roots(
+            interp.gc_heap_mut(),
+            object,
+            raw_roots,
+            Vec::new(),
+        ))
     }
 
     /// Allocate a fresh object through a native context.
     pub fn new_in_ctx<'a>(
         ctx: &'a mut NativeCtx<'_>,
     ) -> Result<ObjectBuilder<'a>, otter_gc::OutOfMemory> {
-        ObjectBuilder::<'a>::new(ctx.heap_mut())
+        let raw_roots = ctx.collect_native_roots();
+        let mut value_roots = vec![ctx.this_value().clone()];
+        if let Some(new_target) = ctx.new_target() {
+            value_roots.push(new_target.clone());
+        }
+        let object = ctx.alloc_object()?;
+        Ok(ObjectBuilder::<'a>::from_object_with_raw_and_value_roots(
+            ctx.heap_mut(),
+            object,
+            raw_roots,
+            value_roots,
+        ))
+    }
+
+    /// Bind a builder to an existing object through a native context,
+    /// preserving the native root set for later method/accessor allocation.
+    #[must_use]
+    pub fn from_object_in_ctx<'a>(
+        ctx: &'a mut NativeCtx<'_>,
+        object: JsObject,
+    ) -> ObjectBuilder<'a> {
+        let raw_roots = ctx.collect_native_roots();
+        let mut value_roots = vec![ctx.this_value().clone()];
+        if let Some(new_target) = ctx.new_target() {
+            value_roots.push(new_target.clone());
+        }
+        ObjectBuilder::<'a>::from_object_with_raw_and_value_roots(
+            ctx.heap_mut(),
+            object,
+            raw_roots,
+            value_roots,
+        )
     }
 
     /// Bind a builder to an existing object.
@@ -231,6 +345,43 @@ impl<'rt> ObjectBuilder<'rt> {
         Self {
             heap,
             object,
+            raw_roots: Vec::new(),
+            value_roots: Vec::new(),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Bind a builder to an existing object while carrying additional
+    /// bootstrap/runtime roots across method allocation.
+    #[must_use]
+    pub fn from_object_with_value_roots(
+        heap: &'rt mut otter_gc::GcHeap,
+        object: JsObject,
+        value_roots: Vec<Value>,
+    ) -> Self {
+        Self {
+            heap,
+            object,
+            raw_roots: Vec::new(),
+            value_roots,
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Bind a builder to an existing object while carrying raw runtime root
+    /// slots and owned value roots across method/accessor allocation.
+    #[must_use]
+    pub fn from_object_with_raw_and_value_roots(
+        heap: &'rt mut otter_gc::GcHeap,
+        object: JsObject,
+        raw_roots: Vec<*mut otter_gc::raw::RawGc>,
+        value_roots: Vec<Value>,
+    ) -> Self {
+        Self {
+            heap,
+            object,
+            raw_roots,
+            value_roots,
             _not_send_sync: PhantomData,
         }
     }
@@ -259,7 +410,19 @@ impl<'rt> ObjectBuilder<'rt> {
         call: NativeCall,
         attrs: Attr,
     ) -> Result<&mut Self, JsSurfaceError> {
-        let native = NativeFunction::from_call(self.heap, name, length, call)?;
+        let object_root = Value::Object(self.object);
+        let mut roots = Vec::with_capacity(self.value_roots.len() + 1);
+        roots.push(&object_root);
+        roots.extend(self.value_roots.iter());
+        let native = native_from_call_with_raw_roots(
+            self.heap,
+            name,
+            length,
+            call,
+            self.raw_roots.as_slice(),
+            roots.as_slice(),
+            &[],
+        )?;
         define_data(
             self.object,
             self.heap,
@@ -277,21 +440,36 @@ impl<'rt> ObjectBuilder<'rt> {
 
     /// Define an accessor property.
     pub fn accessor_from_spec(&mut self, spec: &AccessorSpec) -> Result<&mut Self, JsSurfaceError> {
+        let object_root = Value::Object(self.object);
+        let mut roots = Vec::with_capacity(self.value_roots.len() + 1);
+        roots.push(&object_root);
+        roots.extend(self.value_roots.iter());
         let getter = match &spec.get {
-            Some(call) => Some(Value::NativeFunction(NativeFunction::from_call(
+            Some(call) => Some(Value::NativeFunction(native_from_call_with_raw_roots(
                 self.heap,
                 spec.name,
                 0,
                 call.clone(),
+                self.raw_roots.as_slice(),
+                roots.as_slice(),
+                &[],
             )?)),
             None => None,
         };
+        let getter_root = getter.clone().unwrap_or(Value::Undefined);
+        let mut setter_roots = Vec::with_capacity(self.value_roots.len() + 2);
+        setter_roots.push(&object_root);
+        setter_roots.push(&getter_root);
+        setter_roots.extend(self.value_roots.iter());
         let setter = match &spec.set {
-            Some(call) => Some(Value::NativeFunction(NativeFunction::from_call(
+            Some(call) => Some(Value::NativeFunction(native_from_call_with_raw_roots(
                 self.heap,
                 spec.name,
                 1,
                 call.clone(),
+                self.raw_roots.as_slice(),
+                setter_roots.as_slice(),
+                &[],
             )?)),
             None => None,
         };
@@ -315,48 +493,12 @@ impl<'rt> ObjectBuilder<'rt> {
     }
 }
 
-/// Mutator-bound builder for a native function value.
-pub struct FunctionBuilder<'rt> {
-    heap: &'rt mut otter_gc::GcHeap,
-    name: &'static str,
-    length: u8,
-    call: NativeCall,
-    _not_send_sync: PhantomData<Rc<()>>,
-}
-
-impl<'rt> FunctionBuilder<'rt> {
-    /// Start a function builder.
-    #[must_use]
-    pub fn new(
-        heap: &'rt mut otter_gc::GcHeap,
-        name: &'static str,
-        length: u8,
-        call: NativeCall,
-    ) -> Self {
-        Self {
-            heap,
-            name,
-            length,
-            call,
-            _not_send_sync: PhantomData,
-        }
-    }
-
-    /// Build the function value.
-    pub fn build(self) -> Result<Value, otter_gc::OutOfMemory> {
-        Ok(Value::NativeFunction(NativeFunction::from_call(
-            self.heap,
-            self.name,
-            self.length,
-            self.call,
-        )?))
-    }
-}
-
 /// Mutator-bound builder for constructor-shaped objects.
 pub struct ConstructorBuilder<'rt> {
     heap: &'rt mut otter_gc::GcHeap,
     spec: &'static ConstructorSpec,
+    raw_roots: Vec<*mut otter_gc::raw::RawGc>,
+    value_roots: Vec<Value>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -367,25 +509,69 @@ impl<'rt> ConstructorBuilder<'rt> {
         Self {
             heap,
             spec,
+            raw_roots: Vec::new(),
+            value_roots: Vec::new(),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Start from a static constructor spec while carrying roots through
+    /// object/native-function allocation.
+    #[must_use]
+    pub fn from_spec_with_raw_and_value_roots(
+        heap: &'rt mut otter_gc::GcHeap,
+        spec: &'static ConstructorSpec,
+        raw_roots: Vec<*mut otter_gc::raw::RawGc>,
+        value_roots: Vec<Value>,
+    ) -> Self {
+        Self {
+            heap,
+            spec,
+            raw_roots,
+            value_roots,
             _not_send_sync: PhantomData,
         }
     }
 
     /// Build a constructor object with `.prototype` and method bags.
     pub fn build(self) -> Result<JsObject, JsSurfaceError> {
-        let ctor = object::alloc_object(self.heap)?;
-        let proto = object::alloc_object(self.heap)?;
-        let function = NativeFunction::from_call(
+        let root_refs: Vec<&Value> = self.value_roots.iter().collect();
+        let ctor = alloc_object_with_raw_roots(
+            self.heap,
+            self.raw_roots.as_slice(),
+            root_refs.as_slice(),
+            &[],
+        )?;
+        let ctor_root = Value::Object(ctor);
+        let mut proto_roots = Vec::with_capacity(root_refs.len() + 1);
+        proto_roots.push(&ctor_root);
+        proto_roots.extend(root_refs.iter().copied());
+        let proto = alloc_object_with_raw_roots(
+            self.heap,
+            self.raw_roots.as_slice(),
+            proto_roots.as_slice(),
+            &[],
+        )?;
+        let proto_root = Value::Object(proto);
+        let mut function_roots = Vec::with_capacity(root_refs.len() + 2);
+        function_roots.push(&ctor_root);
+        function_roots.push(&proto_root);
+        function_roots.extend(root_refs.iter().copied());
+        let function = native_from_call_with_raw_roots(
             self.heap,
             self.spec.name,
             self.spec.length,
             self.spec.call.clone(),
+            self.raw_roots.as_slice(),
+            function_roots.as_slice(),
+            &[],
         )?;
+        let function_root = Value::NativeFunction(function);
         define_data(
             ctor,
             self.heap,
             "call",
-            Value::NativeFunction(function),
+            function_root.clone(),
             Attr::builtin_function(),
         )?;
         define_data(
@@ -395,11 +581,28 @@ impl<'rt> ConstructorBuilder<'rt> {
             Value::Object(proto),
             Attr::data(),
         )?;
+        let mut builder_roots = Vec::with_capacity(self.value_roots.len() + 3);
+        builder_roots.push(ctor_root);
+        builder_roots.push(proto_root);
+        builder_roots.push(function_root);
+        builder_roots.extend(self.value_roots);
         for method in self.spec.static_methods {
-            ObjectBuilder::from_object(self.heap, ctor).method_from_spec(method)?;
+            ObjectBuilder::from_object_with_raw_and_value_roots(
+                self.heap,
+                ctor,
+                self.raw_roots.clone(),
+                builder_roots.clone(),
+            )
+            .method_from_spec(method)?;
         }
         for method in self.spec.prototype_methods {
-            ObjectBuilder::from_object(self.heap, proto).method_from_spec(method)?;
+            ObjectBuilder::from_object_with_raw_and_value_roots(
+                self.heap,
+                proto,
+                self.raw_roots.clone(),
+                builder_roots.clone(),
+            )
+            .method_from_spec(method)?;
         }
         Ok(ctor)
     }
@@ -409,6 +612,8 @@ impl<'rt> ConstructorBuilder<'rt> {
 pub struct ClassBuilder<'rt> {
     heap: &'rt mut otter_gc::GcHeap,
     spec: &'static ClassSpec,
+    raw_roots: Vec<*mut otter_gc::raw::RawGc>,
+    value_roots: Vec<Value>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -419,30 +624,88 @@ impl<'rt> ClassBuilder<'rt> {
         Self {
             heap,
             spec,
+            raw_roots: Vec::new(),
+            value_roots: Vec::new(),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Start from a static class spec while carrying roots through
+    /// constructor/prototype/static method allocation.
+    #[must_use]
+    pub fn from_spec_with_raw_and_value_roots(
+        heap: &'rt mut otter_gc::GcHeap,
+        spec: &'static ClassSpec,
+        raw_roots: Vec<*mut otter_gc::raw::RawGc>,
+        value_roots: Vec<Value>,
+    ) -> Self {
+        Self {
+            heap,
+            spec,
+            raw_roots,
+            value_roots,
             _not_send_sync: PhantomData,
         }
     }
 
     /// Build the class constructor value.
     pub fn build(self) -> Result<Value, JsSurfaceError> {
-        let prototype = object::alloc_object(self.heap)?;
-        let statics = object::alloc_object(self.heap)?;
-        let constructor = Value::NativeFunction(NativeFunction::from_call(
+        let root_refs: Vec<&Value> = self.value_roots.iter().collect();
+        let prototype = alloc_object_with_raw_roots(
+            self.heap,
+            self.raw_roots.as_slice(),
+            root_refs.as_slice(),
+            &[],
+        )?;
+        let prototype_root = Value::Object(prototype);
+        let mut statics_roots = Vec::with_capacity(root_refs.len() + 1);
+        statics_roots.push(&prototype_root);
+        statics_roots.extend(root_refs.iter().copied());
+        let statics = alloc_object_with_raw_roots(
+            self.heap,
+            self.raw_roots.as_slice(),
+            statics_roots.as_slice(),
+            &[],
+        )?;
+        let statics_root = Value::Object(statics);
+        let mut constructor_roots = Vec::with_capacity(root_refs.len() + 2);
+        constructor_roots.push(&prototype_root);
+        constructor_roots.push(&statics_root);
+        constructor_roots.extend(root_refs.iter().copied());
+        let constructor = Value::NativeFunction(native_from_call_with_raw_roots(
             self.heap,
             self.spec.constructor.name,
             self.spec.constructor.length,
             self.spec.constructor.call.clone(),
+            self.raw_roots.as_slice(),
+            constructor_roots.as_slice(),
+            &[],
         )?);
+        let mut builder_roots = Vec::with_capacity(self.value_roots.len() + 3);
+        builder_roots.push(prototype_root.clone());
+        builder_roots.push(statics_root.clone());
+        builder_roots.push(constructor.clone());
+        builder_roots.extend(self.value_roots);
 
         {
-            let mut static_builder = ObjectBuilder::from_object(self.heap, statics);
+            let mut static_builder = ObjectBuilder::from_object_with_raw_and_value_roots(
+                self.heap,
+                statics,
+                self.raw_roots.clone(),
+                builder_roots.clone(),
+            );
             for method in self.spec.constructor.static_methods {
                 static_builder.method_from_spec(method)?;
             }
         }
 
         {
-            let mut prototype_builder = ObjectBuilder::from_object(self.heap, prototype);
+            let mut prototype_builder = ObjectBuilder::from_object_with_raw_and_value_roots(
+                self.heap,
+                prototype,
+                self.raw_roots.clone(),
+                builder_roots.clone(),
+            );
             for method in self.spec.constructor.prototype_methods {
                 prototype_builder.method_from_spec(method)?;
             }
@@ -451,11 +714,21 @@ impl<'rt> ClassBuilder<'rt> {
             }
         }
 
-        let class = Value::ClassConstructor(ClassConstructor::new(
+        let class_roots: Vec<&Value> = builder_roots.iter().collect();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            visit_raw_and_value_roots(
+                visitor,
+                self.raw_roots.as_slice(),
+                class_roots.as_slice(),
+                &[],
+            );
+        };
+        let class = Value::ClassConstructor(ClassConstructor::new_with_roots(
             self.heap,
             constructor,
             prototype,
             statics,
+            &mut external_visit,
         )?);
         define_data(
             prototype,
@@ -473,6 +746,8 @@ pub struct NamespaceBuilder<'rt> {
     heap: &'rt mut otter_gc::GcHeap,
     spec: &'static NamespaceSpec,
     object: JsObject,
+    raw_roots: Vec<*mut otter_gc::raw::RawGc>,
+    value_roots: Vec<Value>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -482,11 +757,32 @@ impl<'rt> NamespaceBuilder<'rt> {
         heap: &'rt mut otter_gc::GcHeap,
         spec: &'static NamespaceSpec,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let object = object::alloc_object(heap)?;
+        let object = alloc_object_with_roots(heap, &[], &[])?;
         Ok(Self {
             heap,
             spec,
             object,
+            raw_roots: Vec::new(),
+            value_roots: Vec::new(),
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    /// Allocate a namespace object from a static spec while carrying
+    /// bootstrap/runtime roots across method/accessor allocation.
+    pub fn from_spec_with_value_roots(
+        heap: &'rt mut otter_gc::GcHeap,
+        spec: &'static NamespaceSpec,
+        value_roots: Vec<Value>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let root_refs: Vec<&Value> = value_roots.iter().collect();
+        let object = alloc_object_with_roots(heap, root_refs.as_slice(), &[])?;
+        Ok(Self {
+            heap,
+            spec,
+            object,
+            raw_roots: Vec::new(),
+            value_roots,
             _not_send_sync: PhantomData,
         })
     }
@@ -496,13 +792,31 @@ impl<'rt> NamespaceBuilder<'rt> {
         ctx: &'a mut NativeCtx<'_>,
         spec: &'static NamespaceSpec,
     ) -> Result<NamespaceBuilder<'a>, otter_gc::OutOfMemory> {
-        NamespaceBuilder::<'a>::from_spec(ctx.heap_mut(), spec)
+        let raw_roots = ctx.collect_native_roots();
+        let mut value_roots = vec![ctx.this_value().clone()];
+        if let Some(new_target) = ctx.new_target() {
+            value_roots.push(new_target.clone());
+        }
+        let object = ctx.alloc_object()?;
+        Ok(NamespaceBuilder {
+            heap: ctx.heap_mut(),
+            spec,
+            object,
+            raw_roots,
+            value_roots,
+            _not_send_sync: PhantomData,
+        })
     }
 
     /// Install all constants, methods, and accessors on the object.
     pub fn build(self) -> Result<JsObject, JsSurfaceError> {
         {
-            let mut object = ObjectBuilder::from_object(self.heap, self.object);
+            let mut object = ObjectBuilder::from_object_with_raw_and_value_roots(
+                self.heap,
+                self.object,
+                self.raw_roots,
+                self.value_roots,
+            );
             for property in self.spec.constants {
                 object.property_from_spec(property)?;
             }

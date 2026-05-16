@@ -50,12 +50,23 @@ pub(crate) fn install_symbol_has_instance(
     heap: &mut otter_gc::GcHeap,
     prototype: JsObject,
     well_known_has_instance: symbol::JsSymbol,
+    value_roots: &[&Value],
 ) -> Result<(), JsSurfaceError> {
-    let value = NativeFunction::from_call(
+    let prototype_root = Value::Object(prototype);
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&prototype_root);
+    roots.extend_from_slice(value_roots);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in &roots {
+            value.trace_value_slots(visitor);
+        }
+    };
+    let value = NativeFunction::from_call_with_roots(
         heap,
         "[Symbol.hasInstance]",
         1,
         NativeCall::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance),
+        &mut external_visit,
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let descriptor = PropertyDescriptor::data(Value::NativeFunction(value), false, false, false);
@@ -85,10 +96,21 @@ const fn intrinsic_method(
 pub(crate) fn install_restricted_accessors(
     heap: &mut otter_gc::GcHeap,
     prototype: JsObject,
+    value_roots: &[&Value],
 ) -> Result<(), JsSurfaceError> {
-    let thrower = Value::NativeFunction(NativeFunction::throw_type_error(
+    let prototype_root = Value::Object(prototype);
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&prototype_root);
+    roots.extend_from_slice(value_roots);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in &roots {
+            value.trace_value_slots(visitor);
+        }
+    };
+    let thrower = Value::NativeFunction(NativeFunction::throw_type_error_with_roots(
         heap,
         throw_restricted_function_property,
+        &mut external_visit,
     )?);
     for name in ["caller", "arguments"] {
         let descriptor =

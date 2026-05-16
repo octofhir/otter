@@ -84,10 +84,9 @@ pub enum MapKey {
     String(JsString),
     /// Symbols compare by `Rc::ptr_eq` identity.
     Symbol(JsSymbol),
-    /// Heap object identity.
-    ObjectPtr(*const ()),
     /// The original [`Value`] for the object key — kept so iteration
-    /// can hand back the live key reference.
+    /// can hand back the live key reference and the moving collector can
+    /// rewrite the key slot in place.
     ObjectValue(Value),
 }
 
@@ -97,9 +96,9 @@ impl MapKey {
     /// # Algorithm
     /// 1. Primitives map to a structural variant (number normalises
     ///    `-0.0 → 0.0`).
-    /// 2. Migrated object-shaped values map to [`MapKey::ObjectPtr`]
-    ///    keyed on their heap identity; non-migrated object-shaped
-    ///    values fall back to [`MapKey::ObjectValue`].
+    /// 2. Object-shaped values map to [`MapKey::ObjectValue`] so the key is a
+    ///    traced slot. This keeps identity stable across young-generation
+    ///    relocation.
     pub fn from_value(value: &Value) -> Self {
         match value {
             Value::Undefined => MapKey::Undefined,
@@ -115,18 +114,17 @@ impl MapKey {
             Value::BigInt(b) => MapKey::BigInt(b.clone()),
             Value::String(s) => MapKey::String(s.clone()),
             Value::Symbol(s) => MapKey::Symbol(s.clone()),
-            Value::Object(o) => MapKey::ObjectPtr(o.as_header_ptr() as *const ()),
-            Value::Array(a) => MapKey::ObjectPtr(crate::array::identity_addr(*a)),
-            Value::RegExp(r) => MapKey::ObjectPtr(r.identity_addr()),
-            Value::Promise(p) => MapKey::ObjectPtr(p.identity_addr()),
-            Value::Iterator(i) => MapKey::ObjectPtr(i.as_header_ptr() as *const ()),
-            Value::Generator(g) => MapKey::ObjectPtr(g.identity_addr()),
-            Value::BoundFunction(b) => MapKey::ObjectPtr(b.identity_addr()),
-            Value::NativeFunction(n) => MapKey::ObjectPtr(n.identity_addr()),
-            // Functions, closures, class constructors, and other
-            // non-GC reference wrappers — all compare via the
-            // originating `Value`'s `PartialEq`, which is identity
-            // on every callable shape.
+            Value::Object(_)
+            | Value::Array(_)
+            | Value::RegExp(_)
+            | Value::Promise(_)
+            | Value::Iterator(_)
+            | Value::Generator(_)
+            | Value::BoundFunction(_)
+            | Value::NativeFunction(_) => MapKey::ObjectValue(value.clone()),
+            // Functions, closures, class constructors, and other reference
+            // wrappers compare via the originating `Value`'s `PartialEq`,
+            // which is identity on every callable shape.
             _ => MapKey::ObjectValue(value.clone()),
         }
     }
@@ -150,7 +148,6 @@ impl PartialEq for MapKey {
             (MapKey::BigInt(a), MapKey::BigInt(b)) => a == b,
             (MapKey::String(a), MapKey::String(b)) => a.equals(b),
             (MapKey::Symbol(a), MapKey::Symbol(b)) => a.ptr_eq(b),
-            (MapKey::ObjectPtr(a), MapKey::ObjectPtr(b)) => a == b,
             (MapKey::ObjectValue(a), MapKey::ObjectValue(b)) => a == b,
             _ => false,
         }
@@ -177,11 +174,10 @@ impl std::hash::Hash for MapKey {
             MapKey::BigInt(b) => b.to_decimal_string().hash(state),
             MapKey::String(s) => s.to_lossy_string().hash(state),
             MapKey::Symbol(s) => s.identity_addr().hash(state),
-            MapKey::ObjectPtr(p) => p.hash(state),
             MapKey::ObjectValue(_) => {
                 // Identity-based fallback: hash by discriminant alone
-                // and rely on `eq` to disambiguate. Collisions are
-                // rare (only callable values land here).
+                // and rely on `eq` to disambiguate. This intentionally avoids
+                // hashing moving heap addresses.
             }
         }
     }
@@ -200,6 +196,23 @@ pub enum CollectionError {
     /// `WeakMap` / `WeakSet` rejects primitive keys.
     #[error("WeakMap / WeakSet keys must be objects")]
     NonObjectKey,
+    /// Allocation or accounting failed while growing collection storage.
+    #[error("out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}")]
+    OutOfMemory {
+        /// Bytes requested.
+        requested_bytes: u64,
+        /// Heap cap (`0` = unlimited).
+        heap_limit_bytes: u64,
+    },
+}
+
+impl From<otter_gc::OutOfMemory> for CollectionError {
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
+        }
+    }
 }
 
 /// JS `Map` — ordered associative store.
@@ -270,7 +283,7 @@ pub fn map_has(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> bool {
 /// `Map.prototype.set` — Spec §24.1.3.9. Updates in place
 /// without changing insertion order; new keys append.
 pub fn map_set(
-    map: JsMap,
+    mut map: JsMap,
     heap: &mut otter_gc::GcHeap,
     key: Value,
     value: Value,
@@ -280,8 +293,14 @@ pub fn map_set(
     let k = MapKey::from_value(&key);
     let exists = heap.read_payload(map, |body| body.entries.contains_key(&k));
     if !exists {
-        reserve_map_for_target_len(map, heap, map_len(map, heap).saturating_add(1))?;
+        let target_len = map_len(map, heap).saturating_add(1);
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            key.trace_value_slots(visitor);
+            value.trace_value_slots(visitor);
+        };
+        reserve_map_for_target_len_with_roots(&mut map, heap, target_len, &mut reserve_roots)?;
     }
+    let k = MapKey::from_value(&key);
     heap.with_payload(map, |body| {
         if let Some(slot) = body.entries.get_mut(&k) {
             slot.1 = value;
@@ -439,7 +458,7 @@ pub fn set_has(set: JsSet, heap: &otter_gc::GcHeap, value: &Value) -> bool {
 
 /// `Set.prototype.add` — Spec §24.2.3.1.
 pub fn set_add(
-    set: JsSet,
+    mut set: JsSet,
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
@@ -447,8 +466,13 @@ pub fn set_add(
     let k = MapKey::from_value(&value);
     let exists = heap.read_payload(set, |body| body.entries.contains_key(&k));
     if !exists {
-        reserve_set_for_target_len(set, heap, set_len(set, heap).saturating_add(1))?;
+        let target_len = set_len(set, heap).saturating_add(1);
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            value.trace_value_slots(visitor);
+        };
+        reserve_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
     }
+    let k = MapKey::from_value(&value);
     heap.with_payload(set, |body| {
         if !body.entries.contains_key(&k) {
             body.entries.insert(k, value);
@@ -571,17 +595,70 @@ pub fn weak_map_has(
     Ok(heap.read_payload(map, |body| body.entries.contains_key(&key)))
 }
 
+/// Number of weak-map entries currently stored.
+#[must_use]
+pub fn weak_map_len(map: JsWeakMap, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(map, |body| body.entries.len())
+}
+
 /// `WeakMap.prototype.set` — Spec §24.3.3.5.
 pub fn weak_map_set(
-    map: JsWeakMap,
+    mut map: JsWeakMap,
     heap: &mut otter_gc::GcHeap,
     key: Value,
     value: Value,
 ) -> Result<(), CollectionError> {
+    let barrier_value = value.clone();
+    let key_root = key.clone();
+    let value_root = value.clone();
+    let key_raw = object_gc_key(&key)?;
+    let exists = heap.read_payload(map, |body| body.entries.contains_key(&key_raw));
+    if !exists {
+        let target_len = weak_map_len(map, heap).saturating_add(1);
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            key_root.trace_value_slots(visitor);
+            value_root.trace_value_slots(visitor);
+        };
+        reserve_weak_map_for_target_len_with_roots(&mut map, heap, target_len, &mut reserve_roots)?;
+    }
     let key = object_gc_key(&key)?;
     heap.with_payload(map, |body| {
         body.entries.insert(key, value);
     });
+    heap.record_write(map, &barrier_value);
+    Ok(())
+}
+
+/// `WeakMap.prototype.set` for stack/native-visible VM construction paths.
+pub(crate) fn weak_map_set_with_roots(
+    map: &mut JsWeakMap,
+    heap: &mut otter_gc::GcHeap,
+    key: Value,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), CollectionError> {
+    let barrier_value = value.clone();
+    let key_root = key.clone();
+    let value_root = value.clone();
+    let key = object_gc_key(&key)?;
+    let exists = heap.read_payload(*map, |body| body.entries.contains_key(&key));
+    if !exists {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            key_root.trace_value_slots(visitor);
+            value_root.trace_value_slots(visitor);
+        };
+        reserve_weak_map_for_target_len_with_roots(
+            map,
+            heap,
+            weak_map_len(*map, heap).saturating_add(1),
+            &mut reserve_roots,
+        )?;
+    }
+    heap.with_payload(*map, |body| {
+        body.entries.insert(key, value);
+    });
+    heap.record_write(*map, &barrier_value);
     Ok(())
 }
 
@@ -639,14 +716,58 @@ pub fn weak_set_has(
     Ok(heap.read_payload(set, |body| body.entries.contains_key(&key)))
 }
 
+/// Number of weak-set entries currently stored.
+#[must_use]
+pub fn weak_set_len(set: JsWeakSet, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(set, |body| body.entries.len())
+}
+
 /// `WeakSet.prototype.add` — Spec §24.4.3.1.
 pub fn weak_set_add(
-    set: JsWeakSet,
+    mut set: JsWeakSet,
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<(), CollectionError> {
+    let value_root = value.clone();
+    let key_raw = object_gc_key(&value)?;
+    let exists = heap.read_payload(set, |body| body.entries.contains_key(&key_raw));
+    if !exists {
+        let target_len = weak_set_len(set, heap).saturating_add(1);
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            value_root.trace_value_slots(visitor);
+        };
+        reserve_weak_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
+    }
     let key = object_gc_key(&value)?;
     heap.with_payload(set, |body| {
+        body.entries.insert(key, ());
+    });
+    Ok(())
+}
+
+/// `WeakSet.prototype.add` for stack/native-visible VM construction paths.
+pub(crate) fn weak_set_add_with_roots(
+    set: &mut JsWeakSet,
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), CollectionError> {
+    let value_root = value.clone();
+    let key = object_gc_key(&value)?;
+    let exists = heap.read_payload(*set, |body| body.entries.contains_key(&key));
+    if !exists {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            value_root.trace_value_slots(visitor);
+        };
+        reserve_weak_set_for_target_len_with_roots(
+            set,
+            heap,
+            weak_set_len(*set, heap).saturating_add(1),
+            &mut reserve_roots,
+        )?;
+    }
+    heap.with_payload(*set, |body| {
         body.entries.insert(key, ());
     });
     Ok(())
@@ -741,27 +862,6 @@ fn trace_map_key(key: &MapKey, visitor: &mut SlotVisitor<'_>) {
     }
 }
 
-fn reserve_map_for_target_len(
-    map: JsMap,
-    heap: &mut otter_gc::GcHeap,
-    target_len: usize,
-) -> Result<(), otter_gc::OutOfMemory> {
-    let capacity = heap.read_payload(map, |body| body.entries.capacity());
-    if target_len <= capacity {
-        return Ok(());
-    }
-    let before = map_capacity_bytes(capacity);
-    let after = map_capacity_bytes(target_len);
-    if after > before {
-        heap.reserve_bytes((after - before) as u64)?;
-    }
-    heap.with_payload(map, |body| {
-        body.entries
-            .reserve(target_len.saturating_sub(body.entries.len()));
-    });
-    Ok(())
-}
-
 fn reserve_map_for_target_len_with_roots(
     map: &mut JsMap,
     heap: &mut otter_gc::GcHeap,
@@ -782,27 +882,6 @@ fn reserve_map_for_target_len_with_roots(
         heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
     }
     heap.with_payload(*map, |body| {
-        body.entries
-            .reserve(target_len.saturating_sub(body.entries.len()));
-    });
-    Ok(())
-}
-
-fn reserve_set_for_target_len(
-    set: JsSet,
-    heap: &mut otter_gc::GcHeap,
-    target_len: usize,
-) -> Result<(), otter_gc::OutOfMemory> {
-    let capacity = heap.read_payload(set, |body| body.entries.capacity());
-    if target_len <= capacity {
-        return Ok(());
-    }
-    let before = set_capacity_bytes(capacity);
-    let after = set_capacity_bytes(target_len);
-    if after > before {
-        heap.reserve_bytes((after - before) as u64)?;
-    }
-    heap.with_payload(set, |body| {
         body.entries
             .reserve(target_len.saturating_sub(body.entries.len()));
     });
@@ -835,12 +914,72 @@ fn reserve_set_for_target_len_with_roots(
     Ok(())
 }
 
+fn reserve_weak_map_for_target_len_with_roots(
+    map: &mut JsWeakMap,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let capacity = heap.read_payload(*map, |body| body.entries.capacity());
+    if target_len <= capacity {
+        return Ok(());
+    }
+    let before = weak_map_capacity_bytes(capacity);
+    let after = weak_map_capacity_bytes(target_len);
+    if after > before {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            visitor(std::ptr::addr_of_mut!(*map) as *mut RawGc);
+        };
+        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
+    }
+    heap.with_payload(*map, |body| {
+        body.entries
+            .reserve(target_len.saturating_sub(body.entries.len()));
+    });
+    Ok(())
+}
+
+fn reserve_weak_set_for_target_len_with_roots(
+    set: &mut JsWeakSet,
+    heap: &mut otter_gc::GcHeap,
+    target_len: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let capacity = heap.read_payload(*set, |body| body.entries.capacity());
+    if target_len <= capacity {
+        return Ok(());
+    }
+    let before = weak_set_capacity_bytes(capacity);
+    let after = weak_set_capacity_bytes(target_len);
+    if after > before {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            visitor(std::ptr::addr_of_mut!(*set) as *mut RawGc);
+        };
+        heap.reserve_bytes_with_roots((after - before) as u64, &mut reserve_roots)?;
+    }
+    heap.with_payload(*set, |body| {
+        body.entries
+            .reserve(target_len.saturating_sub(body.entries.len()));
+    });
+    Ok(())
+}
+
 fn map_capacity_bytes(capacity: usize) -> usize {
     capacity.saturating_mul(std::mem::size_of::<(MapKey, (Value, Value))>())
 }
 
 fn set_capacity_bytes(capacity: usize) -> usize {
     capacity.saturating_mul(std::mem::size_of::<(MapKey, Value)>())
+}
+
+fn weak_map_capacity_bytes(capacity: usize) -> usize {
+    capacity.saturating_mul(std::mem::size_of::<(RawGc, Value)>())
+}
+
+fn weak_set_capacity_bytes(capacity: usize) -> usize {
+    capacity.saturating_mul(std::mem::size_of::<(RawGc, ())>())
 }
 
 #[cfg(test)]
@@ -851,6 +990,11 @@ mod tests {
 
     fn n(i: i32) -> Value {
         Value::Number(NumberValue::from_i32(i))
+    }
+
+    fn young_object_value(heap: &mut otter_gc::GcHeap) -> Value {
+        let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        Value::Object(crate::object::alloc_object_with_roots(heap, &mut no_roots).unwrap())
     }
 
     #[test]
@@ -905,6 +1049,49 @@ mod tests {
         set_add(s, &mut heap, n(1)).unwrap();
         set_add(s, &mut heap, n(2)).unwrap();
         assert_eq!(set_len(s, &heap), 2);
+    }
+
+    #[test]
+    fn map_object_key_survives_minor_relocation() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut m = alloc_map(&mut heap).unwrap();
+        let key = young_object_value(&mut heap);
+        let before = key.as_gc_raw().unwrap();
+
+        map_set(m, &mut heap, key.clone(), n(42)).unwrap();
+
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(std::ptr::addr_of_mut!(m) as *mut RawGc);
+            key.trace_value_slots(visitor);
+        };
+        heap.collect_minor_with_roots(&mut roots);
+
+        let after = key.as_gc_raw().unwrap();
+        assert_ne!(after, before);
+        assert!(map_has(m, &heap, &key));
+        assert_eq!(map_get(m, &heap, &key), Some(n(42)));
+        assert_eq!(map_keys(m, &heap), vec![key]);
+    }
+
+    #[test]
+    fn set_object_key_survives_minor_relocation() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut s = alloc_set(&mut heap).unwrap();
+        let key = young_object_value(&mut heap);
+        let before = key.as_gc_raw().unwrap();
+
+        set_add(s, &mut heap, key.clone()).unwrap();
+
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(std::ptr::addr_of_mut!(s) as *mut RawGc);
+            key.trace_value_slots(visitor);
+        };
+        heap.collect_minor_with_roots(&mut roots);
+
+        let after = key.as_gc_raw().unwrap();
+        assert_ne!(after, before);
+        assert!(set_has(s, &heap, &key));
+        assert_eq!(set_values(s, &heap), vec![key]);
     }
 
     #[test]

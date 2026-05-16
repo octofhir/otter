@@ -27,7 +27,7 @@
 
 use crate::bootstrap::BootstrapEntry;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::native_function::{NativeCall, NativeFunction};
+use crate::native_function::NativeCall;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::weak_refs::{self, JsFinalizationRegistry, JsWeakRef};
 use crate::{NativeCtx, NativeError, Value};
@@ -38,10 +38,12 @@ pub(crate) fn install_weak_ref(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     link_object_prototype(heap, prototype, global);
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         builder.method(
             "deref",
             0,
@@ -49,8 +51,15 @@ pub(crate) fn install_weak_ref(
             Attr::builtin_function(),
         )?;
     }
-    let ctor = NativeFunction::new_constructor_static(heap, "WeakRef", 1, weak_ref_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
+        heap,
+        "WeakRef",
+        1,
+        weak_ref_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
@@ -72,10 +81,12 @@ pub(crate) fn install_finalization_registry(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     link_object_prototype(heap, prototype, global);
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         builder.method(
             "register",
             2,
@@ -89,9 +100,15 @@ pub(crate) fn install_finalization_registry(
             Attr::builtin_function(),
         )?;
     }
-    let ctor =
-        NativeFunction::new_constructor_static(heap, "FinalizationRegistry", 1, fr_ctor_call)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
+        heap,
+        "FinalizationRegistry",
+        1,
+        fr_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {

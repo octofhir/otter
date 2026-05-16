@@ -9,8 +9,8 @@
 //! adds a VM-internal ParameterMap over selected indexed properties.
 //!
 //! # Contents
-//! - [`create_unmapped`] — allocate and populate an arguments object.
-//! - [`create_mapped`] — allocate a sloppy mapped arguments object.
+//! - [`initialize_unmapped`] — populate an unmapped arguments object.
+//! - [`initialize_mapped`] — populate a sloppy mapped arguments object.
 //!
 //! # Invariants
 //! - The object is represented with the ordinary descriptor-capable
@@ -30,13 +30,13 @@ use crate::Value;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, MappedArgumentEntry, PropertyDescriptor};
 
-/// Allocate an unmapped `arguments` object from a captured argv list.
-pub(crate) fn create_unmapped(
+/// Populate an unmapped `arguments` object from a captured argv list.
+pub(crate) fn initialize_unmapped(
+    obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     args: SmallVec<[Value; 4]>,
     throw_type_error: Value,
-) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let obj = object::alloc_object(heap)?;
+) {
     for (index, value) in args.iter().cloned().enumerate() {
         let key = index.to_string();
         let descriptor = PropertyDescriptor::data(value, true, true, true);
@@ -61,18 +61,17 @@ pub(crate) fn create_unmapped(
             false,
         ),
     );
-    Ok(obj)
 }
 
-/// Allocate a sloppy mapped `arguments` object from a captured argv
+/// Populate a sloppy mapped `arguments` object from a captured argv
 /// list plus VM-internal parameter cells.
-pub(crate) fn create_mapped(
+pub(crate) fn initialize_mapped(
+    obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     args: SmallVec<[Value; 4]>,
     callee: Value,
     mapped_entries: Vec<MappedArgumentEntry>,
-) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let obj = object::alloc_object(heap)?;
+) {
     for (index, value) in args.iter().cloned().enumerate() {
         let key = index.to_string();
         let descriptor = PropertyDescriptor::data(value, true, true, true);
@@ -93,5 +92,4 @@ pub(crate) fn create_mapped(
         PropertyDescriptor::data(callee, true, false, true),
     );
     object::install_mapped_arguments(obj, heap, mapped_entries);
-    Ok(obj)
 }

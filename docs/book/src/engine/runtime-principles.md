@@ -125,7 +125,9 @@ This includes:
 External memory should be able to trigger GC or budget rejection before
 the host process becomes memory pressured. Large/off-heap data needs
 separate counters because GC heap usage alone is not enough to describe
-resident memory.
+resident memory. Shared backing stores that can be dropped away from the
+mutator thread must report releases through heap-owned shared accounting state
+instead of mutating isolate-local heap counters directly.
 
 ## Host Operations
 

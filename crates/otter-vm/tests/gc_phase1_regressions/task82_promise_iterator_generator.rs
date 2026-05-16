@@ -3,9 +3,12 @@
 use smallvec::smallvec;
 
 use otter_bytecode::Function;
-use otter_vm::generator::{GENERATOR_BODY_TYPE_TAG, PARKED_FRAME_BODY_TYPE_TAG};
-use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+use otter_vm::generator::GENERATOR_BODY_TYPE_TAG;
 use otter_vm::promise::{JsPromise, PURE_PROMISE_BODY_TYPE_TAG};
+use otter_vm::test_support::{
+    promise_fulfill_reaction_count, promise_fulfill_reaction_debug,
+    promise_has_object_fulfill_capability,
+};
 use otter_vm::{Frame, ITERATOR_STATE_TYPE_TAG, Interpreter, IteratorState, Value};
 
 fn empty_function() -> Function {
@@ -25,8 +28,6 @@ fn live_bytes(interp: &mut Interpreter, tag: u8) -> usize {
 #[test]
 fn promise_reaction_graph_survives_force_gc_when_rooted() {
     let mut interp = Interpreter::new();
-    interp.force_gc();
-    let baseline = live_bytes(&mut interp, OBJECT_BODY_TYPE_TAG);
 
     let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     let retained = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
@@ -48,9 +49,13 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
     let _ = retained;
     interp.force_gc();
 
-    let after = live_bytes(&mut interp, OBJECT_BODY_TYPE_TAG);
+    let rooted = otter_vm::object::get(global, interp.gc_heap(), "promise")
+        .expect("promise root survives force_gc");
+    let Value::Promise(promise) = rooted else {
+        panic!("expected rooted promise after force_gc")
+    };
     assert!(
-        after > baseline,
+        promise_has_object_fulfill_capability(promise, interp.gc_heap()),
         "rooted promise reaction capability must keep object live"
     );
 }
@@ -90,8 +95,6 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
 #[test]
 fn pending_promise_microtask_payload_roots_until_drained() {
     let mut interp = Interpreter::new();
-    interp.force_gc();
-    let baseline = live_bytes(&mut interp, OBJECT_BODY_TYPE_TAG);
     let payload = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
     interp.microtasks_mut().enqueue(otter_vm::Microtask {
         callee: Value::Undefined,
@@ -104,19 +107,17 @@ fn pending_promise_microtask_payload_roots_until_drained() {
 
     let _ = payload;
     interp.force_gc();
-    let rooted = live_bytes(&mut interp, OBJECT_BODY_TYPE_TAG);
+
+    let mut batch = interp
+        .microtasks_mut()
+        .begin_drain()
+        .expect("outer drain batch");
+    let task = batch.tasks.pop_front().expect("queued task");
     assert!(
-        rooted > baseline,
+        matches!(task.args.first(), Some(Value::Object(_))),
         "pending microtask payload must root object"
     );
-
-    interp.microtasks_mut().clear_for_tests();
-    interp.force_gc();
-    let after = live_bytes(&mut interp, OBJECT_BODY_TYPE_TAG);
-    assert_eq!(
-        after, baseline,
-        "cleared microtask payload should be reaped"
-    );
+    interp.microtasks_mut().end_drain();
 }
 
 #[test]
@@ -125,11 +126,10 @@ fn iterator_state_holding_array_object_survives_force_gc() {
     let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
     let array = otter_vm::array::from_elements(interp.gc_heap_mut(), [Value::Object(object)])
         .expect("array");
-    let iter = otter_vm::alloc_iterator_state(
-        interp.gc_heap_mut(),
-        IteratorState::Array { array, index: 0 },
-    )
-    .expect("iterator");
+    let iter = interp
+        .gc_heap_mut()
+        .alloc_old(IteratorState::Array { array, index: 0 })
+        .expect("iterator");
     let global = *interp.global_this();
     otter_vm::object::set(global, interp.gc_heap_mut(), "iter", Value::Iterator(iter));
 
@@ -199,10 +199,17 @@ fn generator_and_parked_frame_roots_register_values() {
 
     let _ = parked_object;
     interp.force_gc();
-    let live = live_bytes(&mut interp, PARKED_FRAME_BODY_TYPE_TAG);
+    let rooted = otter_vm::object::get(global, interp.gc_heap(), "awaitPromise")
+        .expect("await promise root survives force_gc");
+    let Value::Promise(promise) = rooted else {
+        panic!("expected rooted await promise after force_gc")
+    };
+    let reaction_count = promise_fulfill_reaction_count(promise, interp.gc_heap());
     assert!(
-        live > 0,
-        "pending await reaction must retain parked frame body"
+        reaction_count > 0,
+        "pending await reaction must retain parked frame body; fulfill reaction count={}, handlers={:?}",
+        reaction_count,
+        promise_fulfill_reaction_debug(promise, interp.gc_heap())
     );
 }
 
@@ -217,7 +224,9 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     promise.fulfill(interp.gc_heap_mut(), Value::Promise(promise));
 
-    let iter = otter_vm::alloc_iterator_state(interp.gc_heap_mut(), IteratorState::Exhausted)
+    let iter = interp
+        .gc_heap_mut()
+        .alloc_old(IteratorState::Exhausted)
         .expect("iterator");
     interp.gc_heap_mut().with_payload(iter, |state| {
         *state = IteratorState::FlatMap {

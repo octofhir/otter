@@ -124,7 +124,7 @@ impl Interpreter {
                         entry.trace_value_slots(visitor);
                     }
                 };
-                let m = crate::collections::alloc_weak_map_with_roots(
+                let mut m = crate::collections::alloc_weak_map_with_roots(
                     &mut self.gc_heap,
                     &mut external_visit,
                 )?;
@@ -138,8 +138,14 @@ impl Interpreter {
                     }
                     let key = crate::array::get(pair, &self.gc_heap, 0);
                     let value = crate::array::get(pair, &self.gc_heap, 1);
-                    crate::collections::weak_map_set(m, &mut self.gc_heap, key, value)
-                        .map_err(|_| VmError::TypeMismatch)?;
+                    crate::collections::weak_map_set_with_roots(
+                        &mut m,
+                        &mut self.gc_heap,
+                        key,
+                        value,
+                        &mut external_visit,
+                    )
+                    .map_err(weak_collection_to_vm_error)?;
                 }
                 Ok(Value::WeakMap(m))
             }
@@ -153,13 +159,18 @@ impl Interpreter {
                         entry.trace_value_slots(visitor);
                     }
                 };
-                let s = crate::collections::alloc_weak_set_with_roots(
+                let mut s = crate::collections::alloc_weak_set_with_roots(
                     &mut self.gc_heap,
                     &mut external_visit,
                 )?;
-                for v in seed_entries {
-                    crate::collections::weak_set_add(s, &mut self.gc_heap, v)
-                        .map_err(|_| VmError::TypeMismatch)?;
+                for v in &seed_entries {
+                    crate::collections::weak_set_add_with_roots(
+                        &mut s,
+                        &mut self.gc_heap,
+                        v.clone(),
+                        &mut external_visit,
+                    )
+                    .map_err(weak_collection_to_vm_error)?;
                 }
                 Ok(Value::WeakSet(s))
             }
@@ -180,5 +191,18 @@ fn seed_array(seed: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Vec<Value>, Vm
             elements.to_vec()
         })),
         _ => Err(VmError::TypeMismatch),
+    }
+}
+
+fn weak_collection_to_vm_error(err: crate::collections::CollectionError) -> VmError {
+    match err {
+        crate::collections::CollectionError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+        _ => VmError::TypeMismatch,
     }
 }

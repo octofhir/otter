@@ -47,7 +47,8 @@ pub(crate) fn install_promise(
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
     // Prototype object linked to %Object.prototype%.
-    let prototype = object::alloc_object(heap)?;
+    let global_root = Value::Object(global);
+    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
@@ -56,7 +57,8 @@ pub(crate) fn install_promise(
 
     // §27.2.5 — `then` / `catch` / `finally` prototype methods.
     {
-        let mut builder = ObjectBuilder::from_object(heap, prototype);
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         builder.method(
             "then",
             2,
@@ -78,8 +80,15 @@ pub(crate) fn install_promise(
     }
 
     // §27.2.3 The Promise Constructor.
-    let ctor = NativeFunction::new_constructor_static(heap, "Promise", 1, promise_ctor_call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype_root = Value::Object(prototype);
+    let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
+        heap,
+        "Promise",
+        1,
+        promise_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
 
     // §27.2.3.1 — `Promise.prototype` own data property:
@@ -90,18 +99,34 @@ pub(crate) fn install_promise(
     }
 
     // §27.2.4 — static methods.
-    define_ctor_method(heap, ctor, "resolve", 1, promise_static_resolve)?;
-    define_ctor_method(heap, ctor, "reject", 1, promise_static_reject)?;
-    define_ctor_method(heap, ctor, "all", 1, promise_static_all)?;
-    define_ctor_method(heap, ctor, "race", 1, promise_static_race)?;
-    define_ctor_method(heap, ctor, "allSettled", 1, promise_static_all_settled)?;
-    define_ctor_method(heap, ctor, "any", 1, promise_static_any)?;
+    let ctor_roots = vec![global_root.clone(), Value::Object(prototype)];
+    define_ctor_method(
+        heap,
+        ctor,
+        "resolve",
+        1,
+        promise_static_resolve,
+        &ctor_roots,
+    )?;
+    define_ctor_method(heap, ctor, "reject", 1, promise_static_reject, &ctor_roots)?;
+    define_ctor_method(heap, ctor, "all", 1, promise_static_all, &ctor_roots)?;
+    define_ctor_method(heap, ctor, "race", 1, promise_static_race, &ctor_roots)?;
+    define_ctor_method(
+        heap,
+        ctor,
+        "allSettled",
+        1,
+        promise_static_all_settled,
+        &ctor_roots,
+    )?;
+    define_ctor_method(heap, ctor, "any", 1, promise_static_any, &ctor_roots)?;
     define_ctor_method(
         heap,
         ctor,
         "withResolvers",
         0,
         promise_static_with_resolvers,
+        &ctor_roots,
     )?;
 
     // §27.2.5.2 — `Promise.prototype.constructor` back-pointer.
@@ -311,9 +336,20 @@ fn define_ctor_method(
     name: &'static str,
     length: u8,
     call: crate::native_function::NativeFastFn,
+    value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
-    let func = NativeFunction::new_static(heap, name, length, call)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_root = Value::NativeFunction(ctor);
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&ctor_root);
+    roots.extend(value_roots.iter());
+    let func = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        name,
+        length,
+        call,
+        roots.as_slice(),
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let string_heap = crate::string::StringHeap::default();
     let attrs = Attr::builtin_function();
     let desc = PropertyDescriptor::data(

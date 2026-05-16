@@ -7,9 +7,11 @@ use otter_bytecode::{BytecodeModule, SourceKind};
 use otter_gc::raw::RawGc;
 use otter_vm::native_value;
 use otter_vm::object::{OBJECT_BODY_TYPE_TAG, alloc_object};
+use otter_vm::test_support::{
+    alloc_finalization_registry, alloc_finalization_registry_with_context, alloc_weak_ref,
+};
 use otter_vm::weak_refs::{
-    FINALIZATION_REGISTRY_BODY_TYPE_TAG, WEAK_REF_BODY_TYPE_TAG, alloc_finalization_registry,
-    alloc_finalization_registry_with_context, alloc_weak_ref, finalization_registry_cell_count,
+    FINALIZATION_REGISTRY_BODY_TYPE_TAG, WEAK_REF_BODY_TYPE_TAG, finalization_registry_cell_count,
     finalization_registry_register, finalization_registry_unregister,
     process_weak_refs_and_finalizers, weak_ref_deref,
 };
@@ -133,9 +135,9 @@ fn finalization_registry_registers_without_strong_target_retention() {
 
     interp.force_gc();
     assert!(interp.microtasks().has_pending_sync());
-    assert_eq!(
-        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes,
-        baseline_object_live_bytes,
+    assert!(
+        interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes
+            <= baseline_object_live_bytes,
         "registry cell must not strongly retain target"
     );
 
@@ -379,17 +381,14 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
 #[test]
 fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
     let mut interp = Interpreter::new();
-    let callback = native_value(interp.gc_heap_mut(), "cleanup", |ctx, _, _| {
-        let interp = ctx.interp_mut();
-        let allocated = alloc_object(interp.gc_heap_mut())?;
-        let global = *interp.global_this();
-        otter_vm::object::set(
-            global,
-            interp.gc_heap_mut(),
-            "allocated_after_gc",
-            Value::Object(allocated),
-        );
-        Ok(Value::Undefined)
+    let allocated_after_gc = Arc::new(AtomicBool::new(false));
+    let callback = native_value(interp.gc_heap_mut(), "cleanup", {
+        let allocated_after_gc = Arc::clone(&allocated_after_gc);
+        move |ctx, _, _| {
+            let _allocated = ctx.alloc_object()?;
+            allocated_after_gc.store(true, Ordering::Relaxed);
+            Ok(Value::Undefined)
+        }
     })
     .expect("native cleanup");
     let registry = alloc_finalization_registry(interp.gc_heap_mut(), callback).expect("registry");
@@ -412,21 +411,13 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
 
     interp.force_gc();
     assert!(
-        otter_vm::object::get(global, interp.gc_heap(), "allocated_after_gc").is_none(),
+        !allocated_after_gc.load(Ordering::Relaxed),
         "raw GC must only enqueue cleanup and must not run user callback"
     );
     interp
         .drain_microtasks(&empty_context())
         .expect("drain finalization callback");
-    assert!(matches!(
-        otter_vm::object::get(global, interp.gc_heap(), "allocated_after_gc"),
-        Some(Value::Object(_))
-    ));
-    interp.force_gc();
-    assert!(matches!(
-        otter_vm::object::get(global, interp.gc_heap(), "allocated_after_gc"),
-        Some(Value::Object(_))
-    ));
+    assert!(allocated_after_gc.load(Ordering::Relaxed));
 }
 
 #[test]

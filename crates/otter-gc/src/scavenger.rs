@@ -104,6 +104,9 @@ impl ScavCtx {
 /// scavenger may rewrite each in place. `external_visit` is a
 /// hook for additional root sources (handle stack, global
 /// handles); each call yields the additional slots.
+/// `weak_registry_slots` are non-root registry entries: a slot is
+/// rewritten only if its target was already forwarded by strong
+/// reachability; otherwise it is nulled for later pruning.
 ///
 /// # Safety
 ///
@@ -118,6 +121,7 @@ pub unsafe fn scavenge(
     trace_table: &TraceTable,
     root_slots: &[*mut RawGc],
     external_visit: &mut RootSlotVisitor<'_>,
+    weak_registry_slots: &[*mut RawGc],
 ) -> ScavengeStats {
     let mut ctx = ScavCtx {
         // SAFETY: borrows are valid for the duration of this fn.
@@ -150,7 +154,15 @@ pub unsafe fn scavenge(
     // SAFETY: STW + raw-pointer state.
     unsafe { cheney_scan(&mut ctx) };
 
-    // 5) Bump survival ages on to-space pages — those are
+    // 5) Rewrite non-root weak registry entries after all strong
+    // reachability has been evacuated, but before from-space is
+    // recycled by the flip below.
+    for &slot in weak_registry_slots {
+        // SAFETY: caller guarantees slot is a valid registry slot.
+        unsafe { process_weak_registry_slot(&mut ctx, slot) };
+    }
+
+    // 6) Bump survival ages on to-space pages — those are
     // the pages that received survivors during this scavenge.
     // After the flip below they become the new from-space; the
     // next scavenge reads their (now-bumped) survival_age and
@@ -162,7 +174,7 @@ pub unsafe fn scavenge(
         }
     }
 
-    // 6) Flip from↔to.
+    // 7) Flip from↔to.
     ctx.new_space().flip();
 
     ctx.stats
@@ -188,6 +200,33 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
         let new_offset = evacuate(ctx, header_ptr);
         (*slot).0 = new_offset;
         ctx.stats.slot_updates += 1;
+    }
+}
+
+/// Update a non-root registry slot if its young target survived.
+///
+/// # Safety
+///
+/// `slot` must be a dereferenceable registry slot. Unlike
+/// [`process_slot`], this never evacuates the target; it observes whether
+/// ordinary strong tracing already forwarded the object.
+unsafe fn process_weak_registry_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
+    // SAFETY: slot is dereferenceable per precondition.
+    unsafe {
+        let raw = (*slot).0;
+        if raw == 0 {
+            return;
+        }
+        let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+        if !(*header_ptr).is_young() {
+            return;
+        }
+        if (*header_ptr).is_forwarded() {
+            (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
+            ctx.stats.slot_updates += 1;
+        } else {
+            *slot = RawGc::NULL;
+        }
     }
 }
 

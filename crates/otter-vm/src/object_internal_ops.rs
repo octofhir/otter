@@ -26,9 +26,32 @@ use smallvec::SmallVec;
 use crate::{
     ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value, VmError,
     VmGetOutcome, VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata,
-    make_array_iterator_factory, object, object_statics, proxy, regexp_prototype, string, symbol,
-    to_length,
+    make_array_iterator_factory_runtime_rooted, object, object_statics, proxy, regexp_prototype,
+    string, symbol, to_length,
 };
+
+#[derive(Clone, Copy)]
+enum DescriptorAllocationRoots<'a> {
+    Runtime {
+        value_roots: &'a [&'a Value],
+        slice_roots: &'a [&'a [Value]],
+    },
+    Stack(&'a SmallVec<[Frame; 8]>),
+}
+
+fn partial_descriptor_value_roots(descriptor: &object::PartialPropertyDescriptor) -> Vec<Value> {
+    let mut roots = Vec::with_capacity(3);
+    if let Some(value) = &descriptor.value {
+        roots.push(value.clone());
+    }
+    if let Some(get) = &descriptor.get {
+        roots.push(get.clone());
+    }
+    if let Some(set) = &descriptor.set {
+        roots.push(set.clone());
+    }
+    roots
+}
 
 impl Interpreter {
     /// §28.2 — call a Proxy handler trap. When the trap is missing,
@@ -275,12 +298,51 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn ordinary_get_own_property_descriptor_value(
+    pub(crate) fn ordinary_get_own_property_descriptor_value_stack_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        target: Value,
+        key: &VmPropertyKey,
+        hops: usize,
+    ) -> Result<Option<object::PropertyDescriptor>, VmError> {
+        self.ordinary_get_own_property_descriptor_value_with_roots(
+            context,
+            target,
+            key,
+            hops,
+            DescriptorAllocationRoots::Stack(stack),
+        )
+    }
+
+    pub(crate) fn ordinary_get_own_property_descriptor_value_runtime_rooted(
         &mut self,
         context: &ExecutionContext,
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Option<object::PropertyDescriptor>, VmError> {
+        self.ordinary_get_own_property_descriptor_value_with_roots(
+            context,
+            target,
+            key,
+            hops,
+            DescriptorAllocationRoots::Runtime {
+                value_roots,
+                slice_roots,
+            },
+        )
+    }
+
+    fn ordinary_get_own_property_descriptor_value_with_roots(
+        &mut self,
+        context: &ExecutionContext,
+        target: Value,
+        key: &VmPropertyKey,
+        hops: usize,
+        allocation_roots: DescriptorAllocationRoots<'_>,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(None);
@@ -297,12 +359,14 @@ impl Interpreter {
                     trap_args,
                 )? {
                     Some(Value::Undefined) | Some(Value::Null) => {
-                        let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            context,
-                            proxy.target(),
-                            key,
-                            hops + 1,
-                        )?;
+                        let target_desc = self
+                            .ordinary_get_own_property_descriptor_value_with_roots(
+                                context,
+                                proxy.target(),
+                                key,
+                                hops + 1,
+                                allocation_roots,
+                            )?;
                         self.validate_proxy_get_own_property_descriptor(
                             &proxy.target(),
                             target_desc.as_ref(),
@@ -314,12 +378,14 @@ impl Interpreter {
                         let partial =
                             object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
                         let desc = partial.complete_for_new_property();
-                        let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            context,
-                            proxy.target(),
-                            key,
-                            hops + 1,
-                        )?;
+                        let target_desc = self
+                            .ordinary_get_own_property_descriptor_value_with_roots(
+                                context,
+                                proxy.target(),
+                                key,
+                                hops + 1,
+                                allocation_roots,
+                            )?;
                         self.validate_proxy_get_own_property_descriptor(
                             &proxy.target(),
                             target_desc.as_ref(),
@@ -332,11 +398,12 @@ impl Interpreter {
                             "Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
                                 .to_string(),
                     }),
-                    None => self.ordinary_get_own_property_descriptor_value(
+                    None => self.ordinary_get_own_property_descriptor_value_with_roots(
                         context,
                         proxy.target(),
                         key,
                         hops + 1,
+                        allocation_roots,
                     ),
                 }
             }
@@ -403,7 +470,25 @@ impl Interpreter {
                         .string_name()
                         .expect("non-symbol key has string spelling");
                     if key == "prototype" {
-                        let _ = self.function_property_get(context, function_id, "prototype")?;
+                        let _ = match allocation_roots {
+                            DescriptorAllocationRoots::Runtime {
+                                value_roots,
+                                slice_roots,
+                            } => self.function_property_get_runtime_rooted(
+                                context,
+                                function_id,
+                                "prototype",
+                                value_roots,
+                                slice_roots,
+                            )?,
+                            DescriptorAllocationRoots::Stack(stack) => self
+                                .function_property_get_stack_rooted(
+                                    context,
+                                    stack,
+                                    function_id,
+                                    "prototype",
+                                )?,
+                        };
                         let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                             return Ok(None);
                         };
@@ -569,9 +654,11 @@ impl Interpreter {
                     });
                 }
                 let key_value = self.vm_property_key_to_value(key)?;
-                let descriptor_object = self.partial_descriptor_to_object(&descriptor)?;
+                let target_value = proxy.target();
+                let descriptor_object =
+                    self.partial_descriptor_to_object(&descriptor, &[&key_value, &target_value])?;
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    proxy.target(),
+                    target_value.clone(),
                     key_value,
                     Value::Object(descriptor_object),
                 ];
@@ -581,13 +668,19 @@ impl Interpreter {
                         if !ok {
                             return Ok(false);
                         }
-                        let target_value = proxy.target();
-                        let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            context,
-                            target_value.clone(),
-                            key,
-                            0,
-                        )?;
+                        let descriptor_roots = partial_descriptor_value_roots(&descriptor);
+                        let mut value_roots = Vec::with_capacity(descriptor_roots.len() + 1);
+                        value_roots.push(&target_value);
+                        value_roots.extend(descriptor_roots.iter());
+                        let target_desc = self
+                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                context,
+                                target_value.clone(),
+                                key,
+                                0,
+                                value_roots.as_slice(),
+                                &[],
+                            )?;
                         let extensible = self.is_extensible_value(context, &target_value)?;
                         let setting_config_false = matches!(descriptor.configurable, Some(false))
                             || (descriptor.configurable.is_none() && !descriptor.is_generic() && {
@@ -721,8 +814,20 @@ impl Interpreter {
     fn partial_descriptor_to_object(
         &mut self,
         descriptor: &object::PartialPropertyDescriptor,
+        value_roots: &[&Value],
     ) -> Result<object::JsObject, VmError> {
-        let obj = object::alloc_object(&mut self.gc_heap)?;
+        let mut roots = Vec::with_capacity(value_roots.len() + 3);
+        roots.extend_from_slice(value_roots);
+        if let Some(v) = &descriptor.value {
+            roots.push(v);
+        }
+        if let Some(v) = &descriptor.get {
+            roots.push(v);
+        }
+        if let Some(v) = &descriptor.set {
+            roots.push(v);
+        }
+        let obj = self.alloc_runtime_rooted_object_with_roots(roots.as_slice(), &[])?;
         if let Some(v) = &descriptor.value {
             object::set(obj, &mut self.gc_heap, "value", v.clone());
         }
@@ -1115,17 +1220,25 @@ impl Interpreter {
         let target_keys = self.own_property_keys_value(context, &target_value, string_heap)?;
         let mut target_configurable: Vec<Value> = Vec::new();
         let mut target_nonconfigurable: Vec<Value> = Vec::new();
-        for key in target_keys {
+        for key in &target_keys {
             let vm_key = property_key_from_value(&key)?;
-            let desc = self.ordinary_get_own_property_descriptor_value(
+            let slice_roots: [&[Value]; 4] = [
+                target_keys.as_slice(),
+                trap_result.as_slice(),
+                target_configurable.as_slice(),
+                target_nonconfigurable.as_slice(),
+            ];
+            let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 context,
                 target_value.clone(),
                 &vm_key,
                 0,
+                &[&target_value],
+                &slice_roots,
             )?;
             match desc {
-                Some(d) if !d.configurable() => target_nonconfigurable.push(key),
-                _ => target_configurable.push(key),
+                Some(d) if !d.configurable() => target_nonconfigurable.push(key.clone()),
+                _ => target_configurable.push(key.clone()),
             }
         }
         if extensible_target && target_nonconfigurable.is_empty() {
@@ -1485,7 +1598,7 @@ impl Interpreter {
                             .well_known_tag()
                             .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
                     {
-                        make_array_iterator_factory(arr, &mut self.gc_heap)?
+                        make_array_iterator_factory_runtime_rooted(self, arr)?
                     }
                     VmPropertyKey::Symbol(_) => Value::Undefined,
                     _ => {
@@ -1759,12 +1872,15 @@ impl Interpreter {
                         // exists.
                         if !result {
                             let target_value = proxy.target();
-                            let target_desc = self.ordinary_get_own_property_descriptor_value(
-                                context,
-                                target_value.clone(),
-                                key,
-                                hops + 1,
-                            )?;
+                            let target_desc = self
+                                .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                    context,
+                                    target_value.clone(),
+                                    key,
+                                    hops + 1,
+                                    &[&target_value],
+                                    &[],
+                                )?;
                             if let Some(desc) = target_desc {
                                 if !desc.configurable() {
                                     return Err(VmError::TypeError {
@@ -1923,7 +2039,11 @@ impl Interpreter {
                         &[&target_clone],
                         &[args],
                     )?,
-                    None => array::from_elements(&mut self.gc_heap, values)?,
+                    None => self.alloc_runtime_rooted_array_from_values(
+                        values,
+                        &[&target_clone],
+                        &[args],
+                    )?,
                 };
                 Ok(Some(Value::Array(array)))
             }
@@ -1943,7 +2063,11 @@ impl Interpreter {
                         &[&target_clone],
                         &[args],
                     )?,
-                    None => array::from_elements(&mut self.gc_heap, values)?,
+                    None => self.alloc_runtime_rooted_array_from_values(
+                        values,
+                        &[&target_clone],
+                        &[args],
+                    )?,
                 };
                 Ok(Some(Value::Array(array)))
             }
@@ -1958,7 +2082,14 @@ impl Interpreter {
         key: Option<&Value>,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
         let key = Self::coerce_vm_property_key(key)?;
-        self.ordinary_get_own_property_descriptor_value(context, target, &key, 0)
+        self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+            context,
+            target.clone(),
+            &key,
+            0,
+            &[&target],
+            &[],
+        )
     }
 
     pub(crate) fn enumerable_own_string_keys_for_value(
@@ -1993,16 +2124,20 @@ impl Interpreter {
                     }
                 };
                 let mut enumerable = Vec::new();
-                for key in keys {
+                for key in &keys {
                     let Value::String(name) = key else {
                         continue;
                     };
                     let name = name.to_lossy_string();
-                    let desc = self.ordinary_get_own_property_descriptor_value(
+                    let proxy_root = Value::Proxy(proxy.clone());
+                    let slice_roots: [&[Value]; 1] = [keys.as_slice()];
+                    let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
-                        Value::Proxy(proxy.clone()),
+                        proxy_root.clone(),
                         &VmPropertyKey::OwnedString(name.clone()),
                         hops + 1,
+                        &[&proxy_root],
+                        &slice_roots,
                     )?;
                     if desc
                         .as_ref()
@@ -2082,12 +2217,15 @@ impl Interpreter {
                         // configurable properties may only disappear
                         // from an extensible target.
                         let target_value = proxy.target();
-                        let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            context,
-                            target_value.clone(),
-                            key,
-                            hops + 1,
-                        )?;
+                        let target_desc = self
+                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                context,
+                                target_value.clone(),
+                                key,
+                                hops + 1,
+                                &[&target_value],
+                                &[],
+                            )?;
                         if let Some(desc) = target_desc {
                             if !desc.configurable() {
                                 return Err(VmError::TypeError {
@@ -2194,12 +2332,15 @@ impl Interpreter {
                         // success, verify the target descriptor admits
                         // the new value.
                         let target_value = proxy.target();
-                        let target_desc = self.ordinary_get_own_property_descriptor_value(
-                            context,
-                            target_value.clone(),
-                            key,
-                            hops + 1,
-                        )?;
+                        let target_desc = self
+                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                context,
+                                target_value.clone(),
+                                key,
+                                hops + 1,
+                                &[&target_value, &value, &receiver],
+                                &[],
+                            )?;
                         if let Some(desc) = target_desc.as_ref()
                             && !desc.configurable()
                         {
@@ -2272,7 +2413,7 @@ impl Interpreter {
             },
             Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
                 VmPropertyKey::Symbol(sym) => {
-                    let bag = self.function_user_bag(function_id)?;
+                    let bag = self.function_user_bag_runtime_rooted(function_id, &[&value], &[])?;
                     Ok(object::set_symbol(
                         bag,
                         &mut self.gc_heap,

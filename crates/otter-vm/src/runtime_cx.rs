@@ -39,8 +39,8 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ExecutionContext, Interpreter, IteratorHandle, IteratorState, Value, array, collections,
-    object, weak_refs,
+    ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, array,
+    collections, native_function, object, promise::JsPromiseHandle, weak_refs,
 };
 
 /// Internal VM context. Carried explicitly through the dispatch
@@ -320,6 +320,103 @@ impl<'rt> NativeCtx<'rt> {
         object::alloc_object_with_roots(self.heap_mut(), &mut external_visit)
     }
 
+    /// Allocate a host-data object through the native root contract.
+    pub fn alloc_host_object<T: object::HostObjectData>(
+        &mut self,
+        data: T,
+    ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
+        self.alloc_host_object_with_roots(data, &[], &[])
+    }
+
+    /// Allocate a host-data object while keeping additional local values alive.
+    pub fn alloc_host_object_with_roots<T: object::HostObjectData>(
+        &mut self,
+        data: T,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        object::alloc_host_object_with_roots(self.heap_mut(), data, &mut external_visit)
+    }
+
+    /// Allocate a captured native function through the native root contract.
+    pub fn native_value_with_captures<F>(
+        &mut self,
+        name: &'static str,
+        captures: smallvec::SmallVec<[Value; 4]>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+        call: F,
+    ) -> Result<Value, otter_gc::OutOfMemory>
+    where
+        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
+            + 'static,
+    {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let capture_roots = captures.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+            for value in &capture_roots {
+                value.trace_value_slots(visitor);
+            }
+        };
+        native_function::native_value_with_captures_unchecked_with_roots(
+            self.heap_mut(),
+            name,
+            captures,
+            &mut external_visit,
+            call,
+        )
+    }
+
+    /// Allocate a pre-fulfilled promise through the native root contract.
+    pub fn fulfilled_promise_with_roots(
+        &mut self,
+        value: Value,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let value_root = value.clone();
+        let mut combined_roots = Vec::with_capacity(value_roots.len() + 1);
+        combined_roots.push(&value_root);
+        combined_roots.extend_from_slice(value_roots);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                combined_roots.as_slice(),
+                slice_roots,
+            );
+        };
+        JsPromiseHandle::fulfilled_with_roots(self.heap_mut(), value, &mut external_visit)
+    }
+
     /// Allocate a `Map` body through the native root contract.
     pub fn alloc_map(&mut self) -> Result<collections::JsMap, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
@@ -426,8 +523,18 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value.clone();
         let new_target = self.call_info.new_target.clone();
+        let map_root = Value::Map(*map);
+        let key_root = key.clone();
+        let value_root = value.clone();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                &[&map_root, &key_root, &value_root],
+                &[],
+            );
         };
         collections::map_set_with_roots(map, self.heap_mut(), key, value, &mut external_visit)
     }
@@ -441,10 +548,69 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value.clone();
         let new_target = self.call_info.new_target.clone();
+        let set_root = Value::Set(*set);
+        let value_root = value.clone();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                &[&set_root, &value_root],
+                &[],
+            );
         };
         collections::set_add_with_roots(set, self.heap_mut(), value, &mut external_visit)
+    }
+
+    /// Insert into a `WeakMap` through the native root contract.
+    pub fn weak_map_set(
+        &mut self,
+        map: &mut collections::JsWeakMap,
+        key: Value,
+        value: Value,
+    ) -> Result<(), collections::CollectionError> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let map_root = Value::WeakMap(*map);
+        let key_root = key.clone();
+        let value_root = value.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                &[&map_root, &key_root, &value_root],
+                &[],
+            );
+        };
+        collections::weak_map_set_with_roots(map, self.heap_mut(), key, value, &mut external_visit)
+    }
+
+    /// Insert into a `WeakSet` through the native root contract.
+    pub fn weak_set_add(
+        &mut self,
+        set: &mut collections::JsWeakSet,
+        value: Value,
+    ) -> Result<(), collections::CollectionError> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let set_root = Value::WeakSet(*set);
+        let value_root = value.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                &[&set_root, &value_root],
+                &[],
+            );
+        };
+        collections::weak_set_add_with_roots(set, self.heap_mut(), value, &mut external_visit)
     }
 
     /// Allocate an array through the native root contract.
@@ -704,8 +870,14 @@ mod tests {
             let mut set = ctx.alloc_set().expect("native set allocation");
             ctx.set_add(&mut set, Value::Number(NumberValue::from_i32(3)))
                 .expect("native set insert");
-            let _weak_map = ctx.alloc_weak_map().expect("native weak map allocation");
-            let _weak_set = ctx.alloc_weak_set().expect("native weak set allocation");
+            let weak_key = Value::Object(ctx.alloc_object().expect("native weak key"));
+            let weak_value = Value::Object(ctx.alloc_object().expect("native weak value"));
+            let mut weak_map = ctx.alloc_weak_map().expect("native weak map allocation");
+            ctx.weak_map_set(&mut weak_map, weak_key.clone(), weak_value)
+                .expect("native weak map insert");
+            let mut weak_set = ctx.alloc_weak_set().expect("native weak set allocation");
+            ctx.weak_set_add(&mut weak_set, weak_key)
+                .expect("native weak set insert");
         }
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(

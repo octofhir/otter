@@ -94,4 +94,23 @@ impl WeakFinalizationRegistry {
         self.weak_refs.retain(|raw| is_marked(*raw));
         self.finalization_registries.retain(|raw| is_marked(*raw));
     }
+
+    /// Mutable raw slots for young-generation relocation.
+    ///
+    /// These slots are not roots. The scavenger rewrites a slot only when the
+    /// registered object was already forwarded through ordinary roots; otherwise
+    /// it nulls the entry so the registry can prune it.
+    pub fn handle_slots(&mut self) -> Vec<*mut RawGc> {
+        self.weak_refs
+            .iter_mut()
+            .chain(self.finalization_registries.iter_mut())
+            .map(|raw| raw as *mut RawGc)
+            .collect()
+    }
+
+    /// Drop entries nulled by a young-generation collection.
+    pub fn retain_non_null(&mut self) {
+        self.weak_refs.retain(|raw| !raw.is_null());
+        self.finalization_registries.retain(|raw| !raw.is_null());
+    }
 }

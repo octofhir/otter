@@ -102,12 +102,14 @@ impl Interpreter {
 
     pub(crate) fn run_make_class_regs(
         &mut self,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        frame_idx: usize,
         dst: u16,
         ctor_reg: u16,
         proto_reg: u16,
         statics_reg: u16,
     ) -> Result<(), VmError> {
+        let frame = &stack[frame_idx];
         let ctor = read_register(frame, ctor_reg)?.clone();
         if !self.is_callable_runtime(&ctor) {
             return Err(VmError::NotCallable);
@@ -120,7 +122,20 @@ impl Interpreter {
             Value::Object(o) => *o,
             _ => return Err(VmError::TypeMismatch),
         };
-        let class = ClassConstructor::new(&mut self.gc_heap, ctor, prototype, statics)?;
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let class = ClassConstructor::new_with_roots(
+            &mut self.gc_heap,
+            ctor,
+            prototype,
+            statics,
+            &mut external_visit,
+        )?;
+        let frame = &mut stack[frame_idx];
         write_register(frame, dst, Value::ClassConstructor(class))?;
         frame.pc += 1;
         Ok(())
@@ -715,17 +730,6 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn function_user_bag(&mut self, function_id: u32) -> Result<JsObject, VmError> {
-        match self.function_user_props.get(&function_id).copied() {
-            Some(bag) => Ok(bag),
-            None => {
-                let bag = crate::object::alloc_object(&mut self.gc_heap)?;
-                self.function_user_props.insert(function_id, bag);
-                Ok(bag)
-            }
-        }
-    }
-
     pub(crate) fn function_user_bag_stack_rooted(
         &mut self,
         stack: &SmallVec<[Frame; 8]>,
@@ -867,7 +871,7 @@ impl Interpreter {
         }
         let bag = match stack_roots {
             Some(stack) => self.function_user_bag_stack_rooted(stack, function_id, &roots)?,
-            None => self.function_user_bag(function_id)?,
+            None => self.function_user_bag_runtime_rooted(function_id, &roots, &[])?,
         };
         let ok = crate::object::define_own_property(bag, &mut self.gc_heap, key, descriptor);
         if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) {
@@ -949,12 +953,25 @@ impl Interpreter {
                             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
                             _ => return Err(VmError::TypeMismatch),
                         };
-                        let desc = self.ordinary_get_own_property_descriptor_value(
-                            context,
-                            target.clone(),
-                            &vm_key,
-                            0,
-                        )?;
+                        let desc = match stack_roots {
+                            Some(stack) => self
+                                .ordinary_get_own_property_descriptor_value_stack_rooted(
+                                    context,
+                                    stack,
+                                    target.clone(),
+                                    &vm_key,
+                                    0,
+                                )?,
+                            None => self
+                                .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                    context,
+                                    target.clone(),
+                                    &vm_key,
+                                    0,
+                                    &[&target],
+                                    &[args],
+                                )?,
+                        };
                         if desc.as_ref().is_some_and(|d| d.enumerable()) {
                             values.push(key);
                         }
@@ -1020,7 +1037,11 @@ impl Interpreter {
                             Some(stack) => {
                                 self.function_user_bag_stack_rooted(stack, function_id, &[&target])?
                             }
-                            None => self.function_user_bag(function_id)?,
+                            None => self.function_user_bag_runtime_rooted(
+                                function_id,
+                                &[&target],
+                                &[args],
+                            )?,
                         };
                         crate::object::define_own_symbol_property_partial(
                             bag,
@@ -1179,7 +1200,7 @@ impl Interpreter {
                 value_roots,
                 slice_roots,
             ),
-            None => Ok(array::from_elements(&mut self.gc_heap, values)?),
+            None => self.alloc_runtime_rooted_array_from_values(values, value_roots, slice_roots),
         }
     }
 
@@ -1190,10 +1211,6 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[Value],
     ) -> Result<JsObject, VmError> {
-        let Some(stack) = stack_roots else {
-            return object_statics::descriptor_to_object(desc, &mut self.gc_heap);
-        };
-
         let mut roots = Vec::with_capacity(value_roots.len() + 2);
         roots.extend_from_slice(value_roots);
         match &desc.kind {
@@ -1207,8 +1224,16 @@ impl Interpreter {
                 }
             }
         }
-        let result =
-            self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
+        let result = match stack_roots {
+            Some(stack) => self.alloc_stack_rooted_object_with_value_roots(
+                stack,
+                roots.as_slice(),
+                slice_roots,
+            )?,
+            None => {
+                self.alloc_runtime_rooted_object_with_roots(roots.as_slice(), &[slice_roots])?
+            }
+        };
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
                 object::set(result, &mut self.gc_heap, "value", value.clone());
@@ -1267,51 +1292,22 @@ impl Interpreter {
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
+        if name == "prototype" {
+            return self.function_property_get_runtime_rooted(context, function_id, name, &[], &[]);
+        }
+        self.function_property_get_non_prototype(context, function_id, name)
+    }
+
+    fn function_property_get_non_prototype(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name: &str,
+    ) -> Result<Value, VmError> {
         if let Some(bag) = self.function_user_props.get(&function_id).copied()
             && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
         {
             return Ok(v);
-        }
-        if name == "prototype" {
-            // §9.2.10 — function instances expose a writable,
-            // non-configurable `.prototype` that auto-allocates as
-            // a fresh ordinary object on first access. The fresh
-            // prototype owns the standard non-enumerable
-            // `constructor` data property pointing back at the
-            // function object.
-            let bag = match self.function_user_props.get(&function_id).copied() {
-                Some(b) => b,
-                None => {
-                    let new_bag = crate::object::alloc_object(&mut self.gc_heap)?;
-                    self.function_user_props.insert(function_id, new_bag);
-                    new_bag
-                }
-            };
-            if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
-                return Ok(existing);
-            }
-            let proto = crate::object::alloc_object(&mut self.gc_heap)?;
-            if let Some(Value::Object(object_ctor)) =
-                crate::object::get(self.global_this, &self.gc_heap, "Object")
-                && let Some(Value::Object(object_proto)) =
-                    crate::object::get(object_ctor, &self.gc_heap, "prototype")
-            {
-                crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
-            }
-            let proto_value = Value::Object(proto);
-            let constructor = object::PropertyDescriptor::data(
-                Value::Function { function_id },
-                true,
-                false,
-                true,
-            );
-            let _ =
-                object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
-            let prototype_desc =
-                object::PropertyDescriptor::data(proto_value.clone(), true, false, false);
-            let _ =
-                object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
-            return Ok(proto_value);
         }
         if name == "name" || name == "length" {
             let ctx = function_metadata::FunctionMetadataContext::new(
@@ -1344,7 +1340,7 @@ impl Interpreter {
         name: &str,
     ) -> Result<Value, VmError> {
         if name != "prototype" {
-            return self.function_property_get(context, function_id, name);
+            return self.function_property_get_non_prototype(context, function_id, name);
         }
         if let Some(bag) = self.function_user_props.get(&function_id).copied()
             && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
@@ -1386,7 +1382,7 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         if name != "prototype" {
-            return self.function_property_get(context, function_id, name);
+            return self.function_property_get_non_prototype(context, function_id, name);
         }
         if let Some(bag) = self.function_user_props.get(&function_id).copied()
             && let Some(v) = crate::object::get(bag, &self.gc_heap, name)

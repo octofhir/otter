@@ -115,6 +115,8 @@ pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
+#[doc(hidden)]
+pub mod test_support;
 pub mod timers;
 pub mod weak_refs;
 
@@ -154,8 +156,8 @@ pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
-    ConstructorSpec, FunctionBuilder, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec,
-    ObjectBuilder, PropertySpec,
+    ConstructorSpec, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec, ObjectBuilder,
+    PropertySpec,
 };
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_function::{
@@ -483,19 +485,32 @@ pub struct ClassConstructor {
 }
 
 impl ClassConstructor {
-    /// Allocate a fresh class constructor on the GC heap.
-    pub fn new(
+    /// Allocate a class constructor while exposing caller-owned roots
+    /// across the body allocation.
+    pub(crate) fn new_with_roots(
         heap: &mut otter_gc::GcHeap,
         ctor: Value,
         prototype: JsObject,
         statics: JsObject,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
+        let prototype_root = Value::Object(prototype);
+        let statics_root = Value::Object(statics);
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            ctor.trace_value_slots(visitor);
+            prototype_root.trace_value_slots(visitor);
+            statics_root.trace_value_slots(visitor);
+        };
         Ok(Self {
-            inner: heap.alloc_old(ClassConstructorBody {
-                ctor,
-                prototype,
-                statics,
-            })?,
+            inner: heap.alloc_with_roots(
+                ClassConstructorBody {
+                    ctor: ctor.clone(),
+                    prototype,
+                    statics,
+                },
+                &mut visit,
+            )?,
         })
     }
 
@@ -691,14 +706,6 @@ impl otter_gc::SafeTraceable for IteratorState {
     }
 }
 
-/// Allocate a GC-managed iterator state.
-pub fn alloc_iterator_state(
-    heap: &mut otter_gc::GcHeap,
-    state: IteratorState,
-) -> Result<IteratorHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(state)
-}
-
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
 /// [`BoundFunctionBody`].
 pub const BOUND_FUNCTION_BODY_TYPE_TAG: u8 = 0x1c;
@@ -778,6 +785,8 @@ fn trace_bound_metadata_property(
     }
 }
 
+fn no_extra_roots(_: &mut dyn FnMut(*mut RawGc)) {}
+
 /// Cheap-to-clone handle for [`BoundFunctionBody`].
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -814,19 +823,15 @@ impl BoundFunction {
         bound_args: SmallVec<[Value; 4]>,
         metadata: function_metadata::BoundFunctionCreateMetadata,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let own_properties = object::alloc_object(heap)?;
-        Ok(Self {
-            inner: heap.alloc_old(BoundFunctionBody {
-                target,
-                bound_this,
-                bound_args,
-                builtin_name: metadata.name,
-                builtin_length: metadata.length,
-                name_property: BoundFunctionMetadataProperty::Builtin,
-                length_property: BoundFunctionMetadataProperty::Builtin,
-                own_properties,
-            })?,
-        })
+        let mut external_visit = no_extra_roots;
+        Self::new_with_metadata_and_roots(
+            heap,
+            target,
+            bound_this,
+            bound_args,
+            metadata,
+            &mut external_visit,
+        )
     }
 
     /// Build a bound function while exposing caller-owned roots
@@ -1712,10 +1717,12 @@ impl Interpreter {
                 object::get(function_ctor, &gc_heap, "prototype")
         {
             let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
+            let global_root = Value::Object(global_this);
             function_prototype::install_symbol_has_instance(
                 &mut gc_heap,
                 function_proto,
                 has_instance,
+                &[&global_root],
             )
             .expect("Function.prototype[@@hasInstance] fits within any positive cap");
             Some(function_proto)
@@ -2544,7 +2551,15 @@ impl Interpreter {
     /// specs stay static, while the actual object allocation and
     /// global mutation happen during one mutator turn.
     pub fn install_global_class(&mut self, spec: &'static ClassSpec) -> Result<(), JsSurfaceError> {
-        let value = ClassBuilder::from_spec(&mut self.gc_heap, spec).build()?;
+        let raw_roots = self.collect_runtime_roots();
+        let global_root = Value::Object(self.global_this);
+        let value = ClassBuilder::from_spec_with_raw_and_value_roots(
+            &mut self.gc_heap,
+            spec,
+            raw_roots,
+            vec![global_root],
+        )
+        .build()?;
         let descriptor = crate::object::PropertyDescriptor::data(
             value,
             spec.constructor.attrs.writable,
@@ -3557,19 +3572,33 @@ impl Interpreter {
                         )
                     };
                     let obj = if kind == ArgumentsObjectKind::Mapped {
-                        crate::arguments_object::create_mapped(
+                        let obj = self.alloc_stack_rooted_object_with_value_roots(
+                            stack,
+                            &[&callee],
+                            &elements,
+                        )?;
+                        crate::arguments_object::initialize_mapped(
+                            obj,
                             &mut self.gc_heap,
                             elements,
                             callee,
                             mapped_entries,
-                        )?
+                        );
+                        obj
                     } else {
                         let thrower = self.restricted_throw_type_error()?;
-                        crate::arguments_object::create_unmapped(
+                        let obj = self.alloc_stack_rooted_object_with_value_roots(
+                            stack,
+                            &[&thrower],
+                            &elements,
+                        )?;
+                        crate::arguments_object::initialize_unmapped(
+                            obj,
                             &mut self.gc_heap,
                             elements,
                             thrower,
-                        )?
+                        );
+                        obj
                     };
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, Value::Object(obj))?;
@@ -3987,8 +4016,14 @@ impl Interpreter {
                     let statics_reg = context
                         .exec_register(instr, 3)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_make_class_regs(frame, dst, ctor_reg, proto_reg, statics_reg)?;
+                    self.run_make_class_regs(
+                        &mut *stack,
+                        top_idx,
+                        dst,
+                        ctor_reg,
+                        proto_reg,
+                        statics_reg,
+                    )?;
                     continue;
                 }
                 Op::NewError => {
@@ -4655,11 +4690,11 @@ impl Interpreter {
                     self.run_typed_array_static_call_operands(stack, operands)?;
                     continue;
                 }
-                Op::MathCall
-                | Op::DateCall
-                | Op::BigIntCall
-                | Op::DataViewCall
-                | Op::SharedArrayBufferCall => {
+                Op::SharedArrayBufferCall => {
+                    self.run_shared_array_buffer_static_call_operands(stack, operands)?;
+                    continue;
+                }
+                Op::MathCall | Op::DateCall | Op::BigIntCall | Op::DataViewCall => {
                     self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 Op::ProxyCall => {
@@ -5143,24 +5178,43 @@ fn make_array_iterator_factory(
         heap,
         "Array[Symbol.iterator]",
         smallvec::smallvec![Value::Array(array)],
-        |ctx, _, captures| {
-            let array = match captures.first() {
-                Some(Value::Array(array)) => *array,
-                _ => {
-                    return Err(crate::native_function::NativeError::TypeError {
-                        name: "Array[Symbol.iterator]",
-                        reason: "missing traced array capture".to_string(),
-                    });
-                }
-            };
-            let state = IteratorState::Array { array, index: 0 };
-            Ok(Value::Iterator(ctx.alloc_iterator_state(
-                state,
-                &[],
-                &[],
-            )?))
-        },
+        array_iterator_factory_call,
     )
+}
+
+pub(crate) fn make_array_iterator_factory_runtime_rooted(
+    interp: &mut Interpreter,
+    array: JsArray,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    interp.native_value_with_captures_runtime_rooted(
+        "Array[Symbol.iterator]",
+        smallvec::smallvec![Value::Array(array)],
+        &[],
+        &[],
+        array_iterator_factory_call,
+    )
+}
+
+fn array_iterator_factory_call(
+    ctx: &mut NativeCtx<'_>,
+    _: &[Value],
+    captures: &[Value],
+) -> Result<Value, NativeError> {
+    let array = match captures.first() {
+        Some(Value::Array(array)) => *array,
+        _ => {
+            return Err(NativeError::TypeError {
+                name: "Array[Symbol.iterator]",
+                reason: "missing traced array capture".to_string(),
+            });
+        }
+    };
+    let state = IteratorState::Array { array, index: 0 };
+    Ok(Value::Iterator(ctx.alloc_iterator_state(
+        state,
+        &[],
+        &[],
+    )?))
 }
 
 /// Generator resume entry per ECMA-262 §27.5.3.
@@ -6493,7 +6547,7 @@ mod tests {
         interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
         let iterator_value = stack[0].registers[1].clone();
         let method = interp
-            .synthesize_iterator_method("next", iterator_value)
+            .synthesize_iterator_method(&stack, "next", iterator_value)
             .unwrap();
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;

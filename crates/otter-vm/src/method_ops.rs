@@ -32,7 +32,8 @@ use crate::{
     native_to_vm_error, number, object_prototype_intercept,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
-    string_prototype, symbol_prototype, temporal, weak_refs, write_register,
+    string::prototype as string_prototype,
+    symbol_prototype, temporal, weak_refs, write_register,
 };
 
 impl Interpreter {

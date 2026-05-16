@@ -35,6 +35,23 @@
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
+//!
+//! # Submodules
+//! The String class is split into per-concern files to keep this
+//! root module focused on the value representation:
+//!
+//! - [`dispatch`] — compile-time `String.<static>` dispatcher used by
+//!   the `StringCall` opcode.
+//! - [`ops`] — lower-level VM string opcodes (concat, slice, etc.).
+//! - [`prototype`] — `String.prototype.*` intrinsic implementations.
+//! - [`statics`] — JS-visible static method specs installed on the
+//!   `String` constructor object (`fromCharCode`, `fromCodePoint`).
+
+pub mod dispatch;
+pub mod intrinsic;
+pub mod ops;
+pub mod prototype;
+pub mod statics;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

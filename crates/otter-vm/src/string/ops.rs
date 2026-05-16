@@ -1,7 +1,7 @@
 //! String opcode helpers.
 //!
 //! The high-level `String(...)` constructor and statics live in
-//! [`crate::string_dispatch`]. This module owns lower-level VM string opcodes
+//! [`crate::string::dispatch`]. This module owns lower-level VM string opcodes
 //! that operate directly on registers.
 //!
 //! # Contents

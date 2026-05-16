@@ -18,7 +18,7 @@
 //! # See also
 //! - [`crate::abstract_ops`]
 //! - [`crate::number`]
-//! - [`crate::string_dispatch`]
+//! - [`crate::string::dispatch`]
 
 use otter_bytecode::Operand;
 use smallvec::SmallVec;

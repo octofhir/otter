@@ -127,7 +127,7 @@ pub enum VmError {
         message: String,
     },
     /// `CALL_STRING_METHOD` referenced a method name not in
-    /// [`crate::string_prototype::STRING_PROTOTYPE_TABLE`].
+    /// [`crate::string::prototype::STRING_PROTOTYPE_TABLE`].
     UnknownIntrinsic {
         /// Method name as it appeared in the constant pool.
         name: String,

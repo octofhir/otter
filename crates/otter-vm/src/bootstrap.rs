@@ -325,11 +325,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_json,
     },
-    BootstrapEntry {
-        name: "String",
-        feature: BootstrapFeatures::CORE,
-        install: install_string,
-    },
+    crate::bootstrap_entry!(crate::string::intrinsic::Intrinsic),
     BootstrapEntry {
         name: "Number",
         feature: BootstrapFeatures::CORE,
@@ -1486,118 +1482,9 @@ fn install_number(
     Ok(())
 }
 
-fn install_string(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    use crate::{NativeCtx, NativeError};
-
-    let global_root = Value::Object(global);
-    let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let constructor_root = Value::Object(constructor);
-    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
-    {
-        object::set_prototype(constructor, heap, Some(object_proto));
-        object::set_prototype(prototype, heap, Some(object_proto));
-    }
-    crate::object::set_string_data(
-        prototype,
-        heap,
-        crate::string::JsString::from_str("", &crate::string::StringHeap::default())
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
-    );
-
-    fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        // §22.1.1.1 — bare `String(value)` returns `ToString(value)`.
-        // ToString routes through `[Symbol.toPrimitive]` → `toString` →
-        // `valueOf` for objects, so a class with an overridden
-        // `toString` (or a custom `Symbol.toPrimitive`) is observable.
-        // The fast path keeps primitives cheap; only non-primitive
-        // values re-enter the interpreter for ToPrimitive coercion.
-        let raw = args.first().cloned().unwrap_or(Value::Undefined);
-        let string_heap = ctx.interp_mut().string_heap_clone();
-        let primitive = match &raw {
-            Value::Undefined
-            | Value::Null
-            | Value::Boolean(_)
-            | Value::Number(_)
-            | Value::BigInt(_)
-            | Value::String(_)
-            | Value::Symbol(_) => raw.clone(),
-            _ => {
-                let (interp, exec) = ctx.interp_mut_and_context();
-                let exec = exec.ok_or_else(|| NativeError::TypeError {
-                    name: "String",
-                    reason: "missing execution context".to_string(),
-                })?;
-                interp
-                    .evaluate_to_primitive(
-                        &exec,
-                        &raw,
-                        crate::abstract_ops::ToPrimitiveHint::String,
-                    )
-                    .map_err(|e| match e {
-                        crate::VmError::Uncaught { value } => NativeError::Thrown {
-                            name: "String",
-                            message: value,
-                        },
-                        other => NativeError::TypeError {
-                            name: "String",
-                            reason: other.to_string(),
-                        },
-                    })?
-            }
-        };
-        let value = crate::string_dispatch::call(
-            otter_bytecode::method_id::StringMethod::Construct,
-            std::slice::from_ref(&primitive),
-            &string_heap,
-        )
-        .map_err(|err| NativeError::TypeError {
-            name: "String",
-            reason: err.to_string(),
-        })?;
-        if ctx.is_construct_call() {
-            let Value::String(string) = value else {
-                return Err(NativeError::TypeError {
-                    name: "String",
-                    reason: "constructor did not return a string primitive".to_string(),
-                });
-            };
-            let this = ctx.this_value().clone();
-            if let Value::Object(obj) = this {
-                crate::object::set_string_data(obj, ctx.heap_mut(), string);
-                Ok(Value::Object(obj))
-            } else {
-                Err(NativeError::TypeError {
-                    name: "String",
-                    reason: "expected object receiver in `new String(...)`".to_string(),
-                })
-            }
-        } else {
-            Ok(value)
-        }
-    }
-
-    let prototype_root = Value::Object(prototype);
-    let ctor_native = native_static_with_value_roots(
-        heap,
-        "String",
-        1,
-        string_ctor_call,
-        &[&global_root, &constructor_root, &prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
-    object::set(constructor, heap, "prototype", Value::Object(prototype));
-    let string_value = Value::Object(constructor);
-    object::set(prototype, heap, "constructor", string_value.clone());
-    define_global(global, heap, entry.name, string_value);
-    Ok(())
-}
+// `String` installer migrated to [`crate::string::intrinsic::Intrinsic`]
+// — see [`crate::intrinsic_install::BuiltinIntrinsic`] for the
+// per-class installation contract.
 
 fn install_boolean(
     entry: &BootstrapEntry,
